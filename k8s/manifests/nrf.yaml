@@ -1,6 +1,9 @@
-# ClusterIP, never NodePort (#1365): the SBI is unauthenticated in the dev
-# profile, and a NodePort opens it on every node IP. From a workstation use
+# ClusterIP, never NodePort (#1365): the SBI is TLS (#1617), but discovery and
+# the token endpoint need no client certificate, and a NodePort opens them on
+# every node IP. From a workstation use
 #   kubectl -n nextg-system port-forward svc/nrf 7777:7777
+# and dial https://nrf:7777 with --resolve nrf:7777:127.0.0.1 and the ca.crt
+# of Secret nf-tls-nrf (nrf.crt names DNS:nrf).
 apiVersion: v1
 kind: Service
 metadata:
@@ -58,6 +61,11 @@ spec:
         app.kubernetes.io/name: nrf
         app.kubernetes.io/part-of: nextgcore
     spec:
+      # #1617: the nf-tls files are group fsGroup, mode 0440, and every container
+      # of the pod runs with fsGroup as a supplementary group, so the NF reads
+      # its key as the image's non-root user (any gid works; 999 is the image's).
+      securityContext:
+        fsGroup: 999
       initContainers:
         - name: wait-mongodb
           image: busybox:1.36
@@ -76,6 +84,11 @@ spec:
             - containerPort: 9090
               name: metrics
           env:
+            # Pinned to the urn:uuid of nrf.crt (docker/rust/certs/nf-identities.txt,
+            # #1617). The NRF's own OAuth2 client presents nrf.crt only when its
+            # URN is this NRF's nfInstanceId.
+            - name: NEXTGCORE_NRF_INSTANCE_ID
+              value: "6b1d7e3c-0000-4000-8000-0000000000f0"
             - name: RUST_LOG
               value: info
             - name: RUST_BACKTRACE
@@ -93,6 +106,10 @@ spec:
               cpu: 200m
               memory: 128Mi
           volumeMounts:
+            # Its own Secret only (#1617).
+            - name: nf-tls
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
             - name: config
               mountPath: /etc/nextgcore/nrf.yaml
               subPath: nrf.yaml
@@ -110,6 +127,12 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
       volumes:
+        # #1617: this pod's certificate and key and the CA certificate, mode 0440
+        # to the pod's fsGroup. Never the CA key: it does not leave the deploy host.
+        - name: nf-tls
+          secret:
+            secretName: nf-tls-nrf
+            defaultMode: 0440
         - name: config
           configMap:
             name: nextgcore-configs

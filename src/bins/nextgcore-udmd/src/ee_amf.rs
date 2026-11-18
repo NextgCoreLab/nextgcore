@@ -344,7 +344,9 @@ async fn amf_unsubscribe(subscription_uri: &str) {
     let Some((host, port, path)) = split_uri(subscription_uri) else {
         return;
     };
-    let client = amf_client(&host, port).await;
+    // The URI can be one the AMF supplied (SUBSCRIPTION_ID_CHANGE), so it does
+    // not go through the tokened-client cache (#1659 review m2).
+    let client = crate::app::uncached_peer_client(&host, port, NfType::Amf).await;
     match tokio::time::timeout(
         amf_call_timeout(),
         client.send_request(SbiRequest::delete(&path)),

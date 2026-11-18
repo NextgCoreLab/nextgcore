@@ -282,7 +282,7 @@ pub async fn delete_producer_subscription(resource_uri: &str) {
         log::warn!("[DCCF] cannot delete producer subscription: unparseable URI {resource_uri}");
         return;
     };
-    let client = SbiClient::for_peer(&host, port);
+    let client = producer_client(&host, port, path.trim_start_matches('/'));
     match client.delete(&path).await {
         Ok(resp) => log::info!(
             "[DCCF] deleted producer subscription {resource_uri} -> status={}",
@@ -363,7 +363,7 @@ async fn post_producer_subscription(
     let Some((host, port, _)) = split_uri(api_root) else {
         return Err(format!("unparseable producer apiRoot {api_root}"));
     };
-    let client = SbiClient::for_peer(&host, port);
+    let client = producer_client(&host, port, service_name);
     let path = format!("/{service_name}/v1/subscriptions");
     let resp = client
         .post_json(&path, body)
@@ -377,6 +377,35 @@ async fn post_producer_subscription(
         .get_header("location")
         .cloned()
         .unwrap_or_else(|| format!("{api_root}{path}")))
+}
+
+/// The client for a service request to the producer at `host:port` (#1663):
+/// the SBI profile applies (`for_peer`), and the installed OAuth2 client is
+/// attached for the producer's NF type, read from the service name `service`
+/// starts with: API names follow `n<nftype>-<service>` (TS 29.501 §4.4.1's
+/// example is `nsmf-pdusession`), so `nnwdaf-...` is the NWDAF. A service name
+/// that names no known NF type gets no token rather than one for a guessed
+/// audience.
+fn producer_client(host: &str, port: u16, service: &str) -> SbiClient {
+    let client = SbiClient::for_peer(host, port);
+    match producer_nf_type(service) {
+        Some(target) => crate::attach_oauth2(client, target),
+        None => {
+            log::warn!(
+                "[DCCF] service {service:?} names no known producer NF type; sending without \
+                 an access token"
+            );
+            client
+        }
+    }
+}
+
+/// The producer NF type a TS 29.501 service name (or a path starting with one)
+/// names: `namf-evts` is AMF, `nnwdaf-eventssubscription` NWDAF.
+fn producer_nf_type(service: &str) -> Option<nextgcore_sbi::types::NfType> {
+    let api_name = service.split('/').next()?;
+    let nf = api_name.split('-').next()?.strip_prefix('n')?;
+    nextgcore_sbi::types::NfType::from_name(&nf.to_ascii_uppercase())
 }
 
 /// Split `scheme://host:port/path` into `(host, port, path)`.
@@ -472,6 +501,136 @@ mod tests {
                 "nfServices": [{"serviceName": "namf-evts"}]
             })),
             None
+        );
+    }
+
+    /// #1663: the producer NF type comes from the service name, and an unknown
+    /// one yields none rather than a guess.
+    #[test]
+    fn the_producer_type_is_read_from_the_service_name() {
+        use nextgcore_sbi::types::NfType;
+        assert_eq!(producer_nf_type("namf-evts"), Some(NfType::Amf));
+        assert_eq!(producer_nf_type("nsmf-event-exposure"), Some(NfType::Smf));
+        assert_eq!(
+            producer_nf_type("nnwdaf-eventssubscription"),
+            Some(NfType::Nwdaf)
+        );
+        assert_eq!(producer_nf_type("npcf-eventexposure"), Some(NfType::Pcf));
+        assert_eq!(
+            producer_nf_type("namf-evts/v1/subscriptions/s1"),
+            Some(NfType::Amf)
+        );
+        assert_eq!(producer_nf_type("xyz-evts"), None);
+        assert_eq!(producer_nf_type("nfoo-evts"), None);
+    }
+
+    /// #1663, failure-path property 1 (a failed request applies nothing): when
+    /// the token cannot be obtained, neither the producer subscription's create
+    /// nor its delete is sent, not even bare. The recorder here is UNGATED, so it
+    /// would see a bare send. The create's error means `ensure_producer_subscription`
+    /// records no producer subscription.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_token_fetch_sends_nothing_1663() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let recorder = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        recorder
+            .start(move |_req| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("location", "/x/v1/subscriptions/s-1")
+                }
+            })
+            .await
+            .expect("recorder starts");
+        let api_root = format!("http://127.0.0.1:{}", addr.port());
+        // Port 1 on loopback: nothing listens, so the token request fails.
+        let no_nrf = stand_in::oauth2_client_for(1, NfType::Dccf);
+        let create = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                std::sync::Arc::clone(&no_nrf),
+                post_producer_subscription(&api_root, "namf-evts", &serde_json::json!({})),
+            )
+            .await;
+        crate::TEST_OAUTH2_CLIENT
+            .scope(
+                no_nrf,
+                delete_producer_subscription(&format!("{api_root}/namf-evts/v1/subscriptions/s-1")),
+            )
+            .await;
+
+        assert!(
+            create.as_ref().is_err_and(|e| e.contains("access token")),
+            "the token error, not a producer answer: {create:?}"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no token: nothing is sent, not even bare"
+        );
+    }
+
+    /// #1663: the producer subscription's create and delete pass an
+    /// OAuth2-required producer with the installed client, and the create is
+    /// refused 401 without one. The stand-in AMF is gated by nextgcore-sbi's own
+    /// check (JWKS, audience AMF), so a recorded request passed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_subscription_create_and_delete_pass_an_oauth2_required_amf_1663() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (_amf, amf_port, seen) = stand_in::oauth2_producer(&sk, NfType::Amf, |req| {
+            if req.header.method == "DELETE" {
+                nextgcore_sbi::message::SbiResponse::with_status(204)
+            } else {
+                nextgcore_sbi::message::SbiResponse::with_status(201)
+                    .with_header("location", "/namf-evts/v1/subscriptions/s-1663")
+            }
+        })
+        .await;
+        let api_root = format!("http://127.0.0.1:{amf_port}");
+        let body = serde_json::json!({ "eventList": [] });
+
+        let without = post_producer_subscription(&api_root, "namf-evts", &body).await;
+        let oauth2 = stand_in::oauth2_client_for(nrf_port, NfType::Dccf);
+        let with = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                std::sync::Arc::clone(&oauth2),
+                post_producer_subscription(&api_root, "namf-evts", &body),
+            )
+            .await;
+        crate::TEST_OAUTH2_CLIENT
+            .scope(
+                oauth2,
+                delete_producer_subscription(&format!(
+                    "{api_root}/namf-evts/v1/subscriptions/s-1663"
+                )),
+            )
+            .await;
+
+        assert!(
+            without.as_ref().is_err_and(|e| e.contains("401")),
+            "refused without a token: {without:?}"
+        );
+        assert_eq!(with, Ok("/namf-evts/v1/subscriptions/s-1663".to_string()));
+        assert_eq!(
+            stand_in::bearer_requests(&seen, "POST", "/namf-evts/v1/subscriptions"),
+            1
+        );
+        assert_eq!(
+            stand_in::bearer_requests(&seen, "DELETE", "/namf-evts/v1/subscriptions/s-1663"),
+            1
         );
     }
 

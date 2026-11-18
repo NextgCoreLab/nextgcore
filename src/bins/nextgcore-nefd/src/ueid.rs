@@ -437,14 +437,19 @@ enum Lookup {
     Unavailable(String),
 }
 
-fn client_for(uri: &str) -> Result<nextgcore_sbi::client::SbiClient, String> {
+/// The client for a service request to the `target` producer at `uri`, carrying
+/// the token when one is installed (#1661).
+fn client_for(
+    uri: &str,
+    target: nextgcore_sbi::types::NfType,
+) -> Result<nextgcore_sbi::client::SbiClient, String> {
     let (host, port) = crate::parse_host_port(uri).ok_or_else(|| format!("bad URI {uri}"))?;
-    Ok(crate::bounded_client(&host, port))
+    Ok(crate::service_client(&host, port, target))
 }
 
 /// §4.15.10 steps 7-8: the SUPI of the PDU session bound to `ipv4`.
 async fn bsf_supi(bsf_uri: &str, ipv4: std::net::Ipv4Addr) -> Lookup {
-    let client = match client_for(bsf_uri) {
+    let client = match client_for(bsf_uri, nextgcore_sbi::types::NfType::Bsf) {
         Ok(c) => c,
         Err(e) => return Lookup::Unavailable(e),
     };
@@ -480,7 +485,7 @@ async fn bsf_supi(bsf_uri: &str, ipv4: std::net::Ipv4Addr) -> Lookup {
 
 /// §4.15.10 steps 9-10: the UE's External Identifier, bare (`username@realm`).
 async fn udm_external_id(udm_uri: &str, supi: &str) -> Lookup {
-    let client = match client_for(udm_uri) {
+    let client = match client_for(udm_uri, nextgcore_sbi::types::NfType::Udm) {
         Ok(c) => c,
         Err(e) => return Lookup::Unavailable(e),
     };
@@ -520,6 +525,58 @@ mod tests {
     use super::*;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use std::sync::Mutex;
+
+    /// #1661: the BSF and UDM lookups carry the NRF-issued token, so they pass
+    /// OAuth2-required producers (gated by nextgcore-sbi's own check), and are
+    /// refused without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bsf_and_udm_lookups_pass_oauth2_required_producers_1661() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (_bsf, bsf_port, bsf_seen) = stand_in::oauth2_producer(&sk, NfType::Bsf, |_| {
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({ "supi": "imsi-001010000001661" }))
+                .expect("json")
+        })
+        .await;
+        let (_udm, udm_port, udm_seen) = stand_in::oauth2_producer(&sk, NfType::Udm, |_| {
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({ "gpsi": "extid-af1661@example.com" }))
+                .expect("json")
+        })
+        .await;
+        let bsf_uri = format!("http://127.0.0.1:{bsf_port}");
+        let udm_uri = format!("http://127.0.0.1:{udm_port}");
+        let ip: std::net::Ipv4Addr = IP.parse().expect("ip");
+
+        let bare = bsf_supi(&bsf_uri, ip).await;
+        let (bsf, udm) = crate::TEST_OAUTH2_CLIENT
+            .scope(stand_in::oauth2_client_for(nrf_port, NfType::Nef), async {
+                (
+                    bsf_supi(&bsf_uri, ip).await,
+                    udm_external_id(&udm_uri, "imsi-001010000001661").await,
+                )
+            })
+            .await;
+
+        assert!(
+            !matches!(bare, Lookup::Found(_)),
+            "refused without a token: {bare:?}"
+        );
+        assert_eq!(bsf, Lookup::Found("imsi-001010000001661".to_string()));
+        assert!(matches!(udm, Lookup::Found(_)), "{udm:?}");
+        assert_eq!(
+            stand_in::bearer_requests(&bsf_seen, "GET", "/nbsf-management/v1/pcfBindings"),
+            1
+        );
+        assert_eq!(
+            stand_in::bearer_requests(&udm_seen, "GET", "/id-translation-result"),
+            1
+        );
+    }
 
     const KID: &str = "nrf-es256";
     const IP: &str = "10.45.0.13";

@@ -31,7 +31,29 @@ compose files in step:
    the `uri`s of an `nrf:` block, and any nrf-named flag, variable or key
    (--nrf-uri, NRF_URI, nrf_uri) set to an http:// value.
 
-Usage: check-nf-identities.py [--self-test]
+6. Kubernetes (k8s/, deploy/eks; --k8s): in each rendered kustomization, a
+   pod that mounts a Secret nf-tls-<name> (k8s/nf-tls-secrets.sh issues it at
+   deploy time) presents <name>.crt to the NRF, so:
+   - <name> is a table row (or ca: the CA certificate alone, for a client
+     that only discovers);
+   - the container mounting it pins that row's nfInstanceId and no other
+     UUID (its env, args, command and the ConfigMap keys it reads), or, when
+     one container hands several rows to processes of their own (the d443a
+     EAS sidecar), each mounted row's ID is in what it configures;
+   - a client other than the NRF names its pair and the CA with
+     NEXTGCORE_NRF_TLS_CLIENT_CERT / _KEY / _CA (files <name>.crt, <name>.key,
+     ca.crt) and sets NEXTGCORE_NRF_TLS_SERVER_NAME=nrf: the URIs dial the
+     cluster FQDN or a ClusterIP, nrf.crt names DNS:nrf;
+   - the key is mode 0400 or 0440, and a nextgcore image (non-root) reading it
+     gets it through the pod's fsGroup with 0440;
+   - the NRF's nrf.yaml serves TLS from its Secret with client_auth optional;
+   - a container that names an NRF URI mounts an nf-tls Secret, and no NRF
+     URI is http://;
+   - nothing committed is an nf-tls Secret or holds a ca.key.
+   Rule 5 also covers every file under k8s/ and deploy/eks, including scripts
+   that curl the NRF (http://nrf..., any http:// .../nnrf-... path).
+
+Usage: check-nf-identities.py [--self-test] [--k8s]
 """
 
 import glob
@@ -55,6 +77,12 @@ TLS_VOLUME = re.compile(r'^tls-([a-z0-9-]+)$')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 NRF_BLOCK = re.compile(r'^(\s*)(?:-\s+)?nrf:\s*(?:#.*)?$')
 NRF_SETTING = re.compile(r'nrf[a-z0-9_-]*["\']?[ \t:=,]+["\']?http://', re.I)
+NRF_PATH = re.compile(r'http://(?:nrf[.:]|[^\s"\'`]*/nnrf-)', re.I)
+REPO_DIR = os.path.dirname(os.path.dirname(COMPOSE_DIR))
+K8S_DIRS = ('k8s', os.path.join('deploy', 'eks'))
+K8S_SECRET = re.compile(r'^nf-tls-([a-z0-9-]+)$')
+K8S_URI = re.compile(r'(https?)://([^\s"\'/]*nrf[^\s"\'/]*)', re.I)
+POD_KINDS = ('Deployment', 'StatefulSet', 'DaemonSet', 'Job')
 INTERP = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-([^}]*))?\}')
 
 
@@ -201,8 +229,9 @@ def plaintext_nrf_uris(fname, text):
         if m:
             block = len(m.group(1))
             continue
-        if (block is not None and 'http://' in code) or NRF_SETTING.search(code):
-            errors.append('%s:%d: NRF URI over plaintext http:// (every compose NRF serves '
+        if (block is not None and 'http://' in code) or NRF_SETTING.search(code) \
+                or NRF_PATH.search(code):
+            errors.append('%s:%d: NRF URI over plaintext http:// (every shipped NRF serves '
                           'TLS, #1617): %s' % (fname, num, code.strip()))
     return errors
 
@@ -233,6 +262,204 @@ def check(table, stacks, read_file=lambda path: None):
         errors += check_certificates(table, fname, services, read_file)
     return errors
 
+
+
+def k8s_texts(container, pod, configmaps):
+    """What one container configures, as a list of texts: env (with ConfigMap
+    refs), args, command, and the ConfigMap keys it reads -- directly, or
+    through an emptyDir that an init container fills from a ConfigMap (the
+    rewrite-advertise-addr / resolve-dns pattern)."""
+    parts = []
+    for e in container.get('env') or []:
+        if 'value' in e:
+            parts.append(str(e['value']))
+        ref = ((e.get('valueFrom') or {}).get('configMapKeyRef') or {})
+        if ref:
+            parts.append(str((configmaps.get(ref.get('name')) or {}).get(ref.get('key'), '')))
+    for k in ('command', 'args'):
+        v = container.get(k) or []
+        parts += [v] if isinstance(v, str) else [str(x) for x in v]
+    vols = {v.get('name'): v for v in pod.get('volumes') or []}
+
+    def cm_keys(mount, subpath=None):
+        cm = (vols.get(mount.get('name')) or {}).get('configMap')
+        if not cm:
+            return []
+        data = configmaps.get(cm.get('name')) or {}
+        key = subpath or mount.get('subPath')
+        return [str(data.get(key, ''))] if key else [str(x) for x in data.values()]
+    for m in container.get('volumeMounts') or []:
+        v = vols.get(m.get('name')) or {}
+        if 'configMap' in v:
+            parts += cm_keys(m)
+        elif 'emptyDir' in v:
+            for ic in pod.get('initContainers') or []:
+                ims = ic.get('volumeMounts') or []
+                if not any(x.get('name') == m.get('name') for x in ims):
+                    continue
+                for x in ims:
+                    parts += cm_keys(x, m.get('subPath') if not x.get('subPath') else None)
+    return parts
+
+
+def k8s_text(container, pod, configmaps):
+    return '\n'.join(k8s_texts(container, pod, configmaps))
+
+
+def k8s_env(container):
+    return {e.get('name'): str(e.get('value', '')) for e in container.get('env') or []
+            if 'value' in e}
+
+
+def check_k8s(table, fname, docs):
+    """Rule 6 for one rendered kustomization (a list of documents)."""
+    errors = []
+    configmaps = {}
+    for d in docs:
+        if d.get('kind') == 'ConfigMap':
+            configmaps[d['metadata']['name']] = d.get('data') or {}
+        if d.get('kind') == 'Secret':
+            name = d['metadata'].get('name', '')
+            if K8S_SECRET.match(name) or 'ca.key' in (d.get('data') or {}) \
+                    or 'ca.key' in (d.get('stringData') or {}):
+                errors.append('%s: Secret %s is committed; nf-tls Secrets are issued at deploy '
+                              'time (k8s/nf-tls-secrets.sh) and no CA key is ever a Secret'
+                              % (fname, name))
+    for d in docs:
+        if d.get('kind') not in POD_KINDS:
+            continue
+        pod = ((d.get('spec') or {}).get('template') or {}).get('spec') or {}
+        where0 = '%s: %s/%s' % (fname, d['kind'], d['metadata'].get('name'))
+        fs_group = (pod.get('securityContext') or {}).get('fsGroup')
+        secrets = {}
+        for v in pod.get('volumes') or []:
+            m = K8S_SECRET.match(((v.get('secret') or {}).get('secretName')) or '')
+            if m:
+                secrets[v['name']] = (m.group(1), v['secret'])
+            hp = ((v.get('hostPath') or {}).get('path')) or ''
+            if 'certs' in hp:
+                errors.append('%s: hostPath volume %s (%s); the certificates come from '
+                              'nf-tls Secrets only' % (where0, v['name'], hp))
+        for c in (pod.get('containers') or []) + (pod.get('initContainers') or []):
+            where = '%s container %s' % (where0, c.get('name'))
+            text = k8s_text(c, pod, configmaps)
+            for scheme, host in K8S_URI.findall(text):
+                if scheme.lower() == 'http':
+                    errors.append('%s: NRF URI http://%s over plaintext (the NRF serves TLS, '
+                                  '#1617)' % (where, host))
+            mounted = [(secrets[m['name']], m) for m in c.get('volumeMounts') or []
+                       if m.get('name') in secrets]
+            if not mounted:
+                # An init container that only copies a config is not a client.
+                if c in (pod.get('containers') or []) and K8S_URI.search(text):
+                    errors.append('%s names an NRF URI but mounts no nf-tls Secret (its '
+                                  'certificate, or nf-tls-ca to discover only)' % where)
+                continue
+            env = k8s_env(c)
+            ids = {u.lower() for u in UUID.findall(text)}
+            image = str(c.get('image', ''))
+            uid = (c.get('securityContext') or {}).get(
+                'runAsUser', (pod.get('securityContext') or {}).get('runAsUser'))
+            nonroot = image.split('/')[-2:-1] == ['nextgcore-rust'] or 'nextgcore-rust/' in image \
+                or (uid is not None and uid != 0)
+            for (row, secret), m in mounted:
+                w = '%s (nf-tls-%s)' % (where, row)
+                if row != 'ca' and row not in table:
+                    errors.append('%s: no row %s in certs/nf-identities.txt' % (w, row))
+                    continue
+                modes = [secret.get('defaultMode')] + [
+                    i.get('mode') for i in secret.get('items') or [] if str(i.get('key', '')).endswith('.key')]
+                key_mode = next((x for x in reversed(modes) if x is not None), 0o644)
+                if row != 'ca' and key_mode not in (0o400, 0o440):
+                    errors.append('%s: the key is mode %o, not 0400 or 0440' % (w, key_mode))
+                if row != 'ca' and nonroot and not (key_mode == 0o440 and fs_group is not None):
+                    errors.append('%s: a non-root container reads the key only as mode 0440 '
+                                  'through the pod\'s securityContext.fsGroup' % w)
+                if not m.get('readOnly'):
+                    errors.append('%s is not mounted readOnly' % w)
+            rows = [r for (r, _), _ in mounted]
+            if len(mounted) > 1:
+                for (row, _), m in mounted:
+                    if m.get('mountPath') != '%s/%s' % (CERT_DIR, row):
+                        errors.append('%s (nf-tls-%s) is mounted at %s, not %s/%s (one '
+                                      'directory per row)' % (where, row, m.get('mountPath'),
+                                                              CERT_DIR, row))
+                    if row in table and table[row][1] not in ids:
+                        errors.append('%s (nf-tls-%s): urn:uuid:%s is not among the IDs it '
+                                      'configures' % (where, row, table[row][1]))
+                for u in sorted(ids - {table[r][1] for r in rows if r in table}):
+                    errors.append('%s configures %s, which none of its certificates names'
+                                  % (where, u))
+                if env.get('NEXTGCORE_NRF_TLS_SERVER_NAME') != 'nrf':
+                    errors.append('%s: NEXTGCORE_NRF_TLS_SERVER_NAME is %r, not nrf'
+                                  % (where, env.get('NEXTGCORE_NRF_TLS_SERVER_NAME')))
+                continue
+            (row, _), m = mounted[0]
+            if row not in table and row != 'ca':
+                continue
+            w = '%s (nf-tls-%s)' % (where, row)
+            if m.get('mountPath') != CERT_DIR:
+                errors.append('%s is mounted at %s, not %s' % (w, m.get('mountPath'), CERT_DIR))
+            want_files = {'NEXTGCORE_NRF_TLS_CA': 'ca.crt'}
+            if row == 'ca':
+                for u in sorted(ids):
+                    errors.append('%s configures %s but presents no certificate' % (w, u))
+            else:
+                nf_type, want = table[row]
+                if not ids:
+                    errors.append('%s pins no nfInstanceId; its certificate names urn:uuid:%s'
+                                  % (w, want))
+                for u in sorted(ids - {want}):
+                    errors.append('%s configures %s, but its certificate names urn:uuid:%s'
+                                  % (w, u, want))
+                if nf_type == 'NRF':
+                    errors += check_k8s_nrf(w, k8s_texts(c, pod, configmaps))
+                    continue
+                want_files.update({'NEXTGCORE_NRF_TLS_CLIENT_CERT': row + '.crt',
+                                   'NEXTGCORE_NRF_TLS_CLIENT_KEY': row + '.key'})
+            for var, base in sorted(want_files.items()):
+                if os.path.basename(env.get(var, '')) != base:
+                    errors.append('%s: %s is %r, not <dir>/%s' % (w, var, env.get(var), base))
+            if env.get('NEXTGCORE_NRF_TLS_SERVER_NAME') != 'nrf':
+                errors.append('%s: NEXTGCORE_NRF_TLS_SERVER_NAME is %r, not nrf'
+                              % (w, env.get('NEXTGCORE_NRF_TLS_SERVER_NAME')))
+    return errors
+
+
+def check_k8s_nrf(where, texts):
+    """The NRF container's nrf.yaml serves TLS from its Secret, client auth optional."""
+    want = {'enabled': True, 'cert': CERT_DIR + '/nrf.crt', 'key': CERT_DIR + '/nrf.key',
+            'ca': CERT_DIR + '/ca.crt', 'client_auth': 'optional'}
+    for chunk in texts:
+        try:
+            doc = yaml.safe_load(chunk)
+        except yaml.YAMLError:
+            continue
+        servers = (((doc or {}).get('nrf') or {}).get('sbi') or {}).get('server') \
+            if isinstance(doc, dict) else None
+        if servers:
+            tls = (servers[0] or {}).get('tls') or {}
+            return ['%s: nrf.yaml nrf.sbi.server[0].tls.%s is %r, not %r'
+                    % (where, k, tls.get(k), v) for k, v in want.items() if tls.get(k) != v]
+    return ['%s: no nrf.yaml with nrf.sbi.server among what it reads' % where]
+
+
+def k8s_renders():
+    """{kustomization dir: [documents]} for every tracked kustomization under K8S_DIRS."""
+    import subprocess
+    listed = subprocess.run(['git', '-C', REPO_DIR, 'ls-files', '--'] +
+                            ['%s/*kustomization.yaml' % d for d in K8S_DIRS] +
+                            ['%s/kustomization.yaml' % d for d in K8S_DIRS],
+                            check=True, capture_output=True, text=True).stdout.split()
+    out = {}
+    for k in sorted(set(listed)):
+        d = os.path.dirname(k)
+        r = subprocess.run(['kubectl', 'kustomize', '--load-restrictor', 'LoadRestrictionsNone',
+                            os.path.join(REPO_DIR, d)], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit('check-nf-identities: kubectl kustomize %s failed:\n%s' % (d, r.stderr))
+        out[d] = [x for x in yaml.safe_load_all(r.stdout) if isinstance(x, dict)]
+    return out
 
 def self_test():
     table = {'amf': ('AMF', 'a'), 'scp': ('SCP', 's'), 'ees': ('AF', 'e')}
@@ -324,6 +551,88 @@ def self_test():
     ]
     for text in good:
         assert plaintext_nrf_uris('f', text) == [], (text, plaintext_nrf_uris('f', text))
+    # Rule 6: rendered Kubernetes documents.
+    import copy
+    t6 = {'amf': ('AMF', '6b1d7e3c-0000-4000-8000-000000000af0'),
+          'nrf': ('NRF', '6b1d7e3c-0000-4000-8000-0000000000f0'),
+          'eas-a': ('AF', '6b1d7e3c-0000-4000-8000-0000000471a1'),
+          'eas-b': ('AF', '6b1d7e3c-0000-4000-8000-0000000471a2')}
+    cm = {'kind': 'ConfigMap', 'metadata': {'name': 'cfg'}, 'data': {
+        'amf.yaml': 'amf:\n  sbi:\n    client:\n      nrf:\n        - uri: https://nrf.ns.svc:7777\n',
+        'nrf.yaml': yaml.safe_dump({'nrf': {'sbi': {'server': [{'address': '0.0.0.0', 'tls': {
+            'enabled': True, 'cert': CERT_DIR + '/nrf.crt', 'key': CERT_DIR + '/nrf.key',
+            'ca': CERT_DIR + '/ca.crt', 'client_auth': 'optional'}}]}}}),
+        'eases': 'eas-a 6b1d7e3c-0000-4000-8000-0000000471a1\neas-b 6b1d7e3c-0000-4000-8000-0000000471a2\n'}}
+
+    def dep(name, containers, volumes, fs=999):
+        spec = {'containers': containers, 'volumes': volumes}
+        if fs is not None:
+            spec['securityContext'] = {'fsGroup': fs}
+        return {'kind': 'Deployment', 'metadata': {'name': name},
+                'spec': {'template': {'spec': spec}}}
+
+    def tls_vol(row, mode=0o440, name='nf-tls'):
+        return {'name': name, 'secret': {'secretName': 'nf-tls-' + row, 'defaultMode': mode}}
+    tls_mount = {'name': 'nf-tls', 'mountPath': CERT_DIR, 'readOnly': True}
+    cfg_vol = {'name': 'config', 'configMap': {'name': 'cfg'}}
+    amf_env = [{'name': 'NEXTGCORE_AMF_INSTANCE_ID', 'value': t6['amf'][1]},
+               {'name': 'NEXTGCORE_NRF_TLS_CA', 'value': CERT_DIR + '/ca.crt'},
+               {'name': 'NEXTGCORE_NRF_TLS_CLIENT_CERT', 'value': CERT_DIR + '/amf.crt'},
+               {'name': 'NEXTGCORE_NRF_TLS_CLIENT_KEY', 'value': CERT_DIR + '/amf.key'},
+               {'name': 'NEXTGCORE_NRF_TLS_SERVER_NAME', 'value': 'nrf'}]
+    amf_c = {'name': 'amf', 'image': 'nextgcore-rust/amf:latest', 'env': amf_env,
+             'volumeMounts': [tls_mount, {'name': 'config', 'mountPath': '/etc/nextgcore/amf.yaml',
+                                          'subPath': 'amf.yaml'}]}
+    nrf_c = {'name': 'nrf', 'image': 'nextgcore-rust/nrf:latest',
+             'env': [{'name': 'NEXTGCORE_NRF_INSTANCE_ID', 'value': t6['nrf'][1]}],
+             'volumeMounts': [tls_mount, {'name': 'config', 'mountPath': '/etc/nextgcore/nrf.yaml',
+                                          'subPath': 'nrf.yaml'}]}
+    side = {'name': 'side', 'image': 'nextgsim-ue:latest',
+            'env': [{'name': 'EASES', 'valueFrom': {'configMapKeyRef': {'name': 'cfg', 'key': 'eases'}}},
+                    {'name': 'NEXTGCORE_NRF_TLS_SERVER_NAME', 'value': 'nrf'}],
+            'volumeMounts': [{'name': 'a', 'mountPath': CERT_DIR + '/eas-a', 'readOnly': True},
+                             {'name': 'b', 'mountPath': CERT_DIR + '/eas-b', 'readOnly': True}]}
+    good6 = [cm, dep('amf', [amf_c], [tls_vol('amf'), cfg_vol]),
+             dep('nrf', [nrf_c], [tls_vol('nrf'), cfg_vol]),
+             dep('upf', [side], [tls_vol('eas-a', 0o400, 'a'), tls_vol('eas-b', 0o400, 'b')], None)]
+    assert check_k8s(t6, 'r', good6) == [], check_k8s(t6, 'r', good6)
+
+    def broken6(edit):
+        docs = copy.deepcopy(good6)
+        edit(docs)
+        return check_k8s(t6, 'r', docs)
+    def amf_env_set(var, value):
+        return lambda d: [e.update(value=value) for e in d[1]['spec']['template']['spec']
+                          ['containers'][0]['env'] if e['name'] == var]
+    cases6 = [
+        (amf_env_set('NEXTGCORE_AMF_INSTANCE_ID', '6b1d7e3c-0000-4000-8000-0000000005f0'),
+         'configures 6b1d7e3c-0000-4000-8000-0000000005f0'),
+        (amf_env_set('NEXTGCORE_NRF_TLS_CLIENT_KEY', CERT_DIR + '/smf.key'), 'NEXTGCORE_NRF_TLS_CLIENT_KEY'),
+        (amf_env_set('NEXTGCORE_NRF_TLS_SERVER_NAME', 'nrf.ns.svc'), 'SERVER_NAME'),
+        (lambda d: d[1]['spec']['template']['spec']['volumes'][0]['secret'].update(secretName='nf-tls-zzz'),
+         'no row zzz'),
+        (lambda d: d[1]['spec']['template']['spec'].pop('securityContext'), 'fsGroup'),
+        (lambda d: d[1]['spec']['template']['spec']['volumes'][0]['secret'].update(defaultMode=0o444),
+         'mode 444'),
+        (lambda d: d[0]['data'].update({'amf.yaml': 'nrf:\n  - uri: http://nrf.ns.svc:7777\n'}),
+         'over plaintext'),
+        (lambda d: d[1]['spec']['template']['spec']['containers'][0].update(
+            volumeMounts=d[1]['spec']['template']['spec']['containers'][0]['volumeMounts'][1:]),
+         'mounts no nf-tls Secret'),
+        (lambda d: d[0]['data'].update({'nrf.yaml': d[0]['data']['nrf.yaml'].replace('optional', 'required')}),
+         'client_auth'),
+        (lambda d: d[0]['data'].update({'eases': 'eas-a 6b1d7e3c-0000-4000-8000-0000000471a1\n'}),
+         'urn:uuid:6b1d7e3c-0000-4000-8000-0000000471a2 is not among'),
+        (lambda d: d[3]['spec']['template']['spec']['containers'][0]['volumeMounts'][1].update(
+            mountPath=CERT_DIR), 'one directory per row'),
+        (lambda d: d.append({'kind': 'Secret', 'metadata': {'name': 'nf-tls-amf'}, 'data': {}}),
+         'is committed'),
+        (lambda d: d.append({'kind': 'Secret', 'metadata': {'name': 'pki'}, 'data': {'ca.key': 'x'}}),
+         'is committed'),
+    ]
+    for edit, needle in cases6:
+        errs = broken6(edit)
+        assert any(needle in e for e in errs), (needle, errs)
     print('check-nf-identities self-test: ok')
 
 
@@ -331,7 +640,7 @@ def main(argv):
     if argv[1:] == ['--self-test']:
         self_test()
         return 0
-    if argv[1:]:
+    if argv[1:] not in ([], ['--k8s']):
         print(__doc__, file=sys.stderr)
         return 2
     table = read_table(TABLE)
@@ -355,12 +664,26 @@ def main(argv):
     for path in shipped:
         with open(path, encoding='utf-8', errors='replace') as f:
             errors += plaintext_nrf_uris(os.path.relpath(path, COMPOSE_DIR), f.read())
+    k8s_files = sorted(p for d in K8S_DIRS
+                       for p in glob.glob(os.path.join(REPO_DIR, d, '**', '*'), recursive=True)
+                       if os.path.isfile(p) and not p.endswith('.dryrun.yaml')
+                       and '.dryrun.' not in os.path.basename(p))
+    for path in k8s_files:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            errors += plaintext_nrf_uris(os.path.relpath(path, REPO_DIR), f.read())
+    renders = k8s_renders() if argv[1:] == ['--k8s'] else {}
+    for d, docs in sorted(renders.items()):
+        errors += check_k8s(table, d, docs)
     for e in errors:
         print('check-nf-identities: ' + e, file=sys.stderr)
     if errors:
         return 1
     print('check-nf-identities: %d compose files agree with %d certificate identities; '
-          'no http:// NRF URI in %d shipped files' % (len(stacks), len(table), len(shipped)))
+          'no http:// NRF URI in %d shipped files' % (len(stacks), len(table),
+                                                      len(shipped) + len(k8s_files)))
+    if renders:
+        print('check-nf-identities: %d rendered kustomizations mount only their own nf-tls '
+              'Secrets' % len(renders))
     return 0
 
 

@@ -327,7 +327,9 @@ d445a_gates() {
     printf '%s %s\n' "$1" "${t}" >>"${G}"; echo "[scenario] gate $1 ${t}"
   }
   ip1="$(awk '$1=="ue1"{print $2; exit}' "${S}/ue-ips.txt")"
-  nrf="http://nrf.${NAMESPACE}.svc.cluster.local:7777"
+  # The NRF serves TLS (#1617); `nrf` is the name nrf.crt carries, and the
+  # nrf pod's CA certificate is the trust anchor.
+  nrf="https://nrf:7777"
   nef_ip="$("${K[@]}" get pod -l app.kubernetes.io/name=nef -o jsonpath='{.items[0].status.podIP}')"
   local body="{\"afId\":\"d445a-gates\",\"ueIpAddr\":{\"ipv4Addr\":\"${ip1}\"}}"
   # curl from the nrf pod (core image); -i for the status and WWW-Authenticate.
@@ -344,14 +346,14 @@ d445a_gates() {
   status() { awk 'NR==1{print $2}' <<<"$1" | tr -d '\r'; }
   token() {      # ID TYPE TARGET SCOPE -> access_token or the error body
     local cca; cca="$(python3 "${HERE}/cca.py" cca "${keys}" "$1")"
-    "${K[@]}" exec deploy/nrf -c nrf -- curl -s --http2-prior-knowledge --max-time 10 -X POST \
+    "${K[@]}" exec deploy/nrf -c nrf -- curl -s --http2 --cacert /etc/nextgcore/certs/ca.crt --max-time 10 -X POST \
       -H 'Content-Type: application/x-www-form-urlencoded' \
       --data-urlencode grant_type=client_credentials --data-urlencode "nfInstanceId=$1" \
       --data-urlencode "nfType=$2" --data-urlencode "targetNfType=$3" --data-urlencode "scope=$4" \
       --data-urlencode "cca=${cca}" "${nrf}/nnrf-oauth2/v1/access-token" 2>&1
   }
   register() {   # ID TYPE
-    "${K[@]}" exec deploy/nrf -c nrf -- curl -s -o /dev/null -w '%{http_code}' --http2-prior-knowledge --max-time 10 \
+    "${K[@]}" exec deploy/nrf -c nrf -- curl -s -o /dev/null -w '%{http_code}' --http2 --cacert /etc/nextgcore/certs/ca.crt --max-time 10 \
       -X PUT -H 'Content-Type: application/json' \
       -d "{\"nfInstanceId\":\"$1\",\"nfType\":\"$2\",\"nfStatus\":\"REGISTERED\",\"heartBeatTimer\":600}" \
       "${nrf}/nnrf-nfm/v1/nf-instances/$1" 2>&1

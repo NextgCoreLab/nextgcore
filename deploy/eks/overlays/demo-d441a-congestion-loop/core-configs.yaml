@@ -48,6 +48,16 @@ data:
           - address: 0.0.0.0
             advertise: nrf.nextg-system.svc.cluster.local
             port: 7777
+            # TLS on the NRF's one listener (#1617), as in k8s/manifests/configmap.yaml:
+            # client certificate optional; a presented one must chain to `ca` and
+            # names the registrant. Files: Secret nf-tls-nrf.
+            tls:
+              enabled: true
+              cert: /etc/nextgcore/certs/nrf.crt
+              key: /etc/nextgcore/certs/nrf.key
+              ca: /etc/nextgcore/certs/ca.crt
+              client_auth: optional
+              min_version: "1.2"
         oauth2:
           cca_trusted_keys_dir: /etc/nextgcore/cca-trusted
   pcf.yaml: |
@@ -67,7 +77,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
       # #1639: as the k8s/manifests pcf.yaml this replaces (the EKS profiles'
       # base): a policy create is refused when the NRF does not answer and no
       # UDR is known.

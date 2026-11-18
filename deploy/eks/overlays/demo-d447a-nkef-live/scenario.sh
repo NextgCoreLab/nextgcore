@@ -149,7 +149,8 @@ nkef_main() {
   ask() { local f="${D}/$1"; shift; cli nkef-query "$@" >"${f}" 2>&1; echo "--- $(basename "${f}"):"; cat "${f}"; }
   gnb_log() { "${K[@]}" logs "${POD}" -c gnb --tail=-1 "${@:2}" >"${D}/$1" 2>&1; }
   nf_log() { "${K[@]}" logs "deploy/$1" -c "$1" --tail=-1 >"${D}/$1.log" 2>&1; }
-  nrf_get() { "${K[@]}" exec deploy/amf -c amf -- curl -s --max-time 5 --http2-prior-knowledge "http://nrf:7777$1"; }
+  # The NRF serves TLS (#1617): the amf pod's CA certificate, the name nrf.crt carries.
+  nrf_get() { "${K[@]}" exec deploy/amf -c amf -- curl -s --max-time 5 --http2 --cacert /etc/nextgcore/certs/ca.crt "https://nrf:7777$1"; }
 
   attach || return 1
   sleep 8  # an NRF poll and several RLS windows

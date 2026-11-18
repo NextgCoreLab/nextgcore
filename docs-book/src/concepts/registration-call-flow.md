@@ -383,6 +383,13 @@ registration:
   `deregCallbackUri` ends in a per-registration token. A dereg-notify naming
   any other token concerns a registration the AMF no longer holds, so it is
   answered 204 and tears nothing down (#753).
+- **Callback URIs carry tokens (#1518).** A UE context restored from a record
+  written before #1518 keeps the token-less policy `notificationUri`s and
+  `smContextStatusUri`s its peers hold, and only those are served without a
+  token. At the restore's SMF update and the first verified message's PCF
+  updates, the AMF re-issues each URI with a fresh token. It records the token
+  only once that peer answered 2xx; until then the token-less URI stays served
+  (#1642). Once none is token-less, the context is written as tokened.
 - **Config loading is lenient.** An unreadable/unparsable `amf.yaml` logs a
   warning and continues with built-in defaults (`load_config` in
   `lib.rs`) — a running AMF is not proof your config was applied. See the

@@ -1,0 +1,28 @@
+# The gNB's nKEF reads the NRF over TLS (#1617): discovery only (nrf_poll_secs,
+# gnb-nkef-config.yaml), so it presents no certificate and has no row of its
+# own. It mounts Secret nf-tls-ca, the CA certificate alone, and checks the
+# NRF's nrf.crt against it under the name nrf.crt carries (DNS:nrf): the NRF
+# URI dials the cluster FQDN. The gNB runs as root, the files' owner.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gnb
+spec:
+  template:
+    spec:
+      containers:
+        - name: gnb
+          env:
+            - name: NEXTGCORE_NRF_TLS_CA
+              value: /etc/nextgcore/certs/ca.crt
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
+          volumeMounts:
+            - name: nf-tls
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
+      volumes:
+        - name: nf-tls
+          secret:
+            secretName: nf-tls-ca
+            defaultMode: 0440

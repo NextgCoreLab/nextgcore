@@ -39,7 +39,7 @@ data:
     ees:
       api_root: "http://ees.nextg-system.svc.cluster.local:7777"
       oauth2:
-        nrf: "http://nrf.nextg-system.svc.cluster.local:7777"
+        nrf: "https://nrf.nextg-system.svc.cluster.local:7777"
         nf_instance_id: "@ID@"
         # Created by nr-she-eas itself, as its own uid, in a 0700 directory
         # it made itself: no other EAS can read it, and the private key never
@@ -124,10 +124,19 @@ data:
       # As its own uid: it makes its 0700 key directory and 0755 JWK directory
       # itself, and refuses to start if either exists already (a name another
       # uid took first would otherwise be used). $args is the start file's flag list.
+      # Toward the NRF over TLS (#1617) with its own certificate, Secret
+      # nf-tls-$id at $c: ca.crt and $id.crt 0444, $id.key 0400 to root. Its own
+      # uid cannot read the key (--clear-groups), so this shell opens it and the
+      # EAS copies it from stdin into a 0700 directory it made itself, as it does
+      # its CCA key; no other EAS uid can read it there.
+      c="/etc/nextgcore/certs/$id"
       ( sh -c "echo \$\$ >$D/$id.pid; exec ip netns exec $id setpriv --reuid=$uid --regid=$uid \
           --clear-groups --inh-caps=-all --no-new-privs \
-          sh -c 'mkdir -m 0700 $T/d443a-key-$id && mkdir -m 0755 $T/d443a-jwk-$id && exec nr-she-eas -c $cfg $args'" \
-          2>&1 | sed -u "s/^/[$id] /"
+          sh -c 'mkdir -m 0700 $T/d443a-key-$id && mkdir -m 0755 $T/d443a-jwk-$id \
+            && mkdir -m 0700 $T/d443a-tls-$id && cat >$T/d443a-tls-$id/$id.key \
+            && NEXTGCORE_NRF_TLS_CA=$c/ca.crt NEXTGCORE_NRF_TLS_CLIENT_CERT=$c/$id.crt \
+               NEXTGCORE_NRF_TLS_CLIENT_KEY=$T/d443a-tls-$id/$id.key exec nr-she-eas -c $cfg $args'" \
+          <"$c/$id.key" 2>&1 | sed -u "s/^/[$id] /"
         say "$id: nr-she-eas exited" ) &
     done <<EASES
     ${D443A_EASES}

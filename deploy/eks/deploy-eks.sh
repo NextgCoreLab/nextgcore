@@ -432,7 +432,12 @@ for d in yaml.safe_load_all(open(sys.argv[2])):
     if d.get('kind') == 'Deployment' and d['metadata']['name'] == sys.argv[3]:
         spec = d['spec']['template']['spec']
         spec['nodeSelector'] = ps['nodeSelector']
-        spec['volumes'] = ps['volumes']
+        # The variant's volumes win by name; the rest stay, because another
+        # container of the pod may mount them (a demo sidecar's nf-tls Secrets,
+        # #1617: replacing the list left its mounts without volumes).
+        own = {v['name'] for v in ps['volumes']}
+        spec['volumes'] = ps['volumes'] + [v for v in spec.get('volumes', [])
+                                           if v['name'] not in own]
         c = spec['containers'][0]
         c['command'] = pc['command']
         # wrapper.sh takes no args; leaving the --no-dataplane args in place
@@ -491,6 +496,10 @@ if [[ "${DRY_RUN}" == "true" ]]; then
   # Validated locally in Python, not with `kubectl apply --dry-run=client`:
   # that still needs REST mappings from the API server, so it cannot run
   # without credentials and would defeat the point of a dry run.
+  # #1617: every nf-tls-<name> Secret the render mounts names a row of
+  # docker/rust/certs/nf-identities.txt (no cluster access).
+  "${CORE_DIR}/k8s/nf-tls-secrets.sh" --dry-run "${NAMESPACE}" "${RENDERED}" \
+    || die "the render mounts an nf-tls Secret with no certificate identity"
   log "validating rendered manifests offline..."
   python3 - "${RENDERED}" <<'PY' || die "validation failed"
 import sys, yaml
@@ -641,6 +650,27 @@ elif [[ -f "${HNET_DIR}/curve25519-1.key" && -f "${HNET_DIR}/secp256r1-2.key" ]]
   warn "those are the repo's DEVELOPMENT keys. Replace them for any real use."
 else
   die "hnet keys not found under ${HNET_DIR}. The UDM will crash-loop without them."
+fi
+
+# --- NRF TLS secrets (#1617) ----------------------------------------------
+
+# The NRF serves TLS (client certificate optional), and the NRF and each pod
+# that dials it mount a Secret nf-tls-<name>: its own certificate (urn:uuid
+# URI SAN + RFC 9310 NFTypes from docker/rust/certs/nf-identities.txt, TS 33.310
+# §6.1.3c.3) and the CA certificate. k8s/nf-tls-secrets.sh issues them from
+# the dev PKI generator, or keeps them while they are current; the CA key never
+# enters the cluster. Each CA's Secrets carry its version in their names
+# (nf-tls-<name>-<version>); the render is pointed at the version in force and
+# stamped with it, so a new CA moves the NRF and its clients together, and a
+# failed or interrupted issue leaves the running pods' Secrets untouched.
+NF_TLS_CA="$("${CORE_DIR}/k8s/nf-tls-secrets.sh" "${NAMESPACE}" "${RENDERED}")" \
+  || die "could not create the nf-tls Secrets"
+if [[ -n "${NF_TLS_CA}" ]]; then
+  log "nf-tls Secrets current (CA version ${NF_TLS_CA}); pointing the pod templates at them"
+  "${CORE_DIR}/k8s/nf-tls-secrets.sh" --stamp "${NF_TLS_CA}" "${RENDERED}" > "${RENDERED}.tmp" \
+    || die "nf-tls stamp failed"
+  mv "${RENDERED}.tmp" "${RENDERED}"
+  warn "the nf-tls certificates are DEVELOPMENT certificates. Replace them for any real use."
 fi
 
 # --- Grafana admin secret (#1100) ------------------------------------------
