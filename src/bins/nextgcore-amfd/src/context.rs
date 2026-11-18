@@ -1255,6 +1255,15 @@ pub struct EventSubscription {
     /// heard CONNECTED (in its immediate report) is told IDLE. Keyed and bounded as
     /// [`Self::reported_reachability`] is.
     pub reported_connectivity: std::collections::HashMap<String, String>,
+    /// The location this subscription was told by a report the UE's own location
+    /// baseline did not produce (#1737): its first report, at the subscription
+    /// (TS 29.518 §5.3.2.2.2, `29518-k00.txt:5731-5737`), in a notification or in
+    /// the subscribe response's `reportList`. The next location evaluation measures
+    /// this subscription's change from it rather than from the UE's baseline, and
+    /// takes it, so its `locationFilterList` gate starts from what it was told. A
+    /// subscription targets one UE when it has one (an any-UE subscription gets no
+    /// first report), so one slot is enough.
+    pub reported_location: Option<LocationBaseline>,
     /// Created by this AMF from a transferred UE context's `eventSubscriptionList`
     /// (#397, #1699), not by a consumer's subscribe. Only such a subscription is a
     /// candidate for [`AmfContext::event_subscription_add_unless_equivalent`]'s
@@ -1262,6 +1271,10 @@ pub struct EventSubscription {
     /// resource, even when it is the one the transferred copy came from.
     pub taken_over: bool,
 }
+
+/// A UE location as the LOCATION_REPORT change gate compares it (#1424, #1737): the
+/// TAI, the NR cell, and the NGAP association of the serving RAN node.
+pub type LocationBaseline = (Tai5gs, NrCgi, u64);
 
 /// The most UEs one subscription records a reported reachability for (#1641 review
 /// m6). An any-UE subscription is the only one that reaches it.
@@ -1302,6 +1315,15 @@ pub struct LocationChange {
 }
 
 impl LocationChange {
+    /// What changed from `then` to `now`.
+    pub fn between(then: &LocationBaseline, now: &LocationBaseline) -> Self {
+        Self {
+            tai: then.0 != now.0,
+            cell: then.1 != now.1,
+            ran_node: then.2 != now.2,
+        }
+    }
+
     /// Whether anything changed.
     pub fn any(&self) -> bool {
         self.tai || self.cell || self.ran_node
@@ -2855,6 +2877,21 @@ impl AmfContext {
         }
     }
 
+    /// Take the location a subscription's first report told it (#1737), so the
+    /// location evaluation that takes it measures that subscription's change from
+    /// it, once. `None` when there is none, or the subscription is gone.
+    pub fn event_subscription_take_reported_location(
+        &self,
+        subscription_id: &str,
+    ) -> Option<LocationBaseline> {
+        self.event_subscriptions
+            .write()
+            .ok()?
+            .get_mut(subscription_id)?
+            .reported_location
+            .take()
+    }
+
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
     pub fn event_subscription_find(&self, subscription_id: &str) -> Option<EventSubscription> {
         self.event_subscriptions
@@ -2876,6 +2913,8 @@ impl AmfContext {
                 let mut sub = sub;
                 sub.reported_reachability = std::mem::take(&mut e.get_mut().reported_reachability);
                 sub.reported_connectivity = std::mem::take(&mut e.get_mut().reported_connectivity);
+                // #1737: and so is the location its first report told.
+                sub.reported_location = e.get_mut().reported_location.take();
                 e.insert(sub);
                 return true;
             }

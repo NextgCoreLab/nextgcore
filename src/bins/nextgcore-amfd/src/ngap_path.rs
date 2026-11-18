@@ -12417,17 +12417,13 @@ impl NgapServer {
                     cell: true,
                     ran_node: true,
                 },
-                Some((tai, cgi, assoc)) => crate::context::LocationChange {
-                    tai: *tai != now.0,
-                    cell: *cgi != now.1,
-                    ran_node: *assoc != now.2,
-                },
+                Some(then) => crate::context::LocationChange::between(then, &now),
             };
-            state.location_evaluated = Some(now);
-            evaluated = Some((state.amf_ue.clone(), change));
+            state.location_evaluated = Some(now.clone());
+            evaluated = Some((state.amf_ue.clone(), change, now));
         });
-        if let Some((amf_ue, change)) = evaluated {
-            crate::namf_server::fire_location_change_report(&amf_ue, change);
+        if let Some((amf_ue, change, now)) = evaluated {
+            crate::namf_server::fire_location_change_report(&amf_ue, change, &now);
         }
     }
 
@@ -37299,6 +37295,36 @@ mod tests {
         tag: &str,
         filters: Option<&[&str]>,
     ) -> (nextgcore_sbi::SbiServer, mpsc::Receiver<String>) {
+        let (sink, rx, resp) = location_report_subscription(supi, tag, filters, false).await;
+        assert_eq!(resp.status, 201, "the subscription must be created first");
+        // #1737: a UE registered when the subscription is made is first told where it
+        // is now (TS 29.518 §5.3.2.2.2). That report is taken here, so the caller's
+        // next one is the one its own step causes.
+        let mut rx = rx;
+        let registered = crate::context::amf_self()
+            .read()
+            .ok()
+            .and_then(|g| g.ue_store().find_by_supi(supi))
+            .is_some_and(|(_, r)| r.is_registered());
+        if registered {
+            let (got, _, _) = next_location_report(&mut rx).await;
+            assert_eq!(got, supi, "the first report, at the subscription");
+        }
+        (sink, rx)
+    }
+
+    /// A LOCATION_REPORT subscription for `supi` with a sink, and the subscribe
+    /// response, nothing taken from the sink.
+    async fn location_report_subscription(
+        supi: &str,
+        tag: &str,
+        filters: Option<&[&str]>,
+        immediate: bool,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        mpsc::Receiver<String>,
+        nextgcore_sbi::SbiResponse,
+    ) {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = addr.port();
         let (tx, rx) = mpsc::channel::<String>(16);
@@ -37316,17 +37342,18 @@ mod tests {
         .await
         .expect("sink start");
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let mut event = serde_json::json!({ "type": "LOCATION_REPORT" });
+        if let Some(f) = filters {
+            event["locationFilterList"] = serde_json::json!(f);
+        }
+        if immediate {
+            event["immediateFlag"] = serde_json::json!(true);
+        }
         let resp = crate::namf_server::namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({
                     "subscription": {
-                        "eventList": [match filters {
-                            None => serde_json::json!({ "type": "LOCATION_REPORT" }),
-                            Some(f) => serde_json::json!({
-                                "type": "LOCATION_REPORT",
-                                "locationFilterList": f,
-                            }),
-                        }],
+                        "eventList": [event],
                         "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
                         "notifyCorrelationId": format!("corr-{tag}"),
                         "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
@@ -37336,8 +37363,7 @@ mod tests {
                 .expect("json"),
         )
         .await;
-        assert_eq!(resp.status, 201, "the subscription must be created first");
-        (sink, rx)
+        (sink, rx, resp)
     }
 
     /// The first LOCATION_REPORT body `rx` receives, as `(supi, tac, nrCellId)`.
@@ -37507,6 +37533,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            reported_location: None,
             taken_over: false,
             reporting_threshold: None,
             location_filters: f.iter().map(|s| s.to_string()).collect(),
@@ -37879,6 +37906,174 @@ mod tests {
         ngap.ue_auth_state.remove(newer_id);
         plain.stop().await.expect("sink stop");
         cell.stop().await.expect("sink stop");
+    }
+
+    /// **#1737**, TS 29.518 §5.3.2.2.2 (`29518-k00.txt:5731-5737`): a LOCATION_REPORT
+    /// subscription without the immediateFlag gets a first notification of the UE's
+    /// current location once it is created.
+    /// - A CM-CONNECTED UE: its TAI and cell, with no `ageOfLocationInformation`.
+    /// - A CM-IDLE UE: its last known location, with `ageOfLocationInformation` other
+    ///   than 0.
+    /// - With the immediateFlag the report is in the subscribe response, and is not
+    ///   notified as well.
+    ///
+    /// REVERT-VERIFIED: without the `deliver_location_report` call in
+    /// `handle_event_subscription_create`, no first notification arrives ("a
+    /// LOCATION_REPORT must be delivered"); with the age left out, the idle UE's
+    /// report has none ("the last known location").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_location_subscription_is_first_told_where_the_ue_is_1737() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (17_370_101u64, "imsi-001010001737101");
+        let mut stored = idle_registered_ue(id);
+        stored.cm_idle = false;
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x1737;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0001_7371;
+        let store = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store();
+        store.insert(id, stored);
+        let report = |body: String| -> serde_json::Value {
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            v["reportList"][0].clone()
+        };
+        async fn recv(rx: &mut mpsc::Receiver<String>) -> String {
+            tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("a LOCATION_REPORT must be delivered")
+                .expect("channel closed")
+        }
+
+        // CM-CONNECTED.
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1737-connected", None, false).await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let first = report(recv(&mut rx).await);
+        assert_eq!(first["type"], "LOCATION_REPORT", "{first}");
+        assert_eq!(first["supi"], supi);
+        let nr = &first["location"]["nrLocation"];
+        assert_eq!(nr["tai"]["tac"], "1737", "{first}");
+        assert_eq!(nr["ncgi"]["nrCellId"], "000017371", "{first}");
+        assert!(
+            nr.get("ageOfLocationInformation").is_none(),
+            "a connected UE's location is current: {first}"
+        );
+        sink.stop().await.expect("sink stop");
+
+        // CM-IDLE: the last known location.
+        store.with_mut(id, |s| s.cm_idle = true);
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1737-idle", None, false).await;
+        let _sub_idle = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let first = report(recv(&mut rx).await);
+        let nr = &first["location"]["nrLocation"];
+        assert_eq!(nr["ncgi"]["nrCellId"], "000017371", "{first}");
+        assert!(
+            nr["ageOfLocationInformation"]
+                .as_u64()
+                .is_some_and(|m| m >= 1),
+            "the last known location: {first}"
+        );
+        sink.stop().await.expect("sink stop");
+
+        // The immediateFlag: in the response.
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1737-immediate", None, true).await;
+        let _sub_immediate = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(v["reportList"][0]["type"], "LOCATION_REPORT", "{v}");
+        assert_eq!(
+            v["reportList"][0]["location"]["nrLocation"]["ncgi"]["nrCellId"],
+            "000017371"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "not notified as well"
+        );
+        sink.stop().await.expect("sink stop");
+        store.remove(id);
+    }
+
+    /// **#1737**: the first report is the subscription's own baseline. The UE's
+    /// baseline (#1424) is the cell 0x5_1200 of TAC 0x74 it was last reported in, and
+    /// it has since been seen in TAC 0x75, which is what a new subscription is told.
+    /// When the UE then comes back from cell 0x5_1200, nothing changed against the
+    /// UE's baseline, but against what this subscriber was told the TA did, so it is
+    /// told. A second Service Request from the same cell tells it nothing more.
+    ///
+    /// REVERT-VERIFIED: with the change measured from the UE's baseline only (the
+    /// `reported_location` ignored in `fire_location_change_report`), the subscriber
+    /// is never told the UE is back in TAC 0x74 ("a LOCATION_REPORT must be
+    /// delivered").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_location_report_is_the_subscription_s_baseline_1737() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id, newer_id) = (17_370_201u64, 17_370_202u64, 17_370_203u64);
+        let supi = "imsi-001010001737201";
+        let mut stored = idle_registered_ue(old_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        let plmn = PlmnId::new("001", "01");
+        // Where `service_request_initial_ue` comes from: TAC 0x74, cell 0x5_1200.
+        let mut reported_tai = stored.amf_ue.nr_tai.clone();
+        reported_tai.plmn_id = plmn.clone();
+        reported_tai.tac = 0x74;
+        let mut reported_cgi = stored.amf_ue.nr_cgi.clone();
+        reported_cgi.plmn_id = plmn.clone();
+        reported_cgi.cell_id = 0x0005_1200;
+        stored.location_evaluated = Some((reported_tai.clone(), reported_cgi, 1));
+        stored.association_id = 1;
+        stored.amf_ue.nr_tai = reported_tai;
+        stored.amf_ue.nr_tai.tac = 0x75;
+        stored.amf_ue.nr_cgi.plmn_id = plmn;
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1300;
+        ngap.ue_auth_state.insert(old_id, stored);
+
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1737-baseline", None, false).await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let (got, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!(got, supi);
+        assert_eq!(
+            (tac.as_str(), nci.as_str()),
+            ("0075", "000051300"),
+            "told where the UE was last seen"
+        );
+
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE is back");
+        let (_, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+
+        // Idle again, and back from the same cell: the baseline was taken.
+        ngap.ue_auth_state.with_mut(new_id, |s| s.cm_idle = true);
+        ngap.forced_amf_ue_ngap_id = Some(newer_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(newer_id).is_some(), "back again");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "the same TA is no change"
+        );
+        ngap.ue_auth_state.remove(newer_id);
+        sink.stop().await.expect("sink stop");
     }
 
     /// **#1424**: a registration update's Registration Accept reports the UE's
@@ -38961,6 +39156,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            reported_location: None,
             taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
@@ -43011,6 +43207,7 @@ mod tests {
                 reachability_filter: None,
                 reported_reachability: std::collections::HashMap::new(),
                 reported_connectivity: std::collections::HashMap::new(),
+                reported_location: None,
                 taken_over: false,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
@@ -43142,6 +43339,7 @@ mod tests {
                 reachability_filter: None,
                 reported_reachability: std::collections::HashMap::new(),
                 reported_connectivity: std::collections::HashMap::new(),
+                reported_location: None,
                 taken_over: false,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
