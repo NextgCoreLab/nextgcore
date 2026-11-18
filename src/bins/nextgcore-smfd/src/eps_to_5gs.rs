@@ -1317,6 +1317,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sm_policy_notify_token: None,
                         sdm_notify_token: None,
                         network_paging: None,
+                        ue_unreachable: None,
                         // No DNS context is created for a move.
                         easdf_report_token: None,
                         // An EPS move creates no SM policy association (#475): no PCF to record.

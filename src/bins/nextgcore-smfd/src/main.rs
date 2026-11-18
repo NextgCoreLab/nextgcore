@@ -67,6 +67,7 @@ pub mod slicing; // Rel-17: per-slice QoS profiles
 mod smf_sm;
 mod timer;
 mod udm; // #79: Nudm_UECM_Registration + Nudm_SDM_Get sm-data
+mod ue_reachability; // #1707: UE unreachable after paging (TS 23.502 §4.2.3.3 steps 3a, 3c)
 mod up_path; // #994: PFCP Node Report, user plane path failure and recovery
 
 use context::{smf_context_final, smf_context_init, smf_self};
@@ -2673,6 +2674,11 @@ fn callback_not_admitted(sm_context_ref: &str, kind: context::SessionCallback) -
 /// (TS 29.518 §6.1.3.5, POST only), and the token is minted per transfer and dropped
 /// when the paging ends.
 ///
+/// #1707: `{ref}/ue-reachability/{token}` (a REACHABILITY_REPORT subscription's
+/// `eventNotifyUri`) needs an AMF: the URI does not stay with the AMF it was given
+/// to. A UE context transfer hands the UE's event subscriptions, URI included, to
+/// the next AMF (`eventSubscriptionList`, TS 29.518 §6.1.6.2.25, #1727).
+///
 /// `{ref}/easdf-dns-report/{token}` (the DNS context's `notificationUri`) is admitted
 /// on its token alone too: only the EASDF the context was created on holds it.
 /// Neasdf_DNSContext has no read of a context (easdfd serves POST, PUT and DELETE on
@@ -2721,6 +2727,12 @@ fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExem
             "/nsmf-callback/v1/{var}/sdm-notify/{token}".to_string(),
             SessionCallback::SdmNotify,
             "UDM",
+        ),
+        // Namf_EventExposure Notify, REACHABILITY_REPORT (TS 29.518 §5.3.2.4.1), #1707.
+        route(
+            "/nsmf-callback/v1/{var}/ue-reachability/{token}".to_string(),
+            SessionCallback::UeReachabilityNotify,
+            "AMF",
         ),
         // EASDF DNS message report (TS 23.548 §6.2.3.2.2), #1518.
         OAuth2CallbackExemption::new(
@@ -2789,6 +2801,12 @@ fn tokened_callback<'a>(
             *token,
             None,
         )),
+        ["nsmf-callback", _, r, "ue-reachability", token] => Some((
+            *r,
+            context::SessionCallback::UeReachabilityNotify,
+            *token,
+            None,
+        )),
         _ => None,
     }
 }
@@ -2797,7 +2815,11 @@ fn tokened_callback<'a>(
 fn is_tokened_callback_keyword(segment: &str) -> bool {
     matches!(
         segment,
-        "sm-policy-notify" | "sdm-notify" | "n1-n2-failure" | "easdf-dns-report"
+        "sm-policy-notify"
+            | "sdm-notify"
+            | "n1-n2-failure"
+            | "easdf-dns-report"
+            | "ue-reachability"
     )
 }
 
@@ -2853,6 +2875,9 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
             (context::SessionCallback::N1n2TransferFailure, _) => {
                 handle_n1n2_transfer_failure_notification(sm_context_ref, token, &request).await
+            }
+            (context::SessionCallback::UeReachabilityNotify, _) => {
+                ue_reachability::handle_reachability_notify(sm_context_ref, &request).await
             }
         };
     }
@@ -3627,6 +3652,8 @@ async fn pfcp_session_modify(
 ) -> Result<()> {
     use n4_build::{build_session_modification_request, SessionModificationParams};
 
+    // #1707: after any step 3c FAR change in flight (`dl_far_locks`).
+    let _far = SmContextLock::acquire(dl_far_locks(), &smf_n4_seid.to_string()).await;
     let client = pfcp_path::client_for_session(smf_n4_seid)
         .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     if !client.is_associated().await {
@@ -4356,14 +4383,17 @@ async fn split_pdu_session_modification(
             .collect(),
         ..Default::default()
     };
-    pfcp_modify_with(smf_n4_seid_for(sm_context_ref), upf_seid, &params)
-        .await
-        .map_err(|e| {
-            (
-                SmfCause::TransportResourceUnavailable,
-                format!("PFCP Session Modification failed ({e})"),
-            )
-        })?;
+    let smf_n4_seid = smf_n4_seid_for(sm_context_ref);
+    // #1707: after any step 3c FAR change in flight (`dl_far_locks`).
+    let far_lock = SmContextLock::acquire(dl_far_locks(), &smf_n4_seid.to_string()).await;
+    let modified = pfcp_modify_with(smf_n4_seid, upf_seid, &params).await;
+    drop(far_lock);
+    modified.map_err(|e| {
+        (
+            SmfCause::TransportResourceUnavailable,
+            format!("PFCP Session Modification failed ({e})"),
+        )
+    })?;
     if let Some(mut s) = sess {
         s.dc_tunnel_fars = new_fars.clone();
         if let Ok(ctx) = smf_self().read() {
@@ -5727,6 +5757,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     sm_policy_notify_token: Some(sm_policy_notify_token.clone()),
                     sdm_notify_token: Some(sdm_notify_token.clone()),
                     network_paging: None,
+                    ue_unreachable: None,
                     // #1713 review: held only when a DNS context was created with it.
                     easdf_report_token: easdf_dns_context_id
                         .is_some()
@@ -5895,6 +5926,13 @@ fn mark_up_cnx_state(sm_context_ref: &str, state: context::UpCnxState) {
             }
         }
     }
+    // #1707: a UE whose user plane is being activated is reachable.
+    if matches!(
+        state,
+        context::UpCnxState::Activating | context::UpCnxState::Activated
+    ) {
+        ue_reachability::clear(sm_context_ref, "its user plane is activated");
+    }
 }
 
 /// How long the SMF waits on a network-triggered paging before it takes the paging
@@ -6019,6 +6057,12 @@ fn hold_temporarily_rejected_paging(sm_context_ref: &str, token: &str) -> bool {
 /// SMF takes the step 3c at expiry of the guard timer". The paging ends, the session
 /// DEACTIVATED, so a later Downlink Data Report pages again. Only the paging this
 /// guard was started for: a re-invocation since replaced its token.
+///
+/// #1707: step 3c's UE-unreachable policy is conditional, "If the SMF receives an
+/// indication from the AMF that the UE is unreachable" (`23502-k20.txt:7261-7262`),
+/// and a temporary reject is no such indication: the AMF was paging the UE. So no
+/// unreachability is recorded here; `ue_reachability` records it on the AMF's
+/// UE_NOT_REACHABLE.
 fn end_temporarily_rejected_paging(
     sm_context_ref: &str,
     token: &nextgcore_sbi::callback_auth::CallbackToken,
@@ -6283,6 +6327,10 @@ enum PagingAnswer {
     /// 409 TEMPORARY_REJECT_REGISTRATION_ONGOING or _HANDOVER_ONGOING (#1706, TS
     /// 23.502 §4.2.3.3 step 3b): held for the next message from an AMF.
     TemporarilyRejected,
+    /// 504 UE_NOT_REACHABLE (#1707, TS 29.518 §5.2.2.3.1: "the UE is not reachable
+    /// for paging"): refused, and the UE recorded unreachable (TS 23.502 §4.2.3.3
+    /// step 3c).
+    UeNotReachable,
 }
 
 impl PagingAnswer {
@@ -6297,12 +6345,17 @@ impl PagingAnswer {
     /// [`PagingAnswer::of`], telling a temporary reject (TS 29.518 §5.2.2.3.1: 409 with
     /// the cause in the N1N2MessageTransferError's `error`) from other refusals.
     fn of_response(resp: &nextgcore_sbi::message::SbiResponse) -> Self {
-        let cause = (resp.status == 409)
+        let cause = matches!(resp.status, 409 | 504)
             .then(|| serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref()?).ok())
             .flatten()
             .and_then(|b| b.pointer("/error/cause")?.as_str().map(str::to_string));
-        if cause.as_deref().is_some_and(is_temporary_reject_cause) {
+        if resp.status == 409 && cause.as_deref().is_some_and(is_temporary_reject_cause) {
             return Self::TemporarilyRejected;
+        }
+        // #1707: not UE_NOT_RESPONDING, the other 504 cause ("not responding for a
+        // previous paging"), which says nothing of reachability.
+        if resp.status == 504 && cause.as_deref() == Some("UE_NOT_REACHABLE") {
+            return Self::UeNotReachable;
         }
         Self::of(resp.status)
     }
@@ -6327,6 +6380,14 @@ fn settle_network_paging(
         hold_temporarily_rejected_paging(sm_context_ref, token.as_str());
         return;
     }
+    // #1707: the paging is refused as any other refusal is, and, when it was this
+    // paging's answer, the UE recorded unreachable.
+    let unreachable = answer == PagingAnswer::UeNotReachable;
+    let answer = if unreachable {
+        PagingAnswer::Refused
+    } else {
+        answer
+    };
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
         return;
@@ -6355,6 +6416,10 @@ fn settle_network_paging(
                 ctx.sess_update(&sess);
             }
         }
+    }
+    drop(ctx);
+    if ours && unreachable {
+        ue_reachability::record_ue_unreachable(sm_context_ref, true);
     }
 }
 
@@ -6989,6 +7054,28 @@ pub(crate) fn decode_tsc_from_report(
     body: &[u8],
 ) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
     decode_tsc_ies(body, 201)
+}
+
+/// The locks that serialise a change to a session's downlink FAR, by CP SEID (#1707):
+/// the activation's FORW ([`pfcp_session_modify`], [`split_pdu_session_modification`])
+/// and the step 3c policy and its undo (`ue_reachability`). The latter changes the FAR
+/// only while the session is DEACTIVATED, checked under the lock, and an activation
+/// marks ACTIVATING before it takes the lock, so the two cannot land out of order.
+fn dl_far_locks() -> &'static SmContextLockMap {
+    static LOCKS: std::sync::OnceLock<SmContextLockMap> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Set the downlink FAR's Apply Action to `action` (#1707, TS 23.502 §4.2.3.3 step
+/// 3c), the caller holding its [`dl_far_locks`] entry.
+async fn pfcp_set_dl_far_action(smf_n4_seid: u64, upf_seid: u64, action: u16) -> Result<()> {
+    let params = n4_build::SessionModificationParams {
+        update_fars_apply_action: vec![(2, action)],
+        ..Default::default()
+    };
+    pfcp_modify_with(smf_n4_seid, upf_seid, &params)
+        .await
+        .map(|_| ())
 }
 
 /// Deactivate the downlink FAR (back to BUFF) — used when the AN-side
@@ -8394,6 +8481,10 @@ pub(crate) fn take_sm_context(sm_context_ref: &str) -> Option<Option<context::Po
     if binding.is_none() && sess.is_none() {
         return None;
     }
+    // #1707: a released session's reachability subscription goes with it.
+    if let Some(record) = binding.as_ref().and_then(|b| b.ue_unreachable.clone()) {
+        ue_reachability::forget(record);
+    }
     // #994, #1031: the GTP-U peers of its FARs and its UPF binding, under the SEID
     // the next line forgets.
     let smf_seid = ctx
@@ -9635,6 +9726,16 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
         return;
     };
 
+    // #1707, TS 23.502 §4.2.3.3 step 3a: "The SMF does not contact the AMF: if the SMF
+    // had previously been notified that the UE is unreachable".
+    if ue_reachability::ue_unreachable_holds(&sm_context_ref) {
+        log::info!(
+            "Downlink Data Report for ref={sm_context_ref}: the AMF reported the UE \
+             unreachable, so the AMF is not contacted (TS 23.502 §4.2.3.3 step 3a)"
+        );
+        return;
+    }
+
     // #1230: the paging's Setup Request Transfer names the uplink endpoint (TS 38.413
     // §9.3.4.1); a restored context that lacks it gets one first.
     recover_upf_ul_endpoint(&sm_context_ref).await;
@@ -9860,6 +9961,7 @@ async fn send_n1_n2_paging_request(
                             // #1706 review m1: the retried transfer can be temporarily
                             // rejected too, and is held as the first answer would be.
                             N1n2RetryEnd::TemporarilyRejected => PagingAnswer::TemporarilyRejected,
+                            N1n2RetryEnd::UeNotReachable => PagingAnswer::UeNotReachable,
                             N1n2RetryEnd::Sent(status) => PagingAnswer::of(status),
                             _ => PagingAnswer::Refused,
                         };
@@ -9981,6 +10083,9 @@ enum N1n2RetryEnd {
     /// 29.518 §5.2.2.3.1, 409 TEMPORARY_REJECT_REGISTRATION_ONGOING or
     /// _HANDOVER_ONGOING), which a paging holds rather than drops.
     TemporarilyRejected,
+    /// The AMF answered the resend 504 UE_NOT_REACHABLE (#1707), which records the UE
+    /// unreachable.
+    UeNotReachable,
     /// The session was released before the resend (#1079 review m1).
     SessionGone,
     /// The AMF asked for a longer wait than [`N1N2_RETRY_AFTER_MAX_S`] (m2).
@@ -10052,10 +10157,13 @@ async fn retry_n1n2_after_paging_conflict(
                 Some(next) => wait = next,
                 None => {
                     log::info!("N1N2MessageTransfer retried: status={}", resp.status);
-                    if PagingAnswer::of_response(&resp) == PagingAnswer::TemporarilyRejected {
-                        return N1n2RetryEnd::TemporarilyRejected;
+                    match PagingAnswer::of_response(&resp) {
+                        PagingAnswer::TemporarilyRejected => {
+                            return N1n2RetryEnd::TemporarilyRejected
+                        }
+                        PagingAnswer::UeNotReachable => return N1n2RetryEnd::UeNotReachable,
+                        _ => return N1n2RetryEnd::Sent(resp.status),
                     }
-                    return N1n2RetryEnd::Sent(resp.status);
                 }
             },
             Err(e) => {
@@ -12733,6 +12841,18 @@ async fn handle_n1n2_transfer_failure_notification(
                 ctx.sess_update(&sess);
             }
         }
+    }
+    // #1707, TS 23.502 §4.2.3.3 step 3c: "the UE is not reachable for the non-3GPP PDU
+    // session" (TS 29.518 Table 6.1.6.3.x), so this session is recorded,
+    // once it is DEACTIVATED again.
+    //
+    // #1773 R13 m3: REACHABILITY_REPORT is not per access. A UE CM-IDLE on non-3GPP
+    // but reachable over 3GPP gets the AMF's immediate REACHABLE report (TS 29.518
+    // §5.3.1, `29518-k00.txt:5074-5080`), so against a conformant AMF this record
+    // ends within milliseconds, and the next Downlink Data Report repeats the cycle.
+    // amfd never sends this cause; only a third-party AMF reaches it.
+    if cause == "UE_NOT_REACHABLE_FOR_SESSION" {
+        ue_reachability::record_ue_unreachable(sm_context_ref, false);
     }
     // The AMF's string, bounded and quoted rather than logged as sent.
     let cause: String = cause.chars().take(64).collect();
@@ -18282,6 +18402,7 @@ mod tests {
                             "sdm-{sm_context_ref}"
                         ))),
                         network_paging: None,
+                        ue_unreachable: None,
                         easdf_report_token: Some(test_callback_token(&format!(
                             "eas-{sm_context_ref}"
                         ))),
@@ -18315,6 +18436,7 @@ mod tests {
                 "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/update",
                 "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/terminate",
                 "POST /nsmf-callback/v1/{var}/sdm-notify/{token}",
+                "POST /nsmf-callback/v1/{var}/ue-reachability/{token}",
                 "POST /nsmf-callback/v1/{var}/easdf-dns-report/{token}",
                 "POST /nsmf-callback/v1/{var}/n1-n2-failure/{token}",
             ]
@@ -18464,6 +18586,73 @@ mod tests {
         // Session b's own tokens name session b.
         assert!(admits(sm_policy_notify_path(b, "update"), peer(&["PCF"])).await);
         assert!(admits(sdm_notify_path(b), peer(&["UDM"])).await);
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            bindings.remove(a);
+            bindings.remove(b);
+        }
+    }
+
+    /// #1707: the REACHABILITY_REPORT `eventNotifyUri`, `{ref}/ue-reachability/{token}`,
+    /// is admitted without a bearer only for a verified AMF certificate together
+    /// with the session's current record token. Another NF type, no certificate, a
+    /// forged token, and a session with no record are held to the bearer.
+    ///
+    /// REVERT-VERIFIED: with the route's NF type "UDM", "a verified AMF" fails.
+    #[tokio::test]
+    async fn the_reachability_route_admits_only_an_amf_with_the_record_s_token_1707() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (a, b) = ("170711", "170712");
+        seed_binding(a, 5);
+        seed_binding(b, 6);
+        let token = nextgcore_sbi::callback_auth::CallbackToken::mint();
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(binding) = ctx.policy_bindings.write().unwrap().get_mut(a) {
+                binding.ue_unreachable = Some(context::UeUnreachable {
+                    ue_wide: true,
+                    notify_token: token.clone(),
+                    amf_uri: "http://127.0.0.1:9".to_string(),
+                    subscription_id: None,
+                    upf_action: None,
+                    ended: Default::default(),
+                });
+            }
+        }
+        let peer = |types: &[&str]| {
+            Some(VerifiedPeer {
+                nf_instance_id: "4e3c1707-0000-4000-8000-000000000002".to_string(),
+                nf_types: types.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        let exemptions = oauth2_callback_exemptions();
+        let exemptions = &exemptions;
+        let admits = |path: String, p: Option<VerifiedPeer>| async move {
+            nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                exemptions,
+                "POST",
+                &path,
+                p.as_ref(),
+            )
+            .await
+        };
+        let path = |r: &str, t: &str| format!("/nsmf-callback/v1/{r}/ue-reachability/{t}");
+        assert!(
+            admits(path(a, token.as_str()), peer(&["AMF"])).await,
+            "a verified AMF"
+        );
+        assert!(!admits(path(a, token.as_str()), peer(&["UDM"])).await);
+        assert!(!admits(path(a, token.as_str()), peer(&[])).await);
+        assert!(!admits(path(a, token.as_str()), None).await);
+        assert!(
+            !admits(path(a, "0123456789abcdef0123456789abcdef"), peer(&["AMF"])).await,
+            "a forged token"
+        );
+        assert!(
+            !admits(path(b, token.as_str()), peer(&["AMF"])).await,
+            "a session with no record"
+        );
         if let Ok(ctx) = smf_self().read() {
             let mut bindings = ctx.policy_bindings.write().unwrap();
             bindings.remove(a);
@@ -29810,10 +29999,11 @@ mod tests {
         drop_session_for_retry(&reference);
         amf.stop().await.expect("stop");
 
-        // A refusal: 504 UE_NOT_REACHABLE.
+        // A refusal: 504 UE_NOT_RESPONDING. (UE_NOT_REACHABLE records the UE
+        // unreachable, #1707.)
         let (amf, port, seen) = scripted_amf_1631(vec![(
             504,
-            serde_json::json!({ "error": { "status": 504, "cause": "UE_NOT_REACHABLE" } }),
+            serde_json::json!({ "error": { "status": 504, "cause": "UE_NOT_RESPONDING" } }),
         )])
         .await;
         let (reference, seid) = seed_paged_session_1631("imsi-001010000016314", 7, port);
@@ -30868,6 +31058,968 @@ mod tests {
         );
 
         amf.stop().await.expect("stop");
+    }
+
+    // ==================================================================
+    // #1707: a UE the AMF reported unreachable (TS 23.502 §4.2.3.3 steps 3a, 3c).
+    // ==================================================================
+
+    /// What the #1707 stand-in AMF saw: (method, path, body).
+    type AmfSeen1707 = Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    /// A stand-in AMF for #1707. It answers the `n`-th N1N2MessageTransfer with
+    /// `answers[n]` (the last one repeated). It answers a Namf_EventExposure
+    /// subscribe 201 with `subscriptionId` `sub-1707-<n>`, and an unsubscribe 204. It
+    /// is strict: a subscription missing a mandatory member of AmfEventSubscription
+    /// (TS 29.518 Table 6.2.6.2.3-1) gets the 400 amfd answers.
+    async fn reachability_amf_1707(
+        answers: Vec<(u16, serde_json::Value)>,
+    ) -> (nextgcore_sbi::server::SbiServer, u16, AmfSeen1707) {
+        reachability_amf_with_1707(answers, false).await
+    }
+
+    /// [`reachability_amf_1707`]; with `immediate`, it behaves as a conformant AMF for
+    /// a UE reachable at subscription time (TS 29.518 §5.3.1, `29518-k00.txt:5074-5080`):
+    /// before it answers the subscription, it delivers a REACHABLE report to its
+    /// `eventNotifyUri` (seen as `NOTIFY`, with the SMF's status as the body), then
+    /// answers 201 with `subscriptionId` `sub-late`.
+    async fn reachability_amf_with_1707(
+        answers: Vec<(u16, serde_json::Value)>,
+        immediate: bool,
+    ) -> (nextgcore_sbi::server::SbiServer, u16, AmfSeen1707) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let seen: AmfSeen1707 = Arc::default();
+        let sink = Arc::clone(&seen);
+        let answers = Arc::new(answers);
+        let transfers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                let answers = Arc::clone(&answers);
+                let transfers = Arc::clone(&transfers);
+                let subscriptions = Arc::clone(&subscriptions);
+                async move {
+                    use std::sync::atomic::Ordering;
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let method = req.header.method.clone();
+                    let path = req.header.uri.clone();
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((method.clone(), path.clone(), body.clone()));
+                    if path.ends_with("/n1-n2-messages") {
+                        let n = transfers.fetch_add(1, Ordering::SeqCst);
+                        let (status, answer) = answers[n.min(answers.len() - 1)].clone();
+                        return SbiResponse::with_status(status)
+                            .with_json_body(&answer)
+                            .unwrap_or_else(|_| SbiResponse::with_status(status));
+                    }
+                    if path == "/namf-evts/v1/subscriptions" && method == "POST" {
+                        let sub = &body["subscription"];
+                        let complete = sub["eventList"].as_array().is_some_and(|l| !l.is_empty())
+                            && sub["eventNotifyUri"].is_string()
+                            && sub["notifyCorrelationId"].is_string()
+                            && sub["nfId"].is_string();
+                        if !complete {
+                            return SbiResponse::with_status(400);
+                        }
+                        let id = if immediate {
+                            let uri = sub["eventNotifyUri"].as_str().unwrap_or_default();
+                            let path = &uri[uri.find("/nsmf-callback/").unwrap_or(0)..];
+                            let status = smf_sbi_request_handler(
+                                SbiRequest::post(path.to_string()).with_body(
+                                    serde_json::json!({
+                                        "notifyCorrelationId": sub["notifyCorrelationId"],
+                                        "reportList": [{
+                                            "type": "REACHABILITY_REPORT",
+                                            "state": { "active": true },
+                                            "timeStamp": "2026-11-18T00:00:00Z",
+                                            "reachability": "REACHABLE",
+                                        }],
+                                    })
+                                    .to_string(),
+                                    "application/json",
+                                ),
+                            )
+                            .await
+                            .status;
+                            sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                                "NOTIFY".to_string(),
+                                path.to_string(),
+                                serde_json::json!(status),
+                            ));
+                            "sub-late".to_string()
+                        } else {
+                            format!(
+                                "sub-1707-{}",
+                                subscriptions.fetch_add(1, Ordering::SeqCst)
+                            )
+                        };
+                        return SbiResponse::with_status(201)
+                            .with_json_body(&serde_json::json!({
+                                "subscription": sub,
+                                "subscriptionId": format!("http://127.0.0.1/namf-evts/v1/subscriptions/{id}"),
+                            }))
+                            .expect("json");
+                    }
+                    if method == "DELETE" {
+                        return SbiResponse::with_status(204);
+                    }
+                    SbiResponse::with_status(404)
+                }
+            })
+            .await
+            .expect("stand-in AMF starts");
+        (server, addr.port(), seen)
+    }
+
+    fn not_reachable_1707() -> (u16, serde_json::Value) {
+        (
+            504,
+            serde_json::json!({ "error": { "status": 504, "cause": "UE_NOT_REACHABLE" } }),
+        )
+    }
+
+    fn transfers_1707(seen: &AmfSeen1707) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _)| p.ends_with("/n1-n2-messages"))
+            .count()
+    }
+
+    fn requests_1707(
+        seen: &AmfSeen1707,
+        method: &str,
+        path_has: &str,
+    ) -> Vec<(String, serde_json::Value)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == method && p.contains(path_has))
+            .map(|(_, p, b)| (p.clone(), b.clone()))
+            .collect()
+    }
+
+    /// Wait for the `n`-th request matching (method, path).
+    async fn await_requests_1707(seen: &AmfSeen1707, method: &str, path_has: &str, n: usize) {
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+            || async { (requests_1707(seen, method, path_has).len() >= n).then_some(()) },
+        )
+        .await;
+        assert!(
+            ok.is_some(),
+            "{method} {path_has} x{n}: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// The token in a subscription's `eventNotifyUri`, which must be the session's
+    /// `{ref}/ue-reachability/{token}`.
+    fn reachability_token_1707(body: &serde_json::Value, reference: &str) -> String {
+        let uri = body["subscription"]["eventNotifyUri"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an eventNotifyUri: {body}"));
+        let marker = format!("/nsmf-callback/v1/{reference}/ue-reachability/");
+        let at = uri.find(&marker).unwrap_or_else(|| panic!("{uri}"));
+        uri[at + marker.len()..].to_string()
+    }
+
+    async fn notify_reachability_1707(reference: &str, token: &str, reachability: &str) -> u16 {
+        smf_sbi_request_handler(
+            SbiRequest::post(format!(
+                "/nsmf-callback/v1/{reference}/ue-reachability/{token}"
+            ))
+            .with_body(
+                serde_json::json!({
+                    "notifyCorrelationId": reference,
+                    "reportList": [{
+                        "type": "REACHABILITY_REPORT",
+                        "state": { "active": true },
+                        "timeStamp": "2026-11-18T00:00:00Z",
+                        "reachability": reachability,
+                    }],
+                })
+                .to_string(),
+                "application/json",
+            ),
+        )
+        .await
+        .status
+    }
+
+    /// #1707, TS 23.502 §4.2.3.3 steps 3a and 3c, both peers' halves of the
+    /// exchange the SMF drives:
+    /// - a paging the AMF answers 504 UE_NOT_REACHABLE records the UE unreachable,
+    ///   and the SMF subscribes at the AMF to REACHABILITY_REPORT, "UE Reachable for
+    ///   DL Traffic", with an `eventNotifyUri` carrying a token of its own;
+    /// - while it holds, a Downlink Data Report for that session, or for another
+    ///   session of the UE, pages nothing (step 3a);
+    /// - a second 504 does not subscribe twice;
+    /// - a notification with another token, or reporting UNREACHABLE, or with no
+    ///   reportList, changes nothing;
+    /// - REACHABLE ends it: the subscription is deleted, a report pages again, and
+    ///   the same notification again is refused, with no second delete.
+    ///
+    /// REVERT-VERIFIED: with the report path not asking `ue_unreachable_holds`,
+    /// "step 3a: no page" fails; with the notify handler not clearing, "REACHABLE: a
+    /// report pages again" fails; with `record_ue_unreachable` recording every time,
+    /// "a repeated indication" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_ue_is_paged_again_only_once_the_amf_reports_it_reachable_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) =
+            reachability_amf_1707(vec![not_reachable_1707(), attempting_1631()]).await;
+        let supi = "imsi-001010000170701";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port);
+        let (other, other_seid) = seed_paged_session_1631(supi, 6, port);
+
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(transfers_1707(&seen), 1);
+        await_requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions", 1).await;
+        let (_, sub) = requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions")[0].clone();
+        let event = &sub["subscription"]["eventList"][0];
+        assert_eq!(event["type"], "REACHABILITY_REPORT");
+        assert_eq!(event["reachabilityFilter"], "UE_REACHABLE_DL_TRAFFIC");
+        assert_eq!(sub["subscription"]["supi"], supi);
+        assert!(
+            sub["subscription"]["options"]["expiry"].is_string(),
+            "{sub}"
+        );
+        let token = reachability_token_1707(&sub, &reference);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        assert!(ue_reachability::ue_unreachable_holds(&reference));
+        assert!(
+            ue_reachability::ue_unreachable_holds(&other),
+            "UE-wide: its other session too"
+        );
+
+        report_dl_data_1631(seid, 5).await;
+        report_dl_data_1631(other_seid, 5).await;
+        assert_eq!(transfers_1707(&seen), 1, "step 3a: no page");
+
+        // A repeated indication makes no second record or subscription.
+        assert!(
+            !ue_reachability::record_ue_unreachable(&reference, true),
+            "a repeated indication"
+        );
+        assert!(
+            !ue_reachability::record_ue_unreachable(&other, true),
+            "a repeated indication, on another session"
+        );
+
+        // Nothing changes on a wrong token, an UNREACHABLE, or a malformed body.
+        assert_eq!(
+            notify_reachability_1707(&reference, "0123456789abcdef0123456789abcdef", "REACHABLE")
+                .await,
+            404
+        );
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "UNREACHABLE").await,
+            204
+        );
+        let malformed = smf_sbi_request_handler(
+            SbiRequest::post(format!(
+                "/nsmf-callback/v1/{reference}/ue-reachability/{token}"
+            ))
+            .with_body("{}".to_string(), "application/json"),
+        )
+        .await;
+        assert_eq!(malformed.status, 400);
+        assert!(
+            ue_reachability::ue_unreachable_holds(&reference),
+            "still held"
+        );
+
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        report_dl_data_1631(other_seid, 5).await;
+        assert_eq!(transfers_1707(&seen), 2, "REACHABLE: a report pages again");
+        await_requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-1707-0", 1).await;
+
+        // The same notification again: its token is gone, and nothing is undone twice.
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            404
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(requests_1707(&seen, "DELETE", "/namf-evts/").len(), 1);
+        assert_eq!(requests_1707(&seen, "POST", "/namf-evts/").len(), 1);
+
+        drop_session_for_retry(&reference);
+        drop_session_for_retry(&other);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1707: UE_NOT_REACHABLE_FOR_SESSION in a failure notification names the
+    /// non-3GPP session (TS 29.518 Table 6.1.6.3.x), so that session is held and the
+    /// UE's other one still pages. UE_NOT_RESPONDING, as a notification or as the 504
+    /// cause, says nothing of reachability, and records nothing. The UE's user plane
+    /// being activated ends the record, and deletes the subscription.
+    ///
+    /// REVERT-VERIFIED: with the failure notification recording UE-wide, "the other
+    /// session still pages" fails; with every 504 cause read as UE_NOT_REACHABLE,
+    /// "UE_NOT_RESPONDING holds nothing" fails; with `mark_up_cnx_state` not clearing,
+    /// "an activation ends it" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_unreachable_record_holds_that_session_until_the_ue_activates_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = reachability_amf_1707(vec![
+            attempting_1631(),
+            (
+                504,
+                serde_json::json!({ "error": { "status": 504, "cause": "UE_NOT_RESPONDING" } }),
+            ),
+            attempting_1631(),
+        ])
+        .await;
+        let supi = "imsi-001010000170702";
+        let (n3gpp, n3gpp_seid) = seed_paged_session_1631(supi, 5, port);
+        let (other, other_seid) = seed_paged_session_1631(supi, 6, port);
+
+        report_dl_data_1631(n3gpp_seid, 5).await;
+        let (_, transfer) = requests_1707(&seen, "POST", "/n1-n2-messages")[0].clone();
+        let failure_token = failure_token_1631(&transfer, &n3gpp);
+        assert_eq!(
+            notify_failure_1631(
+                &n3gpp,
+                &failure_token,
+                serde_json::json!({
+                    "cause": "UE_NOT_REACHABLE_FOR_SESSION",
+                    "n1n2MsgDataUri": "http:",
+                }),
+            )
+            .await,
+            204
+        );
+        await_requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions", 1).await;
+        assert!(ue_reachability::ue_unreachable_holds(&n3gpp));
+        report_dl_data_1631(n3gpp_seid, 5).await;
+        assert_eq!(transfers_1707(&seen), 1, "the session is held");
+
+        // The other session pages; its 504 UE_NOT_RESPONDING records nothing.
+        report_dl_data_1631(other_seid, 5).await;
+        assert_eq!(transfers_1707(&seen), 2, "the other session still pages");
+        report_dl_data_1631(other_seid, 5).await;
+        assert_eq!(transfers_1707(&seen), 3, "UE_NOT_RESPONDING holds nothing");
+        assert_eq!(requests_1707(&seen, "POST", "/namf-evts/").len(), 1);
+
+        // The UE answers the other session's paging: it is reachable.
+        mark_up_cnx_state(&other, context::UpCnxState::Activating);
+        assert!(
+            !ue_reachability::ue_unreachable_holds(&n3gpp),
+            "an activation ends it"
+        );
+        await_requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-1707-0", 1).await;
+
+        drop_session_for_retry(&n3gpp);
+        drop_session_for_retry(&other);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1707, step 3c's policy toward the UPF and its undo:
+    /// - `stop-notifications` sets the downlink FAR to BUFF without NOCP;
+    /// - REACHABLE re-arms it to BUFF|NOCP;
+    /// - `discard` sets it to DROP;
+    /// - the hold running out ends the record as REACHABLE does: re-armed, the
+    ///   subscription deleted.
+    ///
+    /// REVERT-VERIFIED: with `undo` not restoring the FAR, "re-armed on REACHABLE"
+    /// fails; with the hold not taking the record, "the hold ends it" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_step_3c_upf_policy_is_applied_and_undone_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (upf, mods, upf_task) = modification_recording_upf_1387().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let far_actions = |mods: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>| -> Vec<u16> {
+            mods.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|body| {
+                    let far = pfcp_path::find_ie(body, n4_build::pfcp_ie::UPDATE_FAR)?;
+                    let aa = pfcp_path::find_ie(far, n4_build::pfcp_ie::APPLY_ACTION)?;
+                    Some(n4_build::decode_apply_action(aa))
+                })
+                .collect()
+        };
+        let report = |seid: u64| async move {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("sock");
+            handle_pfcp_session_report(&sock, &dldr_report_packet(seid, 5), upf).await;
+        };
+        let await_far = |n: usize, what: &'static str| {
+            let mods = mods.clone();
+            async move {
+                let ok = nextgcore_sbi::test_support::poll_until(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_millis(10),
+                    || async { (far_actions(&mods).len() >= n).then_some(()) },
+                )
+                .await;
+                assert!(
+                    ok.is_some(),
+                    "{what}: {n} FAR updates: {:?}",
+                    far_actions(&mods)
+                );
+            }
+        };
+        let bind_upf = |reference: &str, upf_seid: u64| {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            ctx.pfcp_sessions
+                .write()
+                .expect("w")
+                .insert(reference.to_string(), upf_seid);
+        };
+        use n4_build::apply_action as aa;
+
+        // stop-notifications, ended by REACHABLE.
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::StopNotifications), None);
+        let (amf, port, seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170703", 5, port);
+        bind_upf(&reference, 0x1707_0003);
+        report(seid).await;
+        await_far(1, "the policy").await;
+        assert_eq!(
+            far_actions(&mods),
+            vec![aa::BUFF],
+            "stop Data Notifications"
+        );
+        await_requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions", 1).await;
+        let (_, sub) = requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions")[0].clone();
+        let token = reachability_token_1707(&sub, &reference);
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        await_far(2, "re-armed on REACHABLE").await;
+        assert_eq!(
+            far_actions(&mods)[1],
+            aa::BUFF | aa::NOCP,
+            "re-armed on REACHABLE"
+        );
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+
+        // discard, ended by the hold.
+        mods.lock().unwrap().clear();
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (
+            Some(ue_reachability::UpfPolicy::Discard),
+            Some(std::time::Duration::from_millis(300)),
+        );
+        let (amf, port, seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170704", 5, port);
+        bind_upf(&reference, 0x1707_0004);
+        report(seid).await;
+        await_far(1, "the policy").await;
+        assert_eq!(
+            far_actions(&mods),
+            vec![aa::DROP],
+            "discard the buffered data"
+        );
+        assert!(ue_reachability::ue_unreachable_holds(&reference));
+        await_far(2, "the hold ends it").await;
+        assert_eq!(far_actions(&mods)[1], aa::BUFF | aa::NOCP);
+        assert!(
+            !ue_reachability::ue_unreachable_holds(&reference),
+            "the hold ends it"
+        );
+        await_requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-1707-0", 1).await;
+
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        listener.abort();
+        upf_task.abort();
+    }
+
+    // ---- #1773 R13 M1: a late success is cleaned up ----
+
+    /// What the #1707 holding UPF did, in order: `("recv", action)` when a Session
+    /// Modification arrived and `("apply", action)` when it answered it, `action`
+    /// being the Apply Action of its first Update FAR.
+    type UpfLog1707 = Arc<std::sync::Mutex<Vec<(&'static str, u16)>>>;
+
+    /// A stand-in UPF for #1773 R13 M1 that APPLIES a Session Modification when it
+    /// answers it, as the FAR state the UPF ends at is the one it answered last. It
+    /// answers at once, except a modification whose Update FAR sets `held`, which it
+    /// answers only once `release` is notified. A retransmission is ignored.
+    async fn holding_upf_1707(
+        held: u16,
+    ) -> (
+        std::net::SocketAddr,
+        UpfLog1707,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use pfcp_path::pfcp_message_type as t;
+        let upf = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = upf.local_addr().unwrap();
+        let log: UpfLog1707 = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (sink, gate) = (log.clone(), release.clone());
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut seen = std::collections::HashSet::new();
+            while let Ok((len, from)) = upf.recv_from(&mut buf).await {
+                let Some(h) = pfcp_path::parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                if h.msg_type != t::SESSION_MODIFICATION_REQUEST || !seen.insert(h.sequence_number)
+                {
+                    continue;
+                }
+                let body = &buf[h.body_offset..len];
+                let action = pfcp_path::find_ie(body, n4_build::pfcp_ie::UPDATE_FAR)
+                    .and_then(|far| pfcp_path::find_ie(far, n4_build::pfcp_ie::APPLY_ACTION))
+                    .map_or(0, n4_build::decode_apply_action);
+                sink.lock().unwrap().push(("recv", action));
+                let reply = pfcp_path::encode_wire_message(
+                    t::SESSION_MODIFICATION_RESPONSE,
+                    Some(h.seid),
+                    h.sequence_number,
+                    &[0x00, 0x13, 0x00, 0x01, 1],
+                );
+                let (upf, sink, gate) = (upf.clone(), sink.clone(), gate.clone());
+                tokio::spawn(async move {
+                    if action == held {
+                        gate.notified().await;
+                    }
+                    sink.lock().unwrap().push(("apply", action));
+                    let _ = upf.send_to(&reply, from).await;
+                });
+            }
+        });
+        (addr, log, release, task)
+    }
+
+    fn upf_log_1707(log: &UpfLog1707, what: &str) -> Vec<u16> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(w, _)| *w == what)
+            .map(|(_, a)| *a)
+            .collect()
+    }
+
+    async fn await_upf_1707(log: &UpfLog1707, what: &str, action: u16, why: &str) {
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(5),
+            || async { upf_log_1707(log, what).contains(&action).then_some(()) },
+        )
+        .await;
+        assert!(ok.is_some(), "{why}: {:?}", log.lock().unwrap());
+    }
+
+    /// A Downlink Data Report for `seid` through the real PFCP Session Report path,
+    /// from `upf`, whose client the caller installed.
+    async fn report_from_1707(seid: u64, upf: std::net::SocketAddr) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sock");
+        handle_pfcp_session_report(&sock, &dldr_report_packet(seid, 5), upf).await;
+    }
+
+    fn bind_upf_1707(reference: &str, upf_seid: u64) {
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        ctx.pfcp_sessions
+            .write()
+            .expect("w")
+            .insert(reference.to_string(), upf_seid);
+    }
+
+    fn record_token_1707(reference: &str) -> String {
+        lookup_policy_binding(reference)
+            .and_then(|b| b.ue_unreachable)
+            .expect("a record")
+            .notify_token
+            .as_str()
+            .to_string()
+    }
+
+    /// #1773 R13 M1(a): a conformant AMF sends the immediate REACHABLE report for a
+    /// UE reachable at subscription time BEFORE it answers the subscription 201
+    /// (TS 29.518 §5.3.1, `29518-k00.txt:5074-5080`; amfd #1641). The record is then
+    /// cleared before the SMF learns the subscriptionId, so the late 201's
+    /// subscription is deleted, and nothing holds.
+    ///
+    /// REVERT-VERIFIED: with `establish` not unsubscribing when `update_record` fails
+    /// after the 201, "the late 201's subscription is deleted" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_201_after_the_immediate_reachable_is_unsubscribed_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = reachability_amf_with_1707(vec![not_reachable_1707()], true).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170705", 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        await_requests_1707(&seen, "NOTIFY", "/ue-reachability/", 1).await;
+        let (_, status) = requests_1707(&seen, "NOTIFY", "/ue-reachability/")[0].clone();
+        assert_eq!(status, 204, "the immediate REACHABLE is admitted");
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+            || async {
+                (!requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-late").is_empty())
+                    .then_some(())
+            },
+        )
+        .await;
+        assert!(
+            ok.is_some(),
+            "the late 201's subscription is deleted: {:?}",
+            seen.lock().unwrap()
+        );
+        assert!(!ue_reachability::ue_unreachable_holds(&reference));
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1773 R13 M1(b): the UPF takes the step 3c DROP only after the record was
+    /// cleared (REACHABLE arrived within the PFCP round trip). `establish` then puts
+    /// the FAR back to BUFF|NOCP, so a DEACTIVATED session with no record is not left
+    /// silently discarding its downlink, and it subscribes to nothing.
+    ///
+    /// REVERT-VERIFIED: with `establish` not calling `restore_far_locked` when
+    /// `update_record` fails after the UPF's answer, "a late FAR change is restored"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_far_change_the_upf_takes_after_reachable_is_restored_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        use n4_build::apply_action as aa;
+        let (upf, log, release, upf_task) = holding_upf_1707(aa::DROP).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::Discard), None);
+        let (amf, port, seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170706", 5, port);
+        bind_upf_1707(&reference, 0x1707_0006);
+
+        report_from_1707(seid, upf).await;
+        await_upf_1707(&log, "recv", aa::DROP, "the policy is in flight").await;
+        let token = record_token_1707(&reference);
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        assert!(!ue_reachability::ue_unreachable_holds(&reference));
+        release.notify_one();
+        await_upf_1707(
+            &log,
+            "apply",
+            aa::BUFF | aa::NOCP,
+            "a late FAR change is restored",
+        )
+        .await;
+        assert_eq!(
+            upf_log_1707(&log, "apply"),
+            vec![aa::DROP, aa::BUFF | aa::NOCP],
+            "a late FAR change is restored"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            requests_1707(&seen, "POST", "/namf-evts/").is_empty(),
+            "a cleared record subscribes to nothing"
+        );
+
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// The #1773 R13 M1(c) set-up: a session the AMF reported unreachable under the
+    /// `discard` policy, whose step 3c DROP the holding UPF has received and holds.
+    /// Returns what the test needs, the caller holding the ambient and N4 locks.
+    async fn a_drop_in_flight_1707(
+        supi: &str,
+        upf_seid: u64,
+    ) -> (
+        String,
+        UpfLog1707,
+        Arc<tokio::sync::Notify>,
+        nextgcore_sbi::server::SbiServer,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        use n4_build::apply_action as aa;
+        let (upf, log, release, upf_task) = holding_upf_1707(aa::DROP).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::Discard), None);
+        let (amf, port, _seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port);
+        bind_upf_1707(&reference, upf_seid);
+        report_from_1707(seid, upf).await;
+        await_upf_1707(&log, "recv", aa::DROP, "the policy is in flight").await;
+        (reference, log, release, amf, vec![listener, upf_task])
+    }
+
+    /// The activation's FORW lands after the step 3c DROP in flight: it is SENT only
+    /// once the UPF answered the DROP, so the FAR ends at FORW.
+    async fn assert_forw_lands_last_1707(
+        log: &UpfLog1707,
+        release: &tokio::sync::Notify,
+        activation: tokio::task::JoinHandle<SbiResponse>,
+    ) {
+        use n4_build::apply_action as aa;
+        // The activation runs meanwhile, on another worker.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release.notify_one();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), activation)
+            .await
+            .expect("the activation completes")
+            .expect("joins");
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        await_upf_1707(log, "apply", aa::FORW, "the activation").await;
+        assert_eq!(
+            upf_log_1707(log, "apply").last(),
+            Some(&aa::FORW),
+            "the activation's FORW lands last: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    async fn end_drop_in_flight_1707(
+        reference: &str,
+        amf: nextgcore_sbi::server::SbiServer,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        for t in tasks {
+            t.abort();
+        }
+    }
+
+    /// #1773 R13 M1(c), `pfcp_session_modify`: the gNB's PDU_RES_SETUP_RSP arrives
+    /// while the step 3c DROP is in flight. Its FORW waits on `dl_far_locks`, so it
+    /// cannot land before the DROP and then be overwritten by it on an ACTIVE session.
+    ///
+    /// REVERT-VERIFIED: with `pfcp_session_modify` not taking its `dl_far_locks`
+    /// entry, "the activation's FORW lands last" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_activation_s_forw_lands_after_a_drop_in_flight_1707() {
+        use base64::Engine as _;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (reference, log, release, amf, tasks) =
+            a_drop_in_flight_1707("imsi-001010000170707", 0x1707_0007).await;
+
+        let setup_rsp = serde_json::json!({
+            "n2SmInfoType": "PDU_RES_SETUP_RSP",
+            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(GNB_SETUP_RESPONSE_TRANSFER),
+        })
+        .to_string();
+        let r = reference.clone();
+        let activation = tokio::spawn(async move {
+            handle_sm_context_update(
+                &r,
+                &SbiRequest::post("/x/modify").with_body(setup_rsp, "application/json"),
+            )
+            .await
+        });
+        assert_forw_lands_last_1707(&log, &release, activation).await;
+
+        end_drop_in_flight_1707(&reference, amf, tasks).await;
+    }
+
+    /// #1773 R13 M1(c), `split_pdu_session_modification`: a Service Request marks the
+    /// session ACTIVATING, then a Modify Indication for a split session (one with
+    /// additional NG-U tunnel FARs) arrives while the step 3c DROP is in flight. Its
+    /// FORW waits on `dl_far_locks` too.
+    ///
+    /// REVERT-VERIFIED: with `split_pdu_session_modification` not taking its
+    /// `dl_far_locks` entry, "the activation's FORW lands last" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_split_modification_s_forw_lands_after_a_drop_in_flight_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (reference, log, release, amf, tasks) =
+            a_drop_in_flight_1707("imsi-001010000170708", 0x1707_0008).await;
+        if let Ok(ctx) = smf_self().read() {
+            let mut sess = ctx.sess_find_by_sm_context_ref(&reference).expect("sess");
+            sess.dc_tunnel_fars = vec![DC_TUNNEL_FAR_BASE + 1];
+            ctx.sess_update(&sess);
+        }
+        mark_up_cnx_state(&reference, context::UpCnxState::Activating);
+
+        let r = reference.clone();
+        let activation = tokio::spawn(async move {
+            an_initiated_modification(&r, &indication([10, 1, 7, 8], 0x1707, &[5])).await
+        });
+        assert_forw_lands_last_1707(&log, &release, activation).await;
+
+        end_drop_in_flight_1707(&reference, amf, tasks).await;
+    }
+
+    /// #1773 R13 m1: an `undo` that waited on `dl_far_locks` while a NEWER record's
+    /// `establish` took the lock first and set DROP is stale: it re-checks under the
+    /// lock and leaves the newer record's FAR alone. The newer record's own end then
+    /// re-arms it.
+    ///
+    /// REVERT-VERIFIED: with `restore_far_locked` not re-checking for a newer record's
+    /// action, "a stale undo leaves the newer record's DROP" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stale_undo_leaves_a_newer_record_s_far_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        use n4_build::apply_action as aa;
+        let (upf, log, _release, upf_task) = holding_upf_1707(u16::MAX).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::Discard), None);
+        let (amf, port, _seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170709", 5, port);
+        bind_upf_1707(&reference, 0x1707_0009);
+
+        // The newer record: its DROP applied.
+        report_from_1707(seid, upf).await;
+        await_upf_1707(&log, "apply", aa::DROP, "the newer record's policy").await;
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(5),
+            || async {
+                lookup_policy_binding(&reference)
+                    .and_then(|b| b.ue_unreachable)
+                    .and_then(|u| u.upf_action)
+                    .map(|_| ())
+            },
+        )
+        .await;
+        assert!(ok.is_some(), "the newer record holds its DROP");
+
+        // The older record's undo, reaching the lock only now.
+        let mut stale = lookup_policy_binding(&reference)
+            .and_then(|b| b.ue_unreachable)
+            .expect("record");
+        stale.notify_token = nextgcore_sbi::callback_auth::CallbackToken::mint();
+        stale.subscription_id = None;
+        ue_reachability::undo(reference.clone(), stale).await;
+        assert_eq!(
+            upf_log_1707(&log, "recv"),
+            vec![aa::DROP],
+            "a stale undo leaves the newer record's DROP"
+        );
+
+        // The newer record's own end re-arms it.
+        let token = record_token_1707(&reference);
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        await_upf_1707(&log, "apply", aa::BUFF | aa::NOCP, "its own end re-arms").await;
+
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// #1773 R13 m4: a record that ends stops its hold task at once, rather than
+    /// leaving it to sleep out `SMF_UE_UNREACHABLE_HOLD_SECS` (3600 s by default).
+    ///
+    /// REVERT-VERIFIED: with the hold a plain sleep (no `select!` on the record's
+    /// end), "the hold ends with its record" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_ends_with_its_record_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170710", 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        await_requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions", 1).await;
+        let token = record_token_1707(&reference);
+        let running = |want: bool| {
+            let token = token.clone();
+            async move {
+                nextgcore_sbi::test_support::poll_until(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_millis(5),
+                    || async { (ue_reachability::hold_running(&token) == want).then_some(()) },
+                )
+                .await
+                .is_some()
+            }
+        };
+        assert!(running(true).await, "the hold runs");
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        assert!(running(false).await, "the hold ends with its record");
+        await_requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-1707-0", 1).await;
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1707: the default policy, `refrain`, changes no FAR; an unknown value falls
+    /// back to it; the step's second and third options are one Apply Action (DROP),
+    /// since NOCP needs BUFF (TS 29.244 §8.2.26, `29244-k00.txt:30338`).
+    #[test]
+    fn the_step_3c_policy_values_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        use ue_reachability::UpfPolicy;
+        assert_eq!(ue_reachability::upf_policy(), UpfPolicy::Refrain);
+        for (value, policy) in [
+            ("refrain", UpfPolicy::Refrain),
+            ("stop-notifications", UpfPolicy::StopNotifications),
+            ("discard", UpfPolicy::Discard),
+            ("stop-notifications-and-discard", UpfPolicy::Discard),
+            ("maybe", UpfPolicy::Refrain),
+        ] {
+            std::env::set_var("SMF_UE_UNREACHABLE_UPF_POLICY", value);
+            assert_eq!(ue_reachability::upf_policy(), policy, "{value}");
+        }
+        std::env::remove_var("SMF_UE_UNREACHABLE_UPF_POLICY");
     }
 
     // ---- #1387: an SM policy UpdateNotify is a DELTA over what the session enforces ----
