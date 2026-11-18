@@ -3363,8 +3363,11 @@ mod tests {
     }
 
     /// #1811: with no Access-Scope header, a delegated token for the UDR's
-    /// AuthenticationSubscription asks for its resource scope too, so a UDM
-    /// behind the SCP still reads it from a udrd enforcing that scope.
+    /// AuthenticationSubscription REQUESTS its resource scope too. Whether the NRF
+    /// grants it depends on whose identity the token carries. If the consumer
+    /// attested itself with its own CCA as a UDM, the NRF grants it. If the token
+    /// is SCP-attested (no consumer CCA, `trust_requester_identity` off), the UDR
+    /// grants the SCP `nudr-dr` only, and the read is refused 403: fail closed.
     #[test]
     fn the_delegated_scope_carries_the_resource_scope_1811() {
         let path = "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription";

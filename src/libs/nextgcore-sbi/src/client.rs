@@ -2489,6 +2489,93 @@ mod tests {
         assert!(oauth2.get_token(NfType::Udm, "nudm-sdm").await.is_ok());
     }
 
+    /// #1811 review m2: `prepare_request` is the second attach site. It runs when
+    /// `send_request`'s own attach got no token, here because the NRF refuses the
+    /// FIRST token request. It must ask for the resource scope too, or a udrd
+    /// enforcing it refuses the request 403.
+    ///
+    /// REVERT-VERIFIED: with `prepare_request`'s scope back to
+    /// `derive_scope_from_uri`, the producer answers 403 insufficient_scope and the
+    /// status assertion fails.
+    #[tokio::test]
+    async fn the_retried_attach_asks_for_the_resource_scope_too_1811() {
+        use crate::test_support::oauth2 as stand_in;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sk = crate::oauth::generate_es256_key();
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&token_requests);
+        let signer = sk.clone();
+        let (nrf_listener, nrf_addr) = crate::test_support::bound_listener().into_parts();
+        let nrf = crate::server::SbiServer::on_listener(
+            crate::server::SbiServerConfig::new(nrf_addr),
+            nrf_listener,
+        );
+        nrf.start(move |req: SbiRequest| {
+            let seen = Arc::clone(&seen);
+            let sk = signer.clone();
+            async move {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return SbiResponse::with_status(503);
+                }
+                let form = req.http.content.clone().unwrap_or_default();
+                let field = |name: &str| {
+                    form.split('&')
+                        .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                        .map(crate::uri_encode::decode_form_value)
+                        .unwrap_or_default()
+                };
+                let token = stand_in::es256_access_token(
+                    &sk,
+                    stand_in::TEST_NRF_KID,
+                    &field("targetNfType"),
+                    &field("scope"),
+                );
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({
+                        "access_token": token, "token_type": "Bearer", "expires_in": 3600
+                    }))
+                    .unwrap_or_else(|_| SbiResponse::with_status(500))
+            }
+        })
+        .await
+        .expect("nrf starts");
+
+        let (udr_listener, udr_addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = crate::server::SbiServerConfig::new(udr_addr)
+            .with_expected_audience_nf_type(NfType::Udr)
+            .with_oauth2_resource_scopes(crate::resource_scope::required_resource_scope);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = crate::server::SbiServer::on_listener(cfg, udr_listener);
+        udr.start(|_req: SbiRequest| async { SbiResponse::with_status(200) })
+            .await
+            .expect("udr starts");
+
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port()).with_oauth2(
+            stand_in::oauth2_client_for(nrf_addr.port(), NfType::Udm),
+            NfType::Udr,
+        );
+        let path = "/nudr-dr/v2/subscription-data/imsi-001010000018113/authentication-data/authentication-subscription";
+        let resp = client
+            .send_request(SbiRequest::get(path))
+            .await
+            .expect("response");
+        udr.stop().await.expect("stop udr");
+        nrf.stop().await.expect("stop nrf");
+
+        assert_eq!(
+            token_requests.load(Ordering::SeqCst),
+            2,
+            "the first attach failed, so prepare_request fetched the token"
+        );
+        assert_eq!(
+            resp.status,
+            200,
+            "{:?}",
+            resp.http.get_header("www-authenticate")
+        );
+    }
+
     #[tokio::test]
     async fn test_oauth2_not_attached_when_disabled() {
         let addr = serve_token_and_echo("test-access-token").await;
