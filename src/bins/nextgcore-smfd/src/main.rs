@@ -12834,6 +12834,12 @@ async fn handle_n1n2_transfer_failure_notification(
     // #1707, TS 23.502 §4.2.3.3 step 3c: "the UE is not reachable for the non-3GPP PDU
     // session" (TS 29.518 Table 6.1.6.3.x), so this session is recorded,
     // once it is DEACTIVATED again.
+    //
+    // #1773 R13 m3: REACHABILITY_REPORT is not per access. A UE CM-IDLE on non-3GPP
+    // but reachable over 3GPP gets the AMF's immediate REACHABLE report (TS 29.518
+    // §5.3.1, `29518-k00.txt:5074-5080`), so against a conformant AMF this record
+    // ends within milliseconds, and the next Downlink Data Report repeats the cycle.
+    // amfd never sends this cause; only a third-party AMF reaches it.
     if cause == "UE_NOT_REACHABLE_FOR_SESSION" {
         ue_reachability::record_ue_unreachable(sm_context_ref, false);
     }
@@ -18578,6 +18584,7 @@ mod tests {
                     amf_uri: "http://127.0.0.1:9".to_string(),
                     subscription_id: None,
                     upf_action: None,
+                    ended: Default::default(),
                 });
             }
         }
@@ -31036,6 +31043,18 @@ mod tests {
     async fn reachability_amf_1707(
         answers: Vec<(u16, serde_json::Value)>,
     ) -> (nextgcore_sbi::server::SbiServer, u16, AmfSeen1707) {
+        reachability_amf_with_1707(answers, false).await
+    }
+
+    /// [`reachability_amf_1707`]; with `immediate`, it behaves as a conformant AMF for
+    /// a UE reachable at subscription time (TS 29.518 §5.3.1, `29518-k00.txt:5074-5080`):
+    /// before it answers the subscription, it delivers a REACHABLE report to its
+    /// `eventNotifyUri` (seen as `NOTIFY`, with the SMF's status as the body), then
+    /// answers 201 with `subscriptionId` `sub-late`.
+    async fn reachability_amf_with_1707(
+        answers: Vec<(u16, serde_json::Value)>,
+        immediate: bool,
+    ) -> (nextgcore_sbi::server::SbiServer, u16, AmfSeen1707) {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let seen: AmfSeen1707 = Arc::default();
         let sink = Arc::clone(&seen);
@@ -31081,10 +31100,38 @@ mod tests {
                         if !complete {
                             return SbiResponse::with_status(400);
                         }
-                        let id = format!(
-                            "sub-1707-{}",
-                            subscriptions.fetch_add(1, Ordering::SeqCst)
-                        );
+                        let id = if immediate {
+                            let uri = sub["eventNotifyUri"].as_str().unwrap_or_default();
+                            let path = &uri[uri.find("/nsmf-callback/").unwrap_or(0)..];
+                            let status = smf_sbi_request_handler(
+                                SbiRequest::post(path.to_string()).with_body(
+                                    serde_json::json!({
+                                        "notifyCorrelationId": sub["notifyCorrelationId"],
+                                        "reportList": [{
+                                            "type": "REACHABILITY_REPORT",
+                                            "state": { "active": true },
+                                            "timeStamp": "2026-11-18T00:00:00Z",
+                                            "reachability": "REACHABLE",
+                                        }],
+                                    })
+                                    .to_string(),
+                                    "application/json",
+                                ),
+                            )
+                            .await
+                            .status;
+                            sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                                "NOTIFY".to_string(),
+                                path.to_string(),
+                                serde_json::json!(status),
+                            ));
+                            "sub-late".to_string()
+                        } else {
+                            format!(
+                                "sub-1707-{}",
+                                subscriptions.fetch_add(1, Ordering::SeqCst)
+                            )
+                        };
                         return SbiResponse::with_status(201)
                             .with_json_body(&serde_json::json!({
                                 "subscription": sub,
@@ -31477,6 +31524,451 @@ mod tests {
         pfcp_path::clear_global_upf_for_test();
         listener.abort();
         upf_task.abort();
+    }
+
+    // ---- #1773 R13 M1: a late success is cleaned up ----
+
+    /// What the #1707 holding UPF did, in order: `("recv", action)` when a Session
+    /// Modification arrived and `("apply", action)` when it answered it, `action`
+    /// being the Apply Action of its first Update FAR.
+    type UpfLog1707 = Arc<std::sync::Mutex<Vec<(&'static str, u16)>>>;
+
+    /// A stand-in UPF for #1773 R13 M1 that APPLIES a Session Modification when it
+    /// answers it, as the FAR state the UPF ends at is the one it answered last. It
+    /// answers at once, except a modification whose Update FAR sets `held`, which it
+    /// answers only once `release` is notified. A retransmission is ignored.
+    async fn holding_upf_1707(
+        held: u16,
+    ) -> (
+        std::net::SocketAddr,
+        UpfLog1707,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use pfcp_path::pfcp_message_type as t;
+        let upf = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = upf.local_addr().unwrap();
+        let log: UpfLog1707 = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (sink, gate) = (log.clone(), release.clone());
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut seen = std::collections::HashSet::new();
+            while let Ok((len, from)) = upf.recv_from(&mut buf).await {
+                let Some(h) = pfcp_path::parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                if h.msg_type != t::SESSION_MODIFICATION_REQUEST
+                    || !seen.insert(h.sequence_number)
+                {
+                    continue;
+                }
+                let body = &buf[h.body_offset..len];
+                let action = pfcp_path::find_ie(body, n4_build::pfcp_ie::UPDATE_FAR)
+                    .and_then(|far| pfcp_path::find_ie(far, n4_build::pfcp_ie::APPLY_ACTION))
+                    .map_or(0, n4_build::decode_apply_action);
+                sink.lock().unwrap().push(("recv", action));
+                let reply = pfcp_path::encode_wire_message(
+                    t::SESSION_MODIFICATION_RESPONSE,
+                    Some(h.seid),
+                    h.sequence_number,
+                    &[0x00, 0x13, 0x00, 0x01, 1],
+                );
+                let (upf, sink, gate) = (upf.clone(), sink.clone(), gate.clone());
+                tokio::spawn(async move {
+                    if action == held {
+                        gate.notified().await;
+                    }
+                    sink.lock().unwrap().push(("apply", action));
+                    let _ = upf.send_to(&reply, from).await;
+                });
+            }
+        });
+        (addr, log, release, task)
+    }
+
+    fn upf_log_1707(log: &UpfLog1707, what: &str) -> Vec<u16> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(w, _)| *w == what)
+            .map(|(_, a)| *a)
+            .collect()
+    }
+
+    async fn await_upf_1707(log: &UpfLog1707, what: &str, action: u16, why: &str) {
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(5),
+            || async { upf_log_1707(log, what).contains(&action).then_some(()) },
+        )
+        .await;
+        assert!(ok.is_some(), "{why}: {:?}", log.lock().unwrap());
+    }
+
+    /// A Downlink Data Report for `seid` through the real PFCP Session Report path,
+    /// from `upf`, whose client the caller installed.
+    async fn report_from_1707(seid: u64, upf: std::net::SocketAddr) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sock");
+        handle_pfcp_session_report(&sock, &dldr_report_packet(seid, 5), upf).await;
+    }
+
+    fn bind_upf_1707(reference: &str, upf_seid: u64) {
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        ctx.pfcp_sessions
+            .write()
+            .expect("w")
+            .insert(reference.to_string(), upf_seid);
+    }
+
+    fn record_token_1707(reference: &str) -> String {
+        lookup_policy_binding(reference)
+            .and_then(|b| b.ue_unreachable)
+            .expect("a record")
+            .notify_token
+            .as_str()
+            .to_string()
+    }
+
+    /// #1773 R13 M1(a): a conformant AMF sends the immediate REACHABLE report for a
+    /// UE reachable at subscription time BEFORE it answers the subscription 201
+    /// (TS 29.518 §5.3.1, `29518-k00.txt:5074-5080`; amfd #1641). The record is then
+    /// cleared before the SMF learns the subscriptionId, so the late 201's
+    /// subscription is deleted, and nothing holds.
+    ///
+    /// REVERT-VERIFIED: with `establish` not unsubscribing when `update_record` fails
+    /// after the 201, "the late 201's subscription is deleted" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_201_after_the_immediate_reachable_is_unsubscribed_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = reachability_amf_with_1707(vec![not_reachable_1707()], true).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170705", 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        await_requests_1707(&seen, "NOTIFY", "/ue-reachability/", 1).await;
+        let (_, status) = requests_1707(&seen, "NOTIFY", "/ue-reachability/")[0].clone();
+        assert_eq!(status, 204, "the immediate REACHABLE is admitted");
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+            || async {
+                (!requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-late")
+                    .is_empty())
+                .then_some(())
+            },
+        )
+        .await;
+        assert!(
+            ok.is_some(),
+            "the late 201's subscription is deleted: {:?}",
+            seen.lock().unwrap()
+        );
+        assert!(!ue_reachability::ue_unreachable_holds(&reference));
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1773 R13 M1(b): the UPF takes the step 3c DROP only after the record was
+    /// cleared (REACHABLE arrived within the PFCP round trip). `establish` then puts
+    /// the FAR back to BUFF|NOCP, so a DEACTIVATED session with no record is not left
+    /// silently discarding its downlink, and it subscribes to nothing.
+    ///
+    /// REVERT-VERIFIED: with `establish` not calling `restore_far_locked` when
+    /// `update_record` fails after the UPF's answer, "a late FAR change is restored"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_far_change_the_upf_takes_after_reachable_is_restored_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        use n4_build::apply_action as aa;
+        let (upf, log, release, upf_task) = holding_upf_1707(aa::DROP).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::Discard), None);
+        let (amf, port, seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170706", 5, port);
+        bind_upf_1707(&reference, 0x1707_0006);
+
+        report_from_1707(seid, upf).await;
+        await_upf_1707(&log, "recv", aa::DROP, "the policy is in flight").await;
+        let token = record_token_1707(&reference);
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        assert!(!ue_reachability::ue_unreachable_holds(&reference));
+        release.notify_one();
+        await_upf_1707(
+            &log,
+            "apply",
+            aa::BUFF | aa::NOCP,
+            "a late FAR change is restored",
+        )
+        .await;
+        assert_eq!(
+            upf_log_1707(&log, "apply"),
+            vec![aa::DROP, aa::BUFF | aa::NOCP],
+            "a late FAR change is restored"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            requests_1707(&seen, "POST", "/namf-evts/").is_empty(),
+            "a cleared record subscribes to nothing"
+        );
+
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// The #1773 R13 M1(c) set-up: a session the AMF reported unreachable under the
+    /// `discard` policy, whose step 3c DROP the holding UPF has received and holds.
+    /// Returns what the test needs, the caller holding the ambient and N4 locks.
+    async fn a_drop_in_flight_1707(
+        supi: &str,
+        upf_seid: u64,
+    ) -> (
+        String,
+        UpfLog1707,
+        Arc<tokio::sync::Notify>,
+        nextgcore_sbi::server::SbiServer,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        use n4_build::apply_action as aa;
+        let (upf, log, release, upf_task) = holding_upf_1707(aa::DROP).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::Discard), None);
+        let (amf, port, _seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port);
+        bind_upf_1707(&reference, upf_seid);
+        report_from_1707(seid, upf).await;
+        await_upf_1707(&log, "recv", aa::DROP, "the policy is in flight").await;
+        (reference, log, release, amf, vec![listener, upf_task])
+    }
+
+    /// The activation's FORW lands after the step 3c DROP in flight: it is SENT only
+    /// once the UPF answered the DROP, so the FAR ends at FORW.
+    async fn assert_forw_lands_last_1707(
+        log: &UpfLog1707,
+        release: &tokio::sync::Notify,
+        activation: tokio::task::JoinHandle<SbiResponse>,
+    ) {
+        use n4_build::apply_action as aa;
+        // The activation runs meanwhile, on another worker.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release.notify_one();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), activation)
+            .await
+            .expect("the activation completes")
+            .expect("joins");
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        await_upf_1707(log, "apply", aa::FORW, "the activation").await;
+        assert_eq!(
+            upf_log_1707(log, "apply").last(),
+            Some(&aa::FORW),
+            "the activation's FORW lands last: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    async fn end_drop_in_flight_1707(
+        reference: &str,
+        amf: nextgcore_sbi::server::SbiServer,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        for t in tasks {
+            t.abort();
+        }
+    }
+
+    /// #1773 R13 M1(c), `pfcp_session_modify`: the gNB's PDU_RES_SETUP_RSP arrives
+    /// while the step 3c DROP is in flight. Its FORW waits on `dl_far_locks`, so it
+    /// cannot land before the DROP and then be overwritten by it on an ACTIVE session.
+    ///
+    /// REVERT-VERIFIED: with `pfcp_session_modify` not taking its `dl_far_locks`
+    /// entry, "the activation's FORW lands last" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_activation_s_forw_lands_after_a_drop_in_flight_1707() {
+        use base64::Engine as _;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (reference, log, release, amf, tasks) =
+            a_drop_in_flight_1707("imsi-001010000170707", 0x1707_0007).await;
+
+        let setup_rsp = serde_json::json!({
+            "n2SmInfoType": "PDU_RES_SETUP_RSP",
+            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(GNB_SETUP_RESPONSE_TRANSFER),
+        })
+        .to_string();
+        let r = reference.clone();
+        let activation = tokio::spawn(async move {
+            handle_sm_context_update(
+                &r,
+                &SbiRequest::post("/x/modify").with_body(setup_rsp, "application/json"),
+            )
+            .await
+        });
+        assert_forw_lands_last_1707(&log, &release, activation).await;
+
+        end_drop_in_flight_1707(&reference, amf, tasks).await;
+    }
+
+    /// #1773 R13 M1(c), `split_pdu_session_modification`: a Service Request marks the
+    /// session ACTIVATING, then a Modify Indication for a split session (one with
+    /// additional NG-U tunnel FARs) arrives while the step 3c DROP is in flight. Its
+    /// FORW waits on `dl_far_locks` too.
+    ///
+    /// REVERT-VERIFIED: with `split_pdu_session_modification` not taking its
+    /// `dl_far_locks` entry, "the activation's FORW lands last" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_split_modification_s_forw_lands_after_a_drop_in_flight_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (reference, log, release, amf, tasks) =
+            a_drop_in_flight_1707("imsi-001010000170708", 0x1707_0008).await;
+        if let Ok(ctx) = smf_self().read() {
+            let mut sess = ctx.sess_find_by_sm_context_ref(&reference).expect("sess");
+            sess.dc_tunnel_fars = vec![DC_TUNNEL_FAR_BASE + 1];
+            ctx.sess_update(&sess);
+        }
+        mark_up_cnx_state(&reference, context::UpCnxState::Activating);
+
+        let r = reference.clone();
+        let activation = tokio::spawn(async move {
+            an_initiated_modification(&r, &indication([10, 1, 7, 8], 0x1707, &[5])).await
+        });
+        assert_forw_lands_last_1707(&log, &release, activation).await;
+
+        end_drop_in_flight_1707(&reference, amf, tasks).await;
+    }
+
+    /// #1773 R13 m1: an `undo` that waited on `dl_far_locks` while a NEWER record's
+    /// `establish` took the lock first and set DROP is stale: it re-checks under the
+    /// lock and leaves the newer record's FAR alone. The newer record's own end then
+    /// re-arms it.
+    ///
+    /// REVERT-VERIFIED: with `restore_far_locked` not re-checking for a newer record's
+    /// action, "a stale undo leaves the newer record's DROP" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stale_undo_leaves_a_newer_record_s_far_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        use n4_build::apply_action as aa;
+        let (upf, log, _release, upf_task) = holding_upf_1707(u16::MAX).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() =
+            (Some(ue_reachability::UpfPolicy::Discard), None);
+        let (amf, port, _seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170709", 5, port);
+        bind_upf_1707(&reference, 0x1707_0009);
+
+        // The newer record: its DROP applied.
+        report_from_1707(seid, upf).await;
+        await_upf_1707(&log, "apply", aa::DROP, "the newer record's policy").await;
+        let ok = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(5),
+            || async {
+                lookup_policy_binding(&reference)
+                    .and_then(|b| b.ue_unreachable)
+                    .and_then(|u| u.upf_action)
+                    .map(|_| ())
+            },
+        )
+        .await;
+        assert!(ok.is_some(), "the newer record holds its DROP");
+
+        // The older record's undo, reaching the lock only now.
+        let mut stale = lookup_policy_binding(&reference)
+            .and_then(|b| b.ue_unreachable)
+            .expect("record");
+        stale.notify_token = nextgcore_sbi::callback_auth::CallbackToken::mint();
+        stale.subscription_id = None;
+        ue_reachability::undo(reference.clone(), stale).await;
+        assert_eq!(
+            upf_log_1707(&log, "recv"),
+            vec![aa::DROP],
+            "a stale undo leaves the newer record's DROP"
+        );
+
+        // The newer record's own end re-arms it.
+        let token = record_token_1707(&reference);
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        await_upf_1707(&log, "apply", aa::BUFF | aa::NOCP, "its own end re-arms").await;
+
+        *ue_reachability::TEST_OVERRIDES.lock().unwrap() = (None, None);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+        pfcp_path::clear_global_upf_for_test();
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// #1773 R13 m4: a record that ends stops its hold task at once, rather than
+    /// leaving it to sleep out `SMF_UE_UNREACHABLE_HOLD_SECS` (3600 s by default).
+    ///
+    /// REVERT-VERIFIED: with the hold a plain sleep (no `select!` on the record's
+    /// end), "the hold ends with its record" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_ends_with_its_record_1707() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = reachability_amf_1707(vec![not_reachable_1707()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000170710", 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        await_requests_1707(&seen, "POST", "/namf-evts/v1/subscriptions", 1).await;
+        let token = record_token_1707(&reference);
+        let running = |want: bool| {
+            let token = token.clone();
+            async move {
+                nextgcore_sbi::test_support::poll_until(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_millis(5),
+                    || async { (ue_reachability::hold_running(&token) == want).then_some(()) },
+                )
+                .await
+                .is_some()
+            }
+        };
+        assert!(running(true).await, "the hold runs");
+        assert_eq!(
+            notify_reachability_1707(&reference, &token, "REACHABLE").await,
+            204
+        );
+        assert!(running(false).await, "the hold ends with its record");
+        await_requests_1707(&seen, "DELETE", "/namf-evts/v1/subscriptions/sub-1707-0", 1).await;
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
     }
 
     /// #1707: the default policy, `refrain`, changes no FAR; an unknown value falls

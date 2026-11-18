@@ -1797,6 +1797,8 @@ pub struct UeUnreachable {
     /// The step 3c Apply Action the downlink FAR was set to, once the UPF took it;
     /// `None` while it buffers and notifies as before.
     pub upf_action: Option<u16>,
+    /// Notified when the record ends, so its hold task stops waiting (#1773 R13 m4).
+    pub ended: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// A network-triggered paging in progress (#1631): what step 3a's re-paging rule

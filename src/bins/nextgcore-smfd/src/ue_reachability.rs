@@ -183,18 +183,20 @@ pub(crate) fn record_ue_unreachable(sm_context_ref: &str, ue_wide: bool) -> bool
             None if covered => None,
             None => {
                 let token = nextgcore_sbi::callback_auth::CallbackToken::mint();
+                let ended = std::sync::Arc::new(tokio::sync::Notify::new());
                 binding.ue_unreachable = Some(context::UeUnreachable {
                     ue_wide,
                     notify_token: token.clone(),
                     amf_uri: amf_uri.clone(),
                     subscription_id: None,
                     upf_action: None,
+                    ended: ended.clone(),
                 });
-                Some((supi, token))
+                Some((supi, token, ended))
             }
         }
     };
-    let Some((supi, token)) = made else {
+    let Some((supi, token, ended)) = made else {
         log::info!("UE of ref={sm_context_ref} reported unreachable again: already recorded");
         return false;
     };
@@ -210,7 +212,7 @@ pub(crate) fn record_ue_unreachable(sm_context_ref: &str, ue_wide: bool) -> bool
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         let sm_context_ref = sm_context_ref.to_string();
         rt.spawn(async move {
-            establish(&sm_context_ref, &supi, &amf_uri, &token).await;
+            establish(&sm_context_ref, &supi, &amf_uri, &token, &ended).await;
         });
     }
     true
@@ -253,12 +255,14 @@ fn update_record(
 /// hold. Each step's outcome is kept only while the record is still the one `token`
 /// names. A record cleared meanwhile is undone here (review rule: clean up a late
 /// success): the FAR changed after the clear is restored, the subscription created
-/// after it deleted.
+/// after it deleted. The hold ends early when the record does (`ended`), so a record
+/// cleared after milliseconds leaves no task sleeping out the hour (#1773 R13 m4).
 async fn establish(
     sm_context_ref: &str,
     supi: &str,
     amf_uri: &str,
     token: &nextgcore_sbi::callback_auth::CallbackToken,
+    ended: &tokio::sync::Notify,
 ) {
     if let Some(action) = upf_policy().far_action() {
         let smf_seid = crate::smf_n4_seid_for(sm_context_ref);
@@ -289,7 +293,10 @@ async fn establish(
             if !update_record(sm_context_ref, token, |u| {
                 u.subscription_id = Some(id.clone())
             }) {
+                // Cleared before the 201: a conformant AMF sends the immediate REACHABLE
+                // report ahead of it (TS 29.518 §5.3.1, `29518-k00.txt:5074-5080`).
                 unsubscribe(amf_uri, &id).await;
+                return;
             }
         }
         Err(e) => log::warn!(
@@ -298,7 +305,13 @@ async fn establish(
             hold()
         ),
     }
-    tokio::time::sleep(hold()).await;
+    {
+        let _holding = Holding::enter(token);
+        tokio::select! {
+            () = tokio::time::sleep(hold()) => {}
+            () = ended.notified() => return,
+        }
+    }
     if let Some(record) = take_token(sm_context_ref, token) {
         log::warn!(
             "UE of ref={sm_context_ref} recorded unreachable for {:?} with no reachability \
@@ -307,6 +320,43 @@ async fn establish(
         );
         undo(sm_context_ref.to_string(), record).await;
     }
+}
+
+/// The holds in progress, by their record's token: what a test reads to see a hold
+/// end with its record ([`hold_running`]).
+static HOLDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// One record's hold in progress, listed in [`HOLDS`] until dropped.
+struct Holding(String);
+
+impl Holding {
+    fn enter(token: &nextgcore_sbi::callback_auth::CallbackToken) -> Self {
+        let token = token.as_str().to_string();
+        HOLDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(token.clone());
+        Self(token)
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let mut holds = HOLDS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = holds.iter().position(|r| *r == self.0) {
+            holds.swap_remove(at);
+        }
+    }
+}
+
+/// Whether the hold of the record whose token is `token` is in progress.
+#[cfg(test)]
+pub(crate) fn hold_running(token: &str) -> bool {
+    HOLDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|t| t == token)
 }
 
 fn session_deactivated(sm_context_ref: &str) -> bool {
@@ -426,6 +476,7 @@ fn take_for_ue(sm_context_ref: &str) -> Vec<(String, context::UeUnreachable)> {
         .iter_mut()
         .filter(|(_, b)| b.supi == supi)
         .filter_map(|(r, b)| b.ue_unreachable.take().map(|u| (r.clone(), u)))
+        .inspect(|(_, u)| u.ended.notify_one())
         .collect()
 }
 
@@ -451,6 +502,7 @@ pub(crate) fn clear(sm_context_ref: &str, why: &str) -> bool {
 /// A session's binding was taken (a release): its record's subscription is deleted.
 /// Its FAR goes with the PFCP session.
 pub(crate) fn forget(record: context::UeUnreachable) {
+    record.ended.notify_one();
     if let (Some(id), Ok(rt)) = (
         record.subscription_id,
         tokio::runtime::Handle::try_current(),
@@ -461,7 +513,7 @@ pub(crate) fn forget(record: context::UeUnreachable) {
 }
 
 /// Undo what a record did: the FAR back to BUFF|NOCP, the subscription deleted.
-async fn undo(sm_context_ref: String, record: context::UeUnreachable) {
+pub(crate) async fn undo(sm_context_ref: String, record: context::UeUnreachable) {
     if record.upf_action.is_some() {
         let smf_seid = crate::smf_n4_seid_for(&sm_context_ref);
         if let Some(upf_seid) = crate::lookup_upf_seid(&sm_context_ref) {
@@ -478,8 +530,21 @@ async fn undo(sm_context_ref: String, record: context::UeUnreachable) {
 /// Re-arm the downlink FAR to BUFF|NOCP, the caller holding its `dl_far_locks` entry.
 /// Only for a session still DEACTIVATED: an activation sets FORW under the same lock
 /// after it marked the session ACTIVATING, so a restore after that would undo it.
+/// And only while no newer record holds a FAR change of its own: an undo that waited
+/// on the lock while a new record's `establish` took it first is stale, and would put
+/// back BUFF|NOCP under a record that believes DROP (#1773 R13 m1).
 async fn restore_far_locked(sm_context_ref: &str, smf_seid: u64, upf_seid: u64) {
     if !session_deactivated(sm_context_ref) {
+        return;
+    }
+    if crate::lookup_policy_binding(sm_context_ref)
+        .and_then(|b| b.ue_unreachable)
+        .is_some_and(|u| u.upf_action.is_some())
+    {
+        log::info!(
+            "Downlink FAR of ref={sm_context_ref} not re-armed: a newer unreachable record \
+             holds its own step 3c action"
+        );
         return;
     }
     if let Err(e) =
