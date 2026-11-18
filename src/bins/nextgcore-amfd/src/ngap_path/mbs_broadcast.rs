@@ -1437,7 +1437,10 @@ mod tests {
         server.process_mbs_broadcast().await;
         take_sent_ngap(&mut server);
         for a in [1, 2] {
-            server.process_ngap_message(a, &setup_response(&t, None)).await.unwrap();
+            server
+                .process_ngap_message(a, &setup_response(&t, None))
+                .await
+                .unwrap();
         }
         let r = body_json(&create.await.unwrap())["mbsContextRef"]
             .as_str()
@@ -1445,7 +1448,11 @@ mod tests {
             .to_string();
         let (epoch, id) = r.split_once('-').expect("<epoch>-<id>");
         assert_eq!(epoch.len(), 8, "{r}");
-        let stale_epoch = if epoch == "00000000" { "00000001" } else { "00000000" };
+        let stale_epoch = if epoch == "00000000" {
+            "00000001"
+        } else {
+            "00000000"
+        };
         let stale = crate::namf_request_handler(SbiRequest::delete(format!(
             "/namf-mbs-bc/v1/mbs-contexts/{stale_epoch}-{id}"
         )))
@@ -1453,7 +1460,10 @@ mod tests {
         assert_eq!(stale.status, 404, "a pre-restart ref is not found");
         assert_eq!(body_json(&stale)["cause"], "CONTEXT_NOT_FOUND");
         server.process_mbs_broadcast().await;
-        assert!(take_sent_ngap(&mut server).is_empty(), "and releases nothing");
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "and releases nothing"
+        );
         assert!(
             mcast
                 .broadcast_context_find(crate::ngap_mcast::parse_context_ref(&r).unwrap())
@@ -1464,7 +1474,10 @@ mod tests {
         let deleted = delete(&r).await;
         server.process_mbs_broadcast().await;
         for (a, _) in take_sent_ngap(&mut server) {
-            server.process_ngap_message(a, &release_response(&t, None)).await.unwrap();
+            server
+                .process_ngap_message(a, &release_response(&t, None))
+                .await
+                .unwrap();
         }
         assert_eq!(deleted.await.unwrap().status, 204);
     }

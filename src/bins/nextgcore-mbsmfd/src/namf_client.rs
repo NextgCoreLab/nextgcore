@@ -258,7 +258,9 @@ fn context_create_request(
         "notifyUri": amf_notify_uri(notify_base, notify_token),
         "snssai": leg.snssai,
     });
-    match nextgcore_sbi::message::SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts").with_json_body(&body) {
+    match nextgcore_sbi::message::SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+        .with_json_body(&body)
+    {
         Ok(r) => Some(r.with_part(nextgcore_sbi::message::SbiPart::with_content(
             N2_CONTENT_ID,
             nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
@@ -552,7 +554,10 @@ mod tests {
             .await;
         let after_first = sessions();
         let retry = crate::TEST_OAUTH2_CLIENT
-            .scope(oauth2, context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"))
+            .scope(
+                oauth2,
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
+            )
             .await;
 
         assert_eq!(bare, None, "the AMF's gate refuses a bare ContextCreate");
@@ -1151,7 +1156,10 @@ mod tests {
         let tmgi = tmgi_1758([0x02, 0x17, 0x96]);
 
         let context_ref = crate::TEST_OAUTH2_CLIENT
-            .scope(oauth2.clone(), context_create(&amf, &tmgi, &leg(), NOTIFY_BASE, "t"))
+            .scope(
+                oauth2.clone(),
+                context_create(&amf, &tmgi, &leg(), NOTIFY_BASE, "t"),
+            )
             .await
             .expect("amfd creates the context");
         let sent = ngap.sent.lock().unwrap().clone();
