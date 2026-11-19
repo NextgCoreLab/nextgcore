@@ -2444,13 +2444,22 @@ fn select_default_dnn(
         Some(sd) => format!("{sst:02x}-{sd}"),
         None => format!("{sst:02x}"),
     };
-    let infos = smf_sel_data.get("subscribedSnssaiInfos");
+    let infos = smf_sel_data
+        .get("subscribedSnssaiInfos")
+        .and_then(|i| i.as_object());
+    // #1878: the SD is hex in either case (TS 29.571 §5.4.4.2), so the key is
+    // compared that way too.
+    let lookup = |want: &str| {
+        infos.and_then(|i| {
+            i.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                .map(|(_, v)| v)
+        })
+    };
     // Fall back to the key with no SD when the exact key is absent: a subscription
     // provisioned without an SD still applies to a request that carries one, the
     // same widening `nsacfd`'s quota lookup does.
-    let entry = infos
-        .and_then(|i| i.get(&key))
-        .or_else(|| infos.and_then(|i| i.get(format!("{sst:02x}"))));
+    let entry = lookup(&key).or_else(|| lookup(&format!("{sst:02x}")));
 
     let dnn_infos = entry
         .and_then(|e| e.get("dnnInfos"))
@@ -5534,7 +5543,42 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
         eps_interworking,
     )
     .await;
-    let subscribed = udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await;
+    let subscribed = match udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await {
+        Ok(subscribed) => subscribed,
+        Err(udm::SliceNotSubscribed) => {
+            // #1878: the UDM holds this DNN's subscription for other slices only. TS
+            // 29.502 Table 6.1.3.2.3.1-3: 403 SNSSAI_DENIED, "the subscriber does not
+            // have the necessary subscription to access the SNSSAI"; TS 24.501
+            // §9.11.4.2: 5GSM cause #70, missing or unknown DNN in a slice. Before,
+            // the session took the first entry's (another slice's) AMBR and 5QI.
+            log::warn!(
+                "[{supi}] DNN {dnn} is not subscribed on S-NSSAI[SST:{sst} SD:{snssai_sd:?}]: \
+                 rejecting (SNSSAI_DENIED, 5GSM cause #70)"
+            );
+            fsm.transition_to(gsm_sm::GsmState::Exception);
+            rollback();
+            spawn_create_udm_rollback(&supi, pdu_session_id, None);
+            rollback_create_nsac(
+                nsac_admitted,
+                nsac_nf_id.as_deref(),
+                nsac_nsacf.as_ref(),
+                policy::plmn_ref(&nsac_plmn),
+                &supi,
+                pdu_session_id,
+                sst,
+                snssai_sd.as_deref(),
+            )
+            .await;
+            return sm_context_create_error(
+                403,
+                "SNSSAI_DENIED",
+                pdu_session_id,
+                pti,
+                policy::gsm_cause::MISSING_OR_UNKNOWN_DNN_IN_A_SLICE,
+                reject_to,
+            );
+        }
+    };
 
     // #293: subscribe to changes in what was just fetched, so an administrative edit
     // reaches a session that is already up (TS 23.502 §4.3.2.2.1 step 4,
@@ -12868,7 +12912,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     // #310: this re-read is now shared by BOTH arms. Before, the PCF arm returned 204
     // before reaching it, so the change reached a PCF-authorised session through no
     // path at all.
-    let Some(subscribed) = udm::fetch_sm_data(
+    let Ok(Some(subscribed)) = udm::fetch_sm_data(
         &binding.supi,
         &binding.dnn,
         binding.sst,
@@ -12876,6 +12920,8 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     )
     .await
     else {
+        // #1878: an `Err` (the slice is no longer subscribed for the DNN) is not
+        // answered with another slice's values either; the session keeps its QoS.
         log::warn!(
             "[{}] SM data changed but could not be re-read: ref={sm_context_ref} keeps \
              the QoS it was established with",
@@ -22724,6 +22770,119 @@ mod tests {
 
         assert_eq!(status, 500);
         assert_eq!(order, vec!["INC", "DEC"], "counted out once");
+    }
+
+    /// #1878: a create whose DNN the UDM subscribes on other slices only is refused
+    /// 403 SNSSAI_DENIED with 5GSM cause #70, and rolled back: its address is freed,
+    /// its UECM registration removed and its NSACF admission counted out. Before, it
+    /// was established on the first entry's (another slice's) AMBR and 5QI.
+    ///
+    /// REVERT-VERIFIED: with `parse_sm_data` falling back to the first entry again,
+    /// this fails: the create answers 201.
+    #[tokio::test]
+    async fn a_create_on_an_unsubscribed_slice_is_refused_and_rolled_back_1878() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, nsac_seen) = recording_nsacf(204, 204, zero, zero).await;
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (udm_srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    if req.header.uri.contains("/sm-data") {
+                        // The DNN is subscribed, on SST 2 only.
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!([{
+                                "singleNssai": { "sst": 2 },
+                                "dnnConfigurations": { "internet": {
+                                    "sessionAmbr": { "uplink": "1 Mbps", "downlink": "1 Mbps" },
+                                    "5gQosProfile": { "5qi": 8 } } }
+                            }]))
+                            .unwrap();
+                    }
+                    if req.header.method == "DELETE" {
+                        return SbiResponse::with_status(204);
+                    }
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010000018781";
+        let addresses = smf_self().read().unwrap().ipv4_pool.active_count();
+
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            5,
+            &n1(
+                5,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        side_effects_settled().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deregistered = || {
+            seen.lock().unwrap().iter().any(|(m, u)| {
+                m == "DELETE" && u.ends_with(&format!("{supi}/registrations/smf-registrations/5"))
+            })
+        };
+        while !deregistered() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let body: serde_json::Value = resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default();
+        let gsm_cause = resp.http.parts.iter().find_map(|p| {
+            let n1 = p.data.as_ref();
+            (n1.len() >= 5 && n1[0] == 0x2E && n1[3] == 0xC3).then(|| n1[4])
+        });
+        let order = nsac_order(&nsac_seen, supi);
+        let addresses_after = smf_self().read().unwrap().ipv4_pool.active_count();
+        let was_deregistered = deregistered();
+        stop_udm_leg();
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        udm_srv.stop().await.ok();
+
+        assert_eq!(resp.status, 403, "{body}");
+        assert_eq!(body["error"]["cause"], "SNSSAI_DENIED", "{body}");
+        assert_eq!(gsm_cause, Some(70), "5GSM #70 in the N1 reject");
+        assert_eq!(addresses_after, addresses, "the address is freed");
+        assert!(was_deregistered, "the UECM registration is removed");
+        assert_eq!(order, vec!["INC", "DEC"], "counted out");
+    }
+
+    /// #1878: the smf-select-data `subscribedSnssaiInfos` key carries the SD in
+    /// either case (TS 29.571 §5.4.4.2).
+    ///
+    /// REVERT-VERIFIED: with the exact-case key lookup back, this fails with
+    /// NoSubscribedDnn.
+    #[test]
+    fn the_default_dnn_key_matches_the_sd_in_either_case_1878() {
+        let upper = serde_json::json!({
+            "subscribedSnssaiInfos": { "01-0A0B0C": { "dnnInfos": [{ "dnn": "corp" }] } }
+        });
+        assert_eq!(
+            select_default_dnn(&upper, 1, Some("0a0b0c")),
+            Ok("corp".to_string())
+        );
     }
 
     // ---- #1874: a CreateSMContext dropped mid-way leaves nothing behind ----

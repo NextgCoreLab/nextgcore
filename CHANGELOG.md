@@ -34,6 +34,27 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   MongoDB with compose `depends_on` health conditions (#420).
 
 ### Changed
+- **Breaking:** udrd serves the AuthenticationSubscription resource
+  (`.../authentication-data/authentication-subscription`: K, OPc/TOPc, SQN) only to a token that
+  also carries its TS 29.505 resource scope. GET needs
+  `nudr-dr:subscription-data:authentication-subscription:read`; PATCH and the provisioning PUT
+  need `...:modify`. Anything else is refused `403 insufficient_scope` before anything is read
+  (#1811, TS 33.501 §13.4.1). udrd registers `allowedOperationsPerNfType` on `nudr-dr` that grants
+  the two scopes to the UDM only, and nrfd grants resource scopes per TS 29.510 Table 6.1.6.2.3-1
+  NOTE 11. Upgrade impact:
+  - Upgrade nrfd and udmd with or before udrd. An older NRF drops the resource scope, and an
+    older udmd does not request it. Either way udrd refuses the UDM's GET with 403, so 5G AKA
+    fails and registrations stop.
+  - The provisioning PUT, with OAuth2 on, needs a token carrying `:modify`. The NRF grants that
+    only to a UDM.
+  - A UDM reached through an SCP in Model D without attestation loses AKA (403). With no
+    `3gpp-Sbi-Client-Credentials` from the consumer, the SCP's token is SCP-attested, and the UDR
+    grants the SCP `nudr-dr` only. No shipped stack routes UDM to UDR through the SCP: udmd sends
+    Nudr directly. The SCP's `trust_requester_identity` (code-only, off) would assert the
+    consumer's identity unattested. That lets any SCP client claim to be a UDM and obtain a K-read
+    token, so leave it off.
+  - A UDR registered with a custom `allowedOperationsPerNfType` must list every NF type it
+    serves with its scopes. A type left out is barred from `nudr-dr` entirely.
 - **Breaking:** nrfd refuses NFRegister / NFUpdate / NFDeregister from a caller with no verified
   client certificate identity (`urn:uuid:` URI SAN, TS 33.310 §6.1.3c.3), plaintext included:
   `400 INVALID_CLIENT`, nothing stored (#1617 step f, operator decision). There is no opt-out.

@@ -29,6 +29,9 @@ pub mod gsm_cause {
     pub const INSUFFICIENT_RESOURCES: u8 = 26;
     #[allow(dead_code)]
     pub const MISSING_OR_UNKNOWN_DNN: u8 = 27;
+    /// #70 Missing or unknown DNN in a slice (TS 24.501 §9.11.4.2): the DNN is not
+    /// subscribed on the requested S-NSSAI (#1878).
+    pub const MISSING_OR_UNKNOWN_DNN_IN_A_SLICE: u8 = 70;
     #[allow(dead_code)]
     pub const UNKNOWN_PDU_SESSION_TYPE: u8 = 28;
     pub const USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED: u8 = 29;

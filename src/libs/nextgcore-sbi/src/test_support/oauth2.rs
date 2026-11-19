@@ -92,9 +92,8 @@ pub async fn token_nrf(sk: p256::ecdsa::SigningKey) -> (SbiServer, u16) {
                 let field = |name: &str| {
                     form.split('&')
                         .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                        .map(crate::uri_encode::decode_form_value)
                         .unwrap_or_default()
-                        .replace("%20", " ")
-                        .replace('+', " ")
                 };
                 let token =
                     es256_access_token(&sk, TEST_NRF_KID, &field("targetNfType"), &field("scope"));

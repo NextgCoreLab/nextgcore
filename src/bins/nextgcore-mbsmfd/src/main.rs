@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod context;
+mod lane; // #1854: one ContextCreate/ContextDelete at a time per (AMF, TMGI)
 mod n2_mbs_transfer; // #417: the N2 MBS SM transfers, on the generated NGAP codec
 mod n4mb;
 mod namf_client;
@@ -944,17 +945,25 @@ async fn create_amf_mbs_context(
     tmgi: Tmgi,
     amf: namf_client::DiscoveredAmf,
 ) -> Option<namf_client::MbsContextRef> {
+    // #1854: the create and its record run in the (AMF, TMGI) lane, so a delete of
+    // the context a released session held on the same TMGI is either done before
+    // this create (which then gets a fresh context) or sees this record and is
+    // dropped. The AMF's ContextCreate is idempotent on the TMGI, so without the
+    // lane this create could be handed a context an in-flight delete then removes.
+    let lane = lane::enter(&amf.host, amf.port, Some(&tmgi)).await;
     let context_ref = namf_client::context_create(&amf, &tmgi).await?;
     let record = AmfMbsContext {
         host: amf.host,
         port: amf.port,
         nf_instance_id: amf.nf_instance_id,
         context_ref: context_ref.clone(),
+        tmgi: Some(tmgi),
     };
     let recorded = mbsmf_self()
         .read()
         .map(|c| c.record_amf_context(session_id, record.clone()))
         .unwrap_or(false);
+    drop(lane);
     if recorded {
         return Some(context_ref);
     }
@@ -996,9 +1005,10 @@ const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [Duration::from_millis(20); 5];
 async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
     let mut failed = Vec::new();
     for c in contexts {
-        match namf_client::context_delete(&c).await {
-            namf_client::ContextDeleteOutcome::Deleted
-            | namf_client::ContextDeleteOutcome::Gone => {
+        match delete_in_lane(&c).await {
+            None => {}
+            Some(namf_client::ContextDeleteOutcome::Deleted)
+            | Some(namf_client::ContextDeleteOutcome::Gone) => {
                 log::info!(
                     "MBS: AMF {}:{} released MBS context {}",
                     c.host,
@@ -1006,34 +1016,48 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
                     c.context_ref
                 );
             }
-            namf_client::ContextDeleteOutcome::Failed => failed.push(c),
+            Some(namf_client::ContextDeleteOutcome::Failed) => failed.push(c),
         }
     }
     if failed.is_empty() {
         return true;
     }
+    release_retries(failed);
+    false
+}
+
+/// #1854: one ContextDelete of `c` in its (AMF, TMGI) lane: `None`, not sent, when a
+/// live session holds the context again (a session reusing the TMGI was handed the
+/// same `mbsContextRef`, R24), checked inside the lane so no create for the TMGI
+/// can record it between the check and the send.
+pub(crate) async fn delete_in_lane(c: &AmfMbsContext) -> Option<namf_client::ContextDeleteOutcome> {
+    let _lane = lane::enter(&c.host, c.port, c.tmgi.as_ref()).await;
+    if mbsmf_self()
+        .read()
+        .is_ok_and(|ctx| ctx.amf_context_in_use(c))
+    {
+        log::info!(
+            "MBS: AMF {}:{} MBS context {} is in use again; its ContextDelete is dropped",
+            c.host,
+            c.port,
+            c.context_ref
+        );
+        return None;
+    }
+    Some(namf_client::context_delete(c).await)
+}
+
+/// The fast retries of [`release_amf_contexts`] (#1758), on a detached task; then
+/// (#1817) the reconciler.
+fn release_retries(mut failed: Vec<AmfMbsContext>) {
     spawn_detached(async move {
         for delay in AMF_RELEASE_RETRY_DELAYS {
             tokio::time::sleep(delay).await;
             let mut still = Vec::new();
             for c in failed {
-                // R24: a session reusing the TMGI got this same context back.
-                if mbsmf_self()
-                    .read()
-                    .is_ok_and(|ctx| ctx.amf_context_in_use(&c))
-                {
-                    log::info!(
-                        "MBS: AMF {}:{} MBS context {} is in use again; its ContextDelete is \
-                         dropped",
-                        c.host,
-                        c.port,
-                        c.context_ref
-                    );
-                    continue;
-                }
-                if namf_client::context_delete(&c).await
-                    == namf_client::ContextDeleteOutcome::Failed
-                {
+                // R24, #1854: in its lane, and not when a session reusing the TMGI
+                // got this same context back.
+                if delete_in_lane(&c).await == Some(namf_client::ContextDeleteOutcome::Failed) {
                     still.push(c);
                 }
             }
@@ -1055,7 +1079,6 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
         // #1817: not dropped. The reconciler keeps retrying until the AMF answers.
         reconcile::park(failed);
     });
-    false
 }
 
 /// Handle MBS Session Release (TS 23.247 7.2.3)

@@ -806,7 +806,7 @@ impl SbiClient {
         // attached here, as `prepare_request` would, so the token the producer
         // refuses is known (review m1: only that token is evicted). A failure to
         // obtain one is left to `prepare_request`, which fails closed (#63).
-        let scope = derive_scope_from_uri(&request.header.uri);
+        let scope = request_access_scope(&request);
         let ours = request.http.get_header("Authorization").is_none() && !scope.is_empty();
         let mut resend = None;
         if let Some((oauth2, target)) = ours
@@ -1170,7 +1170,7 @@ impl SbiClient {
             // copied from a hyper (lowercased HTTP/2) message also counts.
             if request.http.get_header("Authorization").is_none() {
                 // Derive scope from the request URI service name
-                let scope = derive_scope_from_uri(&request.header.uri);
+                let scope = request_access_scope(request);
                 if !scope.is_empty() {
                     match oauth2.authorization_header(*target_nf_type, &scope).await {
                         Ok(auth_value) => {
@@ -1704,6 +1704,18 @@ fn bearer_challenge_error(www_authenticate: &str) -> Option<String> {
             .eq_ignore_ascii_case("error")
             .then(|| val.trim().trim_matches('"').to_string())
     })
+}
+
+/// #1811: the scope this client asks the NRF for to send `request`: the
+/// service-level scope plus the resource-level scope the operation needs, if
+/// any (TS 29.500 §6.7.3; [`crate::resource_scope`]). A producer that enforces
+/// a resource scope refuses a token for the service alone.
+fn request_access_scope(request: &SbiRequest) -> String {
+    crate::resource_scope::access_token_scope(
+        &derive_scope_from_uri(&request.header.uri),
+        &request.header.method,
+        &request.header.uri,
+    )
 }
 
 fn derive_scope_from_uri(uri: &str) -> String {
@@ -2364,6 +2376,25 @@ mod tests {
     }
 
     #[test]
+    fn the_auth_subscription_token_asks_for_the_resource_scope_1811() {
+        let path = "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription";
+        assert_eq!(
+            request_access_scope(&SbiRequest::get(path)),
+            "nudr-dr nudr-dr:subscription-data:authentication-subscription:read"
+        );
+        assert_eq!(
+            request_access_scope(&SbiRequest::patch(path)),
+            "nudr-dr nudr-dr:subscription-data:authentication-subscription:modify"
+        );
+        assert_eq!(
+            request_access_scope(&SbiRequest::get(
+                "/nudr-dr/v2/subscription-data/imsi-001010000000001/provisioned-data/am-data"
+            )),
+            "nudr-dr"
+        );
+    }
+
+    #[test]
     fn test_derive_scope_from_uri() {
         assert_eq!(
             derive_scope_from_uri("/nsmf-pdusession/v1/sm-contexts"),
@@ -2456,6 +2487,93 @@ mod tests {
 
         // The token was cached for (target NF type, scope).
         assert!(oauth2.get_token(NfType::Udm, "nudm-sdm").await.is_ok());
+    }
+
+    /// #1811 review m2: `prepare_request` is the second attach site. It runs when
+    /// `send_request`'s own attach got no token, here because the NRF refuses the
+    /// FIRST token request. It must ask for the resource scope too, or a udrd
+    /// enforcing it refuses the request 403.
+    ///
+    /// REVERT-VERIFIED: with `prepare_request`'s scope back to
+    /// `derive_scope_from_uri`, the producer answers 403 insufficient_scope and the
+    /// status assertion fails.
+    #[tokio::test]
+    async fn the_retried_attach_asks_for_the_resource_scope_too_1811() {
+        use crate::test_support::oauth2 as stand_in;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sk = crate::oauth::generate_es256_key();
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&token_requests);
+        let signer = sk.clone();
+        let (nrf_listener, nrf_addr) = crate::test_support::bound_listener().into_parts();
+        let nrf = crate::server::SbiServer::on_listener(
+            crate::server::SbiServerConfig::new(nrf_addr),
+            nrf_listener,
+        );
+        nrf.start(move |req: SbiRequest| {
+            let seen = Arc::clone(&seen);
+            let sk = signer.clone();
+            async move {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return SbiResponse::with_status(503);
+                }
+                let form = req.http.content.clone().unwrap_or_default();
+                let field = |name: &str| {
+                    form.split('&')
+                        .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                        .map(crate::uri_encode::decode_form_value)
+                        .unwrap_or_default()
+                };
+                let token = stand_in::es256_access_token(
+                    &sk,
+                    stand_in::TEST_NRF_KID,
+                    &field("targetNfType"),
+                    &field("scope"),
+                );
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({
+                        "access_token": token, "token_type": "Bearer", "expires_in": 3600
+                    }))
+                    .unwrap_or_else(|_| SbiResponse::with_status(500))
+            }
+        })
+        .await
+        .expect("nrf starts");
+
+        let (udr_listener, udr_addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = crate::server::SbiServerConfig::new(udr_addr)
+            .with_expected_audience_nf_type(NfType::Udr)
+            .with_oauth2_resource_scopes(crate::resource_scope::required_resource_scope);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = crate::server::SbiServer::on_listener(cfg, udr_listener);
+        udr.start(|_req: SbiRequest| async { SbiResponse::with_status(200) })
+            .await
+            .expect("udr starts");
+
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port()).with_oauth2(
+            stand_in::oauth2_client_for(nrf_addr.port(), NfType::Udm),
+            NfType::Udr,
+        );
+        let path = "/nudr-dr/v2/subscription-data/imsi-001010000018113/authentication-data/authentication-subscription";
+        let resp = client
+            .send_request(SbiRequest::get(path))
+            .await
+            .expect("response");
+        udr.stop().await.expect("stop udr");
+        nrf.stop().await.expect("stop nrf");
+
+        assert_eq!(
+            token_requests.load(Ordering::SeqCst),
+            2,
+            "the first attach failed, so prepare_request fetched the token"
+        );
+        assert_eq!(
+            resp.status,
+            200,
+            "{:?}",
+            resp.http.get_header("www-authenticate")
+        );
     }
 
     #[tokio::test]

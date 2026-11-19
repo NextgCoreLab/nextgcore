@@ -46,6 +46,7 @@ pub mod n4_handler;
 pub mod n6_delay;
 pub mod nat_exclude;
 pub mod path_qos;
+pub mod pfcp_dup;
 pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod programmable_plane;
