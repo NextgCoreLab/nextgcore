@@ -165,6 +165,12 @@ struct Args {
     /// Repeatable. Every target must also be https.
     #[arg(long = "n32f-target-allow")]
     n32f_target_allow: Vec<String>,
+
+    /// The SBI port a home-domain host, a bare `--n32f-target-allow` host or a
+    /// `.domain` entry is admitted on (#1870). Repeatable; default 443. A
+    /// `host:port` entry names its own port.
+    #[arg(long = "n32f-target-port")]
+    n32f_target_port: Vec<u16>,
 }
 
 /// Parse "mcc:mnc" into a PlmnId
@@ -325,11 +331,14 @@ async fn main() -> Result<()> {
     } else {
         n32_tls_opt
     };
-    n32_server::set_n32_client_tls(n32_server::n32_peer_tls_for_profile(
+    let peer_tls = n32_server::n32_peer_tls_for_profile(
         profile,
         given,
         &nextgcore_sbi::security::TlsPaths::from_env(),
-    ));
+    );
+    // #1870 review: a missing file is a startup error, not a dial failure.
+    n32_server::check_peer_tls_files(profile, peer_tls.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
+    n32_server::set_n32_client_tls(peer_tls);
 
     // #1870: where a peer-supplied N32-f target may point, and over what.
     let home_domains: Vec<String> = sepp_self()
@@ -345,7 +354,11 @@ async fn main() -> Result<()> {
         nextgcore_sbi::security::SbiProfile::resolve(),
         home_domains,
         args.n32f_target_allow.clone(),
-    );
+    )
+    .with_allowed_ports(args.n32f_target_port.clone());
+    forward_policy
+        .check_files()
+        .map_err(|e| anyhow::anyhow!(e))?;
     if forward_policy.profile.is_production() {
         log::info!(
             "N32-f forwarding: production SBI profile, https targets only, under {:?} or in \

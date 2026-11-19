@@ -894,7 +894,15 @@ pub struct N32fForwardPolicy {
     pub allowed_targets: Vec<String>,
     /// The TLS material for the SEPP-to-NF hop under production.
     pub tls: TlsPaths,
+    /// The SBI ports a home-domain host, a bare-host entry or a `.suffix` entry
+    /// is admitted on (#1870 review: not every port of a home host). A
+    /// `host:port` entry names its own port. Default `[443]`, the https default
+    /// port an apiRoot without a port uses (TS 29.501 §4.4.1).
+    pub allowed_ports: Vec<u16>,
 }
+
+/// Default [`N32fForwardPolicy::allowed_ports`].
+pub const DEFAULT_N32F_TARGET_PORTS: &[u16] = &[443];
 
 impl N32fForwardPolicy {
     /// The policy for `profile` with this process's TLS paths and no targets
@@ -917,7 +925,40 @@ impl N32fForwardPolicy {
                 .filter(|t| !t.is_empty())
                 .collect(),
             tls: TlsPaths::from_env(),
+            allowed_ports: DEFAULT_N32F_TARGET_PORTS.to_vec(),
         }
+    }
+
+    /// The same policy admitting home and bare/suffix targets on `ports`
+    /// instead of [`DEFAULT_N32F_TARGET_PORTS`]. An empty list keeps the default.
+    pub fn with_allowed_ports(mut self, ports: Vec<u16>) -> Self {
+        if !ports.is_empty() {
+            self.allowed_ports = ports;
+        }
+        self
+    }
+
+    /// Under production, the TLS files the SEPP-to-NF hop needs must exist at
+    /// startup (#1870 review), named when one does not, rather than failing on
+    /// the first forward. Dev needs none.
+    pub fn check_files(&self) -> Result<(), String> {
+        if !self.profile.is_production() {
+            return Ok(());
+        }
+        check_tls_files(
+            "N32-f forwarding",
+            &[
+                ("CA (NEXTGCORE_SBI_TLS_CA)", Some(&self.tls.ca_cert)),
+                (
+                    "client certificate (NEXTGCORE_SBI_TLS_CLIENT_CERT)",
+                    self.tls.client_cert.as_ref(),
+                ),
+                (
+                    "client key (NEXTGCORE_SBI_TLS_CLIENT_KEY)",
+                    self.tls.client_key.as_ref(),
+                ),
+            ],
+        )
     }
 
     /// Whether `host:port` is a target this PLMN owns. Production only; dev
@@ -925,21 +966,23 @@ impl N32fForwardPolicy {
     fn admits(&self, host: &str, port: u16) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         let under = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
-        if self.home_domains.iter().any(|d| under(d)) {
+        // #1870 review: only the SBI port(s), not every port of a home host.
+        let sbi_port = self.allowed_ports.contains(&port);
+        if sbi_port && self.home_domains.iter().any(|d| under(d)) {
             return true;
         }
         self.allowed_targets.iter().any(|entry| {
             if let Some(suffix) = entry.strip_prefix('.') {
-                return under(suffix.trim_end_matches('.'));
+                return sbi_port && under(suffix.trim_end_matches('.'));
             }
             match entry.rsplit_once(':') {
                 // `host:port` or `[v6]:port`; a bare IPv6 literal's last group
                 // does not parse as a port unless it is bracketed.
                 Some((h, p)) if (!h.contains(':') || h.ends_with(']')) => match p.parse::<u16>() {
                     Ok(p) => h == host && p == port,
-                    Err(_) => *entry == host,
+                    Err(_) => sbi_port && *entry == host,
                 },
-                _ => *entry == host,
+                _ => sbi_port && *entry == host,
             }
         })
     }
@@ -990,6 +1033,45 @@ impl N32fForwardPolicy {
         config.client_key = self.tls.client_key.clone();
         Ok(nextgcore_sbi::client::SbiClient::new(config))
     }
+}
+
+/// Each `(label, path)` must be configured and an existing file (#1870 review).
+fn check_tls_files(what: &str, files: &[(&str, Option<&String>)]) -> Result<(), String> {
+    for (label, path) in files {
+        match path {
+            Some(p) if std::path::Path::new(p.as_str()).is_file() => {}
+            Some(p) => {
+                return Err(format!(
+                    "the SBI profile is production and the {what} {label} {p} does not exist"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "the SBI profile is production and no {what} {label} is configured"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Under production, the files of the installed peer-SEPP TLS
+/// ([`n32_peer_tls_for_profile`]) must exist at startup (#1870 review).
+pub fn check_peer_tls_files(profile: SbiProfile, tls: Option<&N32TlsConfig>) -> Result<(), String> {
+    let (true, Some(tls)) = (profile.is_production(), tls) else {
+        return Ok(());
+    };
+    check_tls_files(
+        "peer-SEPP",
+        &[
+            (
+                "client certificate (--n32-client-cert)",
+                tls.client_cert.as_ref(),
+            ),
+            ("client key (--n32-client-key)", tls.client_key.as_ref()),
+            ("CA (--n32-ca-cert)", tls.ca_cert.as_ref()),
+        ],
+    )
 }
 
 /// The TS 23.003 §28.2 home network domain of `plmn`:
@@ -2348,8 +2430,24 @@ mod tests {
             "[fd00::5]:443",
         ]);
         assert!(p.admits(&format!("udm.{HOME}"), 443));
+        // #1870 review: a home host, a bare-host entry or a suffix entry only on
+        // the SBI port(s), never on any port.
+        assert!(
+            !p.admits(&format!("udm.{HOME}"), 22),
+            "a home host's non-SBI port"
+        );
+        assert!(
+            !p.admits("10.0.0.5", 6379),
+            "a bare-host entry's non-SBI port"
+        );
+        assert!(
+            !p.admits("ausf.core.example", 8080),
+            "a suffix entry's non-SBI port"
+        );
+        let wider = production_policy(&[]).with_allowed_ports(vec![443, 7777]);
+        assert!(wider.admits(&format!("udm.{HOME}"), 7777));
         assert!(p.admits(&format!("UDM.{}.", HOME.to_uppercase()), 443));
-        assert!(p.admits("10.0.0.5", 1234));
+        assert!(p.admits("10.0.0.5", 443));
         assert!(p.admits("udr.internal", 8443));
         assert!(
             !p.admits("udr.internal", 8444),
@@ -2384,8 +2482,14 @@ mod tests {
     #[test]
     fn production_dials_an_admitted_target_with_mutual_tls_1870() {
         let client = production_policy(&[])
-            .client_for(&format!("https://udm.{HOME}:8443"))
-            .expect("admitted");
+            .client_for(&format!("https://udm.{HOME}"))
+            .expect("admitted on the default SBI port");
+        assert!(
+            production_policy(&[])
+                .client_for(&format!("https://udm.{HOME}:8443"))
+                .is_err(),
+            "a home host off the allowed SBI ports is refused"
+        );
         let config = client.config();
         assert_eq!(config.scheme, nextgcore_sbi::types::UriScheme::Https);
         assert_eq!(config.ca_cert.as_deref(), Some("/tls/ca/ca.crt"));
@@ -2565,5 +2669,50 @@ mod tests {
             err.contains(cert),
             "the forward must dial with the SEPP certificate: {err}"
         );
+    }
+
+    /// #1870 review: under production the forwarding and peer-SEPP TLS files
+    /// must exist at startup, named when one does not; dev needs none.
+    #[test]
+    fn production_checks_the_tls_files_at_startup_1870() {
+        let dir = std::env::temp_dir().join(format!(
+            "h2-1870-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, "pem").unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let mut policy = production_policy(&[]);
+        policy.tls.ca_cert = file("ca.crt");
+        policy.tls.client_cert = Some(file("client.crt"));
+        policy.tls.client_key = Some(file("client.key"));
+        assert!(policy.check_files().is_ok());
+        policy.tls.client_key = Some(dir.join("absent.key").to_string_lossy().into_owned());
+        let err = policy.check_files().unwrap_err();
+        assert!(err.contains("absent.key"), "{err}");
+        let mut dev = policy.clone();
+        dev.profile = SbiProfile::Dev;
+        assert!(dev.check_files().is_ok());
+
+        let peer = N32TlsConfig {
+            client_cert: Some(file("n32.crt")),
+            client_key: Some(file("n32.key")),
+            ca_cert: Some(file("n32-ca.crt")),
+            ..Default::default()
+        };
+        assert!(check_peer_tls_files(SbiProfile::Production, Some(&peer)).is_ok());
+        let mut no_ca = peer.clone();
+        no_ca.ca_cert = None;
+        let err = check_peer_tls_files(SbiProfile::Production, Some(&no_ca)).unwrap_err();
+        assert!(err.contains("--n32-ca-cert"), "{err}");
+        assert!(check_peer_tls_files(SbiProfile::Dev, Some(&no_ca)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
