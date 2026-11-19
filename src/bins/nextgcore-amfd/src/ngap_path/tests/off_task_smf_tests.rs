@@ -2458,3 +2458,54 @@ async fn an_ng_reset_that_supersedes_waiting_activations_closes_their_join_1924(
     assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
     server.forget_ue(new);
 }
+
+/// **#1924 (R31 M1).** The other NG-release caller: an SCTP association lost
+/// (restart, closure, or NG Setup without retention, TS 38.413 §8.7.1.1)
+/// during an idle Service Request releases the UE's NG connection as an NG
+/// Reset does, superseding the activations still waiting for a permit. Their
+/// join is closed straight away, not after `SMF_JOIN_MAX_WAIT`.
+///
+/// REVERT-VERIFIED: with `resolve_superseded_join_parts` dropped from
+/// `reset_ue_associations_of`, the join is still open and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_association_loss_that_supersedes_waiting_activations_closes_their_join_1924() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let _guami = ServeOneGuami::install();
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, _seen) = slow_up_cnx_smf(Duration::from_millis(400)).await;
+    let mut server = capturing_ngap_server().await;
+    // No permits: every offloaded exchange waits, as under heavy load.
+    server.sbi_offload = crate::sbi_offload::SbiOffload::new(0);
+    seed_gnb_session(&server, 1).await;
+    let (old, new) = (19_240_011u64, 19_240_012u64);
+    let pdu = idle_ue_with_two_sessions(
+        &mut server,
+        old,
+        new,
+        fast_port,
+        slow_port,
+        ("isr-1924-assoc-fast", "isr-1924-assoc-slow"),
+    );
+    server
+        .handle_initial_ue_message(1, &pdu)
+        .await
+        .expect("handled");
+    assert_eq!(
+        server.smf_joins.len(),
+        1,
+        "the join waits for both activations"
+    );
+
+    server
+        .reset_ue_associations_of(1, "SCTP association lost (test)")
+        .await;
+    assert!(
+        server.smf_joins.is_empty(),
+        "the superseded activations will never answer: their join is closed now"
+    );
+    assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
+    server.forget_ue(new);
+}

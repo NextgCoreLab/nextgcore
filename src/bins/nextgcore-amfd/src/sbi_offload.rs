@@ -441,6 +441,12 @@ impl SbiOffload {
     /// #1924: returns whether any work was dropped. A dropped job delivers no
     /// outcome, so a caller whose state waits on that outcome (an SMF join) must
     /// resolve it itself.
+    ///
+    /// `true` means SOME non-durable work on the key was dropped, not
+    /// necessarily the outcome the caller waits for: with that exchange already
+    /// running and other work queued behind it, it still answers. A caller that
+    /// then treats the outcome as lost is safe as long as a late outcome that
+    /// finds nothing waiting is ignored, as an SMF join's is (R31 m1).
     pub(crate) fn supersede_key(&mut self, key: SbiKey) -> bool {
         let Some(queue) = self.keys.get_mut(&key) else {
             return false;
