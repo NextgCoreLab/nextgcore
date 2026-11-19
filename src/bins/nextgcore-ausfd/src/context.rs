@@ -607,16 +607,41 @@ impl AusfContext {
         ue_list.get(&id).cloned()
     }
 
-    /// Update UE in the context
+    /// Update UE in the context: write back a context read from it.
+    ///
+    /// #1907: refused (`false`, nothing written) when `ue` carries an authCtxId
+    /// other than the stored one. That is a stale copy: a re-authentication
+    /// retired its authCtxId after it was read, and writing it back would revive
+    /// the retired id together with its old owner. Only
+    /// [`Self::ue_begin_authentication`] installs a new authCtxId.
     pub fn ue_update(&self, ue: &AusfUe) -> bool {
+        self.ue_write(ue, false)
+    }
+
+    /// #1872/#1907: store `ue` as the start of a new authentication, whose
+    /// fresh authCtxId (and owner) replaces and retires the previous one.
+    pub fn ue_begin_authentication(&self, ue: &AusfUe) -> bool {
+        self.ue_write(ue, true)
+    }
+
+    fn ue_write(&self, ue: &AusfUe, new_authentication: bool) -> bool {
         let mut ue_list = self.ue_list.write().unwrap();
         let mut supi_hash = self.supi_hash.write().unwrap();
         let mut ctx_hash = self.ctx_hash.write().unwrap();
 
         if let Some(existing) = ue_list.get_mut(&ue.id) {
-            // #1872: a new authentication's authCtxId retires the previous one,
-            // so a confirmation or DELETE for the old one finds nothing.
             if existing.ctx_id != ue.ctx_id {
+                if !new_authentication {
+                    log::debug!(
+                        "[{}] stale write for retired authCtxId {} refused (current {})",
+                        ue.suci,
+                        ue.ctx_id,
+                        existing.ctx_id
+                    );
+                    return false;
+                }
+                // #1872: a new authentication's authCtxId retires the previous
+                // one, so a confirmation or DELETE for the old one finds nothing.
                 ctx_hash.remove(&existing.ctx_id);
                 ctx_hash.insert(ue.ctx_id.clone(), ue.id);
             }
