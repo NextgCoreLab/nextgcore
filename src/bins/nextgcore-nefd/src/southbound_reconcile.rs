@@ -52,16 +52,14 @@ pub static PARKED: nextgcore_metrics::nf::CounterFamily = nextgcore_metrics::nf:
 
 /// The parked unsubscribes, oldest first.
 ///
-/// Tests that read or write it hold [`PENDING_TEST_LOCK`], declared beside it.
+/// Every test that can write it (any that reaches a failing southbound unsubscribe,
+/// through a handler or directly) holds `crate::context::NEF_CONTEXT_TEST_LOCK`,
+/// the lock beside the NEF's process-global state, which this set is part of
+/// (R27 #1947: a sibling test's park landed in another test's count, 1 run in 3).
 fn pending() -> &'static Mutex<VecDeque<SouthboundRef>> {
     static PENDING: Mutex<VecDeque<SouthboundRef>> = Mutex::new(VecDeque::new());
     &PENDING
 }
-
-/// Serialises the tests that touch [`pending`]: one test's reconcile pass would
-/// otherwise deliver or drain another's parked unsubscribe.
-#[cfg(test)]
-pub static PENDING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn lock() -> std::sync::MutexGuard<'static, VecDeque<SouthboundRef>> {
     pending().lock().unwrap_or_else(|e| e.into_inner())
@@ -117,7 +115,9 @@ pub fn clear_for_test() {
 }
 
 /// One pass: retry the parked unsubscribes, oldest first, for at most
-/// [`MAX_PASS`], against the producer URI configured now. Returns how many ended.
+/// [`MAX_PASS`], against the producer each subscription was made at (else the
+/// producer URI configured now, for one recorded before that was kept). Returns how
+/// many ended.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<SouthboundRef> = lock().drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
