@@ -623,6 +623,16 @@ struct NrfPolicy {
     /// profile (set in `main`), OFF under `dev`, where a plaintext stack has no
     /// identity to bind to. Default ON: a policy nobody set fails closed.
     require_subscriber_identity: bool,
+    /// #1917: NFRegister / NFUpdate / NFDeregister need the NF type from the
+    /// caller's OWN verified certificate (RFC 9310 NFTypes, TS 33.310 §6.1.3c.3),
+    /// and the profile's `nfType` must be one of them. Refused `400
+    /// INVALID_CLIENT` when the certificate names no NF type, or when the identity
+    /// came only through a forwarded header (the connection's certificate is then
+    /// the terminator's). Without this an SMF whose certificate carried no NFTypes
+    /// could register as AUSF and be granted nudm-ueau tokens (#1866). ON under the
+    /// `production` SBI profile (set in `main`), OFF under `dev`. Default ON: a
+    /// policy nobody set fails closed.
+    require_registrant_nf_types: bool,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
     /// signature (not just the claim binding). Default ON (issue #64 gap 2).
     cca_verify_signature: bool,
@@ -690,6 +700,7 @@ impl Default for NrfPolicy {
             // authentication; the operator chose not to rely on it.
             require_registrant_identity: true,
             require_subscriber_identity: true,
+            require_registrant_nf_types: true,
             cca_trusted_keys: std::collections::HashMap::new(),
             cca_conflicted: std::collections::HashSet::new(),
             cca_trusted_keys_dir: None,
@@ -1863,6 +1874,14 @@ async fn main() -> Result<()> {
     // #1809: subscriptions are bound to a verified identity under production.
     policy.require_subscriber_identity =
         nextgcore_sbi::security::SbiProfile::resolve().is_production();
+    // #1917: and NF management to the NF type the caller's certificate names.
+    policy.require_registrant_nf_types =
+        nextgcore_sbi::security::SbiProfile::resolve().is_production();
+    if !policy.require_registrant_nf_types {
+        log::warn!(
+            "nrfd-1917: dev SBI profile: a registrant whose certificate names no NF type              (RFC 9310 NFTypes), or whose identity was forwarded by a terminator, may              register as any NF type"
+        );
+    }
     if policy.require_subscriber_identity {
         let manager = nf_manager();
         let unbound = manager
@@ -2212,6 +2231,12 @@ fn oauth2_gate(
 /// is tested over real TLS (`server_tls_tests_1617`, `dev_pki_tests_1617`) and
 /// at the handlers (`unverified_registrant_tests_1617`). Test-only: nothing in
 /// the daemon can attach an identity a handshake did not verify.
+///
+/// #1917: that certificate also names the NF type the request registers as (a
+/// PUT's `nfType`) or manages (the stored profile's), as a production NF
+/// certificate does (RFC 9310 NFTypes); one naming none is refused under the
+/// production profile, and that refusal is tested in
+/// `registrant_nf_type_tests_1917`.
 #[cfg(test)]
 async fn nrf_handler_as_path_certificate(mut request: SbiRequest) -> SbiResponse {
     if request.peer_cert_nf_instance_id.is_none() {
@@ -2222,8 +2247,32 @@ async fn nrf_handler_as_path_certificate(mut request: SbiRequest) -> SbiResponse
             .and_then(|rest| rest.split(['/', '?']).next())
             .filter(|id| !id.is_empty())
             .map(str::to_string);
+        if let Some(id) = request.peer_cert_nf_instance_id.clone() {
+            if request.peer_cert_nf_types.is_empty() {
+                request.peer_cert_nf_types = test_certificate_nf_type(&request, &id)
+                    .into_iter()
+                    .collect();
+            }
+        }
     }
     nrf_sbi_request_handler(request).await
+}
+
+/// #1917, tests only: the NF type a stand-in certificate for `id` names, from a
+/// PUT body's `nfType`, else from the stored profile.
+#[cfg(test)]
+fn test_certificate_nf_type(request: &SbiRequest, id: &str) -> Option<String> {
+    request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .and_then(|v| v.get("nfType").and_then(|t| t.as_str()).map(str::to_string))
+        .or_else(|| {
+            nf_manager()
+                .get(&nextgcore_nrfd::nnrf_handler::canonical_nf_instance_id(id))
+                .map(|p| p.nf_type.clone())
+        })
 }
 
 async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
@@ -2445,9 +2494,12 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         );
     }
     // #1611: and only as an NF type its verified certificate names.
-    if let Some(refused) =
-        registrant.bind_nf_type("NFRegister", nf_instance_id, &nf_profile.nf_type)
-    {
+    if let Some(refused) = registrant.bind_nf_type(
+        "NFRegister",
+        nf_instance_id,
+        &nf_profile.nf_type,
+        registrant_nf_types_required(),
+    ) {
         return refused;
     }
     // #1719: and claims only the NF Sets the operator provisioned it for.
@@ -2586,10 +2638,14 @@ async fn handle_nf_deregister(nf_instance_id: &str, request: &SbiRequest) -> Sbi
 
     // Fetch the profile before deregistering so we can notify subscribers
     let profile_for_notify = manager.get(nf_instance_id);
-    if let Some(refused) = profile_for_notify
-        .as_ref()
-        .and_then(|p| registrant.bind_nf_type("NFDeregister", nf_instance_id, &p.nf_type))
-    {
+    if let Some(refused) = profile_for_notify.as_ref().and_then(|p| {
+        registrant.bind_nf_type(
+            "NFDeregister",
+            nf_instance_id,
+            &p.nf_type,
+            registrant_nf_types_required(),
+        )
+    }) {
         return refused;
     }
 
@@ -2832,7 +2888,12 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     }
     // #1611: the patched profile's nfType must still be one the verified
     // certificate names (a patch must not re-type the instance either).
-    if let Some(refused) = registrant.bind_nf_type("NFUpdate", nf_instance_id, &updated.nf_type) {
+    if let Some(refused) = registrant.bind_nf_type(
+        "NFUpdate",
+        nf_instance_id,
+        &updated.nf_type,
+        registrant_nf_types_required(),
+    ) {
         return refused;
     }
     // #1719: a patch may not add an NF Set the registrant is not provisioned for.
@@ -4776,6 +4837,9 @@ struct RegistrantIdentity {
     /// The NF types the caller's verified certificate names. Empty means the
     /// certificate asserts none (or there is no certificate), never "any".
     nf_types: Vec<String>,
+    /// #1917: the certificate identity came only through a forwarded header, so
+    /// no NF type of the caller is known (see [`Self::bind_nf_type`]).
+    forwarded: bool,
 }
 
 impl RegistrantIdentity {
@@ -4814,6 +4878,7 @@ impl RegistrantIdentity {
         Self {
             instance_ids,
             nf_types,
+            forwarded,
         }
     }
 
@@ -4881,19 +4946,37 @@ impl RegistrantIdentity {
         )))
     }
 
-    /// The profile's `nfType` must be one the verified certificate names, when it
-    /// names any (TS 33.310 §6.1.3c.3, RFC 9310). `Some` is the refusal to send.
+    /// The profile's `nfType` must be one the verified certificate names (TS
+    /// 33.310 §6.1.3c.3, RFC 9310; TS 33.501 §5.9.2.2 NOTE). When it names none,
+    /// or the identity was forwarded, the type cannot be verified: `required`
+    /// ([`registrant_nf_types_required`], the production profile, #1917) refuses
+    /// it, otherwise it is accepted as asserted. `Some` is the refusal to send.
     fn bind_nf_type(
         &self,
         operation: &str,
         nf_instance_id: &str,
         nf_type: &str,
+        required: bool,
     ) -> Option<SbiResponse> {
-        if self.nf_types.is_empty()
-            || self
-                .nf_types
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(nf_type))
+        if self.nf_types.is_empty() {
+            if !required {
+                return None;
+            }
+            nextgcore_nrfd::metrics::observe_unverified_nf_management();
+            let why = if self.forwarded {
+                "its identity was forwarded by a TLS terminator, whose certificate names                  the terminator's NF types, not the requester's"
+            } else {
+                "its client certificate names no NF type (RFC 9310 NFTypes)"
+            };
+            log::debug!("{operation} for NF instance {nf_instance_id} as {nf_type} refused: {why}");
+            return Some(invalid_client(&format!(
+                "{operation}: nfType {nf_type:?} cannot be verified: {why} (TS 33.310                  §6.1.3c.3)"
+            )));
+        }
+        if self
+            .nf_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(nf_type))
         {
             return None;
         }
@@ -4908,6 +4991,16 @@ impl RegistrantIdentity {
             self.nf_types
         )))
     }
+}
+
+/// #1917: [`NrfPolicy::require_registrant_nf_types`], which tests of the dev
+/// behaviour turn off for their own task only.
+fn registrant_nf_types_required() -> bool {
+    #[cfg(test)]
+    if let Ok(required) = registrant_nf_type_tests_1917::REQUIRED.try_with(|r| *r) {
+        return required;
+    }
+    nrf_policy().require_registrant_nf_types
 }
 
 /// #1809: [`NrfPolicy::require_subscriber_identity`], which tests of the dev
@@ -7902,6 +7995,7 @@ mod tests {
             json!({"nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED"}).to_string(),
         );
         req.peer_cert_nf_instance_id = Some(id.into());
+        req.peer_cert_nf_types = vec!["SMF".into()];
         let resp = handle_nf_register(id, &req).await;
         assert_eq!(resp.status, 201);
         let body: serde_json::Value =
@@ -7922,6 +8016,7 @@ mod tests {
             .to_string(),
         );
         req2.peer_cert_nf_instance_id = Some(id2.into());
+        req2.peer_cert_nf_types = vec!["SMF".into()];
         let resp2 = handle_nf_register(id2, &req2).await;
         let body2: serde_json::Value =
             serde_json::from_str(resp2.http.content.as_deref().unwrap()).unwrap();
@@ -8064,6 +8159,7 @@ mod tests {
         let mut put = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{rogue_id}"));
         put.http.set_content(profile(rogue_id, "EES").to_string());
         put.peer_cert_nf_instance_id = Some(rogue_id.into());
+        put.peer_cert_nf_types = vec!["EES".into()];
         let resp = handle_nf_register(rogue_id, &put).await;
         assert_eq!(
             resp.status, 201,
@@ -11619,6 +11715,7 @@ mod tests {
         let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
         req.http.set_content(profile.to_string());
         req.peer_cert_nf_instance_id = Some(nf_id.into());
+        req.peer_cert_nf_types = vec![TEST_NF_TYPE.into()];
 
         // --- First PUT: a new instance -> 201 and NF_REGISTERED -------------
         let first = handle_nf_register(nf_id, &req).await;
@@ -11639,6 +11736,7 @@ mod tests {
         let mut replacement = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
         replacement.http.set_content(replacement_body.to_string());
         replacement.peer_cert_nf_instance_id = Some(nf_id.into());
+        replacement.peer_cert_nf_types = vec![TEST_NF_TYPE.into()];
 
         let second = handle_nf_register(nf_id, &replacement).await;
         assert_eq!(second.status, 200, "a replacement is 200 OK");
@@ -12480,7 +12578,12 @@ mod registrant_binding_tests_1611 {
     async fn the_registrant_binding_folds_only_uuid_case_1633() {
         let own = "nrfd1633-m2";
         let other = own.to_ascii_uppercase();
-        let (server, client) = mtls_nrf("m2-1633", Some(&format!("urn:uuid:{own}")), None).await;
+        let (server, client) = mtls_nrf(
+            "m2-1633",
+            Some(&format!("urn:uuid:{own}")),
+            Some(&["CUSTOM_T1633M2"]),
+        )
+        .await;
         let run = async {
             let resp = put(&client, &other, "CUSTOM_T1633M2").await;
             assert_eq!(resp.status, 400, "{:?}", resp.http.content);
@@ -12503,8 +12606,12 @@ mod registrant_binding_tests_1611 {
 
         let lower = "1633d0d0-0000-4000-8000-0000000000c3";
         let upper = lower.to_ascii_uppercase();
-        let (server, client) =
-            mtls_nrf("m2-1633-uuid", Some(&format!("urn:uuid:{upper}")), None).await;
+        let (server, client) = mtls_nrf(
+            "m2-1633-uuid",
+            Some(&format!("urn:uuid:{upper}")),
+            Some(&["CUSTOM_T1633M2"]),
+        )
+        .await;
         let run = async {
             let resp = put(&client, lower, "CUSTOM_T1633M2").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
@@ -12522,7 +12629,12 @@ mod registrant_binding_tests_1611 {
     }
 
     /// A verified certificate without an NFTypes extension still binds the
-    /// instance (TS 33.310 §6.1.3c.3 URI-ID), but asserts no type to bind.
+    /// instance (TS 33.310 §6.1.3c.3 URI-ID), but asserts no type to bind. Over
+    /// real mTLS and under the NRF's shipped (production) policy, #1917: it
+    /// therefore registers as no type at all, its own instance included.
+    ///
+    /// REVERT-VERIFIED (#1917): with the empty-NFTypes branch of `bind_nf_type`
+    /// returning `None` again, the own-instance PUT is 201 and this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_certificate_without_nf_types_binds_only_the_instance_1611() {
         let own = "1611c0c0-0000-4000-8000-00000000000c";
@@ -12533,7 +12645,18 @@ mod registrant_binding_tests_1611 {
             assert_eq!(resp.status, 400, "{:?}", resp.http.content);
             assert_eq!(cause(&resp), "INVALID_CLIENT");
             let resp = put(&client, own, "CUSTOM_T1611C").await;
-            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(cause(&resp), "INVALID_CLIENT");
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("names no NF type"),
+                "{:?}",
+                resp.http.content
+            );
+            assert!(stored_type(own).is_none(), "nothing stored for {own}");
         };
         tokio::time::timeout(Duration::from_secs(30), run)
             .await
@@ -12624,7 +12747,9 @@ mod registrant_binding_tests_1611 {
         );
         assert_eq!(none, RegistrantIdentity::default());
         assert!(none.bind_instance("NFRegister", "any").is_none());
-        assert!(none.bind_nf_type("NFRegister", "any", "UDM").is_none());
+        assert!(none
+            .bind_nf_type("NFRegister", "any", "UDM", false)
+            .is_none());
 
         // A verified token subject.
         let token = RegistrantIdentity::of(&request_with(None, &[], None, Some("nf-a")), &plain);
@@ -12648,7 +12773,22 @@ mod registrant_binding_tests_1611 {
             [("forwarded client certificate", "nf-c".to_string())]
         );
         assert!(fwd.nf_types.is_empty());
-        assert!(fwd.bind_nf_type("NFRegister", "nf-c", "AMF").is_none());
+        assert!(fwd.forwarded);
+        // Dev: accepted as asserted. Production (#1917): the forwarded caller's
+        // type cannot be verified, so it is refused.
+        assert!(fwd
+            .bind_nf_type("NFRegister", "nf-c", "AMF", false)
+            .is_none());
+        let refused = fwd
+            .bind_nf_type("NFRegister", "nf-c", "AMF", true)
+            .expect("#1917: a forwarded identity's type is unverifiable");
+        assert_eq!(refused.status, 400);
+        assert!(refused
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("forwarded by a TLS terminator"));
 
         // The direct certificate outranks the header and carries its types.
         let direct = RegistrantIdentity::of(
@@ -12659,9 +12799,12 @@ mod registrant_binding_tests_1611 {
             direct.instance_ids,
             [("client certificate", "nf-d".to_string())]
         );
-        assert!(direct.bind_nf_type("NFRegister", "nf-d", "amf").is_none());
+        assert!(!direct.forwarded);
+        assert!(direct
+            .bind_nf_type("NFRegister", "nf-d", "amf", true)
+            .is_none());
         let refused = direct
-            .bind_nf_type("NFRegister", "nf-d", "UDM")
+            .bind_nf_type("NFRegister", "nf-d", "UDM", false)
             .expect("refused");
         assert_eq!(refused.status, 400);
         assert!(refused
@@ -13817,16 +13960,26 @@ mod tests_nf_set_ids_1719 {
         let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"))
             .with_body(body.to_string(), "application/json");
         // #1617 step f: NF management needs a verified certificate identity, so
-        // each request carries one naming its own instance (no NF types, so the
-        // nfType binding admits any type). The allowlist check runs after it.
+        // each request carries one naming its own instance, and (#1917) the NF
+        // type it registers as. The allowlist check runs after both.
         req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = test_certificate_nf_type(&req, id).into_iter().collect();
         handle_nf_register(id, &req).await
     }
 
     async fn patch(id: &str, ops: serde_json::Value) -> SbiResponse {
+        patch_as(id, ops, &[]).await
+    }
+
+    /// A patch from a certificate naming the stored type and `more` (#1917: a
+    /// re-typing patch needs a certificate that names the new type too).
+    async fn patch_as(id: &str, ops: serde_json::Value, more: &[&str]) -> SbiResponse {
         let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}"))
             .with_body(ops.to_string(), "application/json-patch+json");
         req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = test_certificate_nf_type(&req, id).into_iter().collect();
+        req.peer_cert_nf_types
+            .extend(more.iter().map(|t| t.to_string()));
         handle_nf_update(id, &req).await
     }
 
@@ -13904,10 +14057,12 @@ mod tests_nf_set_ids_1719 {
                 assert_eq!(stored_sets(rogue), Some(vec![SET2.to_string()]));
 
                 // R19: NFUpdate re-typing the rogue to SMF while it keeps set 2,
-                // which only PCFs may claim: refused, type and sets unchanged.
-                let resp = patch(
+                // which only PCFs may claim: refused, type and sets unchanged. Its
+                // certificate names SMF too, so the set check is what refuses it.
+                let resp = patch_as(
                     rogue,
                     json!([{"op": "replace", "path": "/nfType", "value": "SMF"}]),
+                    &["SMF"],
                 )
                 .await;
                 assert_eq!(
@@ -14869,5 +15024,152 @@ mod sbi_profile_tests_1795 {
         check_listener_profile(SbiProfile::Production, Some(&tls))
             .expect("the NRF's own TLS is admitted under production");
         check_listener_profile(SbiProfile::Dev, None).expect("dev keeps its cleartext NRF");
+    }
+}
+
+/// #1917: under the production profile, NF management is bound to the NF type the
+/// caller's OWN verified certificate names (RFC 9310 NFTypes, TS 33.310 §6.1.3c.3,
+/// TS 33.501 §5.9.2.2 NOTE). A certificate naming none cannot register, update or
+/// deregister as any type; under dev it still may.
+#[cfg(test)]
+mod registrant_nf_type_tests_1917 {
+    use super::*;
+    use serde_json::json;
+
+    tokio::task_local! {
+        /// Overrides [`NrfPolicy::require_registrant_nf_types`] for one test's
+        /// task, so the dev behaviour is testable without touching the
+        /// process-global policy the rest of the binary reads.
+        pub(super) static REQUIRED: bool;
+    }
+
+    /// A request from a directly verified certificate for `id` naming `types`.
+    fn from_cert(mut req: SbiRequest, id: &str, types: &[&str]) -> SbiRequest {
+        req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+        req
+    }
+
+    fn put(id: &str, nf_type: &str, types: &[&str]) -> SbiRequest {
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"));
+        req.http.set_content(
+            json!({"nfInstanceId": id, "nfType": nf_type, "nfStatus": "REGISTERED"}).to_string(),
+        );
+        from_cert(req, id, types)
+    }
+
+    fn patch(id: &str, types: &[&str]) -> SbiRequest {
+        let req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}")).with_body(
+            json!([{"op": "replace", "path": "/nfStatus", "value": "SUSPENDED"}]).to_string(),
+            "application/json-patch+json",
+        );
+        from_cert(req, id, types)
+    }
+
+    fn assert_unverifiable_type(r: &SbiResponse, what: &str) {
+        assert_eq!(r.status, 400, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        assert!(body.contains("INVALID_CLIENT"), "{what}: {body}");
+        assert!(
+            body.contains("names no NF type"),
+            "{what}: refused for the missing NFTypes, not another reason: {body}"
+        );
+    }
+
+    /// The default fails closed, and the dev opt-out is per task only.
+    #[test]
+    fn a_policy_nobody_set_requires_the_certificate_nf_type_1917() {
+        assert!(NrfPolicy::default().require_registrant_nf_types);
+    }
+
+    /// **#1917.** A certificate with no NFTypes registers as no type under
+    /// production (an SMF could otherwise register as AUSF and be granted
+    /// nudm-ueau tokens, #1866), but as the asserted type under dev. A certificate
+    /// naming the type registers under production.
+    ///
+    /// REVERT-VERIFIED: with the empty-NFTypes branch of `bind_nf_type` returning
+    /// `None` again, the production PUT is 201 and the first assertion fails.
+    #[tokio::test]
+    async fn a_certificate_without_nf_types_registers_as_no_type_under_production_1917() {
+        let id = "19170000-0000-4000-8000-000000000001";
+        let r = REQUIRED
+            .scope(true, handle_nf_register(id, &put(id, "AUSF", &[])))
+            .await;
+        assert_unverifiable_type(&r, "production NFRegister without NFTypes");
+        assert!(nf_manager().get(id).is_none(), "nothing stored");
+
+        let r = REQUIRED
+            .scope(false, handle_nf_register(id, &put(id, "AUSF", &[])))
+            .await;
+        assert_eq!(
+            r.status, 201,
+            "dev keeps today's behaviour: {:?}",
+            r.http.content
+        );
+        let _ = nf_manager().deregister(id);
+
+        // Positive control: the certificate names the type it registers as.
+        let r = REQUIRED
+            .scope(true, handle_nf_register(id, &put(id, "AUSF", &["AUSF"])))
+            .await;
+        assert_eq!(r.status, 201, "{:?}", r.http.content);
+        // ... and only that type.
+        let other = "19170000-0000-4000-8000-000000000002";
+        let r = REQUIRED
+            .scope(
+                true,
+                handle_nf_register(other, &put(other, "AUSF", &["SMF"])),
+            )
+            .await;
+        assert_eq!(r.status, 400, "an SMF certificate cannot register an AUSF");
+        let _ = nf_manager().deregister(id);
+    }
+
+    /// **#1917.** NFUpdate and NFDeregister bind the same way: a certificate with
+    /// no NFTypes cannot manage the entry under production, and can under dev.
+    ///
+    /// REVERT-VERIFIED: with `registrant_nf_types_required()` passed as `false`
+    /// at the NFUpdate site, the production PATCH succeeds and this fails; the
+    /// same at the NFDeregister site fails the DELETE assertion.
+    #[tokio::test]
+    async fn update_and_deregister_need_the_certificate_nf_type_under_production_1917() {
+        let id = "19170000-0000-4000-8000-000000000003";
+        nf_manager()
+            .register(
+                NfProfile::from_json(
+                    &json!({"nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED"}),
+                )
+                .expect("profile"),
+            )
+            .expect("stored");
+
+        let r = REQUIRED
+            .scope(true, handle_nf_update(id, &patch(id, &[])))
+            .await;
+        assert_unverifiable_type(&r, "production NFUpdate without NFTypes");
+        let delete = from_cert(
+            SbiRequest::delete(format!("/nnrf-nfm/v1/nf-instances/{id}")),
+            id,
+            &[],
+        );
+        let r = REQUIRED
+            .scope(true, handle_nf_deregister(id, &delete))
+            .await;
+        assert_unverifiable_type(&r, "production NFDeregister without NFTypes");
+        assert!(nf_manager().get(id).is_some(), "the entry is untouched");
+
+        let r = REQUIRED
+            .scope(false, handle_nf_update(id, &patch(id, &[])))
+            .await;
+        assert!(
+            (200..300).contains(&r.status),
+            "dev NFUpdate: {} {:?}",
+            r.status,
+            r.http.content
+        );
+        let r = REQUIRED
+            .scope(false, handle_nf_deregister(id, &delete))
+            .await;
+        assert_eq!(r.status, 204, "dev NFDeregister: {:?}", r.http.content);
     }
 }
