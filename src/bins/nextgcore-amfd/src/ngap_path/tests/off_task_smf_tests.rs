@@ -2396,3 +2396,65 @@ async fn a_release_before_the_connected_report_reports_no_idle_1645() {
         sink_b.stop().await.expect("sink stop");
     }
 }
+
+/// **#1924.** An NG Reset that supersedes a Service Request's SMF activations
+/// before they started (they were still waiting for a permit) resolves the join
+/// that waited on them at once. Their outcomes never arrive, so before, the join
+/// lingered until its deadline: the flake of
+/// `a_release_before_the_connected_report_reports_no_idle_1645` under load, made
+/// deterministic here with an offload that has no permits to give.
+///
+/// REVERT-VERIFIED: with `resolve_superseded_join_parts` not called from the NG
+/// Reset handler, the join is still open and the assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ng_reset_that_supersedes_waiting_activations_closes_their_join_1924() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let _guami = ServeOneGuami::install();
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, _seen) = slow_up_cnx_smf(Duration::from_millis(400)).await;
+    let mut server = capturing_ngap_server().await;
+    // No permits: every offloaded exchange waits, as under heavy load.
+    server.sbi_offload = crate::sbi_offload::SbiOffload::new(0);
+    seed_gnb_session(&server, 1).await;
+    let (old, new) = (19_240_001u64, 19_240_002u64);
+    let pdu = idle_ue_with_two_sessions(
+        &mut server,
+        old,
+        new,
+        fast_port,
+        slow_port,
+        ("isr-1924-fast", "isr-1924-slow"),
+    );
+    server
+        .handle_initial_ue_message(1, &pdu)
+        .await
+        .expect("handled");
+    assert_eq!(
+        server.smf_joins.len(),
+        1,
+        "the join waits for both activations"
+    );
+
+    let item = nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+        amf_ue_ngap_id: Some(new),
+        ran_ue_ngap_id: None,
+    };
+    server
+        .handle_ng_reset(
+            1,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                item,
+            ])),
+        )
+        .await
+        .expect("handled");
+    assert!(
+        server.smf_joins.is_empty(),
+        "the superseded activations will never answer: their join is closed now"
+    );
+    assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
+    server.forget_ue(new);
+}

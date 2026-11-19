@@ -437,11 +437,17 @@ impl SbiOffload {
     /// Drop the keyed work for `key` that has not started: the queued work and a
     /// job still waiting for a permit. Durable work stays. A started exchange is
     /// left to finish; its outcome is still delivered.
-    pub(crate) fn supersede_key(&mut self, key: SbiKey) {
+    ///
+    /// #1924: returns whether any work was dropped. A dropped job delivers no
+    /// outcome, so a caller whose state waits on that outcome (an SMF join) must
+    /// resolve it itself.
+    pub(crate) fn supersede_key(&mut self, key: SbiKey) -> bool {
         let Some(queue) = self.keys.get_mut(&key) else {
-            return;
+            return false;
         };
+        let before = queue.queued.len();
         queue.queued.retain(|(_, kind)| *kind == Kind::Durable);
+        let dropped_queued = queue.queued.len() != before;
         let cancelled = queue
             .running
             .as_ref()
@@ -453,6 +459,7 @@ impl SbiOffload {
         } else if queue.running.is_none() && queue.queued.is_empty() {
             self.keys.remove(&key);
         }
+        dropped_queued || cancelled
     }
 
     /// Drop only the moot work for `key` ([`SbiOffload::spawn_keyed_moot`]) that has
