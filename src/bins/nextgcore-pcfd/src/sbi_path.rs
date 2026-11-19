@@ -2612,18 +2612,35 @@ pub async fn pcf_update_bsf_binding(
 
 /// Deregister a PCF binding with a discovered BSF
 /// (`DELETE /nbsf-management/v1/pcfBindings/{bindingId}`). `Ok(true)` on 204/200.
-pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String> {
-    let Some(ep) = pcf_discover_endpoint("BSF", "nbsf-management").await? else {
-        return Ok(false);
+/// How a BSF binding deregistration ended (#1877).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BsfDeregistration {
+    /// 2xx, or 404: the BSF does not hold it, the state wanted.
+    Delivered,
+    /// A 4xx a retry cannot change (R27 on #1976): not retried.
+    Refused(u16),
+    /// No BSF discovered, no answer, a 5xx or a refused token: worth retrying.
+    Failed(String),
+}
+
+/// Nbsf_Management_Deregister (TS 29.521 §5.2.2.3) of `binding_id`.
+pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> BsfDeregistration {
+    let ep = match pcf_discover_endpoint("BSF", "nbsf-management").await {
+        Ok(Some(ep)) => ep,
+        Ok(None) => return BsfDeregistration::Failed("no BSF discovered".to_string()),
+        Err(e) => return BsfDeregistration::Failed(e),
     };
     let client = client_for(&ep, NfType::Bsf);
     let path = format!("/nbsf-management/v1/pcfBindings/{binding_id}");
-    let resp = client
-        .delete(&path)
-        .await
-        .map_err(|e| format!("nbsf-management delete failed: {e}"))?;
-    // #1877: 404, the BSF does not hold it, is the state wanted.
-    Ok(resp.status == 204 || resp.status == 200 || resp.status == 404)
+    match client.delete(&path).await {
+        Ok(resp) if resp.is_success() || resp.status == 404 => BsfDeregistration::Delivered,
+        Ok(resp) if (resp.status == 401 || resp.status == 403) && resp.is_bearer_refusal() => {
+            BsfDeregistration::Failed(format!("token refused ({})", resp.status))
+        }
+        Ok(resp) if (400..500).contains(&resp.status) => BsfDeregistration::Refused(resp.status),
+        Ok(resp) => BsfDeregistration::Failed(format!("status {}", resp.status)),
+        Err(e) => BsfDeregistration::Failed(format!("nbsf-management delete failed: {e}")),
+    }
 }
 
 // --- Wave-6 E4: UE-policy (URSP) delivery via Namf_Communication N1N2 ---
@@ -3217,15 +3234,12 @@ pub fn pcf_sess_register_bsf_binding(sess_id: u64) {
                         // gone, or it was replaced) leaves nothing to store it on, and the
                         // binding is deregistered rather than left stale at the BSF.
                         let stored = crate::context::pcf_self().read().is_ok_and(|ctx| {
-                            ctx.sess_find_by_id(sess_id)
-                                .filter(|s| s.sm_policy_id == sm_policy_id)
-                                .is_some_and(|mut sess| {
-                                    sess.binding.store(
-                                        &format!("/nbsf-management/v1/pcfBindings/{id}"),
-                                        &id,
-                                    );
-                                    ctx.sess_update(&sess)
-                                })
+                            ctx.sess_set_binding(
+                                sess_id,
+                                &sm_policy_id,
+                                &format!("/nbsf-management/v1/pcfBindings/{id}"),
+                                &id,
+                            )
                         });
                         if !stored {
                             log::info!(
@@ -3306,14 +3320,15 @@ pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
     };
     handle.spawn(async move {
         match pcf_deregister_bsf_binding(&binding_id).await {
-            Ok(true) => log::info!("PCF binding {binding_id} deregistered from BSF"),
-            // #1877: retried until the BSF takes it, rather than left there.
-            Ok(false) => {
-                log::warn!("No BSF reachable; binding {binding_id} parked for the reconciler");
-                crate::bsf_reconcile::park(&binding_id);
+            BsfDeregistration::Delivered => {
+                log::info!("PCF binding {binding_id} deregistered from BSF")
             }
-            Err(e) => {
-                log::warn!("BSF binding deregistration failed: {e}; parked");
+            BsfDeregistration::Refused(status) => log::warn!(
+                "BSF refused the deregistration of binding {binding_id} ({status}); not retried"
+            ),
+            // #1877: retried until the BSF takes it, rather than left there.
+            BsfDeregistration::Failed(why) => {
+                log::warn!("BSF binding {binding_id} deregistration failed ({why}); parked");
                 crate::bsf_reconcile::park(&binding_id);
             }
         }
@@ -3970,6 +3985,10 @@ mod tests_api_root {
 
     type Seen1877 = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
+    /// A port the NRF stand-in names for the BSF instead of its own (0: itself).
+    /// Set only by tests that hold `CONTEXT_GUARD`, before the stand-in starts.
+    static BSF_PORT_1877: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
     /// One SBI peer playing the NRF (it answers BSF discovery with itself) and the
     /// BSF: a binding POST answered 201 after `post_delay`, a DELETE with `delete`.
     async fn nrf_and_bsf_1877(
@@ -3982,10 +4001,14 @@ mod tests_api_root {
         let sink = seen.clone();
         let port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
         let own = port.clone();
+        let bsf_override = BSF_PORT_1877.load(Ordering::SeqCst);
         let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
             move |req: nextgcore_sbi::message::SbiRequest| {
                 let sink = sink.clone();
-                let port = own.load(Ordering::SeqCst);
+                let port = match bsf_override {
+                    0 => own.load(Ordering::SeqCst),
+                    dead => dead,
+                };
                 let delete = delete.load(Ordering::SeqCst);
                 async move {
                     use nextgcore_sbi::message::SbiResponse;
@@ -4014,6 +4037,10 @@ mod tests_api_root {
                         // A binding the BSF fails every time (#1954's starvation shape).
                         if uri.ends_with("/b-poison") {
                             return SbiResponse::with_status(500);
+                        }
+                        // A binding the BSF refuses outright (not a token refusal).
+                        if uri.ends_with("/b-refused") {
+                            return SbiResponse::with_status(400);
                         }
                         return SbiResponse::with_status(delete);
                     }
@@ -4166,6 +4193,78 @@ mod tests_api_root {
 
         assert_eq!(delivered, 1, "the other binding is deregistered");
         assert!(poison_parked, "the failing one stays parked");
+    }
+
+    /// #1877 (R27 on #1976): a deregistration that gets no answer at all (the BSF is
+    /// discovered but nothing listens) is parked, as a 5xx is.
+    ///
+    /// REVERT-VERIFIED: with the transport-error arm not parking, this fails: not
+    /// parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the PCF context guard, held across the test
+    async fn an_unreachable_bsf_deregistration_is_parked_1877() {
+        use std::sync::atomic::Ordering;
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::bsf_reconcile::clear_for_test();
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        BSF_PORT_1877.store(closed, Ordering::SeqCst);
+        let (srv, port, _seen) = nrf_and_bsf_1877(
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204)),
+        )
+        .await;
+        BSF_PORT_1877.store(0, Ordering::SeqCst);
+        let _nrf = crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{port}")).await;
+
+        pcf_sess_deregister_bsf_binding("b-unreachable".to_string());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::bsf_reconcile::is_parked("b-unreachable")
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let parked = crate::bsf_reconcile::is_parked("b-unreachable");
+        crate::bsf_reconcile::clear_for_test();
+        srv.stop().await.ok();
+
+        assert!(parked, "the unanswered deregistration is parked");
+    }
+
+    /// #1877 (R27 on #1976): a deregistration the BSF refuses with a 4xx is not
+    /// retried for ever: the reconciler ends it as `refused`.
+    ///
+    /// REVERT-VERIFIED: with a refusal treated as a failure, this fails: it stays
+    /// parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the PCF context guard, held across the test
+    async fn a_refused_deregistration_is_not_retried_1877() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::bsf_reconcile::clear_for_test();
+        let (srv, port, _seen) = nrf_and_bsf_1877(
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204)),
+        )
+        .await;
+        let _nrf = crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        crate::bsf_reconcile::park("b-refused");
+        let refused = || crate::bsf_reconcile::RECONCILED.get(&["refused"]);
+        let before = refused();
+
+        crate::bsf_reconcile::reconcile_once().await;
+        let parked = crate::bsf_reconcile::is_parked("b-refused");
+        let after = refused();
+        crate::bsf_reconcile::clear_for_test();
+        srv.stop().await.ok();
+
+        assert!(!parked, "a refused deregistration is not parked again");
+        assert_eq!(after - before, 1, "counted refused");
     }
 
     /// #1322 (#1321 review): no self identity, no BSF binding, logged once.

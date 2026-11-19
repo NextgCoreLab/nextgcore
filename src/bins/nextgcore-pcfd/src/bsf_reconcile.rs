@@ -25,11 +25,23 @@ pub const RECONCILE_PERIOD: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub const RECONCILE_PERIOD: Duration = Duration::from_millis(20);
 
+/// How long a deregistration stays parked before it is given up (`expired`, R27 on
+/// #1976): a BSF that has not taken it for a day is not coming back for it.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// One parked deregistration: the binding id and when it was first parked.
+#[derive(Debug, Clone)]
+struct Parked {
+    id: String,
+    since: std::time::Instant,
+}
+
 /// The longest one pass sends for.
 pub const MAX_PASS: Duration = Duration::from_secs(30);
 
 /// `pcf_bsf_deregistrations_reconciled_total{result}`: parked deregistrations the
-/// reconciler ended, `delivered` (2xx or 404) or `abandoned` (evicted).
+/// reconciler ended, `delivered` (2xx or 404), `refused` (a 4xx a retry cannot
+/// change), `expired` (parked longer than [`MAX_AGE`]) or `abandoned` (evicted).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "pcf_bsf_deregistrations_reconciled_total",
@@ -44,24 +56,33 @@ pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
 /// beside the PCF's process-global state this set belongs to, and assert on their
 /// own binding ids: any test whose SM policy delete meets an unreachable BSF parks
 /// into it.
-fn pending() -> &'static Mutex<VecDeque<String>> {
-    static PENDING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+fn pending() -> &'static Mutex<VecDeque<Parked>> {
+    static PENDING: Mutex<VecDeque<Parked>> = Mutex::new(VecDeque::new());
     &PENDING
 }
 
 /// Whether `binding_id` is parked (tests).
 #[cfg(test)]
 pub fn is_parked(binding_id: &str) -> bool {
-    lock().iter().any(|b| b == binding_id)
+    lock().iter().any(|p| p.id == binding_id)
 }
 
-fn lock() -> std::sync::MutexGuard<'static, VecDeque<String>> {
+fn lock() -> std::sync::MutexGuard<'static, VecDeque<Parked>> {
     pending().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn evict(set: &mut VecDeque<String>) {
+fn evict(set: &mut VecDeque<Parked>) {
     while set.len() > MAX_PENDING {
-        if let Some(old) = set.pop_front() {
+        // The oldest by park time, wherever rotation has put it.
+        let Some(oldest) = set
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.since)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        if let Some(Parked { id: old, .. }) = set.remove(oldest) {
             log::error!(
                 "BSF deregistration of binding {old} abandoned: {MAX_PENDING} are already pending"
             );
@@ -73,14 +94,17 @@ fn evict(set: &mut VecDeque<String>) {
 /// Park a deregistration that failed. One already parked is not added twice.
 pub fn park(binding_id: &str) {
     let mut set = lock();
-    if set.iter().any(|b| b == binding_id) {
+    if set.iter().any(|p| p.id == binding_id) {
         return;
     }
     log::warn!(
         "BSF deregistration of binding {binding_id} failed; parked, retried every \
          {RECONCILE_PERIOD:?}"
     );
-    set.push_back(binding_id.to_string());
+    set.push_back(Parked {
+        id: binding_id.to_string(),
+        since: std::time::Instant::now(),
+    });
     evict(&mut set);
 }
 
@@ -102,36 +126,50 @@ pub fn clear_for_test() {
 /// the starvation shape). The one that failed goes to the BACK of the queue and the
 /// untried keep their turn at the front, so each is tried in turn across passes.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<String> = lock().drain(..).collect();
+    use crate::sbi_path::BsfDeregistration;
+    let batch: Vec<Parked> = lock().drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
     let mut untried = Vec::new();
     let mut failed = Vec::new();
-    for id in batch {
-        if !failed.is_empty() || tokio::time::Instant::now() >= deadline {
-            untried.push(id);
+    for parked in batch {
+        if parked.since.elapsed() > MAX_AGE {
+            log::error!(
+                "BSF deregistration of binding {} expired after {MAX_AGE:?}",
+                parked.id
+            );
+            RECONCILED.inc(&["expired"]);
+            ended += 1;
             continue;
         }
-        if matches!(
-            crate::sbi_path::pcf_deregister_bsf_binding(&id).await,
-            Ok(true)
-        ) {
-            log::info!("BSF binding {id}: deregistration reconciled");
-            RECONCILED.inc(&["delivered"]);
-            ended += 1;
-        } else {
-            failed.push(id);
+        if !failed.is_empty() || tokio::time::Instant::now() >= deadline {
+            untried.push(parked);
+            continue;
         }
+        let result = match crate::sbi_path::pcf_deregister_bsf_binding(&parked.id).await {
+            BsfDeregistration::Delivered => "delivered",
+            BsfDeregistration::Refused(_) => "refused",
+            BsfDeregistration::Failed(_) => {
+                failed.push(parked);
+                continue;
+            }
+        };
+        log::info!(
+            "BSF binding {}: deregistration reconciled ({result})",
+            parked.id
+        );
+        RECONCILED.inc(&[result]);
+        ended += 1;
     }
     let mut set = lock();
-    for id in untried.into_iter().rev() {
-        if !set.contains(&id) {
-            set.push_front(id);
+    for parked in untried.into_iter().rev() {
+        if !set.iter().any(|p| p.id == parked.id) {
+            set.push_front(parked);
         }
     }
-    for id in failed {
-        if !set.contains(&id) {
-            set.push_back(id);
+    for parked in failed {
+        if !set.iter().any(|p| p.id == parked.id) {
+            set.push_back(parked);
         }
     }
     evict(&mut set);
