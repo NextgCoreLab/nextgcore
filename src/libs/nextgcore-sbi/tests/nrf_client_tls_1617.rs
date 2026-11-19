@@ -405,7 +405,11 @@ async fn a_redirect_away_from_the_nrf_is_verified_as_its_own_host_1617() {
     })
     .await;
 
-    let client = SbiClient::for_nrf_uri(&format!("https://127.0.0.1:{port}")).unwrap();
+    // #1915: a cross-origin redirect is followed only on an explicit opt-in;
+    // this test is about how the followed target is verified.
+    let client = SbiClient::for_nrf_uri(&format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .with_target_policy(Arc::new(|_: &nextgcore_sbi::client::SbiTarget| Ok(())));
     assert_eq!(client.config().tls_server_name.as_deref(), Some("nrf"));
     let resp = client
         .get("/nnrf-disc/v1/nf-instances")

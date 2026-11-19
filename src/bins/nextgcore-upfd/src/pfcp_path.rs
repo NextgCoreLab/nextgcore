@@ -1668,8 +1668,7 @@ impl PfcpServer {
                     header.msg_type,
                     header.sequence_number
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.resend_cached(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -1767,13 +1766,27 @@ impl PfcpServer {
     }
 
     /// Send `response` to `to`, keeping it for a retransmission of the request it
-    /// answers (#1851). Every response to a request goes out through here.
+    /// answers (#1851). Every response to a request goes out through here, so every
+    /// one is replayed rather than re-executed (#1898); the source guard
+    /// `every_pfcp_send_goes_through_one_of_three_helpers_1898` holds it there.
     async fn reply(&self, response: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         self.replies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .record(to, response);
         self.socket.send_to(response, to).await
+    }
+
+    /// Send again the cached `response` a retransmitted request is answered with
+    /// (#1851). Not recorded: it is already the cache's.
+    async fn resend_cached(&self, response: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(response, to).await
+    }
+
+    /// Send a request this UPF originates (Heartbeat, Session Report, Node Report),
+    /// or a T1 retransmission of one. Responses never go through here (#1898).
+    async fn send_request(&self, request: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(request, to).await
     }
 
     /// Handle one PFCP message the association gate admitted.
@@ -2283,7 +2296,7 @@ impl PfcpServer {
         #[cfg(not(feature = "compute-aware-upf"))]
         let payload = crate::n4_build::build_heartbeat_request(self.recovery_time_stamp);
         let message = self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
-        match self.socket.send_to(&message, peer).await {
+        match self.send_request(&message, peer).await {
             Ok(_) => {
                 // Track it: an untracked heartbeat can never reveal silence.
                 self.heartbeat.lock().await.outstanding.insert(seq);
@@ -2658,8 +2671,7 @@ impl PfcpServer {
                                 &resp_payload,
                                 true,
                             );
-                            self.socket
-                                .send_to(&response, src_addr)
+                            self.reply(&response, src_addr)
                                 .await
                                 .map_err(|e| format!("Send error: {e}"))?;
                             return Ok(());
@@ -3735,12 +3747,31 @@ impl PfcpServer {
         // neither this response nor any later report. A rejected request applies
         // nothing (§6.3.3), and the counters are part of what it must not touch.
         let mut usage_reports = Vec::new();
+        // Whether the query in this message (QAURR, or a Query URR naming it) covers
+        // the URR `id`.
+        let queried = |id: u32| query_all_urrs || queried_urr_ids.contains(&id);
         if failure.is_none() && !removed_urr_ids.is_empty() {
-            usage_reports.extend(self.collect_usage_reports(
-                upf_seid,
-                Some(&removed_urr_ids),
-                UsageReportReason::Termination,
-            ));
+            usage_reports.extend(
+                self.collect_usage_reports(
+                    upf_seid,
+                    Some(&removed_urr_ids),
+                    UsageReportReason::Termination,
+                )
+                .into_iter()
+                // #1852: a removed URR the query also covers reports once (below it is
+                // filtered out of the query's reports), so this final report is ALSO
+                // the query's answer: it carries the Query URR Reference
+                // (§5.2.2.3.1, Table 7.5.5.2-1) and IMMER beside TERMR (§8.2.41: more
+                // than one trigger bit may be set). One the query does not cover
+                // answers only the removal and carries neither.
+                .map(|mut r| {
+                    if queried(r.urr_id) {
+                        r.query_urr_reference = query_urr_reference;
+                        r.trigger.immediate_report = true;
+                    }
+                    r
+                }),
+            );
         }
         // QAURR together with a Query URR IE was rejected above (#1816, NOTE 3), so
         // at most one of the two forms reaches here.
@@ -3761,9 +3792,8 @@ impl PfcpServer {
                     // A URR removed by this same message has already reported with
                     // TERMR; reporting it twice would double-count it.
                     .filter(|r| !already.contains(&r.urr_id))
-                    // #1835: each report answering the query carries its reference.
-                    // A TERMR report for a removed URR answers the removal, not the
-                    // query, so it carries none.
+                    // #1835: each report answering the query carries its reference
+                    // (a removed URR's TERMR report was tagged above, #1852).
                     .map(|mut r| {
                         r.query_urr_reference = query_urr_reference;
                         r
@@ -4201,7 +4231,7 @@ impl PfcpServer {
                 usage: Vec::new(),
             },
         );
-        if let Err(e) = self.socket.send_to(&message, peer).await {
+        if let Err(e) = self.send_request(&message, peer).await {
             self.pending_reports.lock().await.remove(&seq);
             return Err(format!("Failed to send Node Report Request: {e}"));
         }
@@ -4509,7 +4539,7 @@ impl PfcpServer {
                 usage: Vec::new(),
             },
         );
-        if let Err(e) = self.socket.send_to(&message, peer).await {
+        if let Err(e) = self.send_request(&message, peer).await {
             self.pending_reports.lock().await.remove(&seq);
             self.path_ledger.lock().unwrap().answered(seq, false);
             return Err(format!("Failed to send Node Report Request: {e}"));
@@ -4956,7 +4986,7 @@ impl PfcpServer {
             );
         }
 
-        if let Err(e) = self.socket.send_to(&message, smf_addr).await {
+        if let Err(e) = self.send_request(&message, smf_addr).await {
             // Send failed outright: drop the pending entry, nothing to retry on.
             self.pending_reports.lock().await.remove(&seq);
             return Err(format!("Failed to send {what}: {e}"));
@@ -4990,7 +5020,7 @@ impl PfcpServer {
             });
         }
         for (seq, msg, dest) in to_send {
-            match self.socket.send_to(&msg, dest).await {
+            match self.send_request(&msg, dest).await {
                 Ok(_) => log::warn!(
                     "Retransmitting Session Report Request (seq={seq}) to {dest} (T1 expired)"
                 ),
@@ -10132,7 +10162,8 @@ mod tests {
     /// **#1835, TS 29.244 §5.2.2.3.1, Table 7.5.4.1-1 and Table 7.5.5.2-1.** A
     /// Query URR Reference in a Session Modification Request is echoed in every
     /// usage report sent in response to its query, Query URR or QAURR alike, and
-    /// in no other: a URR removed by the same message reports TERMR without it, and
+    /// in no other: a URR removed by the same message and NOT queried reports TERMR
+    /// without it (one the query covers carries it, #1852), and
     /// a query without a reference carries none. A reference too short for its
     /// value is discarded (§7.6.8). upfd never parsed the IE.
     #[tokio::test]
@@ -10209,6 +10240,111 @@ mod tests {
             assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
             assert_eq!(report_references_1835(&resp), vec![(3, None)], "seq {seq}");
         }
+    }
+
+    /// (URR ID, Query URR Reference, IMMER, TERMR) of every Usage Report in a
+    /// Session Modification Response, sorted. IMMER is octet 5 bit 8 and TERMR
+    /// octet 6 bit 4 of the Usage Report Trigger (TS 29.244 §8.2.41).
+    fn report_triggers_1852(resp: &[u8]) -> Vec<(u32, Option<u32>, bool, bool)> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let mut out: Vec<_> =
+            ParsedIe::find_all_ies(&ParsedIe::parse_all(body), pfcp_ie::USAGE_REPORT_SMR)
+                .iter()
+                .map(|ur| {
+                    let inner = ParsedIe::parse_all(&ur.value);
+                    let u32_of = |t: u16| {
+                        ParsedIe::find_ie(&inner, t)
+                            .map(|ie| u32::from_be_bytes(ie.value[..4].try_into().unwrap()))
+                    };
+                    let trigger = ParsedIe::find_ie(&inner, pfcp_ie::USAGE_REPORT_TRIGGER)
+                        .expect("every usage report carries its trigger")
+                        .value
+                        .clone();
+                    (
+                        u32_of(pfcp_ie::URR_ID).unwrap(),
+                        u32_of(pfcp_ie::QUERY_URR_REFERENCE),
+                        trigger[0] & 0x80 != 0,
+                        trigger[1] & 0x08 != 0,
+                    )
+                })
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// **#1852, TS 29.244 §5.2.2.3.1, Table 7.5.5.2-1, §8.2.41.** A URR removed by
+    /// the same Session Modification whose query covers it -- QAURR, or a Query URR
+    /// naming it -- reports once, and that final report also answers the query: it
+    /// carries the Query URR Reference and IMMER beside TERMR. A removed URR the
+    /// query does not cover reports TERMR alone (#1835's test covers that case).
+    #[tokio::test]
+    async fn a_removed_urr_s_final_report_answers_a_query_covering_it_1852() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for id in [2, 3, 4] {
+            b.add_tlv(
+                pfcp_ie::CREATE_URR,
+                &urr_body(id, Some(1_000_000), None, None),
+            );
+        }
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let modify = |seq: u32, build: &dyn Fn(&mut crate::n4_build::PfcpMessageBuilder)| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            build(&mut b);
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        // QAURR with a reference, and remove URR 1: every report answers the query,
+        // the removed URR's final one included.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(4, &|b| {
+                b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0x1852);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_triggers_1852(&resp),
+            vec![
+                (1, Some(0x1852), true, true),
+                (2, Some(0x1852), true, false),
+                (3, Some(0x1852), true, false),
+                (4, Some(0x1852), true, false),
+            ],
+            "the removed URR reports once, with the reference, IMMER and TERMR"
+        );
+        apply_next(&mut rx, &dp).await;
+
+        // A Query URR naming URR 2, which the same message removes, and naming 3;
+        // URR 4 is removed but not queried.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(5, &|b| {
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 3));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 4));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0x1853);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_triggers_1852(&resp),
+            vec![
+                (2, Some(0x1853), true, true),
+                (3, Some(0x1853), true, false),
+                (4, None, false, true),
+            ],
+            "a named and removed URR answers both; a removed, unqueried one only the removal"
+        );
     }
 
     /// Query URR (IE 77, TS 29.244 §7.5.4.10): report the URRs the SMF NAMED, and
@@ -13581,6 +13717,68 @@ mod tests {
             response_cause(&again),
             PfcpCause::NoEstablishedPfcpAssociation as u8,
             "the old incarnation's response must not be replayed to the new one"
+        );
+    }
+
+    /// **#1898.** The F-TEID collision refusal #1843 added is a response like any
+    /// other, so it is cached: its retransmission is replayed (TS 29.244 §6.4),
+    /// not executed again. It went out through `socket.send_to`, so the cache
+    /// never saw it.
+    #[tokio::test]
+    async fn a_teid_collision_refusal_is_kept_for_its_retransmission_1898() {
+        let (server, smf, addr, _rx, _dp, _a_seid) = established_session().await;
+        let request = encode_pfcp(
+            50,
+            Some(0),
+            20,
+            &establishment_1834(0xB, &[None, Some(0x1234)]),
+        );
+        let resp = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8,
+            "PDR 2 names the established session's TEID"
+        );
+        let kept = server.replies.lock().unwrap().replay(
+            smf.local_addr().unwrap(),
+            20,
+            &request,
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            kept,
+            Some(resp.clone()),
+            "the refusal must be kept for a retransmission"
+        );
+        assert_eq!(exchange(&smf, addr, &request).await, resp);
+    }
+
+    /// **#1898, source guard.** Every PFCP datagram this server sends goes out
+    /// through one of three helpers: [`PfcpServer::reply`] (a response, recorded
+    /// for retransmissions), [`PfcpServer::resend_cached`] (a recorded response sent
+    /// again) or [`PfcpServer::send_request`] (a request this UPF originates). A
+    /// direct `send_to` anywhere else is how #1843's collision refusal escaped the
+    /// duplicate-request cache, so this fails on the next one.
+    #[test]
+    fn every_pfcp_send_goes_through_one_of_three_helpers_1898() {
+        let src = include_str!("pfcp_path.rs");
+        let production = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module")];
+        let mut senders: Vec<&str> = production
+            .match_indices(".send_to(")
+            .map(|(at, _)| {
+                let before = &production[..at];
+                let fn_at = before.rfind("fn ").expect("inside a fn") + 3;
+                let name = &before[fn_at..];
+                &name[..name.find(['(', '<']).unwrap()]
+            })
+            .collect();
+        senders.sort_unstable();
+        assert_eq!(
+            senders,
+            vec!["reply", "resend_cached", "send_request"],
+            "a PFCP send outside the three helpers: route a response through reply()"
         );
     }
 }

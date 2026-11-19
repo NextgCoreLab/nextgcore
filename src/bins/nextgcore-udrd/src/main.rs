@@ -338,6 +338,36 @@ fn outbound_oauth2_client(
     )
 }
 
+/// #1795: the UDR's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with UDR as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    let config = nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Udr,
+        nrf_uri,
+    )?;
+    // #1811: whenever the listener requires a token, whether the knob or the
+    // production profile asked for it, the AuthenticationSubscription resource
+    // (K, OPc, SQN) needs its TS 29.505 resource scope too.
+    Ok(if config.require_oauth2 {
+        config.with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
+    } else {
+        config
+    })
+}
+
 /// The OAuth2 posture of the UDR's listener when `require_oauth2` is on: every
 /// request needs a valid NRF-issued bearer whose `aud` names the UDR and whose
 /// scope covers what it invokes. The verification keys are the caller's to set.
@@ -501,7 +531,9 @@ async fn main() -> Result<()> {
     let sbi_config = SbiServerConfig {
         addr: sbi.host.clone(),
         port: sbi.port,
-        tls_enabled: args.tls,
+        // #1795: the listener below serves TLS under `--tls` or the production
+        // profile, so what this NF publishes says so too.
+        tls_enabled: args.tls || nextgcore_sbi::security::SbiProfile::resolve().is_production(),
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
     };
@@ -519,11 +551,24 @@ async fn main() -> Result<()> {
         "--sbi-addr (or udr.sbi.server[0].address in the config file)",
     );
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
+    // #1795: `--tls` reaches the listener it advertises (under `dev`; the
+    // profile's certificate wins under `production`).
+    if args.tls {
+        sbi_server_config = sbi_server_config.with_tls(
+            args.tls_key
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/server.key"),
+            args.tls_cert
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/server.crt"),
+        );
+    }
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         nrf_uri_cfg.as_deref(),
     ));
@@ -544,6 +589,14 @@ async fn main() -> Result<()> {
                 .unwrap_or("UNCONFIGURED")
         );
     }
+    // #1795: the listener follows the SBI security profile.
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        nrf_uri_cfg.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
@@ -9149,5 +9202,65 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming UDR.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Udr,
+            super::sbi_listener_config,
+        );
+    }
+
+    /// #1811 x #1795: under production the token requirement comes from the
+    /// profile, and the K-read resource scope must come with it.
+    ///
+    /// REVERT-VERIFIED: with the resource-scope step removed from
+    /// `sbi_listener_config`, the production listener has none and this fails.
+    #[test]
+    fn production_keeps_the_auth_subscription_resource_scope_1795() {
+        use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+        let dir = std::env::temp_dir().join(format!("udrd-1795-rs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("udr.crt"),
+                key: file("udr.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let base = super::NextgcoreSbiServerConfig::new(addr);
+        let prod = super::sbi_listener_config(
+            base.clone(),
+            SbiProfile::Production,
+            &policy,
+            "https://127.0.0.10:7777",
+        )
+        .unwrap();
+        assert!(prod.require_oauth2);
+        assert!(
+            prod.oauth2_resource_scopes.is_some(),
+            "the K-read resource scope is enforced under production"
+        );
+        let dev =
+            super::sbi_listener_config(base, SbiProfile::Dev, &policy, "https://127.0.0.10:7777")
+                .unwrap();
+        assert!(dev.oauth2_resource_scopes.is_none(), "dev adds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

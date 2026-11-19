@@ -363,6 +363,28 @@ fn api_root() -> &'static str {
     API_ROOT.get().map(String::as_str).unwrap_or("http://ucmf")
 }
 
+/// #1795: the UCMF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with UCMF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Ucmf,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -466,8 +488,9 @@ async fn main() -> Result<()> {
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     if let Some(oauth2) = outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         settings.require_oauth2,
         Some(&settings.nrf_uri),
     ) {
@@ -484,6 +507,14 @@ async fn main() -> Result<()> {
         sbi_config = sbi_config.with_expected_audience_nf_type(NfType::Ucmf);
         log::info!("OAuth2 enforcement enabled");
     }
+    // #1795: the listener follows the SBI security profile.
+    let sbi_config = sbi_listener_config(
+        sbi_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &settings.nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
 
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
@@ -2387,6 +2418,20 @@ mod outbound_oauth2_1665_tests {
         assert!(
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
+        );
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming UCMF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Ucmf,
+            super::sbi_listener_config,
         );
     }
 }
