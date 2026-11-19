@@ -75,6 +75,8 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 
 ## Restoring a lost registration, and the ECS role (#107)
 
+**Every ECS route needs a verified caller (#2050).** The `eecs-eesregistration`, `eecs-serviceprovisioning` and `eecs-targeteesdiscovery` routes accept either a verified client certificate (mTLS) or an access token for that API's scope (`eecs-eesregistration`, …), checked by the same per-operation gate as the `eees-*` routes. Anything else gets 401, or 403 for a token without the scope. Under the `production` profile the EES listener verifies a client certificate whenever one is presented, against the policy CA, without demanding one: EECs and EASes hold none. The EES-side ECS client presents its own certificate through the shared profile-following client. Under `dev` nothing presents a credential, so the ECS role answers 401 unless a caller sends a token.
+
 Three things were silently brittle before #107, and one thing was missing entirely.
 
 **The EDGE-6 client.**
