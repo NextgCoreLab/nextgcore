@@ -976,13 +976,20 @@ impl Http2Limits {
 /// An SBI resource URI is `{apiRoot}/{apiName}/{apiVersion}/{apiSpecificResourceUriPart}`
 /// (TS 29.501 §4.4.1), a sequence of non-empty segments. Refused:
 /// - an empty segment (`//`, a leading `//`, a trailing `/`);
-/// - a dot segment, `.` or `..`, also percent-encoded (RFC 3986 §3.3, §6.2.2.2);
-/// - a percent-encoded `/` or `\` inside a segment, which a router that decodes
-///   would split where the scope check did not.
+/// - a dot segment, `.` or `..`, also percent-encoded (RFC 3986 §3.3, §6.2.2.2).
 ///
 /// The bare root `/` is accepted. So every NF router and every per-path check
 /// (resource scopes, callback exemptions) sees the same segments, whichever way
 /// each one splits.
+///
+/// #1939 item 1: a percent-encoded `/` (`%2F`) or `\` (`%5C`) INSIDE a segment
+/// is accepted. TS 29.501 §5.2 has a resource URI variable that is a free-form
+/// string carry such characters percent-encoded (TS 29.519 `{appId}`, TS 29.122
+/// `{scsAsId}` / `{afId}`, TS 29.522 `{afId}`), and no router or per-path check
+/// in this tree decodes a path before splitting it (they all split on the raw
+/// `/` and compare raw segments), so an encoded separator is one segment to
+/// every one of them. A future router that decodes a path must decode AFTER
+/// splitting, segment by segment, or it reintroduces #1934's disagreement.
 pub fn path_segment_refusal(path: &str) -> Option<String> {
     let rest = path.strip_prefix('/').unwrap_or(path);
     if rest.is_empty() {
@@ -992,11 +999,7 @@ pub fn path_segment_refusal(path: &str) -> Option<String> {
         if segment.is_empty() {
             return Some("an empty segment".to_string());
         }
-        let lower = segment.to_ascii_lowercase();
-        if lower.contains("%2f") || lower.contains("%5c") {
-            return Some("an encoded path separator in a segment".to_string());
-        }
-        let decoded = lower.replace("%2e", ".");
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
         if decoded == "." || decoded == ".." {
             return Some("a dot segment".to_string());
         }
@@ -3949,6 +3952,9 @@ mod oauth2_callback_exemption_tests {
             "/nnsacf-nsac/v1/slices/local-configs/update",
             "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription",
             "/a/b.c/..d/x%20y",
+            // #1939 item 1: an encoded separator inside an identifier.
+            "/nudr-dr/v2/application-data/pfds/vendor%2Fapp",
+            "/nnef-pfdmanagement/v1/applications/a%5Cb",
         ] {
             assert_eq!(path_segment_refusal(ok), None, "{ok}");
         }
@@ -3960,8 +3966,7 @@ mod oauth2_callback_exemption_tests {
             "/nnsacf-nsac/v1/slices/./local-configs/update",
             "/nnsacf-nsac/v1/x/../slices/local-configs/update",
             "/nnsacf-nsac/v1/%2e%2E/slices",
-            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
-            "/nnsacf-nsac/v1/slices%5clocal-configs",
+            "/nnsacf-nsac/v1/%2E/slices",
         ] {
             assert!(path_segment_refusal(bad).is_some(), "{bad}");
         }

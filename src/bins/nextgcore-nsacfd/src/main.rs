@@ -3168,19 +3168,28 @@ nsacf:
         // service scope alone. nsacfd's router drops empty segments where the scope
         // table does not, so `//` used to be routed here unscoped (204). The SBI
         // server now refuses every such path 400 before the scope check and the
-        // router; `%2F` would only reach the router as one segment, and is refused
-        // the same way.
+        // router. (`%2F` is the #1939 case below: one segment to both.)
         for spelling in [
             "/nnsacf-nsac/v1//slices/local-configs/update",
             "/nnsacf-nsac/v1/slices//local-configs/update",
             "//nnsacf-nsac/v1/slices/local-configs/update",
             "/nnsacf-nsac/v1/slices/local-configs/update/",
-            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
             "/nnsacf-nsac/v1/slices/./local-configs/update",
         ] {
             let resp = send("nnsacf-nsac", spelling, ac_update_data(92, 1000, 1000)).await;
             assert_eq!(resp.status, 400, "{spelling}: {:?}", resp.http.content);
         }
+        // #1939 item 1: an encoded `/` is accepted by the server inside a segment
+        // (identifiers may carry one), and is ONE segment to the scope table and
+        // to the router alike: no route matches it, so it is the router's 404,
+        // and nothing changes.
+        let resp = send(
+            "nnsacf-nsac",
+            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
+            ac_update_data(92, 1000, 1000),
+        )
+        .await;
+        assert_eq!(resp.status, 404, "{:?}", resp.http.content);
         assert_eq!(ceiling(full).await, 7, "no spelling changed the ceiling");
 
         // The service scope alone still serves an AMF's NSAC operation.

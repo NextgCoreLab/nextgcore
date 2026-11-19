@@ -59,6 +59,7 @@ use nextgcore_sbi::types::NfType;
 use racs_id::RacsId;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -114,6 +115,20 @@ struct UcmfSection {
     purge_outdated_ids: Option<bool>,
     /// Capacity limits (#786).
     limits: Option<LimitsYaml>,
+    /// Nucmf_Provisioning policy (#1939).
+    provisioning: Option<ProvisioningYaml>,
+}
+
+/// `ucmf.provisioning` (#1939). Both members optional; absent means no
+/// restriction beyond the NEF / AF consumer rule and the creator binding.
+#[derive(Debug, Default, Deserialize)]
+struct ProvisioningYaml {
+    /// NF Instance IDs of the AFs trusted to provision directly (TS 29.675
+    /// §4.1.3.2). Absent: any AF that reaches this SBI.
+    trusted_afs: Option<Vec<String>>,
+    /// Consumer NF Instance ID -> TS 23.003 §29.2 Vendor IDs (8 hex digits) it
+    /// may provision. Absent or empty: no restriction.
+    vendor_ids: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +196,7 @@ struct Settings {
     purge_outdated_ids: bool,
     require_oauth2: bool,
     limits: context::Limits,
+    provisioning: context::ProvisioningPolicy,
 }
 
 fn parse_version_id(s: &str) -> Result<u8> {
@@ -236,6 +252,29 @@ fn settle(args: &Args, yaml: Option<&str>) -> Result<Settings> {
                 max_subscriptions_per_consumer: l
                     .max_subscriptions_per_consumer
                     .unwrap_or(d.max_subscriptions_per_consumer),
+            }
+        },
+        provisioning: {
+            let p = section.provisioning.unwrap_or_default();
+            let mut vendor_ids = BTreeMap::new();
+            for (consumer, vendors) in p.vendor_ids.unwrap_or_default() {
+                let parsed = vendors
+                    .iter()
+                    .map(|v| {
+                        let v = v.trim();
+                        anyhow::ensure!(
+                            v.len() == 8 && v.chars().all(|c| c.is_ascii_hexdigit()),
+                            "ucmf.provisioning.vendor_ids.{consumer}: a Vendor ID is 8 \
+                             hexadecimal digits (TS 23.003 §29.2), got '{v}'"
+                        );
+                        Ok(u32::from_str_radix(v, 16)?)
+                    })
+                    .collect::<Result<Vec<u32>>>()?;
+                vendor_ids.insert(consumer, parsed);
+            }
+            context::ProvisioningPolicy {
+                trusted_afs: p.trusted_afs,
+                vendor_ids,
             }
         },
         require_oauth2: args.oauth2_require.unwrap_or_else(|| {
@@ -414,6 +453,19 @@ async fn main() -> Result<()> {
     // one so restored subscribers hear about a change.
     let mut ucmf = Ucmf::new(settings.version_id, settings.mode);
     ucmf.set_limits(settings.limits);
+    ucmf.set_provisioning_policy(settings.provisioning.clone());
+    log::info!("Provisioning policy: {:?}", settings.provisioning);
+    // #1989 review m1: both rules are opt-in; say so where an operator looks.
+    if nextgcore_sbi::security::SbiProfile::resolve().is_production()
+        && settings.provisioning.trusted_afs.is_none()
+        && settings.provisioning.vendor_ids.is_empty()
+    {
+        log::warn!(
+            "ucmf.provisioning sets neither trusted_afs nor vendor_ids: any NEF, and any AF that \
+             reaches this SBI, may provision manufacturer-assigned RACS IDs of any vendor \
+             (TS 29.675 §4.1.3.2). Configure them to restrict provisioning."
+        );
+    }
     log::info!("Capacity limits: {:?}", settings.limits);
     match ucmf.attach_store(settings.state_file.as_ref().map(PathBuf::from)) {
         Ok(true) => log::info!("Restored {} dictionary entries", ucmf.entry_count()),
@@ -604,7 +656,11 @@ fn nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16, scheme: &str)
     let provisioning = service(
         nextgcore_sbi::types::SbiServiceType::NucmfProvisioning.to_name(),
         PROVISIONING_API_FULL_VERSION,
-        &["NEF", "AF", "SCP"],
+        // #1939 item 4: no SCP. An SCP forwards the consumer's token, or asks the
+        // NRF for one ON BEHALF of the consumer, with the consumer's NF type
+        // (TS 33.501 §13.4.1.2); listed here it could obtain a provisioning
+        // token of its own.
+        &["NEF", "AF"],
     );
     nextgcore_sbi::nf_addressing::classify_profile_host(
         json!({
@@ -728,6 +784,14 @@ async fn ucmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let Some(ucmf) = UCMF.get() else {
         return send_internal_error("UCMF not initialised");
     };
+    // #1989 review M1: who may provision is decided before `handle`, here,
+    // because proving a caller relayed by an SCP is a NEF takes an NRF lookup.
+    if is_provisioning_path(&request.header.uri) {
+        let policy = read_state(ucmf).provisioning_policy().clone();
+        if let Some(refusal) = provisioner_refusal(&policy, &request, caller_is_nef).await {
+            return refusal;
+        }
+    }
     let (response, notes) = handle(ucmf, &request, Utc::now());
     for note in notes {
         dispatch(note);
@@ -1313,6 +1377,10 @@ fn create_provisioning(
         Ok(owner) => owner,
         Err(refusal) => return (*refusal, Vec::new()),
     };
+    let (configs, refused) = vet_racs_ids(u.provisioning_policy(), request, configs);
+    if configs.is_empty() {
+        return (all_failed(&refused), Vec::new());
+    }
     match u.create_provisioning_owned(&configs, supp_feat, now, owner) {
         (Some(p), failed, note) => {
             let response = SbiResponse::created()
@@ -1324,11 +1392,11 @@ fn create_provisioning(
                         p.id
                     ),
                 )
-                .with_json_body(&racs_data_body(&p, &failed))
+                .with_json_body(&racs_data_body(&p, &[failed, refused].concat()))
                 .unwrap_or_else(|e| send_internal_error(&format!("encoding RacsData: {e}")));
             (response, note.into_iter().collect())
         }
-        (None, failed, _) => (all_failed(&failed), Vec::new()),
+        (None, failed, _) => (all_failed(&[failed, refused].concat()), Vec::new()),
     }
 }
 
@@ -1398,6 +1466,159 @@ fn refuse_provisioning_consumer(request: &SbiRequest) -> Option<SbiResponse> {
     );
     log::debug!("{why}");
     Some(nextgcore_sbi::server::send_forbidden(&why, None))
+}
+
+/// Whether `uri` names the Nucmf_Provisioning API.
+fn is_provisioning_path(uri: &str) -> bool {
+    let path = uri.split('?').next().unwrap_or(uri);
+    path.trim_start_matches('/').split('/').next() == Some(PROVISIONING_API)
+}
+
+/// The `403` for a caller that may not provision directly when
+/// `ucmf.provisioning.trusted_afs` is set (#1939 item 5; #1989 review M1), or
+/// `None` to go on. TS 29.675 §4.1.3.2: the NEF provisions (also for an
+/// untrusted AF), and a TRUSTED AF provisions directly.
+///
+/// Decided by the caller's VERIFIED identity, never by what its certificate
+/// type alone suggests (an SCP's certificate says nothing about the consumer,
+/// and a certificate may name no type at all):
+/// - a listed trusted AF is admitted;
+/// - anyone else must prove it is a NEF: by the NF types of its own certificate
+///   when it calls directly, otherwise (relayed by an SCP or SEPP, identified by
+///   a token alone, or a certificate naming no types) by its NRF profile, via
+///   `is_nef`, which fails closed;
+/// - a caller with no verified identity, or two that disagree, is refused.
+///
+/// Unset `trusted_afs` admits everyone here (the #1916 rules still apply).
+async fn provisioner_refusal<F, Fut>(
+    policy: &context::ProvisioningPolicy,
+    request: &SbiRequest,
+    is_nef: F,
+) -> Option<SbiResponse>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    policy.trusted_afs.as_ref()?;
+    let refuse = |why: String| {
+        let why = format!("only the NEF or a trusted AF provisions (TS 29.675 §4.1.3.2): {why}");
+        log::debug!("{why}");
+        Some(nextgcore_sbi::server::send_forbidden(&why, None))
+    };
+    let caller = match owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return refuse("the requester has no verified identity".into()),
+        Err(why) => return refuse(why),
+    };
+    if policy.trusts_af(Some(&caller)) {
+        return None;
+    }
+    let types = &request.peer_cert_nf_types;
+    let relayed = types.iter().any(|t| {
+        owner_binding::RELAY_NF_TYPES
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(t))
+    });
+    let direct_typed = request.peer_cert_nf_instance_id.is_some() && !relayed && !types.is_empty();
+    if direct_typed {
+        if types.iter().any(|t| t.eq_ignore_ascii_case("NEF")) {
+            return None;
+        }
+        return refuse(format!(
+            "{caller} is not in ucmf.provisioning.trusted_afs and its certificate names {types:?}"
+        ));
+    }
+    match is_nef(caller.clone()).await {
+        Ok(true) => None,
+        Ok(false) => refuse(format!(
+            "{caller} is not in ucmf.provisioning.trusted_afs and its NRF profile is not a NEF"
+        )),
+        Err(why) => refuse(format!(
+            "{caller} is not in ucmf.provisioning.trusted_afs and could not be shown to be a NEF \
+             ({why})"
+        )),
+    }
+}
+
+/// Whether NF instance `id` is a NEF, per its NRF profile (#1989 review M1; the
+/// pattern of ausfd's `caller_is`, #1964). Yes only when the NFDiscovery result
+/// names `id` itself as a NEF, so an NRF that ignores the instance filter cannot
+/// vouch for it. `Err` (no NRF, no answer, an unparsable one) fails closed.
+async fn caller_is_nef(id: String) -> Result<bool, String> {
+    let sbi_ctx = global_context();
+    let nrf_uri = sbi_ctx
+        .get_nrf_uri()
+        .await
+        .ok_or("no NRF is configured to look the caller up")?;
+    let (host, port, _) = split_uri(&nrf_uri).ok_or("invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&host, port).await;
+    let path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type=NEF&requester-nf-type=UCMF&target-nf-instance-id={id}"
+    );
+    let resp = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("NRF lookup failed: {e}"))?;
+    if resp.status != 200 {
+        return Err(format!("NRF lookup returned {}", resp.status));
+    }
+    let json: Value = serde_json::from_str(resp.http.content.as_deref().unwrap_or(""))
+        .map_err(|e| format!("NRF lookup answer does not parse: {e}"))?;
+    Ok(json["nfInstances"].as_array().is_some_and(|list| {
+        list.iter().any(|p| {
+            p["nfInstanceId"]
+                .as_str()
+                .is_some_and(|i| i.eq_ignore_ascii_case(&id))
+                && p["nfType"]
+                    .as_str()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("NEF"))
+        })
+    }))
+}
+
+/// #1939 item 3: split `configs` into the RACS IDs `request`'s caller may
+/// provision under `policy` and the refused ones, reported `OTHER_REASON`
+/// (TS 29.122 Table 5.16.2.2.3-1 has no more specific code). A `null` (a PATCH
+/// removing an ID from the caller's own provisioning) is never refused.
+fn vet_racs_ids(
+    policy: &context::ProvisioningPolicy,
+    request: &SbiRequest,
+    configs: Map<String, Value>,
+) -> (Map<String, Value>, Vec<(String, &'static str)>) {
+    let caller = owner_binding::verified_consumer_id(request).ok().flatten();
+    let mut refused = Vec::new();
+    let allowed = configs
+        .into_iter()
+        .filter(|(key, value)| {
+            let ok = value.is_null() || policy.may_provision(caller.as_deref(), key);
+            if !ok {
+                log::debug!(
+                    "Provisioning of {key} refused: its Vendor ID is not configured for {}",
+                    caller.as_deref().unwrap_or("<unidentified>")
+                );
+                refused.push((key.clone(), context::RACS_OTHER_REASON));
+            }
+            ok
+        })
+        .collect();
+    (allowed, refused)
+}
+
+/// `outcome` with the RACS IDs [`vet_racs_ids`] refused reported too.
+fn with_refused(
+    outcome: ProvisioningOutcome,
+    refused: Vec<(String, &'static str)>,
+) -> ProvisioningOutcome {
+    outcome.map(|r| match r {
+        Ok((p, mut failed, notes)) => {
+            failed.extend(refused);
+            Ok((p, failed, notes))
+        }
+        Err(mut failed) => {
+            failed.extend(refused);
+            Err(failed)
+        }
+    })
 }
 
 /// The `403` for a caller other than the NEF / AF that created provisioning
@@ -1481,7 +1702,13 @@ fn replace_provisioning(
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
     };
-    provisioning_update_response(id, u.replace_provisioning(id, &configs, supp_feat, now))
+    let (configs, refused) = vet_racs_ids(u.provisioning_policy(), request, configs);
+    if configs.is_empty() {
+        // Nothing the caller may hold: the resource is left unchanged.
+        return (all_failed(&refused), Vec::new());
+    }
+    let outcome = u.replace_provisioning(id, &configs, supp_feat, now);
+    provisioning_update_response(id, with_refused(outcome, refused))
 }
 
 /// TS 29.675 §5.2.2.3: `PATCH /provisionings/{id}` (`application/merge-patch+json`).
@@ -1498,7 +1725,12 @@ fn patch_provisioning(
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
     };
-    provisioning_update_response(id, u.patch_provisioning(id, &configs, now))
+    let (configs, refused) = vet_racs_ids(u.provisioning_policy(), request, configs);
+    if configs.is_empty() {
+        return (all_failed(&refused), Vec::new());
+    }
+    let outcome = u.patch_provisioning(id, &configs, now);
+    provisioning_update_response(id, with_refused(outcome, refused))
 }
 
 /// TS 29.675 §5.2.2.4: `DELETE /provisionings/{id}`.
@@ -2636,6 +2868,259 @@ mod tests {
             ["nucmf-uecapabilitymanagement", "nucmf-provisioning"]
         );
         assert_eq!(p["nfServices"][0]["supportedFeatures"], "1");
+    }
+
+    /// #1939 item 4: the NRF may issue a provisioning token to a NEF or an AF,
+    /// never to an SCP in its own right (it asks on the consumer's behalf).
+    #[test]
+    fn no_scp_holds_a_provisioning_token_of_its_own_1939() {
+        let p = nf_profile("id-1", "10.0.0.9", 7777, "http");
+        assert_eq!(p["nfServices"][1]["serviceName"], "nucmf-provisioning");
+        assert_eq!(
+            p["nfServices"][1]["allowedNfTypes"],
+            serde_json::json!(["NEF", "AF"])
+        );
+        // The UECM service is unchanged: its SCP forwards for AMFs and MMEs.
+        assert_eq!(
+            p["nfServices"][0]["allowedNfTypes"],
+            serde_json::json!(["AMF", "MME", "SCP"])
+        );
+    }
+
+    /// #1939 items 3 and 5: `ucmf.provisioning` is read from the config, a bad
+    /// Vendor ID refuses to start, and absent means no restriction.
+    #[test]
+    fn the_provisioning_policy_is_settled_from_yaml_1939() {
+        let args = Args::parse_from(["nextgcore-ucmfd"]);
+        let yaml = "ucmf:\n  provisioning:\n    trusted_afs: [af-1]\n    vendor_ids:\n      nef-1: [\"00007ED9\"]\n";
+        let s = settle(&args, Some(yaml)).unwrap();
+        assert_eq!(s.provisioning.trusted_afs, Some(vec!["af-1".to_string()]));
+        assert_eq!(s.provisioning.vendor_ids.get("nef-1"), Some(&vec![0x7ED9]));
+        let bad = "ucmf:\n  provisioning:\n    vendor_ids:\n      nef-1: [\"7ED9\"]\n";
+        assert!(
+            settle(&args, Some(bad)).is_err(),
+            "a Vendor ID is 8 hex digits"
+        );
+        assert_eq!(
+            settle(&args, None).unwrap().provisioning,
+            context::ProvisioningPolicy::default()
+        );
+    }
+
+    /// #1939 item 3: with `vendor_ids` configured, a NEF provisions only RACS IDs
+    /// under its own Vendor IDs. Another manufacturer's ID is refused per RACS ID
+    /// (`OTHER_REASON`) and never enters the dictionary, so it cannot be squatted
+    /// first-come; the configured NEF then provisions it. A PUT or PATCH cannot
+    /// smuggle one in either.
+    #[test]
+    fn a_nef_provisions_only_its_own_vendor_ids_1939() {
+        let u = ucmf();
+        // MAN's Vendor ID is 0x00007ED9.
+        u.write()
+            .unwrap()
+            .set_provisioning_policy(context::ProvisioningPolicy {
+                trusted_afs: None,
+                vendor_ids: [
+                    (NEF_A_1916.to_string(), vec![0x7ED9]),
+                    (NEF_B_1916.to_string(), vec![0x1234]),
+                ]
+                .into_iter()
+                .collect(),
+            });
+        let create = |who: Option<&str>| {
+            as_nf_1862(
+                with_json(
+                    req("POST", "/nucmf-provisioning/v1/provisionings"),
+                    provisioning_body("0a0b"),
+                ),
+                who,
+            )
+        };
+        let resolves = |u: &RwLock<Ucmf>| read_state(u).entry_count() > 0;
+        for squatter in [Some(NEF_B_1916), None] {
+            let (r, notes) = handle(&u, &create(squatter), now());
+            assert_eq!(r.status, 500, "{squatter:?}: {:?}", body(&r));
+            assert_eq!(body(&r)[0]["racsIds"][0], MAN, "{:?}", body(&r));
+            assert_eq!(body(&r)[0]["failureCode"], "OTHER_REASON");
+            assert!(notes.is_empty());
+            assert!(!resolves(&u), "{squatter:?} squatted the ID");
+        }
+        let (r, _) = handle(&u, &create(Some(NEF_A_1916)), now());
+        assert_eq!(r.status, 201, "{:?}", body(&r));
+        assert!(resolves(&u));
+
+        // B's own provisioning cannot take A's ID by PUT or PATCH either.
+        let other = "000001234000000000ab";
+        let (r, _) = handle(
+            &u,
+            &as_nf_1862(
+                with_json(
+                    req("POST", "/nucmf-provisioning/v1/provisionings"),
+                    json!({"racsConfigs": {other: {"imeiTacs": ["35123457"], "racsParam5Gs": "0c"}}}),
+                ),
+                Some(NEF_B_1916),
+            ),
+            now(),
+        );
+        assert_eq!(r.status, 201, "{:?}", body(&r));
+        let doc = r.http.get_header("Location").unwrap().to_string();
+        let doc = doc[doc.find("/nucmf-provisioning").unwrap()..].to_string();
+        let before = read_state(&u).entry_count();
+        for r in [
+            with_json(req("PUT", &doc), provisioning_body("0d")),
+            with_json(
+                req("PATCH", &doc),
+                json!({"racsConfigs": {MAN: {"imeiTacs": ["35123458"], "racsParam5Gs": "0e"}}}),
+            ),
+        ] {
+            let method = r.header.method.clone();
+            let (r, _) = handle(&u, &as_nf_1862(r, Some(NEF_B_1916)), now());
+            assert_eq!(r.status, 500, "{method}: {:?}", body(&r));
+            assert_eq!(
+                read_state(&u).entry_count(),
+                before,
+                "{method} changed the dictionary"
+            );
+        }
+    }
+
+    /// #1939 item 5, #1989 review M1: with `trusted_afs` configured, trust is decided
+    /// by the caller's VERIFIED identity, not by its certificate type alone. A listed
+    /// AF is admitted however it arrives. Anyone else must prove it is a NEF: by its
+    /// own certificate when direct, else by its NRF profile, which fails closed. So an
+    /// untrusted AF relayed by an SCP, one with a certificate that names no type, and
+    /// one with a token alone are all refused; a NEF behind an SCP is admitted only
+    /// when the NRF says it is a NEF. Unconfigured, nothing is judged here.
+    #[tokio::test]
+    async fn only_the_nef_or_a_trusted_af_provisions_1989() {
+        let af_ok = "aaaaaaaa-1939-4000-8000-0000000000af";
+        let af_other = "bbbbbbbb-1939-4000-8000-0000000000af";
+        // (certificate NF types, certificate NF Instance ID, token sub)
+        let caller = |types: &[&str], cert: Option<&str>, token: Option<&str>| {
+            let mut r = as_nf_1862(
+                with_json(
+                    req("POST", "/nucmf-provisioning/v1/provisionings"),
+                    provisioning_body("0a0b"),
+                ),
+                token,
+            );
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r
+        };
+        let scp = "cccccccc-1939-4000-8000-000000000scp";
+        let nrf_nef_is = |nef: &'static str| {
+            move |id: String| async move { Ok::<bool, String>(id.eq_ignore_ascii_case(nef)) }
+        };
+        let nrf_down = |_id: String| async { Err::<bool, String>("no NRF".into()) };
+
+        let open = context::ProvisioningPolicy::default();
+        assert!(
+            provisioner_refusal(&open, &caller(&["AF"], Some(af_other), None), nrf_down)
+                .await
+                .is_none(),
+            "unconfigured: not judged"
+        );
+
+        let policy = context::ProvisioningPolicy {
+            trusted_afs: Some(vec![af_ok.to_string()]),
+            vendor_ids: BTreeMap::new(),
+        };
+        let refused = |r: Option<SbiResponse>, what: &str| {
+            let r = r.unwrap_or_else(|| panic!("{what}: admitted"));
+            assert_eq!(r.status, 403, "{what}");
+            assert!(
+                body(&r)["detail"].as_str().unwrap().contains("trusted AF"),
+                "{what}: {:?}",
+                body(&r)
+            );
+        };
+        // An untrusted AF: direct, via an SCP, with a typeless certificate, token only.
+        refused(
+            provisioner_refusal(&policy, &caller(&["AF"], Some(af_other), None), nrf_down).await,
+            "direct AF certificate",
+        );
+        refused(
+            provisioner_refusal(
+                &policy,
+                &caller(&["SCP"], Some(scp), Some(af_other)),
+                nrf_nef_is(NEF_A_1916),
+            )
+            .await,
+            "untrusted AF via an SCP",
+        );
+        refused(
+            provisioner_refusal(
+                &policy,
+                &caller(&[], Some(af_other), None),
+                nrf_nef_is(NEF_A_1916),
+            )
+            .await,
+            "typeless certificate",
+        );
+        refused(
+            provisioner_refusal(
+                &policy,
+                &caller(&[], None, Some(af_other)),
+                nrf_nef_is(NEF_A_1916),
+            )
+            .await,
+            "token only",
+        );
+        refused(
+            provisioner_refusal(&policy, &caller(&[], None, None), nrf_down).await,
+            "anonymous",
+        );
+        // A NEF behind an SCP, but the NRF cannot be asked: fails closed.
+        refused(
+            provisioner_refusal(
+                &policy,
+                &caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
+                nrf_down,
+            )
+            .await,
+            "NEF via an SCP with no NRF",
+        );
+
+        // Admitted: the trusted AF however it arrives, a NEF by certificate, a NEF
+        // behind an SCP or with a typeless certificate by its NRF profile.
+        for (r, what) in [
+            (caller(&["AF"], Some(af_ok), None), "trusted AF direct"),
+            (
+                caller(&["SCP"], Some(scp), Some(af_ok)),
+                "trusted AF via an SCP",
+            ),
+            (caller(&["NEF"], Some(NEF_B_1916), None), "NEF certificate"),
+        ] {
+            assert!(
+                provisioner_refusal(&policy, &r, nrf_down).await.is_none(),
+                "{what}"
+            );
+        }
+        for r in [
+            caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
+            caller(&[], Some(NEF_A_1916), None),
+        ] {
+            assert!(
+                provisioner_refusal(&policy, &r, nrf_nef_is(NEF_A_1916))
+                    .await
+                    .is_none(),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// #1989 review M1: the provisioning API is judged by [`provisioner_refusal`]
+    /// with the real NRF lookup, in the handler every request goes through.
+    #[test]
+    fn the_handler_judges_provisioners_with_the_nrf_lookup_1989() {
+        let src = include_str!("main.rs");
+        let call = "provisioner_refusal(&policy, &request, caller_is_nef).await";
+        assert_eq!(src.matches(call).count(), 2, "the call and this test");
+        assert!(is_provisioning_path(
+            "/nucmf-provisioning/v1/provisionings/1?x=1"
+        ));
+        assert!(!is_provisioning_path("/nucmf-uecm/v1/dic-entries"));
     }
 
     #[test]
