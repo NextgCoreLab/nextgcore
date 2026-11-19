@@ -3735,12 +3735,31 @@ impl PfcpServer {
         // neither this response nor any later report. A rejected request applies
         // nothing (§6.3.3), and the counters are part of what it must not touch.
         let mut usage_reports = Vec::new();
+        // Whether the query in this message (QAURR, or a Query URR naming it) covers
+        // the URR `id`.
+        let queried = |id: u32| query_all_urrs || queried_urr_ids.contains(&id);
         if failure.is_none() && !removed_urr_ids.is_empty() {
-            usage_reports.extend(self.collect_usage_reports(
-                upf_seid,
-                Some(&removed_urr_ids),
-                UsageReportReason::Termination,
-            ));
+            usage_reports.extend(
+                self.collect_usage_reports(
+                    upf_seid,
+                    Some(&removed_urr_ids),
+                    UsageReportReason::Termination,
+                )
+                .into_iter()
+                // #1852: a removed URR the query also covers reports once (below it is
+                // filtered out of the query's reports), so this final report is ALSO
+                // the query's answer: it carries the Query URR Reference
+                // (§5.2.2.3.1, Table 7.5.5.2-1) and IMMER beside TERMR (§8.2.41: more
+                // than one trigger bit may be set). One the query does not cover
+                // answers only the removal and carries neither.
+                .map(|mut r| {
+                    if queried(r.urr_id) {
+                        r.query_urr_reference = query_urr_reference;
+                        r.trigger.immediate_report = true;
+                    }
+                    r
+                }),
+            );
         }
         // QAURR together with a Query URR IE was rejected above (#1816, NOTE 3), so
         // at most one of the two forms reaches here.
@@ -3761,9 +3780,8 @@ impl PfcpServer {
                     // A URR removed by this same message has already reported with
                     // TERMR; reporting it twice would double-count it.
                     .filter(|r| !already.contains(&r.urr_id))
-                    // #1835: each report answering the query carries its reference.
-                    // A TERMR report for a removed URR answers the removal, not the
-                    // query, so it carries none.
+                    // #1835: each report answering the query carries its reference
+                    // (a removed URR's TERMR report was tagged above, #1852).
                     .map(|mut r| {
                         r.query_urr_reference = query_urr_reference;
                         r
@@ -10132,7 +10150,8 @@ mod tests {
     /// **#1835, TS 29.244 §5.2.2.3.1, Table 7.5.4.1-1 and Table 7.5.5.2-1.** A
     /// Query URR Reference in a Session Modification Request is echoed in every
     /// usage report sent in response to its query, Query URR or QAURR alike, and
-    /// in no other: a URR removed by the same message reports TERMR without it, and
+    /// in no other: a URR removed by the same message and NOT queried reports TERMR
+    /// without it (one the query covers carries it, #1852), and
     /// a query without a reference carries none. A reference too short for its
     /// value is discarded (§7.6.8). upfd never parsed the IE.
     #[tokio::test]
@@ -10209,6 +10228,111 @@ mod tests {
             assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
             assert_eq!(report_references_1835(&resp), vec![(3, None)], "seq {seq}");
         }
+    }
+
+    /// (URR ID, Query URR Reference, IMMER, TERMR) of every Usage Report in a
+    /// Session Modification Response, sorted. IMMER is octet 5 bit 8 and TERMR
+    /// octet 6 bit 4 of the Usage Report Trigger (TS 29.244 §8.2.41).
+    fn report_triggers_1852(resp: &[u8]) -> Vec<(u32, Option<u32>, bool, bool)> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let mut out: Vec<_> =
+            ParsedIe::find_all_ies(&ParsedIe::parse_all(body), pfcp_ie::USAGE_REPORT_SMR)
+                .iter()
+                .map(|ur| {
+                    let inner = ParsedIe::parse_all(&ur.value);
+                    let u32_of = |t: u16| {
+                        ParsedIe::find_ie(&inner, t)
+                            .map(|ie| u32::from_be_bytes(ie.value[..4].try_into().unwrap()))
+                    };
+                    let trigger = ParsedIe::find_ie(&inner, pfcp_ie::USAGE_REPORT_TRIGGER)
+                        .expect("every usage report carries its trigger")
+                        .value
+                        .clone();
+                    (
+                        u32_of(pfcp_ie::URR_ID).unwrap(),
+                        u32_of(pfcp_ie::QUERY_URR_REFERENCE),
+                        trigger[0] & 0x80 != 0,
+                        trigger[1] & 0x08 != 0,
+                    )
+                })
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// **#1852, TS 29.244 §5.2.2.3.1, Table 7.5.5.2-1, §8.2.41.** A URR removed by
+    /// the same Session Modification whose query covers it -- QAURR, or a Query URR
+    /// naming it -- reports once, and that final report also answers the query: it
+    /// carries the Query URR Reference and IMMER beside TERMR. A removed URR the
+    /// query does not cover reports TERMR alone (#1835's test covers that case).
+    #[tokio::test]
+    async fn a_removed_urr_s_final_report_answers_a_query_covering_it_1852() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for id in [2, 3, 4] {
+            b.add_tlv(
+                pfcp_ie::CREATE_URR,
+                &urr_body(id, Some(1_000_000), None, None),
+            );
+        }
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let modify = |seq: u32, build: &dyn Fn(&mut crate::n4_build::PfcpMessageBuilder)| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            build(&mut b);
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        // QAURR with a reference, and remove URR 1: every report answers the query,
+        // the removed URR's final one included.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(4, &|b| {
+                b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0x1852);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_triggers_1852(&resp),
+            vec![
+                (1, Some(0x1852), true, true),
+                (2, Some(0x1852), true, false),
+                (3, Some(0x1852), true, false),
+                (4, Some(0x1852), true, false),
+            ],
+            "the removed URR reports once, with the reference, IMMER and TERMR"
+        );
+        apply_next(&mut rx, &dp).await;
+
+        // A Query URR naming URR 2, which the same message removes, and naming 3;
+        // URR 4 is removed but not queried.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(5, &|b| {
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 3));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 4));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0x1853);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_triggers_1852(&resp),
+            vec![
+                (2, Some(0x1853), true, true),
+                (3, Some(0x1853), true, false),
+                (4, None, false, true),
+            ],
+            "a named and removed URR answers both; a removed, unqueried one only the removal"
+        );
     }
 
     /// Query URR (IE 77, TS 29.244 §7.5.4.10): report the URRs the SMF NAMED, and
