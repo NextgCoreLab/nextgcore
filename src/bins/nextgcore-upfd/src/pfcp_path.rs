@@ -1668,8 +1668,7 @@ impl PfcpServer {
                     header.msg_type,
                     header.sequence_number
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.resend_cached(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -1767,13 +1766,27 @@ impl PfcpServer {
     }
 
     /// Send `response` to `to`, keeping it for a retransmission of the request it
-    /// answers (#1851). Every response to a request goes out through here.
+    /// answers (#1851). Every response to a request goes out through here, so every
+    /// one is replayed rather than re-executed (#1898); the source guard
+    /// `every_pfcp_send_goes_through_one_of_three_helpers_1898` holds it there.
     async fn reply(&self, response: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         self.replies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .record(to, response);
         self.socket.send_to(response, to).await
+    }
+
+    /// Send again the cached `response` a retransmitted request is answered with
+    /// (#1851). Not recorded: it is already the cache's.
+    async fn resend_cached(&self, response: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(response, to).await
+    }
+
+    /// Send a request this UPF originates (Heartbeat, Session Report, Node Report),
+    /// or a T1 retransmission of one. Responses never go through here (#1898).
+    async fn send_request(&self, request: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(request, to).await
     }
 
     /// Handle one PFCP message the association gate admitted.
@@ -2283,7 +2296,7 @@ impl PfcpServer {
         #[cfg(not(feature = "compute-aware-upf"))]
         let payload = crate::n4_build::build_heartbeat_request(self.recovery_time_stamp);
         let message = self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
-        match self.socket.send_to(&message, peer).await {
+        match self.send_request(&message, peer).await {
             Ok(_) => {
                 // Track it: an untracked heartbeat can never reveal silence.
                 self.heartbeat.lock().await.outstanding.insert(seq);
@@ -2658,8 +2671,7 @@ impl PfcpServer {
                                 &resp_payload,
                                 true,
                             );
-                            self.socket
-                                .send_to(&response, src_addr)
+                            self.reply(&response, src_addr)
                                 .await
                                 .map_err(|e| format!("Send error: {e}"))?;
                             return Ok(());
@@ -4219,7 +4231,7 @@ impl PfcpServer {
                 usage: Vec::new(),
             },
         );
-        if let Err(e) = self.socket.send_to(&message, peer).await {
+        if let Err(e) = self.send_request(&message, peer).await {
             self.pending_reports.lock().await.remove(&seq);
             return Err(format!("Failed to send Node Report Request: {e}"));
         }
@@ -4527,7 +4539,7 @@ impl PfcpServer {
                 usage: Vec::new(),
             },
         );
-        if let Err(e) = self.socket.send_to(&message, peer).await {
+        if let Err(e) = self.send_request(&message, peer).await {
             self.pending_reports.lock().await.remove(&seq);
             self.path_ledger.lock().unwrap().answered(seq, false);
             return Err(format!("Failed to send Node Report Request: {e}"));
@@ -4974,7 +4986,7 @@ impl PfcpServer {
             );
         }
 
-        if let Err(e) = self.socket.send_to(&message, smf_addr).await {
+        if let Err(e) = self.send_request(&message, smf_addr).await {
             // Send failed outright: drop the pending entry, nothing to retry on.
             self.pending_reports.lock().await.remove(&seq);
             return Err(format!("Failed to send {what}: {e}"));
@@ -5008,7 +5020,7 @@ impl PfcpServer {
             });
         }
         for (seq, msg, dest) in to_send {
-            match self.socket.send_to(&msg, dest).await {
+            match self.send_request(&msg, dest).await {
                 Ok(_) => log::warn!(
                     "Retransmitting Session Report Request (seq={seq}) to {dest} (T1 expired)"
                 ),
@@ -13705,6 +13717,68 @@ mod tests {
             response_cause(&again),
             PfcpCause::NoEstablishedPfcpAssociation as u8,
             "the old incarnation's response must not be replayed to the new one"
+        );
+    }
+
+    /// **#1898.** The F-TEID collision refusal #1843 added is a response like any
+    /// other, so it is cached: its retransmission is replayed (TS 29.244 §6.4),
+    /// not executed again. It went out through `socket.send_to`, so the cache
+    /// never saw it.
+    #[tokio::test]
+    async fn a_teid_collision_refusal_is_kept_for_its_retransmission_1898() {
+        let (server, smf, addr, _rx, _dp, _a_seid) = established_session().await;
+        let request = encode_pfcp(
+            50,
+            Some(0),
+            20,
+            &establishment_1834(0xB, &[None, Some(0x1234)]),
+        );
+        let resp = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8,
+            "PDR 2 names the established session's TEID"
+        );
+        let kept = server.replies.lock().unwrap().replay(
+            smf.local_addr().unwrap(),
+            20,
+            &request,
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            kept,
+            Some(resp.clone()),
+            "the refusal must be kept for a retransmission"
+        );
+        assert_eq!(exchange(&smf, addr, &request).await, resp);
+    }
+
+    /// **#1898, source guard.** Every PFCP datagram this server sends goes out
+    /// through one of three helpers: [`PfcpServer::reply`] (a response, recorded
+    /// for retransmissions), [`PfcpServer::resend_cached`] (a recorded response sent
+    /// again) or [`PfcpServer::send_request`] (a request this UPF originates). A
+    /// direct `send_to` anywhere else is how #1843's collision refusal escaped the
+    /// duplicate-request cache, so this fails on the next one.
+    #[test]
+    fn every_pfcp_send_goes_through_one_of_three_helpers_1898() {
+        let src = include_str!("pfcp_path.rs");
+        let production = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module")];
+        let mut senders: Vec<&str> = production
+            .match_indices(".send_to(")
+            .map(|(at, _)| {
+                let before = &production[..at];
+                let fn_at = before.rfind("fn ").expect("inside a fn") + 3;
+                let name = &before[fn_at..];
+                &name[..name.find(['(', '<']).unwrap()]
+            })
+            .collect();
+        senders.sort_unstable();
+        assert_eq!(
+            senders,
+            vec!["reply", "resend_cached", "send_request"],
+            "a PFCP send outside the three helpers: route a response through reply()"
         );
     }
 }
