@@ -96,9 +96,101 @@ fn admissions() -> &'static Mutex<HashMap<Key, Admission>> {
 struct Ops {
     /// DECREASEs registered before their check and still on the wire.
     in_flight: HashMap<Key, Vec<Arc<Flight>>>,
-    /// INCREASEs being decided, each with the DECREASEs it superseded: they are
-    /// owed again if this INCREASE does not end up counting the UE.
-    admitting: HashMap<Key, Vec<Admission>>,
+    /// INCREASEs being decided, with the DECREASEs they superseded: those are
+    /// owed again unless one of them ends up counting the UE at that NSACF.
+    admitting: HashMap<Key, Admitting>,
+}
+
+/// #2036: the INCREASEs (and re-counts) of one key being decided. Overlapping
+/// ones share the entry; each holds it through an [`AdmittingSlot`], and the
+/// last to leave settles what is owed.
+#[derive(Default)]
+struct Admitting {
+    /// How many INCREASEs of the key are being decided.
+    deciding: usize,
+    /// The DECREASEs superseded meanwhile.
+    owed: Vec<Admission>,
+    /// The NSACFs at which a settled INCREASE of the entry counted the UE.
+    counted_at: Vec<(String, u16)>,
+}
+
+/// #2036: one INCREASE's hold on its key's [`Admitting`] entry. Settled when its
+/// answer is in; dropped unsettled (the task panicked, or was cancelled, as at a
+/// shutdown) it still leaves the entry, so later DECREASEs of the key are not
+/// swallowed for good, and it parks what is owed: the superseded DECREASEs and,
+/// for an INCREASE, a precautionary DECREASE of its own admission (it may have
+/// landed; a DECREASE of a UE the NSACF does not hold is a no-op, and one of a key
+/// admitted again is superseded).
+struct AdmittingSlot {
+    key: Key,
+    own: Option<Admission>,
+    settled: bool,
+}
+
+impl AdmittingSlot {
+    /// Hold `key`'s entry. The caller holds the admissions lock, then `ops`.
+    fn enter(ops: &mut Ops, key: &Key, own: Option<Admission>) -> Self {
+        ops.admitting.entry(key.clone()).or_default().deciding += 1;
+        Self {
+            key: key.clone(),
+            own,
+            settled: false,
+        }
+    }
+
+    /// The INCREASE is settled, having counted the UE at `counted_at` or not.
+    /// Returns the DECREASEs owed now: none while another INCREASE of the key is
+    /// still being decided; once the last one leaves, every superseded DECREASE
+    /// except those at an NSACF where one of them counted the UE.
+    fn settle(mut self, counted_at: Option<(String, u16)>) -> Vec<Admission> {
+        self.settled = true;
+        let _admitted = lock(admissions());
+        leave(&mut lock(ops()), &self.key, counted_at)
+    }
+}
+
+impl Drop for AdmittingSlot {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let owed = {
+            let _admitted = lock(admissions());
+            leave(&mut lock(ops()), &self.key, None)
+        };
+        log::warn!(
+            "NSAC admission of {:?} ended unsettled (a panic or a shutdown); parking \
+             {} owed DECREASE(s)",
+            self.key,
+            owed.len() + usize::from(self.own.is_some())
+        );
+        for a in owed.into_iter().chain(self.own.take()) {
+            park(a);
+        }
+    }
+}
+
+/// Leave `key`'s entry; see [`AdmittingSlot::settle`].
+fn leave(ops: &mut Ops, key: &Key, counted_at: Option<(String, u16)>) -> Vec<Admission> {
+    let Some(entry) = ops.admitting.get_mut(key) else {
+        return Vec::new();
+    };
+    entry.counted_at.extend(counted_at);
+    entry.deciding = entry.deciding.saturating_sub(1);
+    if entry.deciding > 0 {
+        return Vec::new();
+    }
+    let entry = ops.admitting.remove(key).unwrap_or_default();
+    entry
+        .owed
+        .into_iter()
+        .filter(|old| {
+            !entry
+                .counted_at
+                .iter()
+                .any(|(host, port)| *host == old.nsacf_host && *port == old.nsacf_port)
+        })
+        .collect()
 }
 
 /// One DECREASE on the wire, which an INCREASE for its key waits for.
@@ -199,37 +291,9 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
 /// The longest a failing peer is left alone between attempts.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 
-type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
-
-/// Per peer: when it may next be tried, and the current backoff.
-fn backoff() -> &'static Mutex<Backoff> {
-    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
-        std::sync::LazyLock::new(Default::default);
-    &BACKOFF
-}
-
-fn backing_off(peer: &str) -> bool {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(peer)
-        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
-}
-
-fn note_failure(peer: &str) {
-    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    let wait = map
-        .get(peer)
-        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
-    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
-}
-
-fn note_success(peer: &str) {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(peer);
-}
+/// Per peer: its backoff (#1994: the shared one), guarded like the parked set.
+static BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(BACKOFF_BASE, BACKOFF_MAX);
 
 /// The peer a DECREASE goes to: the NSACF that granted the admission.
 fn peer_of(a: &Admission) -> String {
@@ -352,11 +416,11 @@ pub async fn admit_registration(
         // INCREASE); one that checks after sees this one and is superseded, its
         // count handed to this INCREASE.
         let key = key_of(supi, access_type, snssai);
-        let flights = {
+        let (slot, flights) = {
             let _admitted = lock(admissions());
             let mut ops = lock(ops());
-            ops.admitting.entry(key.clone()).or_default();
-            ops.in_flight.get(&key).cloned().unwrap_or_default()
+            let slot = AdmittingSlot::enter(&mut ops, &key, Some(admission.clone()));
+            (slot, ops.in_flight.get(&key).cloned().unwrap_or_default())
         };
         let until = tokio::time::Instant::now() + DECREASE_WAIT;
         for f in flights {
@@ -374,21 +438,12 @@ pub async fn admit_registration(
         )
         .await;
         // The DECREASEs superseded while this INCREASE was out: still owed unless
-        // this INCREASE counts the UE at the same NSACF (it counts a UE once).
-        let inherited = {
-            let _admitted = lock(admissions());
-            lock(ops()).admitting.remove(&key).unwrap_or_default()
-        };
+        // it (or an overlapping one, #2036) counts the UE at the same NSACF (it
+        // counts a UE once).
         let counted_here = matches!(&answer, Ok(res) if res.counted);
-        let owed: Vec<Admission> = inherited
-            .into_iter()
-            .filter(|old| {
-                !(counted_here
-                    && old.nsacf_host == admission.nsacf_host
-                    && old.nsacf_port == admission.nsacf_port)
-            })
-            .collect();
-        spawn_decreases(owed);
+        spawn_decreases(
+            slot.settle(counted_here.then(|| (admission.nsacf_host.clone(), admission.nsacf_port))),
+        );
         match answer {
             Ok(res) => {
                 granted |= res.admitted;
@@ -454,8 +509,8 @@ async fn decrease_once(a: Admission) -> Outcome {
         if admitted.contains_key(&key) {
             return Outcome::Superseded;
         }
-        if let Some(owed) = ops.admitting.get_mut(&key) {
-            owed.push(a);
+        if let Some(entry) = ops.admitting.get_mut(&key) {
+            entry.owed.push(a);
             return Outcome::Superseded;
         }
         let flight = Arc::new(Flight::default());
@@ -503,7 +558,7 @@ fn spawn_recount(key: Key) {
         // finds it, and its DECREASE is handed to the re-count and sent once the
         // re-count's INCREASE is settled, instead of possibly landing first and
         // leaving the NSACF counting a UE the AMF has already dropped.
-        let (live, flights) = {
+        let (live, slot, flights) = {
             let admitted = lock(admissions());
             let Some(live) = admitted.get(&key).cloned() else {
                 return;
@@ -513,8 +568,12 @@ fn spawn_recount(key: Key) {
                 // Another INCREASE of the key is being decided: it counts the UE.
                 return;
             }
-            ops.admitting.entry(key.clone()).or_default();
-            (live, ops.in_flight.get(&key).cloned().unwrap_or_default())
+            let slot = AdmittingSlot::enter(&mut ops, &key, None);
+            (
+                live,
+                slot,
+                ops.in_flight.get(&key).cloned().unwrap_or_default(),
+            )
         };
         let until = tokio::time::Instant::now() + DECREASE_WAIT;
         for f in flights {
@@ -542,11 +601,7 @@ fn spawn_recount(key: Key) {
         // The DECREASEs superseded while the re-count was out (the UE
         // deregistered, or its S-NSSAI was removed): the re-count does not own
         // the admission, so every one is still owed and is sent now, after it.
-        let owed = {
-            let _admitted = lock(admissions());
-            lock(ops()).admitting.remove(&key).unwrap_or_default()
-        };
-        spawn_decreases(owed);
+        spawn_decreases(slot.settle(None));
     });
 }
 
@@ -599,18 +654,27 @@ async fn send(a: &Admission) -> Outcome {
 }
 
 fn evict(set: &mut VecDeque<Parked>) {
-    while set.len() > MAX_PENDING {
-        if let Some(Parked { a: old, .. }) = set.pop_front() {
-            log::error!(
-                "[{}] NSACF DECREASE for SST={} SD={:?} abandoned: {MAX_PENDING} are already \
-                 pending; the UE stays counted at the NSACF",
-                old.supi,
-                old.snssai.sst,
-                old.snssai.sd
-            );
-            RECONCILED.inc(&["abandoned"]);
-        }
+    // #1994: the oldest by park time, wherever rotation has put it (it popped the
+    // front, which rotation makes the next to be tried, not the oldest).
+    for Parked { a: old, .. } in
+        nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
+    {
+        log::error!(
+            "[{}] NSACF DECREASE for SST={} SD={:?} abandoned: {MAX_PENDING} are already \
+             pending; the UE stays counted at the NSACF",
+            old.supi,
+            old.snssai.sst,
+            old.snssai.sd
+        );
+        RECONCILED.inc(&["abandoned"]);
     }
+}
+
+/// #1994: forget the backoff of an NSACF with nothing left parked, so one that
+/// never comes back does not stay in the map for good.
+fn prune_backoff(set: &VecDeque<Parked>) {
+    let live: std::collections::HashSet<String> = set.iter().map(|p| peer_of(&p.a)).collect();
+    BACKOFF.retain(|peer| live.contains(peer));
 }
 
 /// Park a DECREASE that failed. One already parked is not parked twice.
@@ -671,7 +735,7 @@ pub async fn reconcile_once() -> usize {
             continue;
         }
         let peer = peer_of(a);
-        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
             untried.push(p);
             continue;
         }
@@ -680,12 +744,12 @@ pub async fn reconcile_once() -> usize {
             Outcome::Accepted => "delivered",
             Outcome::Refused => "refused",
             Outcome::Failed => {
-                note_failure(&peer);
+                BACKOFF.note_failure(&peer);
                 failed.push(p);
                 continue;
             }
         };
-        note_success(&peer);
+        BACKOFF.note_success(&peer);
         log::info!(
             "[{}] parked NSACF DECREASE for SST={} SD={:?}: {result}",
             a.supi,
@@ -707,6 +771,7 @@ pub async fn reconcile_once() -> usize {
         }
     }
     evict(&mut set);
+    prune_backoff(&set);
     ended
 }
 
@@ -757,7 +822,7 @@ pub fn render(out: &mut String) {
 pub fn clear_for_test() {
     lock(admissions()).clear();
     lock(pending()).clear();
-    lock(backoff()).clear();
+    BACKOFF.clear();
     let mut ops = lock(ops());
     ops.in_flight.clear();
     ops.admitting.clear();
@@ -833,6 +898,161 @@ pub(crate) mod tests {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
         get()
+    }
+
+    fn admission_2036(port: u16) -> Admission {
+        Admission {
+            supi: "imsi-001010000020361".to_string(),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(1),
+            nf_id: "amf-2036".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        }
+    }
+
+    fn key_2036() -> Key {
+        key_of("imsi-001010000020361", "3GPP_ACCESS", &snssai(1))
+    }
+
+    fn admitting_2036() -> bool {
+        lock(ops()).admitting.contains_key(&key_2036())
+    }
+
+    /// #2036: a registration cancelled while its INCREASE is out (as at a
+    /// shutdown) leaves the key's admitting entry, so a later DECREASE of the key
+    /// is sent rather than swallowed, and parks what it owed: the DECREASE it
+    /// superseded and a precautionary one of its own INCREASE.
+    ///
+    /// REVERT-VERIFIED: with `AdmittingSlot`'s `Drop` doing nothing, this fails:
+    /// the key stays admitting and nothing is parked.
+    #[tokio::test]
+    async fn a_cancelled_admission_leaves_its_slot_and_parks_what_it_owed_2036() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // An NSACF that accepts the INCREASE's connection and never answers.
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hole_port = hole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = hole.accept().await {
+                conns.push(c);
+            }
+        });
+        let admitting = tokio::spawn(async move {
+            admit_registration(
+                "imsi-001010000020361",
+                "3GPP_ACCESS",
+                &[snssai(1)],
+                "127.0.0.1",
+                hole_port,
+                "amf-2036",
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !admitting_2036() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // An earlier registration's DECREASE (at another NSACF) is superseded.
+        let earlier = admission_2036(1);
+        let superseded = decrease_once(earlier.clone()).await;
+        admitting.abort();
+        let cancelled = admitting.await.is_err();
+        let still_admitting = admitting_2036();
+        let parked = parked();
+        // A later DECREASE of the key is sent (port 1 refuses it: Failed).
+        let later = decrease_once(earlier.clone()).await;
+        clear_for_test();
+        held.abort();
+
+        assert_eq!(superseded, Outcome::Superseded);
+        assert!(cancelled);
+        assert!(!still_admitting, "the slot is left");
+        assert!(parked.contains(&earlier), "the owed DECREASE is parked");
+        assert!(
+            parked.contains(&admission_2036(hole_port)),
+            "and a precautionary one of its own INCREASE: {parked:?}"
+        );
+        assert_eq!(later, Outcome::Failed, "not swallowed");
+    }
+
+    /// #2036: a task that panics while it holds the key's admitting entry leaves
+    /// it, and parks the DECREASE it superseded.
+    ///
+    /// REVERT-VERIFIED: with `AdmittingSlot`'s `Drop` doing nothing, this fails:
+    /// the key stays admitting for good.
+    #[tokio::test]
+    async fn a_panic_while_admitting_leaves_the_slot_2036() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _slot = {
+                let _admitted = lock(admissions());
+                AdmittingSlot::enter(&mut lock(ops()), &key_2036(), None)
+            };
+            let _ = entered_tx.send(());
+            let _ = go_rx.await;
+            panic!("#2036: a panic while admitting");
+        });
+        entered_rx.await.unwrap();
+        let earlier = admission_2036(1);
+        let superseded = decrease_once(earlier.clone()).await;
+        let _ = go_tx.send(());
+        let panicked = task.await.is_err_and(|e| e.is_panic());
+        let still_admitting = admitting_2036();
+        let parked = parked();
+        clear_for_test();
+
+        assert_eq!(superseded, Outcome::Superseded);
+        assert!(panicked);
+        assert!(!still_admitting, "the slot is left");
+        assert_eq!(parked, vec![earlier], "the owed DECREASE is parked");
+    }
+
+    /// #2036: overlapping INCREASEs of a key each hold its admitting entry. The
+    /// first to settle does not end it: a DECREASE meanwhile is still superseded,
+    /// and the last to settle returns it owed, unless one of them counted the UE
+    /// at its NSACF.
+    ///
+    /// REVERT-VERIFIED: with `leave` ending the entry whatever `deciding` is (one
+    /// shared slot, as before), this fails: the first settle ends it.
+    #[tokio::test]
+    async fn overlapping_increases_each_hold_the_slot_2036() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let enter = || {
+            let _admitted = lock(admissions());
+            AdmittingSlot::enter(&mut lock(ops()), &key_2036(), None)
+        };
+        let earlier = admission_2036(1);
+
+        let (first, second) = (enter(), enter());
+        let after_first = first.settle(None);
+        let held = admitting_2036();
+        let superseded = decrease_once(earlier.clone()).await;
+        let after_second = second.settle(Some(("127.0.0.1".to_string(), 2)));
+        let ended = !admitting_2036();
+
+        // One of them counted the UE at the superseded DECREASE's NSACF.
+        let (first, second) = (enter(), enter());
+        let _ = decrease_once(earlier.clone()).await;
+        let counted_one = first.settle(Some(("127.0.0.1".to_string(), 1)));
+        let counted_last = second.settle(None);
+        clear_for_test();
+
+        assert!(after_first.is_empty(), "the first settle owes nothing yet");
+        assert!(held, "the second still holds the entry");
+        assert_eq!(superseded, Outcome::Superseded);
+        assert_eq!(after_second, vec![earlier], "owed once the last settles");
+        assert!(ended);
+        assert!(
+            counted_one.is_empty() && counted_last.is_empty(),
+            "counted: not owed"
+        );
     }
 
     /// #1942: a registration denied on its second S-NSSAI rejects that S-NSSAI
@@ -1379,5 +1599,69 @@ pub(crate) mod tests {
         assert_eq!(held.len(), MAX_PENDING);
         assert_eq!(held[0].supi, "imsi-bound-1", "the oldest went");
         assert_eq!(RECONCILED.get(&["abandoned"]) - before, 1);
+    }
+
+    fn parked_decrease_1994(n: usize, port: u16) -> Admission {
+        Admission {
+            supi: format!("imsi-1994-{n}"),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(1),
+            nf_id: "amf-1994".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        }
+    }
+
+    /// #1994: eviction takes the oldest wherever rotation has put it. A failed
+    /// DECREASE goes to the back, so the front is the next to be tried, not the
+    /// oldest.
+    ///
+    /// REVERT-VERIFIED: with `evict` popping the front, as before, this fails:
+    /// the younger front entry is evicted and the oldest kept.
+    #[tokio::test]
+    async fn eviction_takes_the_oldest_after_rotation_1994() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        for n in 0..MAX_PENDING {
+            park(parked_decrease_1994(n, 1));
+        }
+        // A pass tried the oldest and it failed: it is at the back now.
+        {
+            let mut set = lock(pending());
+            let oldest = set.pop_front().expect("parked");
+            set.push_back(oldest);
+        }
+        park(parked_decrease_1994(MAX_PENDING, 1));
+        let held: Vec<String> = parked().into_iter().map(|a| a.supi).collect();
+        clear_for_test();
+
+        assert_eq!(held.len(), MAX_PENDING);
+        assert!(
+            !held.contains(&"imsi-1994-0".to_string()),
+            "the oldest went"
+        );
+        assert!(held.contains(&"imsi-1994-1".to_string()), "not the front");
+    }
+
+    /// #1994: a pass forgets the backoff of an NSACF with nothing parked, and
+    /// keeps that of one still holding parked DECREASEs.
+    ///
+    /// REVERT-VERIFIED: with `prune_backoff` a no-op, this fails: the NSACF with
+    /// nothing parked keeps its backoff.
+    #[tokio::test]
+    async fn an_nsacf_with_nothing_parked_is_pruned_1994() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (gone, kept) = ("127.0.0.1:19941", "127.0.0.1:19942");
+        BACKOFF.note_failure(gone);
+        BACKOFF.note_failure(kept);
+        // Backing off, so not contacted: it stays parked.
+        park(parked_decrease_1994(0, 19942));
+        reconcile_once().await;
+        let after = (BACKOFF.current(gone), BACKOFF.current(kept));
+        clear_for_test();
+
+        assert_eq!(after.0, None, "nothing parked: pruned");
+        assert_eq!(after.1, Some(BACKOFF_BASE), "still parked: kept");
     }
 }

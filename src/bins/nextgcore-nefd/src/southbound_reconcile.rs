@@ -77,40 +77,18 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
 /// The longest a failing producer is left alone between attempts.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 
-/// Per producer (target base URI): when it may next be tried, and the current
-/// backoff. Guarded like [`pending`].
-fn backoff() -> &'static Mutex<std::collections::HashMap<String, (tokio::time::Instant, Duration)>>
-{
-    static BACKOFF: std::sync::LazyLock<
-        Mutex<std::collections::HashMap<String, (tokio::time::Instant, Duration)>>,
-    > = std::sync::LazyLock::new(Default::default);
-    &BACKOFF
-}
+/// Per producer (target base URI): its backoff (#1994: the shared one). Guarded
+/// like [`pending`].
+static BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(BACKOFF_BASE, BACKOFF_MAX);
 
-fn backing_off(target: &str) -> bool {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(target)
-        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
-}
-
-fn note_failure(target: &str) {
-    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    let wait = map
-        .get(target)
-        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
-    map.insert(
-        target.to_string(),
-        (tokio::time::Instant::now() + wait, wait),
-    );
-}
-
-fn note_success(target: &str) {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(target);
+/// The producer a parked unsubscribe is retried at: the one its subscription was
+/// made at, else the producer URI configured now. Its backoff key.
+fn target_of(southbound: &SouthboundRef) -> Option<String> {
+    southbound
+        .producer_base
+        .clone()
+        .or_else(|| crate::producer_uri(southbound.producer))
 }
 
 /// One parked unsubscribe, and when it was first parked.
@@ -125,27 +103,16 @@ fn lock() -> std::sync::MutexGuard<'static, VecDeque<Parked>> {
 }
 
 fn evict(set: &mut VecDeque<Parked>) {
-    while set.len() > MAX_PENDING {
-        // The oldest by park time, wherever rotation has put it.
-        let Some(oldest) = set
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, p)| p.since)
-            .map(|(i, _)| i)
-        else {
-            break;
-        };
-        if let Some(Parked {
-            southbound: old, ..
-        }) = set.remove(oldest)
-        {
-            log::error!(
-                "{} unsubscribe of {} abandoned: {MAX_PENDING} are already pending",
-                old.producer.as_str(),
-                old.subscription_id
-            );
-            RECONCILED.inc(&["abandoned"]);
-        }
+    for Parked {
+        southbound: old, ..
+    } in nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
+    {
+        log::error!(
+            "{} unsubscribe of {} abandoned: {MAX_PENDING} are already pending",
+            old.producer.as_str(),
+            old.subscription_id
+        );
+        RECONCILED.inc(&["abandoned"]);
     }
 }
 
@@ -182,11 +149,23 @@ pub fn parked() -> Vec<SouthboundRef> {
     lock().iter().map(|p| p.southbound.clone()).collect()
 }
 
+/// The backoff a producer is in (tests).
+#[cfg(test)]
+pub fn backoff_of(target: &str) -> Option<Duration> {
+    BACKOFF.current(target)
+}
+
+/// Record a failure at a producer (tests).
+#[cfg(test)]
+pub fn note_failure_for_test(target: &str) {
+    BACKOFF.note_failure(target);
+}
+
 /// Forget every parked unsubscribe (a test's own).
 #[cfg(test)]
 pub fn clear_for_test() {
     lock().clear();
-    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    BACKOFF.clear();
 }
 
 /// One pass: retry the parked unsubscribes in turn order, for at most
@@ -218,19 +197,16 @@ pub async fn reconcile_once() -> usize {
             ended += 1;
             continue;
         }
-        let uri = southbound
-            .producer_base
-            .clone()
-            .or_else(|| crate::producer_uri(southbound.producer));
+        let uri = target_of(southbound);
         let target = uri.clone().unwrap_or_default();
         // A producer that failed (in this pass or an earlier one) is backing off:
         // its unsubscribes wait, so it costs one attempt per backoff period.
-        if tokio::time::Instant::now() >= deadline || backing_off(&target) {
+        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&target) {
             untried.push(parked);
             continue;
         }
         if crate::try_southbound_unsubscribe(uri, southbound).await {
-            note_success(&target);
+            BACKOFF.note_success(&target);
             log::info!(
                 "{} unsubscribe of {}: reconciled",
                 southbound.producer.as_str(),
@@ -239,7 +215,7 @@ pub async fn reconcile_once() -> usize {
             RECONCILED.inc(&["delivered"]);
             ended += 1;
         } else {
-            note_failure(&target);
+            BACKOFF.note_failure(&target);
             failed.push(parked);
         }
     }
@@ -255,7 +231,20 @@ pub async fn reconcile_once() -> usize {
         }
     }
     evict(&mut set);
+    let parked: Vec<SouthboundRef> = set.iter().map(|p| p.southbound.clone()).collect();
+    drop(set);
+    prune_backoff(&parked);
     ended
+}
+
+/// #1994: forget the backoff of a producer with nothing left parked, so one that
+/// never comes back does not stay in the map for good.
+fn prune_backoff(parked: &[SouthboundRef]) {
+    let live: std::collections::HashSet<String> = parked
+        .iter()
+        .map(|s| target_of(s).unwrap_or_default())
+        .collect();
+    BACKOFF.retain(|target| live.contains(target));
 }
 
 /// Run [`reconcile_once`] every [`RECONCILE_PERIOD`] for the life of the process.

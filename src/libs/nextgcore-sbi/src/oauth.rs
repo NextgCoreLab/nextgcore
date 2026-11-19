@@ -1536,6 +1536,14 @@ impl OAuth2Client {
         Ok(self.with_tls(TlsConnector::from(Arc::new(cfg))))
     }
 
+    /// The NF Instance ID this client requests tokens as (`nfInstanceId` of the
+    /// AccessTokenReq, TS 29.510 §6.3.5.2.2), which the NRF issues as the token's
+    /// `sub`. A producer that binds a resource to its consumer binds it to this
+    /// (#1931).
+    pub fn nf_instance_id(&self) -> &str {
+        &self.nf_instance_id
+    }
+
     /// Get the NRF URI.
     pub fn nrf_uri(&self) -> &str {
         &self.nrf_uri

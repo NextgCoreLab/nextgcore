@@ -85,37 +85,9 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
 /// The longest a failing peer is left alone between attempts.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 
-type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
-
-/// Per peer: when it may next be tried, and the current backoff.
-fn backoff() -> &'static Mutex<Backoff> {
-    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
-        std::sync::LazyLock::new(Default::default);
-    &BACKOFF
-}
-
-fn backing_off(peer: &str) -> bool {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(peer)
-        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
-}
-
-fn note_failure(peer: &str) {
-    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    let wait = map
-        .get(peer)
-        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
-    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
-}
-
-fn note_success(peer: &str) {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(peer);
-}
+/// Per peer: its backoff (#1994: the shared one), guarded like the parked set.
+static BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(BACKOFF_BASE, BACKOFF_MAX);
 
 /// The peer every Delete goes to: the one resolved PCF.
 const PCF_PEER: &str = "pcf";
@@ -130,11 +102,6 @@ pub fn park(resource_id: String) {
         if set.iter().any(|p| p.resource_id == resource_id) {
             return;
         }
-        let evicted = if set.len() >= MAX_PENDING {
-            set.pop_front().map(|p| p.resource_id)
-        } else {
-            None
-        };
         log::warn!(
             "Npcf_PolicyAuthorization_Delete for {resource_id} is parked; it is retried every \
              {RECONCILE_PERIOD:?}"
@@ -143,11 +110,28 @@ pub fn park(resource_id: String) {
             resource_id,
             since: std::time::SystemTime::now(),
         });
-        evicted
+        evict(&mut set)
     };
-    if let Some(old) = evicted {
+    for old in evicted {
         abandon(&old);
     }
+}
+
+/// Evict down to [`MAX_PENDING`], the oldest by park time first, wherever
+/// rotation has put it (#1994: it popped the front, which rotation makes the
+/// next to be tried, not the oldest). Returns the evicted resource ids, for
+/// [`abandon`] once the set's lock is released.
+fn evict(set: &mut VecDeque<Parked>) -> Vec<String> {
+    nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
+        .into_iter()
+        .map(|p| p.resource_id)
+        .collect()
+}
+
+/// #1994: forget the PCF's backoff once nothing is parked for it, so the map
+/// does not keep it for good.
+fn prune_backoff(set: &VecDeque<Parked>) {
+    BACKOFF.retain(|peer| peer != PCF_PEER || !set.is_empty());
 }
 
 fn abandon(resource_id: &str) {
@@ -198,13 +182,13 @@ pub async fn reconcile_once() -> usize {
             expired.push(p.resource_id);
             continue;
         }
-        if tokio::time::Instant::now() >= deadline || backing_off(PCF_PEER) {
+        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(PCF_PEER) {
             untried.push(p);
             continue;
         }
         match crate::actuation::delete_once_for_reconciler(&p.resource_id).await {
             crate::actuation::DeleteOutcome::Deleted => {
-                note_success(PCF_PEER);
+                BACKOFF.note_success(PCF_PEER);
                 log::info!(
                     "reconciler deleted the PCF app session of {}",
                     p.resource_id
@@ -214,7 +198,7 @@ pub async fn reconcile_once() -> usize {
             }
             crate::actuation::DeleteOutcome::NothingRecorded => {}
             crate::actuation::DeleteOutcome::Failed => {
-                note_failure(PCF_PEER);
+                BACKOFF.note_failure(PCF_PEER);
                 failed.push(p);
             }
         }
@@ -231,9 +215,8 @@ pub async fn reconcile_once() -> usize {
                 set.push_back(p);
             }
         }
-        while set.len() > MAX_PENDING {
-            evicted.extend(set.pop_front().map(|p| p.resource_id));
-        }
+        evicted = evict(&mut set);
+        prune_backoff(&set);
     }
     for old in evicted {
         abandon(&old);
@@ -285,7 +268,7 @@ pub fn clear_for_test() {
     if let Ok(mut set) = pending().lock() {
         set.clear();
     }
-    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    BACKOFF.clear();
 }
 
 #[cfg(test)]
@@ -296,6 +279,75 @@ mod tests {
         crate::context::PROCESS_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pass_1994() -> usize {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(reconcile_once())
+    }
+
+    fn held_1994() -> Vec<String> {
+        pending()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.resource_id.clone())
+            .collect()
+    }
+
+    /// #1994: eviction takes the oldest wherever rotation has put it. A failed
+    /// Delete goes to the back, so the front is the next to be tried, not the
+    /// oldest.
+    ///
+    /// REVERT-VERIFIED: with `evict` popping the front, as before, this fails:
+    /// the younger front entry is evicted and the oldest kept.
+    #[test]
+    fn eviction_takes_the_oldest_after_rotation_1994() {
+        let _g = lock();
+        clear_for_test();
+        crate::actuation::clear_app_sessions_for_test();
+        for n in 0..MAX_PENDING {
+            park(format!("r-{n}"));
+        }
+        // A pass tried the oldest and it failed: it is at the back now.
+        {
+            let mut set = pending().lock().unwrap();
+            let oldest = set.pop_front().expect("parked");
+            set.push_back(oldest);
+        }
+        park(format!("r-{MAX_PENDING}"));
+        let held = held_1994();
+        clear_for_test();
+
+        assert_eq!(held.len(), MAX_PENDING);
+        assert!(!held.contains(&"r-0".to_string()), "the oldest went");
+        assert!(held.contains(&"r-1".to_string()), "not the front");
+    }
+
+    /// #1994: the PCF's backoff is kept while a Delete is parked for it, and
+    /// forgotten by the first pass with nothing parked.
+    ///
+    /// REVERT-VERIFIED: with `prune_backoff` a no-op, this fails: the backoff
+    /// outlives the parked set.
+    #[test]
+    fn the_pcf_backoff_is_pruned_once_nothing_is_parked_1994() {
+        let _g = lock();
+        clear_for_test();
+        BACKOFF.note_failure(PCF_PEER);
+        // Backing off, so not contacted: it stays parked.
+        park("r-1994".to_string());
+        pass_1994();
+        let while_parked = BACKOFF.current(PCF_PEER);
+        pending().lock().unwrap().clear();
+        pass_1994();
+        let after = BACKOFF.current(PCF_PEER);
+        clear_for_test();
+
+        assert_eq!(while_parked, Some(BACKOFF_BASE), "still parked: kept");
+        assert_eq!(after, None, "nothing parked: pruned");
     }
 
     /// #1817 bound: parking past [`MAX_PENDING`] evicts the oldest, forgets its
