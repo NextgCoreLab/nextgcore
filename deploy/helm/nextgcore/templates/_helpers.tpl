@@ -415,3 +415,91 @@ claim shared ReadWriteMany, would be two processes rewriting one snapshot.
 {{- end }}
 {{- end }}
 {{- end -}}
+
+{{/*
+#2052: the AMF Set NF Set ID of the chart's AMF (TS 23.003 §28.12), as nrfd
+derives it from the AMF's GUAMI (#2035): set<AMF Set ID>.region<AMF Region
+ID>.amfset.5gc.mnc<MNC>.mcc<MCC>, the IDs in the hex form of the published
+amfSetId (3 digits) and amfRegionId (2 digits), the MNC padded to 3 digits.
+The GUAMI is the one amf.yaml renders: global.plmn and amf.config.amfId.
+*/}}
+{{- define "nextgcore.amfSetNfSetId" -}}
+{{- $region := toString .Values.amf.config.amfId.region -}}
+{{- $set := toString .Values.amf.config.amfId.set -}}
+{{- if or (not (regexMatch "^[0-9]{1,3}$" $region)) (gt (atoi $region) 255) -}}
+{{- fail (printf "amf.config.amfId.region=%s: an AMF Region ID is an integer 0-255 (TS 23.003 §2.10.1)" $region) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]{1,4}$" $set)) (gt (atoi $set) 1023) -}}
+{{- fail (printf "amf.config.amfId.set=%s: an AMF Set ID is an integer 0-1023 (TS 23.003 §2.10.1)" $set) -}}
+{{- end -}}
+{{- $mcc := toString .Values.global.plmn.mcc -}}
+{{- $mnc := toString .Values.global.plmn.mnc -}}
+{{- if not (regexMatch "^[0-9]{3}$" $mcc) -}}
+{{- fail (printf "global.plmn.mcc=%s: an MCC is 3 digits (TS 23.003 §2.2)" $mcc) -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]{2,3}$" $mnc) -}}
+{{- fail (printf "global.plmn.mnc=%s: an MNC is 2 or 3 digits (TS 23.003 §2.2)" $mnc) -}}
+{{- end -}}
+{{- printf "set%03x.region%02x.amfset.5gc.mnc%03s.mcc%s" (atoi $set) (atoi $region) $mnc $mcc -}}
+{{- end -}}
+
+{{/*
+#2052: nrf.nf_set_allowlist (#1719, #2035), as a YAML list, or nothing.
+
+nrf.nfSetAllowlist set (a list): that list, verbatim, in place of the derived
+one. Each entry needs a non-empty nf_set_id; nf_types and nf_instance_ids,
+when given, are lists. With the AMF enabled the list must admit the chart's
+AMF for its AMF Set (the render fails otherwise): a production NRF would
+refuse its registration. An empty list is accepted only with the AMF
+disabled.
+
+Unset (the default): with the AMF enabled, one entry for the AMF's AMF Set,
+for type AMF and the AMF's nfInstanceId only. With it disabled, nothing (the
+NRF then has no allowlist, as before #2052).
+*/}}
+{{- define "nextgcore.nfSetAllowlist" -}}
+{{- $explicit := .Values.nrf.nfSetAllowlist -}}
+{{- if not (kindIs "invalid" $explicit) -}}
+{{- if not (kindIs "slice" $explicit) -}}
+{{- fail (printf "nrf.nfSetAllowlist must be a list of {nf_set_id, nf_types, nf_instance_ids}, got %v" $explicit) -}}
+{{- end -}}
+{{- range $i, $e := $explicit -}}
+{{- if not (kindIs "map" $e) -}}
+{{- fail (printf "nrf.nfSetAllowlist[%d] must be a map with nf_set_id, got %v" $i $e) -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $e.nf_set_id) (trim $e.nf_set_id)) -}}
+{{- fail (printf "nrf.nfSetAllowlist[%d].nf_set_id must be a non-empty NF Set ID (TS 23.003 §28.12)" $i) -}}
+{{- end -}}
+{{- range $k := list "nf_types" "nf_instance_ids" -}}
+{{- if and (hasKey $e $k) (not (kindIs "slice" (get $e $k))) -}}
+{{- fail (printf "nrf.nfSetAllowlist[%d].%s must be a list" $i $k) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $.Values.amf.enabled -}}
+{{- $setId := include "nextgcore.amfSetNfSetId" $ | lower -}}
+{{- $amfId := include "nextgcore.nfInstanceId" (dict "root" $ "nf" "amf") | lower -}}
+{{- $admitted := false -}}
+{{- range $e := $explicit -}}
+{{- $typeOk := not (hasKey $e "nf_types") -}}
+{{- range $t := ($e.nf_types | default list) -}}
+{{- if eq (lower (trim (toString $t))) "amf" -}}{{- $typeOk = true -}}{{- end -}}
+{{- end -}}
+{{- $idOk := not (hasKey $e "nf_instance_ids") -}}
+{{- range $n := ($e.nf_instance_ids | default list) -}}
+{{- if eq (lower (trim (toString $n))) $amfId -}}{{- $idOk = true -}}{{- end -}}
+{{- end -}}
+{{- if and (eq (lower (trim $e.nf_set_id)) $setId) $typeOk $idOk -}}{{- $admitted = true -}}{{- end -}}
+{{- end -}}
+{{- if not $admitted -}}
+{{- fail (printf "nrf.nfSetAllowlist admits no AMF %s for its AMF Set %s (amf.config.amfId, global.plmn): a production NRF would refuse its registration (#2035, #2052). Add an entry for it, or leave nrf.nfSetAllowlist unset to derive it" $amfId $setId) -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $explicit -}}
+{{- else if .Values.amf.enabled -}}
+- nf_set_id: {{ include "nextgcore.amfSetNfSetId" . }}
+  nf_types: [AMF]
+  nf_instance_ids:
+    - {{ include "nextgcore.nfInstanceId" (dict "root" . "nf" "amf") | quote }}
+{{- end -}}
+{{- end -}}

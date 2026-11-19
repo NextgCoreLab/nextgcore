@@ -51,6 +51,14 @@ data:
               client_auth: optional
               # Minimum TLS version per 3GPP TS 33.501 §13.2
               min_version: "1.2"
+      {{- with include "nextgcore.nfSetAllowlist" . }}
+      # #2052: who may claim which NF Set (#1719), and which AMF may list GUAMIs
+      # of which AMF Set (#2035, TS 23.003 §2.10.1, §28.12). Under the production
+      # profile an AMF with no entry for its AMF Set is refused. values.yaml
+      # nrf.nfSetAllowlist; unset, the chart's AMF only.
+      nf_set_allowlist:
+        {{- . | nindent 8 }}
+      {{- end }}
 
   amf.yaml: |
     logger:
