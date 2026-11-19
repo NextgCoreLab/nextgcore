@@ -128,8 +128,9 @@ use acr::{
     EELACRReq, EELACRResp,
 };
 use acrevents::{ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo};
-use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
+use context::{ees_context_final, ees_context_init, ees_self, EesContext, Owned, UpdateError};
 use eec::EecRegistration;
+use nextgcore_sbi::owner_binding;
 use services::{
     ACInfoSubscription, ACRParamsInfo, AcrMgntEventsSubscription, CommonEASInfo, EECContextPush,
     EECContextPushRes, SessionContexts,
@@ -575,9 +576,13 @@ fn install_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiSer
 /// layout (eesd-01). Every protected operation is gated by per-operation OAuth2
 /// (eesd-08) *before* the method is dispatched. The legacy `nees-*` /
 /// `uecontexttransfer` paths are gone and fall through to 404.
-async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
-    let method = request.header.method.as_str();
-    let uri = &request.header.uri;
+async fn ees_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
+    // Owned copies: the per-route gate records the verified token `sub` on
+    // `request` (#1865), so the route match cannot borrow from it.
+    let method_owned = request.header.method.clone();
+    let method = method_owned.as_str();
+    let uri_owned = request.header.uri.clone();
+    let uri = &uri_owned;
 
     log::debug!("EES SBI: {method} {}", request_log_uri(uri));
 
@@ -587,7 +592,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     match parts.as_slice() {
         // eees-easregistration (TS 29.558 §5.2) — EAS registration (EDGE-3).
         ["eees-easregistration", "v1", "registrations"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASREGISTRATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EASREGISTRATION) {
                 return resp;
             }
             match method {
@@ -597,12 +602,12 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-easregistration", "v1", "registrations", registration_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASREGISTRATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EASREGISTRATION) {
                 return resp;
             }
             match method {
-                "GET" => handle_eas_get(registration_id).await,
-                "DELETE" => handle_eas_deregister(registration_id).await,
+                "GET" => handle_eas_get(registration_id, &request).await,
+                "DELETE" => handle_eas_deregister(registration_id, &request).await,
                 // eesd-04: full-replace (PUT) and RFC 7396 merge (PATCH).
                 "PUT" => handle_eas_update(registration_id, &request).await,
                 "PATCH" => handle_eas_modify(registration_id, &request).await,
@@ -611,7 +616,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
         // eees-easdiscovery (TS 24.558 §5.3) — EAS discovery (EDGE-1/EDGE-3).
         ["eees-easdiscovery", "v1", "eas-profiles", "request-discovery"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EASDISCOVERY) {
                 return resp;
             }
             match method {
@@ -621,7 +626,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
         // eesd-05: EAS discovery-change subscriptions.
         ["eees-easdiscovery", "v1", "subscriptions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EASDISCOVERY) {
                 return resp;
             }
             match method {
@@ -631,21 +636,21 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-easdiscovery", "v1", "subscriptions", subscription_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EASDISCOVERY) {
                 return resp;
             }
             match method {
-                "GET" => handle_disc_sub_get(subscription_id).await,
+                "GET" => handle_disc_sub_get(subscription_id, &request).await,
                 "PUT" => handle_disc_sub_update(subscription_id, &request).await,
                 // #105: PATCH was unrouted, so a conformant partial update got 405.
                 "PATCH" => handle_disc_sub_patch(subscription_id, &request).await,
-                "DELETE" => handle_disc_sub_delete(subscription_id).await,
+                "DELETE" => handle_disc_sub_delete(subscription_id, &request).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
         // eesd-06: eees-eecregistration (TS 24.558 §5.2) — EEC registration (EDGE-1).
         ["eees-eecregistration", "v1", "registrations"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECREGISTRATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EECREGISTRATION) {
                 return resp;
             }
             match method {
@@ -655,20 +660,20 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-eecregistration", "v1", "registrations", registration_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECREGISTRATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EECREGISTRATION) {
                 return resp;
             }
             match method {
-                "GET" => handle_eec_get(registration_id).await,
+                "GET" => handle_eec_get(registration_id, &request).await,
                 "PUT" => handle_eec_update(registration_id, &request).await,
                 "PATCH" => handle_eec_modify(registration_id, &request).await,
-                "DELETE" => handle_eec_deregister(registration_id).await,
+                "DELETE" => handle_eec_deregister(registration_id, &request).await,
                 _ => send_method_not_allowed(method, "registrations/{registrationId}"),
             }
         }
         // eesd-07: eees-appctxtreloc (TS 24.558 §5.5) — EEC-triggered ACR flow.
         ["eees-appctxtreloc", "v1", "determine"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCTXTRELOC) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_APPCTXTRELOC) {
                 return resp;
             }
             match method {
@@ -677,7 +682,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-appctxtreloc", "v1", "initiate"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCTXTRELOC) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_APPCTXTRELOC) {
                 return resp;
             }
             match method {
@@ -686,7 +691,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-appctxtreloc", "v1", "declare"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCTXTRELOC) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_APPCTXTRELOC) {
                 return resp;
             }
             match method {
@@ -696,7 +701,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
         // eesd-07: eees-eel-acr (TS 29.558 §5.11) — EEL-managed ACR.
         ["eees-eel-acr", "v1", "request-eelacr"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EEL_ACR) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EEL_ACR) {
                 return resp;
             }
             match method {
@@ -708,7 +713,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // (`TS29558_Eees_EELManagedACR.yaml` /subscriptions). Only
         // `request-eelacr` was served, so these two paths were 404.
         ["eees-eel-acr", "v1", "subscriptions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EEL_ACR) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EEL_ACR) {
                 return resp;
             }
             match method {
@@ -718,11 +723,11 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-eel-acr", "v1", "subscriptions", subscription_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EEL_ACR) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EEL_ACR) {
                 return resp;
             }
             match method {
-                "GET" => handle_act_status_sub_read(subscription_id).await,
+                "GET" => handle_act_status_sub_read(subscription_id, &request).await,
                 // The yaml defines only GET on the individual resource: no PUT,
                 // PATCH or DELETE. Answering 405 with an Allow header is the
                 // spec-correct refusal (TS 29.500 §5.2.7.2).
@@ -731,7 +736,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
         // eesd-07: eees-acrstatus-update (TS 29.558 §5.12) — ACR status notification.
         ["eees-acrstatus-update", "v1", "request-acrupdate"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACRSTATUS_UPDATE) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_ACRSTATUS_UPDATE) {
                 return resp;
             }
             match method {
@@ -745,7 +750,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // CommonEASInfoDecResp). This is a DIFFERENT API from the
         // eees-appctxtreloc /declare op above (distinct first path segment).
         ["eees-cea", "v1", "declare"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_CEA) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_CEA) {
                 return resp;
             }
             match method {
@@ -757,7 +762,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // subscriptions hosted at /subscriptions. The yaml defines POST on the
         // collection only (no collection GET → 405).
         ["eees-appclientinformation", "v1", "subscriptions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCLIENTINFORMATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_APPCLIENTINFORMATION) {
                 return resp;
             }
             match method {
@@ -766,23 +771,23 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-appclientinformation", "v1", "subscriptions", subscription_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCLIENTINFORMATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_APPCLIENTINFORMATION) {
                 return resp;
             }
             match method {
-                "GET" => handle_acinfo_get(subscription_id).await,
+                "GET" => handle_acinfo_get(subscription_id, &request).await,
                 // Spec ops on the individual resource: PUT full replace
                 // (ACInfoSubscription) vs PATCH application/merge-patch+json
                 // (ACInfoSubscriptionPatch) — distinct semantics.
                 "PUT" => handle_acinfo_update(subscription_id, &request).await,
                 "PATCH" => handle_acinfo_modify(subscription_id, &request).await,
-                "DELETE" => handle_acinfo_delete(subscription_id).await,
+                "DELETE" => handle_acinfo_delete(subscription_id, &request).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
         // eesd-13: eees-acrmgntevent (TS 29.558 §5.8) — ACR Management Event subscriptions.
         ["eees-acrmgntevent", "v1", "subscriptions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACRMGNTEVENT) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_ACRMGNTEVENT) {
                 return resp;
             }
             match method {
@@ -792,17 +797,17 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-acrmgntevent", "v1", "subscriptions", subscription_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACRMGNTEVENT) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_ACRMGNTEVENT) {
                 return resp;
             }
             match method {
-                "GET" => handle_acrmgnt_sub_get(subscription_id).await,
+                "GET" => handle_acrmgnt_sub_get(subscription_id, &request).await,
                 // Spec ops on the individual resource: PUT full replace
                 // (AcrMgntEventsSubscription) vs PATCH application/merge-patch+json
                 // (AcrMgntEventsSubscriptionPatch) — distinct semantics.
                 "PUT" => handle_acrmgnt_sub_update(subscription_id, &request).await,
                 "PATCH" => handle_acrmgnt_sub_modify(subscription_id, &request).await,
-                "DELETE" => handle_acrmgnt_sub_delete(subscription_id).await,
+                "DELETE" => handle_acrmgnt_sub_delete(subscription_id, &request).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
@@ -818,7 +823,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             let audiences = auth::eec_context_reloc_audiences();
             let audiences: Vec<&str> = audiences.iter().map(String::as_str).collect();
             if let Some(resp) =
-                auth::require_oauth2_aud(&request, auth::SCOPE_EECCONTEXTRELOC, &audiences)
+                auth::authorize_aud(&mut request, auth::SCOPE_EECCONTEXTRELOC, &audiences)
             {
                 return resp;
             }
@@ -834,7 +839,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // PUSHES ACR parameters TO the EES. The reversed bespoke lookup query
         // is gone (falls through to 404).
         ["eees-acr-param", "v1", "send-acrparamsinfo"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACR_PARAM) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_ACR_PARAM) {
                 return resp;
             }
             match method {
@@ -847,7 +852,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // ACRInfoNotification) and PUT/PATCH/DELETE on the individual
         // subscription. There is NO GET on either resource — do not invent one.
         ["eees-acrevents", "v1", "subscriptions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACREVENTS) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_ACREVENTS) {
                 return resp;
             }
             match method {
@@ -856,13 +861,13 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-acrevents", "v1", "subscriptions", subscription_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACREVENTS) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_ACREVENTS) {
                 return resp;
             }
             match method {
                 "PUT" => handle_acrevents_update(subscription_id, &request).await,
                 "PATCH" => handle_acrevents_modify(subscription_id, &request).await,
-                "DELETE" => handle_acrevents_delete(subscription_id).await,
+                "DELETE" => handle_acrevents_delete(subscription_id, &request).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
@@ -876,7 +881,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // eees-easinfoprov (TS24558_Eees_EASInformationProvisioning.yaml) —
         // served locally: everything it needs is in this EES's own state.
         ["eees-easinfoprov", "v1", "declare"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASINFOPROV) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_EASINFOPROV) {
                 return resp;
             }
             match method {
@@ -888,7 +893,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // take the same body and differ only in the operation name, so both land
         // on one handler.
         ["eees-ueidentifier", "v1", op @ ("fetch" | "get")] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UEIDENTIFIER) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_UEIDENTIFIER) {
                 return resp;
             }
             match method {
@@ -901,7 +906,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // answer instead of a bare 404; creating a subscription that could never
         // fire would be worse than refusing it.
         ["eees-uelocation", "v1", "fetch"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UELOCATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_UELOCATION) {
                 return resp;
             }
             match method {
@@ -910,7 +915,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-uelocation", "v1", "subscriptions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UELOCATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_UELOCATION) {
                 return resp;
             }
             match method {
@@ -919,7 +924,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-uelocation", "v1", "subscriptions", _subscription_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UELOCATION) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_UELOCATION) {
                 return resp;
             }
             match method {
@@ -937,7 +942,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // eees-session-with-qos (TS29558_Eees_SessionWithQoS.yaml) — 501: needs
         // the NEF AsSessionWithQoS leg. A 201 here would claim a QoS flow exists.
         ["eees-session-with-qos", "v1", "sessions"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_SESSION_WITH_QOS) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_SESSION_WITH_QOS) {
                 return resp;
             }
             match method {
@@ -946,7 +951,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-session-with-qos", "v1", "sessions", _session_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_SESSION_WITH_QOS) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_SESSION_WITH_QOS) {
                 return resp;
             }
             match method {
@@ -957,7 +962,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // eees-tie (TS29558_Eees_TrafficInfluenceEAS.yaml) — 501: needs the
         // NEF/PCF-AF traffic-influence leg.
         ["eees-tie", "v1", "instances"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_TIE) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_TIE) {
                 return resp;
             }
             match method {
@@ -966,7 +971,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
         ["eees-tie", "v1", "instances", _instance_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_TIE) {
+            if let Some(resp) = auth::authorize(&mut request, auth::SCOPE_TIE) {
                 return resp;
             }
             match method {
@@ -985,7 +990,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // (#1525); the path token is checked again below in any case.
         #[cfg(feature = "demo-d443a-edge-budget")]
         [edge_budget::ROUTE_ROOT, edge_budget::ROUTE_QOS_MON, token] if edge_budget::serving() => {
-            if let Some(resp) = auth::require_oauth2(&request, edge_budget::SCOPE) {
+            if let Some(resp) = auth::authorize(&mut request, edge_budget::SCOPE) {
                 return resp;
             }
             edge_budget::on_notify(token, &request)
@@ -1063,6 +1068,12 @@ fn parse_json_body(request: &SbiRequest) -> Result<serde_json::Value, Box<SbiRes
 /// consumer `easId`, and echoes the stored `EASRegistration` with a `Location`
 /// header keyed on the `registrationId`.
 async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "EAS Registration") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("EAS Register");
 
     let body = match &request.http.content {
@@ -1109,6 +1120,11 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
     let ctx = ees_self();
     let stored = ctx.read().ok().and_then(|context| {
         let stored = context.eas_register(reg)?;
+        context.set_owner(
+            Owned::EasRegistration,
+            stored.registration_id.as_deref().unwrap_or_default(),
+            owner,
+        );
         // eesd-05: notify any discovery subscriptions selecting the new EAS.
         context.notify_discovery_subscribers(&stored.eas_prof);
         Some(stored)
@@ -1139,6 +1155,16 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
 /// (immutable), preserves the `registrationId`, and returns the updated
 /// representation (200).
 async fn handle_eas_update(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EasRegistration,
+        registration_id,
+        request,
+        "UpdateIndEASRegistration",
+        |c| c.eas_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1177,6 +1203,16 @@ async fn handle_eas_update(registration_id: &str, request: &SbiRequest) -> SbiRe
 /// `application/merge-patch+json`). Applies an RFC 7396 merge-patch, rejecting
 /// an `easId` change, and returns the updated representation (200).
 async fn handle_eas_modify(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EasRegistration,
+        registration_id,
+        request,
+        "ModifyIndEASRegistration",
+        |c| c.eas_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     let patch = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1205,7 +1241,17 @@ async fn handle_eas_list() -> SbiResponse {
 }
 
 /// Get an individual EAS registration by its server-minted `registrationId`.
-async fn handle_eas_get(registration_id: &str) -> SbiResponse {
+async fn handle_eas_get(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EasRegistration,
+        registration_id,
+        request,
+        "GetIndEASRegistration",
+        |c| c.eas_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     let ctx = ees_self();
     let reg = ctx.read().ok().and_then(|c| c.eas_find(registration_id));
 
@@ -1221,7 +1267,17 @@ async fn handle_eas_get(registration_id: &str) -> SbiResponse {
 }
 
 /// Deregister an EAS by its `registrationId` (`DeleteIndEASRegistration`).
-async fn handle_eas_deregister(registration_id: &str) -> SbiResponse {
+async fn handle_eas_deregister(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EasRegistration,
+        registration_id,
+        request,
+        "DeleteIndEASRegistration",
+        |c| c.eas_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("EAS Deregister: {registration_id}");
 
     let ctx = ees_self();
@@ -1284,11 +1340,39 @@ async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
+/// #1865: refuse `request` unless it comes from the consumer that created
+/// `kind`/`id` (`nextgcore_sbi::owner_binding`), checked before anything is
+/// read or changed. `None` lets the handler run, which includes an unknown id
+/// (`exists` false): it answers its own 404 first, as before.
+fn refuse_unless_owner(
+    kind: Owned,
+    id: &str,
+    request: &SbiRequest,
+    operation: &str,
+    exists: impl FnOnce(&EesContext) -> bool,
+) -> Option<SbiResponse> {
+    let owner = {
+        let ctx = ees_self();
+        let c = ctx.read().ok()?;
+        if !exists(&c) {
+            return None;
+        }
+        c.owner_of(kind, id)
+    };
+    owner_binding::refuse_non_owner(owner.as_deref(), request, operation)
+}
+
 // ---- eesd-05: EAS discovery subscription handlers --------------------------
 
 /// `CreateEASDiscSub` (POST /subscriptions): create a discovery-change
 /// subscription with a server-minted `subscriptionId` and a `Location` header.
 async fn handle_disc_sub_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "CreateEASDiscSub") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1321,7 +1405,12 @@ async fn handle_disc_sub_create(request: &SbiRequest) -> SbiResponse {
     sub.supp_feat = types::negotiate_supp_feat(sub.supp_feat.as_deref());
 
     let ctx = ees_self();
-    let created = ctx.read().ok().and_then(|c| c.disc_sub_create(sub));
+    let created = ctx.read().ok().and_then(|c| {
+        let created = c.disc_sub_create(sub)?;
+        let id = created.subscription_id.as_deref().unwrap_or_default();
+        c.set_owner(Owned::DiscoverySubscription, id, owner);
+        Some(created)
+    });
     match created {
         Some(created) => {
             let id = created.subscription_id.clone().unwrap_or_default();
@@ -1349,7 +1438,17 @@ async fn handle_disc_sub_list() -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_disc_sub_get(subscription_id: &str) -> SbiResponse {
+async fn handle_disc_sub_get(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::DiscoverySubscription,
+        subscription_id,
+        request,
+        "GetEASDiscSub",
+        |c| c.disc_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let sub = ees_self()
         .read()
         .ok()
@@ -1366,6 +1465,16 @@ async fn handle_disc_sub_get(subscription_id: &str) -> SbiResponse {
 }
 
 async fn handle_disc_sub_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::DiscoverySubscription,
+        subscription_id,
+        request,
+        "UpdateEASDiscSub",
+        |c| c.disc_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1417,6 +1526,16 @@ async fn handle_disc_sub_update(subscription_id: &str, request: &SbiRequest) -> 
 /// through to `405`. A consumer wanting to change one member had to PUT a whole
 /// subscription -- which requires re-sending the mandatory IEs it may not have kept.
 async fn handle_disc_sub_patch(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::DiscoverySubscription,
+        subscription_id,
+        request,
+        "ModifyEASDiscSub",
+        |c| c.disc_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1461,7 +1580,17 @@ async fn handle_disc_sub_patch(subscription_id: &str, request: &SbiRequest) -> S
     }
 }
 
-async fn handle_disc_sub_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_disc_sub_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::DiscoverySubscription,
+        subscription_id,
+        request,
+        "DeleteEASDiscSub",
+        |c| c.disc_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let removed = ees_self()
         .read()
         .ok()
@@ -1621,6 +1750,12 @@ async fn retrieve_relocated_eec_context(reg: &EecRegistration) {
 /// creation. The order matters — a refused registration must not have pulled a
 /// context or created a resource first.
 async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "EEC Registration") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("EEC Register");
     let value = match parse_json_body(request) {
         Ok(v) => v,
@@ -1657,7 +1792,12 @@ async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
     reg.supp_feat = types::negotiate_supp_feat(reg.supp_feat.as_deref());
 
     let ctx = ees_self();
-    let stored = ctx.read().ok().and_then(|c| c.eec_register(reg));
+    let stored = ctx.read().ok().and_then(|c| {
+        let stored = c.eec_register(reg)?;
+        let id = stored.registration_id.as_deref().unwrap_or_default();
+        c.set_owner(Owned::EecRegistration, id, owner);
+        Some(stored)
+    });
     match stored {
         Some(stored) => {
             // #106: TS 29.558 §5.5.2.2 — tell every AppClientInformation
@@ -1695,7 +1835,17 @@ async fn handle_eec_list() -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_eec_get(registration_id: &str) -> SbiResponse {
+async fn handle_eec_get(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EecRegistration,
+        registration_id,
+        request,
+        "GetIndEECReg",
+        |c| c.eec_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     let reg = ees_self()
         .read()
         .ok()
@@ -1712,6 +1862,16 @@ async fn handle_eec_get(registration_id: &str) -> SbiResponse {
 }
 
 async fn handle_eec_update(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EecRegistration,
+        registration_id,
+        request,
+        "UpdateIndEECReg",
+        |c| c.eec_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1758,6 +1918,16 @@ async fn handle_eec_update(registration_id: &str, request: &SbiRequest) -> SbiRe
 }
 
 async fn handle_eec_modify(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EecRegistration,
+        registration_id,
+        request,
+        "ModifyIndEECReg",
+        |c| c.eec_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     let patch = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -1775,7 +1945,17 @@ async fn handle_eec_modify(registration_id: &str, request: &SbiRequest) -> SbiRe
     }
 }
 
-async fn handle_eec_deregister(registration_id: &str) -> SbiResponse {
+async fn handle_eec_deregister(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::EecRegistration,
+        registration_id,
+        request,
+        "DeleteIndEECReg",
+        |c| c.eec_find(registration_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("EEC Deregister: {registration_id}");
     let removed = ees_self()
         .read()
@@ -2119,6 +2299,12 @@ async fn handle_ue_identifier(request: &SbiRequest) -> SbiResponse {
 /// representation and a `Location` header; the `subscriptionId` is server-minted
 /// and is not a member of the schema.
 async fn handle_act_status_sub_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "ACT status Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("ACT Status Subscription create");
     let value = match parse_json_body(request) {
         Ok(v) => v,
@@ -2142,10 +2328,11 @@ async fn handle_act_status_sub_create(request: &SbiRequest) -> SbiResponse {
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
-    let created = ees_self()
-        .read()
-        .ok()
-        .and_then(|c| c.act_status_sub_create(sub.clone()));
+    let created = ees_self().read().ok().and_then(|c| {
+        let id = c.act_status_sub_create(sub.clone())?;
+        c.set_owner(Owned::ActStatusSubscription, &id, owner);
+        Some(id)
+    });
     match created {
         Some(id) => SbiResponse::with_status(201)
             .with_header("Location", format!("{EEL_ACR_SUBSCRIPTIONS_PATH}/{id}"))
@@ -2174,7 +2361,17 @@ async fn handle_act_status_sub_list() -> SbiResponse {
 
 /// `GetACTStatusSubscription`
 /// (`GET {apiRoot}/eees-eel-acr/v1/subscriptions/{subscriptionId}`).
-async fn handle_act_status_sub_read(subscription_id: &str) -> SbiResponse {
+async fn handle_act_status_sub_read(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::ActStatusSubscription,
+        subscription_id,
+        request,
+        "GetACTStatusSubscription",
+        |c| c.act_status_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     match ees_self()
         .read()
         .ok()
@@ -2408,13 +2605,23 @@ fn parse_acinfo_subscription(request: &SbiRequest) -> Result<ACInfoSubscription,
 /// 201 + `Location` (keyed on the server-minted `subscriptionId`) + the echoed
 /// `ACInfoSubscription` body. The wire body never carries the id.
 async fn handle_acinfo_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "AC information Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("ACInfoSubscription create");
     let sub = match parse_acinfo_subscription(request) {
         Ok(s) => s,
         Err(resp) => return *resp,
     };
     let ctx = ees_self();
-    match ctx.read().ok().and_then(|c| c.acinfo_create(sub.clone())) {
+    match ctx.read().ok().and_then(|c| {
+        let id = c.acinfo_create(sub.clone())?;
+        c.set_owner(Owned::AcInfoSubscription, &id, owner);
+        Some(id)
+    }) {
         Some(id) => SbiResponse::with_status(201)
             .with_header("Location", format!("{APPCLIENTINFO_RESOURCES_PATH}/{id}"))
             .with_json_body(&sub)
@@ -2429,7 +2636,17 @@ async fn handle_acinfo_create(request: &SbiRequest) -> SbiResponse {
 }
 
 /// `ReadIndAppClientInfoSubscription` (GET, yaml:115-156).
-async fn handle_acinfo_get(subscription_id: &str) -> SbiResponse {
+async fn handle_acinfo_get(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcInfoSubscription,
+        subscription_id,
+        request,
+        "GetAppClientInfoSubscription",
+        |c| c.acinfo_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let sub = ees_self()
         .read()
         .ok()
@@ -2449,6 +2666,16 @@ async fn handle_acinfo_get(subscription_id: &str) -> SbiResponse {
 /// Validates a complete `ACInfoSubscription` and returns the replaced
 /// representation (200).
 async fn handle_acinfo_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcInfoSubscription,
+        subscription_id,
+        request,
+        "UpdateAppClientInfoSubscription",
+        |c| c.acinfo_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACInfoSubscription replace: {subscription_id}");
     let sub = match parse_acinfo_subscription(request) {
         Ok(s) => s,
@@ -2473,6 +2700,16 @@ async fn handle_acinfo_update(subscription_id: &str, request: &SbiRequest) -> Sb
 /// `ACInfoSubscriptionPatch` members (yaml:355-377) and returns the merged
 /// representation (200); `easId` is not patchable and is preserved.
 async fn handle_acinfo_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcInfoSubscription,
+        subscription_id,
+        request,
+        "ModifyAppClientInfoSubscription",
+        |c| c.acinfo_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACInfoSubscription merge-patch: {subscription_id}");
     let patch = match parse_json_body(request) {
         Ok(v) => v,
@@ -2493,7 +2730,17 @@ async fn handle_acinfo_modify(subscription_id: &str, request: &SbiRequest) -> Sb
 }
 
 /// `DeleteIndAppClientInfoSubscription` (DELETE, yaml:268-303) → 204.
-async fn handle_acinfo_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_acinfo_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcInfoSubscription,
+        subscription_id,
+        request,
+        "DeleteAppClientInfoSubscription",
+        |c| c.acinfo_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACInfoSubscription delete: {subscription_id}");
     let removed = ees_self()
         .read()
@@ -2549,16 +2796,23 @@ fn parse_acrevents_subscription(
 /// echoed `ACREventsSubscription` body. When `requestTestNotification=true`, an
 /// immediate test `ACRInfoNotification` is enqueued to the subscriber.
 async fn handle_acrevents_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "ACR events Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("ACREventsSubscription create");
     let sub = match parse_acrevents_subscription(request) {
         Ok(s) => s,
         Err(resp) => return *resp,
     };
     let ctx = ees_self();
-    let created = ctx
-        .read()
-        .ok()
-        .and_then(|c| c.acrevents_create(sub.clone()));
+    let created = ctx.read().ok().and_then(|c| {
+        let id = c.acrevents_create(sub.clone())?;
+        c.set_owner(Owned::AcrEventsSubscription, &id, owner);
+        Some(id)
+    });
     match created {
         Some(id) => {
             if sub.request_test_notification == Some(true) {
@@ -2597,6 +2851,16 @@ async fn handle_acrevents_create(request: &SbiRequest) -> SbiResponse {
 
 /// `UpdateACREventsSubscription` (PUT full replace, yaml:117-172) → 200.
 async fn handle_acrevents_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrEventsSubscription,
+        subscription_id,
+        request,
+        "UpdateACREventsSubscription",
+        |c| c.acrevents_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACREventsSubscription replace: {subscription_id}");
     let sub = match parse_acrevents_subscription(request) {
         Ok(s) => s,
@@ -2618,6 +2882,16 @@ async fn handle_acrevents_update(subscription_id: &str, request: &SbiRequest) ->
 /// yaml:211-267) → 200. RFC 7396 merge restricted to the
 /// `ACREventsSubscriptionPatch` members; `eecId` is preserved.
 async fn handle_acrevents_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrEventsSubscription,
+        subscription_id,
+        request,
+        "ModifyACREventsSubscription",
+        |c| c.acrevents_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACREventsSubscription merge-patch: {subscription_id}");
     let patch = match parse_json_body(request) {
         Ok(v) => v,
@@ -2636,7 +2910,17 @@ async fn handle_acrevents_modify(subscription_id: &str, request: &SbiRequest) ->
 }
 
 /// `DeleteACREventsSubscription` (DELETE, yaml:174-209) → 204.
-async fn handle_acrevents_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_acrevents_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrEventsSubscription,
+        subscription_id,
+        request,
+        "DeleteACREventsSubscription",
+        |c| c.acrevents_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACREventsSubscription delete: {subscription_id}");
     let removed = ees_self()
         .read()
@@ -2762,13 +3046,26 @@ fn parse_acrmgnt_subscription(
 /// `eventSubscs`, `notificationDestination`), mints a `subscriptionId`, and
 /// returns 201 + `Location` (the resource `self` link) + echoed body.
 async fn handle_acrmgnt_sub_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer the gate verified, refused before anything
+    // is read or stored.
+    let owner =
+        match owner_binding::owner_for_new_resource(request, "ACR management event Subscribe") {
+            Ok(owner) => owner,
+            Err(refused) => return *refused,
+        };
     log::info!("ACR management event subscription create");
     let sub = match parse_acrmgnt_subscription(request) {
         Ok(s) => s,
         Err(resp) => return *resp,
     };
     let ctx = ees_self();
-    match ctx.read().ok().and_then(|c| c.acrmgnt_sub_create(sub)) {
+    match ctx.read().ok().and_then(|c| {
+        let created = c.acrmgnt_sub_create(sub)?;
+        let self_link = created.self_.as_deref().unwrap_or_default();
+        let id = self_link.rsplit('/').next().unwrap_or_default();
+        c.set_owner(Owned::AcrMgntSubscription, id, owner);
+        Some(created)
+    }) {
         Some(created) => {
             let location = created
                 .self_
@@ -2798,7 +3095,17 @@ async fn handle_acrmgnt_sub_list() -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_acrmgnt_sub_get(subscription_id: &str) -> SbiResponse {
+async fn handle_acrmgnt_sub_get(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrMgntSubscription,
+        subscription_id,
+        request,
+        "GetAcrMgntEventsSubscription",
+        |c| c.acrmgnt_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let sub = ees_self()
         .read()
         .ok()
@@ -2816,6 +3123,16 @@ async fn handle_acrmgnt_sub_get(subscription_id: &str) -> SbiResponse {
 
 /// `UpdateIndACRMngEventSubscr` (PUT full replace, yaml:262-315) → 200.
 async fn handle_acrmgnt_sub_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrMgntSubscription,
+        subscription_id,
+        request,
+        "UpdateAcrMgntEventsSubscription",
+        |c| c.acrmgnt_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let sub = match parse_acrmgnt_subscription(request) {
         Ok(s) => s,
         Err(resp) => return *resp,
@@ -2841,6 +3158,16 @@ async fn handle_acrmgnt_sub_update(subscription_id: &str, request: &SbiRequest) 
 /// `AcrMgntEventsSubscriptionPatch` members (yaml:521-535) and returns the
 /// merged representation (200); the immutable `easId`/`self` are preserved.
 async fn handle_acrmgnt_sub_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrMgntSubscription,
+        subscription_id,
+        request,
+        "ModifyAcrMgntEventsSubscription",
+        |c| c.acrmgnt_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     log::info!("ACR management event subscription merge-patch: {subscription_id}");
     let patch = match parse_json_body(request) {
         Ok(v) => v,
@@ -2861,7 +3188,17 @@ async fn handle_acrmgnt_sub_modify(subscription_id: &str, request: &SbiRequest) 
     }
 }
 
-async fn handle_acrmgnt_sub_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_acrmgnt_sub_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before any side effect.
+    if let Some(refused) = refuse_unless_owner(
+        Owned::AcrMgntSubscription,
+        subscription_id,
+        request,
+        "DeleteAcrMgntEventsSubscription",
+        |c| c.acrmgnt_sub_find(subscription_id).is_some(),
+    ) {
+        return refused;
+    }
     let removed = ees_self()
         .read()
         .ok()
@@ -3190,6 +3527,224 @@ mod tests {
         let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
         let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
         format!("Bearer {h}.{p}.{s}")
+    }
+
+    /// #1865: a bearer for `sub`, the identity eesd's gate records.
+    fn bearer_sub(sk: &SigningKey, kid: &str, scope: &str, sub: &str) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss":"CAPIF","sub":sub,"aud":"EES","scope":scope,"exp":exp,"iat":0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("Bearer {h}.{p}.{s}")
+    }
+
+    /// #1865: every EES resource a consumer creates (EAS and EEC
+    /// registrations, and the discovery, AC-information, ACR-management,
+    /// ACR-events and ACT-status subscriptions) is bound to the `sub` the gate
+    /// verified, and only that consumer may read, replace, modify or delete it.
+    /// All through the real router.
+    ///
+    /// For each family: a create whose client certificate and token disagree is
+    /// 403 and stores nothing; the owner's create records the owner; a foreign
+    /// token, a foreign certificate, a certificate/token mismatch (403) and an
+    /// anonymous caller (401 at the gate) each leave the resource unchanged and
+    /// stored on every routed method; then the owner's own requests succeed
+    /// and its DELETE forgets the owner.
+    ///
+    /// REVERT-VERIFIED, each separately, each failing this test at the named
+    /// assertion: `refuse_unless_owner` always `None` ("GET by foreign token":
+    /// 200); `set_owner` a no-op ("bound to the verified sub": None); the gate
+    /// not recording `sub` (`authorize_aud` drops it: "a mismatched create is
+    /// refused" gets 201, the certificate being the only identity left); the
+    /// create refusal ignored (`Err(_) => None`: "a mismatched create is
+    /// refused" gets 201); `forget_owner` a no-op ("a deleted resource's owner
+    /// is forgotten").
+    #[test]
+    fn every_ees_resource_is_managed_only_by_its_creator_1865() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_final();
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        const OWNER: &str = "eec-owner-1865";
+        const OTHER: &str = "eec-other-1865";
+
+        let eas = r#"{"easProf":{"easId":"eas-1865.example.com","endPt":{"fqdn":"eas-1865.example.com"}}}"#;
+        let disc = r#"{"eecId":"eec-1865","easEventType":"EAS_AVAILABLE","notificationDestination":"http://eec/cb"}"#;
+        let eec =
+            r#"{"eecId":"eec-1865.example.com","ueId":"gpsi-1865","acProfs":[{"acId":"ac1"}]}"#;
+        let act = r#"{"easId":"eas1.example.com","notificationUri":"http://eas/cb"}"#;
+        let acinfo = r#"{"easId":"eas1.example.com"}"#;
+        let acrmgnt = r#"{"easId":"eas1.example.com","eventSubscs":[{"event":"UP_PATH_CHG","appGrpId":"grp-1"}],"notificationDestination":"http://eec/acr-mgnt/cb"}"#;
+        let acrevents = r#"{"eecId":"e","easIds":["a"],"eventIds":"ACR_COMPLETE","notificationDestination":"http://cb"}"#;
+        // (family, collection, scope, create body, routed methods with bodies)
+        let families: [(Owned, &str, &str, &str, Vec<(&str, &str)>); 7] = [
+            (
+                Owned::EasRegistration,
+                EASREG_REGISTRATIONS_PATH,
+                auth::SCOPE_EASREGISTRATION,
+                eas,
+                vec![("GET", ""), ("PUT", eas), ("PATCH", "{}"), ("DELETE", "")],
+            ),
+            (
+                Owned::DiscoverySubscription,
+                EASDISC_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_EASDISCOVERY,
+                disc,
+                vec![("GET", ""), ("PUT", disc), ("PATCH", "{}"), ("DELETE", "")],
+            ),
+            (
+                Owned::EecRegistration,
+                EECREG_REGISTRATIONS_PATH,
+                auth::SCOPE_EECREGISTRATION,
+                eec,
+                vec![("GET", ""), ("PUT", eec), ("PATCH", "{}"), ("DELETE", "")],
+            ),
+            (
+                Owned::ActStatusSubscription,
+                EEL_ACR_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_EEL_ACR,
+                act,
+                vec![("GET", "")],
+            ),
+            (
+                Owned::AcInfoSubscription,
+                APPCLIENTINFO_RESOURCES_PATH,
+                auth::SCOPE_APPCLIENTINFORMATION,
+                acinfo,
+                vec![
+                    ("GET", ""),
+                    ("PUT", acinfo),
+                    ("PATCH", "{}"),
+                    ("DELETE", ""),
+                ],
+            ),
+            (
+                Owned::AcrMgntSubscription,
+                ACRMGNTEVENT_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_ACRMGNTEVENT,
+                acrmgnt,
+                vec![
+                    ("GET", ""),
+                    ("PUT", acrmgnt),
+                    ("PATCH", "{}"),
+                    ("DELETE", ""),
+                ],
+            ),
+            (
+                Owned::AcrEventsSubscription,
+                ACREVENTS_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_ACREVENTS,
+                acrevents,
+                vec![("PUT", acrevents), ("PATCH", "{}"), ("DELETE", "")],
+            ),
+        ];
+        let request = |method: &str, uri: &str, body: &str| {
+            let mut r = match method {
+                "GET" => SbiRequest::get(uri),
+                "PUT" => SbiRequest::put(uri),
+                "PATCH" => SbiRequest::patch(uri),
+                "DELETE" => SbiRequest::delete(uri),
+                _ => SbiRequest::post(uri),
+            };
+            if !body.is_empty() {
+                let ct = if method == "PATCH" {
+                    "application/merge-patch+json"
+                } else {
+                    "application/json"
+                };
+                r = r.with_body(body, ct);
+            }
+            r
+        };
+        let ctx = ees_self();
+        for (kind, collection, scope, body, methods) in families {
+            // A create whose certificate and token disagree stores nothing.
+            let before = ctx.read().unwrap().resource_count(kind);
+            let mut mixed = request("POST", collection, body)
+                .with_header("Authorization", bearer_sub(&sk, "k1", scope, OWNER));
+            mixed.peer_cert_nf_instance_id = Some(OTHER.into());
+            let resp = block_on(ees_sbi_request_handler(mixed));
+            assert_eq!(resp.status, 403, "{kind:?}: a mismatched create is refused");
+            assert_eq!(
+                ctx.read().unwrap().resource_count(kind),
+                before,
+                "{kind:?}: a refused create stores nothing"
+            );
+
+            // The owner's create records it.
+            let create = request("POST", collection, body)
+                .with_header("Authorization", bearer_sub(&sk, "k1", scope, OWNER));
+            let resp = block_on(ees_sbi_request_handler(create));
+            assert_eq!(resp.status, 201, "{kind:?}: {:?}", resp.http.content);
+            let location = resp.http.get_header("location").cloned().unwrap();
+            let id = location.rsplit('/').next().unwrap().to_string();
+            let item = format!("{collection}/{id}");
+            assert_eq!(
+                ctx.read().unwrap().owner_of(kind, &id).as_deref(),
+                Some(OWNER),
+                "{kind:?}: bound to the verified sub"
+            );
+            let snapshot = ctx.read().unwrap().resource_snapshot(kind, &id);
+            assert!(snapshot.is_some());
+
+            for (method, body) in &methods {
+                let foreign_token = request(method, &item, body)
+                    .with_header("Authorization", bearer_sub(&sk, "k1", scope, OTHER));
+                let mut foreign_cert = request(method, &item, body)
+                    .with_header("Authorization", bearer_sub(&sk, "k1", scope, OTHER));
+                foreign_cert.peer_cert_nf_instance_id = Some(OTHER.into());
+                let mut mismatch = request(method, &item, body)
+                    .with_header("Authorization", bearer_sub(&sk, "k1", scope, OWNER));
+                mismatch.peer_cert_nf_instance_id = Some(OTHER.into());
+                for (who, req, want) in [
+                    ("foreign token", foreign_token, 403),
+                    ("foreign certificate", foreign_cert, 403),
+                    ("certificate/token mismatch", mismatch, 403),
+                    ("anonymous", request(method, &item, body), 401),
+                ] {
+                    let resp = block_on(ees_sbi_request_handler(req));
+                    assert_eq!(resp.status, want, "{kind:?} {method} by {who}");
+                    assert_eq!(
+                        ctx.read().unwrap().resource_snapshot(kind, &id),
+                        snapshot,
+                        "{kind:?} {method} by {who} changed the resource"
+                    );
+                }
+            }
+            for (method, body) in &methods {
+                let own = request(method, &item, body)
+                    .with_header("Authorization", bearer_sub(&sk, "k1", scope, OWNER));
+                let resp = block_on(ees_sbi_request_handler(own));
+                assert!(
+                    (200..300).contains(&resp.status),
+                    "{kind:?} {method} by the owner: {} {:?}",
+                    resp.status,
+                    resp.http.content
+                );
+            }
+            if methods.iter().any(|(m, _)| *m == "DELETE") {
+                assert!(ctx.read().unwrap().resource_snapshot(kind, &id).is_none());
+                assert_eq!(
+                    ctx.read().unwrap().owner_of(kind, &id),
+                    None,
+                    "{kind:?}: a deleted resource's owner is forgotten"
+                );
+            }
+        }
+        auth::clear_auth_jwks();
     }
 
     /// Drive the async router from a synchronous test on a current-thread
