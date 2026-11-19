@@ -1445,7 +1445,9 @@ mod mtls_oauth2_e2e {
             .start(|req: SbiRequest| async move {
                 let seen = req.peer_cert_nf_instance_id.clone().unwrap_or_default();
                 SbiResponse::with_status(200)
-                    .with_json_body(&serde_json::json!({"peer": seen}))
+                    .with_json_body(
+                        &serde_json::json!({"peer": seen, "present": req.peer_cert_present}),
+                    )
                     .expect("body")
             })
             .await
@@ -1472,6 +1474,12 @@ mod mtls_oauth2_e2e {
             "the server must see the client NF Instance ID from its verified certificate, \
              with the urn:uuid: prefix stripped"
         );
+        // #1990: and that a verified certificate was presented at all, which the
+        // NRF reads to refuse a directly authenticated client's XFCC header.
+        //
+        // REVERT-VERIFIED: with `peer_cert_present` not threaded onto the
+        // request, this is false and fails.
+        assert_eq!(body["present"], true);
 
         server.stop().await.ok();
     }

@@ -1186,6 +1186,12 @@ impl NrfPolicy {
     /// announces it with a `warn!` — the insecure posture stays reachable, but
     /// only when asked for by name.
     fn apply_env_overrides(&mut self) {
+        self.apply_env_overrides_under(nextgcore_sbi::security::SbiProfile::resolve());
+    }
+
+    /// [`Self::apply_env_overrides`] under `profile` (#1990: the trusted-terminator
+    /// variable is ignored under production).
+    fn apply_env_overrides_under(&mut self, profile: nextgcore_sbi::security::SbiProfile) {
         let forced_on = |key: &str| {
             matches!(
                 std::env::var(key).ok().as_deref().map(str::trim),
@@ -1199,7 +1205,18 @@ impl NrfPolicy {
             self.require_client_cert_binding = true;
         }
         if forced_on("NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT") {
-            self.trust_forwarded_client_cert = true;
+            // #1990: an environment variable is not where a production NRF learns
+            // to trust a header any client can send. Under the production profile
+            // only the YAML (`nrf.sbi.oauth2.trust_forwarded_client_cert`), which
+            // the operator deploys with the terminator, turns it on.
+            if profile.is_production() {
+                log::warn!(
+                    "NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT is ignored under the production \
+                     SBI profile: declare the TLS terminator in nrf.sbi.oauth2 instead"
+                );
+            } else {
+                self.trust_forwarded_client_cert = true;
+            }
         }
         if forced_on("NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED") {
             self.require_client_auth = false;
@@ -4758,28 +4775,136 @@ fn decode_cca_jose_header(cca_jwt: &str) -> Result<serde_json::Value, (&'static 
 /// stripped from any client-supplied copy at the trust boundary.
 const XFCC_HEADER: &str = "x-forwarded-client-cert";
 
-/// Parse the URI SubjectAltName from the FIRST cert entry of an Envoy XFCC
-/// header value. The header is a comma-separated list of cert entries (the leaf
-/// / immediate peer first); each entry is a `;`-separated list of `Key=Value`
-/// pairs whose value may be double-quoted (and a quoted value may itself
-/// contain `,` or `;`). Splitting is quote-aware on purpose: a naive split
-/// would let an attacker smuggle a fake `URI=` inside a quoted `Subject` DN.
-/// Returns the (unquoted) `URI=` value of the leaf entry, or None when absent.
-fn parse_xfcc_first_entry_uri(header: &str) -> Option<String> {
-    parse_xfcc_first_entry_element(header, "uri")
+/// #1990: the one XFCC entry a declared terminator forwarded, as its `Key=Value`
+/// elements (keys lower-cased), parsed per Envoy's grammar: entries are
+/// separated by unquoted `,`, elements by unquoted `;`, and a value may be
+/// double-quoted with `\"` and `\\` escapes inside. `None` for anything
+/// ambiguous, which is refused rather than guessed at:
+/// - more than one entry (under Envoy `APPEND_FORWARD` the leading entries are
+///   whatever the client sent; only a lone entry is the terminator's own);
+/// - an unterminated quote, a quote inside an unquoted value, or trailing text
+///   after a closing quote;
+/// - an element without `=`, or a key that appears twice.
+///
+/// Before, quotes were toggled with no escape handling, so a client certificate
+/// whose Subject DN held `\"` could close the quote early and smuggle a second
+/// `URI=` into the entry.
+fn parse_xfcc_single_entry(header: &str) -> Option<std::collections::HashMap<String, String>> {
+    let mut entries: Vec<Vec<(String, String)>> = vec![Vec::new()];
+    let mut key = String::new();
+    let mut value = String::new();
+    let mut in_key = true;
+    let mut chars = header.chars().peekable();
+    // Where the current value stands: not started, inside quotes, closed.
+    #[derive(PartialEq)]
+    enum Q {
+        Bare,
+        Open,
+        Closed,
+    }
+    let mut q = Q::Bare;
+    let push = |entry: &mut Vec<(String, String)>,
+                key: &mut String,
+                value: &mut String,
+                in_key: &mut bool|
+     -> Option<()> {
+        if *in_key {
+            // An element with no `=`: only an empty trailing element is allowed.
+            if !key.trim().is_empty() {
+                return None;
+            }
+        } else {
+            let k = key.trim().to_ascii_lowercase();
+            if k.is_empty() || entry.iter().any(|(e, _)| *e == k) {
+                return None;
+            }
+            entry.push((k, std::mem::take(value)));
+        }
+        key.clear();
+        *in_key = true;
+        Some(())
+    };
+    while let Some(c) = chars.next() {
+        if !in_key && q == Q::Open {
+            match c {
+                '\\' => value.push(chars.next()?),
+                '"' => q = Q::Closed,
+                _ => value.push(c),
+            }
+            continue;
+        }
+        match c {
+            ',' | ';' => {
+                let entry = entries.last_mut().expect("one entry");
+                push(entry, &mut key, &mut value, &mut in_key)?;
+                q = Q::Bare;
+                if c == ',' {
+                    entries.push(Vec::new());
+                }
+            }
+            '=' if in_key => in_key = false,
+            '"' if !in_key && q == Q::Bare && value.trim().is_empty() => {
+                value.clear();
+                q = Q::Open;
+            }
+            '"' => return None,
+            _ if in_key => key.push(c),
+            _ if q == Q::Closed => {
+                if !c.is_whitespace() {
+                    return None;
+                }
+            }
+            _ => value.push(c),
+        }
+    }
+    if q == Q::Open {
+        return None;
+    }
+    let entry = entries.last_mut().expect("one entry");
+    push(entry, &mut key, &mut value, &mut in_key)?;
+    let entries: Vec<_> = entries.into_iter().filter(|e| !e.is_empty()).collect();
+    match entries.as_slice() {
+        [only] => Some(only.iter().cloned().collect()),
+        _ => None,
+    }
 }
 
-/// #1979: the RFC 9310 NFTypes of the leaf certificate a trusted terminator
-/// forwarded in XFCC `Cert=` (Envoy `forward_client_cert_details` with
-/// `set_current_client_cert_details.cert: true`): the URL-encoded PEM of the
-/// client certificate it verified. Empty when the element is absent or does not
-/// decode, so a terminator that forwards no certificate proves no NF type.
-fn parse_xfcc_first_entry_cert_nf_types(header: &str) -> Vec<String> {
+/// #1990: what a declared TLS terminator vouches for, read from the
+/// certificate it forwarded in XFCC `Cert=` and from nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardedClientCert {
+    /// The NF Instance ID of the certificate's `urn:uuid:` URI SAN.
+    nf_instance_id: String,
+    /// Its RFC 9310 NFTypes (empty when it carries none).
+    nf_types: Vec<String>,
+}
+
+/// #1979/#1990: the client certificate a declared TLS terminator forwarded,
+/// or `None` when it is not to be believed.
+///
+/// - Only with `trust_forwarded_client_cert`, and only on a connection that
+///   presented no verified certificate of its own: a client that authenticated
+///   directly is the peer, and a certificate of its own without a URI SAN is
+///   no invitation to assert an identity in a header.
+/// - Only a lone XFCC entry, parsed strictly ([`parse_xfcc_single_entry`]).
+/// - The identity AND the NF types come from the `Cert=` PEM alone, so they
+///   belong to one certificate. `URI=` is ignored: pairing a victim's `URI=`
+///   with any public AMF certificate used to yield (victim, [AMF]).
+/// - When `Hash=` is present it must be the SHA-256 of that certificate's DER,
+///   as Envoy computes it.
+///
+/// Chain verification is the terminator's job: it verified the client before
+/// forwarding (documented in nrf.md). A certificate with no `urn:uuid:` URI
+/// SAN names no NF instance and is not believed.
+fn forwarded_client_cert(request: &SbiRequest, policy: &NrfPolicy) -> Option<ForwardedClientCert> {
     use base64::Engine;
-    let Some(encoded) = parse_xfcc_first_entry_element(header, "cert") else {
-        return Vec::new();
-    };
-    let pem = nextgcore_sbi::uri_encode::decode_query_value(&encoded);
+    use sha2::Digest;
+    if !policy.trust_forwarded_client_cert || request.peer_cert_present {
+        return None;
+    }
+    let header = request.http.get_header(XFCC_HEADER)?;
+    let entry = parse_xfcc_single_entry(header)?;
+    let pem = nextgcore_sbi::uri_encode::decode_query_value(entry.get("cert")?);
     let body: String = pem
         .lines()
         .map(str::trim)
@@ -4787,64 +4912,25 @@ fn parse_xfcc_first_entry_cert_nf_types(header: &str) -> Vec<String> {
         .skip(1)
         .take_while(|l| !l.starts_with("-----END CERTIFICATE-----"))
         .collect();
-    match base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) {
-        Ok(der) if !der.is_empty() => nextgcore_sbi::peer_cert::nf_types_from_der(&der),
-        _ => Vec::new(),
-    }
-}
-
-/// The (unquoted) value of element `key` (case-insensitive) of the FIRST cert
-/// entry of an Envoy XFCC header, or None when absent or empty. Quote-aware, as
-/// [`parse_xfcc_first_entry_uri`] describes.
-fn parse_xfcc_first_entry_element(header: &str, key: &str) -> Option<String> {
-    // 1) Take the first cert entry (up to the first UNQUOTED comma).
-    let mut in_quotes = false;
-    let mut entry_end = header.len();
-    for (i, c) in header.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                entry_end = i;
-                break;
-            }
-            _ => {}
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.as_bytes())
+        .ok()
+        .filter(|d| !d.is_empty())?;
+    if let Some(hash) = entry.get("hash") {
+        let digest: String = sha2::Sha256::digest(&der)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if !hash.trim().eq_ignore_ascii_case(&digest) {
+            log::debug!("{XFCC_HEADER}: Hash= does not match the forwarded Cert=; not believed");
+            return None;
         }
     }
-    let entry = &header[..entry_end];
-
-    // 2) Split the entry into `Key=Value` pairs on UNQUOTED semicolons.
-    let mut pairs: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    in_quotes = false;
-    for (i, c) in entry.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ';' if !in_quotes => {
-                pairs.push(&entry[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    pairs.push(&entry[start..]);
-
-    // 3) Find the element (case-insensitive key) and unquote its value.
-    for pair in pairs {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k.trim().eq_ignore_ascii_case(key) {
-                let v = v.trim();
-                let v = v
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .unwrap_or(v);
-                if v.is_empty() {
-                    return None;
-                }
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    let nf_instance_id = nextgcore_sbi::peer_cert::nf_instance_id_from_der(&der)?;
+    Some(ForwardedClientCert {
+        nf_instance_id,
+        nf_types: nextgcore_sbi::peer_cert::nf_types_from_der(&der),
+    })
 }
 
 /// I2 (TS 33.501 §13.3.1/§13.4.1, TS 33.310, TS 29.510 §6.1.6.2): extract the
@@ -4888,21 +4974,8 @@ fn extract_transport_client_nf_instance_id(
         }
         return None;
     }
-    let xfcc = request.http.get_header(XFCC_HEADER)?;
-    let uri = parse_xfcc_first_entry_uri(xfcc)?;
-    // Strip the `urn:uuid:` scheme+NID (case-insensitive) when present; other
-    // URI SAN forms bind on the exact value. `get(..9)` keeps the slice on a
-    // char boundary (the value is attacker-influenced).
-    let id = match uri.get(..9) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("urn:uuid:") => &uri[9..],
-        _ => uri.as_str(),
-    };
-    let id = id.trim();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id.to_string())
-    }
+    // #1990: identity from the forwarded certificate itself, never from URI=.
+    forwarded_client_cert(request, policy).map(|c| c.nf_instance_id)
 }
 
 /// #1611: who an Nnrf_NFManagement NF-instance request (NFRegister, NFUpdate,
@@ -4968,10 +5041,8 @@ impl RegistrantIdentity {
         // trusted terminator forwarded in XFCC `Cert=`, if it forwarded one.
         let forwarded = !direct && instance_ids.iter().any(|(s, _)| s.starts_with("forwarded"));
         let nf_types = if forwarded {
-            request
-                .http
-                .get_header(XFCC_HEADER)
-                .map(|x| parse_xfcc_first_entry_cert_nf_types(x))
+            forwarded_client_cert(request, policy)
+                .map(|c| c.nf_types)
                 .unwrap_or_default()
         } else {
             request.peer_cert_nf_types.clone()
@@ -5065,8 +5136,8 @@ impl RegistrantIdentity {
             }
             nextgcore_nrfd::metrics::observe_unverified_nf_management();
             let why = if self.forwarded {
-                "its identity was forwarded by a TLS terminator without the requester's \
-                 certificate (XFCC Cert=), so no NF type of the requester is known"
+                "the client certificate a TLS terminator forwarded for it (XFCC Cert=) names \
+                 no NF type (RFC 9310 NFTypes)"
             } else {
                 "its client certificate names no NF type (RFC 9310 NFTypes)"
             };
@@ -5609,10 +5680,10 @@ fn unregistered_nrf_api_consumer(
     if registrant_nf_types_required(policy) {
         // #1979: a trusted forwarded identity proves the NF types of the
         // certificate the terminator forwarded (XFCC `Cert=`).
-        let forwarded_types = (!direct && policy.trust_forwarded_client_cert)
-            .then(|| request.http.get_header(XFCC_HEADER))
+        let forwarded_types = (!direct)
+            .then(|| forwarded_client_cert(request, policy))
             .flatten()
-            .map(|x| parse_xfcc_first_entry_cert_nf_types(x))
+            .map(|c| c.nf_types)
             .unwrap_or_default();
         let verified = authentication.via_transport
             && if direct {
@@ -6089,6 +6160,51 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
 
     log::debug!("Exiting async main event loop");
     Ok(())
+}
+
+/// #1990, tests: an Envoy-style XFCC entry for a client certificate whose URI SAN
+/// is `urn:uuid:<id>` (or `id` verbatim when it already has a scheme) and whose
+/// RFC 9310 NFTypes are `nf_types`: `Hash=` (SHA-256 of the DER), the URL-encoded
+/// PEM in `Cert=`, and a quoted `Subject=`. Self-signed: chain verification is the
+/// terminator's job.
+#[cfg(test)]
+fn test_xfcc(id: &str, nf_types: &[&str]) -> String {
+    use sha2::Digest;
+    let uri = if id.contains(':') {
+        id.to_string()
+    } else {
+        format!("urn:uuid:{id}")
+    };
+    let mut params = rcgen::CertificateParams::new(Vec::new()).expect("params");
+    params.subject_alt_names.push(rcgen::SanType::URI(
+        uri.as_str().try_into().expect("ia5 uri"),
+    ));
+    if !nf_types.is_empty() {
+        let mut body = Vec::new();
+        for t in nf_types {
+            body.push(0x16);
+            body.push(t.len() as u8);
+            body.extend_from_slice(t.as_bytes());
+        }
+        let mut der = vec![0x30, body.len() as u8];
+        der.extend(body);
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 5, 5, 7, 1, 34],
+                der,
+            ));
+    }
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert = params.self_signed(&key).expect("cert");
+    let hash: String = sha2::Sha256::digest(cert.der())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(
+        "By=spiffe://nrf;Hash={hash};Cert=\"{}\";Subject=\"CN=test,O=Op\"",
+        nextgcore_sbi::uri_encode::encode_query_value(&cert.pem())
+    )
 }
 
 #[cfg(test)]
@@ -9047,46 +9163,38 @@ mod tests {
 
     #[test]
     fn test_nrfd_i2_xfcc_uri_extraction() {
-        // Leaf entry URI SAN, urn:uuid stripped to the bare NF Instance ID.
-        assert_eq!(
-            parse_xfcc_first_entry_uri(
-                r#"By=spiffe://c/ns/5gc/sa/nrf;Hash=abcd;Subject="CN=SMF,O=Op";URI=urn:uuid:smf-1"#
-            )
-            .as_deref(),
-            Some("urn:uuid:smf-1")
-        );
+        // #1990: one entry, Envoy's grammar. Quoted values may hold `,` `;` `=`
+        // and escaped quotes; the elements are lower-cased keys.
+        let e = parse_xfcc_single_entry(
+            r#"By=spiffe://c/ns/5gc/sa/nrf;Hash=abcd;Subject="CN=SMF,O=Op; \"x\"";URI=urn:uuid:smf-1"#,
+        )
+        .expect("one entry");
+        assert_eq!(e["hash"], "abcd");
+        assert_eq!(e["subject"], r#"CN=SMF,O=Op; "x""#);
+        assert_eq!(e["uri"], "urn:uuid:smf-1");
 
-        // Quote-awareness (security): a fake `;URI=` smuggled INSIDE a quoted
-        // Subject DN must NOT be treated as a separate URI element — the only
-        // real URI element wins.
-        assert_eq!(
-            parse_xfcc_first_entry_uri(
-                r#"Subject="CN=evil;URI=urn:uuid:victim";URI=urn:uuid:real"#
-            )
-            .as_deref(),
-            Some("urn:uuid:real")
-        );
-        // A quoted Subject carrying only a fake URI (no genuine URI element)
-        // yields nothing — the smuggled value is never surfaced.
-        assert_eq!(
-            parse_xfcc_first_entry_uri(r#"Subject="CN=evil;URI=urn:uuid:victim""#),
-            None
-        );
-        // A quoted value containing a comma does not prematurely end the entry.
-        assert_eq!(
-            parse_xfcc_first_entry_uri(r#"Subject="O=Foo, Inc";URI=urn:uuid:abc"#).as_deref(),
-            Some("urn:uuid:abc")
-        );
-        // Multiple cert entries: the FIRST (leaf) entry's URI is chosen.
-        assert_eq!(
-            parse_xfcc_first_entry_uri("URI=urn:uuid:leaf,By=x;URI=urn:uuid:intermediate")
-                .as_deref(),
-            Some("urn:uuid:leaf")
-        );
-        // No URI element at all.
-        assert_eq!(
-            parse_xfcc_first_entry_uri("Hash=abcd;Subject=\"CN=x\""),
-            None
+        // R30 MAJOR 2: an escaped quote inside a quoted Subject does not close it,
+        // so a smuggled `;URI=` stays inside the Subject value.
+        let e =
+            parse_xfcc_single_entry(r#"Subject="CN=evil\";URI=urn:uuid:victim";URI=urn:uuid:real"#)
+                .expect("one entry");
+        assert_eq!(e["uri"], "urn:uuid:real");
+        assert_eq!(e["subject"], r#"CN=evil";URI=urn:uuid:victim"#);
+
+        // Ambiguous: refused, never guessed at.
+        for bad in [
+            r#"Subject="CN=open;URI=urn:uuid:victim"#, // unterminated quote
+            r#"Subject=CN"x";URI=urn:uuid:a"#,         // a quote inside a bare value
+            r#"Subject="x"y;URI=urn:uuid:a"#,          // text after a closing quote
+            r#"URI=urn:uuid:a;URI=urn:uuid:b"#,        // a key twice
+            r#"URI=urn:uuid:a;bare"#,                  // an element with no '='
+        ] {
+            assert!(parse_xfcc_single_entry(bad).is_none(), "{bad}");
+        }
+        // R30: more than one entry (Envoy APPEND_FORWARD prepends whatever the
+        // client sent): refused.
+        assert!(
+            parse_xfcc_single_entry("URI=urn:uuid:leaf,By=x;URI=urn:uuid:intermediate").is_none()
         );
 
         // Extraction requires a declared trusted terminator (issue #64 gap 2);
@@ -9095,20 +9203,19 @@ mod tests {
             trust_forwarded_client_cert: true,
             ..NrfPolicy::default()
         };
-
-        // Full extraction: urn:uuid: prefix (case-insensitive) is stripped.
+        // The identity is the forwarded certificate's own URI SAN, urn:uuid:
+        // stripped; a non-URN URI SAN binds on the exact value.
         let mut req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
         req.http
-            .set_header("x-forwarded-client-cert", "Hash=ab;URI=URN:UUID:amf-9");
+            .set_header("x-forwarded-client-cert", test_xfcc("amf-9", &[]));
         assert_eq!(
             extract_transport_client_nf_instance_id(&req, &trusting).as_deref(),
             Some("amf-9")
         );
-        // A non-URN URI SAN binds on the exact value.
         let mut req2 = SbiRequest::post("/x");
         req2.http.set_header(
             "x-forwarded-client-cert",
-            "URI=https://amf.example/nf/amf-9",
+            test_xfcc("https://amf.example/nf/amf-9", &[]),
         );
         assert_eq!(
             extract_transport_client_nf_instance_id(&req2, &trusting).as_deref(),
@@ -9213,10 +9320,25 @@ mod tests {
         assert!(p.require_client_cert_binding);
         std::env::remove_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING");
 
-        let mut t = NrfPolicy::default();
+        // #1990 (R30): the trusted-terminator variable turns the knob on under
+        // dev only. Under production a header any client can send is not trusted
+        // on an environment variable's say-so.
+        //
+        // REVERT-VERIFIED: with the production check removed, the production
+        // assertion fails.
         std::env::set_var("NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT", "1");
-        t.apply_env_overrides();
-        assert!(t.trust_forwarded_client_cert);
+        let mut t = NrfPolicy::default();
+        t.apply_env_overrides_under(nextgcore_sbi::security::SbiProfile::Dev);
+        assert!(
+            t.trust_forwarded_client_cert,
+            "dev: the variable turns it on"
+        );
+        let mut prod = NrfPolicy::default();
+        prod.apply_env_overrides_under(nextgcore_sbi::security::SbiProfile::Production);
+        assert!(
+            !prod.trust_forwarded_client_cert,
+            "production: the variable is ignored"
+        );
         std::env::remove_var("NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT");
 
         // A tightening env override never turns a knob back off with a falsy value.
@@ -9296,7 +9418,7 @@ mod tests {
         // The binding check is unconditional: a cert for one NF can never mint a
         // token for another, whatever the policy flags say.
         let resp = handle_access_token_request_with_policy(
-            &token_req(Some("Hash=ab;URI=urn:uuid:some-other-nf")),
+            &token_req(Some(&test_xfcc("some-other-nf", &[]))),
             &policy,
         )
         .await;
@@ -9307,7 +9429,7 @@ mod tests {
 
         // (b) A matching mTLS identity binds cleanly -> token issued (200).
         let resp = handle_access_token_request_with_policy(
-            &token_req(Some(&format!("Hash=ab;URI=urn:uuid:{consumer_id}"))),
+            &token_req(Some(&test_xfcc(consumer_id, &[]))),
             &policy,
         )
         .await;
@@ -9811,7 +9933,7 @@ mod tests {
     #[tokio::test]
     async fn xfcc_header_is_ignored_unless_trusted() {
         let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd64c");
-        let xfcc = format!("Hash=ab;URI=urn:uuid:{consumer_id}");
+        let xfcc = test_xfcc(&consumer_id, &[]);
 
         // Default policy: the header is not evidence, so the request is
         // unauthenticated and refused.
@@ -9885,7 +10007,7 @@ mod tests {
                 &ctype,
                 &producer_id,
                 None,
-                Some("Hash=ab;URI=urn:uuid:a-different-nf"),
+                Some(&test_xfcc("a-different-nf", &[])),
             ),
             &policy,
         )
@@ -10078,17 +10200,13 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &req(lower, None, Some(&format!("Hash=ab;URI=urn:uuid:{upper}"))),
+            &req(lower, None, Some(&test_xfcc(&upper, &[]))),
             &fwd,
         )
         .await;
         assert_eq!(sub_of(&resp), lower, "mTLS, upper-case certificate");
         let resp = handle_access_token_request_with_policy(
-            &req(
-                legacy,
-                None,
-                Some(&format!("Hash=ab;URI=urn:uuid:{legacy_upper}")),
-            ),
+            &req(legacy, None, Some(&test_xfcc(&legacy_upper, &[]))),
             &fwd,
         )
         .await;
@@ -12639,16 +12757,11 @@ mod registrant_binding_tests_1611 {
     /// An Envoy-style XFCC header for a terminator that verified a client
     /// certificate naming `uri` and `nf_types`, with (`with_cert`) or without
     /// its URL-encoded PEM in `Cert=` (#1979).
-    fn xfcc_1979(tag: &str, uri: &str, nf_types: &[&str], with_cert: bool) -> String {
-        let (_, _, _, cert, _) = pki(tag, Some(uri), Some(nf_types));
-        let pem = std::fs::read_to_string(cert).expect("client pem");
+    fn xfcc_1979(_tag: &str, uri: &str, nf_types: &[&str], with_cert: bool) -> String {
         if with_cert {
-            format!(
-                "By=spiffe://nrf;Hash=00;Cert=\"{}\";URI={uri}",
-                nextgcore_sbi::uri_encode::encode_query_value(&pem)
-            )
+            test_xfcc(uri, nf_types)
         } else {
-            format!("By=spiffe://nrf;Hash=00;URI={uri}")
+            format!("By=spiffe://nrf;URI={uri}")
         }
     }
 
@@ -12684,19 +12797,15 @@ mod registrant_binding_tests_1611 {
         assert_eq!(refused.status, 400);
 
         let without = forwarded(&xfcc_1979("xfcc-1979b", &uri, &["AMF"], false));
-        assert!(without.nf_types.is_empty(), "no Cert=, no type");
-        assert!(without
-            .bind_nf_type("NFRegister", id, "AMF", true)
-            .expect("refused where types are required")
-            .http
-            .content
-            .as_deref()
-            .unwrap_or_default()
-            .contains("XFCC Cert="));
+        // #1990: without Cert= the terminator vouches for nothing, not even the
+        // identity (URI= alone is never believed).
+        // (Its nf_types fall back to the connection's own, the terminator's; with
+        // no identity the caller is refused NF management before they matter.)
+        assert!(without.instance_ids.is_empty(), "no Cert=, no identity");
 
         let garbage = forwarded(&format!("By=x;Cert=\"not-a-pem\";URI={uri}"));
         assert!(
-            garbage.nf_types.is_empty(),
+            garbage.instance_ids.is_empty(),
             "an undecodable Cert= proves nothing"
         );
     }
@@ -12745,6 +12854,71 @@ mod registrant_binding_tests_1611 {
             )
             .await;
         assert_eq!(as_ausf.status, 400, "{:?}", as_ausf.http.content);
+    }
+
+    /// **#1990 (R30 MAJOR 1).** The identity and the NF types come from ONE
+    /// certificate, the forwarded `Cert=`. A victim's `URI=` beside an
+    /// attacker's AMF certificate yields the attacker's identity, never
+    /// (victim, [AMF]); and a `Hash=` that does not match `Cert=` is not
+    /// believed at all.
+    ///
+    /// REVERT-VERIFIED: with the identity taken from `URI=` again, the first
+    /// assertion names the victim and fails; with the Hash= check removed, the
+    /// mismatched header is believed and the second fails.
+    #[test]
+    fn the_forwarded_identity_and_types_come_from_one_certificate_1990() {
+        let trusting = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let req = |xfcc: String| {
+            let mut r = SbiRequest::post("/x");
+            r.http.set_header(XFCC_HEADER, xfcc);
+            r
+        };
+        let attacker = test_xfcc("19900000-0000-4000-8000-0000000000aa", &["AMF"]);
+        let spliced = format!("{attacker};URI=urn:uuid:19900000-0000-4000-8000-00000000vic7");
+        assert_eq!(
+            extract_transport_client_nf_instance_id(&req(spliced), &trusting).as_deref(),
+            Some("19900000-0000-4000-8000-0000000000aa"),
+            "the certificate's own identity, not the spliced URI="
+        );
+        let mismatched = attacker.replacen("Hash=", "Hash=00", 1);
+        assert!(
+            extract_transport_client_nf_instance_id(&req(mismatched), &trusting).is_none(),
+            "a Hash= that does not match Cert= is not believed"
+        );
+    }
+
+    /// **#1990 (R30).** With the flag on, a client that authenticated directly
+    /// (a verified certificate of its own, here with no URI SAN) is the peer, and
+    /// its XFCC header is not believed. Neither is a header with more than one
+    /// entry (Envoy APPEND_FORWARD puts the client's own first).
+    ///
+    /// REVERT-VERIFIED: with the `peer_cert_present` check removed, the direct
+    /// client's header is believed and the first assertion fails.
+    #[test]
+    fn a_direct_client_and_an_appended_entry_are_not_believed_1990() {
+        let trusting = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let xfcc = test_xfcc("19900000-0000-4000-8000-0000000000bb", &["AMF"]);
+        let mut direct = SbiRequest::post("/x");
+        direct.peer_cert_present = true; // verified, but no URI SAN
+        direct.http.set_header(XFCC_HEADER, xfcc.clone());
+        assert!(extract_transport_client_nf_instance_id(&direct, &trusting).is_none());
+
+        let mut appended = SbiRequest::post("/x");
+        appended
+            .http
+            .set_header(XFCC_HEADER, format!("{xfcc},{xfcc}"));
+        assert!(extract_transport_client_nf_instance_id(&appended, &trusting).is_none());
+
+        // Control: the lone entry on a connection with no certificate of its own.
+        let mut lone = SbiRequest::post("/x");
+        lone.http.set_header(XFCC_HEADER, xfcc);
+        assert!(extract_transport_client_nf_instance_id(&lone, &trusting).is_some());
     }
 
     /// **#1979 (2).** `registrant_nf_types_required` reads the policy it is
@@ -13113,7 +13287,7 @@ mod registrant_binding_tests_1611 {
 
         // Plaintext / TLS-only: nothing to bind; a forged XFCC is ignored.
         let none = RegistrantIdentity::of(
-            &request_with(None, &[], Some("By=x;URI=urn:uuid:forged"), None),
+            &request_with(None, &[], Some(&test_xfcc("forged", &[])), None),
             &plain,
         );
         assert_eq!(none, RegistrantIdentity::default());
@@ -13136,7 +13310,7 @@ mod registrant_binding_tests_1611 {
         // A trusted forwarded identity: the connection's (terminator's) types
         // are not the registrant's.
         let fwd = RegistrantIdentity::of(
-            &request_with(None, &["SCP"], Some("By=x;URI=urn:uuid:nf-c"), None),
+            &request_with(None, &["SCP"], Some(&test_xfcc("nf-c", &[])), None),
             &trusting,
         );
         assert_eq!(
@@ -13159,11 +13333,11 @@ mod registrant_binding_tests_1611 {
             .content
             .as_deref()
             .unwrap_or_default()
-            .contains("forwarded by a TLS terminator"));
+            .contains("a TLS terminator forwarded for it (XFCC Cert=) names no NF type"));
 
         // The direct certificate outranks the header and carries its types.
         let direct = RegistrantIdentity::of(
-            &request_with(Some("nf-d"), &["AMF"], Some("By=x;URI=urn:uuid:nf-z"), None),
+            &request_with(Some("nf-d"), &["AMF"], Some(&test_xfcc("nf-z", &[])), None),
             &trusting,
         );
         assert_eq!(
@@ -13368,9 +13542,9 @@ mod server_tls_tests_1617 {
         let token_only = RegistrantIdentity::of(&req(None, None, Some("nf-a")), &plain);
         let direct = RegistrantIdentity::of(&req(Some("nf-a"), None, None), &plain);
         let forwarded =
-            RegistrantIdentity::of(&req(None, Some("By=x;URI=urn:uuid:nf-a"), None), &trusting);
+            RegistrantIdentity::of(&req(None, Some(&test_xfcc("nf-a", &[])), None), &trusting);
         let untrusted_forward =
-            RegistrantIdentity::of(&req(None, Some("By=x;URI=urn:uuid:nf-a"), None), &plain);
+            RegistrantIdentity::of(&req(None, Some(&test_xfcc("nf-a", &[])), None), &plain);
 
         let before = nextgcore_nrfd::metrics::unverified_nf_management_total();
         for (who, id) in [

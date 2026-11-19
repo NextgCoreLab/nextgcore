@@ -603,6 +603,8 @@ struct SbiService<H: SbiRequestHandler> {
     /// callback-exemption decision and (#1611) copied onto every request as
     /// [`SbiRequest::peer_cert_nf_types`].
     peer_cert_nf_types: Vec<String>,
+    /// #1990: a verified client certificate was presented on this connection.
+    peer_cert_present: bool,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
@@ -619,6 +621,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             tls_exporter_secret: self.tls_exporter_secret.clone(),
             peer_cert_nf_instance_id: self.peer_cert_nf_instance_id.clone(),
             peer_cert_nf_types: self.peer_cert_nf_types.clone(),
+            peer_cert_present: self.peer_cert_present,
             server_identity: self.server_identity.clone(),
             overload_reporter: self.overload_reporter.clone(),
         }
@@ -637,6 +640,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let tls_exporter_secret = self.tls_exporter_secret.clone();
         let peer_cert_nf_instance_id = self.peer_cert_nf_instance_id.clone();
         let peer_cert_nf_types = self.peer_cert_nf_types.clone();
+        let peer_cert_present = self.peer_cert_present;
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
@@ -669,6 +673,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         // #1611: the verified leaf's RFC 9310 NF types travel with
                         // the request (the NRF binds an NFRegister's nfType to them).
                         request.peer_cert_nf_types = peer_cert_nf_types.clone();
+                        request.peer_cert_present = peer_cert_present;
                         request
                     }
                     Err(ConvertRequestError::BodyTooLarge) => {
@@ -1174,6 +1179,7 @@ async fn convert_request(
         // runs before authorization, so it cannot know it here.
         oauth2_subject: None,
         oauth2_scope: None,
+        peer_cert_present: false,
     })
 }
 
@@ -1647,6 +1653,14 @@ impl SbiServer {
                                                         })
                                                         .unwrap_or_default()
                                                 };
+                                                // #1990: whether any verified client
+                                                // certificate was presented at all.
+                                                let peer_cert_present = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .is_some_and(|chain| !chain.is_empty())
+                                                };
                                                 let service = SbiService {
                                                     handler: handler_ref,
                                                     oauth: oauth_ref,
@@ -1654,6 +1668,7 @@ impl SbiServer {
                                                     tls_exporter_secret,
                                                     peer_cert_nf_instance_id,
                                                     peer_cert_nf_types,
+                                                    peer_cert_present,
                                                     server_identity: server_identity_ref,
                                                     overload_reporter:
                                                         overload_reporter_ref,
@@ -1688,6 +1703,7 @@ impl SbiServer {
                                         tls_exporter_secret: None,
                                         peer_cert_nf_instance_id: None,
                                         peer_cert_nf_types: Vec::new(),
+                                        peer_cert_present: false,
                                         server_identity: server_identity_ref,
                                         overload_reporter: overload_reporter_ref,
                                     };
