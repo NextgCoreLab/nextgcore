@@ -5449,7 +5449,16 @@ struct BindingKeys<'a> {
 ///   reported domain, so an SMF that never sends `ipDomain` is not refused.
 ///
 /// `Err` names why nothing can match (a SUPI with no SM association here).
-fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
+///
+/// #2016 (R31): only sessions `visible` admits are candidates, and they are
+/// filtered BEFORE the `ipDomain` narrowing, which looks at the candidates as
+/// a set: narrowed over every tenant's sessions, another tenant's session in
+/// the asked domain would flip the caller's own (domain-less) match away, an
+/// oracle for other tenants' domains.
+fn binding_candidates(
+    keys: &BindingKeys,
+    visible: impl Fn(&PcfSess) -> bool,
+) -> Result<Vec<PcfSess>, String> {
     let ctx = pcf_self();
     let Ok(context) = ctx.read() else {
         return Err("the PCF context is unavailable".to_string());
@@ -5480,6 +5489,14 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
             })
     });
     drop(context);
+    let found = candidates.len();
+    candidates.retain(|sess| visible(sess));
+    if candidates.len() < found {
+        log::debug!(
+            "PDU session binding: {} of {found} matching session(s) not the caller's",
+            found - candidates.len()
+        );
+    }
     if let (BindingAddress::V4(_), Some(domain)) = (keys.address, keys.ip_domain) {
         if candidates
             .iter()
@@ -5510,19 +5527,11 @@ fn bind_one_visible_session(
     keys: &BindingKeys,
     visible: impl Fn(&PcfSess) -> bool,
 ) -> Result<PcfSess, String> {
-    let mut candidates = match binding_candidates(keys) {
+    let mut candidates = match binding_candidates(keys, visible) {
         Ok(found) => found,
         Err(why) if why.starts_with(NO_SM_ASSOCIATION_FOR_SUPI) => Vec::new(),
         Err(why) => return Err(why),
     };
-    let found = candidates.len();
-    candidates.retain(|sess| visible(sess));
-    if candidates.len() < found {
-        log::debug!(
-            "PDU session binding: {} of {found} matching session(s) not the caller's",
-            found - candidates.len()
-        );
-    }
     let asked = format!(
         "address={:?} ipDomain={:?} sliceInfo={:?} supi={:?} dnn={:?}",
         keys.address, keys.ip_domain, keys.slice, keys.supi, keys.dnn
@@ -14859,6 +14868,76 @@ mod tests {
         );
         // SMF B still has exactly one there.
         assert_eq!(pcf_sbi_request_handler(restore(SMF_B)).await.status, 204);
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #2016 (R31 M): the `ipDomain` narrowing runs over the caller's sessions
+    /// only. SMF A restores its domain-less session with `ipDomain=dom-secret`
+    /// (the fallback to the session with no reported domain); SMF B then holds
+    /// a session on the same IPv4 IN dom-secret. A's answer must not change:
+    /// narrowed over every tenant, B's session would flip it to 500, telling A
+    /// that someone has a session in that domain.
+    ///
+    /// REVERT-VERIFIED: with the visibility filter after the narrowing again,
+    /// A's second restoration is a 500 and the assertion on it fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn another_tenants_ip_domain_does_not_change_the_answer_2016() {
+        const SMF_A: &str = "aaaaaaaa-2016-4000-8000-0000000000d1";
+        const SMF_B: &str = "bbbbbbbb-2016-4000-8000-0000000000d2";
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ipv4 = "10.45.20.26";
+        let as_smf = |mut r: SbiRequest, smf: &str| {
+            r.oauth2_subject = Some(smf.to_string());
+            r
+        };
+        let create = |supi: &str, psi: u8, domain: Option<&str>| {
+            let mut body = full_create_body(supi, psi);
+            let obj = body.as_object_mut().unwrap();
+            obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+            if let Some(d) = domain {
+                obj.insert("ipDomain".to_string(), serde_json::json!(d));
+            }
+            obj.insert(
+                "notificationUri".to_string(),
+                serde_json::json!(format!(
+                    "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                    peers.smf_port
+                )),
+            );
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+        };
+        let restore = || {
+            as_smf(
+                make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4, "ipDomain": "dom-secret" })),
+                ),
+                SMF_A,
+            )
+        };
+        let resp =
+            pcf_sbi_request_handler(as_smf(create("imsi-001010000002026", 1, None), SMF_A)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(pcf_sbi_request_handler(restore()).await.status, 204);
+        let resp = pcf_sbi_request_handler(as_smf(
+            create("imsi-001010000002027", 2, Some("dom-secret")),
+            SMF_B,
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let resp = pcf_sbi_request_handler(restore()).await;
+        assert_eq!(
+            resp.status, 204,
+            "another SMF's session in the asked domain changes nothing: {:?}",
+            resp.http.content
+        );
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
     }
