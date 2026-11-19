@@ -849,6 +849,9 @@ mod tests {
 
         assert_eq!(crate::reconcile::reconcile_once().await, 0, "still refused");
         assert_eq!(crate::reconcile::pending_count(), 1, "kept, not dropped");
+        // #1961: the AMF that refused is backing off; the next pass is after it.
+        tokio::time::sleep(crate::reconcile::BACKOFF_BASE + std::time::Duration::from_millis(50))
+            .await;
 
         assert_eq!(
             crate::reconcile::reconcile_once().await,

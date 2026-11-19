@@ -23,7 +23,11 @@
 //!   `abandoned`); a pass sends for at most [`MAX_PASS`]. A parked DECREASE whose
 //!   (SUPI, access type, S-NSSAI) has been admitted again since is `superseded` and
 //!   not sent: the NSACF counts a UE once, so it would count the live registration
-//!   out.
+//!   out. No NSACF starves the others (#1961, the #1954 / #1972 pattern): once a
+//!   DECREASE to an NSACF fails it backs off ([`BACKOFF_BASE`], doubling to
+//!   [`BACKOFF_MAX`]) and its other DECREASEs wait, in this pass and later ones; one
+//!   tried and failed goes to the BACK of the queue, one not reached keeps its place
+//!   at the front; one parked longer than [`MAX_AGE`] ends as `expired`.
 //!
 //! Ceiling: memory-only. amfd has no durable store for its UE contexts either, so a
 //! restart forgets both the registrations and the DECREASEs they owe; the NSACF's
@@ -161,9 +165,72 @@ const _: () = assert!(
 );
 
 /// The parked DECREASEs, oldest first.
-fn pending() -> &'static Mutex<VecDeque<Admission>> {
-    static PENDING: Mutex<VecDeque<Admission>> = Mutex::new(VecDeque::new());
+fn pending() -> &'static Mutex<VecDeque<Parked>> {
+    static PENDING: Mutex<VecDeque<Parked>> = Mutex::new(VecDeque::new());
     &PENDING
+}
+
+/// One parked DECREASE, and when it was first parked (#1961).
+#[derive(Debug, Clone)]
+struct Parked {
+    a: Admission,
+    /// Wall-clock, so a test can set it back past [`MAX_AGE`].
+    since: std::time::SystemTime,
+}
+
+/// #1961: how long an entry stays parked before it is given up (`expired`): a
+/// peer that has not answered for a day is gone (decommissioned), not
+/// restarting, so its entries end rather than wait to be evicted.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// #1961 (the #1954 / #1972 pattern): the first wait before a peer whose
+/// request failed is tried again, doubled after each further failure up to
+/// [`BACKOFF_MAX`], and cleared by a success. A peer that is backing off is
+/// skipped for the rest of the pass and for later passes until its wait ends,
+/// so a blackholed peer costs one request timeout per backoff period and
+/// cannot starve the entries for healthy peers behind it.
+#[cfg(not(test))]
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
+/// The longest a failing peer is left alone between attempts.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
+
+/// Per peer: when it may next be tried, and the current backoff.
+fn backoff() -> &'static Mutex<Backoff> {
+    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
+        std::sync::LazyLock::new(Default::default);
+    &BACKOFF
+}
+
+fn backing_off(peer: &str) -> bool {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
+}
+
+fn note_failure(peer: &str) {
+    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    let wait = map
+        .get(peer)
+        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
+    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
+}
+
+fn note_success(peer: &str) {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(peer);
+}
+
+/// The peer a DECREASE goes to: the NSACF that granted the admission.
+fn peer_of(a: &Admission) -> String {
+    format!("{}:{}", a.nsacf_host, a.nsacf_port)
 }
 
 /// Serialises the tests that touch [`admissions`] and [`pending`]: one test's
@@ -186,7 +253,8 @@ pub static RECOUNTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// `amf_nsac_ue_decreases_reconciled_total{result}`: parked DECREASEs the
 /// reconciler ended: `delivered`, `superseded` (admitted again since), `refused`
-/// (a 4xx a retry cannot change) or `abandoned` (evicted at the bound).
+/// (a 4xx a retry cannot change), `abandoned` (evicted at the bound) or `expired`
+/// (parked longer than [`MAX_AGE`], #1961).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "amf_nsac_ue_decreases_reconciled_total",
@@ -499,9 +567,9 @@ async fn send(a: &Admission) -> Outcome {
     .await
 }
 
-fn evict(set: &mut VecDeque<Admission>) {
+fn evict(set: &mut VecDeque<Parked>) {
     while set.len() > MAX_PENDING {
-        if let Some(old) = set.pop_front() {
+        if let Some(Parked { a: old, .. }) = set.pop_front() {
             log::error!(
                 "[{}] NSACF DECREASE for SST={} SD={:?} abandoned: {MAX_PENDING} are already \
                  pending; the UE stays counted at the NSACF",
@@ -517,7 +585,7 @@ fn evict(set: &mut VecDeque<Admission>) {
 /// Park a DECREASE that failed. One already parked is not parked twice.
 pub fn park(a: Admission) {
     let mut set = lock(pending());
-    if set.contains(&a) {
+    if set.iter().any(|p| p.a == a) {
         return;
     }
     log::warn!(
@@ -527,7 +595,10 @@ pub fn park(a: Admission) {
         a.snssai.sst,
         a.snssai.sd
     );
-    set.push_back(a);
+    set.push_back(Parked {
+        a,
+        since: std::time::SystemTime::now(),
+    });
     evict(&mut set);
 }
 
@@ -539,19 +610,38 @@ pub fn pending_count() -> usize {
 /// The parked DECREASEs, for tests.
 #[cfg(test)]
 pub fn parked() -> Vec<Admission> {
-    lock(pending()).iter().cloned().collect()
+    lock(pending()).iter().map(|p| p.a.clone()).collect()
 }
 
 /// One reconcile pass over the parked DECREASEs, oldest first, for at most
-/// [`MAX_PASS`]. Returns how many ended.
+/// [`MAX_PASS`]. One older than [`MAX_AGE`] ends as `expired`.
+///
+/// #1961: once a DECREASE to an NSACF fails, that NSACF backs off and its other
+/// DECREASEs are not tried this pass (nor until the backoff ends); one tried and
+/// failed goes to the BACK of the queue, one not reached keeps its place at the
+/// FRONT. Returns how many ended.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<Admission> = lock(pending()).drain(..).collect();
+    let batch: Vec<Parked> = lock(pending()).drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut still = Vec::new();
-    for a in batch {
-        if tokio::time::Instant::now() >= deadline {
-            still.push(a);
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for p in batch {
+        let a = &p.a;
+        if p.since.elapsed().unwrap_or_default() > MAX_AGE {
+            log::error!(
+                "[{}] parked NSACF DECREASE for SST={} SD={:?} expired after {MAX_AGE:?}",
+                a.supi,
+                a.snssai.sst,
+                a.snssai.sd
+            );
+            RECONCILED.inc(&["expired"]);
+            ended += 1;
+            continue;
+        }
+        let peer = peer_of(a);
+        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+            untried.push(p);
             continue;
         }
         let result = match decrease_once(a.clone()).await {
@@ -559,10 +649,12 @@ pub async fn reconcile_once() -> usize {
             Outcome::Accepted => "delivered",
             Outcome::Refused => "refused",
             Outcome::Failed => {
-                still.push(a);
+                note_failure(&peer);
+                failed.push(p);
                 continue;
             }
         };
+        note_success(&peer);
         log::info!(
             "[{}] parked NSACF DECREASE for SST={} SD={:?}: {result}",
             a.supi,
@@ -573,9 +665,14 @@ pub async fn reconcile_once() -> usize {
         ended += 1;
     }
     let mut set = lock(pending());
-    for a in still.into_iter().rev() {
-        if !set.contains(&a) {
-            set.push_front(a);
+    for p in untried.into_iter().rev() {
+        if !set.iter().any(|q| q.a == p.a) {
+            set.push_front(p);
+        }
+    }
+    for p in failed {
+        if !set.iter().any(|q| q.a == p.a) {
+            set.push_back(p);
         }
     }
     evict(&mut set);
@@ -629,6 +726,7 @@ pub fn render(out: &mut String) {
 pub fn clear_for_test() {
     lock(admissions()).clear();
     lock(pending()).clear();
+    lock(backoff()).clear();
     let mut ops = lock(ops());
     ops.in_flight.clear();
     ops.admitting.clear();
@@ -893,6 +991,83 @@ pub(crate) mod tests {
             "two failures, then one delivered; none for `back`"
         );
         assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+    }
+
+    /// #1961: a peer that accepts the connection and never answers, so each
+    /// request to it costs the client's whole timeout. Returns its port; the
+    /// accepted sockets are held for the life of the test process.
+    fn blackhole_1961() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    fn admission_toward_1961(port: u16, supi: &str) -> Admission {
+        Admission {
+            supi: supi.to_string(),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(1),
+            nf_id: "amf-1961".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        }
+    }
+
+    /// #1961: DECREASEs toward a blackholed NSACF ahead of one toward a healthy
+    /// NSACF no longer starve it: the healthy one is delivered within two passes,
+    /// and the blackholed ones stay parked.
+    /// REVERT-VERIFIED: with the old order restored (every not-ended DECREASE
+    /// re-parked at the front, no backoff), the healthy DECREASE is never reached
+    /// and "the healthy NSACF gets its DECREASE" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_nsacf_does_not_starve_a_healthy_one_1961() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let status = Arc::new(AtomicU16::new(204));
+        let (srv, port, seen) = nsacf(&[], status).await;
+        let dead = blackhole_1961();
+        for n in 0..3 {
+            park(admission_toward_1961(
+                dead,
+                &format!("imsi-00101000001961{n}"),
+            ));
+        }
+        park(admission_toward_1961(port, "imsi-001010000019619"));
+        let before = RECONCILED.get(&["delivered"]);
+        for _ in 0..2 {
+            reconcile_once().await;
+        }
+        let delivered = RECONCILED.get(&["delivered"]) - before;
+        let left = pending_count();
+        let hits = seen.lock().unwrap().len();
+        clear_for_test();
+        srv.stop().await.ok();
+        assert_eq!(delivered, 1, "the healthy NSACF gets its DECREASE");
+        assert_eq!(hits, 1);
+        assert_eq!(left, 3, "the blackholed ones stay parked");
+    }
+
+    /// #1961: a DECREASE parked longer than [`MAX_AGE`] ends as `expired`.
+    /// REVERT-VERIFIED: with the age check removed it is attempted and stays
+    /// parked.
+    #[tokio::test]
+    async fn a_decrease_older_than_max_age_expires_1961() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        park(admission_toward_1961(9, "imsi-001010000019618"));
+        lock(pending())[0].since = std::time::SystemTime::now() - MAX_AGE - Duration::from_secs(1);
+        let before = RECONCILED.get(&["expired"]);
+        reconcile_once().await;
+        let expired = RECONCILED.get(&["expired"]) - before;
+        let left = pending_count();
+        clear_for_test();
+        assert_eq!((expired, left), (1, 0));
     }
 
     /// A stand-in NSACF that APPLIES each request `delay` after it arrives, then
