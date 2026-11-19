@@ -766,6 +766,11 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         );
     }
 
+    // #1948: relayed by the home SEPP, before anything is read or stored.
+    if let Some(refused) = refuse_sepp_relayed(request, serving_network_name) {
+        return refused;
+    }
+
     log::info!("UE Authentication: SUPI/SUCI={supi_or_suci}, SNN={serving_network_name}");
 
     // Find or create UE in context
@@ -954,31 +959,9 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
 /// asserted PLMN list. Full enforcement (signature-validated claims, or an
 /// NRF NF-profile PLMN lookup) is a follow-up once that plumbing exists.
 fn extract_consumer_plmns(authorization: &str) -> Vec<(String, String)> {
-    let token = authorization
-        .strip_prefix("Bearer ")
-        .or_else(|| authorization.strip_prefix("bearer "))
-        .unwrap_or(authorization)
-        .trim();
-
-    let payload_b64 = match token.split('.').nth(1) {
-        Some(p) if !p.is_empty() => p,
-        _ => return Vec::new(),
+    let Some(json) = token_payload(authorization) else {
+        return Vec::new();
     };
-
-    // base64url -> standard base64 (+ padding) for the shared decoder.
-    let mut std_b64 = payload_b64.replace('-', "+").replace('_', "/");
-    while std_b64.len() % 4 != 0 {
-        std_b64.push('=');
-    }
-    let bytes = match nextgcore_crypt::base64::decode(&std_b64) {
-        Some(b) => b,
-        None => return Vec::new(),
-    };
-    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(j) => j,
-        Err(_) => return Vec::new(),
-    };
-
     let mut plmns = Vec::new();
     if let Some(arr) = json.get("plmnList").and_then(|v| v.as_array()) {
         for p in arr {
@@ -991,6 +974,30 @@ fn extract_consumer_plmns(authorization: &str) -> Vec<(String, String)> {
         }
     }
     plmns
+}
+
+/// The JSON payload of a bearer token, decoded without checking the signature.
+/// Read only for a token the SBI server already verified (#1948: the SEPP path
+/// requires `oauth2_subject`, which it sets only after verifying).
+fn token_payload(authorization: &str) -> Option<serde_json::Value> {
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .or_else(|| authorization.strip_prefix("bearer "))
+        .unwrap_or(authorization)
+        .trim();
+
+    let payload_b64 = match token.split('.').nth(1) {
+        Some(p) if !p.is_empty() => p,
+        _ => return None,
+    };
+
+    // base64url -> standard base64 (+ padding) for the shared decoder.
+    let mut std_b64 = payload_b64.replace('-', "+").replace('_', "/");
+    while std_b64.len() % 4 != 0 {
+        std_b64.push('=');
+    }
+    let bytes = nextgcore_crypt::base64::decode(&std_b64)?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Build an RFC 7807 / TS 29.500 ProblemDetails response.
@@ -1016,9 +1023,11 @@ fn retired_auth_ctx() -> SbiResponse {
 /// verified, else the NF Instance ID of the client certificate it verified.
 ///
 /// When both are present they must name the same NF (as #1831 rules for the
-/// NRF). The one exception is a certificate whose RFC 9310 NFTypes name the
-/// SCP: in indirect communication the TLS peer is the SCP and the token names
-/// the consumer (TS 33.501 §13.4.1.2), so the token `sub` is the identity.
+/// NRF). The one exception is a certificate whose RFC 9310 NFTypes name only
+/// the SCP, or (#1948) only the SEPP: in indirect communication, and in
+/// roaming relayed by the home SEPP, the TLS peer is the relay and the token
+/// names the consumer (TS 33.501 §13.4.1.2), so the token `sub` is the
+/// identity.
 /// `Err` is the reason a caller is refused: its token names an NF its own
 /// certificate does not.
 fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
@@ -1035,12 +1044,11 @@ fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
             // #1928: a certificate naming the SCP AND another NF type could
             // otherwise present any token `sub`; only a pure SCP certificate
             // is exempt.
-            let via_scp = !request.peer_cert_nf_types.is_empty()
-                && request
-                    .peer_cert_nf_types
-                    .iter()
-                    .all(|ty| ty.eq_ignore_ascii_case("SCP"));
-            if via_scp {
+            // #1948: and a pure SEPP certificate: roaming signalling relayed
+            // over N32-f by the home SEPP carries the visited AMF's token
+            // (TS 33.501 §13.2, §13.4.1.2). What a SEPP-relayed caller may do
+            // is narrowed by `refuse_sepp_relayed`.
+            if relayed_by(request, "SCP") || relayed_by(request, "SEPP") {
                 Ok(Some(t))
             } else {
                 Err(format!(
@@ -1051,6 +1059,78 @@ fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
         (Some(t), _) => Ok(Some(t)),
         (None, c) => Ok(c),
     }
+}
+
+/// #1928/#1948: whether the verified client certificate names `relay` (SCP or
+/// SEPP) and no other NF type. A certificate also naming another type is that
+/// NF's, not a relay's.
+fn relayed_by(request: &SbiRequest, relay: &str) -> bool {
+    !request.peer_cert_nf_types.is_empty()
+        && request
+            .peer_cert_nf_types
+            .iter()
+            .all(|ty| ty.eq_ignore_ascii_case(relay))
+}
+
+/// #1948: what an authentication relayed by the home SEPP needs. The SEPP sits
+/// on the PLMN border and relays only inter-PLMN signalling (TS 33.501 §13.1),
+/// so the caller is an NF of ANOTHER PLMN, and the only Nausf_UEAuthentication
+/// consumer there is the visited AMF (TS 33.501 §6.1.2, roaming):
+/// - a token this AUSF verified (its `sub` is the identity; the certificate is
+///   the SEPP's);
+/// - an inter-PLMN token: `consumerPlmnId` and `producerPlmnId` (TS 29.510
+///   `AccessTokenClaims`) both present and different;
+/// - the serving network name naming the consumer's PLMN (TS 33.501 §6.1.2:
+///   the requester must be entitled to it). Unlike the direct path, this is
+///   not default-permissive.
+///
+/// `None` unless the certificate is a pure SEPP's. `Some` is the refusal.
+fn refuse_sepp_relayed(request: &SbiRequest, serving_network_name: &str) -> Option<SbiResponse> {
+    if !relayed_by(request, "SEPP") {
+        return None;
+    }
+    if request
+        .oauth2_subject
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Some(forbidden(
+            "an authentication relayed by a SEPP needs the visited AMF's verified access token",
+        ));
+    }
+    let claims = request
+        .http
+        .get_header("Authorization")
+        .and_then(|h| token_payload(h));
+    let plmn = |name: &str| {
+        let p = claims.as_ref()?.get(name)?;
+        Some((
+            p.get("mcc")?.as_str()?.to_string(),
+            crate::nausf_handler::normalize_mnc3(p.get("mnc")?.as_str()?),
+        ))
+    };
+    let (Some(consumer), Some(producer)) = (plmn("consumerPlmnId"), plmn("producerPlmnId")) else {
+        return Some(forbidden(
+            "an authentication relayed by a SEPP needs an inter-PLMN access token              (consumerPlmnId and producerPlmnId)",
+        ));
+    };
+    if consumer == producer {
+        return Some(forbidden(
+            "a SEPP relays only inter-PLMN signalling; the access token's consumer is of this PLMN",
+        ));
+    }
+    if crate::nausf_handler::parse_snn_plmn(serving_network_name) != Some(consumer.clone()) {
+        log::warn!(
+            "SEPP-relayed authentication refused: SNN '{serving_network_name}' is not the \
+             consumer PLMN {consumer:?}"
+        );
+        return Some(send_problem(
+            403,
+            "SERVING_NETWORK_NOT_AUTHORIZED",
+            &format!("Serving network '{serving_network_name}' not allowed for consumer"),
+        ));
+    }
+    None
 }
 
 fn forbidden(detail: &str) -> SbiResponse {
@@ -1221,6 +1301,12 @@ async fn caller_has_type(
 ///
 /// `Some` is the refusal to send, before anything is read or stored.
 async fn refuse_authenticate(caller: Option<&str>, request: &SbiRequest) -> Option<SbiResponse> {
+    // #1948: relayed by the home SEPP: the visited AMF is in another PLMN, so
+    // this NRF holds no profile to type it by. `refuse_sepp_relayed` checks it
+    // instead, once the serving network name is read.
+    if relayed_by(request, "SEPP") {
+        return None;
+    }
     let types = &request.peer_cert_nf_types;
     let via_scp = types.iter().any(|t| t.eq_ignore_ascii_case("SCP"));
     if !types.is_empty() && !via_scp {
@@ -1273,6 +1359,14 @@ async fn refuse_deregister(
     ue: Option<&crate::context::AusfUe>,
     request: &SbiRequest,
 ) -> Option<SbiResponse> {
+    // #1948: Deregister is the home UDM's (TS 29.509 §5.2.2.3) and so never
+    // inter-PLMN: a SEPP-relayed one is refused.
+    if relayed_by(request, "SEPP") {
+        return Some(forbidden(
+            "Deregister is the home UDM's (TS 29.509 §5.2.2.3); a SEPP relays only \
+             inter-PLMN signalling",
+        ));
+    }
     let caller = match caller_identity(request) {
         Ok(caller) => caller,
         Err(why) => return Some(forbidden(&why)),
@@ -4345,6 +4439,131 @@ mod tests {
                 svc["serviceName"]
             );
         }
+    }
+
+    // ====================================================================
+    // #1948: a roaming authentication relayed by the home SEPP.
+    // ====================================================================
+
+    /// The home SEPP's certificate (its only NFType is SEPP) and the visited
+    /// AMF's token, with `consumerPlmnId`/`producerPlmnId` claims.
+    fn via_sepp_1948(
+        sub: Option<&str>,
+        consumer: Option<(&str, &str)>,
+        producer: (&str, &str),
+    ) -> SbiRequest {
+        let mut req = SbiRequest::default();
+        req.peer_cert_nf_instance_id = Some("19480000-0000-4000-8000-0000000000e5".into());
+        req.peer_cert_nf_types = vec!["SEPP".into()];
+        req.oauth2_subject = sub.map(str::to_string);
+        let mut claims = serde_json::json!({
+            "sub": sub, "producerPlmnId": { "mcc": producer.0, "mnc": producer.1 },
+        });
+        if let Some((mcc, mnc)) = consumer {
+            claims["consumerPlmnId"] = serde_json::json!({ "mcc": mcc, "mnc": mnc });
+        }
+        let payload = nextgcore_crypt::base64::encode(claims.to_string().as_bytes());
+        req.http
+            .set_header("Authorization", format!("Bearer hdr.{payload}.sig"));
+        req
+    }
+
+    /// #1948: a 5G-AKA relayed by the home SEPP (TS 33.501 §13.2, §6.1.2) is
+    /// served: the token `sub` (the visited AMF) is the identity and owns the
+    /// context, and it confirms through the SEPP. Not widened past what a SEPP
+    /// relays: refused 403 with no token, with a token that is not inter-PLMN
+    /// (no PLMN claims, or consumer = producer), when the serving network name
+    /// is not the consumer's PLMN, and for Deregister (the home UDM's).
+    ///
+    /// REVERT-VERIFIED: with the SEPP left out of `caller_identity`'s relay
+    /// exemption, the relayed authentication is 403; with `refuse_sepp_relayed`
+    /// returning `None`, the same-PLMN token is 201; with the Deregister refusal
+    /// dropped, the owner's SEPP-relayed Deregister is not refused.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn a_roaming_authentication_relayed_by_the_home_sepp_1948() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_addr.port()))),
+                udm_listener,
+            );
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_addr.port().to_string());
+
+            // The visited PLMN is TEST_SNN's (001/01); the home PLMN 999/70.
+            let v_amf = "19480000-0000-4000-8000-0000000000a1";
+            let home = ("999", "70");
+            let roaming = || via_sepp_1948(Some(v_amf), Some(("001", "01")), home);
+            let supi = "imsi-001010000001948";
+            let auth = |req: SbiRequest, snn: &str| {
+                req.with_body(
+                    serde_json::json!({"supiOrSuci": supi, "servingNetworkName": snn}).to_string(),
+                    "application/json",
+                )
+            };
+            for (req, snn, what) in [
+                (
+                    via_sepp_1948(None, Some(("001", "01")), home),
+                    TEST_SNN,
+                    "no token",
+                ),
+                (
+                    via_sepp_1948(Some(v_amf), None, home),
+                    TEST_SNN,
+                    "no consumerPlmnId",
+                ),
+                (
+                    via_sepp_1948(Some(v_amf), Some(("001", "01")), ("001", "01")),
+                    TEST_SNN,
+                    "consumer and producer are one PLMN",
+                ),
+                (
+                    roaming(),
+                    "5G:mnc002.mcc002.3gppnetwork.org",
+                    "an SNN not the consumer's",
+                ),
+            ] {
+                let r = handle_ue_authentication(&auth(req, snn)).await;
+                assert_eq!(r.status, 403, "{what}: {:?}", r.http.content);
+            }
+            assert!(ausf_self()
+                .read()
+                .unwrap()
+                .ue_find_by_suci_or_supi(supi)
+                .is_none());
+
+            let (ctx_id, rand) = authenticate_1872(supi, roaming()).await;
+            let ue = ausf_self()
+                .read()
+                .unwrap()
+                .ue_find_by_ctx_id(&ctx_id)
+                .expect("ctx");
+            assert_eq!(ue.owner.as_deref(), Some(v_amf), "the visited AMF owns it");
+            let r = handle_5g_aka_confirmation(&ctx_id, &confirm_req_1872(&rand, roaming())).await;
+            assert_eq!(
+                r.status, 200,
+                "confirmed through the SEPP: {:?}",
+                r.http.content
+            );
+
+            let r = handle_ue_authentication_deregister(&roaming().with_body(
+                serde_json::json!({ "supi": supi }).to_string(),
+                "application/json",
+            ))
+            .await;
+            assert_eq!(r.status, 403, "Deregister via a SEPP: {:?}", r.http.content);
+            udm_server.stop().await.ok();
+        })
+        .await
+        .expect("no hang");
     }
 
     // ====================================================================

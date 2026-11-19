@@ -107,7 +107,7 @@ pub fn parse_snn_plmn(snn: &str) -> Option<(String, String)> {
 }
 
 /// Left-pad a 2-digit MNC to the 3-digit form used inside an SNN.
-fn normalize_mnc3(mnc: &str) -> String {
+pub fn normalize_mnc3(mnc: &str) -> String {
     if mnc.len() == 2 {
         format!("0{mnc}")
     } else {
