@@ -542,6 +542,31 @@ impl AusfContext {
         None
     }
 
+    /// #1928: remove UE `id` only while its current authentication is still
+    /// `ctx_id`. A DELETE or Deregister checked its caller against that
+    /// authentication; if a re-authentication replaced it meanwhile, the new
+    /// one (and its new owner) is left alone and `None` is returned.
+    pub fn ue_remove_if_ctx(&self, id: u64, ctx_id: &str) -> Option<AusfUe> {
+        let mut ue_list = self.ue_list.write().ok()?;
+        let mut suci_hash = self.suci_hash.write().ok()?;
+        let mut supi_hash = self.supi_hash.write().ok()?;
+        let mut ctx_hash = self.ctx_hash.write().ok()?;
+        if ue_list.get(&id).map(|ue| ue.ctx_id.as_str()) != Some(ctx_id) {
+            return None;
+        }
+        let ue = ue_list.remove(&id)?;
+        suci_hash.remove(&ue.suci);
+        ctx_hash.remove(&ue.ctx_id);
+        if let Some(ref supi) = ue.supi {
+            supi_hash.remove(supi);
+        }
+        log::debug!(
+            "[{}] AUSF UE removed (id={id}, authCtxId {ctx_id})",
+            ue.suci
+        );
+        Some(ue)
+    }
+
     /// Remove all UEs
     pub fn ue_remove_all(&self) {
         if let (Ok(mut ue_list), Ok(mut suci_hash), Ok(mut supi_hash), Ok(mut ctx_hash)) = (
