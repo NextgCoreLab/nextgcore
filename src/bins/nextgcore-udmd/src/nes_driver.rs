@@ -270,7 +270,8 @@ async fn run_nes_loop(settings: NesSettings, gauges: Arc<EnergyGauges>, actions:
         )
         .await
         {
-            log::warn!("NES metrics endpoint failed to bind {metrics_addr}: {e}");
+            // #2056: fatal at start-up under the production profile.
+            nextgcore_metrics::nf::listener_bind_failed("UDM", "NES metrics", metrics_addr, &e);
         }
     }
 

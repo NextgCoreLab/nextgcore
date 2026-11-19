@@ -330,16 +330,19 @@ async fn main() -> Result<()> {
     app.init(&args.config).await?;
 
     // The Prometheus endpoint (#994). Loopback unless NEXTGCORE_METRICS_BIND says
-    // otherwise (#837). Non-fatal, as in sgwud: an SGW-C that cannot expose metrics
-    // still serves S11.
+    // otherwise (#837). #2056: a busy port is fatal at start-up under the production
+    // profile; under dev the SGW-C runs on without metrics.
+    let sgwc_metrics_addr = metrics_addr();
     match nextgcore_metrics::nes_energy::serve_metrics(
-        metrics_addr(),
+        sgwc_metrics_addr,
         std::sync::Arc::new(render_metrics),
     )
     .await
     {
         Ok((bound, _handle)) => log::info!("SGWC metrics endpoint on http://{bound}/metrics"),
-        Err(e) => log::warn!("SGWC metrics endpoint not available: {e}"),
+        Err(e) => {
+            nextgcore_metrics::nf::listener_bind_failed("SGWC", "metrics", sgwc_metrics_addr, &e)
+        }
     }
 
     // Run main loop

@@ -465,8 +465,12 @@ async fn run_sla_observe_loop(settings: SlaSettings) {
         .await
         {
             Ok((bound, _handle)) => log::info!("sla-observe: serving /metrics on {bound}"),
-            Err(e) => log::warn!(
-                "sla-observe: metrics bind on {addr} failed ({e}); continuing without listener"
+            // #2056: fatal at start-up under the production profile.
+            Err(e) => nextgcore_metrics::nf::listener_bind_failed(
+                "NSACF",
+                "sla-observe metrics",
+                addr,
+                &e,
             ),
         }
     }

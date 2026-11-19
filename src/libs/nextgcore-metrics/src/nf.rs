@@ -89,11 +89,77 @@ pub fn nf_metrics_addr_from(bind: Option<&str>, port_env: &str, port: Option<&st
     crate::nes_energy::metrics_bind_addr_from(bind, port)
 }
 
+/// The exit status of an NF that could not bind a listener it was configured with
+/// under the production profile (#2056): `EX_CONFIG` (sysexits.h), so an operator
+/// tells it from a crash.
+pub const EXIT_LISTENER_BIND_FAILED: i32 = 78;
+
+/// What a listener that could not be bound means for the NF (#2056).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerBindFailure {
+    /// Production: the NF does not start, with this reason.
+    Fatal(String),
+    /// Dev: logged, and the NF runs on without the listener.
+    Tolerated(String),
+}
+
+/// [`ListenerBindFailure`] for `nf`'s `what` listener on `addr`, which failed with
+/// `err`, under the production profile when `production` (#2056).
+///
+/// Under production a listener the NF was configured with (its `/metrics`
+/// included) that cannot be bound is a deployment error, and it is fatal at
+/// start-up: the NF exits [`EXIT_LISTENER_BIND_FAILED`] before it serves anything,
+/// so the orchestrator reports the failure (a crash loop), where an NF running on
+/// without the listener only shows as a target with no data, which probes and
+/// alerting do not see. Before #2056 every NF logged and ran on, by design ("an NF
+/// that cannot expose metrics still serves its interfaces"): that stays the dev
+/// behaviour. Only start-up is affected; nothing here can stop a running NF.
+pub fn listener_bind_failure(
+    nf: &str,
+    what: &str,
+    addr: SocketAddr,
+    err: &dyn std::fmt::Display,
+    production: bool,
+) -> ListenerBindFailure {
+    if production {
+        ListenerBindFailure::Fatal(format!(
+            "{nf} {what} endpoint on {addr} cannot be bound ({err}); under the production SBI \
+             profile a configured listener that cannot be bound is fatal at start-up (#2056). \
+             Free the port or configure another one"
+        ))
+    } else {
+        ListenerBindFailure::Tolerated(format!(
+            "{nf} {what} endpoint on {addr} not available: {err}; running without it (dev profile)"
+        ))
+    }
+}
+
+/// Act on a listener bind failure as [`listener_bind_failure`] decides, for the
+/// process's real profile: under production, log the reason and exit
+/// [`EXIT_LISTENER_BIND_FAILED`]; otherwise warn and return. The one place every
+/// NF's `/metrics` (and other optional) listener goes through on a bind error.
+pub fn listener_bind_failed(nf: &str, what: &str, addr: SocketAddr, err: &dyn std::fmt::Display) {
+    match listener_bind_failure(
+        nf,
+        what,
+        addr,
+        err,
+        nextgcore_core::sbi_profile::is_production(),
+    ) {
+        ListenerBindFailure::Fatal(why) => {
+            log::error!("{why}");
+            eprintln!("{why}");
+            std::process::exit(EXIT_LISTENER_BIND_FAILED);
+        }
+        ListenerBindFailure::Tolerated(why) => log::warn!("{why}"),
+    }
+}
+
 /// Serve `render()` at `GET /metrics` on [`nf_metrics_addr`]`(port_env)`.
 ///
-/// Non-fatal, like `smfd`'s: an NF that cannot expose metrics (the port is taken)
-/// still serves its interfaces, so a failure is logged and `None` returned. The
-/// Prometheus `up` series of the target then reports the gap.
+/// #2056: a bind failure goes through [`listener_bind_failed`]: fatal at start-up
+/// under the production profile, logged and `None` under dev (an NF that cannot
+/// expose metrics then still serves its interfaces).
 pub async fn serve_nf_metrics(
     nf: &str,
     port_env: &str,
@@ -107,7 +173,7 @@ pub async fn serve_nf_metrics(
             Some((bound, handle))
         }
         Err(e) => {
-            log::warn!("{nf} metrics endpoint on {addr} not available: {e}");
+            listener_bind_failed(nf, "metrics", addr, &e);
             None
         }
     }
@@ -1001,6 +1067,28 @@ pub fn render_common(id: &NfIdentity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2056: a listener that cannot be bound is fatal under production and
+    /// tolerated under dev; the reason names the NF, the listener and the address.
+    #[test]
+    fn a_listener_bind_failure_is_fatal_only_under_production_2056() {
+        let addr: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        let err = "Address already in use (os error 98)";
+        match listener_bind_failure("AMF", "metrics", addr, &err, true) {
+            ListenerBindFailure::Fatal(why) => {
+                assert!(
+                    why.contains("AMF metrics endpoint on 127.0.0.1:9090"),
+                    "{why}"
+                );
+                assert!(why.contains("fatal at start-up"), "{why}");
+            }
+            other => panic!("production must be fatal: {other:?}"),
+        }
+        assert!(matches!(
+            listener_bind_failure("AMF", "metrics", addr, &err, false),
+            ListenerBindFailure::Tolerated(_)
+        ));
+    }
 
     /// nextgsim#458 / #1394: every NF's common families carry
     /// `nextg_demo_enabled` exactly while a demo is installed active, and nothing

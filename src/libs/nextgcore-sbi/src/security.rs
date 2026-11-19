@@ -232,12 +232,14 @@ pub enum SbiProfile {
 /// [`SbiProfile::Production`]. **Anything else — including the variable being
 /// unset — is `Production`**: an unrecognised value must not silently downgrade
 /// security, which is the failure mode this issue is about.
-pub const SBI_PROFILE_ENV: &str = "NEXTGCORE_SBI_PROFILE";
+pub const SBI_PROFILE_ENV: &str = nextgcore_core::sbi_profile::SBI_PROFILE_ENV;
 
-/// Tri-state programmatic override of the profile: `0` = consult
-/// [`SBI_PROFILE_ENV`], `1` = force [`SbiProfile::Dev`], `2` = force
-/// [`SbiProfile::Production`].
-static SBI_PROFILE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+// Tri-state programmatic override of the profile: `0` = consult
+// [`SBI_PROFILE_ENV`], `1` = force [`SbiProfile::Dev`], `2` = force
+// [`SbiProfile::Production`]. #2056: kept in `nextgcore_core::sbi_profile` so
+// `nextgcore-metrics` (below this crate) reads the same answer, override
+// included.
+use nextgcore_core::sbi_profile::SBI_PROFILE_MODE;
 
 /// Force the process-wide profile, overriding [`SBI_PROFILE_ENV`].
 ///
@@ -289,7 +291,7 @@ impl SbiProfile {
             return Self::Production;
         }
         match v.to_ascii_lowercase().as_str() {
-            "dev" | "development" | "insecure" | "local" | "test" => Self::Dev,
+            dev if nextgcore_core::sbi_profile::DEV_PROFILE_VALUES.contains(&dev) => Self::Dev,
             "production" | "prod" => Self::Production,
             other => {
                 log::warn!(
