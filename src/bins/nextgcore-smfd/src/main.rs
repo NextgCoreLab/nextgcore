@@ -22730,6 +22730,9 @@ mod tests {
         if let Ok(ctx) = smf_self().read() {
             if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
                 b.nsac_admitted = true;
+                // On the parked DECREASE's own slice (R27: another slice's does not
+                // supersede it, `a_live_session_on_another_slice_..._1900`).
+                b.sst = 1;
             }
         }
         // Registered, no binding yet: a create in flight.
@@ -22774,6 +22777,165 @@ mod tests {
         );
         assert!(!live_parked, "and they are no longer parked");
         assert!(deferred, "a create in flight defers them");
+    }
+
+    /// R27 #1900: the NSACF counts per (UE, PSI, S-NSSAI), so a live session for the
+    /// pair on ANOTHER slice does not supersede a parked DECREASE for the old one: it
+    /// is sent, or the old slice's quota leaks.
+    ///
+    /// REVERT-VERIFIED: with the guard matching on (SUPI, PSI) only, this fails: the
+    /// DECREASE is counted `superseded` and never sent.
+    #[tokio::test]
+    async fn a_live_session_on_another_slice_does_not_supersede_a_decrease_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let (peer, seen) =
+            flaky_peer_1875(std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204))).await;
+        let supi = "imsi-001010000019001";
+        let reference = seed_established_session(supi, 7, std::net::Ipv4Addr::new(10, 45, 19, 1));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.nsac_admitted = true;
+                b.sst = 2;
+            }
+        }
+        reconcile::park(reconcile::Cleanup::NsacDecrease {
+            supi: supi.to_string(),
+            psi: 7,
+            sst: 1,
+            sd: None,
+            nf_id: Some("smf-1900".to_string()),
+            nsacf: None,
+            plmn: None,
+        });
+        let delivered = || reconcile::RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+
+        reconcile::reconcile_once().await;
+        let sent = sent_1875(&seen, |_, u, b| {
+            u.contains("/nnsacf-nsac/") && b.contains("DECREASE") && b.contains(supi)
+        });
+        let after = delivered();
+        forget_seeded_session(&reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 19, 1));
+        }
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert_eq!(sent, 1, "the old slice's DECREASE is sent");
+        assert_eq!(after - before, 1, "and delivered");
+    }
+
+    /// R27 #1900: a reconciler DECREASE on the wire is in flight for its (SUPI, PSI),
+    /// so a create for the pair on the same S-NSSAI counts in only after it lands.
+    /// Otherwise the new session's INCREASE (a no-op at the NSACF, whose entry the old
+    /// count still holds) could land first, and the DECREASE then counts it out.
+    ///
+    /// REVERT-VERIFIED: with the attempt taking no `ReleaseInFlight` entry, this
+    /// fails: the NSACF sees INC then DEC.
+    #[tokio::test]
+    async fn a_create_waits_for_a_reconciler_decrease_on_the_wire_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let (nsacf, seen) = recording_nsacf(
+            204,
+            204,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let supi = "imsi-001010000019003";
+        reconcile::park(reconcile::Cleanup::NsacDecrease {
+            supi: supi.to_string(),
+            psi: 11,
+            sst: 1,
+            sd: Some("010203".to_string()),
+            nf_id: Some("smf-1900".to_string()),
+            nsacf: None,
+            plmn: None,
+        });
+
+        let pass = tokio::spawn(reconcile::reconcile_once());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            11,
+            &n1(
+                11,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let _ = pass.await;
+        let order = nsac_order(&seen, supi);
+        let leftover = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi)
+            .map(|(r, _)| r.clone());
+        if let Some(r) = leftover {
+            let _ = release_sm_context_locally(&r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        reconcile::clear_for_test();
+
+        assert_eq!(resp.status, 201);
+        assert_eq!(order.first().map(String::as_str), Some("DEC"), "{order:?}");
+        assert_eq!(
+            &order[..2],
+            ["DEC", "INC"],
+            "the DECREASE lands first: {order:?}"
+        );
+    }
+
+    /// R27 #1900: `park` writes the set into the durable snapshot at once, so a
+    /// cleanup parked just before a crash is not lost.
+    ///
+    /// REVERT-VERIFIED: with `persist()` dropped from `park`, this fails: the state
+    /// file does not name the parked cleanup.
+    #[tokio::test]
+    async fn a_parked_cleanup_is_in_the_state_file_at_once_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        reconcile::clear_for_test();
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-smf-park-1900-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let armed = ArmedStateFile::arm(&path, "19001", 0x1900, 0x1900);
+        reconcile::park(reconcile::Cleanup::SdmUnsubscribe {
+            supi: "imsi-001010000019002".to_string(),
+            subscription_id: "sub-park-1900".to_string(),
+        });
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        reconcile::clear_for_test();
+        drop(armed);
+
+        assert!(
+            written.contains("sub-park-1900"),
+            "the parked cleanup is in the state file: {written}"
+        );
     }
 
     /// #1072 review m2: an INCREASE that is never answered fails open and is

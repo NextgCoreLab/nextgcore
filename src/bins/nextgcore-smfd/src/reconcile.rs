@@ -229,8 +229,12 @@ enum Holder {
     None,
     /// A session is being created for it (registered, no binding yet): wait.
     Creating,
-    /// An established session holds it.
-    Established { nsac_admitted: bool },
+    /// An established session holds it, on this S-NSSAI.
+    Established {
+        nsac_admitted: bool,
+        sst: u8,
+        sd: Option<String>,
+    },
 }
 
 fn holder(supi: &str, psi: u8) -> Holder {
@@ -241,10 +245,14 @@ fn holder(supi: &str, psi: u8) -> Holder {
     let bound = ctx.policy_bindings.read().ok().and_then(|m| {
         m.values()
             .find(|b| b.supi == supi && b.psi == psi)
-            .map(|b| b.nsac_admitted)
+            .map(|b| Holder::Established {
+                nsac_admitted: b.nsac_admitted,
+                sst: b.sst,
+                sd: b.sd.clone(),
+            })
     });
-    if let Some(nsac_admitted) = bound {
-        return Holder::Established { nsac_admitted };
+    if let Some(established) = bound {
+        return established;
     }
     let registered = ctx
         .ue_find_by_supi(supi)
@@ -279,13 +287,30 @@ async fn attempt(c: &Cleanup) -> Attempt {
             nsacf,
             plmn,
         } => {
+            // R27: in flight FIRST, then the check, then the send. A create for the
+            // pair that registers after the check finds this entry and takes the
+            // admission over or waits for the DECREASE (`await_release_in_flight_on`),
+            // and one that registered before it is seen by the check, so no INCREASE
+            // can slip between the two and be counted out.
+            let in_flight =
+                crate::ReleaseInFlight::begin_with(supi, *psi, Some((*sst, sd.clone())));
             match holder(supi, *psi) {
-                // The live session's INCREASE is the count this would remove.
+                // A live session on the SAME S-NSSAI is counted under the entry this
+                // would remove (the NSACF keys by UE, PSI and S-NSSAI). One on another
+                // slice is not, and the old slice's DECREASE still goes (R27).
                 Holder::Established {
                     nsac_admitted: true,
-                } => return Attempt::Superseded,
+                    sst: live_sst,
+                    sd: live_sd,
+                } if crate::same_snssai((live_sst, live_sd.as_deref()), (*sst, sd.as_deref())) => {
+                    return Attempt::Superseded
+                }
                 Holder::Creating => return Attempt::Deferred,
                 Holder::Established { .. } | Holder::None => {}
+            }
+            if !in_flight.entry.begin_nsac_decrease() {
+                // A create took the admission over meanwhile.
+                return Attempt::Superseded;
             }
             let sent = tokio::time::timeout(
                 crate::UDM_RELEASE_TIMEOUT,
@@ -300,6 +325,7 @@ async fn attempt(c: &Cleanup) -> Attempt {
                 ),
             )
             .await;
+            drop(in_flight);
             if matches!(sent, Ok(true)) {
                 Attempt::Delivered
             } else {
@@ -320,6 +346,9 @@ async fn attempt(c: &Cleanup) -> Attempt {
             }
         }
         Cleanup::UecmDeregister { supi, psi } => {
+            // As the DECREASE: in flight, check, then send. The serving-SMF record is
+            // per PSI, so any session for the pair supersedes it.
+            let in_flight = crate::ReleaseInFlight::begin(supi, *psi);
             match holder(supi, *psi) {
                 // Its registration replaced the record this would delete.
                 Holder::Established { .. } => return Attempt::Superseded,
@@ -328,6 +357,9 @@ async fn attempt(c: &Cleanup) -> Attempt {
             }
             if !crate::udm::enabled() {
                 return Attempt::Refused;
+            }
+            if !in_flight.entry.begin_deregistration() {
+                return Attempt::Superseded;
             }
             match tokio::time::timeout(
                 crate::UDM_RELEASE_TIMEOUT,
