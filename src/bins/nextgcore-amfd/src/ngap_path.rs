@@ -29150,6 +29150,7 @@ mod tests {
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
         assert!(
             guard.non_ue_n2_subscription_add(crate::context::NonUeN2InfoSubscription {
+                owner: None,
                 subscription_id: subscription_id.to_string(),
                 n2_information_class: class.to_string(),
                 n2_notify_callback_uri: callback_uri.to_string(),
@@ -31572,6 +31573,7 @@ mod tests {
             assert!(guard.n1n2_subscription_add(
                 supi,
                 crate::context::UeN1N2InfoSubscription {
+                    owner: None,
                     subscription_id: sub_id.to_string(),
                     n1_message_class: None,
                     n1_notify_callback_uri: None,
@@ -31783,6 +31785,7 @@ mod tests {
             let g = ctx.read().unwrap();
             assert!(
                 g.non_ue_n2_subscription_add(crate::context::NonUeN2InfoSubscription {
+                    owner: None,
                     subscription_id: sub_id.to_string(),
                     n2_information_class: "NRPPa".to_string(),
                     n2_notify_callback_uri: format!(
@@ -31861,6 +31864,7 @@ mod tests {
             assert!(guard.n1n2_subscription_add(
                 supi,
                 crate::context::UeN1N2InfoSubscription {
+                    owner: None,
                     subscription_id: sub_id.to_string(),
                     n1_message_class: None,
                     n1_notify_callback_uri: None,
@@ -38358,6 +38362,7 @@ mod tests {
     fn location_filters_select_the_changed_dimensions() {
         use crate::context::LocationChange;
         let sub = |f: &[&str]| crate::context::EventSubscription {
+            owner: None,
             subscription_id: "sub-466-matrix".to_string(),
             notify_uri: "http://127.0.0.1:1/n".to_string(),
             notify_correlation_id: String::new(),
@@ -39484,6 +39489,7 @@ mod tests {
             guard.event_subscription_remove(id);
             assert!(
                 guard.event_subscription_add(crate::context::EventSubscription {
+                    owner: None,
                     subscription_id: id.to_string(),
                     notify_uri: "http://127.0.0.1:1/n".to_string(),
                     notify_correlation_id: String::new(),
@@ -40649,6 +40655,7 @@ mod tests {
         // The window: a first report of REACHABLE decided, then the timer expires
         // before the subscription is stored.
         let mut sub = crate::context::EventSubscription {
+            owner: None,
             subscription_id: "sub-1641-window".to_string(),
             notify_uri: format!("http://127.0.0.1:{port}/notify/1641"),
             notify_correlation_id: "corr-1641-window".to_string(),
@@ -45523,6 +45530,7 @@ mod tests {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().expect("ctx lock");
             guard.event_subscription_add(crate::context::EventSubscription {
+                owner: None,
                 subscription_id: "sub-74-loss-live".to_string(),
                 notify_uri: format!("http://127.0.0.1:{port}/notify/74-loss-live"),
                 notify_correlation_id: "corr-74-loss-live".to_string(),
@@ -45659,6 +45667,7 @@ mod tests {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().expect("ctx lock");
             guard.event_subscription_add(crate::context::EventSubscription {
+                owner: None,
                 subscription_id: subscription_id.to_string(),
                 notify_uri: format!("http://127.0.0.1:{port}/notify/{subscription_id}"),
                 notify_correlation_id: format!("corr-{subscription_id}"),

@@ -255,6 +255,20 @@ pub(crate) async fn oauth2_callback_listener_for_tests() -> (nextgcore_sbi::serv
 
 /// Top-level Namf SBI request handler. Routes all Namf services served by
 /// the AMF (TS 29.518): namf-comm, namf-evts, namf-mt, namf-loc.
+/// #1865: the verified consumer the crate's tests call the router as.
+#[cfg(test)]
+pub(crate) const TEST_CONSUMER_1865: &str = "c0c0c0c0-1865-4000-8000-0000000000c0";
+
+/// `request` as [`TEST_CONSUMER_1865`], unless it already names a verified
+/// identity.
+#[cfg(test)]
+pub(crate) fn as_test_consumer(mut request: SbiRequest) -> SbiRequest {
+    if request.peer_cert_nf_instance_id.is_none() && request.oauth2_subject.is_none() {
+        request.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+    }
+    request
+}
+
 pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
@@ -290,7 +304,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         "namf-evts" if parts[2] == "subscriptions" => match (method, parts.len()) {
             ("POST", 3) => handle_event_subscription_create(&request),
             ("PATCH", 4) => handle_event_subscription_modify(parts[3], &request),
-            ("DELETE", 4) => handle_event_subscription_delete(parts[3]),
+            ("DELETE", 4) => handle_event_subscription_delete(parts[3], &request),
             _ => send_method_not_allowed(method, path),
         },
 
@@ -334,7 +348,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
                 }
                 // N1N2MessageUnSubscribe (TS 29.518 §5.2.2.7)
                 ("DELETE", "n1-n2-messages", 7) if parts[5] == "subscriptions" => {
-                    handle_n1n2_subscription_delete(ue_context_id, parts[6])
+                    handle_n1n2_subscription_delete(ue_context_id, parts[6], &request)
                 }
                 // EBIAssignment (TS 29.518 §6.1.6.2.5), #117
                 ("POST", "assign-ebi", 5) => handle_assign_ebi(ue_context_id, &request),
@@ -399,7 +413,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         {
             match (method, parts.len()) {
                 ("POST", 4) => handle_non_ue_n2_info_subscribe(&request),
-                ("DELETE", 5) => handle_non_ue_n2_info_unsubscribe(parts[4]),
+                ("DELETE", 5) => handle_non_ue_n2_info_unsubscribe(parts[4], &request),
                 _ => send_method_not_allowed(method, path),
             }
         }
@@ -416,9 +430,9 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         // --------------------------------------------------------------
         "namf-comm" if parts[2] == "subscriptions" => match (method, parts.len()) {
             ("POST", 3) => handle_amf_status_subscription_create(&request),
-            ("GET", 4) => handle_amf_status_subscription_read(parts[3]),
+            ("GET", 4) => handle_amf_status_subscription_read(parts[3], &request),
             ("PUT", 4) => handle_amf_status_subscription_replace(parts[3], &request),
-            ("DELETE", 4) => handle_amf_status_subscription_delete(parts[3]),
+            ("DELETE", 4) => handle_amf_status_subscription_delete(parts[3], &request),
             _ => send_method_not_allowed(method, path),
         },
 
@@ -1982,6 +1996,14 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
 /// (TS 29.518 §5.3.2.2.2). Persists the subscription in the AMF context and
 /// returns 201 with Location + AmfCreatedEventSubscription.
 fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, refused before anything is read or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Namf_EventExposure Subscribe",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
     };
@@ -2227,6 +2249,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let sub = EventSubscription {
+        owner,
         subscription_id: subscription_id.clone(),
         notify_uri: notify_uri.to_string(),
         notify_correlation_id: correlation_id.to_string(),
@@ -2492,6 +2515,14 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     };
+    // #1865: only the consumer that created it, checked before any side effect.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        sub.owner.as_deref(),
+        request,
+        "Namf_EventExposure Modify",
+    ) {
+        return refused;
+    }
 
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
@@ -2592,12 +2623,22 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
 /// DELETE /namf-evts/v1/subscriptions/{subscriptionId} —
 /// Namf_EventExposure_Unsubscribe (TS 29.518 §5.3.2.3). 204 on success,
 /// 404 when the subscription does not exist.
-fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
+fn handle_event_subscription_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = amf_self();
     let removed = {
         let Ok(guard) = ctx.read() else {
             return send_error(500, "Internal Server Error", "context lock poisoned", None);
         };
+        if let Some(sub) = guard.event_subscription_find(subscription_id) {
+            // #1865: only the consumer that created it, checked before any side effect.
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                sub.owner.as_deref(),
+                request,
+                "Namf_EventExposure Unsubscribe",
+            ) {
+                return refused;
+            }
+        }
         guard.event_subscription_remove(subscription_id)
     };
     match removed {
@@ -4294,6 +4335,7 @@ pub(crate) fn take_over_transferred_event_subscriptions(
         // allocates, which is the unconditionally-correct branch.
         let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
         let sub = EventSubscription {
+            owner: None,
             subscription_id: subscription_id.clone(),
             notify_uri: notify_uri.to_string(),
             notify_correlation_id: entry
@@ -5702,6 +5744,13 @@ fn paging_ongoing_error() -> SbiResponse {
 /// are stored opaquely (producers do exact-class lookups, so a class that was
 /// never stored is never notified).
 fn handle_n1n2_subscription_create(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, refused before anything is read or stored.
+    let owner =
+        match nextgcore_sbi::owner_binding::owner_for_new_resource(request, "N1N2MessageSubscribe")
+        {
+            Ok(owner) => owner,
+            Err(refused) => return *refused,
+        };
     // The subscription targets an individual UE context (TS 29.518 §6.1.3.5)
     if find_ue_by_context_id(ue_context_id).is_none() {
         return context_not_found(ue_context_id);
@@ -5750,6 +5799,7 @@ fn handle_n1n2_subscription_create(ue_context_id: &str, request: &SbiRequest) ->
 
     let subscription_id = format!("n1n2sub-{}", uuid::Uuid::new_v4());
     let sub = UeN1N2InfoSubscription {
+        owner,
         subscription_id: subscription_id.clone(),
         n1_message_class: n1_message_class.map(String::from),
         n1_notify_callback_uri: n1_notify_callback_uri.map(String::from),
@@ -5796,12 +5846,26 @@ fn handle_n1n2_subscription_create(ue_context_id: &str, request: &SbiRequest) ->
 /// DELETE /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
 /// — Namf_Communication_N1N2MessageUnSubscribe (TS 29.518 §5.2.2.7).
 /// 204 on success, 404 CONTEXT_NOT_FOUND when the subscription does not exist.
-fn handle_n1n2_subscription_delete(ue_context_id: &str, subscription_id: &str) -> SbiResponse {
+fn handle_n1n2_subscription_delete(
+    ue_context_id: &str,
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     let ctx = amf_self();
     let removed = {
         let Ok(guard) = ctx.read() else {
             return send_error(500, "Internal Server Error", "context lock poisoned", None);
         };
+        if let Some(sub) = guard.n1n2_subscription_find(ue_context_id, subscription_id) {
+            // #1865: only the consumer that created it, checked before any side effect.
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                sub.owner.as_deref(),
+                request,
+                "N1N2MessageUnSubscribe",
+            ) {
+                return refused;
+            }
+        }
         guard.n1n2_subscription_remove(ue_context_id, subscription_id)
     };
     match removed {
@@ -7027,6 +7091,14 @@ fn parse_amf_status_subscription_body(
 /// created resource (subscription) together with the status code 201"*
 /// (`29518-k00.txt:4570-4573`).
 fn handle_amf_status_subscription_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, refused before anything is read or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "AMFStatusChangeSubscribe",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let (amf_status_uri, guami_list) = match parse_amf_status_subscription_body(request) {
         Ok(parsed) => parsed,
         Err(resp) => return *resp,
@@ -7034,6 +7106,7 @@ fn handle_amf_status_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     let subscription_id = format!("amfstatus-{}", uuid::Uuid::new_v4());
     let sub = crate::context::AmfStatusSubscription {
+        owner,
         subscription_id: subscription_id.clone(),
         amf_status_uri: amf_status_uri.clone(),
         guami_list,
@@ -7075,7 +7148,7 @@ fn handle_amf_status_subscription_create(request: &SbiRequest) -> SbiResponse {
 /// round-trip test needs a read path that goes through the SBI surface rather than
 /// reaching into the AMF's own store — which would assert the test's plumbing instead
 /// of the producer's. Labelled a local read-back so nobody cites it as conformance.
-fn handle_amf_status_subscription_read(subscription_id: &str) -> SbiResponse {
+fn handle_amf_status_subscription_read(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     let found = amf_self()
         .read()
         .ok()
@@ -7083,6 +7156,14 @@ fn handle_amf_status_subscription_read(subscription_id: &str) -> SbiResponse {
     let Some(sub) = found else {
         return amf_status_subscription_not_found(subscription_id);
     };
+    // #1865: only the consumer that created it, checked before any side effect.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        sub.owner.as_deref(),
+        request,
+        "AMFStatusChange read",
+    ) {
+        return refused;
+    }
     match SbiResponse::ok().with_json_body(&amf_status_subscription_json(&sub)) {
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
@@ -7106,11 +7187,28 @@ fn handle_amf_status_subscription_replace(
     subscription_id: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
+    let Some(existing) = amf_self()
+        .read()
+        .ok()
+        .and_then(|guard| guard.amf_status_subscription_find(subscription_id))
+    else {
+        return amf_status_subscription_not_found(subscription_id);
+    };
+    // #1865: only the consumer that created it, checked before any side effect.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "AMFStatusChangeSubscribeModify",
+    ) {
+        return refused;
+    }
     let (amf_status_uri, guami_list) = match parse_amf_status_subscription_body(request) {
         Ok(parsed) => parsed,
         Err(resp) => return *resp,
     };
     let sub = crate::context::AmfStatusSubscription {
+        // #1865: a replacement keeps its creator.
+        owner: existing.owner,
         subscription_id: subscription_id.to_string(),
         amf_status_uri: amf_status_uri.clone(),
         guami_list,
@@ -7139,7 +7237,24 @@ fn handle_amf_status_subscription_replace(
 /// DELETE /namf-comm/v1/subscriptions/{subscriptionId} — AMFStatusChangeUnSubscribe
 /// (§5.2.2.5.2.1). *"On success, '204 No Content' shall be returned. The response
 /// body shall be empty."* (`29518-k00.txt:4640-4641`).
-fn handle_amf_status_subscription_delete(subscription_id: &str) -> SbiResponse {
+fn handle_amf_status_subscription_delete(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    if let Some(sub) = amf_self()
+        .read()
+        .ok()
+        .and_then(|guard| guard.amf_status_subscription_find(subscription_id))
+    {
+        // #1865: only the consumer that created it, checked before any side effect.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            sub.owner.as_deref(),
+            request,
+            "AMFStatusChangeUnSubscribe",
+        ) {
+            return refused;
+        }
+    }
     let removed = amf_self()
         .read()
         .ok()
@@ -7709,6 +7824,13 @@ pub(crate) const PWS_N2_INFORMATION_CLASSES: [&str; 3] = ["PWS", "PWS-BCAL", "PW
 /// storing a class nothing in this AMF can ever notify would be a subscription
 /// that silently never fires.
 fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, refused before anything is read or stored.
+    let owner =
+        match nextgcore_sbi::owner_binding::owner_for_new_resource(request, "NonUeN2InfoSubscribe")
+        {
+            Ok(owner) => owner,
+            Err(refused) => return *refused,
+        };
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
     };
@@ -7791,6 +7913,7 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
 
     let subscription_id = format!("nonuen2sub-{}", uuid::Uuid::new_v4());
     let sub = crate::context::NonUeN2InfoSubscription {
+        owner: owner.clone(),
         subscription_id: subscription_id.clone(),
         n2_information_class: n2_information_class.to_string(),
         n2_notify_callback_uri: n2_notify_callback_uri.to_string(),
@@ -7820,8 +7943,16 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
         // wins. Only done when an nfId identifies the consumer — without one there
         // is no way to know two subscriptions came from the same instance.
         if let Some(nf) = nf_id.as_deref() {
-            if let Some(dup) =
-                guard.non_ue_n2_subscription_find_by_class_exact(n2_information_class, Some(nf))
+            // #1865: only the caller's OWN duplicate. `nfId` is self-declared, so
+            // matching on it alone let any NF cancel another's PWS subscription by
+            // naming its instance ID.
+            if let Some(dup) = guard
+                .non_ue_n2_subscription_find_by_class_exact(n2_information_class, Some(nf))
+                .filter(|dup| {
+                    nextgcore_sbi::owner_binding::non_owner_refusal(dup.owner.as_deref(), request)
+                        .is_none()
+                        && dup.owner.is_some() == owner.is_some()
+                })
             {
                 log::info!(
                     "NonUeN2InfoSubscribe: replacing duplicate subscription {} from nfId {nf} \
@@ -7878,12 +8009,22 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
 /// cause `SUBSCRIPTION_NOT_FOUND` — the cause §6.1.3.10.3.1's response table
 /// names for this condition (`:10170-10175`), which is NOT the
 /// `CONTEXT_NOT_FOUND` the per-UE unsubscribe uses.
-fn handle_non_ue_n2_info_unsubscribe(subscription_id: &str) -> SbiResponse {
+fn handle_non_ue_n2_info_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = amf_self();
     let removed = {
         let Ok(guard) = ctx.read() else {
             return send_error(500, "Internal Server Error", "context lock poisoned", None);
         };
+        if let Some(sub) = guard.non_ue_n2_subscription_find(subscription_id) {
+            // #1865: only the consumer that created it, checked before any side effect.
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                sub.owner.as_deref(),
+                request,
+                "NonUeN2InfoUnSubscribe",
+            ) {
+                return refused;
+            }
+        }
         guard.non_ue_n2_subscription_remove(subscription_id)
     };
     match removed {
@@ -8531,6 +8672,15 @@ mod tests {
     use super::*;
     use crate::context::amf_context_init;
     use nextgcore_sbi::message::SbiPart;
+
+    /// #1865: the router as [`TEST_CONSUMER_1865`], so the tests that create and
+    /// then manage a subscription pass under both SBI profiles (`production`
+    /// refuses an anonymous create). Shadows the glob import; a test that needs
+    /// an anonymous or foreign caller sets its identity or calls
+    /// `super::namf_request_handler`.
+    async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
+        super::namf_request_handler(as_test_consumer(request)).await
+    }
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -8867,6 +9017,7 @@ mod tests {
         let guard = ctx.read().unwrap();
         let supi = "imsi-001010000060003";
         let sub = EventSubscription {
+            owner: None,
             subscription_id: "sub-expired-test".to_string(),
             notify_uri: "http://127.0.0.1:9/cb".to_string(),
             notify_correlation_id: "c".to_string(),
@@ -9677,6 +9828,60 @@ mod tests {
         ))
         .with_json_body(body)
         .expect("json")
+    }
+
+    /// #1865: an N1N2 message subscription is cancelled only by the consumer
+    /// that created it; a foreign certificate, a foreign token, a mismatched
+    /// pair and an anonymous caller each get 403 and the subscription stays.
+    /// REVERT-VERIFIED: with the N1N2MessageUnSubscribe check removed the first
+    /// intruder's DELETE answers 204.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_n1n2_subscription_is_cancelled_by_its_creator_only_1865() {
+        let (owner, other) = (
+            "aaaaaaaa-1865-4000-8000-0000000000a1",
+            "bbbbbbbb-1865-4000-8000-0000000000b2",
+        );
+        let supi = "imsi-001010000061865";
+        setup_ue(supi, true, true);
+        let mut create = n1n2_subscription_request(supi, &n1n2_subscription_body("o1865"));
+        create.peer_cert_nf_instance_id = Some(owner.into());
+        let resp = namf_request_handler(create).await;
+        assert_eq!(resp.status, 201);
+        let sub_id = body_json(&resp)["n1n2NotifySubscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let uri = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{sub_id}");
+        let held = || {
+            amf_self()
+                .read()
+                .unwrap()
+                .n1n2_subscription_find(supi, &sub_id)
+                .map(|s| s.owner)
+        };
+        assert_eq!(held(), Some(Some(owner.to_string())));
+        let mut foreign_cert = SbiRequest::delete(uri.clone());
+        foreign_cert.peer_cert_nf_instance_id = Some(other.into());
+        let mut foreign_token = SbiRequest::delete(uri.clone());
+        foreign_token.oauth2_subject = Some(other.into());
+        let mut mixed = SbiRequest::delete(uri.clone());
+        mixed.peer_cert_nf_instance_id = Some(owner.into());
+        mixed.oauth2_subject = Some(other.into());
+        for req in [foreign_cert, foreign_token, mixed] {
+            assert_eq!(namf_request_handler(req).await.status, 403);
+        }
+        assert_eq!(
+            super::namf_request_handler(SbiRequest::delete(uri.clone()))
+                .await
+                .status,
+            403,
+            "anonymous"
+        );
+        assert!(held().is_some(), "still subscribed");
+        let mut by_owner = SbiRequest::delete(uri.clone());
+        by_owner.oauth2_subject = Some(owner.into());
+        assert_eq!(namf_request_handler(by_owner).await.status, 204);
+        assert!(held().is_none());
     }
 
     /// Create -> 201 with the yaml:1503 Location structure +
@@ -17158,6 +17363,7 @@ mod tests {
     async fn a_failed_subscription_id_change_names_the_token_redacted() {
         let down = nextgcore_sbi::test_support::down_port();
         let sub = EventSubscription {
+            owner: None,
             subscription_id: "sub-1440-redact".to_string(),
             notify_uri: "http://127.0.0.1:9/cb".to_string(),
             notify_correlation_id: "c".to_string(),
@@ -17543,5 +17749,235 @@ mod tests {
             "/namf-evts/v1/subscriptions/{sub_id}"
         )))
         .await;
+    }
+}
+
+/// #1865: every AMF subscription (Namf_EventExposure, AMFStatusChange,
+/// N1N2MessageSubscribe, NonUeN2InfoSubscribe) is managed only by the consumer
+/// that created it. Every request goes through the real router.
+#[cfg(test)]
+mod subscription_owner_tests_1865 {
+    use super::*;
+    use crate::context::amf_context_init;
+
+    const OWNER: &str = "aaaaaaaa-1865-4000-8000-0000000000a1";
+    const OTHER: &str = "bbbbbbbb-1865-4000-8000-0000000000b2";
+
+    fn as_cert(mut r: SbiRequest, id: &str) -> SbiRequest {
+        r.peer_cert_nf_instance_id = Some(id.to_string());
+        r
+    }
+    fn as_token(mut r: SbiRequest, id: &str) -> SbiRequest {
+        r.oauth2_subject = Some(id.to_string());
+        r
+    }
+    /// The callers that must not manage OWNER's subscription: a foreign
+    /// certificate, a foreign token, the owner's certificate with a foreign
+    /// token, and nobody.
+    fn intruders(r: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
+        vec![
+            ("foreign certificate", as_cert(r(), OTHER)),
+            ("foreign token", as_token(r(), OTHER)),
+            (
+                "mismatched cert and token",
+                as_token(as_cert(r(), OWNER), OTHER),
+            ),
+            ("anonymous", r()),
+        ]
+    }
+    fn body(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default()
+    }
+
+    /// REVERT-VERIFIED: with the Unsubscribe check removed the intruders' DELETE
+    /// answers 204; with the Modify check removed their PATCH applies; with the
+    /// create binding replaced by `Ok(None)` the owner-less subscription under
+    /// dev lets them through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_exposure_subscription_is_managed_by_its_creator_only_1865() {
+        amf_context_init(64, 1024, 4096);
+        let create = SbiRequest::post("/namf-evts/v1/subscriptions")
+            .with_json_body(&serde_json::json!({"subscription": {
+                "eventList": [{"type": "REGISTRATION_STATE_REPORT"}],
+                "eventNotifyUri": "http://127.0.0.1:9/notify-1865",
+                "notifyCorrelationId": "c-1865",
+                "nfId": OTHER, // self-declared; never the owner
+                "anyUE": true,
+            }}))
+            .unwrap();
+        let resp = namf_request_handler(as_cert(create, OWNER)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let id = body(&resp)["subscriptionId"].as_str().unwrap().to_string();
+        let stored = || {
+            amf_self()
+                .read()
+                .unwrap()
+                .event_subscription_find(&id)
+                .map(|s| (s.owner.clone(), s.notify_uri.clone()))
+        };
+        assert_eq!(
+            stored(),
+            Some((Some(OWNER.into()), "http://127.0.0.1:9/notify-1865".into()))
+        );
+        let uri = format!("/namf-evts/v1/subscriptions/{id}");
+        let patch = || {
+            SbiRequest::patch(uri.clone()).with_body(
+                r#"[{"op":"replace","path":"/eventNotifyUri","value":"http://127.0.0.1:9/hijack"}]"#,
+                "application/json-patch+json",
+            )
+        };
+        for (who, req) in intruders(patch) {
+            assert_eq!(
+                namf_request_handler(req).await.status,
+                403,
+                "PATCH by {who}"
+            );
+        }
+        for (who, req) in intruders(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(
+                namf_request_handler(req).await.status,
+                403,
+                "DELETE by {who}"
+            );
+        }
+        assert_eq!(
+            stored(),
+            Some((Some(OWNER.into()), "http://127.0.0.1:9/notify-1865".into())),
+            "nothing an intruder sent was applied"
+        );
+        // The owner, by token this time (UUIDs compare without case).
+        let owner_delete = as_token(SbiRequest::delete(uri.clone()), &OWNER.to_uppercase());
+        assert_eq!(namf_request_handler(owner_delete).await.status, 204);
+        assert_eq!(stored(), None);
+    }
+
+    /// REVERT-VERIFIED: with the read, replace or delete check removed, the
+    /// matching intruder request answers 200/200/204.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_amf_status_subscription_is_managed_by_its_creator_only_1865() {
+        amf_context_init(64, 1024, 4096);
+        let data = serde_json::json!({"amfStatusUri": "http://127.0.0.1:9/status-1865"});
+        let create = SbiRequest::post("/namf-comm/v1/subscriptions")
+            .with_json_body(&data)
+            .unwrap();
+        let resp = namf_request_handler(as_token(create, OWNER)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let location = resp.http.get_header("location").cloned().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let uri = format!("/namf-comm/v1/subscriptions/{id}");
+        let hijack = serde_json::json!({"amfStatusUri": "http://127.0.0.1:9/hijack"});
+        for (who, req) in intruders(|| SbiRequest::get(uri.clone())) {
+            assert_eq!(namf_request_handler(req).await.status, 403, "GET by {who}");
+        }
+        for (who, req) in intruders(|| {
+            SbiRequest::put(uri.clone())
+                .with_json_body(&hijack)
+                .unwrap()
+        }) {
+            assert_eq!(namf_request_handler(req).await.status, 403, "PUT by {who}");
+        }
+        for (who, req) in intruders(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(
+                namf_request_handler(req).await.status,
+                403,
+                "DELETE by {who}"
+            );
+        }
+        let held = amf_self()
+            .read()
+            .unwrap()
+            .amf_status_subscription_find(&id)
+            .expect("still stored");
+        assert_eq!(held.amf_status_uri, "http://127.0.0.1:9/status-1865");
+        // The owner replaces it and keeps it, then removes it.
+        let put = as_token(
+            SbiRequest::put(uri.clone())
+                .with_json_body(&hijack)
+                .unwrap(),
+            OWNER,
+        );
+        assert_eq!(namf_request_handler(put).await.status, 200);
+        let held = amf_self()
+            .read()
+            .unwrap()
+            .amf_status_subscription_find(&id)
+            .unwrap();
+        assert_eq!(
+            held.owner.as_deref(),
+            Some(OWNER),
+            "a replacement keeps its creator"
+        );
+        let get = as_cert(SbiRequest::get(uri.clone()), OWNER);
+        assert_eq!(namf_request_handler(get).await.status, 200);
+        let delete = as_cert(SbiRequest::delete(uri.clone()), OWNER);
+        assert_eq!(namf_request_handler(delete).await.status, 204);
+    }
+
+    /// REVERT-VERIFIED: with the NonUeN2InfoUnSubscribe check removed the
+    /// intruders' DELETE answers 204; with the duplicate filter removed the
+    /// intruder's Subscribe naming the owner's nfId removes the owner's one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_n2_subscription_is_managed_by_its_creator_only_1865() {
+        amf_context_init(64, 1024, 4096);
+        let data = serde_json::json!({
+            "n2InformationClass": "PWS",
+            "n2NotifyCallbackUri": "http://127.0.0.1:9/pws-1865",
+            "nfId": "cbcf-1865",
+        });
+        let subscribe = || {
+            SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
+                .with_json_body(&data)
+                .unwrap()
+        };
+        let resp = namf_request_handler(as_cert(subscribe(), OWNER)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let id = body(&resp)["n2NotifySubscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let held = || {
+            amf_self()
+                .read()
+                .unwrap()
+                .non_ue_n2_subscription_find(&id)
+                .is_some()
+        };
+        // Naming the owner's nfId does not replace the owner's subscription.
+        let resp = namf_request_handler(as_cert(subscribe(), OTHER)).await;
+        assert_eq!(resp.status, 201);
+        assert!(held(), "another NF's duplicate does not remove the owner's");
+        let uri = format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{id}");
+        for (who, req) in intruders(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(
+                namf_request_handler(req).await.status,
+                403,
+                "DELETE by {who}"
+            );
+        }
+        assert!(held());
+        let delete = as_cert(SbiRequest::delete(uri.clone()), OWNER);
+        assert_eq!(namf_request_handler(delete).await.status, 204);
+        assert!(!held());
+    }
+
+    /// REVERT-VERIFIED: with the mismatch arm of `verified_consumer_id` mapped
+    /// to the certificate, the create answers 201 and a subscription is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_certificate_and_token_that_disagree_create_nothing_1865() {
+        amf_context_init(64, 1024, 4096);
+        let create = SbiRequest::post("/namf-comm/v1/subscriptions")
+            .with_json_body(&serde_json::json!({"amfStatusUri": "http://127.0.0.1:9/x-1865"}))
+            .unwrap();
+        let resp = namf_request_handler(as_token(as_cert(create, OWNER), OTHER)).await;
+        assert_eq!(resp.status, 403);
+        assert!(
+            !amf_self()
+                .read()
+                .unwrap()
+                .amf_status_subscriptions_all()
+                .iter()
+                .any(|s| s.amf_status_uri == "http://127.0.0.1:9/x-1865"),
+            "nothing stored"
+        );
     }
 }
