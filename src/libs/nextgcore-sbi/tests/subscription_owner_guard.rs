@@ -100,11 +100,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "subscriber authentication data, not an event subscription; served to the UDM \
          only by its resource scope (#1811)",
     ),
-    (
-        "nextgcore-nwdafd",
-        r#"["subscriptions", id] if m.role == Role::Anlf"#,
-        "#1937: MLModelMonitor subscriptions (demo-feature gated) are not yet bound",
-    ),
 ];
 
 // ---------------------------------------------------------------- source model

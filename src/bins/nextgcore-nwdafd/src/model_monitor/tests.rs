@@ -140,6 +140,7 @@ async fn a_registration_for_an_unknown_model_is_refused() {
         m,
         &guard,
         &post("/", json!({ "modelId": 1, "consumerId": "a" })),
+        false,
     );
     assert_eq!(r.status, 400);
     let v1 = guard.current_model_version().unwrap();
@@ -171,6 +172,7 @@ async fn a_registration_for_an_unknown_model_is_refused() {
         m,
         &guard,
         &post("/", json!({ "modelId": v1.unique_id(), "consumerId": "a" })),
+        false,
     );
     assert_eq!(r.status, 201);
     let loc = r.http.get_header("Location").unwrap().clone();
@@ -193,6 +195,7 @@ async fn a_registration_for_an_unknown_model_is_refused() {
         m,
         &guard,
         &post("/", json!({ "modelId": v1.unique_id(), "consumerId": "c" })),
+        false,
     );
     let loc = r.http.get_header("Location").unwrap().clone();
     assert_eq!(
@@ -575,6 +578,7 @@ fn registered(m: &Monitor, id: &str, model_id: u64) {
             anlf_subscription: None,
             last_seen: unix_now(),
             auditing: false,
+            owner: None,
         },
     );
     lock(&m.feedback).register_model_with(id.into(), FEEDBACK_WINDOW, 0.70);
@@ -609,6 +613,7 @@ fn the_anlf_subscription_map_is_capped() {
                     "notifCorrId": "c", "eventReportReq": { "notifMethod": "PERIODIC", "repPeriod": 1 }
                 }),
             ),
+            false,
         );
         match r.status {
             201 => ok.push(
@@ -632,7 +637,10 @@ fn the_anlf_subscription_map_is_capped() {
     assert!(lock(&m.subscriptions)
         .values()
         .all(|s| s.period_secs == MIN_REPORT_PERIOD_SECS));
-    assert_eq!(handle_unsubscribe(m, &ok[0]).status, 204);
+    assert_eq!(
+        handle_unsubscribe(m, &ok[0], &SbiRequest::delete("/"), false).status,
+        204
+    );
     let r = handle_subscribe(
         m,
         None,
@@ -640,6 +648,7 @@ fn the_anlf_subscription_map_is_capped() {
             "/",
             json!({ "modelIds": [1], "notificationUri": "http://m:1/cb", "notifCorrId": "c" }),
         ),
+        false,
     );
     assert_eq!(r.status, 201, "a freed slot is reusable");
 }
@@ -673,6 +682,7 @@ async fn the_mtlf_registration_map_is_capped() {
                 "/",
                 json!({ "modelId": model, "consumerId": format!("anlf-{i}") }),
             ),
+            false,
         );
         match r.status {
             201 => {}
@@ -692,6 +702,7 @@ async fn the_mtlf_registration_map_is_capped() {
             m,
             &guard,
             &post("/", json!({ "modelId": model, "consumerId": "anlf-0" })),
+            false,
         );
         assert_eq!(r.status, 201);
     }
@@ -741,6 +752,7 @@ async fn slow_peers_do_not_stall_the_reporter() {
                     "notifCorrId": "junk"
                 }),
             ),
+            false,
         );
         assert_eq!(r.status, 201);
     }
@@ -1002,6 +1014,7 @@ async fn a_deregister_during_the_subscribe_leaves_nothing() {
         mtlf,
         &ctx.read().unwrap(),
         &post("/", json!({ "modelId": model, "consumerId": anlf_id })),
+        false,
     );
     let reg = r
         .http
@@ -1012,7 +1025,10 @@ async fn a_deregister_during_the_subscribe_leaves_nothing() {
         .unwrap()
         .to_string();
     until("the Subscribe in flight", || asked.load(Ordering::SeqCst)).await;
-    assert_eq!(handle_deregister(mtlf, &reg).status, 204);
+    assert_eq!(
+        handle_deregister(mtlf, &reg, &SbiRequest::delete("/"), false).status,
+        204
+    );
     release.notify_one();
     until("the AnLF created the subscription", || {
         anlf.next_id.load(Ordering::SeqCst) >= 1
@@ -1150,6 +1166,7 @@ async fn a_new_registration_has_a_fresh_latch() {
             m,
             &guard,
             &post("/", json!({ "modelId": model, "consumerId": "anlf-l" })),
+            false,
         );
         assert_eq!(r.status, 201);
         r.http
@@ -1171,7 +1188,10 @@ async fn a_new_registration_has_a_fresh_latch() {
     let r1 = register();
     drop_reports(&r1);
     assert!(m.retrain_requested(model));
-    assert_eq!(handle_deregister(m, &r1).status, 204);
+    assert_eq!(
+        handle_deregister(m, &r1, &SbiRequest::delete("/"), false).status,
+        204
+    );
     let r2 = register();
     assert!(!m.retrain_requested(model), "a fresh latch");
     drop_reports(&r2);
@@ -1192,4 +1212,450 @@ fn only_an_mtlfs_own_token_is_held() {
         "an AnLF serves no notify"
     );
     assert!(!holds_callback_token(None, &mtlf.token));
+}
+
+// ── #1937: registrations and subscriptions are managed only by their owner ───
+
+const OWNER_1937: &str = "aaaaaaaa-1937-4000-8000-00000000000a";
+const OTHER_1937: &str = "bbbbbbbb-1937-4000-8000-00000000000b";
+const SCP_1937: &str = "5c5c5c5c-1937-4000-8000-0000000005c9";
+
+/// `request` from NF instance `id` over a direct mTLS connection.
+fn direct_1937(mut request: SbiRequest, id: &str) -> SbiRequest {
+    request.peer_cert_present = true;
+    request.peer_cert_nf_instance_id = Some(id.to_string());
+    request.peer_cert_nf_types = vec!["NWDAF".to_string()];
+    request
+}
+
+/// `request` from NF instance `id` through an SCP: the SCP's certificate (a
+/// relay), the consumer's verified access token.
+fn via_scp_1937(mut request: SbiRequest, id: &str) -> SbiRequest {
+    request.peer_cert_present = true;
+    request.peer_cert_nf_instance_id = Some(SCP_1937.to_string());
+    request.peer_cert_nf_types = vec!["SCP".to_string()];
+    request.oauth2_subject = Some(id.to_string());
+    request
+}
+
+/// The two ways [`OWNER_1937`] reaches this NWDAF, labelled.
+fn owner_paths_1937() -> [(&'static str, fn(SbiRequest, &str) -> SbiRequest); 2] {
+    [("direct", direct_1937), ("via SCP", via_scp_1937)]
+}
+
+/// Every caller that is not [`OWNER_1937`], each labelled.
+fn strangers_1937(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
+    let mut mismatch = direct_1937(request(), OWNER_1937);
+    mismatch.oauth2_subject = Some(OTHER_1937.to_string());
+    let mut scp_alone = via_scp_1937(request(), OWNER_1937);
+    scp_alone.oauth2_subject = None;
+    vec![
+        ("a foreign certificate", direct_1937(request(), OTHER_1937)),
+        (
+            "a foreign token via an SCP",
+            via_scp_1937(request(), OTHER_1937),
+        ),
+        ("the owner's certificate with a foreign token", mismatch),
+        ("an SCP certificate and no token", scp_alone),
+        ("an anonymous caller", request()),
+    ]
+}
+
+/// A peer that counts the connections made to it (an outbound call made).
+async fn counting_peer() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            h.fetch_add(1, Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    (port, hits)
+}
+
+fn location_id(r: &SbiResponse) -> String {
+    r.http
+        .get_header("Location")
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// An MTLF whose AnLF discovery never succeeds (its NRF is down), so the only
+/// outbound call a test can see is the Unsubscribe of a Deregister.
+fn mtlf_1937() -> (&'static Monitor, Ctx, u64) {
+    let ctx = context("mtlf-1937");
+    let down = nextgcore_sbi::test_support::down_port();
+    let m = leak(Monitor::new(
+        "retrain",
+        Role::Mtlf,
+        "http://m",
+        "mtlf-1937",
+        &format!("http://127.0.0.1:{}", down.addr().port()),
+    ));
+    std::mem::forget(down);
+    let model = ctx
+        .read()
+        .unwrap()
+        .current_model_version()
+        .unwrap()
+        .unique_id();
+    (m, ctx, model)
+}
+
+/// #1937, the MTLF as producer: a registration is bound at Register to the
+/// AnLF that made it (direct: its certificate; through an SCP: its token), and
+/// only that AnLF deregisters it. Every stranger gets 403 and changes nothing:
+/// the registration, its collector and the counters are as they were and no
+/// Unsubscribe reaches the AnLF. A stranger cannot register in the owner's name,
+/// nor displace the owner's registration.
+///
+/// REVERT-VERIFIED: the Deregister owner check skipped ("must not deregister");
+/// the owner not recorded at Register ("bound to the registering AnLF"); the
+/// consumerId check skipped ("may not register as"); the replacement not scoped
+/// to the owner ("is not displaced").
+#[tokio::test]
+async fn mtlf_registrations_are_deregistered_only_by_their_owner_1937() {
+    // The owner's Unsubscribe is plaintext to a loopback peer (the positive
+    // control); the owner rule itself is the explicit `required` below.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (m, ctx, model) = mtlf_1937();
+    let (anlf_port, unsubscribes) = counting_peer().await;
+    let body = || json!({ "modelId": model, "consumerId": OWNER_1937 });
+    let route_now = |method: &str, rest: &[&str], req: &SbiRequest| {
+        route_with(Some(m), &ctx, method, rest, req, true)
+    };
+    for (path, as_owner) in owner_paths_1937() {
+        let r = route_now(
+            "POST",
+            &["registrations"],
+            &as_owner(post("/", body()), OWNER_1937),
+        );
+        assert_eq!(r.status, 201, "{path}");
+        let id = location_id(&r);
+        assert_eq!(
+            m.registration(&id).unwrap().owner.as_deref(),
+            Some(OWNER_1937),
+            "{path}: bound to the registering AnLF"
+        );
+        lock(&m.registrations)
+            .get_mut(&id)
+            .unwrap()
+            .anlf_subscription = Some(("127.0.0.1".into(), anlf_port, format!("sub-{path}")));
+        let before = m.registration(&id).unwrap();
+        let collectors = lock(&m.feedback).collector_count();
+
+        // Nobody else registers in the owner's name or displaces it.
+        for (who, req) in strangers_1937(|| post("/", body())) {
+            let r = route_now("POST", &["registrations"], &req);
+            assert_eq!(
+                r.status, 403,
+                "{path}: {who} may not register as {OWNER_1937}"
+            );
+        }
+        assert_eq!(m.registration_count(), 1, "{path}: nothing stored");
+
+        for (who, req) in strangers_1937(|| SbiRequest::delete("/")) {
+            let r = route_now("DELETE", &["registrations", &id], &req);
+            assert_eq!(r.status, 403, "{path}: {who} must not deregister");
+            assert_eq!(m.registration(&id).as_ref(), Some(&before), "{path}: {who}");
+        }
+        assert_eq!(lock(&m.feedback).collector_count(), collectors, "{path}");
+        assert_eq!(m.counts(), (0, 0), "{path}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            unsubscribes.load(Ordering::SeqCst),
+            0,
+            "{path}: a refused Deregister sent no Unsubscribe to the AnLF"
+        );
+
+        // The owner deregisters, by either path; the Unsubscribe goes out once.
+        let (_, other_path) = owner_paths_1937()
+            .into_iter()
+            .find(|(p, _)| *p != path)
+            .unwrap();
+        let r = route_now(
+            "DELETE",
+            &["registrations", &id],
+            &other_path(SbiRequest::delete("/"), &OWNER_1937.to_uppercase()),
+        );
+        assert_eq!(r.status, 204, "{path}: the owner deregisters");
+        assert!(m.registration(&id).is_none());
+        until("the Unsubscribe at the AnLF", || {
+            unsubscribes.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // A retried Deregister: 404, no second Unsubscribe.
+        let r = route_now(
+            "DELETE",
+            &["registrations", &id],
+            &as_owner(SbiRequest::delete("/"), OWNER_1937),
+        );
+        assert_eq!(r.status, 404, "{path}: a retry finds it gone");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(unsubscribes.swap(0, Ordering::SeqCst), 1, "{path}");
+    }
+
+    // A Register from the same consumerId and modelId replaces only a
+    // registration of the same owner (dev: an anonymous one may not displace a
+    // bound one).
+    let r = route_now(
+        "POST",
+        &["registrations"],
+        &direct_1937(post("/", body()), OWNER_1937),
+    );
+    let bound = location_id(&r);
+    let r = route_with(
+        Some(m),
+        &ctx,
+        "POST",
+        &["registrations"],
+        &post("/", body()),
+        false,
+    );
+    assert_eq!(r.status, 201);
+    assert!(
+        m.registration(&bound).is_some(),
+        "the owner's registration is not displaced by another's Register"
+    );
+    // The owner registering again does replace its own (idempotent retry).
+    let r = route_now(
+        "POST",
+        &["registrations"],
+        &via_scp_1937(post("/", body()), OWNER_1937),
+    );
+    assert_eq!(r.status, 201);
+    assert!(m.registration(&bound).is_none(), "replaced by its owner");
+    assert_eq!(
+        m.registration_count(),
+        2,
+        "the owner's one, and the anonymous one"
+    );
+}
+
+/// #1937, the AnLF as producer: a subscription is bound at Subscribe to the MTLF
+/// that made it, and only that MTLF updates (`PUT`) or deletes it, directly or
+/// through an SCP. A stranger's `PUT` is refused before its body is read.
+/// Retries by the owner are idempotent.
+///
+/// REVERT-VERIFIED: the `PUT` owner check skipped ("must not update"); the
+/// Unsubscribe owner check skipped ("must not unsubscribe"); the owner not
+/// recorded at Subscribe ("bound to the subscribing MTLF").
+#[test]
+fn anlf_subscriptions_are_managed_only_by_their_mtlf_1937() {
+    let ctx = context("anlf-1937");
+    let m = leak(Monitor::new(
+        "retrain",
+        Role::Anlf,
+        "http://a",
+        "anlf-1937",
+        "http://n",
+    ));
+    let body = |uri: &str| {
+        json!({
+            "modelIds": [7], "notificationUri": uri, "notifCorrId": "reg-1937",
+            "eventReportReq": { "notifMethod": "PERIODIC", "repPeriod": 30 }
+        })
+    };
+    let route_now = |method: &str, rest: &[&str], req: &SbiRequest| {
+        route_with(Some(m), &ctx, method, rest, req, true)
+    };
+    for (path, as_owner) in owner_paths_1937() {
+        let r = route_now(
+            "POST",
+            &["subscriptions"],
+            &as_owner(post("/", body("http://mtlf.example/cb")), OWNER_1937),
+        );
+        assert_eq!(r.status, 201, "{path}");
+        let id = location_id(&r);
+        assert_eq!(
+            m.subscription(&id).unwrap().owner.as_deref(),
+            Some(OWNER_1937),
+            "{path}: bound to the subscribing MTLF"
+        );
+        let before = m.subscription(&id).unwrap();
+
+        let put = || post("/", body("http://attacker.example/cb"));
+        for (who, mut req) in strangers_1937(put) {
+            req.header.method = "PUT".into();
+            let r = route_now("PUT", &["subscriptions", &id], &req);
+            assert_eq!(r.status, 403, "{path}: {who} must not update");
+            assert_eq!(m.subscription(&id).as_ref(), Some(&before), "{path}: {who}");
+        }
+        // Refused before the body is read: a malformed body is still a 403.
+        let r = route_now(
+            "PUT",
+            &["subscriptions", &id],
+            &direct_1937(SbiRequest::put("/"), OTHER_1937),
+        );
+        assert_eq!(r.status, 403, "{path}");
+        for (who, req) in strangers_1937(|| SbiRequest::delete("/")) {
+            let r = route_now("DELETE", &["subscriptions", &id], &req);
+            assert_eq!(r.status, 403, "{path}: {who} must not unsubscribe");
+            assert_eq!(m.subscription(&id).as_ref(), Some(&before), "{path}: {who}");
+        }
+        assert_eq!(m.subscription_count(), 1, "{path}");
+
+        // The owner updates, twice (a retry): one record, same state, owner kept.
+        let mut states = Vec::new();
+        for _ in 0..2 {
+            let r = route_now(
+                "PUT",
+                &["subscriptions", &id],
+                &as_owner(post("/", body("http://mtlf.example/cb2")), OWNER_1937),
+            );
+            assert_eq!(r.status, 200, "{path}: the owner updates");
+            states.push(m.subscription(&id).unwrap());
+        }
+        assert_eq!(
+            states[0], states[1],
+            "{path}: a retried update is idempotent"
+        );
+        assert_eq!(states[0].notification_uri, "http://mtlf.example/cb2");
+        assert_eq!(states[0].owner.as_deref(), Some(OWNER_1937), "{path}");
+        assert_eq!(m.subscription_count(), 1, "{path}");
+
+        let del = || as_owner(SbiRequest::delete("/"), OWNER_1937);
+        assert_eq!(
+            route_now("DELETE", &["subscriptions", &id], &del()).status,
+            204
+        );
+        assert_eq!(
+            route_now("DELETE", &["subscriptions", &id], &del()).status,
+            404
+        );
+        assert_eq!(m.subscription_count(), 0, "{path}");
+    }
+}
+
+/// #1937: an ownerless registration or subscription (created with no verified
+/// identity, which only the `dev` profile allows) is open under `dev` and
+/// frozen under `production`, for every caller; and `production` refuses the
+/// anonymous create outright, storing nothing.
+///
+/// REVERT-VERIFIED: `route_with` passing `false` whatever `required` is
+/// ("frozen under production", "refused under production").
+#[tokio::test]
+async fn ownerless_records_are_frozen_under_production_1937() {
+    let (mtlf, ctx, model) = mtlf_1937();
+    let anlf = leak(Monitor::new(
+        "retrain",
+        Role::Anlf,
+        "http://a",
+        "anlf-1937f",
+        "http://n",
+    ));
+    let reg_body = || post("/", json!({ "modelId": model, "consumerId": OWNER_1937 }));
+    let sub_body = || {
+        post(
+            "/",
+            json!({ "modelIds": [7], "notificationUri": "http://m.example/cb", "notifCorrId": "c" }),
+        )
+    };
+    // Production: an anonymous create is refused and nothing is stored.
+    for (m, rest, req) in [
+        (mtlf, "registrations", reg_body()),
+        (anlf, "subscriptions", sub_body()),
+    ] {
+        let r = route_with(Some(m), &ctx, "POST", &[rest], &req, true);
+        assert_eq!(
+            r.status, 403,
+            "{rest}: an anonymous create is refused under production"
+        );
+    }
+    assert_eq!(
+        (mtlf.registration_count(), anlf.subscription_count()),
+        (0, 0)
+    );
+
+    // Dev: created ownerless.
+    let reg = location_id(&route_with(
+        Some(mtlf),
+        &ctx,
+        "POST",
+        &["registrations"],
+        &reg_body(),
+        false,
+    ));
+    let sub = location_id(&route_with(
+        Some(anlf),
+        &ctx,
+        "POST",
+        &["subscriptions"],
+        &sub_body(),
+        false,
+    ));
+    assert_eq!(mtlf.registration(&reg).unwrap().owner, None);
+    assert_eq!(anlf.subscription(&sub).unwrap().owner, None);
+    let (reg_before, sub_before) = (mtlf.registration(&reg), anlf.subscription(&sub));
+
+    // Production: frozen for everyone, the would-be owner included.
+    let mut everyone = strangers_1937(SbiRequest::new);
+    for (path, as_owner) in owner_paths_1937() {
+        everyone.push((path, as_owner(SbiRequest::new(), OWNER_1937)));
+    }
+    for (who, mut req) in everyone {
+        req.http.content = Some(sub_body().http.content.unwrap());
+        let r = route_with(
+            Some(mtlf),
+            &ctx,
+            "DELETE",
+            &["registrations", &reg],
+            &req,
+            true,
+        );
+        assert_eq!(
+            r.status, 403,
+            "{who}: an ownerless registration is frozen under production"
+        );
+        for method in ["PUT", "DELETE"] {
+            let r = route_with(
+                Some(anlf),
+                &ctx,
+                method,
+                &["subscriptions", &sub],
+                &req,
+                true,
+            );
+            assert_eq!(
+                r.status, 403,
+                "{who} {method}: an ownerless subscription is frozen under production"
+            );
+        }
+    }
+    assert_eq!(mtlf.registration(&reg), reg_before);
+    assert_eq!(anlf.subscription(&sub), sub_before);
+
+    // Dev: open to anyone, as before the binding.
+    let del = SbiRequest::delete("/");
+    assert_eq!(
+        route_with(
+            Some(mtlf),
+            &ctx,
+            "DELETE",
+            &["registrations", &reg],
+            &del,
+            false
+        )
+        .status,
+        204
+    );
+    assert_eq!(
+        route_with(
+            Some(anlf),
+            &ctx,
+            "DELETE",
+            &["subscriptions", &sub],
+            &del,
+            false
+        )
+        .status,
+        204
+    );
 }
