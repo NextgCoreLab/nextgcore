@@ -202,37 +202,9 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
 /// The longest a failing peer is left alone between attempts.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 
-type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
-
-/// Per peer: when it may next be tried, and the current backoff.
-fn backoff() -> &'static Mutex<Backoff> {
-    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
-        std::sync::LazyLock::new(Default::default);
-    &BACKOFF
-}
-
-fn backing_off(peer: &str) -> bool {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(peer)
-        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
-}
-
-fn note_failure(peer: &str) {
-    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    let wait = map
-        .get(peer)
-        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
-    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
-}
-
-fn note_success(peer: &str) {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(peer);
-}
+/// Per peer: its backoff (#1994: the shared one), guarded like the parked set.
+static BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(BACKOFF_BASE, BACKOFF_MAX);
 
 /// The peer a cleanup goes to: the NSACF it names (else the resolved one), the
 /// PCF, or the UDM.
@@ -253,17 +225,27 @@ fn holds(set: &VecDeque<Parked>, c: &Cleanup) -> bool {
     set.iter().any(|p| p.cleanup == *c)
 }
 
-/// Evict down to [`MAX_PENDING`], oldest first.
+/// Evict down to [`MAX_PENDING`], the oldest by park time first, wherever
+/// rotation has put it (#1994: it popped the front, which rotation makes the
+/// next to be tried, not the oldest).
 fn evict(set: &mut VecDeque<Parked>) {
-    while set.len() > MAX_PENDING {
-        if let Some(Parked { cleanup: old, .. }) = set.pop_front() {
-            log::error!(
-                "{}: abandoned; {MAX_PENDING} release cleanups are already pending",
-                old.describe()
-            );
-            RECONCILED.inc(&[old.kind(), "abandoned"]);
-        }
+    for Parked { cleanup: old, .. } in
+        nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
+    {
+        log::error!(
+            "{}: abandoned; {MAX_PENDING} release cleanups are already pending",
+            old.describe()
+        );
+        RECONCILED.inc(&[old.kind(), "abandoned"]);
     }
+}
+
+/// #1994: forget the backoff of a peer with nothing left parked, so one that
+/// never comes back does not stay in the map for good.
+fn prune_backoff() {
+    let live: std::collections::HashSet<String> =
+        lock().iter().map(|p| peer_of(&p.cleanup)).collect();
+    BACKOFF.retain(|peer| live.contains(peer));
 }
 
 /// Write the set into the durable snapshot (a no-op when no state file is set).
@@ -491,6 +473,7 @@ async fn attempt(c: &Cleanup) -> Attempt {
 pub async fn reconcile_once() -> usize {
     let batch: Vec<Parked> = lock().drain(..).collect();
     if batch.is_empty() {
+        prune_backoff();
         return 0;
     }
     let deadline = tokio::time::Instant::now() + MAX_PASS;
@@ -506,7 +489,7 @@ pub async fn reconcile_once() -> usize {
             continue;
         }
         let peer = peer_of(c);
-        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
             untried.push(p);
             continue;
         }
@@ -519,12 +502,12 @@ pub async fn reconcile_once() -> usize {
                 continue;
             }
             Attempt::Failed => {
-                note_failure(&peer);
+                BACKOFF.note_failure(&peer);
                 failed.push(p);
                 continue;
             }
         };
-        note_success(&peer);
+        BACKOFF.note_success(&peer);
         log::info!("{}: reconciled ({result})", c.describe());
         RECONCILED.inc(&[c.kind(), result]);
         ended += 1;
@@ -546,6 +529,7 @@ pub async fn reconcile_once() -> usize {
         }
         evict(&mut set);
     }
+    prune_backoff();
     if ended > 0 {
         persist();
     }
@@ -590,7 +574,7 @@ pub fn render(out: &mut String) {
 #[cfg(test)]
 pub fn clear_for_test() {
     lock().clear();
-    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    BACKOFF.clear();
 }
 
 #[cfg(test)]
@@ -631,6 +615,55 @@ mod tests {
             Some(&policy_delete(MAX_PENDING)),
             "parked once"
         );
+    }
+
+    /// #1994: eviction takes the oldest wherever rotation has put it. A failed
+    /// entry goes to the back, so the front is the next to be tried, not the
+    /// oldest.
+    ///
+    /// REVERT-VERIFIED: with `evict` popping the front, as before, this fails:
+    /// the younger front entry is evicted and the oldest kept.
+    #[tokio::test]
+    async fn eviction_takes_the_oldest_after_rotation_1994() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        clear_for_test();
+        for n in 0..MAX_PENDING {
+            park(policy_delete(n));
+        }
+        // A pass tried the oldest and it failed: it is at the back now.
+        {
+            let mut set = lock();
+            let oldest = set.pop_front().expect("parked");
+            set.push_back(oldest);
+        }
+        park(policy_delete(MAX_PENDING));
+        let held = snapshot();
+        clear_for_test();
+
+        assert_eq!(held.len(), MAX_PENDING);
+        assert!(!held.contains(&policy_delete(0)), "the oldest went");
+        assert!(held.contains(&policy_delete(1)), "not the front");
+    }
+
+    /// #1994: a pass forgets the backoff of a peer with nothing parked, and keeps
+    /// that of one still holding parked cleanups.
+    ///
+    /// REVERT-VERIFIED: with `prune_backoff` a no-op, this fails: the UDM, with
+    /// nothing parked, keeps its backoff.
+    #[tokio::test]
+    async fn a_peer_with_nothing_parked_is_pruned_1994() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        clear_for_test();
+        BACKOFF.note_failure("udm");
+        BACKOFF.note_failure("pcf");
+        // Backing off, so not contacted: it stays parked.
+        park(policy_delete(1994));
+        reconcile_once().await;
+        let after = (BACKOFF.current("udm"), BACKOFF.current("pcf"));
+        clear_for_test();
+
+        assert_eq!(after.0, None, "nothing parked: pruned");
+        assert_eq!(after.1, Some(BACKOFF_BASE), "still parked: kept");
     }
 
     /// #1961: a peer that accepts the connection and never answers, so each

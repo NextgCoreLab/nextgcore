@@ -406,7 +406,8 @@ pub struct SbiClient {
     /// refusal is believed to persist ([`TOKEN_REFUSAL_BACKOFF`]). #2023: the
     /// instance ([`refusing_instance`]) keeps one misconfigured producer behind
     /// an SCP from suspending the resend for its healthy peers.
-    token_refusals: Arc<StdMutex<HashMap<(NfType, String, String), Instant>>>,
+    /// #2031: bounded ([`record_refusal`]), with a type-wide backstop.
+    token_refusals: Arc<StdMutex<HashMap<RefusalKey, Instant>>>,
 }
 
 /// #1986: how long a persistent `invalid_token` refusal (the fresh token was
@@ -416,6 +417,73 @@ pub struct SbiClient {
 /// fixed NRF or producer is picked up within seconds: the first refusal after
 /// it evicts and resends again.
 const TOKEN_REFUSAL_BACKOFF: Duration = Duration::from_secs(10);
+
+/// #2031: when this many instances of one target type and scope are backed
+/// off at once, the whole type and scope is ([`TYPE_WIDE_REFUSAL`]). A
+/// producer (or an SCP) naming a new `3gpp-Sbi-Producer-Id` on every answer
+/// would otherwise open a new key, and so revive one NRF token fetch, per
+/// request.
+const TOKEN_REFUSAL_TYPE_WIDE_AFTER: usize = 8;
+/// #2031: the most refusal entries one client holds. A new key past it backs
+/// off its whole type and scope instead (evicting the entry nearest expiry to
+/// make room if it must), so the map stays bounded by more than its expiry.
+const TOKEN_REFUSAL_CAP: usize = 256;
+/// #2031: the instance key of a type-wide refusal.
+const TYPE_WIDE_REFUSAL: &str = "*";
+
+type RefusalKey = (NfType, String, String);
+
+/// #2031: whether `key` is backed off at `now`: its own instance, or its
+/// whole type and scope. Expired entries are dropped first.
+fn refusal_active(
+    refusals: &mut HashMap<RefusalKey, Instant>,
+    key: &RefusalKey,
+    now: Instant,
+) -> bool {
+    refusals.retain(|_, until| *until > now);
+    let wide = (key.0, key.1.clone(), TYPE_WIDE_REFUSAL.to_string());
+    refusals.contains_key(key) || refusals.contains_key(&wide)
+}
+
+/// #2031: record a persistent refusal by `key`'s instance until `until`,
+/// bounded: [`TOKEN_REFUSAL_TYPE_WIDE_AFTER`] instances of one type and scope,
+/// or a full map ([`TOKEN_REFUSAL_CAP`]), back off the type and scope instead.
+fn record_refusal(
+    refusals: &mut HashMap<RefusalKey, Instant>,
+    key: RefusalKey,
+    now: Instant,
+    until: Instant,
+) {
+    refusals.retain(|_, t| *t > now);
+    let wide = (key.0, key.1.clone(), TYPE_WIDE_REFUSAL.to_string());
+    let same_type = refusals
+        .keys()
+        .filter(|k| k.0 == key.0 && k.1 == key.1 && k.2 != TYPE_WIDE_REFUSAL && **k != key)
+        .count();
+    let target = if refusals.contains_key(&key) || refusals.len() < TOKEN_REFUSAL_CAP {
+        if same_type + 1 >= TOKEN_REFUSAL_TYPE_WIDE_AFTER {
+            wide
+        } else {
+            key
+        }
+    } else {
+        wide
+    };
+    if !refusals.contains_key(&target) && refusals.len() >= TOKEN_REFUSAL_CAP {
+        if let Some(soonest) = refusals
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(k, _)| k.clone())
+        {
+            refusals.remove(&soonest);
+        }
+    }
+    if target.2 == TYPE_WIDE_REFUSAL {
+        // The instances it now covers need no entries of their own.
+        refusals.retain(|k, _| !(k.0 == target.0 && k.1 == target.1));
+    }
+    refusals.insert(target, until);
+}
 
 impl SbiClient {
     /// Create a new SBI client
@@ -937,8 +1005,7 @@ impl SbiClient {
                 .token_refusals
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            refusals.retain(|_, until| *until > now);
-            if refusals.contains_key(&refusal) {
+            if refusal_active(&mut refusals, &refusal, now) {
                 log::debug!(
                     "{} {}: {} invalid_token again within the refusal backoff for {} \
                      scope '{scope}'; not resending",
@@ -986,10 +1053,16 @@ impl SbiClient {
                 scope.clone(),
                 refusing_instance(&request_of_resend, &response),
             );
-            self.token_refusals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(refusal, Instant::now() + TOKEN_REFUSAL_BACKOFF);
+            let now = Instant::now();
+            record_refusal(
+                &mut self
+                    .token_refusals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                refusal,
+                now,
+                now + TOKEN_REFUSAL_BACKOFF,
+            );
         }
         Ok(response)
     }
@@ -1890,35 +1963,66 @@ fn bearer_challenge_error(www_authenticate: &str) -> Option<String> {
     })
 }
 
-/// #1811: the scope this client asks the NRF for to send `request`: the
-/// service-level scope plus the resource-level scope the operation needs, if
-/// any (TS 29.500 §6.7.3; [`crate::resource_scope`]). A producer that enforces
-/// a resource scope refuses a token for the service alone.
-/// #2023: which producer instance refused a token, as a backoff key: the
-/// `3gpp-Sbi-Producer-Id` the answer carries (TS 29.500; set by the
-/// producer, kept by an SCP), else the instance the request named
-/// (`3gpp-Sbi-Target-apiRoot`, `3gpp-Sbi-Target-Nf-Id`,
-/// `3gpp-Sbi-Discovery-target-nf-instance-id`), else `""`: this client's one
-/// producer (direct communication, where each client addresses one).
+/// #2023: which producer instance refused a token, as a backoff key.
+/// #2031: always in `nfinst=<id>` form (lowercase), whichever header named it,
+/// so the same instance is one key.
+///
+/// - The instance the request named (`3gpp-Sbi-Target-Nf-Id`, else
+///   `3gpp-Sbi-Discovery-target-nf-instance-id`) wins: a
+///   `3gpp-Sbi-Producer-Id` naming another instance is ignored, so an answer
+///   cannot move the backoff off the instance this client addressed.
+/// - Else the answer's `3gpp-Sbi-Producer-Id` (TS 29.500 §5.2.3.2.x: its
+///   `nfinst` parameter, or a bare NF instance ID).
+/// - Else the request's `3gpp-Sbi-Target-apiRoot`, as `apiroot=<uri>`, since
+///   it names no instance ID.
+/// - Else `""`: this client's one producer (direct communication).
 fn refusing_instance(request: &SbiRequest, response: &SbiResponse) -> String {
     use crate::constants::{custom_header, discovery_header};
-    let named = |v: Option<&String>| {
+    let header = |v: Option<&String>| {
         v.map(|v| v.trim().to_ascii_lowercase())
             .filter(|v| !v.is_empty())
     };
-    named(response.http.get_header(custom_header::PRODUCER_ID))
-        .or_else(|| named(request.http.get_header(custom_header::TARGET_APIROOT)))
-        .or_else(|| named(request.http.get_header(custom_header::TARGET_NF_ID)))
+    let named = header(request.http.get_header(custom_header::TARGET_NF_ID))
         .or_else(|| {
-            named(
+            header(
                 request
                     .http
                     .get_header(discovery_header::TARGET_NF_INSTANCE_ID),
             )
         })
+        .and_then(|v| nf_instance_of(&v));
+    if let Some(named) = named {
+        return format!("nfinst={named}");
+    }
+    if let Some(producer) = header(response.http.get_header(custom_header::PRODUCER_ID))
+        .and_then(|v| nf_instance_of(&v))
+    {
+        return format!("nfinst={producer}");
+    }
+    header(request.http.get_header(custom_header::TARGET_APIROOT))
+        .map(|root| format!("apiroot={root}"))
         .unwrap_or_default()
 }
 
+/// #2031: the NF instance ID a (lowercased) header value names: the `nfinst`
+/// parameter of a `3gpp-Sbi-Producer-Id`-style value (`nfinst=<id>; nfset=...`),
+/// or the value itself when it carries no parameters.
+fn nf_instance_of(value: &str) -> Option<String> {
+    let id = if value.contains('=') {
+        value.split(';').find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            (k.trim() == "nfinst").then(|| v.trim().to_string())
+        })?
+    } else {
+        value.to_string()
+    };
+    (!id.is_empty()).then_some(id)
+}
+
+/// #1811: the scope this client asks the NRF for to send `request`: the
+/// service-level scope plus the resource-level scope the operation needs, if
+/// any (TS 29.500 §6.7.3; [`crate::resource_scope`]). A producer that enforces
+/// a resource scope refuses a token for the service alone.
 fn request_access_scope(request: &SbiRequest) -> String {
     crate::resource_scope::access_token_scope(
         &derive_scope_from_uri(&request.header.uri),
@@ -3204,10 +3308,127 @@ mod tests {
         // And the Producer-Id of the answer, when given, is the instance.
         let other = SbiResponse::with_status(403)
             .with_header(crate::constants::custom_header::PRODUCER_ID, "nfinst=CCCC");
-        assert_eq!(refusing_instance(&to(a), &other), "nfinst=cccc");
+        assert_eq!(
+            refusing_instance(&SbiRequest::get("/x"), &other),
+            "nfinst=cccc"
+        );
         assert_eq!(
             refusing_instance(&SbiRequest::get("/x"), &SbiResponse::with_status(403)),
             ""
+        );
+    }
+
+    /// **#2031.** The refusal key is one `nfinst=<id>` form whichever header
+    /// named the instance, and a `3gpp-Sbi-Producer-Id` naming another instance
+    /// than the request did is ignored.
+    ///
+    /// REVERT-VERIFIED: keyed by the raw header value, the same instance named
+    /// three ways is three keys; with the Producer-Id preferred again, the
+    /// mismatching one moves the key off the named instance.
+    #[test]
+    fn the_refusal_key_is_the_named_nf_instance_in_nfinst_form_2031() {
+        use crate::constants::{custom_header, discovery_header};
+        let req = |h: &[(&str, &str)]| {
+            let mut r = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+            for (k, v) in h {
+                r.http.set_header(*k, *v);
+            }
+            r
+        };
+        let answer = |pid: Option<&str>| {
+            let r = SbiResponse::with_status(403);
+            match pid {
+                Some(p) => r.with_header(custom_header::PRODUCER_ID, p),
+                None => r,
+            }
+        };
+        let id = "2031AAAA-0000-4000-8000-00000000000A";
+        let key = "nfinst=2031aaaa-0000-4000-8000-00000000000a";
+        // The same instance, three ways: one key.
+        assert_eq!(
+            refusing_instance(&req(&[(custom_header::TARGET_NF_ID, id)]), &answer(None)),
+            key
+        );
+        assert_eq!(
+            refusing_instance(
+                &req(&[(discovery_header::TARGET_NF_INSTANCE_ID, id)]),
+                &answer(None)
+            ),
+            key
+        );
+        let pid = format!("nfinst={id}; nfset=set1.udmset.5gc.mnc001.mcc001");
+        assert_eq!(refusing_instance(&req(&[]), &answer(Some(&pid))), key);
+        assert_eq!(refusing_instance(&req(&[]), &answer(Some(id))), key);
+        // A Producer-Id naming another instance than the request is ignored.
+        assert_eq!(
+            refusing_instance(
+                &req(&[(discovery_header::TARGET_NF_INSTANCE_ID, id)]),
+                &answer(Some("nfinst=2031bbbb-0000-4000-8000-00000000000b"))
+            ),
+            key
+        );
+        // A Producer-Id without an nfinst names no instance.
+        assert_eq!(
+            refusing_instance(&req(&[]), &answer(Some("nfset=set1"))),
+            ""
+        );
+        assert_eq!(
+            refusing_instance(
+                &req(&[(custom_header::TARGET_APIROOT, "http://UDM1:8080")]),
+                &answer(None)
+            ),
+            "apiroot=http://udm1:8080"
+        );
+    }
+
+    /// **#2031.** The refusal map is bounded: once
+    /// `TOKEN_REFUSAL_TYPE_WIDE_AFTER` instances of one type and scope are
+    /// backed off, the whole type and scope is, so a new instance (a fresh
+    /// random Producer-Id) costs no NRF fetch; and the map never exceeds
+    /// `TOKEN_REFUSAL_CAP`, a new key past it backing off its type and scope.
+    ///
+    /// REVERT-VERIFIED: without the type-wide backstop, a ninth instance is not
+    /// backed off; without the cap, the map grows past it.
+    #[test]
+    fn the_refusal_map_is_capped_with_a_type_wide_backstop_2031() {
+        let now = Instant::now();
+        let until = now + TOKEN_REFUSAL_BACKOFF;
+        let key = |scope: &str, i: usize| (NfType::Udm, scope.to_string(), format!("nfinst={i}"));
+        let mut m = HashMap::new();
+        for i in 0..TOKEN_REFUSAL_TYPE_WIDE_AFTER - 1 {
+            record_refusal(&mut m, key("nudm-sdm", i), now, until);
+        }
+        assert!(
+            !refusal_active(&mut m, &key("nudm-sdm", 999), now),
+            "not yet type-wide"
+        );
+        record_refusal(&mut m, key("nudm-sdm", 1000), now, until);
+        assert!(
+            refusal_active(&mut m, &key("nudm-sdm", 999), now),
+            "a new instance of the type and scope is backed off"
+        );
+        assert!(
+            !refusal_active(&mut m, &key("nudm-uecm", 999), now),
+            "another scope is not"
+        );
+        assert_eq!(
+            m.len(),
+            1,
+            "the type-wide entry replaces its instances: {m:?}"
+        );
+        // Past expiry, nothing.
+        assert!(!refusal_active(&mut m, &key("nudm-sdm", 999), until));
+
+        // The cap: one instance in each of many scopes (none type-wide).
+        let mut m = HashMap::new();
+        for i in 0..TOKEN_REFUSAL_CAP + 50 {
+            record_refusal(&mut m, key(&format!("s{i}"), i), now, until);
+            assert!(m.len() <= TOKEN_REFUSAL_CAP, "{} entries", m.len());
+        }
+        let last = key(&format!("s{}", TOKEN_REFUSAL_CAP + 49), 1);
+        assert!(
+            refusal_active(&mut m, &last, now),
+            "a key past the cap backs off its type and scope"
         );
     }
 
