@@ -102,6 +102,9 @@ struct Ops {
 struct Flight {
     done: std::sync::atomic::AtomicBool,
     changed: tokio::sync::Notify,
+    /// #1945: an INCREASE for the key stopped waiting for this DECREASE and was
+    /// sent anyway, so the NSACF may apply this DECREASE after it.
+    overtaken: std::sync::atomic::AtomicBool,
 }
 
 impl Flight {
@@ -110,6 +113,8 @@ impl Flight {
         self.changed.notify_waiters();
     }
 
+    /// Wait for this DECREASE until `until`. Gave up: marked overtaken, so the
+    /// DECREASE re-counts the key when it lands (#1945).
     async fn wait(&self, until: tokio::time::Instant) {
         loop {
             let notified = self.changed.notified();
@@ -119,6 +124,8 @@ impl Flight {
                 return;
             }
             if tokio::time::timeout_at(until, notified).await.is_err() {
+                self.overtaken
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
         }
@@ -130,9 +137,28 @@ fn ops() -> &'static Mutex<Ops> {
     &OPS
 }
 
-/// The longest an INCREASE waits for a DECREASE of its key on the wire: the SBI
-/// client's request timeout bounds the DECREASE, with room to spare.
+/// How long a DECREASE may take to connect, then to be answered (#1945): its own
+/// client is bounded by these, rather than by the SBI client's 30 s default, so
+/// the INCREASE's wait below covers it.
+pub const DECREASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DECREASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest an INCREASE waits for a DECREASE of its key on the wire. #1945: it
+/// covers the DECREASE's own bound (connect, then request), so in the ordinary
+/// case the DECREASE has landed or given up before the INCREASE goes. A DECREASE
+/// the NSACF still applies after that (it got the request and was slow) is caught
+/// by the overtaken re-count in [`decrease_once`].
+#[cfg(not(test))]
 const DECREASE_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const DECREASE_WAIT: Duration = Duration::from_secs(1);
+
+#[cfg(not(test))]
+const _: () = assert!(
+    DECREASE_WAIT.as_millis()
+        > DECREASE_CONNECT_TIMEOUT.as_millis() + DECREASE_REQUEST_TIMEOUT.as_millis(),
+    "an INCREASE's wait must cover a DECREASE's own timeout (#1945)"
+);
 
 /// The parked DECREASEs, oldest first.
 fn pending() -> &'static Mutex<VecDeque<Admission>> {
@@ -153,6 +179,10 @@ pub static DECREASES: nextgcore_metrics::nf::CounterFamily =
          denied registration's rollback, by outcome (accepted, refused, failed = parked, superseded = admitted again)",
         &["result"],
     );
+
+/// `amf_nsac_ue_recounts_total`: INCREASEs re-sent because a DECREASE of the same
+/// key landed after a re-registration's INCREASE (#1945).
+pub static RECOUNTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `amf_nsac_ue_decreases_reconciled_total{result}`: parked DECREASEs the
 /// reconciler ended: `delivered`, `superseded` (admitted again since), `refused`
@@ -375,7 +405,50 @@ async fn decrease_once(a: Admission) -> Outcome {
         }
     }
     flight.finish();
+    // #1945: an INCREASE for the key went before this DECREASE landed, so the NSACF
+    // may have applied this one last and counted the re-registered UE out. Once the
+    // INCREASE is settled, a key admitted again is counted in once more (an INCREASE
+    // of a UE the NSACF holds is idempotent).
+    if outcome != Outcome::Failed && flight.overtaken.load(std::sync::atomic::Ordering::SeqCst) {
+        spawn_recount(key);
+    }
     outcome
+}
+
+/// #1945: once no INCREASE for `key` is being decided (bounded), re-send the
+/// INCREASE for its live admission, if it has one.
+fn spawn_recount(key: Key) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let deadline = tokio::time::Instant::now() + DECREASE_WAIT + DECREASE_REQUEST_TIMEOUT;
+        while lock(ops()).admitting.contains_key(&key) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let Some(live) = lock(admissions()).get(&key).cloned() else {
+            return;
+        };
+        log::warn!(
+            "[{}] NSACF DECREASE for SST={} SD={:?} may have landed after its \
+             re-registration's INCREASE; counting the UE in again",
+            live.supi,
+            live.snssai.sst,
+            live.snssai.sd
+        );
+        RECOUNTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = crate::sbi_path::call_nsacf_ue_admission(
+            &live.nsacf_host,
+            live.nsacf_port,
+            &live.nf_id,
+            &live.supi,
+            live.snssai.sst,
+            live.snssai.sd,
+            &live.access_type,
+            true,
+        )
+        .await;
+    });
 }
 
 /// Count `admissions` out, off the caller's path; a failure is parked.
@@ -541,6 +614,14 @@ pub fn render(out: &mut String) {
     let _ = writeln!(out, "amf_nsac_ue_decreases_pending {}", pending_count());
     DECREASES.render(out);
     RECONCILED.render(out);
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "amf_nsac_ue_recounts_total",
+        "counter",
+        "NSAC INCREASEs re-sent because a DECREASE of the same UE and S-NSSAI may have landed \
+         after a re-registration's INCREASE",
+        RECOUNTS.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
 
 /// Forget every admission and parked DECREASE (a test's own, before and after it).
@@ -919,6 +1000,45 @@ pub(crate) mod tests {
             "the DECREASE lands first"
         );
         assert!(held, "and the re-registered UE is counted");
+    }
+
+    /// #1945: a DECREASE the NSACF is slower to apply than the INCREASE's wait. The
+    /// re-registration's INCREASE goes after its wait and is applied first, then the
+    /// DECREASE counts the UE out; the AMF counts it in again once the DECREASE has
+    /// landed, so the UE ends counted.
+    ///
+    /// REVERT-VERIFIED: without the overtaken re-count, this fails: the NSACF's last
+    /// word is the DECREASE.
+    #[tokio::test]
+    async fn a_decrease_that_lands_after_the_increase_is_counted_in_again_1945() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, applied) =
+            slow_nsacf(Duration::ZERO, Duration::from_millis(1500), &[]).await;
+        let supi = "imsi-001010000019451";
+        record(admission_at(supi, 1, port));
+
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            port,
+            "amf-1945",
+        )
+        .await;
+        let order = applied_n(&applied, 3).await;
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert!(out.granted, "admitted");
+        assert_eq!(
+            order,
+            ["INCREASE-applied", "DECREASE-applied", "INCREASE-applied"],
+            "counted in again after the late DECREASE"
+        );
     }
 
     /// R27 #1940: a DECREASE that finds an INCREASE for its key being decided is
