@@ -135,6 +135,10 @@ pub struct AmfMbsContext {
     pub port: u16,
     pub nf_instance_id: Option<String>,
     pub context_ref: String,
+    /// #1854: the TMGI it was created for, so its delete takes the same
+    /// (AMF, TMGI) lane as a create for that TMGI ([`crate::lane`]). `None` when
+    /// unknown.
+    pub tmgi: Option<Tmgi>,
 }
 
 /// MBS Session Context (TS 23.247 5.3)

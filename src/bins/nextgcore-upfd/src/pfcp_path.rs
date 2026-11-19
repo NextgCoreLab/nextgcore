@@ -877,6 +877,9 @@ pub struct PfcpServer {
     allowed_peers: std::sync::RwLock<PeerAllowlist>,
     /// The IPv6 N3 GTP-U address, set once the IPv6 GTP-U socket is bound (#985).
     n3_ipv6: std::sync::RwLock<Option<Ipv6Addr>>,
+    /// #1851: recent responses, so a retransmitted request is answered with the
+    /// response its original got and is not executed again (TS 29.244 §6.4).
+    replies: std::sync::Mutex<crate::pfcp_dup::ResponseCache>,
 }
 
 /// Outstanding-heartbeat bookkeeping for peer-failure detection.
@@ -1305,6 +1308,7 @@ impl PfcpServer {
                 list.resolve_hosts();
             }),
             n3_ipv6: std::sync::RwLock::new(None),
+            replies: std::sync::Mutex::new(crate::pfcp_dup::ResponseCache::default()),
         })
     }
 
@@ -1470,6 +1474,11 @@ impl PfcpServer {
         self.clear_n6_delay_control();
         // #1513: the CP function's sessions are gone, and with them what it was told.
         *self.path_ledger.lock().unwrap() = PathReportLedger::default();
+        // #1851: and the responses it was given -- a restarted peer's requests are new.
+        self.replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.delete_association_sessions(peer, reason).await;
     }
 
@@ -1635,6 +1644,38 @@ impl PfcpServer {
         // The source is matched by IP, never by port: the association is between Node
         // IDs (§6.2.6), so any of the association's host addresses qualifies (its Setup
         // source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to).
+        // #1851, TS 29.244 §6.4: a retransmitted request (same Sequence Number, same
+        // content, same peer address and port) is answered with the response its
+        // original got, and NOT executed again. Checked before the association gate:
+        // a retransmitted Association Release must get its success again, not the
+        // cause 72 the release it repeats has since made true.
+        let is_request = is_request_type(header.msg_type);
+        if is_request {
+            let cached = self
+                .replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replay(
+                    src_addr,
+                    header.sequence_number,
+                    data,
+                    std::time::Instant::now(),
+                );
+            if let Some(response) = cached {
+                log::debug!(
+                    "PFCP request type={} seq={} from {src_addr} is a retransmission: \
+                     resending its response, not executing it again",
+                    header.msg_type,
+                    header.sequence_number
+                );
+                self.socket
+                    .send_to(&response, src_addr)
+                    .await
+                    .map_err(|e| format!("Send error: {e}"))?;
+                return Ok(());
+            }
+        }
+
         let src_ip = src_addr.ip();
         let from_peer = self
             .association
@@ -1681,7 +1722,7 @@ impl PfcpServer {
                         &resp_payload,
                         session_level,
                     );
-                    let _ = self.socket.send_to(&response, src_addr).await;
+                    let _ = self.reply(&response, src_addr).await;
                     return Ok(());
                 }
                 t => {
@@ -1695,9 +1736,57 @@ impl PfcpServer {
             }
         }
 
+        if !is_request {
+            return self.dispatch(&header, payload, data, src_addr).await;
+        }
+        self.replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(src_addr, header.sequence_number, data);
+        let result = self.dispatch(&header, payload, data, src_addr).await;
+        // Kept only for the CP function this UPF is associated with -- before the
+        // request (from_peer) or because of it (an accepted Setup). Anyone else got a
+        // refusal that is answered the same way again without state, so caching it
+        // would only let strangers push the CP function's responses out.
+        let keep = from_peer
+            || self
+                .association
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|a| a.owns(src_ip));
+        let mut replies = self.replies.lock().unwrap_or_else(|e| e.into_inner());
+        if keep && header.msg_type == pfcp_type::ASSOCIATION_SETUP_REQUEST {
+            // A Setup that is not a retransmission starts a new association: what
+            // the previous one was answered is no answer to the new one's requests,
+            // which a restarted CP function numbers from the start again.
+            replies.clear();
+        }
+        replies.finish(keep, std::time::Instant::now());
+        result
+    }
+
+    /// Send `response` to `to`, keeping it for a retransmission of the request it
+    /// answers (#1851). Every response to a request goes out through here.
+    async fn reply(&self, response: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(to, response);
+        self.socket.send_to(response, to).await
+    }
+
+    /// Handle one PFCP message the association gate admitted.
+    async fn dispatch(
+        &self,
+        header: &ParsedPfcpHeader,
+        payload: &[u8],
+        data: &[u8],
+        src_addr: SocketAddr,
+    ) -> Result<(), String> {
         match header.msg_type {
             pfcp_type::HEARTBEAT_REQUEST => {
-                self.handle_heartbeat_request(&header, payload, src_addr)
+                self.handle_heartbeat_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::HEARTBEAT_RESPONSE => {
@@ -1710,27 +1799,27 @@ impl PfcpServer {
                 }
             }
             pfcp_type::ASSOCIATION_SETUP_REQUEST => {
-                self.handle_association_setup_request(&header, payload, data, src_addr)
+                self.handle_association_setup_request(header, payload, data, src_addr)
                     .await?;
             }
             pfcp_type::ASSOCIATION_RELEASE_REQUEST => {
-                self.handle_association_release_request(&header, src_addr)
+                self.handle_association_release_request(header, src_addr)
                     .await?;
             }
             pfcp_type::ASSOCIATION_UPDATE_REQUEST => {
-                self.handle_association_update_request(&header, payload, src_addr)
+                self.handle_association_update_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_ESTABLISHMENT_REQUEST => {
-                self.handle_session_establishment_request(&header, payload, src_addr)
+                self.handle_session_establishment_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_MODIFICATION_REQUEST => {
-                self.handle_session_modification_request(&header, payload, src_addr)
+                self.handle_session_modification_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_DELETION_REQUEST => {
-                self.handle_session_deletion_request(&header, payload, src_addr)
+                self.handle_session_deletion_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::NODE_REPORT_RESPONSE => {
@@ -1850,8 +1939,7 @@ impl PfcpServer {
             false, // No SEID in header
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -1983,8 +2071,7 @@ impl PfcpServer {
                 &resp_payload,
                 false,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2118,8 +2205,7 @@ impl PfcpServer {
             false,
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -2144,8 +2230,7 @@ impl PfcpServer {
             &resp_payload,
             false,
         );
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
         Ok(())
@@ -2169,8 +2254,7 @@ impl PfcpServer {
             &resp_payload,
             false,
         );
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -2300,8 +2384,7 @@ impl PfcpServer {
                 &resp_payload,
                 true,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2333,8 +2416,7 @@ impl PfcpServer {
                 &resp_payload,
                 true,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2359,8 +2441,7 @@ impl PfcpServer {
                     &resp_payload,
                     true,
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.reply(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -2412,8 +2493,7 @@ impl PfcpServer {
                         &resp_payload,
                         true,
                     );
-                    self.socket
-                        .send_to(&response, src_addr)
+                    self.reply(&response, src_addr)
                         .await
                         .map_err(|e| format!("Send error: {e}"))?;
                     return Ok(());
@@ -2464,8 +2544,7 @@ impl PfcpServer {
                 &resp_payload,
                 true,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2535,8 +2614,7 @@ impl PfcpServer {
                             &resp_payload,
                             true,
                         );
-                        self.socket
-                            .send_to(&response, src_addr)
+                        self.reply(&response, src_addr)
                             .await
                             .map_err(|e| format!("Send error: {e}"))?;
                         return Ok(());
@@ -2722,7 +2800,7 @@ impl PfcpServer {
             true,
         );
 
-        if let Err(e) = self.socket.send_to(&response, src_addr).await {
+        if let Err(e) = self.reply(&response, src_addr).await {
             // #1815: the session is not stored, so nothing would ever give its TEIDs
             // back; the CP function's retransmission chooses afresh.
             self.release_teids(chosen_teids);
@@ -2852,6 +2930,23 @@ impl PfcpServer {
             .iter()
             .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::URR_ID))
             .collect();
+        // #1835: Query URR Reference (IE 125, §8.2.90, an Unsigned32). Optional,
+        // beside a Query URR or QAURR (Table 7.5.4.1-1), and echoed in every usage
+        // report sent in response to the query (§5.2.2.3.1, Table 7.5.5.2-1), so the
+        // SMF can tell which query a report answers. It was not parsed at all. One
+        // too short to hold its value is an optional IE with an invalid value, so it
+        // is discarded and the message processed as if it were absent (§7.6.8).
+        let query_urr_reference: Option<u32> =
+            ParsedIe::find_ie(&ies, pfcp_ie::QUERY_URR_REFERENCE).and_then(|ie| {
+                let value = ie.value.get(..4).and_then(|v| <[u8; 4]>::try_from(v).ok());
+                if value.is_none() {
+                    log::warn!(
+                        "Query URR Reference shorter than its 4-octet value; discarded \
+                         (TS 29.244 §7.6.8)"
+                    );
+                }
+                value.map(u32::from_be_bytes)
+            });
 
         // A Remove IE whose rule-id sub-IE is missing or short is malformed, and is
         // reported rather than skipped: silently dropping it is the defect #306 is
@@ -3613,8 +3708,7 @@ impl PfcpServer {
                     &resp_payload,
                     true,
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.reply(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -3641,12 +3735,31 @@ impl PfcpServer {
         // neither this response nor any later report. A rejected request applies
         // nothing (§6.3.3), and the counters are part of what it must not touch.
         let mut usage_reports = Vec::new();
+        // Whether the query in this message (QAURR, or a Query URR naming it) covers
+        // the URR `id`.
+        let queried = |id: u32| query_all_urrs || queried_urr_ids.contains(&id);
         if failure.is_none() && !removed_urr_ids.is_empty() {
-            usage_reports.extend(self.collect_usage_reports(
-                upf_seid,
-                Some(&removed_urr_ids),
-                UsageReportReason::Termination,
-            ));
+            usage_reports.extend(
+                self.collect_usage_reports(
+                    upf_seid,
+                    Some(&removed_urr_ids),
+                    UsageReportReason::Termination,
+                )
+                .into_iter()
+                // #1852: a removed URR the query also covers reports once (below it is
+                // filtered out of the query's reports), so this final report is ALSO
+                // the query's answer: it carries the Query URR Reference
+                // (§5.2.2.3.1, Table 7.5.5.2-1) and IMMER beside TERMR (§8.2.41: more
+                // than one trigger bit may be set). One the query does not cover
+                // answers only the removal and carries neither.
+                .map(|mut r| {
+                    if queried(r.urr_id) {
+                        r.query_urr_reference = query_urr_reference;
+                        r.trigger.immediate_report = true;
+                    }
+                    r
+                }),
+            );
         }
         // QAURR together with a Query URR IE was rejected above (#1816, NOTE 3), so
         // at most one of the two forms reaches here.
@@ -3666,7 +3779,13 @@ impl PfcpServer {
                     .into_iter()
                     // A URR removed by this same message has already reported with
                     // TERMR; reporting it twice would double-count it.
-                    .filter(|r| !already.contains(&r.urr_id)),
+                    .filter(|r| !already.contains(&r.urr_id))
+                    // #1835: each report answering the query carries its reference
+                    // (a removed URR's TERMR report was tagged above, #1852).
+                    .map(|mut r| {
+                        r.query_urr_reference = query_urr_reference;
+                        r
+                    }),
             );
         }
 
@@ -3698,8 +3817,7 @@ impl PfcpServer {
             true,
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -3808,8 +3926,7 @@ impl PfcpServer {
                     &resp_payload,
                     true,
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.reply(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -3833,8 +3950,7 @@ impl PfcpServer {
             true,
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -4221,8 +4337,7 @@ impl PfcpServer {
             &resp_payload,
             false,
         );
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
         Ok(())
@@ -4304,6 +4419,7 @@ impl PfcpServer {
                     duration_measurement: times.2,
                     time_of_first_packet: times.3,
                     time_of_last_packet: times.4,
+                    query_urr_reference: None,
                 }
             })
             .collect()
@@ -4665,6 +4781,7 @@ impl PfcpServer {
                     duration_measurement: times.2,
                     time_of_first_packet: times.3,
                     time_of_last_packet: times.4,
+                    query_urr_reference: None,
                 }
             })
             .collect();
@@ -4780,6 +4897,7 @@ impl PfcpServer {
                 duration_measurement: times.2,
                 time_of_first_packet: times.3,
                 time_of_last_packet: times.4,
+                query_urr_reference: None,
             }],
             ..Default::default()
         };
@@ -10006,6 +10124,217 @@ mod tests {
         );
     }
 
+    /// `(urr_id, Query URR Reference)` of each Usage Report in a Session
+    /// Modification Response (#1835).
+    fn report_references_1835(resp: &[u8]) -> Vec<(u32, Option<u32>)> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let mut out: Vec<(u32, Option<u32>)> =
+            ParsedIe::find_all_ies(&ParsedIe::parse_all(body), pfcp_ie::USAGE_REPORT_SMR)
+                .iter()
+                .map(|ur| {
+                    let inner = ParsedIe::parse_all(&ur.value);
+                    let u32_of = |t: u16| {
+                        ParsedIe::find_ie(&inner, t)
+                            .map(|ie| u32::from_be_bytes(ie.value[..4].try_into().unwrap()))
+                    };
+                    (
+                        u32_of(pfcp_ie::URR_ID).unwrap(),
+                        u32_of(pfcp_ie::QUERY_URR_REFERENCE),
+                    )
+                })
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// **#1835, TS 29.244 §5.2.2.3.1, Table 7.5.4.1-1 and Table 7.5.5.2-1.** A
+    /// Query URR Reference in a Session Modification Request is echoed in every
+    /// usage report sent in response to its query, Query URR or QAURR alike, and
+    /// in no other: a URR removed by the same message and NOT queried reports TERMR
+    /// without it (one the query covers carries it, #1852), and
+    /// a query without a reference carries none. A reference too short for its
+    /// value is discarded (§7.6.8). upfd never parsed the IE.
+    #[tokio::test]
+    async fn query_urr_reference_is_echoed_in_the_reports_it_triggers_1835() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        assert_eq!(
+            pfcp_ie::QUERY_URR_REFERENCE,
+            125,
+            "TS 29.244 Table 8.1.2-1 (29244-k00.txt:27160)"
+        );
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for id in [2, 3] {
+            b.add_tlv(
+                pfcp_ie::CREATE_URR,
+                &urr_body(id, Some(1_000_000), None, None),
+            );
+        }
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let modify = |seq: u32, build: &dyn Fn(&mut crate::n4_build::PfcpMessageBuilder)| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            build(&mut b);
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        // Query URR 2 with a reference, and remove URR 1 in the same message.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(4, &|b| {
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0xCAFE_1835);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_references_1835(&resp),
+            vec![(1, None), (2, Some(0xCAFE_1835))],
+            "the queried URR echoes the reference; the removed one's TERMR does not"
+        );
+        apply_next(&mut rx, &dp).await;
+
+        // QAURR with a reference: every report answers the query.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(5, &|b| {
+                b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 7);
+            }),
+        )
+        .await;
+        assert_eq!(
+            report_references_1835(&resp),
+            vec![(2, Some(7)), (3, Some(7))]
+        );
+
+        // No reference, and a reference too short for its value: none echoed.
+        for (seq, reference) in [(6, None), (7, Some(&[0x00, 0x01][..]))] {
+            let resp = exchange(
+                &smf,
+                addr,
+                &modify(seq, &|b| {
+                    b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 3));
+                    if let Some(r) = reference {
+                        b.add_tlv(pfcp_ie::QUERY_URR_REFERENCE, r);
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+            assert_eq!(report_references_1835(&resp), vec![(3, None)], "seq {seq}");
+        }
+    }
+
+    /// (URR ID, Query URR Reference, IMMER, TERMR) of every Usage Report in a
+    /// Session Modification Response, sorted. IMMER is octet 5 bit 8 and TERMR
+    /// octet 6 bit 4 of the Usage Report Trigger (TS 29.244 §8.2.41).
+    fn report_triggers_1852(resp: &[u8]) -> Vec<(u32, Option<u32>, bool, bool)> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let mut out: Vec<_> =
+            ParsedIe::find_all_ies(&ParsedIe::parse_all(body), pfcp_ie::USAGE_REPORT_SMR)
+                .iter()
+                .map(|ur| {
+                    let inner = ParsedIe::parse_all(&ur.value);
+                    let u32_of = |t: u16| {
+                        ParsedIe::find_ie(&inner, t)
+                            .map(|ie| u32::from_be_bytes(ie.value[..4].try_into().unwrap()))
+                    };
+                    let trigger = ParsedIe::find_ie(&inner, pfcp_ie::USAGE_REPORT_TRIGGER)
+                        .expect("every usage report carries its trigger")
+                        .value
+                        .clone();
+                    (
+                        u32_of(pfcp_ie::URR_ID).unwrap(),
+                        u32_of(pfcp_ie::QUERY_URR_REFERENCE),
+                        trigger[0] & 0x80 != 0,
+                        trigger[1] & 0x08 != 0,
+                    )
+                })
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// **#1852, TS 29.244 §5.2.2.3.1, Table 7.5.5.2-1, §8.2.41.** A URR removed by
+    /// the same Session Modification whose query covers it -- QAURR, or a Query URR
+    /// naming it -- reports once, and that final report also answers the query: it
+    /// carries the Query URR Reference and IMMER beside TERMR. A removed URR the
+    /// query does not cover reports TERMR alone (#1835's test covers that case).
+    #[tokio::test]
+    async fn a_removed_urr_s_final_report_answers_a_query_covering_it_1852() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for id in [2, 3, 4] {
+            b.add_tlv(
+                pfcp_ie::CREATE_URR,
+                &urr_body(id, Some(1_000_000), None, None),
+            );
+        }
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let modify = |seq: u32, build: &dyn Fn(&mut crate::n4_build::PfcpMessageBuilder)| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            build(&mut b);
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        // QAURR with a reference, and remove URR 1: every report answers the query,
+        // the removed URR's final one included.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(4, &|b| {
+                b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0x1852);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_triggers_1852(&resp),
+            vec![
+                (1, Some(0x1852), true, true),
+                (2, Some(0x1852), true, false),
+                (3, Some(0x1852), true, false),
+                (4, Some(0x1852), true, false),
+            ],
+            "the removed URR reports once, with the reference, IMMER and TERMR"
+        );
+        apply_next(&mut rx, &dp).await;
+
+        // A Query URR naming URR 2, which the same message removes, and naming 3;
+        // URR 4 is removed but not queried.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(5, &|b| {
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 3));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 4));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0x1853);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_triggers_1852(&resp),
+            vec![
+                (2, Some(0x1853), true, true),
+                (3, Some(0x1853), true, false),
+                (4, None, false, true),
+            ],
+            "a named and removed URR answers both; a removed, unqueried one only the removal"
+        );
+    }
+
     /// Query URR (IE 77, TS 29.244 §7.5.4.10): report the URRs the SMF NAMED, and
     /// only those.
     ///
@@ -13210,5 +13539,172 @@ mod tests {
             .await
             .is_err());
         assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
+    }
+
+    // ------------------------------------------------------------------
+    // #1851, TS 29.244 §6.4: a retransmitted request is answered with the
+    // response its original got and is not executed again.
+    // ------------------------------------------------------------------
+
+    /// An establishment whose one PDR asks the UPF to CHOOSE its F-TEID, so a
+    /// second execution would show as a second TEID and a second session.
+    fn choosing_establishment_1851() -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1851,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &create_pdr_1815(1, &[0x05]));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.build()
+    }
+
+    /// **#1851.** A retransmitted Session Establishment Request (same Sequence
+    /// Number, same content, same peer) gets the original response byte for byte
+    /// -- the same UP F-SEID and chosen F-TEID -- and creates nothing: one session,
+    /// one TEID, one SessionEstablished event.
+    #[tokio::test]
+    async fn a_retransmitted_establishment_gets_the_original_response_1851() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let request = encode_pfcp(50, Some(0), 2, &choosing_establishment_1851());
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            again, first,
+            "a retransmission must be answered with the original response"
+        );
+        assert_eq!(
+            server.sessions.read().await.len(),
+            1,
+            "one session, not two"
+        );
+        assert_eq!(server.teids.in_use(), 1, "the retransmission chose no TEID");
+        assert!(matches!(
+            rx.recv().await,
+            Some(PfcpSessionEvent::SessionEstablished { .. })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the retransmission must not reach the data plane"
+        );
+    }
+
+    /// **#1851.** A retransmitted Session Modification Request is answered with
+    /// the original response and not applied twice. A DIFFERENT modification
+    /// reusing the Sequence Number is a new request and is executed (§6.4 matches
+    /// a retransmission by its content, not only by its number).
+    #[tokio::test]
+    async fn a_retransmitted_modification_is_not_applied_twice_1851() {
+        let (server, smf, addr, mut rx, _dp, upf_seid) = established_session().await;
+        // Relative to what the establishment holds (an SMF-named TEID is reserved
+        // too once #1834 lands), so the count is the modification's alone.
+        let base = server.teids.in_use();
+        let request = encode_pfcp(52, Some(upf_seid), 3, &choosing_modification_1815(false));
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), base + 2);
+        assert!(
+            rx.recv().await.is_some(),
+            "the modification reaches the data plane"
+        );
+
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(again, first, "answered with the original response");
+        assert_eq!(
+            server.teids.in_use(),
+            base + 2,
+            "and not applied a second time"
+        );
+        assert!(rx.try_recv().is_err(), "nothing new reaches the data plane");
+
+        // Same Sequence Number, new content: executed.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &create_pdr_1815(0x74, &[0x05]));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), base + 3, "a new request is executed");
+    }
+
+    /// **#1851.** A retransmitted Association Release Request gets its success
+    /// again, not the cause 72 the release it repeats has since made true: the
+    /// replay is checked before the association gate.
+    #[tokio::test]
+    async fn a_retransmitted_release_gets_its_success_again_1851() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let request = encode_pfcp(9, None, 2, &rel.build());
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+        assert!(!server.is_associated().await);
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            response_cause(&again),
+            PfcpCause::RequestAccepted as u8,
+            "the retransmitted release must not be refused with cause 72"
+        );
+        assert_eq!(again, first);
+    }
+
+    /// **#1851.** Only the associated CP function's responses are kept: a
+    /// heartbeat from a host with no association is answered but not cached (its
+    /// answer needs no state to repeat), while an accepted Setup -- whose source
+    /// owns the association only BECAUSE of it -- is kept.
+    #[tokio::test]
+    async fn only_the_associated_cp_function_s_responses_are_kept_1851() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
+        let resp = exchange(&smf, addr, &encode_pfcp(1, None, 1, &hb.build())).await;
+        assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE);
+        assert_eq!(
+            server.replies.lock().unwrap().len(),
+            0,
+            "a stranger's is not kept"
+        );
+
+        let assoc = build_association_setup_request_payload(Some(1));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 2, &assoc)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            server.replies.lock().unwrap().len(),
+            1,
+            "the accepted Setup's is"
+        );
+    }
+
+    /// **#1851.** A peer restart detected from a heartbeat's new Recovery Time
+    /// Stamp forgets the responses its previous incarnation was given: the same
+    /// establishment bytes under the same Sequence Number are now the restarted
+    /// peer's request and are judged afresh (no association: cause 72), not
+    /// answered with the session the old incarnation got.
+    #[tokio::test]
+    async fn a_detected_peer_restart_forgets_the_old_responses_1851() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let request = encode_pfcp(50, Some(0), 2, &choosing_establishment_1851());
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 2);
+        let _ = exchange(&smf, addr, &encode_pfcp(1, None, 3, &hb.build())).await;
+        assert!(!server.is_associated().await, "the restart was detected");
+
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            response_cause(&again),
+            PfcpCause::NoEstablishedPfcpAssociation as u8,
+            "the old incarnation's response must not be replayed to the new one"
+        );
     }
 }

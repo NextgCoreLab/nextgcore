@@ -188,11 +188,15 @@ services:
       UDR_SBI_PORT: "7777"
       NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/udm.crt
       NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/udm.key
+      # #1836: SDM subscriptions, the UDR am-data subscriptions and the am-data
+      # changes waiting for the AMF survive a UDM restart, on the udm_state volume.
+      NEXTGCORE_UDM_STATE_FILE: /var/lib/nextgcore/udm-state.json
     command: ["-c", "/etc/nextgcore/udm.yaml"]
     volumes:
       - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
       - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
       - tls-udm:/etc/nextgcore/certs:ro
+      - udm_state:/var/lib/nextgcore
     networks:
       core:
         ipv4_address: 172.23.0.12
@@ -856,6 +860,8 @@ volumes:
   # is owned by the image's `nextgcore` user -- the NF processes run non-root, and
   # a bind mount would arrive owned by the host user.
   udr_state:
+  # Durable UDM state snapshot (#1836), named for the same reason.
+  udm_state:
   mongodb_data:
   prometheus_data:
   grafana_data:
