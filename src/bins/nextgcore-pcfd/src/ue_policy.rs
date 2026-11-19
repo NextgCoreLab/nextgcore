@@ -347,6 +347,9 @@ pub struct UePolicyAssociation {
     /// The tokens in this association's three callback URIs (#1518), one per
     /// callback, minted with the association. See [`UePolicyCallback`].
     pub callback_tokens: UePolicyCallbackTokens,
+    /// #1937: the verified identity of the AMF that created the association
+    /// (`nextgcore_sbi::owner_binding`); only it may read, update or delete it.
+    pub owner: Option<String>,
 }
 
 /// The serving AMF's GUAMI as carried in a TS 29.525 `PolicyAssociationRequest`
@@ -515,6 +518,17 @@ fn ue_policy_store() -> &'static Mutex<HashMap<String, UePolicyAssociation>> {
 pub fn ue_policy_count() -> usize {
     ue_policy_store().lock().map(|m| m.len()).unwrap_or(0)
 }
+/// #1937: bind association `id` to the verified identity of its creator.
+pub fn ue_policy_set_owner(id: &str, owner: Option<String>) {
+    if let Some(a) = ue_policy_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(id)
+    {
+        a.owner = owner;
+    }
+}
+
 pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UePolicyAssociation {
     let assoc = UePolicyAssociation {
         pol_asso_id: uuid::Uuid::new_v4().to_string(),
@@ -538,6 +552,7 @@ pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UeP
         serving_nf_id: None,
         connectivity_subscription_id: None,
         delivery_generation: 0,
+        owner: None,
         callback_tokens: UePolicyCallbackTokens::mint(),
     };
     if let Ok(mut m) = ue_policy_store().lock() {
