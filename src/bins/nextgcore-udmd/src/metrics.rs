@@ -131,6 +131,8 @@ pub fn render_prometheus() -> String {
         nrf_client: true,
     });
     render_udm_families(&mut out, &census());
+    // #1877: the AMF unsubscribe reconciler.
+    crate::ee_amf::render_unsubscribe_reconciler(&mut out);
     #[cfg(feature = "nes")]
     if let Some(g) = NES_GAUGES.get() {
         out.push_str(&g.render_prometheus());

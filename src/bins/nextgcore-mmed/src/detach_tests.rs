@@ -261,6 +261,12 @@ fn an_unanswered_delete_session_request_does_not_block_the_detach() {
     let (req, _) = recv(&sgw, DELETE_SESSION_REQUEST);
     assert_eq!(delete_session(&req), (Some(SGW_S11_TEID), 5, true));
     wait_pdu(ue.enb_id, is_detach_accept);
+    // #1911: the DETACH ACCEPT is sent before the context is removed, on the GTP
+    // thread, so wait for the removal rather than racing it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ctx.mme_ue_find_by_id(ue.mme_ue_id).is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(ctx.mme_ue_find_by_id(ue.mme_ue_id).is_none(), "removed");
     assert!(
         crate::gtp_path::DELETE_SESSION_TIMEOUTS_TOTAL.load(Ordering::Relaxed) > timeouts0,

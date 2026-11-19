@@ -263,6 +263,9 @@ pub struct TimeSyncConfig {
     pub id: String,
     /// Typed configuration.
     pub config: TimeSyncExposureConfig,
+    /// #1937: the verified identity of the AF/NEF that created it; only it may
+    /// read, update or delete it (`nextgcore_sbi::owner_binding`).
+    pub owner: Option<String>,
 }
 
 impl TimeSyncConfig {
@@ -270,6 +273,7 @@ impl TimeSyncConfig {
         Self {
             id: Uuid::new_v4().to_string(),
             config,
+            owner: None,
         }
     }
 }
@@ -361,6 +365,10 @@ pub struct AstiConfig {
     /// Subscription for 5G access stratum time distribution status.
     pub notification_target_addr: Option<String>,
     pub notification_correlation_id: Option<String>,
+    /// #1937: the verified identity of the AF/NEF that created it. Never read
+    /// from or written to the wire: a body cannot claim an owner.
+    #[serde(skip)]
+    pub owner: Option<String>,
 }
 
 impl AstiConfig {
@@ -423,6 +431,10 @@ pub struct QosTscSession {
     /// Notification target for the Notify operation.
     pub notification_target_addr: Option<String>,
     pub notification_correlation_id: Option<String>,
+    /// #1937: the verified identity of the AF/NEF that created it. Never read
+    /// from or written to the wire: a body cannot claim an owner.
+    #[serde(skip)]
+    pub owner: Option<String>,
 }
 
 impl QosTscSession {

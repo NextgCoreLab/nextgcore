@@ -6772,6 +6772,8 @@ impl NgapServer {
         }
 
         // 3) Npcf_AMPolicyControl_Create
+        #[cfg(test)]
+        crate::test_support::assert_pcf_env_lock_held();
         let (pcf_host, pcf_port) = crate::sbi_path::resolve_nf_endpoint_async(
             crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
         )
@@ -7941,6 +7943,8 @@ impl NgapServer {
         // The same PCF that serves AM policy: TS 29.525 and TS 29.507 are two
         // services of one NF, and this build has no separate UE-policy PCF. Reusing
         // the AM-policy service name is also what step 3b did.
+        #[cfg(test)]
+        crate::test_support::assert_pcf_env_lock_held();
         let (pcf_host, pcf_port) = crate::sbi_path::resolve_nf_endpoint_async(
             crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
         )
@@ -10130,6 +10134,12 @@ impl NgapServer {
         let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
             return;
         };
+        // The resolutions below run on background tasks, so the check is made here,
+        // on the caller's, for any association there is to delete (#1933).
+        #[cfg(test)]
+        if state.policy_association_id.is_some() || state.ue_policy_association_id.is_some() {
+            crate::test_support::assert_pcf_env_lock_held();
+        }
         if let Some(pol_asso_id) = state.policy_association_id {
             tokio::spawn(async move {
                 let (pcf_host, pcf_port) = match crate::sbi_path::resolve_nf_endpoint_async(
@@ -25883,6 +25893,8 @@ mod tests {
     /// delivery the moment the association exists.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ue_policy_association_is_not_created_before_registration_accept() {
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
 
@@ -40749,6 +40761,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_registration_reports_location_only_through_the_filters_1424() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let (old_id, new_id) = (14_240_301u64, 14_240_302u64);
@@ -40807,6 +40821,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_initial_registration_reports_location_after_its_uplink_nas_1716() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         // The Initial Context Setup carrying the Accept needs a served GUAMI.
         let _guamis = serve_only_local_guami();
@@ -40967,6 +40983,8 @@ mod tests {
     #[tokio::test]
     async fn a_mobility_update_out_of_the_subscribed_area_reports_the_transition_1549() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let (old_id, new_id) = (15_490_101u64, 15_490_102u64);
@@ -41123,6 +41141,8 @@ mod tests {
     #[tokio::test]
     async fn a_registration_update_from_cm_idle_reports_connected_and_reachable_1593() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let (old_id, new_id) = (15_939_301u64, 15_939_302u64);
@@ -41234,6 +41254,8 @@ mod tests {
     #[tokio::test]
     async fn an_update_that_changes_no_cm_state_reports_no_connected_1593() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let periodic = crate::gmm_build::registration_type::PERIODIC_UPDATING;
@@ -41671,6 +41693,8 @@ mod tests {
     async fn an_initial_registration_after_unreachable_reports_reachable_1641() {
         let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -45338,6 +45362,8 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         let count = crate::namf_server::connected_reports_on_this_thread;
@@ -45454,6 +45480,8 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -45617,6 +45645,8 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -45775,6 +45805,8 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -49400,6 +49432,8 @@ mod eps_to_5gs_tests {
     // run without a sibling test touching them.
     async fn an_eps_to_5gs_forward_relocation_request_runs_end_to_end() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1933: the Registration Accept resolves the PCF for the UE policy create.
+        let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
         crate::test_support::init_context();
         // The stand-ins are loopback plaintext peers, i.e. a dev-profile deployment; the
         // same explicit statement the other SBI-calling tests in this crate make.
