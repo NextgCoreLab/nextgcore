@@ -153,18 +153,19 @@ fn now_epoch_secs() -> u64 {
 /// microseconds since the epoch. IDs used to restart at 1, so after a restart a
 /// stale PINE still holding `pe-2` heartbeated, or relayed through, whichever
 /// element the new process numbered 2 (TS 23.542 §8.8: the PIN server
-/// identifies an element by the identifier it assigned). Seeding from the
-/// clock keeps IDs increasing across restarts (so "lowest id" still means
-/// "registered first", PIND-07) without persisting a counter: a restart
-/// happens more than a microsecond after the last allocation of the previous
-/// process, and allocations run far slower than one per microsecond.
+/// identifies an element by the identifier it assigned).
+///
+/// #1953 (R32 on #1950): the seed is random, not the wall clock. A clock
+/// stepped backwards could re-issue the previous process's IDs, and a
+/// clock-derived ID tells a prober roughly what IDs exist. 40 random bits:
+/// two process lifetimes overlap only if one's run of IDs reaches the other's,
+/// with odds about (n + m) / 2^40 per restart, and the sequence still
+/// increases within a process (PIND-07 "lowest id").
 fn boot_id_base() -> usize {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as usize)
-        .unwrap_or(1)
-        .max(1)
+    let r = uuid::Uuid::new_v4();
+    let b = r.as_bytes();
+    let v = b[..5].iter().fold(0u64, |acc, &x| acc << 8 | u64::from(x));
+    (v as usize).max(1)
 }
 
 /// Extract the numeric sequence from a `prefix-N` id for "lowest-id" ordering
@@ -493,9 +494,52 @@ impl PinContext {
         self.initialized.load(Ordering::SeqCst)
     }
 
+    /// `prefix-<random>-<seq>`. #1953 (R32 on #1967 M1): the 64 random bits
+    /// make every ID unguessable on its own, so creating one PIN no longer
+    /// reveals its neighbours' IDs. The trailing sequence number keeps PIND-07's
+    /// "lowest id = registered first" (`id_seq` reads the last segment).
     fn alloc_id(&self, prefix: &str) -> String {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        format!("{prefix}-{id}")
+        let r = uuid::Uuid::new_v4();
+        let b = r.as_bytes();
+        let random = b[..8].iter().fold(String::new(), |mut acc, x| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{x:02x}");
+            acc
+        });
+        format!("{prefix}-{random}-{id}")
+    }
+
+    /// #1953 (R32 on #1967): whether `caller` may read PIN `pin_id` (its owner
+    /// and membership), list it, or discover its elements: the owner or a PEMC
+    /// of the PIN (TS 23.542 §8.5: PIN management is the owner's and the
+    /// PEMC's). `NotFound` for an
+    /// unknown PIN, `PemcRequiresOwner` for anyone else, anonymous included.
+    pub fn authorize_pin_reader(
+        &self,
+        pin_id: &str,
+        caller: Option<&str>,
+    ) -> Result<(), PinContextError> {
+        let pins = self
+            .pin_networks
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        let elements = self
+            .elements
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        let pin = pins.get(pin_id).ok_or(PinContextError::NotFound)?;
+        let caller = caller.unwrap_or("");
+        // R32 on #1967: hosting an element is NOT read membership. Anyone who
+        // learns a pinId can self-register a Regular element (201), so that
+        // would let a stranger read the PIN. Only the owner and PEMCs read it,
+        // and a PEMC role is granted only with owner/PEMC approval (PIND-06).
+        // An element still reads its own record (element GET).
+        if caller_is_owner_or_pemc(pin, caller, &elements) {
+            Ok(())
+        } else {
+            Err(PinContextError::PemcRequiresOwner)
+        }
     }
 
     /// Select a PEGC candidate among the owner's registered elements
@@ -953,6 +997,28 @@ impl PinContext {
     }
 
     /// Get a PIN element by ID
+    /// [`Self::element_find`] for `caller`, authorised as heartbeat and relay
+    /// are (#1953): the element itself, the PIN owner or a PEMC of its PIN.
+    pub fn element_find_for(
+        &self,
+        element_id: &str,
+        caller: Option<&str>,
+    ) -> Result<PinElement, PinContextError> {
+        let pins = self
+            .pin_networks
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        let elements = self
+            .elements
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        authorize_element_caller(&pins, &elements, None, element_id, caller)?;
+        elements
+            .get(element_id)
+            .cloned()
+            .ok_or(PinContextError::NotFound)
+    }
+
     pub fn element_find(&self, element_id: &str) -> Option<PinElement> {
         self.elements.read().ok()?.get(element_id).cloned()
     }
@@ -1776,12 +1842,39 @@ mod tests {
             (&before.2, &after.2),
         ] {
             assert_ne!(a, b, "an ID is reused after a restart");
-            assert!(
-                id_seq(a) < id_seq(b),
-                "{a} vs {b}: IDs must keep increasing"
-            );
         }
         assert_ne!(before.0, "pin-1");
+        // #1953: within one process they still increase (PIND-07).
+        assert!(id_seq(&before.0) < id_seq(&before.1) && id_seq(&before.1) < id_seq(&before.2));
+    }
+
+    /// #1953 (R32 on #1967 M1): one ID says nothing about the next: each
+    /// carries its own 64 random bits, while the trailing sequence still orders
+    /// them. REVERT-VERIFIED: with `alloc_id` back to `prefix-<seq>`, the
+    /// random-part assertions fail.
+    #[test]
+    fn ids_are_unguessable_one_by_one_1953() {
+        let mut ctx = PinContext::new();
+        ctx.init(8);
+        let a = ctx.pin_create("Home", "imsi-a-1953").unwrap().pin_id;
+        let b = ctx.pin_create("Home", "imsi-b-1953").unwrap().pin_id;
+        let random = |id: &str| id.split('-').nth(1).unwrap_or("").to_string();
+        assert_eq!(random(&a).len(), 16, "{a}");
+        assert!(random(&a).chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(random(&a), random(&b), "{a} {b}");
+        assert_eq!(id_seq(&b), id_seq(&a) + 1, "the order is kept: {a} {b}");
+    }
+
+    /// #1953 (R32 on #1950): the seed is random, so it does not follow the
+    /// clock: two contexts made in the same microsecond still differ.
+    /// REVERT-VERIFIED: with the wall-clock seed restored, back-to-back
+    /// contexts collide often enough that the 64-pair loop fails.
+    #[test]
+    fn the_id_seed_is_random_not_the_clock_1953() {
+        let seeds: std::collections::HashSet<usize> = (0..64)
+            .map(|_| PinContext::new().next_id.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(seeds.len(), 64, "seeds repeated: not random");
     }
 
     /// #1873: a heartbeat names its PIN and comes from the element itself or
