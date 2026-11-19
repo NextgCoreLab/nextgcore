@@ -3135,6 +3135,8 @@ mod tests {
                 nf_instance_id: Some("amf-18963".to_string()),
                 callback_reference: Some("http://127.0.0.1:9/cb/sdm-notify/r".to_string()),
                 monitored_resource_uris: vec![format!("/nudm-sdm/v2/{supi}/am-data")],
+                // A record written before #1865 has no owner.
+                owner: None,
             }],
             legs: HashMap::new(),
             queues: HashMap::from([(
