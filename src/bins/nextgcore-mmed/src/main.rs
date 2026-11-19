@@ -523,8 +523,9 @@ async fn main() -> Result<()> {
     // Loopback by default: the endpoint is unauthenticated, so an operator who
     // wants it scraped from another host sets MME_METRICS_ADDR to a private
     // address on purpose (or scrapes through a sidecar).
+    let mme_metrics_addr = metrics_addr();
     match nextgcore_metrics::nes_energy::serve_metrics(
-        metrics_addr(),
+        mme_metrics_addr,
         Arc::new(|| {
             // #899 review: S6a messages not delivered because they arrived while a
             // re-established connection was in RFC 3539 REOPEN.
@@ -545,7 +546,10 @@ async fn main() -> Result<()> {
     .await
     {
         Ok((bound, _handle)) => log::info!("MME metrics on http://{bound}/metrics"),
-        Err(e) => log::warn!("MME metrics endpoint not started: {e}"),
+        // #2056: fatal at start-up under the production profile.
+        Err(e) => {
+            nextgcore_metrics::nf::listener_bind_failed("MME", "metrics", mme_metrics_addr, &e)
+        }
     }
 
     // Initialize

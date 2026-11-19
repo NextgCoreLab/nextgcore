@@ -1522,15 +1522,19 @@ async fn main() -> Result<()> {
     // exist, so the first scrape reports the real startup state rather than a zero the
     // daemon had not reached yet.
     //
-    // Non-fatal when the port is busy, matching `sgwud`: an SMF that cannot expose
-    // metrics still anchors sessions, and refusing to start would turn an observability
-    // problem into a control-plane outage. The EPC bring-up gate then fails on the
-    // absent metric, which is the honest outcome — it never silently passes.
-    match nextgcore_metrics::nes_energy::serve_metrics(metrics_addr(), Arc::new(render_metrics))
+    // #2056: a busy port is fatal at start-up under the production profile, before the
+    // SMF anchors any session (so no live traffic is lost, and the orchestrator reports
+    // the failure); under dev the SMF runs on without metrics, as it always did. This
+    // replaces "non-fatal when the port is busy": a production SMF silently without
+    // metrics is invisible to probes and alerting.
+    let smf_metrics_addr = metrics_addr();
+    match nextgcore_metrics::nes_energy::serve_metrics(smf_metrics_addr, Arc::new(render_metrics))
         .await
     {
         Ok((bound, _handle)) => log::info!("SMF metrics endpoint on http://{bound}/metrics"),
-        Err(e) => log::warn!("SMF metrics endpoint not available: {e}"),
+        Err(e) => {
+            nextgcore_metrics::nf::listener_bind_failed("SMF", "metrics", smf_metrics_addr, &e)
+        }
     }
 
     // Main async event loop

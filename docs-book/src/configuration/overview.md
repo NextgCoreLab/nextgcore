@@ -270,6 +270,10 @@ authenticated. GPSI resolution needs the UDM's `id-translation-result`, which
 this repo's `udmd` serves from the UDR's identity data (it answered `501` before
 #85 was fixed); a GPSI the UDR has no mapping for is still refused with `404`.
 
+### A listener that cannot be bound (#2056)
+
+Under the production SBI profile, an NF that cannot bind a listener it is configured with exits at start-up with status `78` (`EX_CONFIG`), logging the NF, the listener and the address. This covers its `/metrics` endpoint and the udmd NES and nsacfd SLA-observe metrics listeners. It does so before serving anything, so the orchestrator reports a crash loop rather than an NF that runs on silently without metrics. Under `dev` the NF logs a warning and runs on without the listener, which was the behaviour of every profile before #2056.
+
 ### Request paths every SBI server refuses (#1934, #1939)
 
 Before routing, before the callback exemption and before any OAuth2 or resource-scope check, every nextgcore-sbi server answers `400 INVALID_MSG_FORMAT` to a request path that has:

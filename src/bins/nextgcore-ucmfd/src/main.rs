@@ -574,14 +574,18 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
     log::info!("SBI server listening on {addr}");
+    let ucmf_metrics_addr = metrics_addr(std::env::var("UCMF_METRICS_ADDR").ok().as_deref());
     match nextgcore_metrics::nes_energy::serve_metrics(
-        metrics_addr(std::env::var("UCMF_METRICS_ADDR").ok().as_deref()),
+        ucmf_metrics_addr,
         Arc::new(|| render_metrics(UCMF.get().map(|u| u.as_ref()))),
     )
     .await
     {
         Ok((bound, _handle)) => log::info!("UCMF metrics on http://{bound}/metrics"),
-        Err(e) => log::warn!("UCMF metrics endpoint not started: {e}"),
+        // #2056: fatal at start-up under the production profile.
+        Err(e) => {
+            nextgcore_metrics::nf::listener_bind_failed("UCMF", "metrics", ucmf_metrics_addr, &e)
+        }
     }
 
     global_context().set_nrf_uri(&settings.nrf_uri).await;

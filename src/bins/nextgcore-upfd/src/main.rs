@@ -557,15 +557,16 @@ async fn main() -> Result<()> {
     // #380: the Prometheus endpoint. Its sources (installed below, once the data plane
     // is shared) are the SAME handles the load gauge uses, so the metric and the NRF
     // `/load` report can never disagree about how many sessions this UPF holds.
-    // Non-fatal when the port is busy, matching `sgwud`: a UPF that cannot expose metrics
-    // still forwards packets, and refusing to start would turn an observability problem
-    // into a user-plane outage. A readiness gate then fails on the absent metric, which is
-    // the honest outcome — it never silently passes.
-    match nextgcore_metrics::nes_energy::serve_metrics(metrics_addr(), Arc::new(render_metrics))
+    // #2056: a busy port is fatal at start-up under the production profile, before the
+    // UPF forwards anything; under dev it runs on without metrics, as it always did.
+    let upf_metrics_addr = metrics_addr();
+    match nextgcore_metrics::nes_energy::serve_metrics(upf_metrics_addr, Arc::new(render_metrics))
         .await
     {
         Ok((bound, _handle)) => log::info!("UPF metrics endpoint on http://{bound}/metrics"),
-        Err(e) => log::warn!("UPF metrics endpoint not available: {e}"),
+        Err(e) => {
+            nextgcore_metrics::nf::listener_bind_failed("UPF", "metrics", upf_metrics_addr, &e)
+        }
     }
 
     // Run data plane (if enabled)
