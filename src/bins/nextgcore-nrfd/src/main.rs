@@ -5308,6 +5308,32 @@ fn enforce_client_authentication(
     Ok(())
 }
 
+/// #1964 (the #1828 residual): a type-targeted token carrying a resource-level
+/// scope was granted because EVERY registered producer of the type allowed that
+/// scope (#1828). With `aud` the bare NF type, a producer that registered later,
+/// or one that would have refused the scope, accepted it too: a token minted
+/// while only a rogue AUSF was registered carried scopes the legitimate AUSF then
+/// honoured. Such a token's `aud` is therefore the NF instance IDs the scope was
+/// evaluated over (TS 29.510 Table 6.3.5.2.4-1: the producer's NF instance ID(s)
+/// "if the exact NF instance(s)" is known). A token with only service-level
+/// scopes keeps the NF-type audience, so a producer that scales out still
+/// accepts it; an instance-targeted token is already pinned.
+fn pin_audience_to_acceptors(
+    claims: &mut serde_json::Value,
+    target_instance: Option<&NfProfile>,
+    acceptors: &[NfProfile],
+    granted: &[String],
+) {
+    if target_instance.is_some() || !granted.iter().any(|s| s.contains(':')) {
+        return;
+    }
+    let ids: Vec<&str> = acceptors
+        .iter()
+        .map(|p| p.nf_instance_id.as_str())
+        .collect();
+    claims["aud"] = serde_json::json!(ids);
+}
+
 /// nrfd-07: build the AccessTokenClaims (TS 29.510 §6.3.5.2.4). When the grant
 /// resolved a specific producer instance, `aud` becomes that instance-ID array
 /// and the optional producer claims (`producerPlmnId`, `producerSnssaiList`,
@@ -5835,7 +5861,7 @@ async fn handle_access_token_request_with_policy(
     // nrfd-07: `iss` is the NRF NF Instance ID (TS 29.510 §6.3.5.2.4); when a
     // producer instance was pinned, `aud` is its instance-ID array and the
     // optional producer/consumer claims are populated.
-    let claims_json = build_access_token_claims(
+    let mut claims_json = build_access_token_claims(
         nrf_instance_id(),
         subject,
         &target_nf_type,
@@ -5844,6 +5870,12 @@ async fn handle_access_token_request_with_policy(
         &scope,
         now,
         now + expires_in,
+    );
+    pin_audience_to_acceptors(
+        &mut claims_json,
+        target_instance.as_ref(),
+        &acceptors,
+        &granted_scopes,
     );
     let claims_str = claims_json.to_string();
 
@@ -6436,7 +6468,7 @@ mod tests {
                 "serviceName": "nausf-auth",
                 "allowedNfTypes": ["AMF", "UDM", "SCP"],
                 "allowedOperationsPerNfType": {
-                    "AMF": ["nausf-auth"],
+                    "AMF": ["nausf-auth", nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS],
                     "UDM": ["nausf-auth", nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS],
                     "SCP": ["nausf-auth"]
                 }
@@ -6475,8 +6507,21 @@ mod tests {
             &[],
             &[],
         )
-        .expect("the AMF keeps its service scope");
-        assert_eq!(amf, vec!["nausf-auth".to_string()]);
+        .expect("the AMF is authorized");
+        // #1964: the AMF holds the ue-authentications scope too (authenticate);
+        // the SCP, which only relays, does not.
+        assert_eq!(amf, requested, "the AMF gets both scopes");
+        let scp = authorize_access_token(
+            &auth_consumer("SCP"),
+            "SCP",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the SCP keeps its service scope");
+        assert_eq!(scp, vec!["nausf-auth".to_string()]);
     }
 
     /// #1811: only the UDM is granted the AuthenticationSubscription scope.
@@ -8232,6 +8277,101 @@ mod tests {
     /// REVERT-VERIFIED: with the handler passing `&producers` instead of
     /// `&acceptors` to `authorize_access_token_for` (the pre-R26 call), the
     /// second request is granted the K-read scope and the second assertion fails.
+    /// **#1964.** A type-targeted token that carries a resource scope is pinned
+    /// to the producers the scope was evaluated over: its `aud` is their NF
+    /// instance IDs, so a producer that registers later (or a legitimate one
+    /// while only a rogue was registered at mint time) does not accept it. A
+    /// token with only the service scope keeps `aud` the NF type.
+    ///
+    /// REVERT-VERIFIED: with `pin_audience_to_acceptors` returning early always,
+    /// the resource-scoped token's `aud` is "UDR" and the first assertion fails.
+    #[tokio::test]
+    async fn a_resource_scoped_token_is_pinned_to_its_evaluated_producers_1964() {
+        use serde_json::json;
+        // An NF type no other test registers, so the acceptor set is exactly the
+        // producer registered here.
+        const READ: &str = "nnssaaf-nssaa:test-1964";
+        let mgr = nf_manager();
+        let udm_id = "19640000-0000-4000-8000-0000000000d1";
+        let udr_id = "19640000-0000-4000-8000-0000000000a1"; // the NSSAAF
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": udm_id, "nfType": "UDM", "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": udr_id, "nfType": "NSSAAF", "nfStatus": "REGISTERED",
+                "nfServices": [{
+                    "serviceInstanceId": "nssaaf-1964", "serviceName": "nnssaaf-nssaa",
+                    "allowedNfTypes": ["UDM"],
+                    "allowedOperationsPerNfType": { "UDM": ["nnssaaf-nssaa", READ] }
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let policy = policy_without_client_auth();
+        let ask = |scope: &str| {
+            let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            r.http.set_content(
+                json!({
+                    "grant_type": "client_credentials", "nfInstanceId": udm_id,
+                    "nfType": "UDM", "targetNfType": "NSSAAF", "scope": scope,
+                })
+                .to_string(),
+            );
+            r
+        };
+        let token_claims = |resp: &SbiResponse| -> serde_json::Value {
+            use base64::Engine;
+            assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let token = body["access_token"].as_str().expect("access_token");
+            let payload = token.split('.').nth(1).expect("payload");
+            serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .expect("base64url"),
+            )
+            .expect("claims JSON")
+        };
+
+        let pinned = token_claims(
+            &handle_access_token_request_with_policy(
+                &ask(&format!("nnssaaf-nssaa {READ}")),
+                &policy,
+            )
+            .await,
+        );
+        assert!(
+            pinned["scope"].as_str().unwrap_or_default().contains(READ),
+            "control: the resource scope is granted ({})",
+            pinned["scope"]
+        );
+        assert_eq!(
+            pinned["aud"],
+            json!([udr_id]),
+            "a resource-scoped token is pinned to the producer it was evaluated over"
+        );
+
+        let service_only = token_claims(
+            &handle_access_token_request_with_policy(&ask("nnssaaf-nssaa"), &policy).await,
+        );
+        assert_eq!(
+            service_only["aud"],
+            json!("NSSAAF"),
+            "a service-scope token keeps the NF-type audience"
+        );
+
+        for id in [udm_id, udr_id] {
+            mgr.deregister(id).ok();
+        }
+    }
+
     #[tokio::test]
     async fn the_token_endpoint_withholds_k_read_when_any_udr_would_refuse_it_1828() {
         use serde_json::json;

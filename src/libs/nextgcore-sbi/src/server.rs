@@ -92,6 +92,12 @@ pub struct SbiServerConfig {
     /// check, preserving prior behaviour. Only consulted when
     /// `require_oauth2` is enabled.
     pub oauth2_expected_audience: Option<String>,
+    /// #1964: this NF's own NF Instance ID, ALSO accepted as the token's `aud`
+    /// (TS 29.510 Table 6.3.5.2.4-1: `aud` is the producer's NF type, or the NF
+    /// instance ID(s) the token is for). nrfd pins a resource-scoped token's
+    /// `aud` to the instances it evaluated the scope against, so a producer that
+    /// enforces or admits a resource scope must recognise its own instance ID.
+    pub oauth2_expected_audience_instance: Option<String>,
     /// #1421: callback routes this NF serves that are admitted WITHOUT a bearer
     /// token when `require_oauth2` is enabled, because the notification
     /// operation does not use OAuth 2.0 (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE).
@@ -162,6 +168,7 @@ impl Default for SbiServerConfig {
             oauth2_jwks: None,
             oauth2_jwks_uri: None,
             oauth2_expected_audience: None,
+            oauth2_expected_audience_instance: None,
             oauth2_callback_exemptions: Vec::new(),
             oauth2_resource_scopes: None,
             max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
@@ -224,6 +231,13 @@ impl SbiServerConfig {
     /// Set the expected OAuth2 `aud` claim from an [`NfType`] (T1.2).
     pub fn with_expected_audience_nf_type(mut self, nf_type: NfType) -> Self {
         self.oauth2_expected_audience = Some(nf_type.to_str().to_string());
+        self
+    }
+
+    /// Also accept a token whose `aud` names `nf_instance_id`, this NF's own
+    /// instance (#1964). See [`Self::oauth2_expected_audience_instance`].
+    pub fn with_expected_audience_instance(mut self, nf_instance_id: impl Into<String>) -> Self {
+        self.oauth2_expected_audience_instance = Some(nf_instance_id.into());
         self
     }
 
@@ -341,6 +355,8 @@ struct OAuthVerifier {
     /// Expected audience (the NF's own type/instanceId); `None` skips the
     /// audience check, preserving prior behaviour.
     expected_audience: Option<String>,
+    /// #1964: this NF's own instance ID, also accepted as `aud`.
+    expected_audience_instance: Option<String>,
     /// #1421: callback routes admitted on their own callback token instead.
     callback_exemptions: Vec<OAuth2CallbackExemption>,
     /// #1811: the resource-level scope each request needs, if any.
@@ -368,6 +384,7 @@ impl OAuthVerifier {
         Some(Self {
             keys,
             expected_audience: config.oauth2_expected_audience.clone(),
+            expected_audience_instance: config.oauth2_expected_audience_instance.clone(),
             callback_exemptions: config.oauth2_callback_exemptions.clone(),
             resource_scopes: config.oauth2_resource_scopes,
         })
@@ -425,12 +442,18 @@ impl OAuthVerifier {
         // #1918: the scope the token grants, read before `bearer_decision`
         // consumes the claims and handed on only if it accepts them.
         let granted = claims.as_ref().map(|c| c.scope.clone()).unwrap_or_default();
-        let sub = bearer_decision(
-            claims,
-            auth_header,
-            self.expected_audience.as_deref(),
-            required_scope,
-        )?;
+        // #1964: a token whose `aud` names THIS instance is for this producer,
+        // whatever the NF-type audience: the audience check has been met.
+        let for_this_instance = match (&claims, self.expected_audience_instance.as_deref()) {
+            (Ok(c), Some(id)) => crate::oauth::check_audience(&c.aud, id).is_ok(),
+            _ => false,
+        };
+        let expected_audience = if for_this_instance {
+            None
+        } else {
+            self.expected_audience.as_deref()
+        };
+        let sub = bearer_decision(claims, auth_header, expected_audience, required_scope)?;
         match resource_refusal {
             Some(refusal) => Err(refusal),
             None => Ok((sub, granted)),
@@ -2256,6 +2279,7 @@ mod tests {
         let unconfigured = OAuthVerifier {
             keys: OAuthKeySource::Unconfigured,
             expected_audience: None,
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
@@ -2270,6 +2294,7 @@ mod tests {
         let static_v = OAuthVerifier {
             keys: OAuthKeySource::Static(serde_json::json!({"keys": []})),
             expected_audience: None,
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
@@ -2287,6 +2312,7 @@ mod tests {
                 "http://127.0.0.1:1/nnrf-oauth2/v1/jwks",
             )),
             expected_audience: None,
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
@@ -2791,6 +2817,15 @@ mod tests {
 
     /// [`token_jwks_with_aud`] with an explicit `scope` claim (#1811).
     fn token_jwks_with_scope(aud: &str, scope: &str) -> (String, serde_json::Value) {
+        token_jwks_with_aud_claim(serde_json::json!(aud), scope)
+    }
+
+    /// A token whose `aud` claim is exactly `aud` (a string or, #1964, an array
+    /// of NF instance IDs).
+    fn token_jwks_with_aud_claim(
+        aud: serde_json::Value,
+        scope: &str,
+    ) -> (String, serde_json::Value) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -2828,6 +2863,7 @@ mod tests {
         let verifier = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("UDM".into()),
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
@@ -2839,6 +2875,7 @@ mod tests {
         let wrong = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("AMF".into()),
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
@@ -2855,10 +2892,58 @@ mod tests {
         let none = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
         assert!(none.authorize(Some(&header), None, None).await.is_ok());
+    }
+
+    /// **#1964.** A producer that knows its own instance ID accepts a token whose
+    /// `aud` names that instance (nrfd pins resource-scoped tokens to the
+    /// instances it evaluated), still accepts its NF type, and refuses a token
+    /// pinned to other instances: the legitimate AUSF no longer honours a token
+    /// minted against a rogue AUSF alone.
+    ///
+    /// REVERT-VERIFIED: with `for_this_instance` forced false, the pinned token
+    /// is refused and the first assertion fails.
+    #[tokio::test]
+    async fn a_token_pinned_to_this_instance_is_accepted_and_one_pinned_elsewhere_is_not_1964() {
+        let verifier = |jwks: serde_json::Value| OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks),
+            expected_audience: Some("AUSF".into()),
+            expected_audience_instance: Some("ausf-legit".into()),
+            callback_exemptions: Vec::new(),
+            resource_scopes: None,
+        };
+        let header = |t: &str| format!("Bearer {t}");
+
+        let (token, jwks) =
+            token_jwks_with_aud_claim(serde_json::json!(["ausf-legit", "ausf-2"]), "nausf-auth");
+        assert!(verifier(jwks)
+            .authorize(Some(&header(&token)), Some("nausf-auth"), None)
+            .await
+            .is_ok());
+
+        let (token, jwks) = token_jwks_with_aud_claim(serde_json::json!("AUSF"), "nausf-auth");
+        assert!(
+            verifier(jwks)
+                .authorize(Some(&header(&token)), Some("nausf-auth"), None)
+                .await
+                .is_ok(),
+            "the NF-type audience is still accepted"
+        );
+
+        let (token, jwks) =
+            token_jwks_with_aud_claim(serde_json::json!(["ausf-rogue"]), "nausf-auth");
+        let err = verifier(jwks)
+            .authorize(Some(&header(&token)), Some("nausf-auth"), None)
+            .await
+            .expect_err("pinned to another instance");
+        assert!(
+            matches!(err, BearerRefusal::ClaimMismatch { claim: "aud", .. }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2868,6 +2953,7 @@ mod tests {
         let verifier = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: None,
         };
@@ -2904,6 +2990,7 @@ mod tests {
         let verifier_for = |jwks: serde_json::Value| OAuthVerifier {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
+            expected_audience_instance: None,
             callback_exemptions: Vec::new(),
             resource_scopes: Some(crate::resource_scope::required_resource_scope),
         };

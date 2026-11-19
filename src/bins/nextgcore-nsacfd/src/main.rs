@@ -1721,8 +1721,13 @@ fn custom_op_body(request: &SbiRequest) -> Result<serde_json::Value, SbiResponse
 /// insufficient_scope before the router runs, so no quota changes. One function
 /// so the tests run the listener's real posture.
 fn nsacf_oauth2_claims(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    // #1964: nrfd pins a resource-scoped token's `aud` to the NSACF instances it
+    // evaluated the scope over, so this NSACF accepts its own instance ID too.
     config
         .with_expected_audience_nf_type(NfType::Nsacf)
+        .with_expected_audience_instance(
+            nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Nsacf).to_string(),
+        )
         .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
 }
 
@@ -2854,6 +2859,26 @@ nsacf:
         assert!(nsacf.sla.is_some(), "raw sla value captured verbatim");
     }
     use super::*;
+
+    /// **#1964.** nrfd pins a resource-scoped token's `aud` to the NSACF
+    /// instances it evaluated the scope over (#1892's `local-configs-update`),
+    /// so the listener accepts this NSACF's own instance ID as well as its NF
+    /// type. The audience semantics are nextgcore-sbi's
+    /// `a_token_pinned_to_this_instance_is_accepted_and_one_pinned_elsewhere_is_not_1964`.
+    ///
+    /// REVERT-VERIFIED: with `.with_expected_audience_instance(..)` removed from
+    /// `nsacf_oauth2_claims`, this fails.
+    #[test]
+    fn the_listener_accepts_its_own_instance_as_audience_1964() {
+        let cfg = nsacf_oauth2_claims(NextgcoreSbiServerConfig::new(
+            "127.0.0.1:0".parse().expect("addr"),
+        ));
+        assert_eq!(
+            cfg.oauth2_expected_audience_instance.as_deref(),
+            Some(nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Nsacf))
+        );
+        assert_eq!(cfg.oauth2_expected_audience.as_deref(), Some("NSACF"));
+    }
     use nextgcore_sbi::client::SbiClient;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use serde_json::json;
