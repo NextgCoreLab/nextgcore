@@ -515,7 +515,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id] => match method {
             "GET" => handle_mbs_session_get(session_id).await,
             "PATCH" => handle_mbs_session_update(session_id, &request).await,
-            "DELETE" => handle_mbs_session_release(session_id).await,
+            "DELETE" => handle_mbs_session_release(session_id, &request).await,
             _ => send_method_not_allowed(method, "mbs-sessions/{id}"),
         },
         // #1796: the AMF's Namf_MBSBroadcast ContextStatusNotify to the notifyUri
@@ -619,6 +619,13 @@ fn spec_tmgi_from(tmgi: &Tmgi) -> types::Tmgi {
 /// Handle MBS Session Create (TS 29.532 §5.3.2.2, CreateReqData/CreateRspData)
 async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Session Create");
+    // #1863: the session is bound to the consumer's verified identity, refused
+    // before anything is read or allocated.
+    let owner =
+        match nextgcore_sbi::owner_binding::owner_for_new_resource(request, "MBS Session Create") {
+            Ok(owner) => owner,
+            Err(refused) => return *refused,
+        };
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -664,7 +671,18 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
         .as_ref()
         .and_then(|id| id.tmgi.as_ref());
     let tmgi = match spec_tmgi {
-        Some(t) => context_tmgi_from(Some(t)),
+        Some(t) => {
+            let tmgi = context_tmgi_from(Some(t));
+            // #1863: a TMGI this MB-SMF allocated to another consumer cannot
+            // name this consumer's session.
+            let allocation = ctx.read().ok().and_then(|c| c.tmgi_allocation(&tmgi));
+            if let Some(allocated_to) = allocation {
+                if !may_manage(allocated_to.as_deref(), request) {
+                    return tmgi_not_owned("MBS Session Create", &tmgi);
+                }
+            }
+            tmgi
+        }
         None => {
             // No TMGI: allocate one. TS 29.571's `MbsSession` is
             // `anyOf [mbsSessionId, tmgiAllocReq]`, and that `anyOf` is deliberately
@@ -675,8 +693,12 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
             // and the schema's intent satisfiable. Stated rather than silent: a
             // conformance suite exercising the `anyOf` will see it accepted.
             let allocated = ctx.read().ok().and_then(|c| {
-                let (tmgis, _expiry) =
-                    c.tmgi_allocate(&default_plmn(), 1, context::TMGI_DEFAULT_TTL_SECS);
+                let (tmgis, _expiry) = c.tmgi_allocate_owned(
+                    &default_plmn(),
+                    1,
+                    context::TMGI_DEFAULT_TTL_SECS,
+                    owner.as_deref(),
+                );
                 tmgis.into_iter().next()
             });
             match allocated {
@@ -693,10 +715,19 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    let session = if let Ok(context) = ctx.read() {
-        context.session_add(tmgi, session_type)
-    } else {
-        None
+    let session = match ctx.read() {
+        // #1863 (R32 on #1943): the TMGI is claimed for this consumer under the
+        // same locks as the add; one allocated to another consumer in the
+        // meantime is refused here too.
+        Ok(context) => match context.session_add_claiming(tmgi.clone(), session_type, owner, |o| {
+            may_manage(o, request)
+        }) {
+            Ok(session) => session,
+            Err(context::TmgiRefusal::NotOwned(t)) => {
+                return tmgi_not_owned("MBS Session Create", &t);
+            }
+        },
+        Err(_) => None,
     };
 
     match session {
@@ -944,6 +975,17 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
         }
     });
 
+    // #1863: only the consumer that created the session, before any change.
+    if let Some(refused) = session.as_ref().and_then(|s| {
+        nextgcore_sbi::owner_binding::refuse_non_owner(
+            s.owner.as_deref(),
+            request,
+            "MBS Session Update",
+        )
+    }) {
+        return refused;
+    }
+
     match session {
         Some(mut session) => {
             // #76: `activityStatus`, `mbsServInfo` (QoS) and `mbsSecurityContext`
@@ -1175,6 +1217,8 @@ pub(crate) async fn delete_in_lane(c: &AmfMbsContext) -> Option<namf_client::Con
         .read()
         .is_ok_and(|ctx| ctx.amf_context_in_use(c))
     {
+        // #1930: its notify tokens went to the session that holds the context now
+        // (`record_amf_context`), and go with the context's own release.
         log::info!(
             "MBS: AMF {}:{} MBS context {} is in use again; its ContextDelete is dropped",
             c.host,
@@ -1249,10 +1293,11 @@ fn retire_amf_notify_token(c: &AmfMbsContext, outcome: namf_client::ContextDelet
 }
 
 /// #1796: the AMF context `c` is released (or given up on): its
-/// ContextStatusNotify token is no longer admitted.
+/// ContextStatusNotify tokens are no longer admitted (#1930: every token of that
+/// context, whichever session's create minted it).
 fn forget_amf_notify_token(c: &AmfMbsContext) {
     if let Ok(ctx) = mbsmf_self().read() {
-        ctx.forget_amf_notify_token(&c.notify_token);
+        ctx.forget_amf_context_tokens(c);
     }
 }
 
@@ -1325,10 +1370,25 @@ fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExem
 }
 
 /// Handle MBS Session Release (TS 23.247 7.2.3)
-async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
+async fn handle_mbs_session_release(session_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Session Release: {session_id}");
 
     let pool_id = parse_session_id(session_id);
+
+    // #1863: only the consumer that created the session releases it, checked
+    // before the N4mb release or anything else; a stale or foreign DELETE used
+    // to release another consumer's session and its TMGI binding.
+    let ctx = mbsmf_self();
+    let found = pool_id.and_then(|id| ctx.read().ok()?.session_find_by_id(id));
+    if let Some(refused) = found.as_ref().and_then(|s| {
+        nextgcore_sbi::owner_binding::refuse_non_owner(
+            s.owner.as_deref(),
+            request,
+            "MBS Session Release",
+        )
+    }) {
+        return refused;
+    }
 
     // #76: release the N4mb session on the MB-UPF BEFORE dropping local state. The
     // old code called `session_remove` alone, whose log line said "releasing N4mb
@@ -2236,6 +2296,13 @@ async fn handle_context_update_amf(
 /// [mbsmfd-04] Allocates `tmgiNumber` fresh TMGIs and/or refreshes a supplied
 /// `tmgiList`, returning `TmgiAllocated` with one common `expirationTime`.
 async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
+    // #1863: TMGIs are allocated to the consumer's verified identity, refused
+    // before anything is read or allocated.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(request, "TMGI Allocate")
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let body = match &request.http.content {
         Some(content) => content,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -2263,26 +2330,38 @@ async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
     let mut allocated: Vec<Tmgi> = Vec::new();
     let mut expiry = 0u64;
 
-    // Refresh any supplied TMGIs (TS 29.532 §5.2.2.2).
-    if let Some(refresh) = &req.tmgi_list {
-        let ctmgis: Vec<Tmgi> = refresh.iter().map(|t| context_tmgi_from(Some(t))).collect();
-        expiry = context.tmgi_refresh(&ctmgis, ttl);
-        allocated.extend(ctmgis);
-    }
-    // Allocate the requested number of fresh TMGIs.
-    if let Some(count) = req.tmgi_number.filter(|n| *n > 0) {
-        let (fresh, e) = context.tmgi_allocate(&plmn, count, ttl);
-        expiry = e;
-        allocated.extend(fresh);
-    }
-    drop(context);
-
-    if allocated.is_empty() {
+    let fresh_count = req.tmgi_number.filter(|n| *n > 0);
+    let refresh: Vec<Tmgi> = req
+        .tmgi_list
+        .iter()
+        .flatten()
+        .map(|t| context_tmgi_from(Some(t)))
+        .collect();
+    if refresh.is_empty() && fresh_count.is_none() {
         return send_bad_request(
             "TmgiAllocate requires tmgiNumber and/or tmgiList",
             Some("MANDATORY_IE_MISSING"),
         );
     }
+    // Refresh any supplied TMGIs (TS 29.532 §5.2.2.2). #1863: only TMGIs
+    // allocated to this consumer, and checked before anything is allocated, so a
+    // refused request changes nothing.
+    if !refresh.is_empty() {
+        match context.tmgi_refresh(&refresh, ttl, |o| may_manage(o, request)) {
+            Ok(e) => expiry = e,
+            Err(context::TmgiRefusal::NotOwned(t)) => {
+                return tmgi_not_owned("TMGI Allocate (refresh)", &t);
+            }
+        }
+        allocated.extend(refresh);
+    }
+    // Allocate the requested number of fresh TMGIs.
+    if let Some(count) = fresh_count {
+        let (fresh, e) = context.tmgi_allocate_owned(&plmn, count, ttl, owner.as_deref());
+        expiry = e;
+        allocated.extend(fresh);
+    }
+    drop(context);
 
     let spec_list: Vec<types::Tmgi> = allocated.iter().map(spec_tmgi_from).collect();
     let rsp = types::TmgiAllocated {
@@ -2299,9 +2378,27 @@ async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
+/// #1863: whether `request` may refresh, deallocate, update or release a
+/// resource allocated to `owner` (`nextgcore_sbi::owner_binding`).
+fn may_manage(owner: Option<&str>, request: &SbiRequest) -> bool {
+    nextgcore_sbi::owner_binding::non_owner_refusal(owner, request).is_none()
+}
+
+/// #1863: the 403 for a TMGI that is not allocated to the requester.
+fn tmgi_not_owned(operation: &str, tmgi: &Tmgi) -> SbiResponse {
+    log::debug!("{operation} refused: TMGI {tmgi:?} is not allocated to the requester");
+    nextgcore_sbi::server::send_forbidden(
+        &format!("{operation}: a listed TMGI is not allocated to the requester"),
+        None,
+    )
+}
+
 /// Handle TMGI Deallocate (TS 29.532 §5.2.2.3, DELETE /nmbsmf-tmgi/v1/tmgi).
-/// [mbsmfd-04] A `tmgi-list` query param selects specific TMGIs; absent means
-/// deallocate all. Always returns 204 No Content.
+/// [mbsmfd-04] The `tmgi-list` query param names the TMGIs to deallocate.
+/// #1863: it is mandatory (TS 29.532 §5.2.2.3: the consumer deallocates the
+/// TMGIs it lists); an absent one used to deallocate the WHOLE pool, every
+/// consumer's TMGIs, and is now 400 `MANDATORY_QUERY_PARAM_MISSING`. Every listed
+/// TMGI still allocated must be the requester's, else 403 and nothing is freed.
 ///
 /// `tmgi-list` is a JSON array in a query parameter, so every conformant sender
 /// percent-encodes it (TS 29.500 §5.2.10.2): `[`, `{`, `"` and `:` are all
@@ -2313,21 +2410,37 @@ async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
 async fn handle_tmgi_deallocate(request: &SbiRequest) -> SbiResponse {
     let ctx = mbsmf_self();
 
-    let freed = if let Some(raw) = request.http.get_param("tmgi-list") {
-        match serde_json::from_str::<Vec<types::Tmgi>>(raw) {
-            Ok(list) => {
-                let ctmgis: Vec<Tmgi> = list.iter().map(|t| context_tmgi_from(Some(t))).collect();
-                ctx.read().map(|c| c.tmgi_deallocate(&ctmgis)).unwrap_or(0)
-            }
-            Err(e) => {
-                return send_bad_request(
-                    &format!("Invalid tmgi-list query parameter: {e}"),
-                    Some("INVALID_QUERY_PARAM"),
-                )
-            }
+    let Some(raw) = request.http.get_param("tmgi-list") else {
+        return send_bad_request(
+            "TMGI Deallocate requires the tmgi-list query parameter (TS 29.532 §5.2.2.3)",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
+        );
+    };
+    let list = match serde_json::from_str::<Vec<types::Tmgi>>(raw) {
+        // minItems 1 (TS29532_Nmbsmf_TMGI.yaml).
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => {
+            return send_bad_request(
+                "tmgi-list must name at least one TMGI",
+                Some("INVALID_QUERY_PARAM"),
+            )
         }
-    } else {
-        ctx.read().map(|c| c.tmgi_deallocate_all()).unwrap_or(0)
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid tmgi-list query parameter: {e}"),
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
+    };
+    let ctmgis: Vec<Tmgi> = list.iter().map(|t| context_tmgi_from(Some(t))).collect();
+    let freed = match ctx.read() {
+        Ok(c) => match c.tmgi_deallocate(&ctmgis, |o| may_manage(o, request)) {
+            Ok(n) => n,
+            Err(context::TmgiRefusal::NotOwned(t)) => {
+                return tmgi_not_owned("TMGI Deallocate", &t);
+            }
+        },
+        Err(_) => 0,
     };
 
     log::info!("TMGI Deallocate: freed {freed} TMGI(s)");
@@ -2966,6 +3079,21 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     }
 }
 
+/// #1863: the verified consumer the crate's tests call the router as.
+#[cfg(test)]
+pub(crate) const TEST_CONSUMER_1863: &str = "c0c0c0c0-1863-4000-8000-0000000000c0";
+
+/// `request` as [`TEST_CONSUMER_1863`], unless it already names a verified
+/// identity, so tests that create and then manage a TMGI or session pass under
+/// both SBI profiles (`production` refuses an anonymous create).
+#[cfg(test)]
+pub(crate) fn as_test_consumer(mut request: SbiRequest) -> SbiRequest {
+    if request.peer_cert_nf_instance_id.is_none() && request.oauth2_subject.is_none() {
+        request.oauth2_subject = Some(TEST_CONSUMER_1863.to_string());
+    }
+    request
+}
+
 #[cfg(test)]
 mod tests {
     /// #1796: only a broadcast session with an MBS service area gets an AMF
@@ -3007,6 +3135,13 @@ mod tests {
     }
 
     use super::*;
+
+    /// #1863: the router as [`TEST_CONSUMER_1863`]. Shadows the glob import; a
+    /// test that needs another caller sets its identity, or calls
+    /// `super::mbsmf_sbi_request_handler` for an anonymous one.
+    async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+        super::mbsmf_sbi_request_handler(as_test_consumer(request)).await
+    }
     // #417: the Setup Response is read back by the generated codec's strict
     // decode and pinned whole against the hand-derived octets
     // (n2_mbs_transfer/golden.rs), not against the hand-written codec.
@@ -5046,6 +5181,169 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1863: TMGIs and MBS sessions are managed only by the consumer they were
+/// allocated to / created by, Deallocate needs its `tmgi-list`, through the
+/// real router.
+#[cfg(test)]
+mod tmgi_session_owner_tests_1863 {
+    use super::*;
+
+    const NEF_A: &str = "aaaaaaaa-1863-4000-8000-0000000000a1";
+    const NEF_B: &str = "bbbbbbbb-1863-4000-8000-0000000000b2";
+
+    fn as_nf(mut r: SbiRequest, id: &str) -> SbiRequest {
+        r.oauth2_subject = Some(id.to_string());
+        r
+    }
+
+    async fn allocate(owner: &str, n: u32) -> Vec<types::Tmgi> {
+        let rsp = mbsmf_sbi_request_handler(as_nf(
+            SbiRequest::post("/nmbsmf-tmgi/v1/tmgi")
+                .with_body(format!(r#"{{"tmgiNumber":{n}}}"#), "application/json"),
+            owner,
+        ))
+        .await;
+        assert_eq!(rsp.status, 200, "{:?}", rsp.http.content);
+        serde_json::from_str::<types::TmgiAllocated>(rsp.http.content.as_deref().unwrap())
+            .unwrap()
+            .tmgi_list
+    }
+
+    fn deallocate(list: &[types::Tmgi]) -> SbiRequest {
+        SbiRequest::delete("/nmbsmf-tmgi/v1/tmgi")
+            .with_param("tmgi-list", serde_json::to_string(list).unwrap())
+    }
+
+    /// REVERT-VERIFIED: with the missing-`tmgi-list` arm restored to
+    /// "deallocate all" the bare DELETE answers 204 and empties the pool; with
+    /// `may_manage` always true NEF-B's DELETE frees NEF-A's TMGI.
+    #[tokio::test]
+    async fn tmgi_deallocate_needs_a_list_and_frees_only_the_callers_tmgis_1863() {
+        mbsmf_context_init(256);
+        let mine = allocate(NEF_A, 2).await;
+        let theirs = allocate(NEF_B, 1).await;
+        let held = |list: &[types::Tmgi]| {
+            list.iter()
+                .filter(|t| {
+                    mbsmf_self()
+                        .read()
+                        .unwrap()
+                        .tmgi_allocation(&context_tmgi_from(Some(t)))
+                        .is_some()
+                })
+                .count()
+        };
+        let all: Vec<types::Tmgi> = mine.iter().chain(&theirs).cloned().collect();
+
+        // No tmgi-list: refused, nothing freed (it used to free the whole pool).
+        let rsp =
+            mbsmf_sbi_request_handler(as_nf(SbiRequest::delete("/nmbsmf-tmgi/v1/tmgi"), NEF_B))
+                .await;
+        assert_eq!(rsp.status, 400);
+        assert!(rsp
+            .http
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("MANDATORY_QUERY_PARAM_MISSING"));
+        assert_eq!(held(&all), 3);
+
+        // NEF-B lists one of NEF-A's TMGIs beside its own: 403, nothing freed.
+        let mixed = [theirs[0].clone(), mine[0].clone()];
+        let rsp = mbsmf_sbi_request_handler(as_nf(deallocate(&mixed), NEF_B)).await;
+        assert_eq!(rsp.status, 403);
+        assert_eq!(held(&all), 3);
+        // Nor may NEF-B refresh NEF-A's.
+        let refresh = SbiRequest::post("/nmbsmf-tmgi/v1/tmgi").with_body(
+            serde_json::json!({ "tmgiList": [mine[0].clone()] }).to_string(),
+            "application/json",
+        );
+        let rsp = mbsmf_sbi_request_handler(as_nf(refresh, NEF_B)).await;
+        assert_eq!(rsp.status, 403);
+        // An anonymous caller frees nothing either.
+        let rsp = super::mbsmf_sbi_request_handler(deallocate(&mine)).await;
+        assert_eq!(rsp.status, 403);
+        assert_eq!(held(&all), 3);
+
+        // Each owner frees its own.
+        let rsp = mbsmf_sbi_request_handler(as_nf(deallocate(&mine), NEF_A)).await;
+        assert_eq!(rsp.status, 204);
+        let rsp = mbsmf_sbi_request_handler(as_nf(deallocate(&theirs), NEF_B)).await;
+        assert_eq!(rsp.status, 204);
+        assert_eq!(held(&all), 0);
+    }
+
+    /// REVERT-VERIFIED: with the Release check removed NEF-B's stale DELETE
+    /// releases NEF-A's session (404 for NEF-A afterwards); with the Update
+    /// check removed NEF-B's PATCH answers 204; with the TMGI check at create
+    /// removed NEF-B creates a session on NEF-A's TMGI.
+    #[tokio::test]
+    async fn an_mbs_session_is_updated_and_released_by_its_creator_only_1863() {
+        mbsmf_context_init(256);
+        let tmgi = allocate(NEF_A, 1).await.remove(0);
+        let create = |who: &str| {
+            as_nf(
+                SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions").with_body(
+                    serde_json::json!({"mbsSession": {
+                        "mbsSessionId": {"tmgi": tmgi.clone()},
+                        "serviceType": "BROADCAST",
+                    }})
+                    .to_string(),
+                    "application/json",
+                ),
+                who,
+            )
+        };
+        // NEF-B cannot open a session on NEF-A's TMGI.
+        assert_eq!(mbsmf_sbi_request_handler(create(NEF_B)).await.status, 403);
+        let rsp = mbsmf_sbi_request_handler(create(NEF_A)).await;
+        assert_eq!(rsp.status, 201, "{:?}", rsp.http.content);
+        let location = rsp.http.get_header("location").cloned().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        assert!(id.starts_with("mbs-sess-") && id != "mbs-sess-1", "{id}");
+        let uri = format!("/nmbsmf-mbssession/v1/mbs-sessions/{id}");
+        let patch = || {
+            SbiRequest::patch(uri.clone()).with_body(
+                r#"[{"op":"replace","path":"/activityStatus","value":"INACTIVE"}]"#,
+                "application/json-patch+json",
+            )
+        };
+        assert_eq!(
+            mbsmf_sbi_request_handler(as_nf(patch(), NEF_B))
+                .await
+                .status,
+            403
+        );
+        assert_eq!(
+            mbsmf_sbi_request_handler(as_nf(SbiRequest::delete(uri.clone()), NEF_B))
+                .await
+                .status,
+            403
+        );
+        assert_eq!(
+            super::mbsmf_sbi_request_handler(SbiRequest::delete(uri.clone()))
+                .await
+                .status,
+            403,
+            "anonymous"
+        );
+        let pool_id = parse_session_id(&id).unwrap();
+        let session = mbsmf_self().read().unwrap().session_find_by_id(pool_id);
+        assert_eq!(
+            session.and_then(|s| s.owner).as_deref(),
+            Some(NEF_A),
+            "still there"
+        );
+        let rsp = mbsmf_sbi_request_handler(as_nf(SbiRequest::delete(uri.clone()), NEF_A)).await;
+        assert_eq!(rsp.status, 204, "{:?}", rsp.http.content);
+        assert!(mbsmf_self()
+            .read()
+            .unwrap()
+            .session_find_by_id(pool_id)
+            .is_none());
     }
 }
 

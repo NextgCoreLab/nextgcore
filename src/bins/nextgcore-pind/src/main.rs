@@ -357,37 +357,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Read the caller identity from the bearer token's verified `sub` claim
-/// (PIND-10; TS 29.500 §5.2.3, TS 33.501 §13.4).
+/// The caller identity from the access token the SBI server verified
+/// (PIND-10; TS 29.500 §5.2.3, TS 33.501 §13.4): [`SbiRequest::oauth2_subject`].
 ///
-/// **FLAG / known gap.** nextgcore-sbi verifies the bearer token at the *server*
-/// layer when `require_oauth2` is enabled (signature + expiry, rejecting bad
-/// tokens with 401 before dispatch), but it does **not** thread the decoded
-/// claims into `SbiRequest`, and there is no public accessor on `SbiRequest`
-/// for the verified `sub`. We therefore re-read the already-verified token's
-/// payload here using the public `nextgcore_sbi::oauth::decode_jwt_parts` +
-/// `AccessTokenClaims`. This is sound for trust **only** because the server
-/// has already cryptographically verified the same token; the caller (via
-/// [`extract_caller_supi`]) gates this on [`oauth2_enabled`]. A token read
-/// while OAuth2 is disabled is unverified and MUST NOT be trusted.
-///
-/// (A clean fix is to add a `verified claims` accessor to nextgcore-sbi
-/// additively and thread the claims through `SbiRequest`; out of scope for
-/// this pind-local change, which must not modify shared libs.)
+/// #1953 (R32 on #1950): this used to re-decode the `Authorization` header
+/// itself and trust its `sub` whenever OAuth2 was switched on. The server now
+/// records the `sub` of a token it verified (signature, expiry, audience,
+/// scope), and nothing else sets the field, so reading it cannot trust an
+/// unverified header, whatever the flags say.
 fn caller_supi_from_token(request: &SbiRequest) -> Option<String> {
-    let auth = request.http.get_header("authorization")?;
-    let token = auth
-        .strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))?
-        .trim();
-    let (_header, payload, _sig) = nextgcore_sbi::oauth::decode_jwt_parts(token).ok()?;
-    let claims: nextgcore_sbi::oauth::AccessTokenClaims = serde_json::from_slice(&payload).ok()?;
-    let sub = claims.sub.trim();
-    if sub.is_empty() {
-        None
-    } else {
-        Some(sub.to_string())
-    }
+    request
+        .oauth2_subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Extract the caller's SUPI / consumer identity from an incoming request.
@@ -411,11 +395,14 @@ fn extract_caller_supi(
     trust_token: bool,
     trust_header: bool,
 ) -> Option<String> {
-    // 1. Verified JWT sub claim (highest priority).
-    if trust_token {
-        if let Some(sub) = caller_supi_from_token(request) {
-            return Some(sub);
-        }
+    // 1. The token subject the SBI server verified (highest priority).
+    // #1953 (R32 on #1967): honoured whenever present. Only the server sets it,
+    // after verifying the token, so `--require-oauth2` (`trust_token`) no
+    // longer has to be on for it; without it a production deployment was
+    // anonymous and every create refused.
+    let _ = trust_token;
+    if let Some(sub) = caller_supi_from_token(request) {
+        return Some(sub);
     }
     // 2/3. Bespoke / consumer-info headers — only when explicitly trusted.
     if trust_header {
@@ -488,11 +475,11 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // PIN Management (PIN-6)
         ["pinapp", "v1", "pins"] => match method {
             "POST" => handle_pin_create(&request).await,
-            "GET" => handle_pin_list().await,
+            "GET" => handle_pin_list(&request).await,
             _ => send_method_not_allowed(method, "pins"),
         },
         ["pinapp", "v1", "pins", pin_id] => match method {
-            "GET" => handle_pin_get(pin_id).await,
+            "GET" => handle_pin_get(pin_id, &request).await,
             "DELETE" => handle_pin_delete(pin_id, &request).await,
             _ => send_method_not_allowed(method, "pins/{id}"),
         },
@@ -503,13 +490,13 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "pins/{id}/elements"),
         },
         ["pinapp", "v1", "pins", _pin_id, "elements", element_id] => match method {
-            "GET" => handle_element_get(element_id).await,
+            "GET" => handle_element_get(element_id, &request).await,
             "DELETE" => handle_element_deregister(element_id, &request).await,
             _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}"),
         },
         // PIND-09: per-element liveness keep-alive (TS 23.542 §8.8).
-        ["pinapp", "v1", "pins", _pin_id, "elements", element_id, "heartbeat"] => match method {
-            "PUT" => handle_element_heartbeat(element_id).await,
+        ["pinapp", "v1", "pins", pin_id, "elements", element_id, "heartbeat"] => match method {
+            "PUT" => handle_element_heartbeat(pin_id, element_id, &request).await,
             _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}/heartbeat"),
         },
         // PIN Element Relay (PIN-7)
@@ -628,12 +615,21 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_pin_list() -> SbiResponse {
+/// #1953 (R32 on #1967): the caller's own PINs only: those it owns or is a
+/// PEMC of (the same rule as PIN GET). The list used to return every PIN and
+/// its owner's SUPI to any caller; an anonymous caller now gets an empty list.
+async fn handle_pin_list(request: &SbiRequest) -> SbiResponse {
+    let caller = caller_supi(request);
     let ctx = pin_self();
     let pins: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
         context
             .pin_list()
             .iter()
+            .filter(|p| {
+                context
+                    .authorize_pin_reader(&p.pin_id, caller.as_deref())
+                    .is_ok()
+            })
             .map(|p| {
                 serde_json::json!({
                     "pinId": p.pin_id,
@@ -657,7 +653,22 @@ async fn handle_pin_list() -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_pin_get(pin_id: &str) -> SbiResponse {
+async fn handle_pin_get(pin_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1953 (R32 on #1967 M1): only the PIN's owner, a PEMC or a member.
+    let refused = pin_self()
+        .read()
+        .map_err(|_| PinContextError::NotFound)
+        .and_then(|c| c.authorize_pin_reader(pin_id, caller_supi(request).as_deref()));
+    match refused {
+        Ok(()) => {}
+        Err(PinContextError::PemcRequiresOwner) => {
+            return send_pin_forbidden(
+                &PinContextError::PemcRequiresOwner,
+                "urn:nextgcore:pin:read-authorization-failed",
+            )
+        }
+        Err(_) => return send_not_found(&format!("PIN {pin_id} not found"), Some("PIN_NOT_FOUND")),
+    }
     let ctx = pin_self();
     let pin = if let Ok(context) = ctx.read() {
         context.pin_find(pin_id)
@@ -780,13 +791,30 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
                 .collect()
         })
         .unwrap_or_default();
-    // host SUPI defaults to the UE Identifier when not explicitly supplied.
-    let host_supi = Some(
-        data.get("hostSupi")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| ue_identifier.clone()),
-    );
+    // #1953 (R32 on #1950, TS 23.542 §8.4): the element's host is the identity
+    // that registered it, as the PIN server authenticated it, because that is
+    // what heartbeat and relay later match "the element itself" against (both
+    // read the same `caller_supi` source). A self-asserted body `hostSupi` was
+    // the match key, so any client could register an element "hosted" by
+    // another subscriber. With a verified caller, a `hostSupi` naming anyone
+    // else is refused. A PEMC registering a non-3GPP PINE on its behalf hosts
+    // it, so it heartbeats for it. With no verified caller (the `dev` lab
+    // stack), the body value is kept as before.
+    let caller = caller_supi(request);
+    let body_host = data
+        .get("hostSupi")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    let host_supi = match (&caller, body_host) {
+        (Some(c), Some(h)) if h != *c => {
+            return send_pin_forbidden(
+                &PinContextError::PemcRequiresOwner,
+                "urn:nextgcore:pin:element-authorization-failed",
+            )
+        }
+        (Some(c), _) => Some(c.clone()),
+        (None, h) => Some(h.unwrap_or_else(|| ue_identifier.clone())),
+    };
     let string_field = |key: &str| {
         data.get(key)
             .and_then(|v| v.as_str())
@@ -802,9 +830,6 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
         device_description: string_field("deviceDescription"),
         ..registration
     };
-
-    // Extract caller identity for authorization (PIND-10 trust policy).
-    let caller = caller_supi(request);
 
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
@@ -845,6 +870,21 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
 }
 
 async fn handle_element_discover(pin_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1953 (R32 on #1967 M1): only the PIN's owner, a PEMC or a member.
+    let refused = pin_self()
+        .read()
+        .map_err(|_| PinContextError::NotFound)
+        .and_then(|c| c.authorize_pin_reader(pin_id, caller_supi(request).as_deref()));
+    match refused {
+        Ok(()) => {}
+        Err(PinContextError::PemcRequiresOwner) => {
+            return send_pin_forbidden(
+                &PinContextError::PemcRequiresOwner,
+                "urn:nextgcore:pin:read-authorization-failed",
+            )
+        }
+        Err(_) => return send_not_found(&format!("PIN {pin_id} not found"), Some("PIN_NOT_FOUND")),
+    }
     let uri = &request.header.uri;
     let capability = uri
         .split("capability=")
@@ -881,12 +921,24 @@ async fn handle_element_discover(pin_id: &str, request: &SbiRequest) -> SbiRespo
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_element_get(element_id: &str) -> SbiResponse {
+/// #1953 (R32 on #1950): an element (its address, port, MAC, relay path) is
+/// read only by the element itself, the PIN owner or a PEMC of its PIN, as
+/// heartbeat and relay are authorised; anyone else gets 403.
+async fn handle_element_get(element_id: &str, request: &SbiRequest) -> SbiResponse {
+    let caller = caller_supi(request);
     let ctx = pin_self();
-    let elem = if let Ok(context) = ctx.read() {
-        context.element_find(element_id)
-    } else {
-        None
+    let elem = match ctx.read() {
+        Ok(context) => match context.element_find_for(element_id, caller.as_deref()) {
+            Ok(e) => Some(e),
+            Err(PinContextError::PemcRequiresOwner) => {
+                return send_pin_forbidden(
+                    &PinContextError::PemcRequiresOwner,
+                    "urn:nextgcore:pin:element-authorization-failed",
+                )
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
     };
 
     match elem {
@@ -921,10 +973,18 @@ async fn handle_element_get(element_id: &str) -> SbiResponse {
 /// PIND-09: handle a per-element keep-alive (PUT
 /// `.../elements/{id}/heartbeat`). Resets the element's liveness deadline so
 /// the background reaper does not deregister it.
-async fn handle_element_heartbeat(element_id: &str) -> SbiResponse {
+/// PIND-09 keep-alive. #1873: honours `{pinId}` and the caller (the element
+/// itself, or the PIN owner / a PEMC), so a stale or foreign PINE cannot keep
+/// another owner's element alive.
+async fn handle_element_heartbeat(
+    pin_id: &str,
+    element_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let caller = caller_supi(request);
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
-        context.element_heartbeat(element_id)
+        context.element_heartbeat(pin_id, element_id, caller.as_deref())
     } else {
         Err(PinContextError::NotFound)
     };
@@ -936,6 +996,10 @@ async fn handle_element_heartbeat(element_id: &str) -> SbiResponse {
                 "result": "HEARTBEAT_ACK",
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(PinContextError::PemcRequiresOwner) => send_pin_forbidden(
+            &PinContextError::PemcRequiresOwner,
+            "urn:nextgcore:pin:heartbeat-authorization-failed",
+        ),
         Err(_) => send_not_found(
             &format!("Element {element_id} not found"),
             Some("ELEMENT_NOT_FOUND"),
@@ -992,7 +1056,8 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
 
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
-        context.element_set_relay(element_id, relay_path)
+        // #1873: authorized against the caller before anything changes.
+        context.element_set_relay(element_id, relay_path, caller_supi(request).as_deref())
     } else {
         Err(PinContextError::NotFound)
     };
@@ -1007,6 +1072,11 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
         ),
         Err(PinContextError::RelayOnlyForPegc) => send_pin_forbidden(
             &PinContextError::RelayOnlyForPegc,
+            "urn:nextgcore:pin:relay-authorization-failed",
+        ),
+        // #1873: the caller is neither the PEGC nor the PIN's owner/PEMC.
+        Err(PinContextError::PemcRequiresOwner) => send_pin_forbidden(
+            &PinContextError::PemcRequiresOwner,
             "urn:nextgcore:pin:relay-authorization-failed",
         ),
         Err(_) => {
@@ -1048,13 +1118,9 @@ mod tests {
     use nextgcore_sbi::message::SbiRequest;
     use std::sync::Mutex;
 
-    /// A precomputed JWT (`header.payload.sig`) whose payload decodes to
-    /// `AccessTokenClaims { sub: "imsi-token-owner-001", .. }`. The signature
-    /// is NOT cryptographically valid: `caller_supi_from_token` only
-    /// base64-decodes the parts and reads `sub`. In production the nextgcore-sbi
-    /// server layer has already verified the same token before dispatch, which
-    /// is why `extract_caller_supi` only honors the token under `trust_token`
-    /// (i.e. `oauth2_enabled()`).
+    /// A precomputed, UNSIGNED JWT (`header.payload.sig`) whose payload decodes
+    /// to `AccessTokenClaims { sub: "imsi-token-owner-001", .. }`: a header no
+    /// server verified, which #1953 makes sure is never read as an identity.
     const TOKEN_OWNER_001: &str = concat!(
         "eyJhbGciOiAiRVMyNTYiLCAidHlwIjogIkpXVCJ9.",
         "eyJpc3MiOiAibnJmIiwgInN1YiI6ICJpbXNpLXRva2VuLW93bmVyLTAwMSIsICJhdWQiOi",
@@ -1112,9 +1178,9 @@ mod tests {
     /// source and wins over a (forgeable) header when both are trusted.
     #[test]
     fn extract_caller_supi_prefers_verified_token_sub() {
-        let request = SbiRequest::post("/pinapp/v1/pins")
-            .with_header("authorization", format!("Bearer {TOKEN_OWNER_001}"))
-            .with_header("x-caller-supi", "imsi-forged-header");
+        let mut request =
+            SbiRequest::post("/pinapp/v1/pins").with_header("x-caller-supi", "imsi-forged-header");
+        request.oauth2_subject = Some("imsi-token-owner-001".into());
         assert_eq!(
             extract_caller_supi(&request, true, true).as_deref(),
             Some("imsi-token-owner-001"),
@@ -1122,14 +1188,23 @@ mod tests {
         );
     }
 
+    /// #1953 (R32 on #1950): the identity is the `sub` the SBI server recorded
+    /// for a token it verified; an `Authorization` header nobody verified (here
+    /// an unsigned JWT naming another subscriber) is never decoded.
+    /// REVERT-VERIFIED: with the old header re-decode restored, the
+    /// unverified-header case returns `imsi-token-owner-001`.
     #[test]
-    fn caller_supi_from_token_reads_sub_claim() {
-        let request = SbiRequest::post("/pinapp/v1/pins")
-            .with_header("authorization", format!("Bearer {TOKEN_OWNER_001}"));
+    fn caller_supi_from_token_reads_the_verified_subject_only_1953() {
+        let mut request = SbiRequest::post("/pinapp/v1/pins");
+        request.oauth2_subject = Some("imsi-token-owner-001".into());
         assert_eq!(
             caller_supi_from_token(&request).as_deref(),
             Some("imsi-token-owner-001")
         );
+        let unverified = SbiRequest::post("/pinapp/v1/pins")
+            .with_header("authorization", format!("Bearer {TOKEN_OWNER_001}"));
+        assert_eq!(caller_supi_from_token(&unverified), None);
+        assert_eq!(extract_caller_supi(&unverified, true, false), None);
     }
 
     /// With OAuth2 off (`trust_token=false`) the token must NOT be trusted.
@@ -1407,6 +1482,205 @@ mod tests {
         guard.pin_create("Home", owner).expect("seed pin").pin_id
     }
 
+    /// #1953 (R32 on #1967 M1): a PIN (with its owner's SUPI) and its element
+    /// list (with addresses and ports) are read only by the owner or a PEMC; a
+    /// stranger, an anonymous caller or a self-registered element gets 403.
+    /// REVERT-VERIFIED: with the `authorize_pin_reader` guard removed from
+    /// either handler, the stranger's request on it answers 200.
+    #[test]
+    fn a_pin_and_its_elements_are_read_by_its_own_clients_only_1953() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-owner-r1953");
+        let reg = register_request(
+            &pin_id,
+            "imsi-member-r1953",
+            full_registration(serde_json::json!({})),
+        );
+        assert_eq!(block_on(handle_element_register(&pin_id, &reg)).status, 201);
+        let read = |path: String, who: Option<&str>| {
+            let mut r = SbiRequest::get(path);
+            if let Some(w) = who {
+                r = r.with_header("x-caller-supi", w);
+            }
+            block_on(pin_sbi_request_handler(r)).status
+        };
+        let pin_path = format!("/pinapp/v1/pins/{pin_id}");
+        let list_path = format!("/pinapp/v1/pins/{pin_id}/elements");
+        for path in [&pin_path, &list_path] {
+            assert_eq!(
+                read(path.clone(), Some("imsi-stranger-r1953")),
+                403,
+                "{path}"
+            );
+            assert_eq!(read(path.clone(), None), 403, "{path}");
+            assert_eq!(read(path.clone(), Some("imsi-owner-r1953")), 200, "{path}");
+            // R32 on #1967: a self-registered (Regular) element's host is not a
+            // reader. REVERT-VERIFIED: with hosting counted as membership
+            // again, this answers 200.
+            assert_eq!(read(path.clone(), Some("imsi-member-r1953")), 403, "{path}");
+        }
+        assert_eq!(
+            read(
+                "/pinapp/v1/pins/pin-absent".into(),
+                Some("imsi-owner-r1953")
+            ),
+            404
+        );
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+    }
+
+    /// #1953 (R32 on #1967): `GET /pins` lists only the caller's own PINs (owned
+    /// or PEMC), never every PIN and its owner's SUPI.
+    /// REVERT-VERIFIED: with the filter removed, the stranger's list holds both
+    /// PINs.
+    #[test]
+    fn the_pin_list_holds_only_the_callers_own_pins_1953() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let mine = seed_pin("imsi-lister-l1953");
+        let theirs = seed_pin("imsi-other-l1953");
+        let list = |who: Option<&str>| -> Vec<String> {
+            let mut r = SbiRequest::get("/pinapp/v1/pins");
+            if let Some(w) = who {
+                r = r.with_header("x-caller-supi", w);
+            }
+            let resp = block_on(pin_sbi_request_handler(r));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            body["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["pinId"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let own = list(Some("imsi-lister-l1953"));
+        assert!(own.contains(&mine) && !own.contains(&theirs), "{own:?}");
+        let stranger = list(Some("imsi-stranger-l1953"));
+        assert!(
+            !stranger.contains(&mine) && !stranger.contains(&theirs),
+            "{stranger:?}"
+        );
+        assert!(list(None).is_empty());
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+    }
+
+    /// #1953 (R32 on #1967): the verified token subject is the caller whether
+    /// or not `--require-oauth2` is set (only the SBI server sets it).
+    /// REVERT-VERIFIED: with the subject gated on `trust_token` again, the
+    /// untrusted-flag case is `None`.
+    #[test]
+    fn the_verified_subject_is_the_caller_without_the_flag_1953() {
+        let mut request = SbiRequest::post("/pinapp/v1/pins");
+        request.oauth2_subject = Some("imsi-verified-1953".into());
+        assert_eq!(
+            extract_caller_supi(&request, false, false).as_deref(),
+            Some("imsi-verified-1953")
+        );
+    }
+
+    fn full_registration(extra: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "ueIdentifier": "imsi-ue-1953",
+            "securityCredentials": "cred",
+            "pineAddress": "10.0.0.19",
+            "port": 1953,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    }
+
+    /// #1953 (R32 on #1950) items 1 and 2: an element's host is the identity
+    /// that registered it, never a self-asserted body `hostSupi`, so a client
+    /// cannot register an element "hosted" by another subscriber, and the
+    /// element heartbeats as the same identity it registered with (the one
+    /// `caller_supi` source, the verified token `sub` under production).
+    /// REVERT-VERIFIED: with the refusal of a foreign `hostSupi` removed, the
+    /// forged registration answers 201.
+    #[test]
+    fn an_elements_host_is_its_authenticated_registrant_1953() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-owner-1953");
+        // Claiming another subscriber as host is refused.
+        let forged = register_request(
+            &pin_id,
+            "imsi-attacker-1953",
+            full_registration(serde_json::json!({"hostSupi": "imsi-victim-1953"})),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &forged));
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        // Without one, the host is the registrant.
+        let own = register_request(
+            &pin_id,
+            "imsi-pine-1953",
+            full_registration(serde_json::json!({})),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &own));
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let elem = body["elementId"].as_str().unwrap().to_string();
+        let host = pin_self()
+            .read()
+            .unwrap()
+            .element_find(&elem)
+            .unwrap()
+            .host_supi;
+        assert_eq!(host.as_deref(), Some("imsi-pine-1953"));
+        // So it heartbeats as itself.
+        let hb = SbiRequest::put(format!(
+            "/pinapp/v1/pins/{pin_id}/elements/{elem}/heartbeat"
+        ))
+        .with_header("x-caller-supi", "imsi-pine-1953");
+        assert_eq!(block_on(pin_sbi_request_handler(hb)).status, 200);
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+    }
+
+    /// #1953 (R32 on #1950) item 5: GET on an element is answered only to the
+    /// element itself, the PIN owner or a PEMC.
+    /// REVERT-VERIFIED: with `handle_element_get` reading `element_find`
+    /// unchecked again, the stranger and anonymous GETs answer 200.
+    #[test]
+    fn an_element_is_read_by_its_owner_or_itself_only_1953() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-owner-g1953");
+        let reg = register_request(
+            &pin_id,
+            "imsi-pine-g1953",
+            full_registration(serde_json::json!({})),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &reg));
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let elem = body["elementId"].as_str().unwrap().to_string();
+        let get = |who: Option<&str>| {
+            let mut r = SbiRequest::get(format!("/pinapp/v1/pins/{pin_id}/elements/{elem}"));
+            if let Some(w) = who {
+                r = r.with_header("x-caller-supi", w);
+            }
+            block_on(pin_sbi_request_handler(r)).status
+        };
+        assert_eq!(get(Some("imsi-stranger-g1953")), 403);
+        assert_eq!(get(None), 403);
+        assert_eq!(get(Some("imsi-owner-g1953")), 200);
+        assert_eq!(get(Some("imsi-pine-g1953")), 200);
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+    }
+
     #[test]
     fn handle_element_register_missing_pine_address_returns_400() {
         let _g = lock_globals();
@@ -1583,27 +1857,47 @@ mod tests {
         let _g = lock_globals();
         pin_context_init(1024, 86_400, 30);
         OAUTH2_ENABLED.store(false, Ordering::Relaxed);
-        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
 
-        let elem_id = {
+        let (pin_id, elem_id) = {
             let ctx = pin_self();
             let guard = ctx.read().expect("ctx read");
             let pin = guard.pin_create("Home", "imsi-hb-owner").expect("seed pin");
-            guard
+            let elem = guard
                 .element_register(
                     &pin.pin_id,
                     PinElementRegistration::new(PinElementType::Element, "10.0.0.8", 8800),
                     None,
                 )
                 .expect("seed element")
-                .element_id
+                .element_id;
+            (pin.pin_id, elem)
+        };
+        let heartbeat = |pin: &str, elem: &str, caller: Option<&str>| {
+            let mut r = SbiRequest::put(format!("/pinapp/v1/pins/{pin}/elements/{elem}/heartbeat"));
+            if let Some(c) = caller {
+                r = r.with_header("x-caller-supi", c);
+            }
+            block_on(pin_sbi_request_handler(r)).status
         };
 
-        let ok = block_on(handle_element_heartbeat(&elem_id));
-        assert_eq!(ok.status, 200, "heartbeat on a known element acks");
-
-        let missing = block_on(handle_element_heartbeat("pe-absent-999"));
-        assert_eq!(missing.status, 404, "heartbeat on unknown element is 404");
+        assert_eq!(
+            heartbeat(&pin_id, &elem_id, Some("imsi-hb-owner")),
+            200,
+            "the owner's heartbeat on a known element acks"
+        );
+        assert_eq!(
+            heartbeat(&pin_id, "pe-absent-999", Some("imsi-hb-owner")),
+            404
+        );
+        // #1873: the caller and the {pinId} segment are honoured.
+        assert_eq!(heartbeat(&pin_id, &elem_id, Some("imsi-hb-stranger")), 403);
+        assert_eq!(heartbeat(&pin_id, &elem_id, None), 403);
+        assert_eq!(
+            heartbeat("pin-elsewhere", &elem_id, Some("imsi-hb-owner")),
+            404
+        );
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
     }
 }
 

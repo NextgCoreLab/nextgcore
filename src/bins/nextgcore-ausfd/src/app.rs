@@ -640,7 +640,9 @@ pub async fn handle_ue_authentication_deregister(request: &SbiRequest) -> SbiRes
     if let Some(refused) = refuse_deregister(ue.as_ref(), request) {
         return refused;
     }
-    let ue_id = ue.map(|ue| ue.id);
+    // #1928: the authentication the caller was checked against; it is removed
+    // only while it is still the current one.
+    let checked = ue.map(|ue| (ue.id, ue.ctx_id));
 
     // Purge the SoR/UPU anchor: the whole point of the operation is that a stale
     // KAUSF must not survive it.
@@ -649,9 +651,12 @@ pub async fn handle_ue_authentication_deregister(request: &SbiRequest) -> SbiRes
         .map(|context| context.anchor_remove(supi))
         .unwrap_or(false);
 
-    let context_removed = match ue_id {
-        Some(id) => {
-            let removed = ctx.read().ok().and_then(|context| context.ue_remove(id));
+    let context_removed = match checked {
+        Some((id, ctx_id)) => {
+            let removed = ctx
+                .read()
+                .ok()
+                .and_then(|context| context.ue_remove_if_ctx(id, &ctx_id));
             match removed {
                 Some(mut ue) => {
                     // Zeroize KAUSF/KSEAF/XRES* before the context is dropped.
@@ -1017,10 +1022,14 @@ fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
     let cert = verified(&request.peer_cert_nf_instance_id);
     match (token, cert) {
         (Some(t), Some(c)) if !t.eq_ignore_ascii_case(&c) => {
-            let via_scp = request
-                .peer_cert_nf_types
-                .iter()
-                .any(|ty| ty.eq_ignore_ascii_case("SCP"));
+            // #1928: a certificate naming the SCP AND another NF type could
+            // otherwise present any token `sub`; only a pure SCP certificate
+            // is exempt.
+            let via_scp = !request.peer_cert_nf_types.is_empty()
+                && request
+                    .peer_cert_nf_types
+                    .iter()
+                    .all(|ty| ty.eq_ignore_ascii_case("SCP"));
             if via_scp {
                 Ok(Some(t))
             } else {
@@ -1073,10 +1082,13 @@ fn refuse_foreign_caller(ue: &crate::context::AusfUe, request: &SbiRequest) -> O
 /// #1907: who may Deregister a SUPI (TS 29.509 §5.2.2.3): "the NF Service
 /// Consumer (e.g. UDM)" clearing a stale security context. A caller with a
 /// verified identity must be the NF that started the UE's current
-/// authentication, or present a client certificate whose RFC 9310 NFTypes
-/// name the UDM. Any other AMF is refused, so it cannot purge another UE's
-/// KAUSF. A caller with no verified identity (a dev stack) is admitted only
-/// when the context is unbound. `Some` is the refusal to send, before anything
+/// authentication, present a client certificate whose RFC 9310 NFTypes name the
+/// UDM, or (#1918) present an access token this AUSF verified whose scope
+/// carries `nausf-auth:ue-authentications`. The NRF grants that scope to the
+/// UDM only ([`AUSF_RESOURCE_SCOPES`]), so it proves a UDM that reached this
+/// AUSF through an SCP, whose certificate is the SCP's. Any other AMF is
+/// refused, so it cannot purge another UE's KAUSF. A caller with no verified
+/// identity is refused (#1928). `Some` is the refusal to send, before anything
 /// is removed.
 fn refuse_deregister(
     ue: Option<&crate::context::AusfUe>,
@@ -1087,17 +1099,24 @@ fn refuse_deregister(
         Err(why) => return Some(forbidden(&why)),
     };
     let owner = ue.and_then(|ue| ue.owner.as_deref());
+    // #1928: never anonymous, dev included. Deregister purges the SUPI's
+    // SoR/UPU anchor, the latest KAUSF (TS 33.501 §6.14.1), whether or not an
+    // authentication context is bound. No NextGCore NF calls it unauthenticated.
     let Some(caller) = caller else {
-        return owner
-            .is_some()
-            .then(|| forbidden("Deregister needs a verified caller identity"));
+        return Some(forbidden("Deregister needs a verified caller identity"));
     };
     let is_udm = request
         .peer_cert_nf_types
         .iter()
         .any(|ty| ty.eq_ignore_ascii_case("UDM"));
     let is_owner = owner.is_some_and(|o| o.eq_ignore_ascii_case(&caller));
-    if is_udm || is_owner {
+    // #1918: the verified token's scope, not a claim the request makes.
+    let has_scope = request.oauth2_scope.as_deref().is_some_and(|scope| {
+        scope
+            .split_whitespace()
+            .any(|s| s == nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS)
+    });
+    if is_udm || is_owner || has_scope {
         return None;
     }
     log::debug!("Deregister refused: NF {caller} is neither the UDM nor the context's owner");
@@ -1677,9 +1696,11 @@ pub async fn handle_auth_context_delete(auth_ctx_id: &str, request: &SbiRequest)
         }
     };
 
+    // #1928: only while the authentication checked above is still current: a
+    // re-authentication by another AMF in between keeps its context (404).
     let removed = {
         if let Ok(context) = ctx.read() {
-            context.ue_remove(ue_id)
+            context.ue_remove_if_ctx(ue_id, auth_ctx_id)
         } else {
             None
         }
@@ -2048,10 +2069,12 @@ async fn send_udm_auth_result(
 /// instance) and [`build_nf_profile`] (the NFProfile PUT to the NRF), so the two
 /// cannot drift.
 const AUSF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
-    // TS 29.509 Nausf_UEAuthentication, consumed by the AMF.
+    // TS 29.509 Nausf_UEAuthentication, consumed by the AMF, and by the UDM
+    // for Deregister (§5.2.2.3, #1918): without it here the NRF grants a UDM
+    // no `nausf-auth` token at all.
     (
         nextgcore_sbi::types::SbiServiceType::NausfAuth,
-        &["AMF", "SCP"],
+        &["AMF", "UDM", "SCP"],
     ),
     // TS 29.509 Nausf_SoRProtection. Wave-6 F-03: the UDM discovers the AUSF
     // holding the latest K_AUSF BY SERVICE NAME (TS 33.501 §6.14.2.1 step 8), so
@@ -2066,6 +2089,47 @@ const AUSF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
         &["UDM", "SCP"],
     ),
 ];
+
+/// #1918: the resource-level scopes of an AUSF service, and the ONE NF type each
+/// is registered for in `allowedOperationsPerNfType` (TS 29.510 Table
+/// 6.1.6.2.3-1 NOTE 11), so the NRF grants it to that type only. The UDM
+/// Deregisters (TS 29.509 §5.2.2.3) and, reaching the AUSF through an SCP,
+/// presents the SCP's certificate, so its type is proven by the NRF's grant of
+/// this scope instead ([`refuse_deregister`]). Spelling: the vendored OpenAPI's
+/// (`nextgcore_sbi::resource_scope`).
+const AUSF_RESOURCE_SCOPES: &[(&str, &str, &str)] = &[(
+    "nausf-auth",
+    nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS,
+    "UDM",
+)];
+
+/// The `allowedOperationsPerNfType` of AUSF service `name`, or `None` when the
+/// service has no resource-level scope (#1918), as udrd builds its own (#1811).
+///
+/// NOTE 11: once the map is present it must name EVERY NF type allowed the
+/// service, with all its scopes, the service-level one included: a type left
+/// out is barred from the whole service. So each of `allowed` gets the
+/// service-level scope, and only the type [`AUSF_RESOURCE_SCOPES`] names gets a
+/// resource scope.
+fn ausf_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::Value> {
+    if !AUSF_RESOURCE_SCOPES.iter().any(|(svc, _, _)| *svc == name) {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = allowed
+        .iter()
+        .map(|nf_type| {
+            let mut scopes = vec![name.to_string()];
+            scopes.extend(
+                AUSF_RESOURCE_SCOPES
+                    .iter()
+                    .filter(|(svc, _, t)| *svc == name && t == nf_type)
+                    .map(|(_, scope, _)| scope.to_string()),
+            );
+            (nf_type.to_string(), serde_json::json!(scopes))
+        })
+        .collect();
+    Some(serde_json::Value::Object(map))
+}
 
 /// Build this AUSF's typed self NF instance from [`AUSF_SERVICES`].
 fn build_ausf_nf_instance(
@@ -2105,7 +2169,7 @@ fn build_nf_profile(
         .iter()
         .map(|(service_type, allowed)| {
             let name = service_type.to_name();
-            serde_json::json!({
+            let mut service = serde_json::json!({
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
@@ -2116,7 +2180,11 @@ fn build_nf_profile(
                     "port": sbi_port
                 }],
                 "allowedNfTypes": allowed,
-            })
+            });
+            if let Some(ops) = ausf_allowed_operations(name, allowed) {
+                service["allowedOperationsPerNfType"] = ops;
+            }
+            service
         })
         .collect();
 
@@ -3871,6 +3939,209 @@ mod tests {
         assert!(!held());
     }
 
+    /// **#1918.** A UDM reaching this AUSF through an SCP presents the SCP's
+    /// certificate and a token naming itself. Its Deregister is admitted when
+    /// that verified token carries `nausf-auth:ue-authentications`, which the NRF
+    /// grants the UDM only (TS 29.509 OpenAPI `security`, TS 29.510 NOTE 11), and
+    /// refused without it, context intact.
+    ///
+    /// REVERT-VERIFIED: with `has_scope` dropped from `refuse_deregister`, the
+    /// scoped Deregister is 403 and the second assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn a_udm_via_the_scp_deregisters_on_its_resource_scope_1918() {
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+        ausf_context_init(128);
+        let supi = "imsi-001010000001918";
+        let ctx = ausf_self();
+        {
+            let guard = ctx.read().unwrap();
+            let mut ue = guard.ue_add("suci-0-001-01-0000-0-0-1918000001").unwrap();
+            ue.supi = Some(supi.into());
+            ue.owner = Some(AMF_A_1872.into());
+            assert!(guard.ue_begin_authentication(&ue));
+            guard.ue_set_supi(ue.id, supi);
+        }
+        let held = || ausf_self().read().unwrap().ue_find_by_supi(supi).is_some();
+        let via_scp = |scope: &str| {
+            let mut req = as_nf_1872(
+                SbiRequest::default(),
+                Some("19180000-0000-4000-8000-0000000000d1"),
+                Some("19180000-0000-4000-8000-0000000000c1"),
+            );
+            req.peer_cert_nf_types = vec!["SCP".into()];
+            req.oauth2_scope = Some(scope.to_string());
+            req.with_body(
+                serde_json::json!({ "supi": supi }).to_string(),
+                "application/json",
+            )
+        };
+
+        let r = handle_ue_authentication_deregister(&via_scp("nausf-auth")).await;
+        assert_eq!(
+            r.status, 403,
+            "the service scope alone: {:?}",
+            r.http.content
+        );
+        assert!(held(), "refused, the context is intact");
+
+        let r = handle_ue_authentication_deregister(&via_scp(
+            "nausf-auth nausf-auth:ue-authentications",
+        ))
+        .await;
+        assert_eq!(
+            r.status, 204,
+            "the UDM's resource scope: {:?}",
+            r.http.content
+        );
+        assert!(!held(), "the stale context is cleared");
+    }
+
+    /// **#1918.** The AUSF registers the Deregister resource scope for the UDM
+    /// (TS 29.510 Table 6.1.6.2.3-1 NOTE 11): `nausf-auth` admits the UDM, and
+    /// its `allowedOperationsPerNfType` names every allowed type with the
+    /// service scope, the UDM alone with the resource scope too. The other
+    /// services carry no map.
+    ///
+    /// REVERT-VERIFIED: with the map not attached in `build_nf_profile`, the
+    /// first map assertion fails; with UDM dropped from `AUSF_SERVICES`, the
+    /// allowedNfTypes assertion fails.
+    #[test]
+    fn the_profile_grants_the_deregister_scope_to_the_udm_only_1918() {
+        let profile = build_nf_profile(
+            "ausf-1918",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let auth = services
+            .iter()
+            .find(|s| s["serviceName"] == "nausf-auth")
+            .expect("nausf-auth");
+        let allowed: Vec<&str> = auth["allowedNfTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(allowed.contains(&"UDM"), "{allowed:?}");
+        let ops = &auth["allowedOperationsPerNfType"];
+        assert_eq!(
+            ops["UDM"],
+            serde_json::json!(["nausf-auth", "nausf-auth:ue-authentications"])
+        );
+        for t in ["AMF", "SCP"] {
+            assert_eq!(ops[t], serde_json::json!(["nausf-auth"]), "{t}");
+        }
+        assert_eq!(
+            ops.as_object().map(|m| m.len()),
+            Some(allowed.len()),
+            "NOTE 11: every allowed type is in the map, or it is barred"
+        );
+        for svc in services.iter().filter(|s| s["serviceName"] != "nausf-auth") {
+            assert!(
+                svc.get("allowedOperationsPerNfType").is_none(),
+                "{}",
+                svc["serviceName"]
+            );
+        }
+    }
+
+    // ====================================================================
+    // #1928: R26's #1919 minors.
+    // ====================================================================
+
+    /// (1) Only a certificate naming the SCP alone is exempt from the
+    /// token/certificate match.
+    ///
+    /// REVERT-VERIFIED: with `via_scp` back to "any type is SCP", the AMF+SCP
+    /// certificate is exempt and the first assertion fails.
+    #[test]
+    fn only_a_pure_scp_certificate_is_exempt_1928() {
+        let mut mixed_types = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872));
+        mixed_types.peer_cert_nf_types = vec!["AMF".into(), "SCP".into()];
+        assert!(
+            caller_identity(&mixed_types).is_err(),
+            "an AMF certificate that also says SCP is not an SCP's"
+        );
+        let mut scp = mixed_types.clone();
+        scp.peer_cert_nf_types = vec!["SCP".into()];
+        assert_eq!(caller_identity(&scp).unwrap().as_deref(), Some(AMF_A_1872));
+    }
+
+    /// (2) A DELETE checked against one authentication cannot remove the one
+    /// another AMF started in between.
+    ///
+    /// REVERT-VERIFIED: with `ue_remove_if_ctx` ignoring the authCtxId (plain
+    /// `ue_remove`), the re-authenticated context is removed and the first
+    /// assertion fails.
+    #[test]
+    fn a_removal_spares_an_authentication_started_meanwhile_1928() {
+        let mut ctx = crate::context::AusfContext::new();
+        ctx.init(8);
+        let mut ue = ctx.ue_add("suci-0-001-01-0000-0-0-1928000001").unwrap();
+        ue.owner = Some(AMF_A_1872.into());
+        assert!(ctx.ue_begin_authentication(&ue));
+        let checked = ue.ctx_id.clone();
+
+        // AMF B re-authenticates between the DELETE's check and its removal.
+        let mut reauth = ue.clone();
+        reauth.ctx_id = crate::context::new_auth_ctx_id();
+        reauth.owner = Some(AMF_B_1872.into());
+        assert!(ctx.ue_begin_authentication(&reauth));
+
+        assert!(
+            ctx.ue_remove_if_ctx(ue.id, &checked).is_none(),
+            "the checked authentication is gone, so nothing is removed"
+        );
+        let current = ctx
+            .ue_find_by_ctx_id(&reauth.ctx_id)
+            .expect("B's context stays");
+        assert_eq!(current.owner.as_deref(), Some(AMF_B_1872));
+        assert!(ctx.ue_remove_if_ctx(ue.id, &reauth.ctx_id).is_some());
+        assert!(ctx.ue_find_by_ctx_id(&reauth.ctx_id).is_none());
+    }
+
+    /// (3) An anonymous Deregister purges nothing, even of an unbound context
+    /// or a bare SoR/UPU anchor (dev).
+    ///
+    /// REVERT-VERIFIED: with the anonymous case admitted again for unbound
+    /// state, the anchor is purged and the first assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn an_anonymous_deregister_purges_no_anchor_1928() {
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+        ausf_context_init(128);
+        let supi = "imsi-001010000001928";
+        {
+            let ctx = ausf_self();
+            let guard = ctx.read().unwrap();
+            guard.anchor_refresh(supi, &[7u8; 32]);
+            let mut ue = guard.ue_add("suci-0-001-01-0000-0-0-1928000002").unwrap();
+            ue.supi = Some(supi.into());
+            assert!(guard.ue_begin_authentication(&ue)); // unbound: no owner
+            guard.ue_set_supi(ue.id, supi);
+        }
+        let req = SbiRequest::default().with_body(
+            serde_json::json!({ "supi": supi }).to_string(),
+            "application/json",
+        );
+        let r = handle_ue_authentication_deregister(&req).await;
+        assert_eq!(r.status, 403, "{:?}", r.http.content);
+        assert!(
+            ausf_self()
+                .read()
+                .unwrap()
+                .anchor_lookup_kausf(supi)
+                .is_some(),
+            "the latest KAUSF survives an anonymous Deregister"
+        );
+        assert!(ausf_self().read().unwrap().ue_find_by_supi(supi).is_some());
+    }
+
     // ====================================================================
     // Issue #82: TS 29.509 §5.2.2.3 Deregister, HAL media type, and the
     // declared-but-unimplemented resources.
@@ -3960,13 +4231,20 @@ mod tests {
             // `DeregistrationInfo` carries ONLY `supi` — no servingNetworkName.
             // Before #82 this fell through to the authenticate handler, which
             // demanded one and answered 400.
-            let resp = client
-                .post_json(
-                    "/nausf-auth/v1/ue-authentications/deregister",
-                    &serde_json::json!({ "supi": supi }),
-                )
-                .await
-                .expect("deregister");
+            // #1928: as the UDM, verified by its certificate's NFTypes. The
+            // loopback client presents no certificate, so the handler is
+            // called with the identity the TLS layer would have attached.
+            let udm_deregister = || {
+                let mut req = SbiRequest::post("/nausf-auth/v1/ue-authentications/deregister")
+                    .with_body(
+                        serde_json::json!({ "supi": supi }).to_string(),
+                        "application/json",
+                    );
+                req.peer_cert_nf_instance_id = Some("19280000-0000-4000-8000-0000000000d1".into());
+                req.peer_cert_nf_types = vec!["UDM".into()];
+                req
+            };
+            let resp = ausf_sbi_request_handler(udm_deregister()).await;
             assert_eq!(
                 resp.status, 204,
                 "a conformant DeregistrationInfo must be 204, not the pre-#82 400"
@@ -3995,13 +4273,7 @@ mod tests {
             );
 
             // Nothing left to clear → 404 on a repeat.
-            let resp = client
-                .post_json(
-                    "/nausf-auth/v1/ue-authentications/deregister",
-                    &serde_json::json!({ "supi": supi }),
-                )
-                .await
-                .expect("second deregister");
+            let resp = ausf_sbi_request_handler(udm_deregister()).await;
             assert_eq!(resp.status, 404, "a second deregister has nothing to clear");
         })
         .await
@@ -4020,7 +4292,11 @@ mod tests {
         ausf_context_init(128);
 
         let post = |body: Option<serde_json::Value>| {
-            let req = SbiRequest::post("/nausf-auth/v1/ue-authentications/deregister");
+            // #1928: Deregister needs a verified caller; the UDM, by its
+            // certificate's NFTypes (the in-process server sees no TLS).
+            let mut req = SbiRequest::post("/nausf-auth/v1/ue-authentications/deregister");
+            req.peer_cert_nf_instance_id = Some("19280000-0000-4000-8000-0000000000d1".into());
+            req.peer_cert_nf_types = vec!["UDM".into()];
             match body {
                 Some(v) => req.with_json_body(&v).expect("valid JSON"),
                 None => req,

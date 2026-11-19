@@ -904,6 +904,8 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
     // The re-page case drains the process-global connected-downlink queue.
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // Paging reads the strategy (#1588).
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;

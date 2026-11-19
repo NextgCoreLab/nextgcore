@@ -955,7 +955,9 @@ async fn nssf_sbi_route(request: SbiRequest) -> SbiResponse {
                 // Per-NF availability document
                 (4, Some(nf_id), "PUT") => handle_nssai_availability_update(nf_id, &request).await,
                 (4, Some(nf_id), "PATCH") => handle_nssai_availability_patch(nf_id, &request).await,
-                (4, Some(nf_id), "DELETE") => handle_nssai_availability_delete(nf_id).await,
+                (4, Some(nf_id), "DELETE") => {
+                    handle_nssai_availability_delete(nf_id, &request).await
+                }
                 (4, Some(_), m) => send_method_not_allowed(m, "nssai-availability/{nfId}"),
                 _ => problem_details(
                     404,
@@ -2456,30 +2458,15 @@ fn check_availability_authorization(
     affected_tais: &[context::Tai],
     request: &SbiRequest,
 ) -> Option<SbiResponse> {
-    let tai = affected_tais.first().cloned().unwrap_or_default();
-
-    // The identity THIS PROCESS attested, in preference order. The verified
-    // client certificate outranks the token because it is bound to the
-    // connection rather than bearer-presentable; both are verified locally, and
-    // neither is read from the request path or body.
-    let caller = request
-        .peer_cert_nf_instance_id
-        .as_deref()
-        .or(request.oauth2_subject.as_deref());
-
-    let result = with_nssf_context(|context| {
-        let restriction = if context.has_plmn_snssai_restriction() {
+    let _ = affected_tais;
+    let restriction = with_nssf_context(|context| {
+        if context.has_plmn_snssai_restriction() {
             Some(context.plmn_supported_snssais())
         } else {
             None
-        };
-        (
-            context.nf_authorized_for_availability(nf_id, caller, &tai),
-            restriction,
-        )
+        }
     });
-
-    let (authorized, restriction) = match result {
+    let restriction = match restriction {
         Some(v) => v,
         // #94: a poisoned context lock now FAILS CLOSED. It used to fall back to
         // the default-allow policy, so poisoning the lock — which any panicking
@@ -2494,39 +2481,49 @@ fn check_availability_authorization(
             return Some(policy_unevaluable_response());
         }
     };
+    // #1937: the caller rule shared with every NF (owner_binding), with the
+    // document's own `{nfId}` as its owner.
+    let refusal = availability_owner_refusal(nf_id, request);
+    if let Some(ref why) = refusal {
+        log::warn!(
+            "availability write for {nf_id} REJECTED: {why} (TS 29.531 Table 6.2.3.2.3.1-2)"
+        );
+    }
+    authorize_availability_doc(nf_id, doc, refusal.is_none(), restriction.as_deref())
+        .err()
+        .map(AvailabilityAuthError::into_problem)
+}
 
-    // The documented escape hatch: a deployment that has explicitly turned SBI
-    // OAuth2 enforcement off has no attestable identity to bind to, so requiring
-    // one would make availability writes impossible rather than safe. Permitted,
-    // and WARNED about at every write so the posture is visible in the log rather
-    // than only in the config (the #64 pattern).
-    // The hatch covers a MISSING CALLER IDENTITY, never a missing resource owner:
-    // an empty `{nfId}` names no document, so there is nothing it could be
-    // authorized to write whatever the posture. Without this guard the hatch
-    // permitted an empty nfId, which the whole-workspace run caught.
-    if !authorized && caller.is_none() && !nf_id.trim().is_empty() && !strict_availability_authz() {
+/// #1937: why `request` may not write or delete the availability document of
+/// NF `nf_id`, or `None` if it may. The document belongs to the NF it names
+/// (TS 29.531 §6.2.3.2.3.1: an AMF reports its own slice availability), so the
+/// caller's verified identity, by the shared rule in
+/// [`nextgcore_sbi::owner_binding`] (certificate unless it names a relay, else
+/// token `sub`, and the two must agree), must be `nf_id`. A caller with no
+/// verified identity is admitted only through the documented escape hatch:
+/// OAuth2 enforcement off AND the `dev` SBI profile, warned at every write.
+/// Under `production` it is refused whatever the knob says. An empty `nf_id`
+/// names no document and is refused under any posture.
+fn availability_owner_refusal(nf_id: &str, request: &SbiRequest) -> Option<String> {
+    if nf_id.trim().is_empty() {
+        return Some("the request names no NF instance".to_string());
+    }
+    let strict = strict_availability_authz() || nextgcore_sbi::owner_binding::identity_required();
+    if !strict
+        && matches!(
+            nextgcore_sbi::owner_binding::verified_consumer_id(request),
+            Ok(None)
+        )
+    {
         log::warn!(
             "availability write for {nf_id} accepted WITHOUT an attested caller identity: \
              SBI OAuth2 enforcement is disabled, so any reachable NF can write any AMF's \
              slice-availability document. Set nssf.sbi.oauth2.require = true to bind the \
              caller to the resource (TS 33.501 §13.4.1)."
         );
-        return authorize_availability_doc(nf_id, doc, true, restriction.as_deref())
-            .err()
-            .map(AvailabilityAuthError::into_problem);
+        return None;
     }
-
-    if !authorized {
-        log::warn!(
-            "availability write for {nf_id} REJECTED: attested caller {:?} is not the owner \
-             of that document (TS 29.531 Table 6.2.3.2.3.1-2)",
-            caller
-        );
-    }
-
-    authorize_availability_doc(nf_id, doc, authorized, restriction.as_deref())
-        .err()
-        .map(AvailabilityAuthError::into_problem)
+    nextgcore_sbi::owner_binding::non_owner_refusal_with(Some(nf_id.trim()), request, strict)
 }
 
 /// The response when the availability-authorization policy cannot be EVALUATED
@@ -2808,8 +2805,15 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
     authorized_availability_response(&patched)
 }
 
-async fn handle_nssai_availability_delete(nf_id: &str) -> SbiResponse {
+async fn handle_nssai_availability_delete(nf_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NSSAI Availability Delete: nf_id={nf_id}");
+
+    // #1937: only the NF the document belongs to may remove it, checked before
+    // anything is removed or any subscriber notified.
+    if let Some(why) = availability_owner_refusal(nf_id, request) {
+        log::warn!("availability delete for {nf_id} REJECTED: {why}");
+        return problem_details(403, "Forbidden", &why, Some("NOT_AUTHORIZED"));
+    }
 
     let (removed, affected_tais) = with_nssf_context(|context| {
         let old = context.get_nssai_availability(nf_id);
@@ -6148,6 +6152,88 @@ nssf:
         );
 
         let _ = with_nssf_context(|c| c.remove_nssai_availability(owner));
+    }
+
+    /// #1937: DELETE is bound to the document's NF too. A non-owner token, a
+    /// certificate/token pair that disagree, and an unattested caller are
+    /// refused 403 with the document kept; the owner's DELETE is 204.
+    ///
+    /// REVERT-VERIFIED: with the owner check removed from
+    /// `handle_nssai_availability_delete`, the intruder's DELETE is 204 and
+    /// the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn availability_delete_is_bound_to_the_owner_1937() {
+        let _guard = context::nssf_test_guard(512);
+        let _posture = with_authz_posture(true);
+
+        let owner = "19370000-0000-4000-8000-0000000000a1";
+        let other = "19370000-0000-4000-8000-0000000000a2";
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let put = authenticated_availability_request("PUT", owner, Some(&body));
+        assert_eq!(
+            handle_nssai_availability_update(owner, &put).await.status,
+            200
+        );
+        let stored = || with_nssf_context(|c| c.get_nssai_availability(owner).is_some()).unwrap();
+
+        let delete = |token: Option<&str>, cert: Option<&str>| {
+            let mut r = SbiRequest::delete(format!(
+                "/nnssf-nssaiavailability/v1/nssai-availability/{owner}"
+            ));
+            r.oauth2_subject = token.map(str::to_string);
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r
+        };
+        for (req, what) in [
+            (delete(Some(other), None), "another AMF's token"),
+            (delete(None, Some(other)), "another AMF's certificate"),
+            (
+                delete(Some(owner), Some(other)),
+                "a certificate and token that disagree",
+            ),
+            (
+                delete(None, None),
+                "an unattested caller under the strict posture",
+            ),
+        ] {
+            let r = handle_nssai_availability_delete(owner, &req).await;
+            assert_eq!(r.status, 403, "{what}: {:?}", r.http.content);
+            assert!(stored(), "{what}: the document is kept");
+        }
+        let r = handle_nssai_availability_delete(owner, &delete(Some(owner), None)).await;
+        assert_eq!(r.status, 204, "the owner deletes its own document");
+        assert!(!stored());
+    }
+
+    /// #1937: PUT/PATCH use the shared caller rule too, so a certificate and a
+    /// token naming different NFs cannot write either NF's document.
+    ///
+    /// REVERT-VERIFIED: with the pre-#1937 "certificate outranks token" read
+    /// restored, the mismatched PUT is 200 and the assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn availability_write_refuses_a_certificate_token_mismatch_1937() {
+        let _guard = context::nssf_test_guard(512);
+        let _posture = with_authz_posture(true);
+        let owner = "19370000-0000-4000-8000-0000000000b1";
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let mut put = authenticated_availability_request("PUT", owner, Some(&body));
+        put.oauth2_subject = Some("19370000-0000-4000-8000-0000000000b2".into());
+        put.peer_cert_nf_instance_id = Some(owner.into());
+        let r = handle_nssai_availability_update(owner, &put).await;
+        assert_eq!(r.status, 403, "{:?}", r.http.content);
+        assert!(with_nssf_context(|c| c.get_nssai_availability(owner).is_none()).unwrap());
     }
 
     /// #94 criterion 2: the authorization decision fails CLOSED.

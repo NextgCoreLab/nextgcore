@@ -2962,6 +2962,7 @@ dependencies = [
  "p256",
  "proptest",
  "rcgen",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

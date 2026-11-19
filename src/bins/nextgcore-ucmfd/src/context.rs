@@ -1227,7 +1227,11 @@ impl Ucmf {
         match loaded {
             Ok(Loaded::Absent) => Ok(false),
             Ok(Loaded::Snapshot(doc)) => {
-                self.restore(&doc);
+                // #1937 (R32 on #1975): a cap applied at restore is written back
+                // at once, or every restart would grant another 24 h.
+                if self.restore(&doc) {
+                    self.persist();
+                }
                 Ok(true)
             }
             Err(e) => Err(e.to_string()),
@@ -1360,7 +1364,11 @@ impl Ucmf {
         }
     }
 
-    fn restore(&mut self, doc: &Value) {
+    /// Install the snapshot `doc`. `true` when restoring changed a record
+    /// relative to `doc` (a capped ownerless expiry, #1937), so the caller must
+    /// write the state back.
+    fn restore(&mut self, doc: &Value) -> bool {
+        let mut changed = false;
         let u64_of = |k: &str| doc.get(k).and_then(Value::as_u64);
         if let Some(v) = u64_of("versionId") {
             self.version_id = v as u8;
@@ -1434,18 +1442,24 @@ impl Ucmf {
             ) else {
                 continue;
             };
+            let owner = s.get("owner").and_then(Value::as_str).map(str::to_string);
+            let expires = s
+                .get("expires")
+                .and_then(Value::as_str)
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Utc));
             self.subscriptions.insert(
                 sid.to_string(),
                 Subscription {
                     id: sid.to_string(),
                     nf_id: s.get("nfId").and_then(Value::as_str).map(str::to_string),
                     notification_uri: uri.to_string(),
-                    expires: s
-                        .get("expires")
-                        .and_then(Value::as_str)
-                        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t.with_timezone(&Utc)),
-                    owner: s.get("owner").and_then(Value::as_str).map(str::to_string),
+                    expires: {
+                        let capped = restored_expiry(expires, owner.is_none(), Utc::now());
+                        changed |= capped != expires;
+                        capped
+                    },
+                    owner,
                 },
             );
         }
@@ -1475,7 +1489,27 @@ impl Ucmf {
                 },
             );
         }
+        changed
     }
+}
+
+/// #1937: the expiry a restored subscription keeps. An ownerless one (written
+/// before #1862) is frozen under the production profile, so nobody can
+/// unsubscribe it; it must not outlive the UCMF's own maximum either. It is
+/// capped at [`MAX_SUBSCRIPTION_LIFETIME_SECS`] from the restart, whatever
+/// (or however absent) its stored expiry, after which it lapses and its
+/// consumer re-subscribes, bound. An owned subscription keeps its expiry: its
+/// owner can still manage it.
+fn restored_expiry(
+    stored: Option<DateTime<Utc>>,
+    ownerless: bool,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if !ownerless {
+        return stored;
+    }
+    let cap = now + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
+    Some(stored.map_or(cap, |t| t.min(cap)))
 }
 
 /// The authority (`host[:port]`) of a notification URI.
@@ -1605,6 +1639,83 @@ mod tests {
         let mut restored = Ucmf::new(0x05, ModeOfOperation::B);
         restored.restore(&old);
         assert_eq!(restored.subscription(&sub.id).unwrap().owner, None);
+    }
+
+    /// R32 on #1975: the cap is written back when it is applied, so a second
+    /// restart does not grant another 24 h: the expiry after two restarts is
+    /// no later than after the first.
+    ///
+    /// REVERT-VERIFIED: with `attach_store` not persisting after a capping
+    /// restore, the second restart re-caps from its own clock and the expiry
+    /// moves later, failing the assertion.
+    #[test]
+    fn a_capped_expiry_does_not_move_later_on_each_restart_1937() {
+        let path = std::env::temp_dir().join(format!(
+            "ucmfd-1937-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let far = Utc::now() + ChronoDuration::days(30);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "subscriptions": [
+                    {"id": "ownerless-far", "uri": "http://amf/cb", "expires": far.to_rfc3339()}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let restart = || {
+            let mut u = Ucmf::new(0x05, ModeOfOperation::B);
+            assert_eq!(u.attach_store(Some(path.clone())), Ok(true));
+            u.subscription("ownerless-far").unwrap().expires.unwrap()
+        };
+        let first = restart();
+        assert!(first < far, "capped at the first restart");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = restart();
+        assert!(
+            second <= first,
+            "a second restart must not extend it ({first} -> {second})"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1937: a restored ownerless subscription lapses within the UCMF's
+    /// maximum lifetime of the restart, whether its stored expiry was far away
+    /// or absent; an owned one keeps its stored expiry.
+    ///
+    /// REVERT-VERIFIED: with `restored_expiry` returning `stored` unchanged,
+    /// the ownerless 30-day subscription keeps its expiry and the first
+    /// assertion fails.
+    #[test]
+    fn a_restored_ownerless_subscription_lapses_within_the_maximum_1937() {
+        let far = Utc::now() + ChronoDuration::days(30);
+        let doc = serde_json::json!({
+            "subscriptions": [
+                {"id": "ownerless-far", "uri": "http://amf/cb", "expires": far.to_rfc3339()},
+                {"id": "ownerless-none", "uri": "http://amf/cb"},
+                {"id": "owned-far", "uri": "http://amf/cb", "expires": far.to_rfc3339(),
+                 "owner": "aaaaaaaa-1937-4000-8000-00000000000a"},
+            ]
+        });
+        let mut u = Ucmf::new(0x05, ModeOfOperation::B);
+        let before = Utc::now();
+        u.restore(&doc);
+        let limit = Utc::now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
+        for id in ["ownerless-far", "ownerless-none"] {
+            let expires = u.subscription(id).unwrap().expires.expect("an expiry");
+            assert!(
+                expires <= limit && expires > before,
+                "{id}: lapses within the maximum ({expires})"
+            );
+        }
+        let owned = u.subscription("owned-far").unwrap().expires.unwrap();
+        assert!(
+            (owned - far).num_seconds().abs() <= 1,
+            "an owned subscription keeps its stored expiry"
+        );
     }
 
     /// #1916: a provisioning's verified owner survives a restart and a replace,

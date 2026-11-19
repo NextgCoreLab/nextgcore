@@ -398,7 +398,7 @@ impl OAuthVerifier {
         auth_header: Option<&str>,
         required_scope: Option<&str>,
         resource_scope: Option<&str>,
-    ) -> Result<String, BearerRefusal> {
+    ) -> Result<(String, String), BearerRefusal> {
         let claims = match &self.keys {
             OAuthKeySource::Static(jwks) => crate::oauth::authorize_bearer_aud(auth_header, jwks, None),
             OAuthKeySource::Remote(cache) => cache.authorize_aud(auth_header, None).await,
@@ -422,6 +422,9 @@ impl OAuthVerifier {
             }
             _ => None,
         };
+        // #1918: the scope the token grants, read before `bearer_decision`
+        // consumes the claims and handed on only if it accepts them.
+        let granted = claims.as_ref().map(|c| c.scope.clone()).unwrap_or_default();
         let sub = bearer_decision(
             claims,
             auth_header,
@@ -430,7 +433,7 @@ impl OAuthVerifier {
         )?;
         match resource_refusal {
             Some(refusal) => Err(refusal),
-            None => Ok(sub),
+            None => Ok((sub, granted)),
         }
     }
 }
@@ -799,7 +802,12 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                 {
                     // Record the identity THIS PROCESS verified, so a producer can
                     // bind authorization to the caller (issue #94).
-                    Ok(sub) => sbi_request.oauth2_subject = Some(sub),
+                    Ok((sub, scope)) => {
+                        sbi_request.oauth2_subject = Some(sub);
+                        // #1918: and the verified scope, for an operation a
+                        // producer admits on a resource scope it does not require.
+                        sbi_request.oauth2_scope = Some(scope);
+                    }
                     Err(refusal) => {
                         // #1766: TS 29.500 §6.7.3 / RFC 6750 §3.1 -- 401 with no
                         // `error` for no token, 401 invalid_token for a bad one,
@@ -1168,6 +1176,7 @@ async fn convert_request(
         // Set by the caller after the bearer token verifies; `convert_request`
         // runs before authorization, so it cannot know it here.
         oauth2_subject: None,
+        oauth2_scope: None,
     })
 }
 
@@ -2960,7 +2969,7 @@ mod tests {
 
         // The handler reports back what it saw, so the assertion is on the value
         // that actually reached it.
-        let seen: Arc<std::sync::Mutex<Option<Option<String>>>> =
+        let seen: Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>> =
             Arc::new(std::sync::Mutex::new(None));
         let sink = Arc::clone(&seen);
 
@@ -2975,7 +2984,7 @@ mod tests {
                 let sink = Arc::clone(&sink);
                 async move {
                     *sink.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(req.oauth2_subject.clone());
+                        Some((req.oauth2_subject.clone(), req.oauth2_scope.clone()));
                     SbiResponse::with_status(204)
                 }
             })
@@ -3005,10 +3014,16 @@ mod tests {
             .clone()
             .expect("the handler must have run");
         assert_eq!(
-            observed.as_deref(),
+            observed.0.as_deref(),
             Some("amf-1"),
             "the handler must see the verified token's `sub` (issue #94)"
         );
+        // #1918: and its verified scope, for an operation a producer admits on a
+        // resource scope it does not require.
+        //
+        // REVERT-VERIFIED: with `sbi_request.oauth2_scope = Some(scope)` removed,
+        // this fails.
+        assert_eq!(observed.1.as_deref(), Some("nudm-sdm"));
 
         server.stop().await.expect("stop");
     }
