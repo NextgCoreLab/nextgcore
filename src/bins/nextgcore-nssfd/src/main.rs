@@ -895,7 +895,9 @@ async fn nssf_sbi_route(request: SbiRequest) -> SbiResponse {
                 // Subscriptions collection
                 (4, Some("subscriptions"), "POST") => handle_subscription_create(&request).await,
                 (4, Some("subscriptions"), m) => send_method_not_allowed(m, "subscriptions"),
-                (5, Some("subscriptions"), "DELETE") => handle_subscription_delete(parts[4]).await,
+                (5, Some("subscriptions"), "DELETE") => {
+                    handle_subscription_delete(parts[4], &request).await
+                }
                 (5, Some("subscriptions"), "PATCH") => {
                     handle_subscription_patch(parts[4], &request).await
                 }
@@ -2902,6 +2904,8 @@ fn subscription_from_json(
         accepted_events,
         amf_id: v.get("amfId").and_then(|x| x.as_str()).map(String::from),
         amf_set_id: v.get("amfSetId").and_then(|x| x.as_str()).map(String::from),
+        // Set by the caller: create binds the requester, PATCH keeps the creator.
+        owner: None,
     })
 }
 
@@ -3022,6 +3026,15 @@ async fn send_availability_notification(
 
 async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     log::info!("NSSAI Availability Subscription Create");
+    // #1909: bound to the consumer's verified identity (never the body's
+    // amfId), refused before anything is read or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "NSSAI availability Subscribe",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -3048,10 +3061,11 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     };
 
     let subscription_id = uuid::Uuid::new_v4().to_string();
-    let sub = match subscription_from_json(&subscription_id, &subscription_data) {
+    let mut sub = match subscription_from_json(&subscription_id, &subscription_data) {
         Ok(s) => s,
         Err(e) => return problem_details(400, "Bad Request", &e, Some("MANDATORY_IE_MISSING")),
     };
+    sub.owner = owner;
 
     let mut created = sub.to_created_json();
     let authorized = collect_authorized_data_for(&sub.tai_list);
@@ -3074,8 +3088,21 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_subscription_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NSSAI Availability Subscription Delete: {subscription_id}");
+
+    // #1909: only the consumer that created it, before anything is removed.
+    if let Some(existing) =
+        with_nssf_context(|context| context.subscription_get(subscription_id)).flatten()
+    {
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            existing.owner.as_deref(),
+            request,
+            "NSSAI availability Unsubscribe",
+        ) {
+            return refused;
+        }
+    }
 
     let removed =
         with_nssf_context(|context| context.subscription_remove(subscription_id)).unwrap_or(false);
@@ -3107,6 +3134,14 @@ async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) 
             )
         }
     };
+    // #1909: only the consumer that created it, before the body is read.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "NSSAI availability Subscription Modify",
+    ) {
+        return refused;
+    }
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -3157,7 +3192,7 @@ async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) 
         );
     }
 
-    let updated = match subscription_from_json(subscription_id, &doc) {
+    let mut updated = match subscription_from_json(subscription_id, &doc) {
         Ok(s) => s,
         Err(e) => {
             return problem_details(
@@ -3175,6 +3210,8 @@ async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) 
         created["authorizedNssaiAvailabilityData"] = serde_json::json!(authorized);
     }
 
+    // #1909: a modified subscription keeps its creator.
+    updated.owner = existing.owner.clone();
     with_nssf_context(|context| context.subscription_update(updated));
 
     SbiResponse::with_status(200)
@@ -7565,5 +7602,123 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1909: an NSSAI-availability subscription is modified and removed only by
+/// the consumer that created it, through the real router.
+#[cfg(test)]
+mod subscription_owner_tests_1909 {
+    use super::*;
+    use serde_json::json;
+
+    const OWNER: &str = "aaaaaaaa-1909-4000-8000-0000000000a1";
+    const OTHER: &str = "bbbbbbbb-1909-4000-8000-0000000000b2";
+    const SUBS: &str = "/nnssf-nssaiavailability/v1/nssai-availability/subscriptions";
+
+    fn with(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
+        r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        r.oauth2_subject = token.map(str::to_string);
+        r
+    }
+
+    fn create() -> SbiRequest {
+        SbiRequest::post(SUBS)
+            .with_json_body(&json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb-1909",
+                "taiList": [{"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "001909"}],
+                "event": "SNSSAI_STATUS_CHANGE_REPORT",
+                "amfId": OTHER, // self-declared; never the owner
+            }))
+            .unwrap()
+    }
+
+    /// REVERT-VERIFIED: the Modify check and the Unsubscribe check, each
+    /// replaced by `None`, make the matching intruder assertion fail; with the
+    /// owner not carried over on PATCH the owner's second PATCH gets 403; with
+    /// the create binding dropped the owner assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_availability_subscription_is_managed_only_by_its_creator_1909() {
+        let _guard = context::nssf_test_guard(512);
+
+        // A certificate and token that disagree create nothing.
+        let resp = nssf_sbi_request_handler(with(create(), Some(OWNER), Some(OTHER))).await;
+        assert_eq!(resp.status, 403);
+        assert!(with_nssf_context(|c| c.subscription_count()).unwrap_or(0) == 0);
+
+        let resp = nssf_sbi_request_handler(with(create(), Some(OWNER), None)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = body["subscriptionId"].as_str().unwrap().to_string();
+        let owner_of = || {
+            with_nssf_context(|c| c.subscription_get(&id))
+                .flatten()
+                .map(|s| (s.owner, s.nf_nssai_availability_uri))
+        };
+        assert_eq!(
+            owner_of(),
+            Some((
+                Some(OWNER.to_string()),
+                "http://127.0.0.1:9/cb-1909".to_string()
+            ))
+        );
+        let uri = format!("{SUBS}/{id}");
+        let patch = || {
+            SbiRequest::patch(uri.clone()).with_body(
+                json!([{"op": "replace", "path": "/nfNssaiAvailabilityUri",
+                        "value": "http://127.0.0.1:9/hijack"}])
+                .to_string(),
+                "application/json-patch+json",
+            )
+        };
+        for (what, req) in [
+            ("PATCH", patch()),
+            ("DELETE", SbiRequest::delete(uri.clone())),
+        ] {
+            let make = |r: &SbiRequest| r.clone();
+            for (who, caller) in [
+                ("foreign certificate", with(make(&req), Some(OTHER), None)),
+                ("foreign token", with(make(&req), None, Some(OTHER))),
+                (
+                    "mismatched pair",
+                    with(make(&req), Some(OWNER), Some(OTHER)),
+                ),
+                ("anonymous", make(&req)),
+            ] {
+                assert_eq!(
+                    nssf_sbi_request_handler(caller).await.status,
+                    403,
+                    "{what} by {who}"
+                );
+            }
+        }
+        assert_eq!(
+            owner_of(),
+            Some((
+                Some(OWNER.to_string()),
+                "http://127.0.0.1:9/cb-1909".to_string()
+            )),
+            "nothing an intruder sent was applied"
+        );
+        // The owner, by token: two PATCHes (the creator survives the first),
+        // then the DELETE.
+        for _ in 0..2 {
+            let resp = nssf_sbi_request_handler(with(patch(), None, Some(OWNER))).await;
+            assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        }
+        assert_eq!(
+            owner_of(),
+            Some((
+                Some(OWNER.to_string()),
+                "http://127.0.0.1:9/hijack".to_string()
+            ))
+        );
+        let resp =
+            nssf_sbi_request_handler(with(SbiRequest::delete(uri.clone()), Some(OWNER), None))
+                .await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(owner_of(), None);
     }
 }
