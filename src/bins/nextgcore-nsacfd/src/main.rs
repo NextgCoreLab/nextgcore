@@ -1731,6 +1731,11 @@ fn nsacf_oauth2_claims(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerCo
 /// SEPP) says nothing about the consumer and is left to the token's
 /// `nnsacf-nsac:local-configs-update` scope; no certificate (`dev`) changes
 /// nothing.
+///
+/// #1934 review m1: an empty type list (a certificate without RFC 9310 NF types,
+/// or none at all under `dev`) is left to the token. Under production the token's
+/// `nnsacf-nsac:local-configs-update` scope is then the whole decision, and the
+/// NRF grants that scope to an NSACF only.
 fn refuse_non_nsacf_certificate(request: &SbiRequest) -> Option<SbiResponse> {
     let types = &request.peer_cert_nf_types;
     let is = |t: &str| types.iter().any(|c| c.eq_ignore_ascii_case(t));
@@ -3082,6 +3087,25 @@ nsacf:
             "the refusal names the missing scope: {problem}"
         );
         assert_eq!(ceiling(full).await, 7, "the refused update changed nothing");
+
+        // #1934 review M1: no other spelling of the route reaches it with the
+        // service scope alone. nsacfd's router drops empty segments where the scope
+        // table does not, so `//` used to be routed here unscoped (204). The SBI
+        // server now refuses every such path 400 before the scope check and the
+        // router; `%2F` would only reach the router as one segment, and is refused
+        // the same way.
+        for spelling in [
+            "/nnsacf-nsac/v1//slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices//local-configs/update",
+            "//nnsacf-nsac/v1/slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices/local-configs/update/",
+            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
+            "/nnsacf-nsac/v1/slices/./local-configs/update",
+        ] {
+            let resp = send("nnsacf-nsac", spelling, ac_update_data(92, 1000, 1000)).await;
+            assert_eq!(resp.status, 400, "{spelling}: {:?}", resp.http.content);
+        }
+        assert_eq!(ceiling(full).await, 7, "no spelling changed the ceiling");
 
         // The service scope alone still serves an AMF's NSAC operation.
         let resp = send(

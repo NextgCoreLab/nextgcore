@@ -182,6 +182,17 @@ mod tests {
             ),
             "nnsacf-nsac nnsacf-nsac:local-configs-update"
         );
+        // #1934 review M1: a path a router may split differently (an empty or dot
+        // segment) is not classified here, so it must never reach a router: the
+        // SBI server refuses each of them 400 first.
+        for uri in [
+            "/nnsacf-nsac/v1//slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices//local-configs/update",
+            "/nnsacf-nsac/v1/slices/./local-configs/update",
+        ] {
+            assert_eq!(required_resource_scope("POST", uri), None, "{uri}");
+            assert!(crate::server::path_segment_refusal(uri).is_some(), "{uri}");
+        }
         for uri in [
             "/nnsacf-nsac/v1/slices/ues",
             "/nnsacf-nsac/v1/slices/pdus",
