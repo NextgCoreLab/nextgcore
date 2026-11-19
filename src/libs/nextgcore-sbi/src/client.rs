@@ -894,7 +894,15 @@ impl SbiClient {
         let Some((oauth2, target, resend, header)) = resend else {
             return Ok(response);
         };
-        if response.status != 401
+        // #1964 (R31 M2): a 403 carrying `invalid_token` is TS 29.500 §6.7.3's
+        // ACCESS_TOKEN_CLAIM_MISMATCH, e.g. a resource-scoped token whose `aud`
+        // nrfd pinned to the producers registered at mint time, sent to one that
+        // registered later. §6.7.3: after a 401 or 403 with a Bearer challenge
+        // the consumer "may repeat the same request with a new OAuth 2.0 access
+        // token", and a new token is re-evaluated against the current producers.
+        // A 403 `insufficient_scope` is not retried: a fresh token carries the
+        // same scope.
+        if !matches!(response.status, 401 | 403)
             || response
                 .http
                 .get_header("WWW-Authenticate")
@@ -904,10 +912,11 @@ impl SbiClient {
             return Ok(response);
         }
         log::warn!(
-            "{} {}: the producer refused our access token (401 invalid_token); evicting \
+            "{} {}: the producer refused our access token ({} invalid_token); evicting \
              the cached {} token for scope '{scope}' and resending once with a fresh one",
             resend.header.method,
             crate::log_redact::redact_callback_tokens(&resend.header.uri),
+            response.status,
             target.to_str()
         );
         let rejected = header.strip_prefix("Bearer ").unwrap_or(&header);
@@ -2934,6 +2943,42 @@ mod tests {
         assert_eq!(counts.token_fetches.load(SeqCst), 2);
     }
 
+    /// **#1964 (R31 M2), TS 29.500 §6.7.3.** A producer that refuses the cached
+    /// token with 403 `invalid_token` (ACCESS_TOKEN_CLAIM_MISMATCH: a token whose
+    /// `aud` nrfd pinned before this producer registered) gets the request again,
+    /// once, with a fresh token, as for a 401. Before, only a 401 evicted, so the
+    /// UDM's K read and the AKA failed until the token expired.
+    ///
+    /// REVERT-VERIFIED: with eviction back on 401 only, the 403 is returned and
+    /// the first assertion fails.
+    #[tokio::test]
+    async fn a_403_claim_mismatch_evicts_the_token_and_resends_once_1964() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1"], 403, "invalid_token").await;
+        let (client, oauth2) = client_1676(addr);
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        assert_eq!(
+            response.status, 200,
+            "the resend with a fresh token succeeds"
+        );
+        assert_eq!(
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst)
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            oauth2.get_token(NfType::Udm, "nudm-sdm").await.unwrap(),
+            "token-2"
+        );
+    }
+
     /// **#1676.** The resend happens once: a producer that refuses every token
     /// gets two requests, and the caller gets its 401.
     ///
@@ -3040,41 +3085,46 @@ mod tests {
         }
     }
 
-    /// **#1779 review m1.** Since #1766 a producer answers a token for another
-    /// producer with 403 and `error="invalid_token"` (TS 29.500 §6.7.3 claims
-    /// mismatch), and a token without the scope with 403 `insufficient_scope`.
-    /// Neither is fixed by a fresh token, so each is returned after one producer
-    /// hit, with no refetch and the cached token kept. The status check is the only
-    /// thing that keeps the first case from resending.
+    /// **#1779 review m1, superseded in part by #1964 (R31 M2).** Since #1766 a
+    /// producer answers a token for another producer with 403 and
+    /// `error="invalid_token"` (TS 29.500 §6.7.3 claims mismatch), and a token
+    /// without the scope with 403 `insufficient_scope`. #1779 returned both
+    /// without a refetch, on the ground that a fresh token does not fix either.
+    /// Since nrfd pins a resource-scoped token's `aud` to the producers
+    /// registered at mint time (#1964), a fresh token DOES fix a claims mismatch
+    /// (§6.7.3: the consumer "may repeat the same request with a new OAuth 2.0
+    /// access token"), so that case is retried once (covered by
+    /// `a_403_claim_mismatch_evicts_the_token_and_resends_once_1964`, and bounded
+    /// to once by `a_second_invalid_token_is_returned_not_retried_1676`).
+    /// `insufficient_scope` still is not: a fresh token carries the same scope.
     ///
-    /// REVERT-VERIFIED: with the eviction condition widened to `401 | 403`, the
-    /// `invalid_token` case makes two hits and two fetches.
+    /// REVERT-VERIFIED: with the eviction condition widened to any 403, the
+    /// `insufficient_scope` case makes two hits and two fetches.
     #[tokio::test]
-    async fn a_403_bearer_refusal_is_returned_not_retried_1779() {
+    async fn a_403_insufficient_scope_is_returned_not_retried_1779() {
         use std::sync::atomic::Ordering::SeqCst;
         let _paths = crate::oauth::lock_path_mode_async().await;
-        for error in ["invalid_token", "insufficient_scope"] {
-            let (addr, counts) = serve_rotating_token_producer(&["token-1"], 403, error).await;
-            let (client, oauth2) = client_1676(addr);
-            let response = client
-                .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
-                .await
-                .expect("sent");
-            assert_eq!(response.status, 403, "{error:?}");
-            assert_eq!(
-                (
-                    counts.token_fetches.load(SeqCst),
-                    counts.producer_hits.load(SeqCst)
-                ),
-                (1, 1),
-                "{error:?}: one hit, no refetch"
-            );
-            assert_eq!(
-                oauth2.get_token(NfType::Udm, "nudm-sdm").await.unwrap(),
-                "token-1",
-                "{error:?}: the cached token is kept"
-            );
-        }
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1"], 403, "insufficient_scope").await;
+        let (client, oauth2) = client_1676(addr);
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        assert_eq!(response.status, 403);
+        assert_eq!(
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst)
+            ),
+            (1, 1),
+            "one hit, no refetch"
+        );
+        assert_eq!(
+            oauth2.get_token(NfType::Udm, "nudm-sdm").await.unwrap(),
+            "token-1",
+            "the cached token is kept"
+        );
     }
 
     #[test]
