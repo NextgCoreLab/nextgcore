@@ -146,6 +146,10 @@ fn ops() -> &'static Mutex<Ops> {
 /// the INCREASE's wait below covers it.
 pub const DECREASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DECREASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// #2005 (R32 on #2002): the whole DECREASE call, its OAuth2 token fetch
+/// included, finishes within this, so an INCREASE's [`DECREASE_WAIT`] covers it.
+pub const DECREASE_BOUND: Duration =
+    Duration::from_secs(DECREASE_CONNECT_TIMEOUT.as_secs() + DECREASE_REQUEST_TIMEOUT.as_secs());
 
 /// The longest an INCREASE waits for a DECREASE of its key on the wire. #1945: it
 /// covers the DECREASE's own bound (connect, then request), so in the ordinary
@@ -159,8 +163,7 @@ const DECREASE_WAIT: Duration = Duration::from_secs(1);
 
 #[cfg(not(test))]
 const _: () = assert!(
-    DECREASE_WAIT.as_millis()
-        > DECREASE_CONNECT_TIMEOUT.as_millis() + DECREASE_REQUEST_TIMEOUT.as_millis(),
+    DECREASE_WAIT.as_millis() > DECREASE_BOUND.as_millis(),
     "an INCREASE's wait must cover a DECREASE's own timeout (#1945)"
 );
 
@@ -494,9 +497,29 @@ fn spawn_recount(key: Key) {
         while lock(ops()).admitting.contains_key(&key) && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let Some(live) = lock(admissions()).get(&key).cloned() else {
-            return;
+        // #2005 (R32 on #2002): the re-count is an INCREASE like any other, so it
+        // registers as being admitted under the admissions lock, in the same step
+        // as reading the live admission. A deregistration in the window then
+        // finds it, and its DECREASE is handed to the re-count and sent once the
+        // re-count's INCREASE is settled, instead of possibly landing first and
+        // leaving the NSACF counting a UE the AMF has already dropped.
+        let (live, flights) = {
+            let admitted = lock(admissions());
+            let Some(live) = admitted.get(&key).cloned() else {
+                return;
+            };
+            let mut ops = lock(ops());
+            if ops.admitting.contains_key(&key) {
+                // Another INCREASE of the key is being decided: it counts the UE.
+                return;
+            }
+            ops.admitting.entry(key.clone()).or_default();
+            (live, ops.in_flight.get(&key).cloned().unwrap_or_default())
         };
+        let until = tokio::time::Instant::now() + DECREASE_WAIT;
+        for f in flights {
+            f.wait(until).await;
+        }
         log::warn!(
             "[{}] NSACF DECREASE for SST={} SD={:?} may have landed after its \
              re-registration's INCREASE; counting the UE in again",
@@ -516,6 +539,14 @@ fn spawn_recount(key: Key) {
             true,
         )
         .await;
+        // The DECREASEs superseded while the re-count was out (the UE
+        // deregistered, or its S-NSSAI was removed): the re-count does not own
+        // the admission, so every one is still owed and is sent now, after it.
+        let owed = {
+            let _admitted = lock(admissions());
+            lock(ops()).admitting.remove(&key).unwrap_or_default()
+        };
+        spawn_decreases(owed);
     });
 }
 
@@ -1213,6 +1244,68 @@ pub(crate) mod tests {
             order,
             ["INCREASE-applied", "DECREASE-applied", "INCREASE-applied"],
             "counted in again after the late DECREASE"
+        );
+    }
+
+    /// #2005 (R32 on #2002): a UE that deregisters while the late-DECREASE
+    /// re-count's INCREASE is on the wire ends counted OUT. Its deregistration's
+    /// DECREASE is handed to the re-count and sent after it, instead of being
+    /// sent at once and landing before the slower re-count INCREASE, which left
+    /// the NSACF counting a UE the AMF had dropped.
+    ///
+    /// Timeline (INCREASE 2 s, DECREASE 1.1 s): the first DECREASE lands at
+    /// 1.1 s, after the registration's 1 s wait, so it is overtaken; the
+    /// registration's INCREASE lands at 3 s; the re-count's INCREASE goes at 3 s
+    /// and lands at 5 s; the UE deregisters during it.
+    ///
+    /// REVERT-VERIFIED: without the re-count registering as being admitted, the
+    /// deregistration's DECREASE lands at about 4.3 s and the re-count INCREASE
+    /// at 5 s, so the NSACF's last word is an INCREASE and this fails.
+    #[tokio::test]
+    async fn a_deregistration_during_the_recount_is_counted_out_after_it_2005() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, applied) = slow_nsacf(
+            Duration::from_millis(2000),
+            Duration::from_millis(1100),
+            &[],
+        )
+        .await;
+        let supi = "imsi-001010000020051";
+        record(admission_at(supi, 1, port));
+        let before = RECOUNTS.load(std::sync::atomic::Ordering::Relaxed);
+
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            port,
+            "amf-2005",
+        )
+        .await;
+        assert!(out.granted);
+        // The re-count's INCREASE is on the wire once the counter moves.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while RECOUNTS.load(std::sync::atomic::Ordering::Relaxed) == before
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The UE deregisters during the re-count.
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        let order = applied_n(&applied, 4).await;
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(order.len(), 4, "{order:?}");
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("DECREASE-applied"),
+            "the NSACF's last word is the deregistration: {order:?}"
         );
     }
 
