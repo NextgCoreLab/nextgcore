@@ -1058,7 +1058,7 @@ async fn route_nudm_sdm(
         ("nssai", "", "GET") => handle_get_nssai(supi, request).await,
         ("sdm-subscriptions", "", "POST") => handle_sdm_subscribe(supi, request).await,
         ("sdm-subscriptions", subscription_id, "DELETE") if !subscription_id.is_empty() => {
-            handle_sdm_unsubscribe(supi, subscription_id).await
+            handle_sdm_unsubscribe(supi, subscription_id, request).await
         }
         // udmd-12: SDM subscription modification PATCH is not implemented.
         ("sdm-subscriptions", subscription_id, "PATCH") if !subscription_id.is_empty() => {
@@ -1180,7 +1180,7 @@ async fn route_nudm_ee(
     match (resource, subscription_id, method) {
         ("ee-subscriptions", "", "POST") => handle_ee_subscribe(ue_identity, request).await,
         ("ee-subscriptions", id, "DELETE") if !id.is_empty() => {
-            handle_ee_unsubscribe(ue_identity, id).await
+            handle_ee_unsubscribe(ue_identity, id, request).await
         }
         ("ee-subscriptions", id, "PATCH") if !id.is_empty() => {
             handle_ee_modify(ue_identity, id, request).await
@@ -2497,8 +2497,31 @@ pub async fn handle_get_nssai(supi: &str, _request: &SbiRequest) -> SbiResponse 
     }
 }
 
+/// #1865: the verified consumer the crate's tests call the subscription
+/// handlers as, so a test that creates and then manages a subscription passes
+/// under both SBI profiles (`production` refuses an anonymous create).
+#[cfg(test)]
+pub(crate) const TEST_CONSUMER_1865: &str = "c0c0c0c0-1865-4000-8000-0000000000c0";
+
+/// `request` as [`TEST_CONSUMER_1865`], unless it already names a verified
+/// identity.
+#[cfg(test)]
+pub(crate) fn as_test_consumer(request: &SbiRequest) -> SbiRequest {
+    let mut r = request.clone();
+    if r.peer_cert_nf_instance_id.is_none() && r.oauth2_subject.is_none() {
+        r.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+    }
+    r
+}
+
 pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("SDM Subscribe: SUPI={supi}");
+    // #1865: bound to the consumer's verified identity, refused before anything is read or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(request, "SDM Subscribe")
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -2554,12 +2577,13 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
     }
 
     // udmd-07: persist the subscription in the UDM context.
-    let sub = UdmSdmSubscription::for_supi(
+    let mut sub = UdmSdmSubscription::for_supi(
         supi,
         nf_instance_id.clone(),
         callback_reference.clone(),
         monitored_resource_uris.clone(),
     );
+    sub.owner = owner;
     let subscription_id = sub.id.clone();
     {
         // #1836: stored and written to the state file before the 201, so a
@@ -2612,20 +2636,34 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiResponse {
+pub async fn handle_sdm_unsubscribe(
+    supi: &str,
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("SDM Unsubscribe: SUPI={supi}, subscriptionId={subscription_id}");
 
-    // udmd-07: 404 if the subscription is not found in context.
-    let exists = {
+    // udmd-07: 404 if the subscription is not found in context. #1865: nor is
+    // one that belongs to another SUPI, since the resource is
+    // /{supi}/sdm-subscriptions/{subscriptionId}.
+    let found = {
         let ctx = udm_self();
         let guard = ctx.read().ok();
         guard
             .as_ref()
             .and_then(|c| c.sdm_subscription_find_by_id(subscription_id))
-            .is_some()
+            .filter(|sub| sub.supi == supi)
     };
-    if !exists {
+    let Some(sub) = found else {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
+    };
+    // #1865: only the consumer that created it, checked before any side effect.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        sub.owner.as_deref(),
+        request,
+        "SDM Unsubscribe",
+    ) {
+        return refused;
     }
     // Remove it from context, and from the state file (#1836): neither, or both.
     // A removal that could not be written is undone and answered 500, as the
@@ -2661,6 +2699,12 @@ pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRes
 /// udmd#0: Nudm_EE CreateEeSubscription (TS 29.503 5.5.2.2 / 6.4).
 pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("EE Subscribe: ueIdentity={ue_identity}");
+    // #1865: bound to the consumer's verified identity, refused before anything is read or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(request, "EE Subscribe")
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let body = match &request.http.content {
         Some(content) => content,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -2685,7 +2729,8 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
     if let Err(detail) = crate::context::ee_monitoring_configurations(&ee_sub) {
         return send_bad_request(&detail, Some("MANDATORY_IE_MISSING"));
     }
-    let sub = UdmEeSubscription::for_ue(ue_identity, callback_reference, body.clone());
+    let mut sub = UdmEeSubscription::for_ue(ue_identity, callback_reference, body.clone());
+    sub.owner = owner;
     let subscription_id = sub.id.clone();
     {
         let ctx = udm_self();
@@ -2715,18 +2760,31 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
 }
 
 /// udmd#0: Nudm_EE DeleteEeSubscription (TS 29.503 5.5.2.3).
-pub async fn handle_ee_unsubscribe(ue_identity: &str, subscription_id: &str) -> SbiResponse {
+pub async fn handle_ee_unsubscribe(
+    ue_identity: &str,
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("EE Unsubscribe: ueIdentity={ue_identity}, subscriptionId={subscription_id}");
-    let exists = {
+    // #1865: a subscription under another ueIdentity is not this resource.
+    let found = {
         let ctx = udm_self();
         let guard = ctx.read().ok();
         guard
             .as_ref()
             .and_then(|c| c.ee_subscription_find_by_id(subscription_id))
-            .is_some()
+            .filter(|sub| sub.ue_identity == ue_identity)
     };
-    if !exists {
+    let Some(sub) = found else {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
+    };
+    // #1865: only the consumer that created it, checked before any side effect.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        sub.owner.as_deref(),
+        request,
+        "EE Unsubscribe",
+    ) {
+        return refused;
     }
     let removed = {
         let ctx = udm_self();
@@ -2765,9 +2823,17 @@ pub async fn handle_ee_modify(
         guard
             .as_ref()
             .and_then(|c| c.ee_subscription_find_by_id(subscription_id))
+            // #1865: a subscription under another ueIdentity is not this resource.
+            .filter(|sub| sub.ue_identity == ue_identity)
     }) else {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     };
+    // #1865: only the consumer that created it, checked before the body is read.
+    if let Some(refused) =
+        nextgcore_sbi::owner_binding::refuse_non_owner(sub.owner.as_deref(), request, "EE Modify")
+    {
+        return refused;
+    }
 
     let Some(body) = request.http.content.as_deref() else {
         return send_bad_request("Missing request body", Some("MISSING_BODY"));
@@ -4957,7 +5023,12 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(handle_sdm_subscribe(supi, &request).await.status, 201);
+        assert_eq!(
+            handle_sdm_subscribe(supi, &crate::app::as_test_consumer(&request))
+                .await
+                .status,
+            201
+        );
         // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
         crate::sdm_udr::wait_idle().await;
         let stored = {
@@ -5040,7 +5111,7 @@ mod tests {
         };
 
         // Subscribe → 201 + Location header.
-        let resp = handle_sdm_subscribe(supi, &request).await;
+        let resp = handle_sdm_subscribe(supi, &crate::app::as_test_consumer(&request)).await;
         assert_eq!(resp.status, 201, "subscribe must return 201");
         // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
         crate::sdm_udr::wait_idle().await;
@@ -5076,7 +5147,12 @@ mod tests {
         }
 
         // Unsubscribe with a bad id → 404 NOT_FOUND.
-        let resp = handle_sdm_unsubscribe(supi, "nonexistent-uuid-0000").await;
+        let resp = handle_sdm_unsubscribe(
+            supi,
+            "nonexistent-uuid-0000",
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         assert_eq!(resp.status, 404, "missing subscription must be 404");
         let pd: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
@@ -5087,7 +5163,12 @@ mod tests {
         );
 
         // Unsubscribe with the real id → 204.
-        let resp = handle_sdm_unsubscribe(supi, &sub_id).await;
+        let resp = handle_sdm_unsubscribe(
+            supi,
+            &sub_id,
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         assert_eq!(resp.status, 204, "valid unsubscribe must return 204");
         // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
         crate::sdm_udr::wait_idle().await;
@@ -5195,7 +5276,12 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(handle_ee_subscribe(ue, &bad).await.status, 400);
+        assert_eq!(
+            handle_ee_subscribe(ue, &crate::app::as_test_consumer(&bad))
+                .await
+                .status,
+            400
+        );
         // Valid -> 201 + Location + echoed eeSubscription.subscriptionId.
         let req = SbiRequest {
             header: SbiHeader::with_method_uri(
@@ -5214,7 +5300,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let resp = handle_ee_subscribe(ue, &req).await;
+        let resp = handle_ee_subscribe(ue, &crate::app::as_test_consumer(&req)).await;
         assert_eq!(resp.status, 201);
         let loc = resp
             .http
@@ -5231,8 +5317,26 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("subscriptionId echoed")
             .to_string();
-        assert_eq!(handle_ee_unsubscribe(ue, "nope-uuid").await.status, 404);
-        assert_eq!(handle_ee_unsubscribe(ue, &sub_id).await.status, 204);
+        assert_eq!(
+            handle_ee_unsubscribe(
+                ue,
+                "nope-uuid",
+                &crate::app::as_test_consumer(&SbiRequest::default())
+            )
+            .await
+            .status,
+            404
+        );
+        assert_eq!(
+            handle_ee_unsubscribe(
+                ue,
+                &sub_id,
+                &crate::app::as_test_consumer(&SbiRequest::default())
+            )
+            .await
+            .status,
+            204
+        );
     }
 
     // ========================================================================
@@ -5705,7 +5809,11 @@ mod tests {
         for ie in ["nfInstanceId", "callbackReference", "monitoredResourceUris"] {
             let mut body = full.clone();
             body.as_object_mut().expect("object").remove(ie);
-            let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(body)).await;
+            let resp = handle_sdm_subscribe(
+                supi,
+                &crate::app::as_test_consumer(&sdm_subscribe_request(body)),
+            )
+            .await;
             assert_eq!(
                 resp.status, 400,
                 "a subscription missing {ie} must be refused"
@@ -5724,11 +5832,19 @@ mod tests {
         // out empty — a bug to surface, not a whole-UE subscription to infer.
         let mut empty = full.clone();
         empty["monitoredResourceUris"] = serde_json::json!([]);
-        let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(empty)).await;
+        let resp = handle_sdm_subscribe(
+            supi,
+            &crate::app::as_test_consumer(&sdm_subscribe_request(empty)),
+        )
+        .await;
         assert_eq!(resp.status, 400);
 
         // A complete body is still accepted, with the v2 Location.
-        let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(full)).await;
+        let resp = handle_sdm_subscribe(
+            supi,
+            &crate::app::as_test_consumer(&sdm_subscribe_request(full)),
+        )
+        .await;
         assert_eq!(resp.status, 201);
         // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
         crate::sdm_udr::wait_idle().await;
@@ -5773,11 +5889,14 @@ mod tests {
             "callbackReference": "http://consumer.example.com/ee",
             "monitoringConfigurations": { "1": { "eventType": "LOSS_OF_CONNECTIVITY" } },
         });
-        let sub = crate::context::UdmEeSubscription::for_ue(
+        let mut sub = crate::context::UdmEeSubscription::for_ue(
             ue,
             "http://consumer.example.com/ee",
             original.to_string(),
         );
+        // #1865: owned by the consumer the PATCHes below come from, so the test
+        // does not depend on a sibling having selected the dev profile.
+        sub.owner = Some(TEST_CONSUMER_1865.to_string());
         let sub_id = sub.id.clone();
         {
             let ctx = udm_self();
@@ -5793,7 +5912,7 @@ mod tests {
         }]);
         let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{sub_id}"));
         req.http.content = Some(patch.to_string());
-        let resp = handle_ee_modify(ue, &sub_id, &req).await;
+        let resp = handle_ee_modify(ue, &sub_id, &crate::app::as_test_consumer(&req)).await;
         assert_eq!(resp.status, 204);
 
         // Read back: the stored subscription must actually have changed. This is
@@ -5824,7 +5943,12 @@ mod tests {
         }]);
         let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{sub_id}"));
         req.http.content = Some(repoint.to_string());
-        assert_eq!(handle_ee_modify(ue, &sub_id, &req).await.status, 204);
+        assert_eq!(
+            handle_ee_modify(ue, &sub_id, &crate::app::as_test_consumer(&req))
+                .await
+                .status,
+            204
+        );
         let stored = {
             let ctx = udm_self();
             let context = ctx.read().expect("context");
@@ -5836,7 +5960,12 @@ mod tests {
         // rather than a silent success.
         let mut req = SbiRequest::patch("/nudm-ee/v1/x/ee-subscriptions/absent");
         req.http.content = Some("[]".to_string());
-        assert_eq!(handle_ee_modify(ue, "absent", &req).await.status, 404);
+        assert_eq!(
+            handle_ee_modify(ue, "absent", &crate::app::as_test_consumer(&req))
+                .await
+                .status,
+            404
+        );
 
         for bad in [
             serde_json::json!([]),
@@ -5849,7 +5978,9 @@ mod tests {
             let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{sub_id}"));
             req.http.content = Some(bad.to_string());
             assert_eq!(
-                handle_ee_modify(ue, &sub_id, &req).await.status,
+                handle_ee_modify(ue, &sub_id, &crate::app::as_test_consumer(&req))
+                    .await
+                    .status,
                 400,
                 "patch {bad} must be refused"
             );
@@ -7644,5 +7775,216 @@ mod shipped_config_tests {
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "udm.yaml") {
             serde_yaml::from_str::<super::UdmYaml>(&text).expect("Helm udm.yaml");
         }
+    }
+}
+
+/// #1865: an SDM or EE subscription is managed only by the consumer that
+/// created it, and only under the SUPI / ueIdentity it was created for. Every
+/// request goes through the real router.
+#[cfg(test)]
+mod subscription_owner_tests_1865 {
+    use super::*;
+    use crate::context::udm_context_init;
+
+    const OWNER: &str = "aaaaaaaa-1865-4000-8000-0000000000a1";
+    const OTHER: &str = "bbbbbbbb-1865-4000-8000-0000000000b2";
+
+    fn with(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
+        r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        r.oauth2_subject = token.map(str::to_string);
+        r
+    }
+    /// A foreign certificate, a foreign token, the owner's certificate with a
+    /// foreign token, and nobody.
+    fn intruders(r: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
+        vec![
+            ("foreign certificate", with(r(), Some(OTHER), None)),
+            ("foreign token", with(r(), None, Some(OTHER))),
+            ("mismatched pair", with(r(), Some(OWNER), Some(OTHER))),
+            ("anonymous", r()),
+        ]
+    }
+    fn body(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default()
+    }
+
+    /// REVERT-VERIFIED: with the EE Modify check removed an intruder's PATCH
+    /// rewrites callbackReference; with the ueIdentity filter removed the PATCH
+    /// under another UE's path does; with the EE Unsubscribe check removed the
+    /// intruder's DELETE answers 204.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn an_ee_subscription_is_managed_by_its_creator_under_its_own_ue_only_1865() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        let ue = "imsi-001010000001865";
+        let mut create = SbiRequest::post(format!("/nudm-ee/v1/{ue}/ee-subscriptions"));
+        create.http.content = Some(
+            serde_json::json!({
+                "callbackReference": "http://nef.example.org/ee-1865",
+                "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}}
+            })
+            .to_string(),
+        );
+        let resp = udm_sbi_request_handler(with(create, Some(OWNER), None)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let id = body(&resp)["eeSubscription"]["subscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let callback = || {
+            udm_self()
+                .read()
+                .unwrap()
+                .ee_subscription_find_by_id(&id)
+                .map(|s| (s.owner.clone(), s.callback_reference.clone()))
+        };
+        let original = Some((
+            Some(OWNER.to_string()),
+            "http://nef.example.org/ee-1865".to_string(),
+        ));
+        assert_eq!(callback(), original);
+        let uri = format!("/nudm-ee/v1/{ue}/ee-subscriptions/{id}");
+        let patch = |uri: &str| {
+            let mut r = SbiRequest::patch(uri.to_string());
+            r.http.content = Some(
+                r#"[{"op":"replace","path":"/callbackReference","value":"http://evil/cb"}]"#
+                    .to_string(),
+            );
+            r
+        };
+        for (who, req) in intruders(|| patch(&uri)) {
+            assert_eq!(
+                udm_sbi_request_handler(req).await.status,
+                403,
+                "PATCH by {who}"
+            );
+        }
+        // The owner itself, under another UE's path: not this resource.
+        let elsewhere = format!("/nudm-ee/v1/imsi-001010000009999/ee-subscriptions/{id}");
+        let resp = udm_sbi_request_handler(with(patch(&elsewhere), Some(OWNER), None)).await;
+        assert_eq!(resp.status, 404, "the ueIdentity path segment is honoured");
+        let resp = udm_sbi_request_handler(with(
+            SbiRequest::delete(elsewhere.clone()),
+            Some(OWNER),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+        for (who, req) in intruders(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(
+                udm_sbi_request_handler(req).await.status,
+                403,
+                "DELETE by {who}"
+            );
+        }
+        assert_eq!(callback(), original, "nothing an intruder sent was applied");
+        let resp = udm_sbi_request_handler(with(patch(&uri), None, Some(OWNER))).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert_eq!(
+            callback().unwrap().1,
+            "http://evil/cb",
+            "the owner's PATCH applies"
+        );
+        let resp =
+            udm_sbi_request_handler(with(SbiRequest::delete(uri.clone()), Some(OWNER), None)).await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(callback(), None);
+    }
+
+    /// REVERT-VERIFIED: with the SDM Unsubscribe check removed the intruder's
+    /// DELETE answers 204; with the SUPI filter removed the owner's DELETE under
+    /// another SUPI's path removes it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn an_sdm_subscription_is_cancelled_by_its_creator_under_its_own_supi_only_1865() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        let supi = "imsi-001010000011865";
+        let mut create = SbiRequest::post(format!("/nudm-sdm/v2/{supi}/sdm-subscriptions"));
+        create.http.content = Some(
+            serde_json::json!({
+                "nfInstanceId": OTHER, // self-declared; never the owner
+                "callbackReference": "http://amf.example.org/sdm-1865",
+                "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/sm-data")],
+            })
+            .to_string(),
+        );
+        let resp = udm_sbi_request_handler(with(create, None, Some(OWNER))).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        crate::sdm_udr::wait_idle().await;
+        let id = body(&resp)["subscriptionId"].as_str().unwrap().to_string();
+        let held = || {
+            udm_self()
+                .read()
+                .unwrap()
+                .sdm_subscription_find_by_id(&id)
+                .map(|s| s.owner)
+        };
+        assert_eq!(held(), Some(Some(OWNER.to_string())));
+        let uri = format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/{id}");
+        for (who, req) in intruders(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(
+                udm_sbi_request_handler(req).await.status,
+                403,
+                "DELETE by {who}"
+            );
+        }
+        let elsewhere = format!("/nudm-sdm/v2/imsi-001010000009999/sdm-subscriptions/{id}");
+        let resp =
+            udm_sbi_request_handler(with(SbiRequest::delete(elsewhere), None, Some(OWNER))).await;
+        assert_eq!(resp.status, 404, "the SUPI path segment is honoured");
+        assert!(held().is_some(), "still subscribed");
+        let resp =
+            udm_sbi_request_handler(with(SbiRequest::delete(uri.clone()), None, Some(OWNER))).await;
+        assert_eq!(resp.status, 204);
+        crate::sdm_udr::wait_idle().await;
+        assert!(held().is_none());
+    }
+
+    /// REVERT-VERIFIED: with the create binding removed (`owner_for_new_resource`
+    /// skipped) the mismatched create answers 201.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_certificate_and_token_that_disagree_create_nothing_1865() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        let ue = "imsi-001010000021865";
+        let mut create = SbiRequest::post(format!("/nudm-ee/v1/{ue}/ee-subscriptions"));
+        create.http.content = Some(
+            serde_json::json!({
+                "callbackReference": "http://nef.example.org/ee-x-1865",
+                "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}}
+            })
+            .to_string(),
+        );
+        let resp = udm_sbi_request_handler(with(create, Some(OWNER), Some(OTHER))).await;
+        assert_eq!(resp.status, 403);
+        let mut create = SbiRequest::post(format!("/nudm-sdm/v2/{ue}/sdm-subscriptions"));
+        create.http.content = Some(
+            serde_json::json!({
+                "nfInstanceId": OWNER,
+                "callbackReference": "http://amf.example.org/sdm-x-1865",
+                "monitoredResourceUris": [format!("/nudm-sdm/v2/{ue}/sm-data")],
+            })
+            .to_string(),
+        );
+        let resp = udm_sbi_request_handler(with(create, Some(OWNER), Some(OTHER))).await;
+        assert_eq!(resp.status, 403);
+        let ctx = udm_self();
+        let ctx = ctx.read().unwrap();
+        assert!(
+            ctx.sdm_subscriptions_for_supi(ue).is_empty(),
+            "nothing stored"
+        );
     }
 }

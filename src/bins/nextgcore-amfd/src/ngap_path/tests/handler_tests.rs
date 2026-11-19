@@ -2227,7 +2227,7 @@ pub(super) async fn n1n2_transfer(
             bytes::Bytes::copy_from_slice(n1),
         ));
     }
-    crate::namf_request_handler(req).await
+    crate::namf_server::test_namf_request_handler(req).await
 }
 
 fn cause_of(resp: &nextgcore_sbi::SbiResponse) -> String {

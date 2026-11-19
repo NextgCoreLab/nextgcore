@@ -541,7 +541,7 @@ async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
             handle_bsf_subscription_replace(parts[3], &request).await
         }
         ("nbsf-management", "subscriptions", "DELETE") if parts.len() >= 4 => {
-            handle_bsf_subscription_delete(parts[3]).await
+            handle_bsf_subscription_delete(parts[3], &request).await
         }
         // A defined resource reached with the wrong method answers 405 WITH an
         // Allow header (the shared helper #229 added), rather than the bare 405
@@ -1297,11 +1297,21 @@ fn parse_bsf_subscription(
         events,
         expiry: doc.get("expiry").and_then(|v| v.as_str()).map(String::from),
         raw: doc,
+        owner: None,
     })
 }
 
 /// `POST /nbsf-management/v1/subscriptions` (TS 29.521 §4.2.6.2) — 201 + Location.
 async fn handle_bsf_subscription_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, decided before anything
+    // is parsed or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Nbsf_Management Subscribe",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = &request.http.content else {
         return nextgcore_sbi::server::send_bad_request(
             "Missing mandatory request body",
@@ -1310,7 +1320,7 @@ async fn handle_bsf_subscription_create(request: &SbiRequest) -> SbiResponse {
     };
     let sub_id = uuid::Uuid::new_v4().to_string();
     let sub = match parse_bsf_subscription(&sub_id, body) {
-        Ok(s) => s,
+        Ok(s) => context::BsfSubscription { owner, ..s },
         Err(resp) => return *resp,
     };
     let raw = sub.raw.clone();
@@ -1332,16 +1342,21 @@ async fn handle_bsf_subscription_create(request: &SbiRequest) -> SbiResponse {
 /// full replacement, 200 with the updated resource, 404 when unknown.
 async fn handle_bsf_subscription_replace(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = context::bsf_self();
-    let exists = ctx
-        .read()
-        .ok()
-        .map(|c| c.subscription_get(sub_id).is_some())
-        .unwrap_or(false);
-    if !exists {
+    let existing = ctx.read().ok().and_then(|c| c.subscription_get(sub_id));
+    let Some(existing) = existing else {
         return nextgcore_sbi::server::send_not_found(
             &format!("Subscription {sub_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
+    };
+    // #1865: only the consumer that subscribed may replace it, checked before the
+    // body is read.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "Nbsf_Management Modify",
+    ) {
+        return refused;
     }
     let Some(body) = &request.http.content else {
         return nextgcore_sbi::server::send_bad_request(
@@ -1353,7 +1368,11 @@ async fn handle_bsf_subscription_replace(sub_id: &str, request: &SbiRequest) -> 
     // create enforced. The subId is preserved, so the resource URI the consumer
     // holds stays valid.
     let sub = match parse_bsf_subscription(sub_id, body) {
-        Ok(s) => s,
+        // A replacement keeps its creator: a PUT is not a transfer.
+        Ok(s) => context::BsfSubscription {
+            owner: existing.owner,
+            ..s
+        },
         Err(resp) => return *resp,
     };
     let raw = sub.raw.clone();
@@ -1367,9 +1386,23 @@ async fn handle_bsf_subscription_replace(sub_id: &str, request: &SbiRequest) -> 
 }
 
 /// `DELETE /nbsf-management/v1/subscriptions/{subId}` (TS 29.521 §4.2.8.2) — 204,
-/// 404 when unknown.
-async fn handle_bsf_subscription_delete(sub_id: &str) -> SbiResponse {
+/// 404 when unknown, 403 for any consumer but the one that subscribed (#1865).
+async fn handle_bsf_subscription_delete(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = context::bsf_self();
+    if let Some(refused) = ctx
+        .read()
+        .ok()
+        .and_then(|c| c.subscription_get(sub_id))
+        .and_then(|s| {
+            nextgcore_sbi::owner_binding::refuse_non_owner(
+                s.owner.as_deref(),
+                request,
+                "Nbsf_Management Unsubscribe",
+            )
+        })
+    {
+        return refused;
+    }
     let removed = ctx
         .read()
         .ok()
@@ -3134,12 +3167,23 @@ mod tests {
         bsf_context_init(1024);
         let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
+        // #1865: a plaintext listener verifies no identity, so the requests these
+        // tests send are stamped with a verified consumer, as a production listener
+        // would. The subscriptions they create are owned, under either profile.
         server
-            .start(bsf_sbi_request_handler)
+            .start(|mut req: SbiRequest| async move {
+                if req.oauth2_subject.is_none() {
+                    req.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+                }
+                bsf_sbi_request_handler(req).await
+            })
             .await
             .expect("BSF SBI server starts");
         (server, SbiClient::with_host_port("127.0.0.1", addr.port()))
     }
+
+    /// #1865: the NF Instance ID `start_bsf`'s listener stamps on every request.
+    const TEST_CONSUMER_1865: &str = "c0c0c0c0-1865-4000-8000-0000000000bf";
 
     /// #1334: the BSF's `/metrics`, scraped over HTTP, follows Nbsf_Management traffic
     /// over the real SBI server: a binding registered, discovered and deregistered, a
@@ -4921,6 +4965,120 @@ mod tests {
         })
     }
 
+    /// #1865: an Nbsf_Management subscription is replaced and removed only by the
+    /// consumer that created it. A foreign certificate, a foreign token, an
+    /// anonymous caller and a certificate/token mismatch each get 403 and leave
+    /// it untouched; the owner then succeeds.
+    ///
+    /// REVERT-VERIFIED: with the PUT check dropped the PUT assertion fails;
+    /// with the DELETE check dropped the DELETE assertion fails; with the owner
+    /// not recorded at create (`owner: None`) the foreign callers pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bsf_subscription_is_managed_only_by_its_creator_1865() {
+        bsf_context_init(1024);
+        const OWNER: &str = "aaaaaaaa-1865-4000-8000-0000000000b1";
+        const OTHER: &str = "0e0e0e0e-1865-4000-8000-0000000000ff";
+        let supi = "imsi-001010000001865";
+        let doc = |uri: &str| bsf_sub_doc(uri, supi, &["PCF_UE_BINDING_REGISTRATION"]);
+        let request = |method: &str, path: &str, body: Option<serde_json::Value>| {
+            let mut r = match method {
+                "POST" => SbiRequest::post(path),
+                "PUT" => SbiRequest::put(path),
+                _ => SbiRequest::delete(path),
+            };
+            if let Some(b) = body {
+                r = r.with_json_body(&b).expect("encode");
+            }
+            r
+        };
+        let mut create = request(
+            "POST",
+            "/nbsf-management/v1/subscriptions",
+            Some(doc("http://127.0.0.1:9/bsf-1865")),
+        );
+        create.oauth2_subject = Some(OWNER.into());
+        let resp = bsf_sbi_request_handler(create).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let location = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .expect("Location");
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let stored = || bsf_self().read().ok().and_then(|c| c.subscription_get(&id));
+        assert_eq!(
+            stored().and_then(|s| s.owner).as_deref(),
+            Some(OWNER),
+            "bound to the verified consumer at create"
+        );
+
+        let as_caller = |method: &str, cert: Option<&str>, token: Option<&str>| {
+            let body = (method == "PUT").then(|| doc("http://127.0.0.1:9/hijacked"));
+            let mut r = request(method, &location, body);
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+        for (cert, token) in [
+            (Some(OTHER), None),
+            (None, Some(OTHER)),
+            (None, None),
+            (Some(OWNER), Some(OTHER)),
+        ] {
+            for method in ["PUT", "DELETE"] {
+                let resp = bsf_sbi_request_handler(as_caller(method, cert, token)).await;
+                assert_eq!(
+                    resp.status, 403,
+                    "{method} by cert={cert:?} token={token:?} must be refused"
+                );
+            }
+            assert_eq!(
+                stored().expect("still stored").notif_uri,
+                "http://127.0.0.1:9/bsf-1865",
+                "unchanged after the refusals"
+            );
+        }
+
+        assert_eq!(
+            bsf_sbi_request_handler(as_caller("PUT", Some(OWNER), None))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            stored().and_then(|s| s.owner).as_deref(),
+            Some(OWNER),
+            "a replacement keeps its creator"
+        );
+        assert_eq!(
+            bsf_sbi_request_handler(as_caller("DELETE", Some(OWNER), None))
+                .await
+                .status,
+            204
+        );
+        assert!(stored().is_none());
+
+        // A certificate/token mismatch at create is refused and stores nothing.
+        let mut mixed = request(
+            "POST",
+            "/nbsf-management/v1/subscriptions",
+            Some(doc("http://127.0.0.1:9/mixed")),
+        );
+        mixed.peer_cert_nf_instance_id = Some(OWNER.into());
+        mixed.oauth2_subject = Some(OTHER.into());
+        assert_eq!(bsf_sbi_request_handler(mixed).await.status, 403);
+        assert!(
+            bsf_self()
+                .read()
+                .unwrap()
+                .subscriptions_wanting("PCF_UE_BINDING_REGISTRATION", Some(supi))
+                .is_empty(),
+            "nothing stored"
+        );
+    }
+
     /// #98 criteria 1–3 + 5: the subscription resource is routed and its CRUD
     /// answers the spec's status codes, replacing the 405 fallthrough.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5379,6 +5537,7 @@ mod tests {
                 events: vec!["PCF_PDU_SESSION_BINDING_REGISTRATION".to_string()],
                 expiry: None,
                 raw: json!({}),
+                owner: None,
             });
         }
         let wanting = |event: &str, supi: Option<&str>| {

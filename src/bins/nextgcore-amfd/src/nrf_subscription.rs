@@ -1030,7 +1030,7 @@ mod tests {
         // A third, so the last eviction below is never of the last SMF.
         ctx.add_nf_instance(cached("smf-668-third", 40003)).await;
 
-        let resp = crate::namf_server::namf_request_handler(notify(json!({
+        let resp = crate::namf_server::test_namf_request_handler(notify(json!({
             "event": "NF_DEREGISTERED",
             "nfInstanceUri": uri("smf-668-gone"),
             "nfProfile": {
@@ -1053,7 +1053,7 @@ mod tests {
         assert!(!planted, "an endpoint was taken from the notification body");
 
         // A load-only change leaves the remaining profile cached.
-        let resp = crate::namf_server::namf_request_handler(notify(json!({
+        let resp = crate::namf_server::test_namf_request_handler(notify(json!({
             "event": "NF_PROFILE_CHANGED",
             "nfInstanceUri": uri("smf-668-kept"),
             "profileChanges": [{ "op": "replace", "path": "/load", "newValue": 70 }]
@@ -1063,7 +1063,7 @@ mod tests {
         assert!(ctx.get_nf_instance("smf-668-kept").await.is_some());
 
         // A moved service endpoint drops it.
-        let resp = crate::namf_server::namf_request_handler(notify(json!({
+        let resp = crate::namf_server::test_namf_request_handler(notify(json!({
             "event": "NF_PROFILE_CHANGED",
             "nfInstanceUri": uri("smf-668-kept"),
             "profileChanges": [{ "op": "replace", "path": "/nfServices/0/ipEndPoints/0/port", "newValue": 9 }]
@@ -1087,9 +1087,9 @@ mod tests {
 
         let forged = uuid::Uuid::new_v4().simple().to_string();
         let resp =
-            crate::namf_server::namf_request_handler(notify_on(&forged, dereg.clone())).await;
+            crate::namf_server::test_namf_request_handler(notify_on(&forged, dereg.clone())).await;
         assert_eq!(resp.status, 404);
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             SbiRequest::post(NOTIFY_PATH).with_body(dereg.to_string(), "application/json"),
         )
         .await;
@@ -1098,7 +1098,8 @@ mod tests {
 
         // A real token, but for the AUSF subscription: an SMF is not its to evict.
         let ausf = register_token("AUSF");
-        let resp = crate::namf_server::namf_request_handler(notify_on(&ausf, dereg.clone())).await;
+        let resp =
+            crate::namf_server::test_namf_request_handler(notify_on(&ausf, dereg.clone())).await;
         assert_eq!(resp.status, 204);
         assert!(ctx.get_nf_instance("smf-940-a").await.is_some());
         assert_eq!(
@@ -1109,7 +1110,7 @@ mod tests {
         // A dropped subscription's token stops working.
         let smf = register_token("SMF");
         unregister_token(&smf);
-        let resp = crate::namf_server::namf_request_handler(notify_on(&smf, dereg)).await;
+        let resp = crate::namf_server::test_namf_request_handler(notify_on(&smf, dereg)).await;
         assert_eq!(resp.status, 404);
         assert!(ctx.get_nf_instance("smf-940-a").await.is_some());
 
@@ -1176,19 +1177,19 @@ mod tests {
     #[tokio::test]
     async fn the_callback_refuses_a_body_without_its_mandatory_members() {
         let token = register_token("SMF");
-        let resp = crate::namf_server::namf_request_handler(notify_on(
+        let resp = crate::namf_server::test_namf_request_handler(notify_on(
             &token,
             json!({ "nfInstanceUri": uri("x") }),
         ))
         .await;
         assert_eq!(resp.status, 400);
-        let resp = crate::namf_server::namf_request_handler(notify_on(
+        let resp = crate::namf_server::test_namf_request_handler(notify_on(
             &token,
             json!({ "event": "NF_DEREGISTERED" }),
         ))
         .await;
         assert_eq!(resp.status, 400);
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             SbiRequest::post(format!("{NOTIFY_PATH}/{token}"))
                 .with_body("not json", "application/json"),
         )

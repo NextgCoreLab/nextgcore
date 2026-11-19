@@ -40,6 +40,7 @@ use clap::Parser;
 use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::SbiContext;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{
     send_bad_request, send_error, send_internal_error, send_method_not_allowed, send_not_found,
     SbiServer, SbiServerConfig,
@@ -503,7 +504,7 @@ async fn easdf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["neasdf-dnscontext", "v1", "dns-contexts", ctx_id] => match method {
             "PUT" => handle_dns_context_update(ctx_id, &request).await,
-            "DELETE" => handle_dns_context_delete(ctx_id).await,
+            "DELETE" => handle_dns_context_delete(ctx_id, &request).await,
             _ => send_method_not_allowed(method, "dns-contexts/{dnsContextId}"),
         },
         // Phase-1 edge DNS resolution over SBI (no UDP/53 listener).
@@ -519,8 +520,8 @@ async fn easdf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "baseline-dns-patterns"),
         },
         ["neasdf-baselinednspattern", "v1", "baseline-dns-patterns", pattern_id] => match method {
-            "GET" => handle_baseline_pattern_read(pattern_id).await,
-            "DELETE" => handle_baseline_pattern_delete(pattern_id).await,
+            "GET" => handle_baseline_pattern_read(pattern_id, &request).await,
+            "DELETE" => handle_baseline_pattern_delete(pattern_id, &request).await,
             _ => send_method_not_allowed(method, "baseline-dns-patterns/{patternId}"),
         },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -576,6 +577,12 @@ fn parse_dns_context_body(
 /// POST /neasdf-dnscontext/v1/dns-contexts — Neasdf_DNSContext_Create
 /// (TS 29.556 §5.2.2.2): validate, store, 201 + Location + echoed context.
 async fn handle_dns_context_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the SMF this EASDF verified, refused before anything is
+    // read or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "DNS context Create") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let (data, supi, pdu_session_id) = match parse_dns_context_body(request) {
         Ok(parsed) => parsed,
         Err(response) => return *response,
@@ -585,7 +592,9 @@ async fn handle_dns_context_create(request: &SbiRequest) -> SbiResponse {
     // #114: parse the DNS message-handling rules and the report callback out of
     // the body. They used to be stored only inside `raw` and never consulted, so
     // the context had no effect on what this EASDF answered.
-    let dns_context = EasdfDnsContext::new(supi.clone(), pdu_session_id, raw).with_parsed(&data);
+    let dns_context = EasdfDnsContext::new(supi.clone(), pdu_session_id, raw)
+        .with_parsed(&data)
+        .with_owner(owner);
     let ctx_id = dns_context.id.clone();
 
     let ctx = easdf_self();
@@ -614,9 +623,39 @@ async fn handle_dns_context_create(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
+/// #1865: refuse `request` unless it comes from the SMF that created DNS
+/// context `ctx_id`. `None` for an unknown id: the handler's 404 comes first.
+fn refuse_non_owner_of_dns_context(
+    ctx_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let stored = easdf_self().read().ok()?.dns_context_find(ctx_id)?;
+    owner_binding::refuse_non_owner(stored.owner.as_deref(), request, operation)
+}
+
+/// #1865: [`refuse_non_owner_of_dns_context`] for a baseline DNS pattern.
+fn refuse_non_owner_of_pattern(
+    id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let owner = {
+        let ctx = easdf_self();
+        let c = ctx.read().ok()?;
+        c.baseline_pattern_find(id)?;
+        c.baseline_pattern_owner(id)
+    };
+    owner_binding::refuse_non_owner(owner.as_deref(), request, operation)
+}
+
 /// PUT /neasdf-dnscontext/v1/dns-contexts/{ctxId} — Update as full replace
 /// (the TS 29.556 json-patch Update is simplified in Phase 1).
 async fn handle_dns_context_update(ctx_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the SMF that created it, before the body is read.
+    if let Some(refused) = refuse_non_owner_of_dns_context(ctx_id, request, "DNS context Update") {
+        return refused;
+    }
     let (data, supi, pdu_session_id) = match parse_dns_context_body(request) {
         Ok(parsed) => parsed,
         Err(response) => return *response,
@@ -655,7 +694,11 @@ async fn handle_dns_context_update(ctx_id: &str, request: &SbiRequest) -> SbiRes
 }
 
 /// DELETE /neasdf-dnscontext/v1/dns-contexts/{ctxId} — 204 / 404.
-async fn handle_dns_context_delete(ctx_id: &str) -> SbiResponse {
+async fn handle_dns_context_delete(ctx_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the SMF that created it, before anything is removed.
+    if let Some(refused) = refuse_non_owner_of_dns_context(ctx_id, request, "DNS context Delete") {
+        return refused;
+    }
     let ctx = easdf_self();
     let removed = match ctx.read() {
         Ok(c) => c.dns_context_remove(ctx_id),
@@ -858,6 +901,12 @@ const BASELINE_PATTERNS_PATH: &str = "/neasdf-baselinednspattern/v1/baseline-dns
 /// session context rule and no static EAS-map entry matched. Mandatory member:
 /// a non-empty domain pattern.
 async fn handle_baseline_pattern_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer this EASDF verified.
+    let owner = match owner_binding::owner_for_new_resource(request, "Baseline DNS pattern Create")
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = request.http.content.as_deref() else {
         return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING"));
     };
@@ -875,7 +924,7 @@ async fn handle_baseline_pattern_create(request: &SbiRequest) -> SbiResponse {
 
     let ctx = easdf_self();
     let created = match ctx.read() {
-        Ok(c) => c.baseline_pattern_insert(rule),
+        Ok(c) => c.baseline_pattern_insert_owned(rule, owner),
         Err(_) => return send_internal_error("EASDF context lock poisoned"),
     };
     match created {
@@ -900,7 +949,10 @@ async fn handle_baseline_pattern_create(request: &SbiRequest) -> SbiResponse {
 }
 
 /// `GET .../baseline-dns-patterns/{id}` — read one baseline DNS pattern (#114).
-async fn handle_baseline_pattern_read(id: &str) -> SbiResponse {
+async fn handle_baseline_pattern_read(id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Some(refused) = refuse_non_owner_of_pattern(id, request, "Baseline DNS pattern Read") {
+        return refused;
+    }
     let ctx = easdf_self();
     let found = ctx.read().ok().and_then(|c| c.baseline_pattern_find(id));
     match found {
@@ -934,7 +986,11 @@ async fn handle_baseline_pattern_list() -> SbiResponse {
 }
 
 /// `DELETE .../baseline-dns-patterns/{id}` — 204 / 404 (#114).
-async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
+async fn handle_baseline_pattern_delete(id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that created it, before anything is removed.
+    if let Some(refused) = refuse_non_owner_of_pattern(id, request, "Baseline DNS pattern Delete") {
+        return refused;
+    }
     let ctx = easdf_self();
     let removed = ctx.read().ok().and_then(|c| c.baseline_pattern_remove(id));
     match removed {
@@ -1325,10 +1381,22 @@ mod tests {
             .block_on(fut)
     }
 
+    /// #1865: the SMF every test acts as. A verified identity, so the tests
+    /// pass under both SBI profiles (`production` refuses an anonymous create).
+    const TEST_SMF: &str = "5mf00000-1865-4000-8000-00000000000a";
+
+    /// `request` as [`TEST_SMF`], by its verified access token.
+    fn as_smf(mut request: SbiRequest) -> SbiRequest {
+        request.oauth2_subject = Some(TEST_SMF.to_string());
+        request
+    }
+
     fn create_request(body: serde_json::Value) -> SbiRequest {
-        SbiRequest::post("/neasdf-dnscontext/v1/dns-contexts")
-            .with_json_body(&body)
-            .expect("serialize test body")
+        as_smf(
+            SbiRequest::post("/neasdf-dnscontext/v1/dns-contexts")
+                .with_json_body(&body)
+                .expect("serialize test body"),
+        )
     }
 
     fn valid_body() -> serde_json::Value {
@@ -1503,7 +1571,7 @@ easdf:
 
     #[test]
     fn dns_context_create_missing_mandatory_ies_returns_400() {
-        let no_body = SbiRequest::post("/neasdf-dnscontext/v1/dns-contexts");
+        let no_body = as_smf(SbiRequest::post("/neasdf-dnscontext/v1/dns-contexts"));
         assert_eq!(block_on(handle_dns_context_create(&no_body)).status, 400);
 
         let missing_supi = create_request(serde_json::json!({"pduSessionId": 5}));
@@ -1536,9 +1604,13 @@ easdf:
             .unwrap()
             .to_string();
 
-        let update = SbiRequest::put(format!("/neasdf-dnscontext/v1/dns-contexts/{ctx_id}"))
-            .with_json_body(&serde_json::json!({"supi": "imsi-002020000000002", "pduSessionId": 7}))
-            .expect("serialize");
+        let update = as_smf(
+            SbiRequest::put(format!("/neasdf-dnscontext/v1/dns-contexts/{ctx_id}"))
+                .with_json_body(
+                    &serde_json::json!({"supi": "imsi-002020000000002", "pduSessionId": 7}),
+                )
+                .expect("serialize"),
+        );
         let response = block_on(handle_dns_context_update(&ctx_id, &update));
         assert_eq!(response.status, 200);
         let stored = easdf_self()
@@ -1569,13 +1641,22 @@ easdf:
             .unwrap()
             .to_string();
 
-        assert_eq!(block_on(handle_dns_context_delete(&ctx_id)).status, 204);
+        let delete = as_smf(SbiRequest::delete(format!(
+            "/neasdf-dnscontext/v1/dns-contexts/{ctx_id}"
+        )));
+        assert_eq!(
+            block_on(handle_dns_context_delete(&ctx_id, &delete)).status,
+            204
+        );
         assert!(easdf_self()
             .read()
             .unwrap()
             .dns_context_find(&ctx_id)
             .is_none());
-        assert_eq!(block_on(handle_dns_context_delete(&ctx_id)).status, 404);
+        assert_eq!(
+            block_on(handle_dns_context_delete(&ctx_id, &delete)).status,
+            404
+        );
     }
 
     #[test]
@@ -1676,13 +1757,160 @@ easdf:
 
     #[test]
     fn dns_context_create_malformed_json_returns_400() {
-        let request = SbiRequest::post("/neasdf-dnscontext/v1/dns-contexts")
-            .with_body("{not json", "application/json");
+        let request = as_smf(
+            SbiRequest::post("/neasdf-dnscontext/v1/dns-contexts")
+                .with_body("{not json", "application/json"),
+        );
         let response = block_on(handle_dns_context_create(&request));
         assert_eq!(response.status, 400, "malformed JSON must be 400");
         let body: serde_json::Value =
             serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["cause"], "INVALID_JSON");
+    }
+
+    /// #1865: a DNS context and a baseline DNS pattern are bound to the SMF
+    /// that created them (verified certificate NF Instance ID, else token
+    /// `sub`), and only that SMF may update, read or delete them. Through the
+    /// real router.
+    ///
+    /// A create whose certificate and token disagree is 403 and stores
+    /// nothing. A foreign token, a foreign certificate, a mismatch and an
+    /// anonymous caller each get 403 on every routed method and leave the
+    /// resource as it was. The owner then succeeds, and a replace keeps the
+    /// binding.
+    ///
+    /// REVERT-VERIFIED, each separately: the DNS-context check dropped
+    /// (`refuse_non_owner_of_dns_context` always `None`: the foreign PUT gets
+    /// 200); the pattern check dropped (the foreign GET gets 200); the owner
+    /// not recorded (`with_owner` ignores it: `stored.owner` is None); the
+    /// replace not carrying the owner (`ctx.owner` left None: the owner is lost
+    /// after the PUT); and the create refusal ignored (`Err(_) => None`: the
+    /// mixed create stores a context).
+    #[test]
+    fn dns_contexts_and_baseline_patterns_are_managed_only_by_their_creator_1865() {
+        let _guard = lock_globals();
+        reset_context(DnsMissBehavior::NxDomain);
+        const OTHER: &str = "0be50000-1865-4000-8000-00000000000b";
+        let intruders = || {
+            let foreign_token = |mut r: SbiRequest| {
+                r.oauth2_subject = Some(OTHER.into());
+                r
+            };
+            let foreign_cert = |mut r: SbiRequest| {
+                r.peer_cert_nf_instance_id = Some(OTHER.into());
+                r
+            };
+            let mismatch = |mut r: SbiRequest| {
+                r.peer_cert_nf_instance_id = Some(OTHER.into());
+                r.oauth2_subject = Some(TEST_SMF.into());
+                r
+            };
+            let anonymous = |r: SbiRequest| r;
+            [
+                (
+                    "foreign token",
+                    Box::new(foreign_token) as Box<dyn Fn(SbiRequest) -> SbiRequest>,
+                ),
+                ("foreign certificate", Box::new(foreign_cert)),
+                ("certificate/token mismatch", Box::new(mismatch)),
+                ("anonymous", Box::new(anonymous)),
+            ]
+        };
+        let ctx_count = || easdf_self().read().unwrap().dns_context_count();
+
+        // DNS context: a mismatched create stores nothing.
+        let before = ctx_count();
+        let mut mixed = create_request(valid_body());
+        mixed.peer_cert_nf_instance_id = Some(OTHER.into());
+        assert_eq!(block_on(easdf_sbi_request_handler(mixed)).status, 403);
+        assert_eq!(ctx_count(), before, "a refused create stores nothing");
+
+        let created = block_on(easdf_sbi_request_handler(create_request(valid_body())));
+        assert_eq!(created.status, 201);
+        let location = created.http.get_header("location").cloned().unwrap();
+        let ctx_id = location.rsplit('/').next().unwrap().to_string();
+        let stored = || easdf_self().read().unwrap().dns_context_find(&ctx_id);
+        assert_eq!(stored().unwrap().owner.as_deref(), Some(TEST_SMF));
+        let raw_before = stored().unwrap().raw;
+        let put = || {
+            SbiRequest::put(location.clone())
+                .with_json_body(&serde_json::json!({"supi": "imsi-1865", "pduSessionId": 9}))
+                .unwrap()
+        };
+        for (who, as_who) in intruders() {
+            for req in [put(), SbiRequest::delete(location.clone())] {
+                let method = req.header.method.clone();
+                let resp = block_on(easdf_sbi_request_handler(as_who(req)));
+                assert_eq!(resp.status, 403, "DNS context {method} by {who}");
+                let now = stored().unwrap_or_else(|| panic!("{method} by {who} removed it"));
+                assert_eq!(now.raw, raw_before, "{method} by {who} changed it");
+            }
+        }
+        // The owner may; a replace keeps the binding.
+        assert_eq!(
+            block_on(easdf_sbi_request_handler(as_smf(put()))).status,
+            200
+        );
+        assert_eq!(stored().unwrap().supi, "imsi-1865");
+        assert_eq!(stored().unwrap().owner.as_deref(), Some(TEST_SMF));
+        let delete = as_smf(SbiRequest::delete(location.clone()));
+        assert_eq!(block_on(easdf_sbi_request_handler(delete)).status, 204);
+        assert!(stored().is_none());
+
+        // Baseline DNS pattern.
+        let body = serde_json::json!({
+            "domainNames": ["*.b1865.example.com"], "easIpAddresses": ["10.18.6.5"]
+        });
+        let create = || {
+            SbiRequest::post(BASELINE_PATTERNS_PATH)
+                .with_json_body(&body)
+                .unwrap()
+        };
+        let patterns = || easdf_self().read().unwrap().baseline_pattern_count();
+        let before = patterns();
+        let mut mixed = as_smf(create());
+        mixed.peer_cert_nf_instance_id = Some(OTHER.into());
+        assert_eq!(block_on(easdf_sbi_request_handler(mixed)).status, 403);
+        assert_eq!(patterns(), before, "a refused create stores nothing");
+        let resp = block_on(easdf_sbi_request_handler(as_smf(create())));
+        assert_eq!(resp.status, 201);
+        let location = resp.http.get_header("location").cloned().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        assert_eq!(
+            easdf_self()
+                .read()
+                .unwrap()
+                .baseline_pattern_owner(&id)
+                .as_deref(),
+            Some(TEST_SMF)
+        );
+        for (who, as_who) in intruders() {
+            for req in [
+                SbiRequest::get(location.clone()),
+                SbiRequest::delete(location.clone()),
+            ] {
+                let method = req.header.method.clone();
+                let resp = block_on(easdf_sbi_request_handler(as_who(req)));
+                assert_eq!(resp.status, 403, "baseline pattern {method} by {who}");
+                assert!(
+                    easdf_self()
+                        .read()
+                        .unwrap()
+                        .baseline_pattern_find(&id)
+                        .is_some(),
+                    "{method} by {who} removed it"
+                );
+            }
+        }
+        let read = as_smf(SbiRequest::get(location.clone()));
+        assert_eq!(block_on(easdf_sbi_request_handler(read)).status, 200);
+        let delete = as_smf(SbiRequest::delete(location.clone()));
+        assert_eq!(block_on(easdf_sbi_request_handler(delete)).status, 204);
+        assert_eq!(
+            easdf_self().read().unwrap().baseline_pattern_owner(&id),
+            None,
+            "a removed pattern's owner is forgotten"
+        );
     }
 
     // ── Router ───────────────────────────────────────────────────────────────
@@ -1774,15 +2002,17 @@ easdf:
         let ctx_id = created["dnsContextId"].as_str().unwrap().to_string();
 
         // Replace the rule with a FORWARD rule for a different name.
-        let update = SbiRequest::put(format!("/neasdf-dnscontext/v1/dns-contexts/{ctx_id}"))
-            .with_json_body(&serde_json::json!({
-                "supi": "imsi-1", "pduSessionId": 1,
-                "dnsHandlingRules": [{
-                    "domainNames": ["b.edge3.example.com"],
-                    "forwardTo": "10.0.0.53"
-                }]
-            }))
-            .unwrap();
+        let update = as_smf(
+            SbiRequest::put(format!("/neasdf-dnscontext/v1/dns-contexts/{ctx_id}"))
+                .with_json_body(&serde_json::json!({
+                    "supi": "imsi-1", "pduSessionId": 1,
+                    "dnsHandlingRules": [{
+                        "domainNames": ["b.edge3.example.com"],
+                        "forwardTo": "10.0.0.53"
+                    }]
+                }))
+                .unwrap(),
+        );
         assert_eq!(block_on(easdf_sbi_request_handler(update)).status, 200);
 
         let resolve = |fqdn: &str| {
@@ -1908,12 +2138,14 @@ easdf:
         reset_context(DnsMissBehavior::NxDomain);
 
         // Create.
-        let create = SbiRequest::post("/neasdf-baselinednspattern/v1/baseline-dns-patterns")
-            .with_json_body(&serde_json::json!({
-                "domainNames": ["*.baseline.example.com"],
-                "easIpAddresses": ["10.90.0.9"]
-            }))
-            .unwrap();
+        let create = as_smf(
+            SbiRequest::post("/neasdf-baselinednspattern/v1/baseline-dns-patterns")
+                .with_json_body(&serde_json::json!({
+                    "domainNames": ["*.baseline.example.com"],
+                    "easIpAddresses": ["10.90.0.9"]
+                }))
+                .unwrap(),
+        );
         let resp = block_on(easdf_sbi_request_handler(create));
         assert_eq!(resp.status, 201);
         let location = resp.http.get_header("location").cloned().expect("Location");
@@ -1924,7 +2156,7 @@ easdf:
         let id = location.rsplit('/').next().unwrap().to_string();
 
         // Read.
-        let read = SbiRequest::get(format!("{BASELINE_PATTERNS_PATH}/{id}"));
+        let read = as_smf(SbiRequest::get(format!("{BASELINE_PATTERNS_PATH}/{id}")));
         let resp = block_on(easdf_sbi_request_handler(read));
         assert_eq!(resp.status, 200);
         let got: serde_json::Value =
@@ -1945,15 +2177,17 @@ easdf:
         );
 
         // A body with no domain pattern is refused.
-        let bad = SbiRequest::post("/neasdf-baselinednspattern/v1/baseline-dns-patterns")
-            .with_json_body(&serde_json::json!({"easIpAddresses": ["10.0.0.1"]}))
-            .unwrap();
+        let bad = as_smf(
+            SbiRequest::post("/neasdf-baselinednspattern/v1/baseline-dns-patterns")
+                .with_json_body(&serde_json::json!({"easIpAddresses": ["10.0.0.1"]}))
+                .unwrap(),
+        );
         assert_eq!(block_on(easdf_sbi_request_handler(bad)).status, 400);
 
         // Delete, then 404.
-        let del = SbiRequest::delete(format!("{BASELINE_PATTERNS_PATH}/{id}"));
+        let del = as_smf(SbiRequest::delete(format!("{BASELINE_PATTERNS_PATH}/{id}")));
         assert_eq!(block_on(easdf_sbi_request_handler(del)).status, 204);
-        let read = SbiRequest::get(format!("{BASELINE_PATTERNS_PATH}/{id}"));
+        let read = as_smf(SbiRequest::get(format!("{BASELINE_PATTERNS_PATH}/{id}")));
         assert_eq!(block_on(easdf_sbi_request_handler(read)).status, 404);
 
         // ...and the service is advertised to the NRF. TS 23.501 Table 7.2.25-1

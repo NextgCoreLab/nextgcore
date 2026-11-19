@@ -304,6 +304,12 @@ pub struct CapsSubscription {
     pub ptp_profiles: Vec<String>,
     /// Report type: one-time, periodic or event-based.
     pub report_type: Option<String>,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed, the
+    /// only one that may read or remove the subscription (TS 33.501 §13.4.1).
+    /// Never read from or written to the wire; `None` when it subscribed with no
+    /// verified identity (`dev`).
+    #[serde(skip)]
+    pub owner: Option<String>,
 }
 
 impl CapsSubscription {
@@ -478,6 +484,12 @@ pub struct QosTscSubscription {
     pub transaction_ref_id: Option<String>,
     /// Events subscribed to.
     pub events: Vec<String>,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed, the
+    /// only one that may read or remove the subscription (TS 33.501 §13.4.1).
+    /// Never read from or written to the wire; `None` when it subscribed with no
+    /// verified identity (`dev`).
+    #[serde(skip)]
+    pub owner: Option<String>,
 }
 
 impl QosTscSubscription {
@@ -811,6 +823,14 @@ impl TsctsfContext {
         sub.subscription_id = Uuid::new_v4().to_string();
         store.insert(sub.subscription_id.clone(), sub.clone());
         Ok(sub)
+    }
+
+    #[cfg(test)]
+    pub fn qos_tsc_sub_count(&self) -> usize {
+        self.qos_tsc_subscriptions
+            .read()
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     pub fn qos_tsc_sub_find(&self, id: &str) -> Option<QosTscSubscription> {

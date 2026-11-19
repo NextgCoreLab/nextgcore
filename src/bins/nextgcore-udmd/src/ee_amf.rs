@@ -952,7 +952,7 @@ mod tests {
             json!({ "callbackReference": callback, "monitoringConfigurations": configs })
                 .to_string(),
         );
-        let resp = crate::app::handle_ee_subscribe(supi, &req).await;
+        let resp = crate::app::handle_ee_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
         assert_eq!(resp.status, 201);
         wait_idle().await;
         let body: Value =
@@ -966,7 +966,9 @@ mod tests {
     async fn ee_patch(supi: &str, id: &str, ops: Value) -> u16 {
         let mut patch = SbiRequest::patch(format!("/nudm-ee/v1/{supi}/ee-subscriptions/{id}"));
         patch.http.content = Some(ops.to_string());
-        let status = crate::app::handle_ee_modify(supi, id, &patch).await.status;
+        let status = crate::app::handle_ee_modify(supi, id, &crate::app::as_test_consumer(&patch))
+            .await
+            .status;
         wait_idle().await;
         status
     }
@@ -1137,7 +1139,12 @@ mod tests {
         );
         assert!(leg_of(&id).is_some(), "the leg outlives the UE context");
 
-        let resp = crate::app::handle_ee_unsubscribe(supi, &id).await;
+        let resp = crate::app::handle_ee_unsubscribe(
+            supi,
+            &id,
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         assert_eq!(resp.status, 204);
         assert!(
             amf_subscription(&leg.subscription_uri).is_none(),
@@ -1168,7 +1175,7 @@ mod tests {
             json!({ "callbackReference": nef_uri, "monitoringConfigurations": loc() }).to_string(),
         );
         let started = std::time::Instant::now();
-        let resp = crate::app::handle_ee_subscribe(supi, &req).await;
+        let resp = crate::app::handle_ee_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
         let took = started.elapsed();
         assert_eq!(resp.status, 201);
         assert!(
@@ -1469,7 +1476,7 @@ mod tests {
         req.http.content = Some(
             json!({ "callbackReference": nef_uri, "monitoringConfigurations": loc() }).to_string(),
         );
-        let resp = crate::app::handle_ee_subscribe(supi, &req).await;
+        let resp = crate::app::handle_ee_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
         let id: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         let id = id["eeSubscription"]["subscriptionId"]
             .as_str()
@@ -1498,7 +1505,12 @@ mod tests {
             Some(leg),
             "the write-back keeps the stored leg"
         );
-        crate::app::handle_ee_unsubscribe(supi, &id).await;
+        crate::app::handle_ee_unsubscribe(
+            supi,
+            &id,
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         assert_eq!(amf_subscriptions_to(supi, &nef_uri), 0);
     }
 
@@ -1539,7 +1551,12 @@ mod tests {
         assert_eq!(register(supi, "amf-oauth-1449", &client).await, 201);
         let id = ee_subscribe(supi, "http://nef.example.org/notify", loc()).await;
         assert!(leg_of(&id).is_some());
-        crate::app::handle_ee_unsubscribe(supi, &id).await;
+        crate::app::handle_ee_unsubscribe(
+            supi,
+            &id,
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
             .write()
             .expect("override") = None;

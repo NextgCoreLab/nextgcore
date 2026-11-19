@@ -31,8 +31,6 @@ ctrlc.workspace = true
 base64.workspace = true
 bytes.workspace = true
 chrono = "0.4"
-# #1862: unguessable subscription IDs (owner_binding::unguessable_id).
-uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true
