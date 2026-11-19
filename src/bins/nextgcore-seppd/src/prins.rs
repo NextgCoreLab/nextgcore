@@ -136,6 +136,49 @@ fn next_send_seq(kid: &str, originator: N32fRole, dir: N32fDirection) -> Result<
     Ok(seq)
 }
 
+/// #2087: drop the SEQ counters and anti-replay windows of N32-f context
+/// `kid`. Each handshake mints a new `kid`, so without this an N32-f context
+/// that was terminated or replaced kept its entries for the life of the process.
+/// Called where a context's keys go (n32f-terminate) and where a new context
+/// replaces one (exchange-params).
+pub fn forget_context(kid: &str) {
+    let prefix = format!("{kid}|");
+    if let Ok(mut map) = send_seq_counters().write() {
+        map.retain(|k, _| !k.starts_with(&prefix));
+    }
+    if let Ok(mut map) = recv_replay_windows().write() {
+        map.retain(|k, _| !k.starts_with(&prefix));
+    }
+}
+
+/// #2087: give `kid` a SEQ counter, as its first encryption does (tests).
+#[cfg(test)]
+pub(crate) fn seed_context_state(kid: &str) {
+    next_send_seq(kid, N32fRole::Initiator, N32fDirection::Request).unwrap();
+}
+
+/// #2087: how many SEQ counters and replay windows `kid` holds (tests).
+#[cfg(test)]
+pub(crate) fn context_state_len(kid: &str) -> usize {
+    let prefix = format!("{kid}|");
+    let count = |keys: Vec<String>| keys.iter().filter(|k| k.starts_with(&prefix)).count();
+    count(
+        send_seq_counters()
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect(),
+    ) + count(
+        recv_replay_windows()
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect(),
+    )
+}
+
 fn recv_replay_windows() -> &'static RwLock<HashMap<String, Arc<Mutex<ReplayWindow>>>> {
     static S: OnceLock<RwLock<HashMap<String, Arc<Mutex<ReplayWindow>>>>> = OnceLock::new();
     S.get_or_init(|| RwLock::new(HashMap::new()))
