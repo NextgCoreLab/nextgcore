@@ -52,6 +52,27 @@
 //!   (it restarted) and the registration is dropped. A registration with no
 //!   report and no successful audit for [`REGISTRATION_EXPIRY_SECS`] expires.
 //!
+//! **Owner binding** (#1937, the rule of #1865 via `nextgcore_sbi::owner_binding`;
+//! TS 33.501 §13.4.1: a producer authorizes on the identity it authenticated,
+//! never on an ID the path or the body claims):
+//!
+//! - A registration is bound at Register to the verified identity of the NF that
+//!   created it (the NF Instance ID of its mTLS certificate, else the `sub` of its
+//!   verified access token, which is what survives an SCP hop), and a
+//!   subscription at Subscribe likewise. Under the `production` SBI profile an
+//!   anonymous create is refused 403; a `consumerId` naming another NF instance
+//!   than the verified caller is refused 403 too.
+//! - Deregister, Subscribe-update (`PUT`) and Unsubscribe by id answer 404 for an
+//!   unknown id, then 403 for any caller that is not the owner, before anything
+//!   changes: no removal, no Unsubscribe sent to the AnLF, no collector or
+//!   counter change, no log-only state change. A Register from one owner never
+//!   replaces another owner's registration.
+//! - An ownerless record (created under the `dev` profile with no identity) is
+//!   managed by anyone under `dev` and frozen under `production`.
+//! - Both maps are in memory only: nothing is persisted, so no ownerless record
+//!   can be restored under production, and the owner is not written anywhere.
+//!   A restarted peer recovers through the 404 handling below.
+//!
 //! The notify callback `/nnwdaf-callback/v1/mlmodel-monitor-notify/{token}`
 //! authenticates by its 122-bit token (TS 33.501 §13.4.1: no OAuth2 on
 //! notifications) and has the same OAuth2-enforcement limitation as the model
@@ -63,6 +84,7 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{send_bad_request, send_not_found};
 use serde_json::{json, Value};
 
@@ -117,6 +139,10 @@ pub struct Registration {
     pub last_seen: u64,
     /// An audit of this registration is in flight.
     pub auditing: bool,
+    /// #1937: the verified NF instance that registered it; only it may
+    /// deregister it. `None` only for a registration created with no verified
+    /// identity under the `dev` profile (frozen under `production`).
+    pub owner: Option<String>,
 }
 
 /// One AnLF-side subscription (an `MLModelMonitorSub`).
@@ -128,6 +154,9 @@ pub struct MonitorSub {
     pub accu_threshold: Option<u8>,
     pub period_secs: u64,
     pub last_report: Option<u64>,
+    /// #1937: the verified NF instance (the MTLF) that created it; only it may
+    /// update or delete it. `None` as for [`Registration::owner`].
+    pub owner: Option<String>,
 }
 
 /// The registration the AnLF holds at the MTLF.
@@ -316,6 +345,13 @@ impl Monitor {
     /// the background. The removed registration, if it was live.
     fn drop_registration(&'static self, id: &str, unsubscribe: bool) -> Option<Registration> {
         let reg = lock(&self.registrations).remove(id)?;
+        self.dropped(id, &reg, unsubscribe);
+        Some(reg)
+    }
+
+    /// The side effects of removing registration `id`: drop its collector and,
+    /// if `unsubscribe`, Unsubscribe at the AnLF in the background.
+    fn dropped(&'static self, id: &str, reg: &Registration, unsubscribe: bool) {
         lock(&self.feedback).unregister_model(id);
         if let (true, Some((host, port, sub))) = (unsubscribe, reg.anlf_subscription.clone()) {
             tokio::spawn(async move {
@@ -325,7 +361,6 @@ impl Monitor {
                     .await;
             });
         }
-        Some(reg)
     }
 
     /// Whether the MTLF requested a retrain of `model_id`: below the
@@ -346,6 +381,7 @@ impl Monitor {
                 anlf_subscription: None,
                 last_seen: unix_now(),
                 auditing: false,
+                owner: None,
             },
         );
         lock(&self.feedback).register_model_with(
@@ -447,13 +483,34 @@ fn created(location: String, body: &Value) -> SbiResponse {
 
 /// Route `/nnwdaf-mlmodelmonitor/v1/<rest>`. `/registrations` is served by an
 /// MTLF, `/subscriptions` by an AnLF-only NWDAF; with the demo off, or on the
-/// other role, both are 404.
+/// other role, both are 404. Creates and manages are owner-bound under
+/// [`owner_binding::identity_required`] (the SBI profile), see the module docs.
 pub fn route(
     monitor: Option<&'static Monitor>,
     ctx: &RwLock<NwdafContext>,
     method: &str,
     rest: &[&str],
     request: &SbiRequest,
+) -> SbiResponse {
+    route_with(
+        monitor,
+        ctx,
+        method,
+        rest,
+        request,
+        owner_binding::identity_required(),
+    )
+}
+
+/// [`route`] with an explicit `required` (`true` = the `production` rule: an
+/// anonymous create is refused and an ownerless record is frozen).
+pub fn route_with(
+    monitor: Option<&'static Monitor>,
+    ctx: &RwLock<NwdafContext>,
+    method: &str,
+    rest: &[&str],
+    request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     let Some(m) = monitor else {
         return send_not_found("Nnwdaf_MLModelMonitor is not served", None);
@@ -463,21 +520,21 @@ pub fn route(
         ["registrations"] if m.role.serves_mtlf() => match method {
             "POST" => {
                 let guard = ctx.read().unwrap_or_else(|p| p.into_inner());
-                handle_register(m, &guard, request)
+                handle_register(m, &guard, request, required)
             }
             _ => not_allowed(),
         },
         ["registrations", id] if m.role.serves_mtlf() => match method {
-            "DELETE" => handle_deregister(m, id),
+            "DELETE" => handle_deregister(m, id, request, required),
             _ => not_allowed(),
         },
         ["subscriptions"] if m.role == Role::Anlf => match method {
-            "POST" => handle_subscribe(m, None, request),
+            "POST" => handle_subscribe(m, None, request, required),
             _ => not_allowed(),
         },
         ["subscriptions", id] if m.role == Role::Anlf => match method {
-            "PUT" => handle_subscribe(m, Some(id), request),
-            "DELETE" => handle_unsubscribe(m, id),
+            "PUT" => handle_subscribe(m, Some(id), request, required),
+            "DELETE" => handle_unsubscribe(m, id, request, required),
             _ => not_allowed(),
         },
         _ => send_not_found("no such Nnwdaf_MLModelMonitor resource on this NWDAF", None),
@@ -511,12 +568,17 @@ fn insufficient_resources(what: &str, cap: usize) -> SbiResponse {
 /// `POST /registrations` (§4.7.2.2.2): 201 + `Location`, then Subscribe at the
 /// AnLF in the background. A `modelId` this MTLF did not provision is 400. A
 /// registration from the same `consumerId` for the same `modelId` replaces the
-/// older one (that AnLF restarted, or registered again); past the cap, 500
-/// `INSUFFICIENT_RESOURCES`.
+/// older one (that AnLF restarted, or registered again), only when both have
+/// the same owner; past the cap, 500 `INSUFFICIENT_RESOURCES`.
+///
+/// #1937: bound to the verified caller ([`owner_binding::owner_for_new_resource_with`]
+/// under `required`) before anything is stored; a `consumerId` that names
+/// another NF instance than the verified caller is 403.
 pub fn handle_register(
     m: &'static Monitor,
     ctx: &NwdafContext,
     request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     let Some(body) = body_json(request) else {
         return send_bad_request("body is not JSON", Some("INVALID_MSG_FORMAT"));
@@ -525,6 +587,28 @@ pub fn handle_register(
         Ok(r) => r,
         Err(e) => return send_bad_request(&e, Some("MANDATORY_IE_MISSING")),
     };
+    let owner = match owner_binding::owner_for_new_resource_with(
+        request,
+        "Nnwdaf_MLModelMonitor_Register",
+        required,
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    // The MTLF discovers and subscribes at `consumerId` (§6.2E.2 step 5): a
+    // verified caller may only register itself, not send the MTLF to another
+    // AnLF (TS 33.501 §13.4.1).
+    if let (Some(owner), Some(consumer)) = (owner.as_deref(), consumer_id.as_deref()) {
+        if !owner_binding::same_nf_instance_id(owner, consumer) {
+            return nextgcore_sbi::server::send_forbidden(
+                &format!(
+                    "Nnwdaf_MLModelMonitor_Register: consumerId {consumer} is not the \
+                     requester ({owner})"
+                ),
+                None,
+            );
+        }
+    }
     if ctx.model_version_by_unique_id(model_id).is_none() {
         return send_bad_request(
             &format!("modelId {model_id} is not a model this MTLF provisioned"),
@@ -542,7 +626,10 @@ pub fn handle_register(
         let replaced: Vec<String> = regs
             .iter()
             .filter(|(_, r)| {
-                consumer_id.is_some() && r.consumer_id == consumer_id && r.model_id == model_id
+                consumer_id.is_some()
+                    && r.consumer_id == consumer_id
+                    && r.model_id == model_id
+                    && r.owner == owner
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -558,6 +645,7 @@ pub fn handle_register(
                 anlf_subscription: None,
                 last_seen: unix_now(),
                 auditing: false,
+                owner,
             },
         );
         replaced
@@ -739,10 +827,33 @@ pub async fn subscribe_at_anlf_retrying(m: &'static Monitor, registration_id: St
 }
 
 /// `DELETE /registrations/{id}` (§4.7.2.3.2): 204, and Unsubscribe at the AnLF.
-pub fn handle_deregister(m: &'static Monitor, id: &str) -> SbiResponse {
-    let Some(reg) = m.drop_registration(id, true) else {
-        return send_not_found(&format!("no registration {id}"), None);
+/// 404 for an unknown id; 403 for a caller that is not its owner (#1937),
+/// decided under the map's lock before anything is removed or sent.
+pub fn handle_deregister(
+    m: &'static Monitor,
+    id: &str,
+    request: &SbiRequest,
+    required: bool,
+) -> SbiResponse {
+    let reg = {
+        let mut regs = lock(&m.registrations);
+        let Some(reg) = regs.get(id) else {
+            return send_not_found(&format!("no registration {id}"), None);
+        };
+        if let Some(refused) = owner_binding::refuse_non_owner_with(
+            reg.owner.as_deref(),
+            request,
+            "Nnwdaf_MLModelMonitor_Deregister",
+            required,
+        ) {
+            return refused;
+        }
+        let Some(reg) = regs.remove(id) else {
+            return send_not_found(&format!("no registration {id}"), None);
+        };
+        reg
     };
+    m.dropped(id, &reg, true);
     nextgcore_demo::demo_log!(
         info,
         DEMO_KEY,
@@ -1159,6 +1270,7 @@ pub fn parse_subscription(body: &Value) -> Result<MonitorSub, String> {
         accu_threshold,
         period_secs,
         last_report: None,
+        owner: None,
     })
 }
 
@@ -1179,16 +1291,40 @@ fn sub_json(id: &str, s: &MonitorSub) -> Value {
 /// `POST /subscriptions` (201 + `Location`; past the cap 500
 /// `INSUFFICIENT_RESOURCES`) or `PUT /subscriptions/{id}` (200; 404 if
 /// unknown), §4.7.2.4.
-pub fn handle_subscribe(m: &Monitor, id: Option<&str>, request: &SbiRequest) -> SbiResponse {
-    let Some(body) = body_json(request) else {
-        return send_bad_request("body is not JSON", Some("INVALID_MSG_FORMAT"));
-    };
-    let sub = match parse_subscription(&body) {
-        Ok(s) => s,
-        Err(e) => return send_bad_request(&e, Some("MANDATORY_IE_MISSING")),
+///
+/// #1937: a create is bound to the verified caller (under `required`) before
+/// anything is stored; an update answers 404, then 403 for a caller that is not
+/// the owner, before the body is read or anything changes, and keeps the owner.
+pub fn handle_subscribe(
+    m: &Monitor,
+    id: Option<&str>,
+    request: &SbiRequest,
+    required: bool,
+) -> SbiResponse {
+    let parse = || -> Result<MonitorSub, SbiResponse> {
+        let Some(body) = body_json(request) else {
+            return Err(send_bad_request(
+                "body is not JSON",
+                Some("INVALID_MSG_FORMAT"),
+            ));
+        };
+        parse_subscription(&body).map_err(|e| send_bad_request(&e, Some("MANDATORY_IE_MISSING")))
     };
     match id {
         None => {
+            let sub = match parse() {
+                Ok(s) => s,
+                Err(bad) => return bad,
+            };
+            let owner = match owner_binding::owner_for_new_resource_with(
+                request,
+                "Nnwdaf_MLModelMonitor_Subscribe",
+                required,
+            ) {
+                Ok(owner) => owner,
+                Err(refused) => return *refused,
+            };
+            let sub = MonitorSub { owner, ..sub };
             let mut subs = lock(&m.subscriptions);
             if subs.len() >= m.cap {
                 return insufficient_resources("MLModelMonitor subscriptions", m.cap);
@@ -1210,9 +1346,22 @@ pub fn handle_subscribe(m: &Monitor, id: Option<&str>, request: &SbiRequest) -> 
             let Some(old) = subs.get(id) else {
                 return send_not_found(&format!("no subscription {id}"), None);
             };
-            // An update keeps the reporting phase.
+            if let Some(refused) = owner_binding::refuse_non_owner_with(
+                old.owner.as_deref(),
+                request,
+                "Nnwdaf_MLModelMonitor_Subscribe (update)",
+                required,
+            ) {
+                return refused;
+            }
+            let sub = match parse() {
+                Ok(s) => s,
+                Err(bad) => return bad,
+            };
+            // An update keeps the reporting phase and the owner.
             let sub = MonitorSub {
                 last_report: old.last_report,
+                owner: old.owner.clone(),
                 ..sub
             };
             let echo = sub_json(id, &sub);
@@ -1224,12 +1373,28 @@ pub fn handle_subscribe(m: &Monitor, id: Option<&str>, request: &SbiRequest) -> 
     }
 }
 
-/// `DELETE /subscriptions/{id}` (§4.7.2.5.2): 204, or 404.
-pub fn handle_unsubscribe(m: &Monitor, id: &str) -> SbiResponse {
-    match lock(&m.subscriptions).remove(id) {
-        Some(_) => SbiResponse::with_status(204),
-        None => send_not_found(&format!("no subscription {id}"), None),
+/// `DELETE /subscriptions/{id}` (§4.7.2.5.2): 204, or 404; 403 for a caller
+/// that is not its owner (#1937), decided under the map's lock before removal.
+pub fn handle_unsubscribe(
+    m: &Monitor,
+    id: &str,
+    request: &SbiRequest,
+    required: bool,
+) -> SbiResponse {
+    let mut subs = lock(&m.subscriptions);
+    let Some(sub) = subs.get(id) else {
+        return send_not_found(&format!("no subscription {id}"), None);
+    };
+    if let Some(refused) = owner_binding::refuse_non_owner_with(
+        sub.owner.as_deref(),
+        request,
+        "Nnwdaf_MLModelMonitor_Unsubscribe",
+        required,
+    ) {
+        return refused;
     }
+    subs.remove(id);
+    SbiResponse::with_status(204)
 }
 
 /// The accuracy of the AnLF's current model on its own recent data: `(percent,
