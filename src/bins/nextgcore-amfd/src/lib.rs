@@ -30,6 +30,7 @@ pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
 pub mod ngap_sm;
+pub mod nsac; // #1876: NSAC UE counts out as well as in, with a reconciler
 pub mod nrf_subscription; // #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5)
 pub mod nwdaf_mobility; // nextgsim#464: UE Mobility analytics for paging (TS 23.501 §5.4.3.1)
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
@@ -1519,6 +1520,8 @@ pub async fn run() -> Result<()> {
     // #664: a request that cannot reach a cached peer re-discovers through this
     // and is resent once, instead of failing the UE's procedure.
     sbi_path::register_rediscovery_hook();
+    // #1876: NSACF DECREASEs that failed are retried from here on.
+    drop(nsac::spawn_reconciler());
 
     // Discover AUSF and SMF from NRF
     if let Err(e) = sbi_path::amf_nrf_discover("AUSF", "nausf-auth").await {

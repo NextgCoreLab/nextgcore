@@ -946,6 +946,8 @@ pub fn render_amf_families(out: &mut String, census: &AmfCensus) {
         GlobalMetric::UeAssociatedRefused.description(),
         g.get(GlobalMetric::UeAssociatedRefused),
     );
+    // #1876: NSAC UE admissions and the DECREASE reconciler.
+    crate::nsac::render(out);
     // nextgsim#464: rendered only under `paging.strategy: nwdaf-mobility`.
     crate::nwdaf_mobility::render_metrics(out);
     // nextgsim#462: rendered only while demo d440a-ai-paging is active.

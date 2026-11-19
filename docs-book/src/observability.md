@@ -97,6 +97,10 @@ Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so
 | `amf_ngap_failures_total` | counter | `direction`, `procedure` | NGAP unsuccessful outcomes |
 | `amf_ng_reset_ue_idled` | counter | | registered UEs an NG Reset moved to CM-IDLE (#754) |
 | `amf_ngap_ue_associated_refused` | counter | | UE-associated NGAP messages refused for a UE the sender does not serve (#739) |
+| `amf_nsac_ue_admissions` | gauge | | UE admissions (SUPI, access type, S-NSSAI) the NSACF granted and the AMF holds, each to be counted out on deregistration (#1876) |
+| `amf_nsac_ue_decreases_pending` | gauge | | Nnsacf_NSAC_NumOfUEsUpdate DECREASEs that failed, parked for the reconciler (#1876) |
+| `amf_nsac_ue_decreases_total` | counter | `result` (`accepted`, `refused`, `failed`: parked) | DECREASEs sent on deregistration, S-NSSAI removal or a denied registration's rollback |
+| `amf_nsac_ue_decreases_reconciled_total` | counter | `result` (`delivered`, `superseded`, `refused`, `abandoned`) | parked DECREASEs the reconciler ended |
 
 The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (`fivegs_amffunction_*`, `ran_ue`, `amf_session`, `gnb`) are not served: nothing increments them.
 

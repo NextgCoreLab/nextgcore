@@ -4390,6 +4390,13 @@ pub async fn call_pcf_am_policy_delete(
 pub struct NsacfUeAdmissionResult {
     /// Whether the UE was admitted for the requested S-NSSAI.
     pub admitted: bool,
+    /// #1876: whether the NSACF answered and counted the UE in (204, or a 200 that
+    /// does not list it): an admission there is a count to undo. False for every
+    /// degrade-open answer, which counted nothing.
+    pub counted: bool,
+    /// #1876: no answer at all (a transport error): the NSACF may have applied the
+    /// INCREASE, so a precautionary DECREASE reconciles it.
+    pub unanswered: bool,
 }
 
 /// Nnsacf_NSAC UE-admission query (TS 29.536 §6.1.3.2).
@@ -4439,10 +4446,20 @@ pub async fn call_nsacf_ue_admission(
         Err(e) => {
             // Degrade-open: NSACF unreachable -> admit.
             log::warn!("NSACF UE admission unreachable, admitting (degrade-open): {e}");
-            return Ok(NsacfUeAdmissionResult { admitted: true });
+            return Ok(NsacfUeAdmissionResult {
+                admitted: true,
+                counted: false,
+                unanswered: true,
+            });
         }
     };
 
+    // #1876: whether the NSACF itself decided (rather than this AMF degrading open).
+    let decided = match response.status {
+        204 | 200 => true,
+        403 => !response.is_bearer_refusal(),
+        _ => false,
+    };
     let admitted = match response.status {
         // All requested S-NSSAIs admitted.
         204 => true,
@@ -4483,7 +4500,61 @@ pub async fn call_nsacf_ue_admission(
     log::info!(
         "Nnsacf UE admission (SST={snssai_sst}, SD={snssai_sd:?}, supi={supi}): admitted={admitted}"
     );
-    Ok(NsacfUeAdmissionResult { admitted })
+    Ok(NsacfUeAdmissionResult {
+        admitted,
+        counted: decided && admitted,
+        unanswered: false,
+    })
+}
+
+/// #1876: Nnsacf_NSAC_NumOfUEsUpdate DECREASE for one S-NSSAI (TS 29.536 §5.2.2.2,
+/// TS 23.502 §4.2.11.2): count the UE out. Same request as
+/// [`call_nsacf_ue_admission`] with `updateFlag` DECREASE, but its answer is read
+/// for delivery, not admission: 2xx (or 404, the NSACF does not hold the UE) is
+/// [`crate::nsac::Outcome::Accepted`]; another 4xx is `Refused`; no answer, a 5xx or
+/// a refused token is `Failed`, which the caller parks for the reconciler.
+pub async fn call_nsacf_ue_decrease(
+    nsacf_host: &str,
+    nsacf_port: u16,
+    nf_id: &str,
+    supi: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<u32>,
+    access_type: &str,
+) -> crate::nsac::Outcome {
+    use crate::nsac::Outcome;
+    let client = peer_client(nextgcore_sbi::types::NfType::Nsacf, nsacf_host, nsacf_port);
+    let mut snssai = serde_json::json!({ "sst": snssai_sst });
+    if let Some(sd) = snssai_sd {
+        snssai["sd"] = serde_json::Value::String(format!("{sd:06X}"));
+    }
+    let body = serde_json::json!({
+        "nfId": nf_id,
+        "ueACRequestInfo": [{
+            "supi": supi,
+            "anType": access_type,
+            "acuOperationList": [{ "updateFlag": "DECREASE", "snssai": snssai }],
+        }],
+    });
+    match client.post_json("/nnsacf-nsac/v1/slices/ues", &body).await {
+        Ok(r) if r.is_success() || r.status == 404 => Outcome::Accepted,
+        Ok(r) if (r.status == 401 || r.status == 403) && r.is_bearer_refusal() => {
+            log::warn!("[{supi}] NSACF refused the AMF's token for a DECREASE ({})", r.status);
+            Outcome::Failed
+        }
+        Ok(r) if (400..500).contains(&r.status) => {
+            log::warn!("[{supi}] NSACF refused a DECREASE for SST={snssai_sst}: {}", r.status);
+            Outcome::Refused
+        }
+        Ok(r) => {
+            log::warn!("[{supi}] NSACF DECREASE for SST={snssai_sst} answered {}", r.status);
+            Outcome::Failed
+        }
+        Err(e) => {
+            log::warn!("[{supi}] NSACF DECREASE for SST={snssai_sst} failed: {e}");
+            Outcome::Failed
+        }
+    }
 }
 
 /// Nudm_UECM_DeregistrationNotification cleanup: PATCH purge on deregistration
