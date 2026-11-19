@@ -348,3 +348,70 @@ replacement just registered (#753, #1617).
 {{- fail (printf "%s.replicas > 1 is not supported: every pod would share one nfInstanceId and one certificate (#753, #1617). Run one per release, or a StatefulSet with a per-ordinal NEXTGCORE_<TYPE>_INSTANCE_ID and certificate." .nf) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+udmd's durable state file (#1836, #1885), when udm.durableState.enabled. One
+writer per file: the state is one udmd instance's, so a second replica, or a
+claim shared ReadWriteMany, would be two processes rewriting one snapshot.
+*/}}
+{{- define "nextgcore.udmStateCheck" -}}
+{{- $ds := .Values.udm.durableState -}}
+{{- if $ds.enabled -}}
+{{- if gt (int .Values.udm.replicas) 1 -}}
+{{- fail "udm.durableState.enabled with udm.replicas > 1 is not supported: the state file is one udmd instance's, and two pods would write one file (#1885)." -}}
+{{- end -}}
+{{- if not (has $ds.type (list "pvc" "emptyDir")) -}}
+{{- fail (printf "udm.durableState.type must be pvc or emptyDir, not %q (#1885)." $ds.type) -}}
+{{- end -}}
+{{- if and (eq $ds.type "pvc") (not (has $ds.persistence.accessMode (list "ReadWriteOnce" "ReadWriteOncePod"))) -}}
+{{- fail (printf "udm.durableState.persistence.accessMode must be ReadWriteOnce or ReadWriteOncePod, not %q: a shared claim lets two pods write one state file (#1885)." $ds.persistence.accessMode) -}}
+{{- end -}}
+{{- if not (hasPrefix "/" $ds.mountPath) -}}
+{{- fail (printf "udm.durableState.mountPath must be absolute, not %q (#1885)." $ds.mountPath) -}}
+{{- end -}}
+{{- if or (not $ds.fileName) (contains "/" $ds.fileName) -}}
+{{- fail (printf "udm.durableState.fileName must be a plain file name, not %q (#1885)." $ds.fileName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "nextgcore.udmStateClaim" -}}
+{{- .Values.udm.durableState.persistence.existingClaim | default (printf "%s-udm-state" .Release.Name) -}}
+{{- end -}}
+
+{{- define "nextgcore.udmStateEnv" -}}
+{{- with .Values.udm.durableState }}
+{{- if .enabled }}
+# #1836: SDM subscriptions, the UDR am-data subscriptions and the queued
+# am-data changes survive a udmd restart, on the udm-state volume (#1885).
+- name: NEXTGCORE_UDM_STATE_FILE
+  value: {{ printf "%s/%s" (trimSuffix "/" .mountPath) .fileName | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "nextgcore.udmStateMount" -}}
+{{- with .Values.udm.durableState }}
+{{- if .enabled }}
+# Writable by the image's non-root user through the pod's fsGroup.
+- name: udm-state
+  mountPath: {{ .mountPath }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "nextgcore.udmStateVolume" -}}
+{{- with .Values.udm.durableState }}
+{{- if .enabled }}
+{{- if eq .type "emptyDir" }}
+# emptyDir: survives a container restart, NOT a pod delete or reschedule.
+- name: udm-state
+  emptyDir: {}
+{{- else }}
+- name: udm-state
+  persistentVolumeClaim:
+    claimName: {{ include "nextgcore.udmStateClaim" $ }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}

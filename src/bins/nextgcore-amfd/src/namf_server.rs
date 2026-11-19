@@ -594,7 +594,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
         //   DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef} (ContextDelete, #1758)
         "namf-mbs-bc" if method == "DELETE" && parts.len() == 4 && parts[2] == "mbs-contexts" => {
-            handle_mbs_context_delete(parts[3])
+            handle_mbs_context_delete(parts[3]).await
         }
 
         _ => {
@@ -1090,6 +1090,9 @@ fn handle_ue_policy_notify_callback(
 ///   change this AMF does not apply (DECISIONS 2026-11-18-030000), never a 204. The check, the changes and the
 ///   derived fields are one step under the store's lock, so a concurrent
 ///   re-subscription cannot interleave and nothing is left half applied.
+/// - An applied change of the UE-AMBR queues the UE for a UE Context Modification
+///   at NG-RAN (#1776, TS 23.502 §4.5.1), which the NGAP task sends if the UE is
+///   CM-CONNECTED.
 fn handle_sdm_notify_callback(
     supi: &str,
     token: Option<&str>,
@@ -1126,25 +1129,39 @@ fn handle_sdm_notify_callback(
             return None;
         }
         let current = crate::sdm_notify::current_am_data(&state.amf_ue);
-        // CM-CONNECTED as `ue_ng_connected` reads it, under the same lock.
-        let cm_connected = !state.is_cm_idle() && state.is_bound();
         Some(
-            crate::sdm_notify::applied_am_data(
-                supi,
-                &current,
-                state.sdm_subscription_id(),
-                &body,
-                cm_connected,
-            )
-            .map(|doc| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc)),
+            crate::sdm_notify::applied_am_data(supi, &current, state.sdm_subscription_id(), &body)
+                .map(|doc| {
+                    let before = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+                    crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc);
+                    before != (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink)
+                }),
         )
     });
+    // #1776, TS 23.502 §4.5.1: a changed UE-AMBR is the UE context at NG-RAN to
+    // modify. Queued for the NGAP task, which owns SCTP and reads the CM state at
+    // send time: a CM-CONNECTED UE's node gets a UE CONTEXT MODIFICATION REQUEST
+    // with the UE-AMBR then held; for a CM-IDLE UE nothing is sent, and its next
+    // Initial Context Setup carries it. Queued whatever the CM state now, so a UE
+    // that connects before the drain, on an Initial Context Setup built from what it
+    // held before this change, is still brought up to date. Only an applied change
+    // is queued, and a retry that changes nothing queues nothing.
+    if let Some(Some(Ok(true))) = outcome {
+        guard.ue_ambr_modification_add(ue.id);
+    }
     drop(guard);
     match outcome {
         None => context_not_found(supi),
         Some(None) => unknown_callback_token(supi, "SDM data change"),
-        Some(Some(Ok(()))) => {
-            log::info!("[{supi}] Nudm_SDM data change notification applied to the am-data");
+        Some(Some(Ok(ue_ambr_changed))) => {
+            log::info!(
+                "[{supi}] Nudm_SDM data change notification applied to the am-data{}",
+                if ue_ambr_changed {
+                    "; the UE-AMBR changed, queued for NG-RAN (UE Context Modification)"
+                } else {
+                    ""
+                }
+            );
             SbiResponse::no_content()
         }
         Some(Some(Err(refusal))) => {
@@ -1961,13 +1978,21 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     if sub.any_ue {
         subscription["anyUE"] = json!(true);
     }
+    // #1819: a PERIODIC subscription echoes (and transfers) its mode and period,
+    // so a target AMF taking it over keeps reporting on the period.
     // #1760: the reporting mode the AMF applies.
     let trigger = if sub.one_time {
         "ONE_TIME"
     } else {
         "CONTINUOUS"
     };
-    if let Some(expiry) = sub.expiry {
+    if let Some(period) = sub.rep_period {
+        let mut options = json!({ "trigger": "PERIODIC", "repPeriod": period.as_secs() });
+        if let Some(expiry) = sub.expiry {
+            options["expiry"] = json!(system_time_to_rfc3339(expiry));
+        }
+        subscription["options"] = options;
+    } else if let Some(expiry) = sub.expiry {
         subscription["options"] = json!({
             "trigger": trigger,
             "expiry": system_time_to_rfc3339(expiry),
@@ -1975,7 +2000,430 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     } else if sub.one_time {
         subscription["options"] = json!({ "trigger": trigger });
     }
+    // #1832: the maximum number of reports round-trips.
+    if let Some(max) = sub.max_reports {
+        if subscription.get("options").is_none() {
+            subscription["options"] = json!({ "trigger": trigger });
+        }
+        subscription["options"]["maxReports"] = json!(max);
+    }
     subscription
+}
+
+/// #1819: `options.repPeriod` when `options.trigger` is PERIODIC (TS 29.518 Table
+/// 6.2.6.2.6-1, `29518-k00.txt:22306-22307`): required then, a `DurationSec` of at
+/// least 1. `Ok(None)` for any other trigger, whose repPeriod is not read.
+#[allow(clippy::result_large_err)]
+fn parse_rep_period(subscription: &Value) -> Result<Option<std::time::Duration>, Box<SbiResponse>> {
+    if subscription
+        .pointer("/options/trigger")
+        .and_then(Value::as_str)
+        != Some("PERIODIC")
+    {
+        return Ok(None);
+    }
+    match subscription.pointer("/options/repPeriod") {
+        None | Some(Value::Null) => Err(Box::new(mandatory_ie_missing(
+            "subscription.options.repPeriod",
+        ))),
+        Some(v) => match v.as_u64().filter(|s| *s >= 1) {
+            Some(secs) => Ok(Some(std::time::Duration::from_secs(secs))),
+            None => Err(Box::new(mandatory_ie_incorrect(
+                "subscription.options.repPeriod",
+                "not a DurationSec of at least 1",
+            ))),
+        },
+    }
+}
+
+/// #1832: the identity a report is about, as the maxReports count keys it: the
+/// SUPI, else the GPSI, else the PEI it carries; empty for an area-level report.
+fn report_ue_key(report: &Value) -> String {
+    ["supi", "gpsi", "pei"]
+        .iter()
+        .find_map(|k| report.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// #1832: claim `report` against `sub`'s maxReports.
+fn claim_report(sub: &EventSubscription, report: &Value) -> crate::context::ReportClaim {
+    let event_type = report.get("type").and_then(Value::as_str).unwrap_or("");
+    match amf_self().read() {
+        Ok(guard) => guard.event_subscription_claim_report(
+            &sub.subscription_id,
+            sub.max_reports,
+            event_type,
+            &report_ue_key(report),
+        ),
+        Err(_) => crate::context::ReportClaim::Granted { ended: false },
+    }
+}
+
+/// #1832: `options.maxReports`, else an `AmfEvent.maxReports` (Table 6.2.6.2.3-1
+/// NOTE 2: the same for every event, and the options' value has precedence). An
+/// integer of at least 1; `Ok(None)` when neither is present.
+#[allow(clippy::result_large_err)]
+fn parse_max_reports(subscription: &Value) -> Result<Option<u32>, Box<SbiResponse>> {
+    let from_events = subscription
+        .get("eventList")
+        .and_then(Value::as_array)
+        .and_then(|l| l.iter().find_map(|e| e.get("maxReports")));
+    let (attr, value) = match subscription.pointer("/options/maxReports") {
+        Some(v) if !v.is_null() => ("subscription.options.maxReports", v),
+        _ => match from_events {
+            Some(v) if !v.is_null() => ("subscription.eventList[].maxReports", v),
+            _ => return Ok(None),
+        },
+    };
+    value
+        .as_u64()
+        .filter(|n| *n >= 1)
+        .and_then(|n| u32::try_from(n).ok())
+        .map(Some)
+        .ok_or_else(|| Box::new(mandatory_ie_incorrect(attr, "not an integer of at least 1")))
+}
+
+/// #1832: a transferred subscription's maxReports. Its `options.maxReports` is the
+/// REMAINING number of reports (Table 6.2.6.2.6-1), so it becomes this AMF's
+/// maximum, counted from zero here. An unusable value is taken over as no maximum,
+/// logged.
+fn transferred_max_reports(entry: &Value) -> Option<u32> {
+    match parse_max_reports(entry) {
+        Ok(m) => m,
+        Err(_) => {
+            log::warn!(
+                "transferred event subscription carries no usable maxReports; taken over \
+                 without one"
+            );
+            None
+        }
+    }
+}
+
+/// #1832: `sub` as a transferred `eventSubscriptionList` entry for `ue`: its echo,
+/// with `options.maxReports` the REMAINING number of reports for the UE (Table
+/// 6.2.6.2.6-1) and the events that have made their maximum left out (they ended).
+pub(crate) fn subscription_transfer_json(sub: &EventSubscription, ue: &AmfUe) -> Value {
+    let mut out = subscription_echo_json(sub);
+    let Some(max) = sub.max_reports else {
+        return out;
+    };
+    let key = ue
+        .supi
+        .as_deref()
+        .or(ue.gpsi.as_deref())
+        .or(ue.pei.as_deref())
+        .unwrap_or("");
+    let remaining = |t: &str| {
+        max.saturating_sub(
+            sub.reports_made
+                .get(&(t.to_string(), key.to_string()))
+                .copied()
+                .unwrap_or(0),
+        )
+    };
+    if let Some(events) = out.get_mut("eventList").and_then(Value::as_array_mut) {
+        events.retain(|e| {
+            e.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| remaining(t) > 0)
+        });
+        for e in events.iter_mut() {
+            e.as_object_mut().map(|o| o.remove("maxReports"));
+        }
+    }
+    let left = sub
+        .event_types
+        .iter()
+        .map(|t| remaining(t))
+        .max()
+        .unwrap_or(0);
+    out["options"]["maxReports"] = json!(left);
+    out
+}
+
+/// #1819: the period of a transferred subscription (an `eventSubscriptionList`
+/// entry, TS 29.518 §6.1.6.2.25), read as the subscribe path reads it. A PERIODIC
+/// entry without a usable repPeriod is taken over as CONTINUOUS and logged: the
+/// subscription is still the consumer's, and refusing it would drop its reports.
+fn transferred_rep_period(entry: &Value) -> Option<std::time::Duration> {
+    match parse_rep_period(entry) {
+        Ok(period) => period,
+        Err(_) => {
+            log::warn!(
+                "transferred PERIODIC event subscription carries no usable repPeriod; taken \
+                 over as CONTINUOUS"
+            );
+            None
+        }
+    }
+}
+
+/// #1819: the running PERIODIC LOCATION_REPORT timers, by subscription id, so the
+/// unsubscribe can stop one at once. Each timer also stops by itself at the
+/// subscription's expiry, and at its next period once the subscription is gone by
+/// any other path. At most one per stored subscription.
+fn periodic_location_timers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>> {
+    static TIMERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    > = std::sync::OnceLock::new();
+    TIMERS.get_or_init(Default::default)
+}
+
+/// #1819: stop `subscription_id`'s PERIODIC LOCATION_REPORT timer, if it runs.
+fn cancel_periodic_location_reports(subscription_id: &str) {
+    if let Some(timer) = periodic_location_timers()
+        .lock()
+        .ok()
+        .and_then(|mut t| t.remove(subscription_id))
+    {
+        timer.abort();
+    }
+}
+
+/// #1819: whether `subscription_id`'s PERIODIC LOCATION_REPORT timer runs.
+#[cfg(test)]
+pub(crate) fn periodic_location_timer_running(subscription_id: &str) -> bool {
+    periodic_location_timers()
+        .lock()
+        .is_ok_and(|t| t.contains_key(subscription_id))
+}
+
+/// #1819: start `sub`'s PERIODIC timer when it is a PERIODIC subscription. Every
+/// `rep_period` it reports the current state of each subscribed event (#1832: not
+/// only LOCATION_REPORT) for the UE(s) the subscription targets, until the
+/// subscription expires, is unsubscribed, makes its maxReports, or is otherwise
+/// gone. The first LOCATION_REPORT (at the subscription) is made by the subscribe
+/// path, so the first tick is one period in.
+fn spawn_periodic_reports(sub: &EventSubscription) {
+    let Some(period) = sub.rep_period else {
+        return;
+    };
+    // R27: nothing for a period to report when no event has a state.
+    if !sub
+        .event_types
+        .iter()
+        .any(|t| crate::context::periodic_reports_state(t))
+    {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("PERIODIC LOCATION_REPORT: no tokio runtime, no timer");
+        return;
+    };
+    let id = sub.subscription_id.clone();
+    let task_id = id.clone();
+    let task = async move {
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let expiry = amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.event_subscription_find(&task_id))
+                .map(|s| s.expiry);
+            let Some(expiry) = expiry else {
+                break;
+            };
+            if expiry.is_some_and(|e| e <= std::time::SystemTime::now()) {
+                break;
+            }
+            let until_expiry = expiry.map(|e| {
+                e.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default()
+            });
+            // R27: at the expiry the loop re-reads the subscription rather than
+            // stopping, so a PATCH that extended it keeps the timer.
+            tokio::select! {
+                _ = timer.tick() => {}
+                _ = tokio::time::sleep(until_expiry.unwrap_or_default()), if until_expiry.is_some() => continue,
+            }
+            let Some(sub) = amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.event_subscription_find(&task_id))
+                .filter(|s| s.expiry.is_none_or(|e| e > std::time::SystemTime::now()))
+            else {
+                break;
+            };
+            // #1760: while its first LOCATION_REPORT waits on a page, the period does
+            // not report a location either; the page's outcome is the first report.
+            // R27: and a PATCH may have removed LOCATION_REPORT from the subscription.
+            let mut reports = Vec::new();
+            if sub.event_types.iter().any(|t| t == "LOCATION_REPORT") && !sub.first_location_pending
+            {
+                reports.extend(periodic_location_reports(&sub));
+            }
+            // #1832: every other event with a current state, as its immediate
+            // report would carry it (TS 29.518 §5.3.2.2.2: "the current status of
+            // the events subscribed").
+            // R27: per targeted UE, resolved as the location reports resolve it
+            // (every UE of an any-UE subscription, the UE a GPSI or PEI names),
+            // and the area-level UES_IN_AREA_REPORT once.
+            let per_ue: Vec<String> = sub
+                .event_types
+                .iter()
+                .filter(|t| {
+                    *t != "LOCATION_REPORT"
+                        && *t != "UES_IN_AREA_REPORT"
+                        && crate::context::periodic_reports_state(t)
+                })
+                .cloned()
+                .collect();
+            if !per_ue.is_empty() {
+                for supi in periodic_target_supis(&sub) {
+                    reports.extend(build_immediate_reports(&per_ue, Some(&supi), &sub));
+                }
+            }
+            if sub.event_types.iter().any(|t| t == "UES_IN_AREA_REPORT") {
+                reports.extend(build_immediate_reports(
+                    &["UES_IN_AREA_REPORT".to_string()],
+                    None,
+                    &sub,
+                ));
+            }
+            // R27: one notification per period, its reportList carrying every report
+            // (every UE of an any-UE subscription). #1832: each is claimed against
+            // maxReports, in order.
+            if !reports.is_empty() {
+                if let Err(e) = deliver_event_notifications(sub.clone(), reports).await {
+                    log::warn!("Periodic event notification delivery failed (sub={task_id}): {e}");
+                }
+            }
+        }
+        // R27: only this task's own entry (a respawn may have replaced it).
+        if let Ok(mut t) = periodic_location_timers().lock() {
+            if t.get(&task_id)
+                .is_some_and(|h| Some(h.id()) == tokio::task::try_id())
+            {
+                t.remove(&task_id);
+            }
+        }
+        log::debug!("PERIODIC timer of {task_id} stopped");
+    };
+    // R27: spawned with the map locked, so the handle is in the map before the
+    // task can reach its own removal (a task finding its subscription gone at once
+    // no longer leaves a stale entry).
+    let Ok(mut timers) = periodic_location_timers().lock() else {
+        return;
+    };
+    let task = handle.spawn(task);
+    if let Some(old) = timers.insert(id, task.abort_handle()) {
+        old.abort();
+    }
+}
+
+/// #1819: one period's LOCATION_REPORTs for `sub`: the current location of each
+/// registered UE it targets (the one UE it names, or every UE for an any-UE
+/// subscription; repPeriod "shall be applied to each individual member UE",
+/// Table 6.2.6.2.6-1). For a CM-IDLE UE that is the last known location, with
+/// `ageOfLocationInformation` the minutes since it was acquired (at least 1), as
+/// the first report does. The UE is not paged for a periodic report.
+/// R27: the SUPIs of the registered UEs a PERIODIC tick reports on for `sub`: every
+/// UE for an any-UE subscription, else the one UE its SUPI, GPSI or PEI names.
+fn periodic_target_supis(sub: &EventSubscription) -> Vec<String> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    // R27: every UE the live store holds (a UE published by the NGAP path is in
+    // the store, not necessarily in `amf_ue_list`).
+    let ues: Vec<AmfUe> = if sub.any_ue {
+        guard
+            .ue_store()
+            .snapshot()
+            .into_iter()
+            .map(|(_, record)| record.amf_ue)
+            .collect()
+    } else {
+        sub.supi
+            .as_deref()
+            .and_then(|s| guard.amf_ue_find_by_supi(s))
+            .or_else(|| {
+                sub.gpsi
+                    .as_deref()
+                    .and_then(|g| guard.amf_ue_find_by_gpsi(g))
+            })
+            .or_else(|| sub.pei.as_deref().and_then(|p| guard.amf_ue_find_by_pei(p)))
+            .into_iter()
+            .collect()
+    };
+    ues.into_iter()
+        .filter(|ue| {
+            guard
+                .ue_store()
+                .get(ue.id)
+                .is_some_and(|r| r.is_registered())
+        })
+        .filter_map(|ue| ue.supi.clone())
+        .collect()
+}
+
+fn periodic_location_reports(sub: &EventSubscription) -> Vec<Value> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    // R27: every UE the live store holds (a UE published by the NGAP path is in
+    // the store, not necessarily in `amf_ue_list`).
+    let ues: Vec<AmfUe> = if sub.any_ue {
+        guard
+            .ue_store()
+            .snapshot()
+            .into_iter()
+            .map(|(_, record)| record.amf_ue)
+            .collect()
+    } else {
+        sub.supi
+            .as_deref()
+            .and_then(|s| guard.amf_ue_find_by_supi(s))
+            .or_else(|| {
+                sub.gpsi
+                    .as_deref()
+                    .and_then(|g| guard.amf_ue_find_by_gpsi(g))
+            })
+            .or_else(|| sub.pei.as_deref().and_then(|p| guard.amf_ue_find_by_pei(p)))
+            .into_iter()
+            .collect()
+    };
+    let registered: Vec<(AmfUe, bool)> = ues
+        .into_iter()
+        .filter_map(|ue| {
+            let record = guard.ue_store().get(ue.id).filter(|r| r.is_registered())?;
+            Some((ue, record.is_cm_idle()))
+        })
+        .collect();
+    drop(guard);
+    registered
+        .iter()
+        .map(|(ue, idle)| periodic_location_report(ue, *idle))
+        .collect()
+}
+
+fn periodic_location_report(ue: &AmfUe, cm_idle: bool) -> Value {
+    let mut location = nr_location_json(ue);
+    if cm_idle {
+        let minutes = location_acquired_at(ue)
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0)
+            .clamp(1, 32_767);
+        location["nrLocation"]["ageOfLocationInformation"] = json!(minutes);
+    }
+    let mut report = build_event_report(
+        "LOCATION_REPORT",
+        ue.supi.as_deref(),
+        json!({ "location": location }),
+    );
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        report["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        report["pei"] = json!(pei);
+    }
+    report
 }
 
 /// POST /namf-evts/v1/subscriptions — Namf_EventExposure_Subscribe
@@ -2217,13 +2665,25 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         None => None,
     };
 
+    // #1819: the PERIODIC mode's period. Refused before anything is stored.
+    let rep_period = match parse_rep_period(subscription) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
     // #1760: the reporting mode (AmfEventMode.trigger, TS 29.518 §6.2.6.2.4). ONE_TIME
-    // is told once; CONTINUOUS and PERIODIC are reported as CONTINUOUS (periodic
-    // reporting is not implemented).
+    // is told once; PERIODIC is reported on its repPeriod (#1819, `rep_period` above);
+    // CONTINUOUS on change.
     let one_time = subscription
         .pointer("/options/trigger")
         .and_then(Value::as_str)
         == Some("ONE_TIME");
+    // #1832: the maximum number of reports per event (and per member UE). A
+    // ONE_TIME subscription is told once, so it carries none.
+    let max_reports = match parse_max_reports(subscription) {
+        Ok(m) => m.filter(|_| !one_time),
+        Err(resp) => return *resp,
+    };
 
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let sub = EventSubscription {
@@ -2247,6 +2707,9 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        rep_period,
+        max_reports,
+        reports_made: std::collections::HashMap::new(),
         one_time,
         first_location_pending: false,
         reporting_threshold,
@@ -2331,6 +2794,16 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
             guard.event_subscription_remove(&subscription_id);
         }
         log::info!("Event subscription {subscription_id} is ONE_TIME and was reported: removed");
+    }
+    // #1832: the reports in the response count against maxReports; the last one
+    // ends the subscription.
+    let mut ended = false;
+    for report in &report_list {
+        ended |= claim_report(&sub, report) == crate::context::ReportClaim::Granted { ended: true };
+    }
+    // #1819, #1832: a PERIODIC subscription is then reported every repPeriod.
+    if !ended {
+        spawn_periodic_reports(&sub);
     }
 
     log::info!(
@@ -2581,6 +3054,10 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     }
+    // R27: the PERIODIC timer follows the modified subscription (its eventList and
+    // its expiry).
+    cancel_periodic_location_reports(subscription_id);
+    spawn_periodic_reports(&sub);
 
     let response_body = json!({ "subscription": subscription_echo_json(&sub) });
     match SbiResponse::ok().with_json_body(&response_body) {
@@ -2600,6 +3077,8 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
         };
         guard.event_subscription_remove(subscription_id)
     };
+    // #1819: its PERIODIC LOCATION_REPORT timer stops with it.
+    cancel_periodic_location_reports(subscription_id);
     match removed {
         Some(_) => {
             log::info!("Event subscription removed: {subscription_id}");
@@ -2619,7 +3098,7 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
 // ============================================================================
 
 /// Build a notification SBI client with bounded connect/request timeouts
-fn notify_client(host: &str, port: u16) -> SbiClient {
+pub(crate) fn notify_client(host: &str, port: u16) -> SbiClient {
     let config = nextgcore_sbi::security::sbi_peer_client_config(host, port)
         .with_connect_timeout(std::time::Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(std::time::Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS))
@@ -2680,13 +3159,56 @@ fn build_event_report(event_type: &str, supi: Option<&str>, extra: Value) -> Val
 /// POST one AmfEventNotification to a subscriber's notify URI with bounded
 /// timeouts. Returns Err on any delivery failure.
 async fn deliver_event_notification(sub: EventSubscription, report: Value) -> Result<(), String> {
+    deliver_event_notifications(sub, vec![report]).await
+}
+
+/// One notification carrying `reports` in its `reportList` (R27: a periodic tick of
+/// an any-UE subscription is one POST, not one per UE).
+///
+/// #1832: every notification goes through here, so maxReports is enforced here.
+/// A report counts when it is GENERATED, as Table 6.2.6.2.6-1 words it ("the
+/// maximum number of reports that can be generated"), not when it is delivered:
+/// a consumer that cannot be reached does not get more reports for it (R27).
+/// each report is claimed, and a refused one is left out. Nothing left, nothing
+/// is sent.
+async fn deliver_event_notifications(
+    sub: EventSubscription,
+    reports: Vec<Value>,
+) -> Result<(), String> {
+    let mut granted = Vec::with_capacity(reports.len());
+    for report in reports {
+        match claim_report(&sub, &report) {
+            crate::context::ReportClaim::Refused => {
+                log::debug!(
+                    "Event report not sent (sub={}): its maxReports is reached",
+                    sub.subscription_id
+                );
+            }
+            crate::context::ReportClaim::Granted { ended } => {
+                if ended {
+                    // A PERIODIC timer stops at its next tick, finding the
+                    // subscription gone; aborting it here could cancel this, its
+                    // last report.
+                    log::info!(
+                        "Event subscription {} made its maxReports: ended",
+                        sub.subscription_id
+                    );
+                }
+                granted.push(report);
+            }
+        }
+    }
+    if granted.is_empty() {
+        return Ok(());
+    }
+    let reports = granted;
     let (host, port, path) =
         parse_http_uri(&sub.notify_uri).ok_or_else(|| format!("bad URI {}", sub.notify_uri))?;
 
     let body = json!({
         "notifyCorrelationId": sub.notify_correlation_id,
         "subsChangeNotifyCorrelationId": Value::Null,
-        "reportList": [report],
+        "reportList": reports,
     });
     // Strip the null field (serde_json keeps explicit nulls)
     let mut body = body;
@@ -2840,6 +3362,11 @@ pub fn fire_location_change_report(
         ue.pei.as_deref(),
         json!({ "location": nr_location_json(ue) }),
         |ctx, sub| {
+            // #1819: a PERIODIC subscription is reported on its period, not on a
+            // change (TS 29.518 §5.3.2.2.2, `29518-k00.txt:5731-5737`).
+            if sub.rep_period.is_some() {
+                return false;
+            }
             let change = match ctx.event_subscription_take_reported_location(&sub.subscription_id) {
                 Some(told) => crate::context::LocationChange::between(&told, now),
                 None => change,
@@ -4381,6 +4908,9 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: true,
+            rep_period: transferred_rep_period(entry),
+            max_reports: transferred_max_reports(entry),
+            reports_made: std::collections::HashMap::new(),
             // #1760: the mode travels with it (the echo carries `options.trigger`).
             one_time: entry.pointer("/options/trigger").and_then(Value::as_str) == Some("ONE_TIME"),
             first_location_pending: false,
@@ -4429,6 +4959,8 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             }
         }
         created += 1;
+        // #1819: a transferred PERIODIC subscription keeps reporting on its period.
+        spawn_periodic_reports(&sub);
 
         // §6.2.6.2.5: an ABSOLUTE URI to the created resource, per §6.2.3.3.2.
         // It was the bare path, which a consumer (udmd, nextgcore#1440) cannot
@@ -5243,7 +5775,12 @@ fn try_positioning_relay(
         // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
         // the paging-map lock, so a page another transfer queues meanwhile is joined,
         // never overwritten.
-        let Some(location) = crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // #1858: this transfer's own resource id, so its failure notification is
+        // its own even when another LMF transfer shares the callback URI. The same
+        // transfer retried gets the same id, and is recorded once.
+        let transfer_id = positioning_transfer_id(body, &downlinks);
+        let Some(location) =
+            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri, &transfer_id)
         else {
             log::info!(
                 "[{ue_context_id}] LCS: the page for the UE already carries {} other \
@@ -5280,6 +5817,30 @@ fn try_positioning_relay(
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     })
+}
+
+/// #1858: the identity of a paged positioning transfer, the `{n1N2MessageId}` of
+/// the Location it is answered with (TS 29.518 §5.2.2.3.1) and of the
+/// n1n2MsgDataUri its failure notification names. Derived from the request itself
+/// (its JSON part and the LPP/NRPPa payloads), so a retry of the same transfer
+/// maps to the same resource and is recorded once, while two transfers with
+/// different content are two resources, even when they share one
+/// n1n2FailureTxfNotifURI.
+fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.to_string().hash(&mut h);
+    for dl in downlinks {
+        match &dl.kind {
+            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::NrppaToGnb {
+                routing_id,
+                nrppa_pdu,
+            } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
+            PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+        }
+    }
+    format!("lcs-{:016x}", h.finish())
 }
 
 /// UPDP (UE policy) downlink relay — Wave-6 E5 (TS 29.525 §4.2.2.2: the PCF
@@ -6331,7 +6892,16 @@ fn handle_ue_context_transfer(ue_context_id: &str, request: &SbiRequest) -> SbiR
     // SUBSCRIPTION_ID_CHANGE once it has taken the subscription over (#1699).
     // Before, the list was never sent, so between two nextgcore AMFs a consumer's
     // subscription stayed at the old AMF and the UE's reports stopped.
-    let subscriptions: Vec<Value> = handed_over.iter().map(subscription_echo_json).collect();
+    // #1832: with the remaining maxReports for this UE.
+    let subscriptions: Vec<Value> = handed_over
+        .iter()
+        .map(|s| subscription_transfer_json(s, &ue))
+        .filter(|s| {
+            s.get("eventList")
+                .and_then(Value::as_array)
+                .is_none_or(|l| !l.is_empty())
+        })
+        .collect();
     let subscription_count = subscriptions.len();
     if !subscriptions.is_empty() {
         ue_context["eventSubscriptionList"] = json!(subscriptions);
@@ -6390,6 +6960,8 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
             };
             guard.amf_ue_update(&ue);
             for id in &released {
+                // R27: and its PERIODIC timer with it.
+                cancel_periodic_location_reports(id);
                 if guard.event_subscription_remove(id).is_some() {
                     log::info!(
                         "[{ue_context_id}] event subscription {id} released: transferred to \
@@ -8392,106 +8964,441 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-/// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
-/// (TS 29.518 §5.6, TS 23.247 §7.3.1).
-///
-/// The MB-SMF asks the AMF to create a broadcast MBS context, which the AMF
-/// then drives toward the NG-RAN with BroadcastSessionSetup (procedure 68).
-async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
-    let Some(body) = parse_json_body(request) else {
-        return malformed_body();
-    };
+/// A TS 29.571 `PlmnId` (`mcc` 3 digits, `mnc` 2 or 3 digits).
+fn plmn_id_from_json(plmn: &Value) -> Option<crate::context::PlmnId> {
+    let mcc = plmn.get("mcc").and_then(Value::as_str)?;
+    let mnc = plmn.get("mnc").and_then(Value::as_str)?;
+    let digits = |s: &str| s.chars().all(|c| c.is_ascii_digit());
+    (mcc.len() == 3 && (2..=3).contains(&mnc.len()) && digits(mcc) && digits(mnc))
+        .then(|| crate::context::PlmnId::new(mcc, mnc))
+}
 
-    let Some(session_value) = body.get("mbsSessionId") else {
-        return mandatory_ie_missing("mbsSessionId");
-    };
-    let tmgi = match parse_mbs_session_id(session_value) {
-        Ok(t) => t,
-        Err(resp) => return *resp,
-    };
+/// A TS 29.571 `Tai`: `plmnId` and a 4- or 6-hex-digit `tac`.
+fn tai_from_json(
+    tai: &Value,
+    attr: &str,
+) -> Result<(crate::context::PlmnId, u32), Box<SbiResponse>> {
+    let plmn = tai
+        .get("plmnId")
+        .and_then(plmn_id_from_json)
+        .ok_or_else(|| {
+            Box::new(mandatory_ie_incorrect(
+                &format!("{attr}.plmnId"),
+                "not a PlmnId",
+            ))
+        })?;
+    let tac = tai
+        .get("tac")
+        .and_then(Value::as_str)
+        .filter(|t| t.len() == 4 || t.len() == 6)
+        .and_then(|t| u32::from_str_radix(t, 16).ok())
+        .ok_or_else(|| {
+            Box::new(mandatory_ie_incorrect(
+                &format!("{attr}.tac"),
+                "must be 4 or 6 hexadecimal digits",
+            ))
+        })?;
+    Ok((plmn, tac))
+}
 
-    // #1818: each ContextCreate gets a context of its own on the MBS session the
-    // TMGI names, so its ContextDelete releases only what it created. A repeat
-    // from the same MB-SMF (`mbsmfId`) for the same TMGI is a retry and gets the
-    // same context back rather than a second one.
-    let mbsmf_id = body.get("mbsmfId").and_then(Value::as_str);
-    let (context_ref, session) =
-        match crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id) {
-            Ok(created) => created,
-            // #1856: bounded, with the TS 29.500 cause for it.
-            Err(crate::ngap_mcast::BroadcastCreateRefused::Full) => {
-                return send_error(
-                    500,
-                    "Internal Server Error",
-                    &format!(
-                        "this AMF holds {} broadcast MBS contexts",
-                        crate::ngap_mcast::MAX_BROADCAST_CONTEXTS
-                    ),
-                    Some("INSUFFICIENT_RESOURCES"),
-                );
-            }
-            Err(crate::ngap_mcast::BroadcastCreateRefused::Failed) => {
-                return send_error(
-                    500,
-                    "Internal Server Error",
-                    "could not create the MBS session context",
-                    None,
-                );
-            }
+/// The location-independent `mbsServiceArea` (TS 29.571 `MbsServiceArea`):
+/// `ncgiList` (cells with their TAI) and/or `taiList`, at least one entry, within
+/// the NGAP bounds of the MBS Service Area IE.
+fn parse_mbs_service_area(
+    area: &Value,
+) -> Result<crate::mbs_broadcast::BroadcastServiceArea, Box<SbiResponse>> {
+    use crate::mbs_broadcast::{
+        BroadcastCell, BroadcastServiceArea, MAX_SERVICE_AREA_CELLS, MAX_SERVICE_AREA_TAIS,
+    };
+    let mut out = BroadcastServiceArea::default();
+    if let Some(tais) = area.get("taiList") {
+        let Some(tais) = tais.as_array() else {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "mbsServiceArea.taiList",
+                "not an array",
+            )));
         };
+        for t in tais {
+            out.tais.push(tai_from_json(t, "mbsServiceArea.taiList")?);
+        }
+    }
+    if let Some(ncgis) = area.get("ncgiList") {
+        let Some(ncgis) = ncgis.as_array() else {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "mbsServiceArea.ncgiList",
+                "not an array",
+            )));
+        };
+        for entry in ncgis {
+            let Some(tai) = entry.get("tai") else {
+                return Err(Box::new(mandatory_ie_missing(
+                    "mbsServiceArea.ncgiList.tai",
+                )));
+            };
+            let tai = tai_from_json(tai, "mbsServiceArea.ncgiList.tai")?;
+            let Some(cells) = entry.get("cellList").and_then(Value::as_array) else {
+                return Err(Box::new(mandatory_ie_missing(
+                    "mbsServiceArea.ncgiList.cellList",
+                )));
+            };
+            for cell in cells {
+                let plmn = cell.get("plmnId").and_then(plmn_id_from_json);
+                let nci = cell
+                    .get("nrCellId")
+                    .and_then(Value::as_str)
+                    .filter(|c| c.len() == 9)
+                    .and_then(|c| u64::from_str_radix(c, 16).ok());
+                let (Some(plmn), Some(nci)) = (plmn, nci) else {
+                    return Err(Box::new(mandatory_ie_incorrect(
+                        "mbsServiceArea.ncgiList.cellList",
+                        "each Ncgi needs a PlmnId and a 9-hex-digit nrCellId",
+                    )));
+                };
+                out.cells.push(BroadcastCell {
+                    tai: tai.clone(),
+                    plmn,
+                    nci,
+                });
+            }
+        }
+    }
+    if out.tais.is_empty() && out.cells.is_empty() {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "mbsServiceArea",
+            "names no TAI and no cell",
+        )));
+    }
+    if out.tais.len() > MAX_SERVICE_AREA_TAIS || out.cells.len() > MAX_SERVICE_AREA_CELLS {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "mbsServiceArea",
+            &format!(
+                "at most {MAX_SERVICE_AREA_TAIS} TAIs and {MAX_SERVICE_AREA_CELLS} cells \
+                 (TS 38.413 MBS Service Area)"
+            ),
+        )));
+    }
+    Ok(out)
+}
 
-    log::info!(
-        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={context_ref} session={}",
-        tmgi.service_id_u32(),
-        session.mbs_session_id,
-    );
+/// Validate a ContextCreate (`ContextCreateReqData`, TS 29.518 §6.5.6.2.2) in
+/// full before anything is stored.
+fn parse_mbs_context_create(
+    request: &SbiRequest,
+) -> Result<crate::mbs_broadcast::BroadcastCreate, Box<SbiResponse>> {
+    use crate::mbs_broadcast::ngap_ie_type;
+    let Some(body) = parse_json_body(request) else {
+        return Err(Box::new(malformed_body()));
+    };
+    let Some(session_value) = body.get("mbsSessionId") else {
+        return Err(Box::new(mandatory_ie_missing("mbsSessionId")));
+    };
+    let tmgi = parse_mbs_session_id(session_value)?;
 
-    // #1856: `<epoch>-<id>`, unique across restarts of this AMF.
-    let context_ref = crate::ngap_mcast::context_ref_string(context_ref);
-    let response_body = json!({ "mbsContextRef": context_ref });
+    // `oneOf: [required: [mbsServiceArea], required: [mbsServiceAreaInfoList]]`.
+    let area = match (
+        body.get("mbsServiceArea"),
+        body.get("mbsServiceAreaInfoList"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "mbsServiceArea",
+                "mbsServiceArea and mbsServiceAreaInfoList are mutually exclusive",
+            )))
+        }
+        (None, Some(_)) => {
+            return Err(Box::new(send_error(
+                501,
+                "Not Implemented",
+                "mbsServiceAreaInfoList (a location dependent broadcast MBS service) is not \
+                 supported by this AMF",
+                Some("UNSPECIFIED_NF_FAILURE"),
+            )))
+        }
+        (None, None) => return Err(Box::new(mandatory_ie_missing("mbsServiceArea"))),
+        (Some(area), None) => parse_mbs_service_area(area)?,
+    };
 
-    // 201 with a Location header naming the created resource (TS 29.518 §6.5).
-    match SbiResponse::created().with_json_body(&response_body) {
-        Ok(resp) => resp.with_header(
-            "Location",
-            format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}"),
-        ),
-        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    let Some(n2) = body.get("n2MbsSmInfo") else {
+        return Err(Box::new(mandatory_ie_missing("n2MbsSmInfo")));
+    };
+    if n2.get("ngapIeType").and_then(Value::as_str) != Some(ngap_ie_type::MBS_SES_REQ) {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "n2MbsSmInfo.ngapIeType",
+            "ContextCreate carries an MBS Session Setup or Modification Request Transfer \
+             (MBS_SES_REQ)",
+        )));
+    }
+    let Some(content_id) = n2
+        .get("ngapData")
+        .and_then(|d| d.get("contentId"))
+        .and_then(Value::as_str)
+    else {
+        return Err(Box::new(mandatory_ie_missing(
+            "n2MbsSmInfo.ngapData.contentId",
+        )));
+    };
+    let Some(setup_transfer) = find_binary_part(request, content_id) else {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "n2MbsSmInfo.ngapData",
+            &format!("no binary part with Content-ID '{content_id}'"),
+        )));
+    };
+    // The NG-RAN rejects the Setup Request outright on a transfer it cannot
+    // decode (criticality reject), so a malformed one is refused here instead.
+    if let Err(e) = nextgcore_ngap_gen::decode_contained::<
+        nextgcore_ngap_gen::generated::MBSSessionSetupOrModRequestTransfer,
+    >(&setup_transfer)
+    {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "n2MbsSmInfo.ngapData",
+            &format!("not an MBS Session Setup or Modification Request Transfer: {e:?}"),
+        )));
+    }
+
+    let Some(notify_uri) = body.get("notifyUri").and_then(Value::as_str) else {
+        return Err(Box::new(mandatory_ie_missing("notifyUri")));
+    };
+    if parse_http_uri(notify_uri).is_none() {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "notifyUri",
+            "not an absolute http(s) URI",
+        )));
+    }
+
+    let Some(snssai) = body.get("snssai") else {
+        return Err(Box::new(mandatory_ie_missing("snssai")));
+    };
+    let Some(sst) = snssai
+        .get("sst")
+        .and_then(Value::as_u64)
+        .and_then(|v| u8::try_from(v).ok())
+    else {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "snssai.sst",
+            "must be 0..255",
+        )));
+    };
+    let sd = match snssai.get("sd") {
+        None => None,
+        Some(sd) => match sd
+            .as_str()
+            .filter(|s| s.len() == 6)
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        {
+            Some(v) => Some(v),
+            None => {
+                return Err(Box::new(mandatory_ie_incorrect(
+                    "snssai.sd",
+                    "must be 6 hexadecimal digits",
+                )))
+            }
+        },
+    };
+
+    let max_response_time = match body.get("maxResponseTime") {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => {
+                return Err(Box::new(mandatory_ie_incorrect(
+                    "maxResponseTime",
+                    "must be a non-negative number of seconds",
+                )))
+            }
+        },
+    };
+
+    Ok(crate::mbs_broadcast::BroadcastCreate {
+        tmgi,
+        mbs_session_id: session_value.clone(),
+        sst,
+        sd,
+        area,
+        setup_transfer,
+        notify_uri: notify_uri.to_string(),
+        max_response_time,
+        // #1818: who the context is for.
+        mbsmf_id: body
+            .get("mbsmfId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// The ContextCreate response for `answer`.
+fn mbs_context_create_response(answer: crate::mbs_broadcast::CreateAnswer) -> SbiResponse {
+    use crate::mbs_broadcast::{CreateAnswer, CreateFailure};
+    match answer {
+        CreateAnswer::Created {
+            context_ref,
+            mbs_session_id,
+            containers,
+            complete,
+        } => {
+            // #1856: `<epoch>-<id>`, unique across restarts of this AMF.
+            let context_ref = crate::ngap_mcast::context_ref_string(context_ref);
+            // `mbsSessionId` is ContextCreateRspData's one required member;
+            // `mbsContextRef` repeats the Location's last segment for consumers
+            // that read it from the body.
+            let mut body = json!({
+                "mbsSessionId": mbs_session_id,
+                "mbsContextRef": context_ref,
+            });
+            let (list, parts) = crate::mbs_broadcast::n2_mbs_sm_info_list(containers);
+            if !list.is_empty() {
+                body["n2MbsSmInfoList"] = Value::Array(list);
+            }
+            if complete {
+                body["operationStatus"] = json!("MBS_SESSION_START_COMPLETE");
+            }
+            match SbiResponse::created().with_json_body(&body) {
+                Ok(mut resp) => {
+                    for (cid, data) in parts {
+                        resp = resp.with_part(SbiPart::with_content(
+                            &cid,
+                            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+                            bytes::Bytes::from(data),
+                        ));
+                    }
+                    // 201 with a Location header naming the created resource (TS 29.518 §6.5).
+                    resp.with_header(
+                        "Location",
+                        format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}"),
+                    )
+                }
+                Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+            }
+        }
+        CreateAnswer::Failed(reason) => {
+            let detail = match reason {
+                CreateFailure::NoNgRan => {
+                    "no NG-RAN node served by this AMF is in the MBS service area"
+                }
+                CreateFailure::AllRefused => {
+                    "every NG-RAN node of the MBS service area failed the Broadcast Session Setup"
+                }
+                CreateFailure::Deleted => {
+                    "the broadcast MBS context was released while its setup was in progress"
+                }
+            };
+            send_error(
+                500,
+                "Internal Server Error",
+                detail,
+                Some("UNSPECIFIED_NF_FAILURE"),
+            )
+        }
     }
 }
 
+/// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
+/// (TS 29.518 §5.6.2.2, TS 23.247 §7.3.1).
+///
+/// #1796: the AMF sends a BROADCAST SESSION SETUP REQUEST carrying the MB-SMF's
+/// N2 MBS SM container to every NG-RAN node of the MBS service area (step 3), from
+/// the NGAP task, and answers on the first successful node response (step 7) --
+/// or failure when every node failed or none serves the area, or after
+/// [`crate::mbs_broadcast::CREATE_ANSWER_WAIT`] with what arrived. Later node
+/// responses reach the MB-SMF in ContextStatusNotify requests.
+///
+/// Everything is validated before anything is stored; a repeated ContextCreate
+/// for the TMGI joins the existing context and sends no second Setup.
+async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
+    use crate::mbs_broadcast::{CreateAnswer, CreateFailure, CreateStart};
+    let create = match parse_mbs_context_create(request) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let tmgi_svc = create.tmgi.service_id_u32();
+    let mcast = crate::context::amf_mcast();
+    let answer = match mcast.broadcast_create(create, std::time::Instant::now()) {
+        CreateStart::Full => {
+            return send_error(
+                500,
+                "Internal Server Error",
+                "the AMF holds as many broadcast MBS contexts as it can",
+                Some("INSUFFICIENT_RESOURCES"),
+            )
+        }
+        CreateStart::Answered(answer) => answer,
+        CreateStart::Wait {
+            context_ref: session_id,
+            mut rx,
+        } => match tokio::time::timeout(crate::mbs_broadcast::CREATE_ANSWER_WAIT, &mut rx).await {
+            Ok(Ok(answer)) => answer,
+            _ => mcast
+                .broadcast_answer_on_timeout(session_id)
+                .or_else(|| rx.try_recv().ok())
+                .unwrap_or(CreateAnswer::Failed(CreateFailure::Deleted)),
+        },
+    };
+    log::info!("Namf_MBSBroadcast ContextCreate: tmgi_svc={tmgi_svc:#x} answer={answer:?}");
+    mbs_context_create_response(answer)
+}
+
 /// `DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef}` — Namf_MBSBroadcast
-/// ContextDelete (TS 29.518 §5.6, `TS29518_Namf_MBSBroadcast.yaml` operationId
+/// ContextRelease (TS 29.518 §5.6.2.4, `TS29518_Namf_MBSBroadcast.yaml` operationId
 /// `ContextDelete`; TS 23.247 §7.3.2 broadcast MBS session release).
 ///
-/// #1758: the MB-SMF's release of a broadcast MBS context this AMF created on its
-/// ContextCreate. 204 on deletion; 404 `CONTEXT_NOT_FOUND` for a reference this AMF
-/// does not hold, which the MB-SMF treats as already gone, so a repeated delete is
-/// harmless. As ContextCreate drives no N2 Broadcast Session Setup in this tree, the
-/// delete drives no Broadcast Session Release either.
-///
-/// #1818: it removes the CONTEXT, and the MBS session under it only when no other
-/// broadcast context rides on it and a ContextCreate created it. It used to remove
-/// the session by its id outright, tearing down a TMGI-shared session another
-/// context or an NGAP multicast session still used.
-fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
-    // #1856: a ref of another epoch (issued before a restart) is not found.
-    let released = crate::ngap_mcast::parse_context_ref(context_ref)
-        .and_then(|id| crate::context::amf_mcast().broadcast_context_delete(id));
-    match released {
-        Some(release) => {
-            log::info!(
-                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x?} \
-                 session_removed={}",
-                release.tmgi.as_ref().map(Tmgi::service_id_u32),
-                release.session_removed
-            );
-            SbiResponse::with_status(204)
-        }
-        None => send_not_found(
+/// #1758: 204 on deletion; 404 `CONTEXT_NOT_FOUND` for a reference this AMF does
+/// not hold, which the MB-SMF treats as already gone, so a repeated delete is
+/// harmless. #1796: the BROADCAST SESSION RELEASE REQUEST goes to every NG-RAN
+/// node the Setup was sent to (step 4), and the 204 follows their responses
+/// (steps 7-8), bounded by [`crate::mbs_broadcast::DELETE_ANSWER_WAIT`]. Their
+/// Release Response Transfers reach the MB-SMF in a ContextStatusNotify
+/// (TS 38.413 §8.17.3.2) before the 204.
+async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
+    use crate::mbs_broadcast::DeleteStart;
+    let not_found = || {
+        send_not_found(
             &format!("No broadcast MBS context {context_ref}"),
             Some("CONTEXT_NOT_FOUND"),
-        ),
+        )
+    };
+    // #1856: a ref of another epoch (issued before a restart) is not found.
+    let Some(ref_num) = crate::ngap_mcast::parse_context_ref(context_ref) else {
+        return not_found();
+    };
+    let mcast = crate::context::amf_mcast();
+    match mcast.broadcast_delete(ref_num) {
+        DeleteStart::NotFound => not_found(),
+        DeleteStart::Released => {
+            log::info!("Namf_MBSBroadcast ContextDelete: ref={context_ref} (no NG-RAN to release)");
+            SbiResponse::with_status(204)
+        }
+        DeleteStart::Wait {
+            release_id,
+            mut rx,
+            notify_uri,
+            mbs_session_id,
+        } => {
+            let containers =
+                match tokio::time::timeout(crate::mbs_broadcast::DELETE_ANSWER_WAIT, &mut rx).await
+                {
+                    Ok(Ok(c)) => c,
+                    _ => mcast.broadcast_release_answer_on_timeout(release_id),
+                };
+            log::info!(
+                "Namf_MBSBroadcast ContextDelete: ref={context_ref} ({} Release Response \
+                 Transfer(s))",
+                containers.len()
+            );
+            for chunk in containers.chunks(crate::mbs_broadcast::N2_MBS_SM_INFO_LIST_MAX) {
+                let (list, parts) = crate::mbs_broadcast::n2_mbs_sm_info_list(chunk.to_vec());
+                let notify = crate::mbs_broadcast::BroadcastNotify {
+                    context_ref: ref_num,
+                    callback_uri: notify_uri.clone(),
+                    body: json!({ "mbsSessionId": mbs_session_id, "n2MbsSmInfoList": list }),
+                    parts,
+                };
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    crate::mbs_broadcast::send_notify(&notify),
+                )
+                .await;
+            }
+            SbiResponse::with_status(204)
+        }
     }
 }
 
@@ -8893,6 +9800,9 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
+            max_reports: None,
+            reports_made: std::collections::HashMap::new(),
             one_time: false,
             first_location_pending: false,
             reporting_threshold: None,
@@ -10234,6 +11144,49 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
+    /// **#1832**, through the UEContextTransfer answer: a handed-over subscription
+    /// carries the REMAINING number of reports as `options.maxReports`.
+    ///
+    /// REVERT-VERIFIED: with `handle_ue_context_transfer` listing the plain echo,
+    /// "the remaining number of reports" fails (3, not 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_context_transfer_carries_the_remaining_max_reports_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let supi = "imsi-001010000183201";
+        let _ue = setup_ue(supi, true, true);
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": "http://127.0.0.1:9/notify/corr-1832",
+                    "notifyCorrelationId": "corr-1832",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661832",
+                    "supi": supi,
+                    "options": { "trigger": "CONTINUOUS", "maxReports": 3 },
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let guard = EventSubscriptionGuard::of(&resp);
+        amf_self().read().unwrap().event_subscription_claim_report(
+            &guard.0,
+            Some(3),
+            "CONNECTIVITY_STATE_REPORT",
+            supi,
+        );
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer"))
+            .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        let list = body_json(&resp)["ueContext"]["eventSubscriptionList"].clone();
+        assert_eq!(
+            list[0]["options"]["maxReports"], 2,
+            "the remaining number of reports: {list}"
+        );
+    }
+
     /// **#1727**, the old AMF's half: the UEContextTransfer answer's UeContext carries
     /// `eventSubscriptionList` (TS 29.518 §6.1.6.2.25, "shall be present if
     /// available") with the subscriptions that target the UE, each with its
@@ -11469,8 +12422,8 @@ mod tests {
     async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000017481";
-        // CM-IDLE: a UE-AMBR change for a CM-CONNECTED UE is refused (see
-        // `a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748`).
+        // CM-IDLE (a CM-CONNECTED UE: see
+        // `a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776`).
         let _ue = setup_ue(supi, false, true);
         let body = am_data_change(
             supi,
@@ -11550,9 +12503,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_sdm_data_change_notification_applies_nothing_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017483";
-        // CM-IDLE, so the UE-AMBR change beside each refused one is applicable.
-        let _ue = setup_ue(supi, false, true);
+        // #1776: CM-CONNECTED, so the UE-AMBR change beside each refused one would be
+        // queued for a UE Context Modification were it applied.
+        let ue = setup_ue(supi, true, true);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
         let token = format!("sdm-{supi}");
         let kept = json!({
             "subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"},
@@ -11629,6 +12590,10 @@ mod tests {
             400
         );
         assert_eq!(sdm_view(supi), before, "nothing applied");
+        assert!(
+            !queued(),
+            "#1776: a refused notification queues no modification"
+        );
         // The S-NSSAIs unchanged: applied (the slices are compared, not the body).
         let same = am_data_change(
             supi,
@@ -11637,19 +12602,26 @@ mod tests {
         );
         assert_eq!(post_sdm_notify(supi, Some(&token), &same).await.status, 204);
         assert_eq!(sdm_view(supi).0, 9_000_000, "applied");
+        assert!(queued(), "#1776: and its UE-AMBR change queued");
+        amf_self()
+            .read()
+            .expect("ctx")
+            .ue_ambr_modification_remove_for(&[ue.id]);
     }
 
-    /// #1748 (R11 MAJOR-2, TS 23.502 §4.5.1): for a CM-CONNECTED UE, NG-RAN enforces
-    /// the UE-AMBR it was given, and this AMF does not send the UE Context
-    /// Modification that would move it, so a change of the subscribed UE-AMBR is
-    /// refused with 400 and nothing is applied, the GPSI change beside it included.
-    /// A change that leaves the UE-AMBR as it is is applied.
+    /// #1776 (lifts #1748 R11 MAJOR-2, TS 23.502 §4.5.1): a change of the subscribed
+    /// UE-AMBR for a CM-CONNECTED UE is applied and answered 204, with the GPSI
+    /// change beside it, and the UE is queued once for the NGAP task's UE Context
+    /// Modification. A change that leaves the UE-AMBR as it is (a GPSI-only change,
+    /// a retry of the same notification) queues nothing.
     ///
-    /// REVERT-VERIFIED: with `cm_connected` passed as `false` from the handler, the
-    /// refusal is a 204 and the UE-AMBR changes.
+    /// REVERT-VERIFIED: with the `ue_ambr_modification_add` call removed from the
+    /// handler, the "queued" assertion fails; with it made unconditional (any applied
+    /// change), the "a GPSI-only change" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748() {
+    async fn a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017488";
         let ue = setup_ue(supi, true, true);
         {
@@ -11664,8 +12636,29 @@ mod tests {
             });
         }
         assert!(ue_ng_connected(&ue), "CM-CONNECTED");
-        let before = sdm_view(supi);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
+        let dequeue = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_remove_for(&[ue.id])
+        };
+        dequeue();
         let token = format!("sdm-{supi}");
+        let gpsi_only = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917489"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
+            204
+        );
+        assert!(!queued(), "a GPSI-only change queues no modification");
         let body = am_data_change(
             supi,
             json!([
@@ -11675,18 +12668,15 @@ mod tests {
             ]),
         );
         let resp = post_sdm_notify(supi, Some(&token), &body).await;
-        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
-        assert_eq!(problem_cause(&resp), "UNSPECIFIED_MSG_FAILURE");
-        assert_eq!(sdm_view(supi), before, "nothing applied");
-        let gpsi_only = am_data_change(
-            supi,
-            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]}]),
-        );
-        assert_eq!(
-            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
-            204
-        );
-        assert_eq!(sdm_view(supi).2.as_deref(), Some("msisdn-4917488"));
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let (ul, dl, gpsi, _, _) = sdm_view(supi);
+        assert_eq!((ul, dl), (5_000_000, 10_000_000), "the new UE-AMBR is held");
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917488"));
+        assert!(queued(), "queued for the UE Context Modification");
+        dequeue();
+        // The UDM's retry of the same notification: 204, and nothing more to send.
+        assert_eq!(post_sdm_notify(supi, Some(&token), &body).await.status, 204);
+        assert!(!queued(), "a retry queues no second modification");
     }
 
     /// #1748: a notification is acted on only with the UE's current SDM subscription
@@ -12543,256 +13533,14 @@ mod tests {
         assert_eq!(body_json(&resp)["result"], json!("N2_NOT_SENT"));
     }
 
-    /// ContextCreate allocates a context, and a REPEAT for the same TMGI (from the
-    /// same MB-SMF: neither names an `mbsmfId`, #1818) returns the SAME ref rather
-    /// than leaking a second context.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mbs_context_create_is_idempotent_on_the_tmgi() {
-        // #1822 item 2: the process-global MBS contexts.
-        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
-        let body = mbs_tmgi_body("001", "01", "00CAFE");
-        let post = || {
-            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-                .with_json_body(&body)
-                .expect("json")
-        };
+    // #1796: ContextCreate / ContextDelete (idempotency, the TMGI reaching the
+    // NGAP layer, 404 on a repeated delete) are tested with a stand-in gNB in
+    // `ngap_path::mbs_broadcast::tests`: a create now answers on the NG-RAN's
+    // response, so it cannot be exercised without one.
 
-        let first = namf_request_handler(post()).await;
-        assert_eq!(first.status, 201);
-        let first_ref = body_json(&first)["mbsContextRef"].clone();
-        assert_ne!(first_ref, Value::Null, "201 must name the created resource");
-
-        let second = namf_request_handler(post()).await;
-        assert_eq!(
-            body_json(&second)["mbsContextRef"],
-            first_ref,
-            "a repeated ContextCreate for one TMGI must not allocate a second session"
-        );
-    }
-
-    /// The TMGI reaches the NGAP layer intact: the context the SBI created is
-    /// findable by the SAME `Tmgi` the NGAP builders encode, with the PLMN
-    /// BCD-packed per TS 24.008 §10.5.1.13 (mcc=001 mnc=01 -> 00 F1 10).
-    ///
-    /// This is the assertion that would catch a JSON->NGAP boundary bug, which a
-    /// 201 status alone cannot.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_created_mbs_context_is_reachable_by_its_ngap_tmgi() {
-        // #1822 item 2: the process-global MBS contexts.
-        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
-        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-            .with_json_body(&mbs_tmgi_body("001", "01", "00BEEF"))
-            .expect("json");
-        assert_eq!(namf_request_handler(req).await.status, 201);
-
-        let expected = Tmgi::new(0x00BEEF, [0x00, 0xF1, 0x10]);
-        assert!(
-            crate::context::amf_mcast()
-                .session_find_by_tmgi(&expected)
-                .is_some(),
-            "the SBI-created context must be findable by the TMGI the NGAP \
-             builders encode; a miss here means the boundary mangled the PLMN \
-             or the service id"
-        );
-    }
-
-    /// **#1856**: an `mbsContextRef` is `<epoch>-<id>`, the epoch this AMF
-    /// instance's own. A ref of another epoch (one an earlier run of this AMF
-    /// issued, whose counter restarted at 1) is 404 CONTEXT_NOT_FOUND and deletes
-    /// nothing, even when its number names a live context now.
-    ///
-    /// REVERT-VERIFIED: with `parse_context_ref` ignoring the epoch, the stale ref
-    /// deletes the live context ("a pre-restart ref is not found").
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ref_from_before_a_restart_deletes_nothing_1856() {
-        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
-        let created = namf_request_handler(
-            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-                .with_json_body(&mbs_tmgi_body("001", "01", "001856"))
-                .expect("json"),
-        )
-        .await;
-        assert_eq!(created.status, 201);
-        let context_ref = body_json(&created)["mbsContextRef"]
-            .as_str()
-            .expect("mbsContextRef")
-            .to_string();
-        let (epoch, id) = context_ref.split_once('-').expect("<epoch>-<id>");
-        assert_eq!(epoch.len(), 8, "{context_ref}");
-        let stale_epoch = if epoch == "00000000" {
-            "00000001"
-        } else {
-            "00000000"
-        };
-        let stale = format!("{stale_epoch}-{id}");
-        let resp = namf_request_handler(SbiRequest::delete(format!(
-            "/namf-mbs-bc/v1/mbs-contexts/{stale}"
-        )))
-        .await;
-        assert_eq!(resp.status, 404, "a pre-restart ref is not found");
-        assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
-        let held = crate::ngap_mcast::parse_context_ref(&context_ref)
-            .and_then(|id| crate::context::amf_mcast().broadcast_context_find(id));
-        assert!(held.is_some(), "the live context is untouched");
-        let resp = namf_request_handler(SbiRequest::delete(format!(
-            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
-        )))
-        .await;
-        assert_eq!(resp.status, 204);
-    }
-
-    /// #1758: ContextDelete removes the broadcast MBS context ContextCreate made,
-    /// and a second delete (or an unknown reference) is 404 CONTEXT_NOT_FOUND, which
-    /// the MB-SMF treats as gone.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn context_delete_removes_the_broadcast_mbs_context_1758() {
-        // #1822 item 2: the process-global MBS contexts.
-        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
-        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-            .with_json_body(&mbs_tmgi_body("001", "01", "001758"))
-            .expect("json");
-        let created = namf_request_handler(req).await;
-        assert_eq!(created.status, 201);
-        let context_ref = body_json(&created)["mbsContextRef"]
-            .as_str()
-            .expect("mbsContextRef")
-            .to_string();
-        let id = crate::ngap_mcast::parse_context_ref(&context_ref).expect("this AMF's ref");
-        assert!(crate::context::amf_mcast()
-            .broadcast_context_find(id)
-            .is_some());
-
-        let path = format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}");
-        let deleted = namf_request_handler(SbiRequest::delete(&path)).await;
-        assert_eq!(deleted.status, 204);
-        assert!(
-            crate::context::amf_mcast()
-                .broadcast_context_find(id)
-                .is_none(),
-            "the AMF holds no context after ContextDelete"
-        );
-        assert!(crate::context::amf_mcast()
-            .session_find_by_tmgi(&Tmgi::new(0x001758, [0x00, 0xF1, 0x10]))
-            .is_none());
-
-        for again in [
-            path.clone(),
-            "/namf-mbs-bc/v1/mbs-contexts/not-a-ref".to_string(),
-        ] {
-            let resp = namf_request_handler(SbiRequest::delete(&again)).await;
-            assert_eq!(resp.status, 404, "{again}");
-            assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND", "{again}");
-        }
-    }
-
-    /// POST a ContextCreate for `svc` (mcc 001, mnc 01), from `mbsmf_id` if given,
-    /// and return its `mbsContextRef`.
-    async fn create_mbs_context_1818(svc: &str, mbsmf_id: Option<&str>) -> String {
-        let mut body = mbs_tmgi_body("001", "01", svc);
-        if let Some(id) = mbsmf_id {
-            body["mbsmfId"] = json!(id);
-        }
-        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-            .with_json_body(&body)
-            .expect("json");
-        let created = namf_request_handler(req).await;
-        assert_eq!(created.status, 201);
-        body_json(&created)["mbsContextRef"]
-            .as_str()
-            .expect("mbsContextRef")
-            .to_string()
-    }
-
-    async fn delete_mbs_context_1818(context_ref: &str) -> u16 {
-        namf_request_handler(SbiRequest::delete(format!(
-            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
-        )))
-        .await
-        .status
-    }
-
-    /// #1818: a ContextDelete does not remove an MBS session the NGAP multicast
-    /// path created and shares by TMGI. The broadcast context joins it, and its
-    /// delete releases the context only; the multicast session (and its gNB
-    /// state) is still held.
-    ///
-    /// REVERT-VERIFIED: with the `owned` check dropped from
-    /// `broadcast_context_delete`, the multicast session is removed and the
-    /// "multicast session survives" assertion fails.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
-        // #1822: the process-global MBS contexts (main left this test without it).
-        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
-        let tmgi = Tmgi::new(0x181800, [0x00, 0xF1, 0x10]);
-        let mcast = crate::context::amf_mcast();
-        let multicast = mcast
-            .session_create(tmgi.clone(), 1, None, vec![1])
-            .expect("multicast session");
-        mcast.session_activate(
-            multicast.mbs_session_id,
-            crate::ngap_mcast::McastTransportInfo {
-                dl_teid: 0x1818,
-                transport_addr: std::net::Ipv4Addr::new(239, 0, 18, 18),
-            },
-            &[1818],
-        );
-
-        let context_ref = create_mbs_context_1818("181800", None).await;
-        let joined = mcast
-            .broadcast_context_find(
-                crate::ngap_mcast::parse_context_ref(&context_ref).expect("ref"),
-            )
-            .expect("the broadcast context is held");
-        assert_eq!(
-            joined.session_id, multicast.mbs_session_id,
-            "the broadcast context joins the multicast session sharing its TMGI"
-        );
-        assert_eq!(delete_mbs_context_1818(&context_ref).await, 204);
-
-        let kept = mcast
-            .session_find(multicast.mbs_session_id)
-            .expect("the multicast session survives the broadcast ContextDelete");
-        assert_eq!(kept.gnb_sessions.len(), 1, "with its gNB state");
-        assert_eq!(
-            mcast.session_find_by_tmgi(&tmgi).map(|s| s.mbs_session_id),
-            Some(multicast.mbs_session_id)
-        );
-        assert_eq!(delete_mbs_context_1818(&context_ref).await, 404);
-        mcast.session_remove(multicast.mbs_session_id);
-    }
-
-    /// #1818: two MB-SMFs' contexts on one TMGI share the session; the first
-    /// delete keeps it for the second, the last delete removes it. A repeat from
-    /// the same MB-SMF is a retry and gets its own context back.
-    ///
-    /// REVERT-VERIFIED: with the `shared` check dropped, the first delete removes
-    /// the session and the "kept for the other context" assertion fails.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_last_broadcast_context_on_a_tmgi_removes_its_session_1818() {
-        // #1822: the process-global MBS contexts (main left this test without it).
-        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
-        let tmgi = Tmgi::new(0x181801, [0x00, 0xF1, 0x10]);
-        let mcast = crate::context::amf_mcast();
-        let a = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
-        let a_again = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
-        assert_eq!(
-            a, a_again,
-            "a retry from the same MB-SMF is the same context"
-        );
-        let b = create_mbs_context_1818("181801", Some("mbsmf-b")).await;
-        assert_ne!(a, b, "another MB-SMF gets a context of its own");
-
-        assert_eq!(delete_mbs_context_1818(&a).await, 204);
-        assert!(
-            mcast.session_find_by_tmgi(&tmgi).is_some(),
-            "kept for the other context"
-        );
-        assert_eq!(delete_mbs_context_1818(&b).await, 204);
-        assert!(
-            mcast.session_find_by_tmgi(&tmgi).is_none(),
-            "the last context removes the session it created"
-        );
-    }
+    // #1818's ContextDelete-ownership tests drive a create that now answers on
+    // the NG-RAN's response; they moved to `ngap_path::mbs_broadcast::tests`
+    // (`*_1818`), with a stand-in gNB.
 
     /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is
     /// `anyOf [tmgi, ssm]`, but the AMF's NGAP `MBS-SessionID` carries a TMGI and
@@ -17181,6 +17929,9 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
+            max_reports: None,
+            reports_made: std::collections::HashMap::new(),
             one_time: false,
             first_location_pending: false,
             reporting_threshold: None,

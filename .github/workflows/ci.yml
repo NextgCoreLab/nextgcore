@@ -412,6 +412,37 @@ jobs:
           fi
           echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
             || { echo "failed for another reason: $out"; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python3 -m pip install pyyaml
+      - name: udm durable state volume only when enabled (#1885)
+        # udmd's state file (#1836): the default chart is memory-only; on,
+        # it mounts a claim (or an emptyDir) and sets NEXTGCORE_UDM_STATE_FILE
+        # in the mount, one replica, one writer. The self-test first: a check
+        # that silently stopped matching would pass every render.
+        run: |
+          set -euo pipefail
+          python3 deploy/check_udm_state_volume.py --self-test
+          r="$RUNNER_TEMP/udm-state"; mkdir -p "$r"
+          h() { helm template t deploy/helm/nextgcore --set global.siteId=ci "$@"; }
+          h > "$r/off.yaml"
+          h --set udm.durableState.enabled=true > "$r/pvc.yaml"
+          h --set udm.durableState.enabled=true --set udm.durableState.type=emptyDir > "$r/emptydir.yaml"
+          python3 deploy/check_udm_state_volume.py --off "$r/off.yaml" \
+            --on "pvc:$r/pvc.yaml" --on "emptydir:$r/emptydir.yaml"
+          # Two writers on one file are refused at render time.
+          refuse() {
+            local want="$1"; shift
+            if out=$(h --set udm.durableState.enabled=true "$@" 2>&1); then
+              echo "rendered with $*; it must fail (#1885)"; exit 1
+            fi
+            echo "$out" | grep -q "$want" || { echo "failed for another reason: $out"; exit 1; }
+          }
+          refuse 'udm.durableState.enabled with udm.replicas > 1' --set udm.replicas=2
+          refuse 'accessMode must be ReadWriteOnce' \
+            --set udm.durableState.persistence.accessMode=ReadWriteMany
 
   observability:
     # #1334: a Prometheus rule or Grafana panel on a series no NF exports never
@@ -525,6 +556,9 @@ jobs:
           while IFS= read -r k; do
             d="$(dirname "$k")"
             case "$d" in deploy/eks/profiles/*) continue ;; esac
+            # A kustomize Component renders only inside an overlay; the
+            # components are rendered over their bases in the next steps.
+            grep -q '^kind: Component$' "$k" && continue
             echo "::group::kubectl kustomize $d"
             kubectl kustomize "$d" > /dev/null
             echo "::endgroup::"
@@ -544,6 +578,40 @@ jobs:
             n=$((n + 1))
           done
           [ "$n" -gt 0 ] || { echo "no profile rendered"; exit 1; }
+      - name: udm durable state components (#1885)
+        # udmd's state file (#1836) on k8s/: the base is memory-only, and each
+        # component adds the volume, the mount and NEXTGCORE_UDM_STATE_FILE
+        # (pvc: one Recreate replica, a ReadWriteOnce claim). Rendered over
+        # k8s/ from a throwaway overlay, and through deploy-eks.sh DRY_RUN
+        # (UDM_DURABLE_STATE) for the 5g and 6g profiles. No cluster.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          python3 deploy/check_udm_state_volume.py --self-test
+          (cd deploy/eks/lib && python3 -m unittest -v test_live_modes)
+          r="$RUNNER_TEMP/udm-state"; mkdir -p "$r"
+          args=()
+          kubectl kustomize k8s > "$r/base.yaml"; args+=(--off "$r/base.yaml")
+          for c in udm-durable-state:pvc udm-durable-state-emptydir:emptydir; do
+            w="$r/${c%%:*}"; mkdir -p "$w"
+            rel() { python3 -c 'import os, sys; print(os.path.relpath(*map(os.path.realpath, sys.argv[1:])))' "$1" "$w"; }
+            printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s\ncomponents:\n  - %s\n' \
+              "$(rel k8s)" "$(rel "k8s/components/${c%%:*}")" > "$w/kustomization.yaml"
+            kubectl kustomize "$w" > "$r/${c%%:*}.yaml"
+            args+=(--on "${c##*:}:$r/${c%%:*}.yaml")
+          done
+          for p in 5g 6g; do
+            f=rendered.dryrun.yaml; [ "$p" = 5g ] || f="rendered.dryrun.$p.yaml"
+            for m in false pvc emptydir; do
+              (cd deploy/eks && DRY_RUN=true PROFILE="$p" UDM_DURABLE_STATE="$m" ./deploy-eks.sh > /dev/null)
+              mv "deploy/eks/$f" "$r/eks-$p-$m.yaml"
+              if [ "$m" = false ]; then args+=(--off "$r/eks-$p-$m.yaml")
+              else args+=(--on "$m:$r/eks-$p-$m.yaml"); fi
+            done
+          done
+          python3 deploy/check_udm_state_volume.py "${args[@]}"
+          # The EKS claim is gp3, the class the CloudFormation template installs.
+          python3 -c 'import sys, yaml; c = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d["kind"] == "PersistentVolumeClaim" and d["metadata"]["name"] == "udm-state"]; assert c and c[0]["spec"].get("storageClassName") == "gp3", c' "$r/eks-5g-pvc.yaml"
       - name: EKS Service patches keep the base ports
         # The 5g profile's Service patches restate whole port lists, so a
         # port they change would differ silently from the base on EKS (#1100

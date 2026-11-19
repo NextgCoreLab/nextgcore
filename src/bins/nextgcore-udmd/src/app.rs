@@ -86,7 +86,17 @@ struct Args {
     /// Maximum number of sessions
     #[arg(long, default_value = "4096")]
     max_sess: usize,
+
+    /// The state file (#1836): SDM subscriptions, the UDR am-data subscriptions and
+    /// the am-data changes waiting for delivery survive a restart in it, as an
+    /// append-only log (#1896; a #1836 snapshot there is migrated). Without it (and
+    /// without NEXTGCORE_UDM_STATE_FILE) they are memory-only.
+    #[arg(long)]
+    state_file: Option<String>,
 }
+
+/// The env var naming the UDM state file when `--state-file` is not given (#1836).
+pub const STATE_FILE_ENV: &str = "NEXTGCORE_UDM_STATE_FILE";
 
 // ---------------------------------------------------------------------------
 // Typed YAML configuration structs for NRF URI seeding
@@ -563,6 +573,25 @@ pub async fn run() -> Result<()> {
             nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
         )
     }));
+    // #1836: restore the SDM subscriptions, the UDR legs and the queued am-data
+    // changes before the listener opens, so the UDR's first notification on a
+    // restored leg is admitted. A state file that cannot be read fails the start:
+    // overwriting it would lose what it holds.
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var(STATE_FILE_ENV).ok())
+        .filter(|p| !p.trim().is_empty());
+    match &state_file {
+        Some(path) => log::info!("UDM state file: {path}"),
+        None => log::warn!(
+            "no UDM state file (--state-file / {STATE_FILE_ENV}): SDM subscriptions and \
+             queued am-data changes are lost on restart"
+        ),
+    }
+    crate::sdm_udr::init_state(state_file.map(std::path::PathBuf::from))
+        .await
+        .map_err(|e| anyhow::anyhow!("UDM state file: {e}"))?;
     let sbi_config = SbiServerConfig {
         addr: sbi.host.clone(),
         port: sbi.port,
@@ -615,6 +644,8 @@ pub async fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
+    // #1836: audit the restored UDR legs now, then refresh them periodically.
+    crate::sdm_udr::spawn_leg_refresh();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -1093,6 +1124,15 @@ async fn route_nudm_ueau(
     request: &SbiRequest,
     uri: &str,
 ) -> SbiResponse {
+    // #1866: KAUSF goes to the AUSF only. Refused before the SUPI is parsed or
+    // the UDR is read, so a refusal has no side effect.
+    if let Some(refused) = crate::consumer_gate::refuse_consumer_type(
+        request,
+        "nudm-ueau",
+        crate::consumer_gate::UEAU_CONSUMER_NF_TYPES,
+    ) {
+        return refused;
+    }
     let supi = parts.get(2).copied().unwrap_or("");
     let resource = parts.get(3).copied().unwrap_or("");
     let action = parts.get(4).copied().unwrap_or("");
@@ -2520,10 +2560,35 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
     );
     let subscription_id = sub.id.clone();
     {
-        let ctx = udm_self();
-        if let Ok(context) = ctx.read() {
-            context.sdm_subscription_insert(sub);
-        };
+        // #1836: stored and written to the state file before the 201, so a
+        // restart after the answer still serves it; neither, or both.
+        let held = crate::sdm_udr::state_lock().await;
+        let inserted = udm_self()
+            .read()
+            .map(|context| context.sdm_subscription_insert(sub))
+            .unwrap_or(false);
+        if !inserted {
+            // TS 29.500 Table 5.2.7.2-1: 500 INSUFFICIENT_RESOURCES.
+            return send_problem(
+                500,
+                "INSUFFICIENT_RESOURCES",
+                "SDM subscription limit reached",
+            );
+        }
+        if let Err(e) =
+            crate::sdm_udr::persist_locked(&held, &[crate::sdm_udr::Rec::Sub(&subscription_id)])
+                .await
+        {
+            log::error!("[{supi}] SDM subscription not written to the state file: {e}");
+            if let Ok(context) = udm_self().read() {
+                context.sdm_subscription_remove(&subscription_id);
+            }
+            return send_problem(
+                500,
+                "INSUFFICIENT_RESOURCES",
+                "the SDM subscription could not be stored",
+            );
+        }
     }
     // #1775: an am-data subscription needs this UDM's leg at the UDR.
     crate::sdm_udr::spawn_reconcile(supi);
@@ -2560,11 +2625,32 @@ pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRes
     if !exists {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
-    // Remove it from context.
-    let ctx = udm_self();
-    if let Ok(context) = ctx.read() {
-        context.sdm_subscription_remove(subscription_id);
-    };
+    // Remove it from context, and from the state file (#1836): neither, or both.
+    // A removal that could not be written is undone and answered 500, as the
+    // subscribe is: answering 204 would let a restart bring the subscription back,
+    // and this UDM would notify a consumer that left. The consumer may retry the
+    // DELETE.
+    {
+        let held = crate::sdm_udr::state_lock().await;
+        let removed = udm_self()
+            .read()
+            .ok()
+            .and_then(|context| context.sdm_subscription_remove(subscription_id));
+        if let Err(e) =
+            crate::sdm_udr::persist_locked(&held, &[crate::sdm_udr::Rec::Sub(subscription_id)])
+                .await
+        {
+            log::error!("[{supi}] SDM unsubscribe not written to the state file: {e}");
+            if let (Some(sub), Ok(context)) = (removed, udm_self().read()) {
+                context.sdm_subscription_insert(sub);
+            }
+            return send_problem(
+                500,
+                "INSUFFICIENT_RESOURCES",
+                "the SDM unsubscribe could not be stored",
+            );
+        }
+    }
     // #1775: the last am-data subscription of the SUPI takes the UDR leg with it.
     crate::sdm_udr::spawn_reconcile(supi);
     SbiResponse::with_status(204)
@@ -3932,6 +4018,124 @@ mod tests {
             .as_str()
             .expect("apiVersionInUri must be a string")
             .to_string()
+    }
+
+    /// #1866: the NRF grants an `nudm-ueau` token only to the types listed on the
+    /// NFService (TS 29.510 Table 6.1.6.2.3-1), so the profile must carry
+    /// `["AUSF"]` there, and nowhere else narrower than the profile-level list.
+    #[test]
+    fn the_profile_offers_nudm_ueau_to_the_ausf_only_1866() {
+        let profile = build_udm_nf_profile(
+            "udm-test-instance",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let ueau = services
+            .iter()
+            .find(|s| s["serviceName"] == "nudm-ueau")
+            .expect("nudm-ueau registered");
+        assert_eq!(ueau["allowedNfTypes"], serde_json::json!(["AUSF"]));
+        for s in services.iter().filter(|s| s["serviceName"] != "nudm-ueau") {
+            assert!(s.get("allowedNfTypes").is_none(), "{s}");
+        }
+        // The profile-level list must still admit the AUSF, or nothing could
+        // authenticate (the NRF ANDs both levels).
+        assert!(profile["allowedNfTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "AUSF"));
+    }
+
+    /// #1866: the NRF's own grant decision over this profile. The access token
+    /// has no consumer-type claim, so this is what makes a verified `nudm-ueau`
+    /// scope mean "an AUSF".
+    #[test]
+    fn the_nrf_grants_nudm_ueau_to_the_ausf_only_1866() {
+        let profile = build_udm_nf_profile(
+            "5a4e8f2c-0000-4000-8000-000000000001",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let nrf_view = nextgcore_nrfd::NfProfile::from_json(&profile).expect("NRF accepts it");
+        assert_eq!(
+            nrf_view.authorizes_service("AUSF", "nudm-ueau"),
+            (true, true)
+        );
+        for t in ["SMF", "PCF", "AMF", "SCP"] {
+            assert_eq!(
+                nrf_view.authorizes_service(t, "nudm-ueau"),
+                (true, false),
+                "{t}"
+            );
+        }
+        // Control: the other services are unchanged.
+        assert_eq!(nrf_view.authorizes_service("SMF", "nudm-sdm"), (true, true));
+        assert_eq!(
+            nrf_view.authorizes_service("AMF", "nudm-uecm"),
+            (true, true)
+        );
+    }
+
+    /// #1866: through the real router, a peer whose verified certificate names
+    /// another NF type gets 403 on every Nudm_UEAU operation, before the body is
+    /// read; the AUSF reaches the handler (its 400 names the missing IE, which
+    /// only the handler produces).
+    #[tokio::test]
+    async fn nudm_ueau_is_refused_to_a_non_ausf_certificate_1866() {
+        const SUPI: &str = "imsi-001010000000001";
+        let gen = format!("/nudm-ueau/v1/{SUPI}/security-information/generate-auth-data");
+        let request = |method: &str, uri: &str, types: &[&str], body: serde_json::Value| {
+            let mut r = SbiRequest {
+                header: nextgcore_sbi::message::SbiHeader::with_method_uri(method, uri),
+                ..SbiRequest::default()
+            };
+            r.http.set_content(body.to_string());
+            r.http.set_header("Content-Type", "application/json");
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let full = serde_json::json!({
+            "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org",
+            "ausfInstanceId": "c0ffee00-0000-4000-8000-000000000001",
+        });
+        for (method, uri) in [
+            ("POST", gen.clone()),
+            ("POST", format!("/nudm-ueau/v1/{SUPI}/auth-events")),
+            ("PUT", format!("/nudm-ueau/v1/{SUPI}/auth-events/1")),
+        ] {
+            for t in ["SMF", "PCF", "AMF"] {
+                let resp = udm_sbi_request_handler(request(method, &uri, &[t], full.clone())).await;
+                let body = resp.http.content.clone().unwrap_or_default();
+                assert_eq!(resp.status, 403, "{t} {method} {uri}: {body}");
+                let pd: serde_json::Value = serde_json::from_str(&body).expect("ProblemDetails");
+                let detail = pd["detail"].as_str().unwrap_or_default();
+                assert!(
+                    detail.contains("served to NF type(s) [\"AUSF\"] only") && detail.contains(t),
+                    "{body}"
+                );
+                assert!(
+                    !body.contains("kausf") && !body.contains("xresStar"),
+                    "{body}"
+                );
+            }
+        }
+        // The AUSF (and an SCP relaying for it) gets past the gate into the handler.
+        for t in ["AUSF", "SCP"] {
+            let resp = udm_sbi_request_handler(request(
+                "POST",
+                &gen,
+                &[t],
+                serde_json::json!({"ausfInstanceId": "c0ffee00-0000-4000-8000-000000000001"}),
+            ))
+            .await;
+            let body = resp.http.content.clone().unwrap_or_default();
+            assert_eq!(resp.status, 400, "{t}: {body}");
+            assert!(body.contains("MANDATORY_IE_MISSING"), "{t}: {body}");
+        }
     }
 
     #[test]
@@ -5729,7 +5933,8 @@ mod tests {
         // The combined provisioned-data document, keyed as udmd asks for it. This
         // stands in for udrd's own `dataset-names` filtering, which udrd tests.
         store.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/"),
+            // #1934: the combined resource, with no trailing `/`.
+            format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data"),
             serde_json::json!({
                 "amData": {"subscribedUeAmbr": {"uplink": "1 Gbps", "downlink": "1 Gbps"}},
                 "smfSelData": {"subscribedSnssaiInfos": {}},
@@ -6376,6 +6581,109 @@ mod tests {
         instance.add_service(svc);
         global_context().add_nf_instance(instance).await;
         (server, hits)
+    }
+
+    /// #1811: the UDM's real 5G AKA (Nudm_UEAU generate-auth-data: the
+    /// authentication-subscription GET, then the SQN PATCH) against a UDR whose
+    /// listener is udrd's: OAuth2 required, audience UDR, and the TS 29.505
+    /// resource scopes enforced by nextgcore-sbi's gate
+    /// (`resource_scope::required_resource_scope`). The UDM asks the NRF for
+    /// `nudr-dr` plus the resource scope each request needs, so the AV is issued;
+    /// with no token client the gate refuses the GET and no AV is issued.
+    ///
+    /// REVERT-VERIFIED: with the client's `request_access_scope` returning the
+    /// service scope alone, the UDR refuses the GET 403 insufficient_scope and the
+    /// tokened generate-auth-data is not 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn the_aka_passes_a_udr_enforcing_the_auth_subscription_scope_1811() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_core::test_log::init();
+        udm_context_init(64, 64);
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        for inst in sbi_ctx
+            .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Udr)
+            .await
+        {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
+
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let state = Arc::new(UeauUdrState::default());
+        state
+            .patch_status
+            .store(204, std::sync::atomic::Ordering::SeqCst);
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = NextgcoreSbiServerConfig::new(udr_addr)
+            .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr)
+            .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr_server = SbiServer::on_listener(cfg, udr_listener);
+        let handler_state = Arc::clone(&state);
+        udr_server
+            .start(move |req: SbiRequest| {
+                let state = Arc::clone(&handler_state);
+                async move { mock_udr_ueau(state, req).await }
+            })
+            .await
+            .expect("gated UDR starts");
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", udr_addr.port().to_string());
+
+        let (udm_server, client) = start_real_udm().await;
+        let gen = |supi: &str| {
+            let path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
+            let client = &client;
+            async move {
+                client
+                    .post_json(
+                        &path,
+                        &serde_json::json!({
+                            "servingNetworkName": TEST_SNN,
+                            "ausfInstanceId": "ausf-1811"
+                        }),
+                    )
+                    .await
+                    .expect("generate-auth-data")
+            }
+        };
+        let bare = gen("imsi-001010000018111").await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            stand_in::oauth2_client_for(nrf_port, nextgcore_sbi::types::NfType::Udm),
+        );
+        let tokened = gen("imsi-001010000018112").await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        std::env::remove_var("UDR_SBI_ADDR");
+        std::env::remove_var("UDR_SBI_PORT");
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+
+        assert_ne!(
+            bare.status, 200,
+            "no token: the UDR's gate refuses the GET: {:?}",
+            bare.http.content
+        );
+        assert_eq!(
+            tokened.status, 200,
+            "the AV is issued past the resource-scope gate: {:?}",
+            tokened.http.content
+        );
+        assert!(
+            json_body(&tokened)["authenticationVector"]["autn"].is_string(),
+            "{:?}",
+            tokened.http.content
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

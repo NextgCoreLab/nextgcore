@@ -325,6 +325,28 @@ async fn published_self_instance_id() -> anyhow::Result<String> {
         })
 }
 
+/// #1795: the PCF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with PCF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Pcf,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 pub async fn run() -> Result<()> {
     let args = Args::parse();
@@ -615,7 +637,9 @@ pub async fn run() -> Result<()> {
         // carries no address, and the NF does not register (#1312).
         addr: sbi.advertise.clone().unwrap_or_default(),
         port: sbi.port,
-        tls_enabled: args.tls,
+        // #1795: the listener below serves TLS under `--tls` or the production
+        // profile, so what this NF publishes says so too.
+        tls_enabled: args.tls || nextgcore_sbi::security::SbiProfile::resolve().is_production(),
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
         nrf_uri: args.nrf_uri.clone(),
@@ -643,13 +667,26 @@ pub async fn run() -> Result<()> {
         "--sbi-addr (or pcf.sbi.server[0].address in the config file)",
     );
     let mut sbi_server_config = with_callback_exemptions(NextgcoreSbiServerConfig::new(sbi_addr));
+    // #1795: `--tls` reaches the listener it advertises (under `dev`; the
+    // profile's certificate wins under `production`).
+    if args.tls {
+        sbi_server_config = sbi_server_config.with_tls(
+            args.tls_key
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/server.key"),
+            args.tls_cert
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/server.crt"),
+        );
+    }
     let require_oauth2 = oauth2_required(&args.config);
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
     let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await;
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         nrf_uri.as_deref(),
     ));
@@ -657,6 +694,24 @@ pub async fn run() -> Result<()> {
     nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;
+    }
+    // #1795: the listener follows the SBI security profile.
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        nrf_uri.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    // What the PCF published (`tls_enabled` above) must be what it serves.
+    if (sbi_server_config.scheme == nextgcore_sbi::types::UriScheme::Https)
+        != crate::sbi_path::advertised_sbi_scheme().eq("https")
+    {
+        anyhow::bail!(
+            "the SBI listener serves {:?} but the PCF advertised {}",
+            sbi_server_config.scheme,
+            crate::sbi_path::advertised_sbi_scheme()
+        );
     }
     let sbi_server = SbiServer::new(sbi_server_config);
 
@@ -16011,6 +16066,20 @@ mod outbound_oauth2_1665_tests {
         assert!(
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
+        );
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming PCF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Pcf,
+            super::sbi_listener_config,
         );
     }
 }

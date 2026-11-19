@@ -89,6 +89,13 @@ spec:
             # URN is this NRF's nfInstanceId.
             - name: NEXTGCORE_NRF_INSTANCE_ID
               value: "6b1d7e3c-0000-4000-8000-0000000000f0"
+            - name: NEXTGCORE_SBI_PROFILE
+              # #1869: under the production profile the NRF accepts, and dials,
+              # only https nfStatusNotificationUris. Every NF in these manifests
+              # runs dev and subscribes an http callback, so the NRF runs dev with
+              # them. Its own TLS listener is its own config (nrf.yaml, #1617) and
+              # does not change. Remove this with the NFs' once certs are mounted.
+              value: "dev"
             - name: RUST_LOG
               value: info
             - name: RUST_BACKTRACE

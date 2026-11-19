@@ -1,4 +1,5 @@
 {{- if .Values.udm.enabled }}
+{{- include "nextgcore.udmStateCheck" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,6 +59,9 @@ spec:
             - name: hnet-keys
               mountPath: /etc/nextgcore/hnet
               readOnly: true
+            {{- if .Values.udm.durableState.enabled }}
+            {{- include "nextgcore.udmStateMount" . | trim | nindent 12 }}
+            {{- end }}
           env:
             {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "udm") | nindent 12 }}
             - name: NEXTGCORE_SBI_PROFILE
@@ -88,6 +92,9 @@ spec:
               value: {{ .Release.Name }}-udr.{{ .Release.Namespace }}.svc.cluster.local
             - name: UDR_SBI_PORT
               value: "{{ .Values.udr.service.port }}"
+            {{- if .Values.udm.durableState.enabled }}
+            {{- include "nextgcore.udmStateEnv" . | trim | nindent 12 }}
+            {{- end }}
       volumes:
         {{- include "nextgcore.nrfTlsVolume" (dict "root" . "nf" "udm") | nindent 8 }}
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
@@ -95,6 +102,9 @@ spec:
           secret:
             secretName: {{ .Values.hnetKeys.existingSecret | default (printf "%s-udm-hnet-keys" .Release.Name) }}
             optional: true
+        {{- if .Values.udm.durableState.enabled }}
+        {{- include "nextgcore.udmStateVolume" . | trim | nindent 8 }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -119,4 +129,26 @@ spec:
   selector:
     app.kubernetes.io/name: udm
     app.kubernetes.io/instance: {{ .Release.Name }}-udm
+{{- with .Values.udm.durableState }}
+{{- if and .enabled (eq .type "pvc") (not .persistence.existingClaim) }}
+---
+# udmd's state file (#1885). ReadWriteOnce and one Recreate replica: one writer.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "nextgcore.udmStateClaim" $ }}
+  labels:
+    app.kubernetes.io/name: udm
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" $ | nindent 4 }}
+spec:
+  accessModes: [{{ .persistence.accessMode | quote }}]
+  {{- with .persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .persistence.size | quote }}
+{{- end }}
+{{- end }}
 {{- end }}

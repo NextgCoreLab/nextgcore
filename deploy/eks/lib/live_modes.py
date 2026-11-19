@@ -12,11 +12,16 @@ change:
   privileged UPF back to --no-dataplane and relabelled the namespace baseline:
   UE traffic stopped, with no error anywhere.
 
-So both default to "auto": adopt whatever the live objects say.
+* udmd's durable state file (UDM_DURABLE_STATE, #1885). A re-run without it
+  rendered the udm Deployment memory-only: the next udmd restart lost the SDM
+  subscriptions and queued am-data changes the state file exists to keep.
+
+So all three default to "auto": adopt whatever the live objects say.
 
 Usage:
   live_modes.py storage LIVE_STS_JSON            -> ephemeral | pvc | absent
   live_modes.py dataplane LIVE_DEPLOY_JSON NAME  -> true | false | absent
+  live_modes.py udm-state LIVE_DEPLOY_JSON       -> pvc | emptydir | false | custom | absent
   live_modes.py sts-diff LIVE_STS_JSON RENDERED_YAML NAME
       prints one line per immutable StatefulSet field that differs; exit 1 if any
 
@@ -54,6 +59,34 @@ def dataplane_mode(deploy, container):
                 (pod.get('containers') or [{}])[0])
     sc = cont.get('securityContext') or {}
     return 'true' if sc.get('privileged') else 'false'
+
+
+UDM_STATE_ENV = 'NEXTGCORE_UDM_STATE_FILE'
+UDM_STATE_VOLUME = 'udm-state'
+
+
+def udm_state_mode(deploy):
+    """The UDM state mode the live udm Deployment was rendered with.
+
+    pvc / emptydir: the components' udm-state volume and the env var. false:
+    neither. custom: anything else (the env var without that volume, or the
+    volume without the env var, as a hand `kubectl patch` leaves it), which a
+    re-run must not guess at."""
+    if not deploy:
+        return 'absent'
+    pod = deploy.get('spec', {}).get('template', {}).get('spec', {})
+    cont = next((c for c in pod.get('containers', []) if c.get('name') == 'udm'),
+                (pod.get('containers') or [{}])[0])
+    has_env = any(e.get('name') == UDM_STATE_ENV for e in cont.get('env') or [])
+    vol = next((v for v in pod.get('volumes') or [] if v.get('name') == UDM_STATE_VOLUME), None)
+    if not has_env and vol is None:
+        return 'false'
+    if has_env and vol is not None:
+        if 'persistentVolumeClaim' in vol:
+            return 'pvc'
+        if 'emptyDir' in vol:
+            return 'emptydir'
+    return 'custom'
 
 
 def _claim(t):
@@ -104,6 +137,9 @@ def main(argv):
         return 0
     if cmd == 'dataplane' and len(argv) == 4:
         print(dataplane_mode(_load_json(argv[2]), argv[3]))
+        return 0
+    if cmd == 'udm-state' and len(argv) == 3:
+        print(udm_state_mode(_load_json(argv[2])))
         return 0
     if cmd == 'sts-diff' and len(argv) == 5:
         live = _load_json(argv[2])

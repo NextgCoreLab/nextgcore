@@ -371,6 +371,108 @@ impl NfProfile {
             .unwrap_or(true);
         (true, profile_ok && service_ok)
     }
+
+    /// #1811: does this producer authorize a consumer to be granted `scope`, a
+    /// service-level scope (`nudr-dr`) or a resource/operation-level one
+    /// (`nudr-dr:subscription-data:authentication-subscription:read`)?
+    ///
+    /// The scope's service is the part before the first `:` (TS 29.500 §6.7.3),
+    /// and the consumer must first pass that service's `allowedNfTypes`
+    /// ([`Self::authorizes_service`]). Then TS 29.510 Table 6.1.6.2.3-1 NOTE 11
+    /// decides, per NFService of that name:
+    /// - neither `allowedOperationsPerNfType` nor `allowedOperationsPerNfInstance`
+    ///   registered: "the NRF should grant access tokens for the service-level
+    ///   scope only", so a resource-level scope is never granted;
+    /// - otherwise the scope must be listed for the consumer: in
+    ///   `allowedOperationsPerNfInstance[<consumer NF Instance ID>]` alone when
+    ///   `allowedOperationsPerNfInstanceOverrides` is true and the instance is a
+    ///   key there, else in either map (the type map for the consumer's NF type).
+    ///   This applies to the service-level scope too: "any NF type or NF
+    ///   instance not listed in these IEs is disallowed to access the NF service
+    ///   instance".
+    ///
+    /// Returns `(offered, permitted)` like [`Self::authorizes_service`].
+    pub fn authorizes_scope(
+        &self,
+        consumer_nf_type: &str,
+        consumer_nf_instance_id: &str,
+        scope: &str,
+    ) -> (bool, bool) {
+        let service_name = scope.split(':').next().unwrap_or(scope);
+        let resource_level = service_name.len() != scope.len();
+        let (offered, permitted) = self.authorizes_service(consumer_nf_type, service_name);
+        if !permitted {
+            return (offered, false);
+        }
+        let services = self
+            .attributes
+            .get("nfServices")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or_default();
+        let mut matched = false;
+        for service in services.iter().filter(|s| {
+            s.get("serviceName")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(service_name))
+        }) {
+            matched = true;
+            if service_operation_allows(
+                service,
+                consumer_nf_type,
+                consumer_nf_instance_id,
+                scope,
+                resource_level,
+            ) {
+                return (true, true);
+            }
+        }
+        // `authorizes_service` found the service in the parsed list; with no
+        // registered document to read the maps from, only the service-level
+        // scope is grantable (NOTE 11's default).
+        (true, !matched && !resource_level)
+    }
+}
+
+/// TS 29.510 Table 6.1.6.2.3-1 NOTE 11 for one registered NFService document:
+/// whether `scope` may be granted to the consumer (#1811). See
+/// [`NfProfile::authorizes_scope`].
+fn service_operation_allows(
+    service: &serde_json::Value,
+    consumer_nf_type: &str,
+    consumer_nf_instance_id: &str,
+    scope: &str,
+    resource_level: bool,
+) -> bool {
+    let per_type = service
+        .get("allowedOperationsPerNfType")
+        .and_then(|v| v.as_object());
+    let per_instance = service
+        .get("allowedOperationsPerNfInstance")
+        .and_then(|v| v.as_object());
+    if per_type.is_none() && per_instance.is_none() {
+        return !resource_level;
+    }
+    let lists = |scopes: Option<&serde_json::Value>| {
+        scopes
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.iter().any(|s| s.as_str() == Some(scope)))
+    };
+    // NF types are matched case-insensitively, as `allowedNfTypes` is.
+    let type_entry = per_type.and_then(|m| {
+        m.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(consumer_nf_type))
+            .map(|(_, v)| v)
+    });
+    let instance_entry = per_instance.and_then(|m| m.get(consumer_nf_instance_id));
+    let overrides = service
+        .get("allowedOperationsPerNfInstanceOverrides")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if overrides && instance_entry.is_some() {
+        return lists(instance_entry);
+    }
+    lists(type_entry) || lists(instance_entry)
 }
 
 /// PLMN ID
@@ -422,6 +524,14 @@ pub struct SubscriptionData {
     /// `notifCondition` (TS 29.510 §5.2.2.5.2): which NFProfile attributes the
     /// subscriber wants `NF_PROFILE_CHANGED` for. `None` => no restriction.
     pub notif_condition: Option<NotifCondition>,
+    /// #1809: the verified identity of the consumer that created the
+    /// subscription (its client-certificate NF Instance ID, else the `sub` of
+    /// the NRF-issued access token it presented). Only that consumer may update
+    /// (TS 29.510 §5.2.2.5.6) or remove (§5.2.2.6) it. `None` when the creator
+    /// presented no verified identity; such a subscription has nothing to bind
+    /// to. Never echoed on the wire: `reqNfInstanceId` is the consumer's claim,
+    /// this is what the NRF verified.
+    pub owner: Option<String>,
 }
 
 /// `NotifCondition` (TS 29.510 §5.2.2.5.2 / `NotifCondition` schema): the list
@@ -1315,6 +1425,9 @@ fn subscription_to_json(sub: &SubscriptionData) -> serde_json::Value {
     if let Some(ref cond) = sub.notif_condition {
         map.insert("notifCondition".into(), cond.to_json());
     }
+    if let Some(ref owner) = sub.owner {
+        map.insert("owner".into(), owner.clone().into());
+    }
     obj
 }
 
@@ -1364,6 +1477,7 @@ fn subscription_from_json(v: &serde_json::Value) -> Option<SubscriptionData> {
         validity_duration,
         req_notif_events,
         notif_condition,
+        owner: str_at("owner"),
     })
 }
 
@@ -2551,6 +2665,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         assert!(manager.add_subscription(subscription));
@@ -2713,6 +2828,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         let result = nrf_nnrf_handle_nf_status_subscribe(subscription);
@@ -3488,6 +3604,7 @@ mod tests {
                 validity_duration: 3600,
                 req_notif_events: None,
                 notif_condition: None,
+                owner: Some("amf-1-cert".to_string()),
             }));
         }
 
@@ -3526,6 +3643,9 @@ mod tests {
             assert_eq!(cond.kind, SubscrCondKind::NfType);
             assert_eq!(cond.str_at("nfType"), Some("SMF"));
             assert_eq!(sub.validity_duration, 3600);
+            // #1809: the verified creator survives too; a restart must not turn
+            // a bound subscription into one any caller can cancel.
+            assert_eq!(sub.owner.as_deref(), Some("amf-1-cert"));
         }
 
         let _ = std::fs::remove_file(&path);

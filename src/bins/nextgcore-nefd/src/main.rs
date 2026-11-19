@@ -409,6 +409,28 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
     .expect("value expected");
 }
 
+/// #1795: the NEF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with NEF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: SbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<SbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Nef,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -547,8 +569,9 @@ async fn main() -> Result<()> {
     // the shipped matched-sim path is byte-unchanged; the privacy fixes in this
     // same change are unconditional.
     let oauth2 = oauth2_required(&args.config);
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         oauth2,
         (!args.nrf_uri.is_empty()).then_some(args.nrf_uri.as_str()),
     ));
@@ -557,9 +580,17 @@ async fn main() -> Result<()> {
     if oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
-    let mtls = args.verify_client;
-    if mtls {
-        if !args.tls {
+    // #1795: the listener follows the SBI security profile, before the
+    // northbound posture below is read off it.
+    let mut sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &args.nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    if args.verify_client {
+        if sbi_server_config.scheme != nextgcore_sbi::types::UriScheme::Https {
             // Fail startup rather than run with an option that silently does
             // nothing: --verify-client without --tls reads as "mutual TLS is on"
             // while the listener is plaintext and every request is unauthenticated.
@@ -569,9 +600,15 @@ async fn main() -> Result<()> {
                  northbound surface as an authenticated one"
             );
         }
-        sbi_server_config.verify_client = true;
-        sbi_server_config.verify_client_cacert = args.verify_client_cacert.clone();
+        // Under production the profile already verifies against its CA.
+        if !sbi_server_config.verify_client {
+            sbi_server_config.verify_client = true;
+            sbi_server_config.verify_client_cacert = args.verify_client_cacert.clone();
+        }
     }
+    // The posture actually installed, knob or profile.
+    let oauth2 = sbi_server_config.require_oauth2;
+    let mtls = sbi_server_config.verify_client;
     let auth = NorthboundAuth { oauth2, mtls };
     let _ = NORTHBOUND_AUTH.set(auth);
     if auth.is_enforced() {
@@ -5085,5 +5122,19 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming NEF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Nef,
+            super::sbi_listener_config,
+        );
     }
 }

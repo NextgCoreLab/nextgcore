@@ -243,6 +243,7 @@ mod tests {
             port: 9,
             nf_instance_id: None,
             context_ref: n.to_string(),
+            notify_token: String::new(),
             tmgi: None,
         }
     }
