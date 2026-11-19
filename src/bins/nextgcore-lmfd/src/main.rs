@@ -9991,6 +9991,8 @@ mod callback_tokens_1518 {
                         SbiResponse::with_status(status)
                             .with_json_body(&serde_json::json!({
                                 "n1n2NotifySubscriptionId": format!("s{n}"),
+                                // #1877: and the non-UE NRPPa answer's member.
+                                "n2NotifySubscriptionId": format!("s{n}"),
                             }))
                             .unwrap()
                     } else {
@@ -10076,12 +10078,7 @@ mod callback_tokens_1518 {
             // Dropped here: the consumer went away.
         }
         let key = amf.amf.subscription_key(ue);
-        let recorded = || {
-            lmf_self()
-                .read()
-                .unwrap()
-                .amf_subscription_get(&key)
-        };
+        let recorded = || lmf_self().read().unwrap().amf_subscription_get(&key);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while recorded().is_none() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -10091,8 +10088,65 @@ mod callback_tokens_1518 {
         let still_admitted = admitted(&token).await;
         amf.server.stop().await.ok();
 
-        assert_eq!(id.as_deref(), Some("s1"), "the AMF's subscription is recorded");
+        assert_eq!(
+            id.as_deref(),
+            Some("s1"),
+            "the AMF's subscription is recorded"
+        );
         assert!(still_admitted, "and its token admitted");
+    }
+
+    /// #1877: the same for the non-UE NRPPa subscription (TS 29.518 §5.2.2.4.2):
+    /// its create, dropped by a caller that went away, is still recorded.
+    ///
+    /// REVERT-VERIFIED: with this create awaited inline again, this fails: the entry
+    /// is abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_subscribe_cancelled_mid_create_is_still_recorded_1877() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+        let amf = stand_in_amf().await;
+        amf.subscribe_delay_ms.store(300, Ordering::SeqCst);
+        let subscribed = || {
+            amf.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(uri, _)| uri.ends_with("/subscriptions"))
+        };
+        {
+            let mut ensure = Box::pin(namf_client::ensure_non_ue_nrppa_subscription(
+                &amf.amf, "lmf-1877",
+            ));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !subscribed() {
+                assert!(tokio::time::Instant::now() < deadline, "never subscribed");
+                if tokio::time::timeout(std::time::Duration::from_millis(5), &mut ensure)
+                    .await
+                    .is_ok()
+                {
+                    panic!("finished before the AMF answered");
+                }
+            }
+        }
+        let key = amf.amf.non_ue_subscription_key();
+        let recorded = || lmf_self().read().unwrap().amf_subscription_get(&key);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorded().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let id = recorded();
+        amf.server.stop().await.ok();
+
+        assert_eq!(
+            id.as_deref(),
+            Some("s1"),
+            "the AMF's subscription is recorded"
+        );
     }
 
     /// #1518, restarts of both peers. The subscription is made once and reused;
