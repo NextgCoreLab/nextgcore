@@ -3762,6 +3762,44 @@ mod tests {
         reset_context();
     }
 
+    /// #1994: a pass forgets the backoff of a producer with nothing parked, and
+    /// keeps that of one still holding parked unsubscribes.
+    ///
+    /// REVERT-VERIFIED: with `prune_backoff` a no-op, this fails: the producer
+    /// with nothing parked keeps its backoff.
+    #[test]
+    fn a_producer_with_nothing_parked_is_pruned_1994() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        // Neither is contacted: one has nothing parked, the other is backing off.
+        let gone = "http://127.0.0.1:9/gone-1994";
+        let kept = "http://127.0.0.1:9/kept-1994";
+        southbound_reconcile::note_failure_for_test(gone);
+        southbound_reconcile::note_failure_for_test(kept);
+        southbound_reconcile::park(SouthboundRef {
+            producer: SouthboundProducer::Amf,
+            subscription_id: "kept-1994".to_string(),
+            delete_path: "/namf-evts/v1/subscriptions/kept-1994".to_string(),
+            producer_base: Some(kept.to_string()),
+        });
+
+        block_on(southbound_reconcile::reconcile_once());
+        let after = (
+            southbound_reconcile::backoff_of(gone),
+            southbound_reconcile::backoff_of(kept),
+        );
+        southbound_reconcile::clear_for_test();
+        reset_context();
+
+        assert_eq!(after.0, None, "nothing parked: pruned");
+        assert_eq!(
+            after.1,
+            Some(southbound_reconcile::BACKOFF_BASE),
+            "still parked: kept"
+        );
+    }
+
     /// #1877: an AF delete whose AMF unsubscribe fails is parked and retried until
     /// the AMF takes it; the record is gone at once.
     ///

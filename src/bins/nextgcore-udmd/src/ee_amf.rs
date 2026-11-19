@@ -403,6 +403,28 @@ const UNSUBSCRIBE_MAX_PASS: std::time::Duration = std::time::Duration::from_mill
 /// is a lane, so dead AMFs cost a timeout each in parallel, not in turn.
 const UNSUBSCRIBE_MAX_LANES: usize = 64;
 
+/// #2029 (the shared #1994 backoff): the first wait before an AMF whose DELETE
+/// failed is tried again, doubled after each further failure up to
+/// [`UNSUBSCRIBE_BACKOFF_MAX`], and cleared by a delivery. An AMF that is backing
+/// off takes no lane slot, so dead AMFs past the first pass do not keep a healthy
+/// one waiting for a slot.
+#[cfg(not(test))]
+pub const UNSUBSCRIBE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+pub const UNSUBSCRIBE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(300);
+/// The longest a failing AMF is left alone between attempts.
+pub const UNSUBSCRIBE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Per AMF (URI authority): its backoff. Guarded like [`parked_unsubscribes`].
+static UNSUBSCRIBE_BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(UNSUBSCRIBE_BACKOFF_BASE, UNSUBSCRIBE_BACKOFF_MAX);
+
+/// The AMF a parked unsubscribe goes to (its URI authority): its lane and its
+/// backoff key.
+fn amf_of(uri: &str) -> String {
+    authority(uri).unwrap_or(uri).to_string()
+}
+
 /// `udm_ee_amf_unsubscribes_reconciled_total{result}`: parked AMF unsubscribes
 /// the reconciler ended, `delivered` (2xx or 404), `abandoned` (evicted at the
 /// bound) or `expired` (parked longer than [`UNSUBSCRIBE_MAX_AGE`]).
@@ -444,24 +466,14 @@ fn lock_parked() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Pa
 }
 
 fn evict_unsubscribes(set: &mut std::collections::VecDeque<ParkedUnsubscribe>) {
-    while set.len() > MAX_PENDING_UNSUBSCRIBES {
-        // The oldest by park time, wherever rotation has put it.
-        let Some(oldest) = set
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, p)| p.since)
-            .map(|(i, _)| i)
-        else {
-            break;
-        };
-        if let Some(old) = set.remove(oldest) {
-            log::error!(
-                "Namf_EventExposure_Unsubscribe {} abandoned: \
-                 {MAX_PENDING_UNSUBSCRIBES} are already pending",
-                old.uri
-            );
-            UNSUBSCRIBES_RECONCILED.inc(&["abandoned"]);
-        }
+    // The oldest by park time, wherever rotation has put it.
+    for old in nextgcore_core::backoff::evict_oldest(set, MAX_PENDING_UNSUBSCRIBES, |p| p.since) {
+        log::error!(
+            "Namf_EventExposure_Unsubscribe {} abandoned: \
+             {MAX_PENDING_UNSUBSCRIBES} are already pending",
+            old.uri
+        );
+        UNSUBSCRIBES_RECONCILED.inc(&["abandoned"]);
     }
 }
 
@@ -491,6 +503,7 @@ pub fn parked_unsubscribe_count() -> usize {
 #[cfg(test)]
 pub fn clear_parked_unsubscribes_for_test() {
     lock_parked().clear();
+    UNSUBSCRIBE_BACKOFF.clear();
 }
 
 /// One reconcile pass over the parked AMF unsubscribes, in turn order, for at most
@@ -504,13 +517,18 @@ pub fn clear_parked_unsubscribes_for_test() {
 /// #1987: each AMF is its own lane, and up to [`UNSUBSCRIBE_MAX_LANES`] lanes send
 /// at once, so a healthy AMF's unsubscribe is not queued behind the timeouts of
 /// dead AMFs ahead of it: it was, by about one pass per six dead AMFs.
+///
+/// #2029: an AMF whose DELETE failed backs off ([`UNSUBSCRIBE_BACKOFF_BASE`],
+/// doubling to [`UNSUBSCRIBE_BACKOFF_MAX`]) and takes no slot while it does. So
+/// with more than [`UNSUBSCRIBE_MAX_LANES`] dead AMFs, a healthy one waits for a
+/// slot in the first pass at most, not in every pass.
 pub async fn reconcile_unsubscribes_once() -> usize {
     let batch: Vec<ParkedUnsubscribe> = lock_parked().drain(..).collect();
     let deadline = tokio::time::Instant::now() + UNSUBSCRIBE_MAX_PASS;
     let mut ended = 0;
     // The lanes, in the order of each AMF's first turn; each holds its entries in
     // turn order, with their place in the batch.
-    let mut lanes: Vec<Vec<(usize, ParkedUnsubscribe)>> = Vec::new();
+    let mut lanes: Vec<(String, Vec<(usize, ParkedUnsubscribe)>)> = Vec::new();
     let mut lane_of: HashMap<String, usize> = HashMap::new();
     for (place, parked) in batch.into_iter().enumerate() {
         if parked.since.elapsed() > UNSUBSCRIBE_MAX_AGE {
@@ -522,22 +540,30 @@ pub async fn reconcile_unsubscribes_once() -> usize {
             ended += 1;
             continue;
         }
-        let amf = authority(&parked.uri).unwrap_or(&parked.uri).to_string();
-        let lane = *lane_of.entry(amf).or_insert_with(|| {
-            lanes.push(Vec::new());
+        let amf = amf_of(&parked.uri);
+        let lane = *lane_of.entry(amf.clone()).or_insert_with(|| {
+            lanes.push((amf, Vec::new()));
             lanes.len() - 1
         });
-        lanes[lane].push((place, parked));
+        lanes[lane].1.push((place, parked));
     }
 
     let gate = Arc::new(tokio::sync::Semaphore::new(UNSUBSCRIBE_MAX_LANES));
     let mut sending = tokio::task::JoinSet::new();
     let mut outcomes: Vec<(usize, ParkedUnsubscribe, UnsubscribeOutcome)> = Vec::new();
-    for lane in lanes {
-        // A lane waits for a free slot, in turn order; one that gets none before
-        // the deadline is not tried this pass.
-        let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, gate.clone().acquire_owned()).await
-        else {
+    for (amf, lane) in lanes {
+        // #2029: an AMF that is backing off is not tried, and takes no slot. Any
+        // other lane waits for a free slot, in turn order; one that gets none
+        // before the deadline is not tried this pass.
+        let slot = if UNSUBSCRIBE_BACKOFF.backing_off(&amf) {
+            None
+        } else {
+            tokio::time::timeout_at(deadline, gate.clone().acquire_owned())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        let Some(slot) = slot else {
             outcomes.extend(
                 lane.into_iter()
                     .map(|(place, p)| (place, p, UnsubscribeOutcome::Untried)),
@@ -558,6 +584,16 @@ pub async fn reconcile_unsubscribes_once() -> usize {
                     UnsubscribeOutcome::Failed
                 };
                 out.push((place, parked, outcome));
+            }
+            // A lane that failed backs its AMF off; one that delivered and did
+            // not fail clears it.
+            if failed {
+                UNSUBSCRIBE_BACKOFF.note_failure(&amf);
+            } else if out
+                .iter()
+                .any(|(_, _, o)| matches!(o, UnsubscribeOutcome::Delivered))
+            {
+                UNSUBSCRIBE_BACKOFF.note_success(&amf);
             }
             out
         });
@@ -597,6 +633,10 @@ pub async fn reconcile_unsubscribes_once() -> usize {
         }
     }
     evict_unsubscribes(&mut set);
+    // #2029: forget the backoff of an AMF with nothing left parked.
+    let live: std::collections::HashSet<String> = set.iter().map(|p| amf_of(&p.uri)).collect();
+    drop(set);
+    UNSUBSCRIBE_BACKOFF.retain(|amf| live.contains(amf));
     ended
 }
 
@@ -1544,6 +1584,139 @@ mod tests {
         );
         assert!(!still.contains(&live));
         assert_eq!(still.len(), 8, "the dead AMFs' stay parked: {still:?}");
+    }
+
+    /// An AMF that accepts connections and never answers, counting them: its
+    /// address, how many it accepted, and its task (abort it at the end).
+    async fn blackhole_2029() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        let task = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                conns.push(c);
+            }
+        });
+        (addr, accepted, task)
+    }
+
+    fn ours_2029(uris: &[&String]) -> Vec<String> {
+        lock_parked()
+            .iter()
+            .map(|p| p.uri.clone())
+            .filter(|u| uris.contains(&u))
+            .collect()
+    }
+
+    /// #2029: the requeue keeps turn order, not the order the lanes finished in.
+    /// A blackholed AMF's entry, parked first, fails after the call timeout; a
+    /// refusing AMF's, parked second, fails at once. Both go to the back, the
+    /// blackholed one still first.
+    ///
+    /// REVERT-VERIFIED: with the requeue sort removed, this fails: the refusing
+    /// AMF's entry, which finished first, comes first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn the_requeue_keeps_turn_order_2029() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        AMF_CALL_TIMEOUT_MS.store(200, Ordering::Relaxed);
+        let (hole, _accepted, held) = blackhole_2029().await;
+        let (_amf, refusing, _seen) = recorder(|_| SbiResponse::with_status(503)).await;
+        let slow = format!("http://{hole}/namf-evts/v1/subscriptions/slow-2029");
+        let fast = format!("http://{refusing}/namf-evts/v1/subscriptions/fast-2029");
+        park_unsubscribe(&slow);
+        park_unsubscribe(&fast);
+
+        reconcile_unsubscribes_once().await;
+        let order = ours_2029(&[&slow, &fast]);
+        clear_parked_unsubscribes_for_test();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        held.abort();
+
+        assert_eq!(order, vec![slow, fast], "turn order kept");
+    }
+
+    /// #2029: an AMF whose DELETE failed backs off: the next pass does not try it
+    /// (nor hold a lane slot for it), and the one after its wait does.
+    ///
+    /// REVERT-VERIFIED: with the `backing_off` check removed, this fails: the
+    /// blackholed AMF is connected to again in the second pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_failed_amf_backs_off_2029() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        AMF_CALL_TIMEOUT_MS.store(100, Ordering::Relaxed);
+        let (hole, accepted, held) = blackhole_2029().await;
+        let dead = format!("http://{hole}/namf-evts/v1/subscriptions/dead-2029");
+        park_unsubscribe(&dead);
+
+        reconcile_unsubscribes_once().await;
+        let first = accepted.load(Ordering::SeqCst);
+        let backoff = UNSUBSCRIBE_BACKOFF.current(&amf_of(&dead));
+        reconcile_unsubscribes_once().await;
+        let second = accepted.load(Ordering::SeqCst);
+        tokio::time::sleep(UNSUBSCRIBE_BACKOFF_BASE + std::time::Duration::from_millis(50)).await;
+        reconcile_unsubscribes_once().await;
+        let third = accepted.load(Ordering::SeqCst);
+        let still = ours_2029(&[&dead]);
+        clear_parked_unsubscribes_for_test();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        held.abort();
+
+        assert!(first >= 1, "tried in the first pass");
+        assert_eq!(backoff, Some(UNSUBSCRIBE_BACKOFF_BASE));
+        assert_eq!(second, first, "not tried while backing off");
+        assert!(third > second, "tried again once its wait ran out");
+        assert_eq!(still, vec![dead], "and still parked");
+    }
+
+    /// #2029: a pass forgets the backoff of an AMF with nothing parked, and keeps
+    /// that of one still holding parked unsubscribes.
+    ///
+    /// REVERT-VERIFIED: with the prune removed, this fails: the AMF with nothing
+    /// parked keeps its backoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn an_amf_with_nothing_parked_is_pruned_2029() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        let gone = amf_of("http://127.0.0.1:19941/namf-evts/v1/subscriptions/gone-2029");
+        let kept_uri = "http://127.0.0.1:19942/namf-evts/v1/subscriptions/kept-2029";
+        let kept = amf_of(kept_uri);
+        UNSUBSCRIBE_BACKOFF.note_failure(&gone);
+        UNSUBSCRIBE_BACKOFF.note_failure(&kept);
+        // Backing off, so not contacted: it stays parked.
+        park_unsubscribe(kept_uri);
+        reconcile_unsubscribes_once().await;
+        let after = (
+            UNSUBSCRIBE_BACKOFF.current(&gone),
+            UNSUBSCRIBE_BACKOFF.current(&kept),
+        );
+        clear_parked_unsubscribes_for_test();
+
+        assert_eq!(after.0, None, "nothing parked: pruned");
+        assert_eq!(
+            after.1,
+            Some(UNSUBSCRIBE_BACKOFF_BASE),
+            "still parked: kept"
+        );
     }
 
     /// **#1449 review 2.** A PATCH of `callbackReference` re-subscribes at the AMF
