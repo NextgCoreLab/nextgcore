@@ -593,6 +593,12 @@ struct NrfPolicy {
     /// opt-out (every shipped deployment presents NF certificates since steps
     /// d1-d3). A field rather than a constant only so the handlers read one policy.
     require_registrant_identity: bool,
+    /// #1809: NFStatusSubscribe needs a verified consumer identity, and an
+    /// ownerless subscription (restored from a state file written before
+    /// #1809) cannot be updated or removed. ON under the `production` SBI
+    /// profile (set in `main`), OFF under `dev`, where a plaintext stack has no
+    /// identity to bind to. Default ON: a policy nobody set fails closed.
+    require_subscriber_identity: bool,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
     /// signature (not just the claim binding). Default ON (issue #64 gap 2).
     cca_verify_signature: bool,
@@ -659,6 +665,7 @@ impl Default for NrfPolicy {
             // #1617 step f: no knob. TS 33.501 §13.3.1.1 permits implicit NF-NRF
             // authentication; the operator chose not to rely on it.
             require_registrant_identity: true,
+            require_subscriber_identity: true,
             cca_trusted_keys: std::collections::HashMap::new(),
             cca_conflicted: std::collections::HashSet::new(),
             cca_trusted_keys_dir: None,
@@ -1830,6 +1837,29 @@ async fn main() -> Result<()> {
     // against this allowlist, and a heartbeating NF never re-registers, so the
     // claim is enforced here, before the policy is published.
     enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());
+    // #1809: subscriptions are bound to a verified identity under production.
+    policy.require_subscriber_identity =
+        nextgcore_sbi::security::SbiProfile::resolve().is_production();
+    if policy.require_subscriber_identity {
+        let manager = nf_manager();
+        let unbound = manager
+            .subscription_ids()
+            .iter()
+            .filter(|id| {
+                manager
+                    .find_subscription(id)
+                    .is_some_and(|s| s.owner.is_none())
+            })
+            .count();
+        if unbound > 0 {
+            log::warn!(
+                "{unbound} restored subscription(s) carry no verified owner (written before \
+                 #1809): they keep their notifications until their validity lapses (at most \
+                 24 h after this restart), but no caller can update or remove them; their \
+                 consumers re-subscribe on the 404 that follows expiry"
+            );
+        }
+    }
     NRF_POLICY.set(policy).ok();
 
     // Client side (T1.1): when SBI OAuth2 is enabled, the NRF acquires and
@@ -2275,7 +2305,7 @@ async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
         ("nnrf-nfm", "subscriptions", "DELETE") if parts.len() >= 4 => {
             // Unsubscribe: DELETE /nnrf-nfm/v1/subscriptions/{subscriptionId}
             let subscription_id = parts[3];
-            handle_subscription_delete(subscription_id).await
+            handle_subscription_delete(subscription_id, &request).await
         }
         ("nnrf-nfm", "subscriptions", "PATCH") if parts.len() >= 4 => {
             // Update subscription: PATCH /nnrf-nfm/v1/subscriptions/{subscriptionId}
@@ -3159,6 +3189,15 @@ async fn handle_subscription_create_under(
 ) -> SbiResponse {
     log::info!("Subscription Create");
 
+    // #1809: the verified identity this subscription is bound to, checked
+    // before the body is read or anything is stored.
+    let owner = match RegistrantIdentity::of(request, nrf_policy())
+        .subscription_owner(subscriber_identity_required())
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+
     let body = match &request.http.content {
         Some(content) => content,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -3344,6 +3383,8 @@ async fn handle_subscription_create_under(
         validity_duration,
         req_notif_events,
         notif_condition,
+        // #1809: bound to who created it, so only that consumer can manage it.
+        owner,
     };
 
     // nrfd-08: the NRF-assigned validityTime is an absolute RFC 3339 timestamp
@@ -3441,9 +3482,14 @@ fn rearm_restored_timers() {
     let mut sub_count = 0usize;
     for id in manager.subscription_ids() {
         if let Some(sub) = manager.find_subscription(&id) {
+            let validity = restored_validity(&sub);
+            if validity != sub.validity_duration {
+                // Stored too, so what the NRF holds matches what it enforces.
+                manager.set_subscription_validity(&id, validity);
+            }
             timer_mgr.start_timer(
                 nextgcore_nrfd::NrfTimerId::SubscriptionValidity,
-                Duration::from_secs(sub.validity_duration),
+                Duration::from_secs(validity),
                 id.clone(),
             );
             sub_count += 1;
@@ -3469,11 +3515,37 @@ fn rearm_restored_timers() {
 // leap-year or offset fix applied here would otherwise stay unapplied in the other
 // five copies.
 
+/// #1809 (R26 on #1831): the validity a restored subscription is re-armed
+/// with. An ownerless one (written before #1809) is frozen under production,
+/// so it must not outlive the NRF's own maximum: it is capped at
+/// [`NRF_SUBSCRIPTION_DEFAULT_VALIDITY`] (24 h), after which its consumer
+/// re-subscribes, bound. Before that cap a PATCH could set any validity, so a
+/// frozen subscription could otherwise have lasted indefinitely. An owned
+/// subscription keeps what was stored: its owner can still extend or cancel it.
+fn restored_validity(sub: &nextgcore_nrfd::SubscriptionData) -> u64 {
+    if sub.owner.is_none() {
+        sub.validity_duration.min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY)
+    } else {
+        sub.validity_duration
+    }
+}
+
 /// Handle Subscription Delete request
-async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_subscription_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("Subscription Delete: {subscription_id}");
 
     let manager = nf_manager();
+    // #1809: only the consumer that created the subscription may cancel it,
+    // checked before anything is removed.
+    if let Some(sub) = manager.find_subscription(subscription_id) {
+        if let Some(refused) = RegistrantIdentity::of(request, nrf_policy()).bind_subscription(
+            "NFStatusUnsubscribe",
+            &sub,
+            subscriber_identity_required(),
+        ) {
+            return refused;
+        }
+    }
     if manager.remove_subscription(subscription_id) {
         log::info!("Subscription {subscription_id} removed");
         SbiResponse::with_status(204) // No Content
@@ -3498,6 +3570,15 @@ async fn handle_subscription_update(subscription_id: &str, request: &SbiRequest)
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     };
+    // #1809: only the consumer that created the subscription may extend it,
+    // checked before the body is read or anything is stored.
+    if let Some(refused) = RegistrantIdentity::of(request, nrf_policy()).bind_subscription(
+        "NFStatusSubscribe update",
+        &existing,
+        subscriber_identity_required(),
+    ) {
+        return refused;
+    }
 
     let body = request.http.content.as_deref().unwrap_or("");
     let patch: serde_json::Value = match serde_json::from_str(body) {
@@ -3545,7 +3626,12 @@ async fn handle_subscription_update(subscription_id: &str, request: &SbiRequest)
             Some("INVALID_MSG_FORMAT"),
         );
     }
-    let validity_duration = absolute - now;
+    // R26 on #1831: the same maximum as Subscribe, so a PATCH cannot pin a
+    // subscription open past what the NRF would grant a new one.
+    let validity_duration = (absolute - now).min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY);
+    // The validity the NRF grants, which the response returns (TS 29.510
+    // §5.2.2.5.6), not the proposal it narrowed.
+    let validity_time = epoch_to_rfc3339(now + validity_duration);
 
     if !manager.set_subscription_validity(subscription_id, validity_duration) {
         return send_error(
@@ -4729,6 +4815,111 @@ impl RegistrantIdentity {
              client certificate ({:?})",
             self.nf_types
         )))
+    }
+}
+
+/// #1809: [`NrfPolicy::require_subscriber_identity`], which tests of the dev
+/// behaviour turn off for their own task only.
+fn subscriber_identity_required() -> bool {
+    #[cfg(test)]
+    if let Ok(required) = subscription_owner_tests_1809::REQUIRED.try_with(|r| *r) {
+        return required;
+    }
+    nrf_policy().require_subscriber_identity
+}
+
+impl RegistrantIdentity {
+    /// #1809: the identity a new subscription is bound to. One rule for create
+    /// and manage: every verified identity of the caller (certificate, trusted
+    /// forwarded certificate, token `sub`) must name the same NF instance, so
+    /// the creator can always manage what it created. Callers whose identities
+    /// disagree are refused `400 INVALID_CLIENT` (TS 29.510 Table 6.1.7.3-1), as
+    /// `bind_instance` refuses them for NF management. A caller with no verified
+    /// identity is refused the same way when `required` (the production
+    /// profile, as #1617 refuses cert-less NF management), else `Ok(None)`.
+    fn subscription_owner(&self, required: bool) -> Result<Option<String>, Box<SbiResponse>> {
+        let Some((_, first)) = self.instance_ids.first() else {
+            if required {
+                nextgcore_nrfd::metrics::observe_unverified_nf_management();
+                return Err(Box::new(invalid_client(
+                    "NFStatusSubscribe: the requester has no verified identity (client \
+                     certificate or NRF-issued access token), so the subscription could not be \
+                     bound to it",
+                )));
+            }
+            return Ok(None);
+        };
+        if let Some((source, other)) = self
+            .instance_ids
+            .iter()
+            .find(|(_, id)| !same_nf_instance_id(id, first))
+        {
+            log::debug!(
+                "NFStatusSubscribe refused: the caller's identities disagree ({first} vs \
+                 {source} {other})"
+            );
+            return Err(Box::new(invalid_client(&format!(
+                "NFStatusSubscribe: the requester's {source} ({other:?}) does not match its \
+                 other verified identity ({first:?})"
+            ))));
+        }
+        Ok(Some(first.clone()))
+    }
+
+    /// #1809: a subscription is updated (TS 29.510 §5.2.2.5.6) or removed
+    /// (§5.2.2.6) only by the consumer that created it. When it was bound to an
+    /// identity, the caller must prove one and every identity it proves must be
+    /// that one (TS 33.501 §13.1: the NRF authorizes on the authenticated
+    /// identity, not on a claim). `403`, because the request is well formed and
+    /// the caller is simply not allowed to act on someone else's resource.
+    /// `Some` is the refusal to send; nothing has been read or changed yet.
+    ///
+    /// An ownerless subscription binds nothing under `dev`. When `required`
+    /// (production) it is refused instead: it can only be one restored from a
+    /// state file written before #1809, and nobody can prove they created it.
+    fn bind_subscription(
+        &self,
+        operation: &str,
+        sub: &nextgcore_nrfd::SubscriptionData,
+        required: bool,
+    ) -> Option<SbiResponse> {
+        let Some(owner) = sub.owner.as_deref() else {
+            return required.then(|| {
+                send_error(
+                    403,
+                    "Forbidden",
+                    &format!(
+                        "{operation}: subscription {} has no verified owner (it predates \
+                         #1809), so no requester can be shown to have created it",
+                        sub.id
+                    ),
+                    None,
+                )
+            });
+        };
+        let foreign = if self.instance_ids.is_empty() {
+            Some("no verified identity".to_string())
+        } else {
+            self.instance_ids
+                .iter()
+                .find(|(_, id)| !same_nf_instance_id(id, owner))
+                .map(|(source, id)| format!("{source} {id:?}"))
+        }?;
+        // debug, not warn: a peer can send these at will (#1620 review m7).
+        log::debug!(
+            "{operation} of subscription {} refused: the caller has {foreign}, the \
+             subscription belongs to NF instance {owner}",
+            sub.id
+        );
+        Some(send_error(
+            403,
+            "Forbidden",
+            &format!(
+                "{operation}: subscription {} was not created by the requester ({foreign})",
+                sub.id
+            ),
+            None,
+        ))
     }
 }
 
@@ -7280,6 +7471,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         // Simulate a PATCH replacing /load.
@@ -7374,6 +7566,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         let request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
@@ -10684,6 +10877,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
         let body = subscription_response_json(&sub, "2023-11-14T22:13:20Z");
         assert_eq!(body["subscriptionId"], "sub-08");
@@ -10867,6 +11061,10 @@ mod tests {
     async fn subscription_patch_replaces_validity_and_404s_for_unknown_id() {
         nextgcore_nrfd::init_nf_manager(None);
         let manager = nf_manager();
+        let owned = |mut r: SbiRequest| {
+            r.peer_cert_nf_instance_id = Some("sub-68-owner".into());
+            r
+        };
 
         let sub = nextgcore_nrfd::SubscriptionData {
             id: "sub-68".to_string(),
@@ -10877,20 +11075,23 @@ mod tests {
             validity_duration: 60,
             req_notif_events: None,
             notif_condition: None,
+            // #1809: a bound subscription, managed by its owner below.
+            owner: Some("sub-68-owner".to_string()),
         };
         assert!(manager.add_subscription(sub));
 
         // An unknown id is 404, not a silent 200.
-        let missing = handle_subscription_update("no-such-sub", &SbiRequest::default()).await;
+        let missing =
+            handle_subscription_update("no-such-sub", &owned(SbiRequest::default())).await;
         assert_eq!(missing.status, 404, "unknown subscription must be 404");
 
         // A patch with nothing replaceable is a client error, not a 200.
-        let empty_req = SbiRequest::default().with_body("{}", "application/json");
+        let empty_req = owned(SbiRequest::default()).with_body("{}", "application/json");
         let empty = handle_subscription_update("sub-68", &empty_req).await;
         assert_eq!(empty.status, 400);
 
         // A malformed body is a 400.
-        let bad_req = SbiRequest::default().with_body("{not json", "application/json");
+        let bad_req = owned(SbiRequest::default()).with_body("{not json", "application/json");
         assert_eq!(
             handle_subscription_update("sub-68", &bad_req).await.status,
             400
@@ -10898,7 +11099,7 @@ mod tests {
 
         // A validityTime in the PAST is refused rather than applied as an
         // instant expiry.
-        let past_req = SbiRequest::default().with_body(
+        let past_req = owned(SbiRequest::default()).with_body(
             r#"{"validityTime":"1971-01-01T00:00:00Z"}"#,
             "application/json",
         );
@@ -10922,7 +11123,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let future = epoch_to_rfc3339(now + 3600);
-        let ok_req = SbiRequest::default().with_body(
+        let ok_req = owned(SbiRequest::default()).with_body(
             format!(r#"{{"validityTime":"{future}"}}"#),
             "application/json",
         );
@@ -11013,6 +11214,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         });
 
         /// Wait until `want` notifications have arrived, or time out.
@@ -11379,8 +11581,10 @@ mod tests {
     async fn subscribe(body: serde_json::Value) -> SbiResponse {
         let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
         req.http.set_content(body.to_string());
+        // #1809: a verified subscriber, as the production policy requires.
+        req.peer_cert_nf_instance_id = Some("nrfd68-subscriber".into());
         // These tests subscribe http callbacks: the dev profile, set on the call
-        // rather than through the process-global override.
+        // rather than through the process-global override (#1869).
         handle_subscription_create_under(&req, nextgcore_sbi::security::SbiProfile::Dev).await
     }
 
@@ -11395,6 +11599,8 @@ mod tests {
         use nextgcore_sbi::security::SbiProfile;
         let uri = format!("http://amf-1869-{}.example/cb", uuid::Uuid::new_v4());
         let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
         req.http
             .set_content(serde_json::json!({ "nfStatusNotificationUri": uri }).to_string());
         let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
@@ -11415,6 +11621,8 @@ mod tests {
 
         let https = uri.replacen("http://", "https://", 1);
         let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
         req.http
             .set_content(serde_json::json!({ "nfStatusNotificationUri": https }).to_string());
         let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
@@ -13479,6 +13687,7 @@ mod tests_nf_set_ids_1719 {
                 validity_duration: 3600,
                 req_notif_events: None,
                 notif_condition: None,
+                owner: None,
             });
         }
         let policy = NrfPolicy {
@@ -13813,6 +14022,7 @@ mod unverified_registrant_tests_1617 {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         });
 
         let wait_for = |want: usize| {
@@ -13868,5 +14078,389 @@ mod unverified_registrant_tests_1617 {
             ),
             "the else branch drops the restored entry: {branch}"
         );
+    }
+}
+
+/// #1809: a subscription is managed only by the consumer that created it.
+/// Every request goes through `nrf_sbi_request_handler`, so the routing that
+/// hands the caller to the handler is covered as well as the check itself.
+#[cfg(test)]
+mod subscription_owner_tests_1809 {
+    use super::*;
+    use serde_json::json;
+
+    tokio::task_local! {
+        /// Overrides [`NrfPolicy::require_subscriber_identity`] for one test's
+        /// task, so the dev behaviour is testable without touching the
+        /// process-global policy the rest of the binary reads.
+        pub(super) static REQUIRED: bool;
+    }
+
+    const OWNER: &str = "18090000-0000-4000-8000-00000000000a";
+    const OTHER: &str = "18090000-0000-4000-8000-00000000000b";
+
+    fn as_caller(mut req: SbiRequest, cert: Option<&str>, token_sub: Option<&str>) -> SbiRequest {
+        req.peer_cert_nf_instance_id = cert.map(str::to_string);
+        req.oauth2_subject = token_sub.map(str::to_string);
+        req
+    }
+
+    /// Subscribe as `cert`/`token_sub` and return the new subscription's id.
+    /// https (#1869): an http callback is refused under the production
+    /// profile, which an unset environment resolves to.
+    async fn subscribe_as(cert: Option<&str>, token_sub: Option<&str>) -> String {
+        let req = SbiRequest::post("/nnrf-nfm/v1/subscriptions").with_body(
+            json!({
+                "nfStatusNotificationUri": "https://consumer.invalid/notify",
+                "reqNfInstanceId": OWNER,
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = nrf_sbi_request_handler(as_caller(req, cert, token_sub)).await;
+        assert_eq!(resp.status, 201, "subscribe: {:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+        body["subscriptionId"].as_str().expect("id").to_string()
+    }
+
+    fn patch(id: &str, cert: Option<&str>, token_sub: Option<&str>) -> SbiRequest {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req = SbiRequest::patch(format!("/nnrf-nfm/v1/subscriptions/{id}")).with_body(
+            json!({ "validityTime": epoch_to_rfc3339(now + 600) }).to_string(),
+            "application/json",
+        );
+        as_caller(req, cert, token_sub)
+    }
+
+    fn delete(id: &str, cert: Option<&str>, token_sub: Option<&str>) -> SbiRequest {
+        as_caller(
+            SbiRequest::delete(format!("/nnrf-nfm/v1/subscriptions/{id}")),
+            cert,
+            token_sub,
+        )
+    }
+
+    fn assert_forbidden(r: &SbiResponse, what: &str) {
+        assert_eq!(r.status, 403, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        assert!(
+            body.contains("was not created by the requester"),
+            "{what}: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_binds_the_verified_identity() {
+        let id = subscribe_as(Some(OWNER), Some(OWNER)).await;
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some(OWNER),
+            "certificate and token agree"
+        );
+        nf_manager().remove_subscription(&id);
+
+        let id = subscribe_as(Some(OWNER), None).await;
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some(OWNER),
+            "the certificate alone"
+        );
+        nf_manager().remove_subscription(&id);
+
+        let id = subscribe_as(None, Some(OTHER)).await;
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some(OTHER),
+            "else the token subject"
+        );
+        nf_manager().remove_subscription(&id);
+    }
+
+    #[tokio::test]
+    async fn another_consumer_cannot_extend_a_subscription() {
+        let id = subscribe_as(Some(OWNER), None).await;
+        let before = nf_manager()
+            .find_subscription(&id)
+            .unwrap()
+            .validity_duration;
+
+        for (cert, sub, what) in [
+            (Some(OTHER), None, "another certificate"),
+            (None, Some(OTHER), "another token subject"),
+            (
+                Some(OWNER),
+                Some(OTHER),
+                "the owner's certificate with a foreign token",
+            ),
+            (None, None, "an anonymous caller"),
+        ] {
+            let r = nrf_sbi_request_handler(patch(&id, cert, sub)).await;
+            assert_forbidden(&r, what);
+            assert_eq!(
+                nf_manager()
+                    .find_subscription(&id)
+                    .unwrap()
+                    .validity_duration,
+                before,
+                "{what}: a refused PATCH must leave the validity untouched"
+            );
+        }
+
+        let r = nrf_sbi_request_handler(patch(&id, Some(OWNER), None)).await;
+        assert_eq!(r.status, 200, "the owner extends: {:?}", r.http.content);
+        assert!(
+            (595..=600).contains(
+                &nf_manager()
+                    .find_subscription(&id)
+                    .unwrap()
+                    .validity_duration
+            ),
+            "the owner's PATCH is applied"
+        );
+        nf_manager().remove_subscription(&id);
+    }
+
+    #[tokio::test]
+    async fn another_consumer_cannot_cancel_a_subscription() {
+        let id = subscribe_as(Some(OWNER), None).await;
+
+        for (cert, sub, what) in [
+            (Some(OTHER), None, "another certificate"),
+            (None, Some(OTHER), "another token subject"),
+            (None, None, "an anonymous caller"),
+        ] {
+            let r = nrf_sbi_request_handler(delete(&id, cert, sub)).await;
+            assert_forbidden(&r, what);
+            assert!(
+                nf_manager().find_subscription(&id).is_some(),
+                "{what}: a refused DELETE must leave the subscription in place"
+            );
+        }
+
+        // The UUID compares case-insensitively, as the registry keys it.
+        let upper = OWNER.to_ascii_uppercase();
+        // The owner's certificate with a foreign token is not the owner either.
+        let r = nrf_sbi_request_handler(delete(&id, Some(OWNER), Some(OTHER))).await;
+        assert_forbidden(&r, "the owner's certificate with a foreign token");
+        assert!(nf_manager().find_subscription(&id).is_some());
+
+        let r = nrf_sbi_request_handler(delete(&id, None, Some(&upper))).await;
+        assert_eq!(r.status, 204, "the owner cancels: {:?}", r.http.content);
+        assert!(nf_manager().find_subscription(&id).is_none());
+    }
+
+    /// Under `dev` a subscription created without any verified identity (a
+    /// plaintext stack) has nothing to bind to and stays manageable.
+    #[tokio::test]
+    async fn under_dev_an_unbound_subscription_stays_manageable() {
+        REQUIRED
+            .scope(false, async {
+                let id = subscribe_as(None, None).await;
+                assert_eq!(nf_manager().find_subscription(&id).unwrap().owner, None);
+                let r = nrf_sbi_request_handler(patch(&id, None, None)).await;
+                assert_eq!(r.status, 200, "{:?}", r.http.content);
+                let r = nrf_sbi_request_handler(delete(&id, None, None)).await;
+                assert_eq!(r.status, 204, "{:?}", r.http.content);
+            })
+            .await;
+    }
+
+    fn assert_invalid_client(r: &SbiResponse, needle: &str, what: &str) {
+        assert_eq!(r.status, 400, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        let problem: serde_json::Value = serde_json::from_str(body).expect("ProblemDetails");
+        assert_eq!(problem["cause"], "INVALID_CLIENT", "{what}: {body}");
+        assert!(body.contains(needle), "{what}: {body}");
+    }
+
+    fn subscribe_req(cert: Option<&str>, token_sub: Option<&str>, uri: &str) -> SbiRequest {
+        as_caller(
+            SbiRequest::post("/nnrf-nfm/v1/subscriptions").with_body(
+                json!({ "nfStatusNotificationUri": uri }).to_string(),
+                "application/json",
+            ),
+            cert,
+            token_sub,
+        )
+    }
+
+    /// No stored subscription carries `uri`.
+    fn nothing_stored_for(uri: &str) -> bool {
+        let m = nf_manager();
+        !m.subscription_ids().iter().any(|id| {
+            m.find_subscription(id)
+                .is_some_and(|s| s.notification_uri == uri)
+        })
+    }
+
+    /// Under production (the policy default) a Subscribe with no verified
+    /// identity is refused as #1617 refuses cert-less NF management, and
+    /// nothing is stored.
+    ///
+    /// REVERT-VERIFIED: with `subscription_owner` returning `Ok(None)` for a
+    /// caller with no identity whatever `required` says, the Subscribe is 201.
+    #[tokio::test]
+    async fn under_production_an_anonymous_subscribe_is_refused() {
+        assert!(NrfPolicy::default().require_subscriber_identity);
+        let uri = "https://anonymous-1809.invalid/notify";
+        let r = nrf_sbi_request_handler(subscribe_req(None, None, uri)).await;
+        assert_invalid_client(&r, "no verified identity", "anonymous");
+        assert!(
+            nothing_stored_for(uri),
+            "a refused Subscribe stores nothing"
+        );
+    }
+
+    /// One identity rule on create and on manage: a caller whose certificate
+    /// and token name different NFs cannot subscribe, so no creator is ever
+    /// locked out of its own subscription.
+    ///
+    /// REVERT-VERIFIED: with the disagreement check removed from
+    /// `subscription_owner`, the mixed caller gets 201.
+    #[tokio::test]
+    async fn a_caller_whose_identities_disagree_cannot_subscribe() {
+        let uri = "https://mixed-1809.invalid/notify";
+        let r = nrf_sbi_request_handler(subscribe_req(Some(OWNER), Some(OTHER), uri)).await;
+        assert_invalid_client(&r, "does not match its other verified identity", "mixed");
+        assert!(
+            nothing_stored_for(uri),
+            "a refused Subscribe stores nothing"
+        );
+    }
+
+    /// R26 on #1831: a restart re-arms an ownerless subscription for at most
+    /// 24 h, whatever validity an old PATCH stored, and leaves an owned one as
+    /// stored; and a PATCH is capped at 24 h like a Subscribe.
+    ///
+    /// REVERT-VERIFIED: with `restored_validity` returning the stored value,
+    /// the ownerless subscription keeps its 10 days and the first assertion
+    /// fails; with the PATCH cap removed, the PATCH stores 10 days.
+    #[tokio::test]
+    async fn validity_is_capped_at_24_hours_for_restored_ownerless_and_patched_1809() {
+        const TEN_DAYS: u64 = 10 * 86400;
+        let sub = |id: &str, owner: Option<&str>| nextgcore_nrfd::SubscriptionData {
+            id: id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://{id}.invalid/notify"),
+            subscr_cond: None,
+            validity_duration: TEN_DAYS,
+            req_notif_events: None,
+            notif_condition: None,
+            owner: owner.map(str::to_string),
+        };
+        let m = nf_manager();
+        m.add_subscription(sub("cap-ownerless-1809", None));
+        m.add_subscription(sub("cap-owned-1809", Some(OWNER)));
+        rearm_restored_timers();
+        assert_eq!(
+            m.find_subscription("cap-ownerless-1809")
+                .unwrap()
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "an ownerless subscription lapses within 24 h of the restart"
+        );
+        assert_eq!(
+            m.find_subscription("cap-owned-1809")
+                .unwrap()
+                .validity_duration,
+            TEN_DAYS,
+            "an owned one keeps what was stored"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req = as_caller(
+            SbiRequest::patch("/nnrf-nfm/v1/subscriptions/cap-owned-1809").with_body(
+                json!({ "validityTime": epoch_to_rfc3339(now + TEN_DAYS) }).to_string(),
+                "application/json",
+            ),
+            Some(OWNER),
+            None,
+        );
+        let r = nrf_sbi_request_handler(req).await;
+        assert_eq!(r.status, 200, "{:?}", r.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+        let granted = rfc3339_to_epoch(body["validityTime"].as_str().unwrap()).unwrap();
+        assert!(
+            granted <= now + NRF_SUBSCRIPTION_DEFAULT_VALIDITY + 5,
+            "the response returns the granted validity, not the proposal"
+        );
+        assert_eq!(
+            m.find_subscription("cap-owned-1809")
+                .unwrap()
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "a PATCH is capped like a Subscribe"
+        );
+        m.remove_subscription("cap-ownerless-1809");
+        m.remove_subscription("cap-owned-1809");
+    }
+
+    /// Under production an ownerless subscription (restored from a state file
+    /// written before #1809) cannot be updated or removed by anyone, the
+    /// consumer that may have created it included: nobody can prove it.
+    ///
+    /// REVERT-VERIFIED: with `bind_subscription` returning `None` for an
+    /// ownerless subscription whatever `required` says, both succeed.
+    #[tokio::test]
+    async fn under_production_an_ownerless_restored_subscription_is_frozen() {
+        let id = "restored-ownerless-1809";
+        nf_manager().add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: Some(OWNER.to_string()),
+            notification_uri: "http://restored-1809.invalid/notify".to_string(),
+            subscr_cond: None,
+            validity_duration: 600,
+            req_notif_events: None,
+            notif_condition: None,
+            owner: None,
+        });
+        for (cert, what) in [(Some(OWNER), "the claimed consumer"), (None, "anonymous")] {
+            let r = nrf_sbi_request_handler(patch(id, cert, None)).await;
+            assert_eq!(r.status, 403, "{what} PATCH: {:?}", r.http.content);
+            assert!(
+                r.http
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no verified owner"),
+                "{what}"
+            );
+            assert_eq!(
+                nf_manager()
+                    .find_subscription(id)
+                    .unwrap()
+                    .validity_duration,
+                600,
+                "{what}: nothing applied"
+            );
+            let r = nrf_sbi_request_handler(delete(id, cert, None)).await;
+            assert_eq!(r.status, 403, "{what} DELETE: {:?}", r.http.content);
+            assert!(
+                nf_manager().find_subscription(id).is_some(),
+                "{what}: still stored"
+            );
+        }
+        nf_manager().remove_subscription(id);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_subscription_is_still_404() {
+        let r = nrf_sbi_request_handler(delete("no-such-1809", Some(OTHER), None)).await;
+        assert_eq!(r.status, 404);
+        let r = nrf_sbi_request_handler(patch("no-such-1809", Some(OTHER), None)).await;
+        assert_eq!(r.status, 404);
     }
 }

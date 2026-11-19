@@ -1386,6 +1386,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         }
     }
 
@@ -1410,6 +1411,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         }
     }
 
