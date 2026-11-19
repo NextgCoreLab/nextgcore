@@ -4011,6 +4011,10 @@ mod tests_api_root {
                             .unwrap();
                     }
                     if method == "DELETE" {
+                        // A binding the BSF fails every time (#1954's starvation shape).
+                        if uri.ends_with("/b-poison") {
+                            return SbiResponse::with_status(500);
+                        }
                         return SbiResponse::with_status(delete);
                     }
                     tokio::time::sleep(post_delay).await;
@@ -4129,6 +4133,39 @@ mod tests_api_root {
         assert!(parked, "the failed deregistration is parked");
         assert!(!parked_after, "and delivered once the BSF answers");
         assert_eq!(tries, 2, "failed once, then delivered");
+    }
+
+    /// #1877 (R30 #1954): a parked deregistration the BSF fails every time does
+    /// not keep the others from their turn. A pass ends at the first failure, and the
+    /// one that failed goes to the back, so the next pass tries the others first.
+    ///
+    /// REVERT-VERIFIED: with the failed one re-parked at the front, this fails: the
+    /// second binding is never sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the PCF context guard, held across the test
+    async fn a_failing_deregistration_does_not_starve_the_others_1877() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::bsf_reconcile::clear_for_test();
+        let (srv, port, seen) = nrf_and_bsf_1877(
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204)),
+        )
+        .await;
+        let _nrf = crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        crate::bsf_reconcile::park("b-poison");
+        crate::bsf_reconcile::park("b-1877");
+
+        crate::bsf_reconcile::reconcile_once().await;
+        crate::bsf_reconcile::reconcile_once().await;
+        let delivered = binding_deletes_1877(&seen);
+        let poison_parked = crate::bsf_reconcile::is_parked("b-poison");
+        crate::bsf_reconcile::clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(delivered, 1, "the other binding is deregistered");
+        assert!(poison_parked, "the failing one stays parked");
     }
 
     /// #1322 (#1321 review): no self identity, no BSF binding, logged once.

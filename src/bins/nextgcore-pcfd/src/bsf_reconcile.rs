@@ -96,29 +96,42 @@ pub fn clear_for_test() {
 }
 
 /// One pass over the parked deregistrations. Returns how many ended.
+///
+/// They all go to the one BSF discovered now, so the first that fails ends the pass:
+/// the rest wait for the next one rather than each costing a timeout (R30 #1954,
+/// the starvation shape). The one that failed goes to the BACK of the queue and the
+/// untried keep their turn at the front, so each is tried in turn across passes.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<String> = lock().drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut still = Vec::new();
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
     for id in batch {
-        let delivered = tokio::time::Instant::now() < deadline
-            && matches!(
-                crate::sbi_path::pcf_deregister_bsf_binding(&id).await,
-                Ok(true)
-            );
-        if delivered {
+        if !failed.is_empty() || tokio::time::Instant::now() >= deadline {
+            untried.push(id);
+            continue;
+        }
+        if matches!(
+            crate::sbi_path::pcf_deregister_bsf_binding(&id).await,
+            Ok(true)
+        ) {
             log::info!("BSF binding {id}: deregistration reconciled");
             RECONCILED.inc(&["delivered"]);
             ended += 1;
         } else {
-            still.push(id);
+            failed.push(id);
         }
     }
     let mut set = lock();
-    for id in still.into_iter().rev() {
+    for id in untried.into_iter().rev() {
         if !set.contains(&id) {
             set.push_front(id);
+        }
+    }
+    for id in failed {
+        if !set.contains(&id) {
+            set.push_back(id);
         }
     }
     evict(&mut set);
