@@ -4619,6 +4619,8 @@ fn registration_accept_of_plain(plain: &[u8]) -> nextgcore_nas::fiveg::message::
 #[allow(clippy::await_holding_lock)]
 async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_sessions() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -4788,6 +4790,8 @@ fn setup_response_uris(calls: &[SmfCall]) -> Vec<String> {
 #[allow(clippy::await_holding_lock)]
 async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_session() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -4854,6 +4858,8 @@ async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_sess
 #[allow(clippy::await_holding_lock)]
 async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_session_up() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
@@ -4931,6 +4937,8 @@ async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_sessio
 #[allow(clippy::await_holding_lock)]
 async fn a_pages_setup_transfer_rides_the_registration_updates_initial_context_setup() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
@@ -4984,6 +4992,8 @@ async fn a_pages_setup_transfer_rides_the_registration_updates_initial_context_s
 #[allow(clippy::await_holding_lock)]
 async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session_up() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
@@ -5108,6 +5118,8 @@ async fn a_page_answered_by_an_initial_registration_is_stopped_and_notified() {
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_release_follows_the_registration_updates_initial_context_setup() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
@@ -5170,6 +5182,8 @@ async fn a_paged_release_follows_the_registration_updates_initial_context_setup(
 #[allow(clippy::await_holding_lock)]
 async fn a_periodic_update_from_cm_idle_without_session_ies_still_sets_up_the_ue_context() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -5229,6 +5243,8 @@ async fn a_periodic_update_from_cm_idle_without_session_ies_still_sets_up_the_ue
 #[allow(clippy::await_holding_lock)]
 async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_gets_its_accept() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let mut server = capturing_ngap_server().await;
@@ -5287,6 +5303,8 @@ async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_
 #[allow(clippy::await_holding_lock)]
 async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // #1588: this test reads the paging strategy.
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
@@ -5545,6 +5563,8 @@ async fn a_later_update_without_session_ies_clears_earlier_ones() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
@@ -5771,6 +5791,8 @@ async fn complete_idle_update(
     ids: (u64, u64, u32),
 ) -> (Vec<(u64, Option<u32>, Option<u8>)>, bool) {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1933: the Registration Accept resolves the PCF for the UE policy create.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let mut server = capturing_ngap_server().await;

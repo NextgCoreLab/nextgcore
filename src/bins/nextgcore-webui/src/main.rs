@@ -2104,10 +2104,23 @@ mod shipped_artefact_guards {
                 "the session cookie must set {attribute} -- block was: {cookie_block}"
             );
         }
-        // Secure must be the default, with only an explicit opt-out.
+        // Secure must be the default, with only an explicit opt-out, and (#1913)
+        // the opt-out is decided by the profile-aware helper, which refuses it
+        // under the production SBI profile. Its behaviour is pinned by
+        // webui/server/lib/insecure-dev.check.js (run in CI).
         assert!(
-            cookie_block.contains("WEBUI_INSECURE_DEV !== '1'"),
-            "`secure` must default to true and require an explicit opt-out"
+            cookie_block.contains("secure: !insecureDev"),
+            "`secure` must come from the profile-aware insecure-dev decision -- block was: \
+             {cookie_block}"
+        );
+        assert!(
+            server.contains("require('./lib/insecure-dev').insecureDev(process.env)"),
+            "index.js must decide WEBUI_INSECURE_DEV through lib/insecure-dev (#1913)"
+        );
+        let helper = read_code("webui/server/lib/insecure-dev.js");
+        assert!(
+            helper.contains("sbiProfile(env) !== 'dev'") && helper.contains("throw new Error("),
+            "the helper must refuse WEBUI_INSECURE_DEV outside the dev profile"
         );
     }
 }
