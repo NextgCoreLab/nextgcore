@@ -1327,25 +1327,36 @@ pub(crate) async fn delete_in_lane(c: &AmfMbsContext) -> Option<namf_client::Con
 
 /// The fast retries of [`release_amf_contexts`] (#1758), on a detached task; then
 /// (#1817) the reconciler.
-fn release_retries(mut failed: Vec<AmfMbsContext>) {
+///
+/// #2075: the contexts not yet delivered are held in an [`UndeliveredDeletes`]
+/// for the whole task, the one in flight included, so an abort (between retries
+/// or mid-delete) parks them with the reconciler instead of losing them.
+pub(crate) fn release_retries(failed: Vec<AmfMbsContext>) -> tokio::task::JoinHandle<()> {
     spawn_detached(async move {
+        let mut undelivered = UndeliveredDeletes(failed);
         for delay in AMF_RELEASE_RETRY_DELAYS {
             tokio::time::sleep(delay).await;
-            let mut still = Vec::new();
-            for c in failed {
+            let mut i = 0;
+            while let Some(c) = undelivered.0.get(i).cloned() {
                 // R24, #1854: in its lane, and not when a session reusing the TMGI
-                // got this same context back.
+                // got this same context back. #2075: it stays held until the
+                // outcome is known.
                 match delete_in_lane(&c).await {
-                    None => {}
-                    Some(namf_client::ContextDeleteOutcome::Failed) => still.push(c),
-                    Some(outcome) => retire_amf_notify_token(&c, outcome),
+                    Some(namf_client::ContextDeleteOutcome::Failed) => i += 1,
+                    None => {
+                        undelivered.0.remove(i);
+                    }
+                    Some(outcome) => {
+                        undelivered.0.remove(i);
+                        retire_amf_notify_token(&c, outcome);
+                    }
                 }
             }
-            failed = still;
-            if failed.is_empty() {
+            if undelivered.0.is_empty() {
                 return;
             }
         }
+        let failed = std::mem::take(&mut undelivered.0);
         for c in &failed {
             log::error!(
                 "MBS: AMF {}:{} MBS context {} could not be released after {} retries; \
@@ -1364,7 +1375,28 @@ fn release_retries(mut failed: Vec<AmfMbsContext>) {
         // pending-token bound; never the token cap's reclaim, which takes only
         // contexts the AMF released.
         reconcile::park(failed);
-    });
+    })
+}
+
+/// #2075: the ContextDeletes a [`release_retries`] task has not delivered yet.
+/// Dropped non-empty -- the task aborted -- they are parked with [`reconcile`]
+/// (which drops any a live session holds again), as the task would have done
+/// after its last retry. A delete in flight at the abort may have reached the
+/// AMF; the reconciler's resend is then a 404, which ends it.
+struct UndeliveredDeletes(Vec<AmfMbsContext>);
+
+impl Drop for UndeliveredDeletes {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        log::warn!(
+            "MBS: the ContextDelete retries for {} AMF MBS context(s) were dropped; \
+             parking them",
+            self.0.len()
+        );
+        reconcile::park(std::mem::take(&mut self.0));
+    }
 }
 
 /// #1796 (R29): how long a released AMF context's notify token is still admitted
