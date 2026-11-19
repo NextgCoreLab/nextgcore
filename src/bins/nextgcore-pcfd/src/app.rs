@@ -1127,12 +1127,12 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ("npcf-am-policy-control", "policies", "GET") if parts.len() >= 4 => {
             // Get AM Policy Association
             let pol_asso_id = parts[3];
-            handle_am_policy_get(pol_asso_id).await
+            handle_am_policy_get(pol_asso_id, &request).await
         }
         ("npcf-am-policy-control", "policies", "DELETE") if parts.len() >= 4 => {
             // Delete AM Policy Association
             let pol_asso_id = parts[3];
-            handle_am_policy_delete(pol_asso_id).await
+            handle_am_policy_delete(pol_asso_id, &request).await
         }
         ("npcf-am-policy-control", "policies", "PATCH") if parts.len() >= 4 => {
             // Legacy update path (kept for backward compatibility)
@@ -1151,10 +1151,10 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             handle_ue_policy_create(&request).await
         }
         ("npcf-ue-policy-control", "policies", "GET") if parts.len() >= 4 => {
-            handle_ue_policy_get(parts[3]).await
+            handle_ue_policy_get(parts[3], &request).await
         }
         ("npcf-ue-policy-control", "policies", "DELETE") if parts.len() >= 4 => {
-            handle_ue_policy_delete(parts[3]).await
+            handle_ue_policy_delete(parts[3], &request).await
         }
         // The three callbacks this PCF hands the serving AMF for a UE-policy
         // association (#1518): `notify/{polAssoId}/{segment}/{token}`, built by
@@ -1177,7 +1177,7 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         {
             // Delete SM Policy (TS 29.512 §4.2.5: POST /sm-policies/{id}/delete)
             let sm_policy_id = parts[3];
-            handle_sm_policy_delete(sm_policy_id).await
+            handle_sm_policy_delete(sm_policy_id, &request).await
         }
         ("npcf-smpolicycontrol", "sm-policies", "POST") if parts.len() < 4 => {
             // Create SM Policy
@@ -1186,12 +1186,12 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ("npcf-smpolicycontrol", "sm-policies", "GET") if parts.len() >= 4 => {
             // Get SM Policy
             let sm_policy_id = parts[3];
-            handle_sm_policy_get(sm_policy_id).await
+            handle_sm_policy_get(sm_policy_id, &request).await
         }
         ("npcf-smpolicycontrol", "sm-policies", "DELETE") if parts.len() >= 4 => {
             // Legacy delete path (kept for backward compatibility)
             let sm_policy_id = parts[3];
-            handle_sm_policy_delete(sm_policy_id).await
+            handle_sm_policy_delete(sm_policy_id, &request).await
         }
 
         // Policy Authorization Service (npcf-policyauthorization)
@@ -1553,6 +1553,14 @@ fn build_policy_association(
 
 pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
     log::info!("AM Policy Create");
+    // #1937: the NF this association is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Npcf_AMPolicyControl_Create",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -1602,6 +1610,7 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
             let features =
                 negotiated_feature_bits(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES);
             let mut updated = ue_am.clone();
+            updated.owner = owner;
             updated.am_policy_control_features = features;
             updated.ue_ambr_requested = policy_data.get("ueAmbr").is_some();
             updated.serv_area_res_requested = policy_data.get("servAreaRes").is_some();
@@ -1660,7 +1669,7 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
+pub async fn handle_am_policy_get(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
     log::debug!("AM Policy Get: {pol_asso_id}");
 
     let ctx = pcf_self();
@@ -1670,6 +1679,16 @@ pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
         None
     };
 
+    if let Some(ref ue_am) = ue_am {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            ue_am.owner.as_deref(),
+            request,
+            "Npcf_AMPolicyControl_Get",
+        ) {
+            return refused;
+        }
+    }
     match ue_am {
         Some(ue_am) => SbiResponse::with_status(200)
             .with_json_body(&build_policy_association(
@@ -1695,7 +1714,7 @@ pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
     }
 }
 
-pub async fn handle_am_policy_delete(pol_asso_id: &str) -> SbiResponse {
+pub async fn handle_am_policy_delete(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("AM Policy Delete: {pol_asso_id}");
 
     let ctx = pcf_self();
@@ -1709,6 +1728,14 @@ pub async fn handle_am_policy_delete(pol_asso_id: &str) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => {
+            // #1937: only the NF that created it, before anything is read or changed.
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                ue_am.owner.as_deref(),
+                request,
+                "Npcf_AMPolicyControl_Delete",
+            ) {
+                return refused;
+            }
             // Remove the UE AM
             if let Ok(context) = ctx.read() {
                 context.ue_am_remove(ue_am.id);
@@ -1749,6 +1776,14 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
             Some("POLICY_NOT_FOUND"),
         );
     };
+    // #1937: only the NF that created it, before anything is read or changed.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        ue_am.owner.as_deref(),
+        request,
+        "Npcf_AMPolicyControl_Update",
+    ) {
+        return refused;
+    }
 
     // TS 29.507 §4.2.3.1: apply the PolicyAssociationUpdateRequest, then
     // re-evaluate. Before #89 the body was deserialised into `_update_data` and
@@ -1903,6 +1938,14 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
 // UE Policy Control handlers (npcf-ue-policy-control, TS 29.525)
 
 pub async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
+    // #1937: the NF this association is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Npcf_UEPolicyControl_Create",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -1923,6 +1966,7 @@ pub async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
     };
     let negotiated = negotiate_features(Some(supp_feat), PCF_UE_POLICY_SUPPORTED_FEATURES);
     let assoc = ue_policy::ue_policy_add(supi, notification_uri, &negotiated);
+    ue_policy::ue_policy_set_owner(&assoc.pol_asso_id, owner);
 
     // #92: record the SERVING AMF's identity from the PolicyAssociationRequest
     // (TS 29.525 §4.2.2.2) BEFORE delivery is spawned, because the delivery task is
@@ -2380,8 +2424,19 @@ fn ue_policy_connectivity_callback_uri(pol_asso_id: &str) -> Option<String> {
     sbi_path::ue_policy_callback_uri(pol_asso_id, ue_policy::UePolicyCallback::ConnectivityState)
 }
 
-pub async fn handle_ue_policy_get(pol_asso_id: &str) -> SbiResponse {
-    match ue_policy::ue_policy_find(pol_asso_id) {
+pub async fn handle_ue_policy_get(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
+    let found = ue_policy::ue_policy_find(pol_asso_id);
+    if let Some(ref a) = found {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            a.owner.as_deref(),
+            request,
+            "Npcf_UEPolicyControl_Get",
+        ) {
+            return refused;
+        }
+    }
+    match found {
         Some(a) => SbiResponse::with_status(200)
             .with_json_body(&serde_json::json!({
                 "suppFeat": a.supp_feat,
@@ -2396,12 +2451,22 @@ pub async fn handle_ue_policy_get(pol_asso_id: &str) -> SbiResponse {
     }
 }
 
-pub async fn handle_ue_policy_delete(pol_asso_id: &str) -> SbiResponse {
+pub async fn handle_ue_policy_delete(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
     // Wave-6 E6: capture the UE-policy N1N2 subscription (if any) BEFORE
     // removing the association so the delete leg can unsubscribe at the AMF
     // (TS 29.518 §5.2.2.7). Removing the association also stops any running
     // T3501 loop (it reads the store each expiry) — cancel-on-delete.
     let assoc = ue_policy::ue_policy_find(pol_asso_id);
+    if let Some(ref a) = assoc {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            a.owner.as_deref(),
+            request,
+            "Npcf_UEPolicyControl_Delete",
+        ) {
+            return refused;
+        }
+    }
     if ue_policy::ue_policy_remove(pol_asso_id) {
         // #92: drop any delivery parked for a UE-reachability retry. Without this a
         // CONNECTIVITY_STATE_REPORT arriving after the delete would resend policy for
@@ -2746,6 +2811,14 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
             Some("POLICY_NOT_FOUND"),
         );
     };
+    // #1937: only the NF that created it, before anything is read or changed.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "Npcf_UEPolicyControl_Update",
+    ) {
+        return refused;
+    }
     let supi = existing.supi.clone();
 
     // `notificationUri` (§5.6.2.4): where subsequent notifications go. Applied first
@@ -3134,6 +3207,14 @@ fn late_overlapping_request(supi: &str, pdu_session_id: u8) -> SbiResponse {
 }
 
 pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
+    // #1937: the NF this association is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Npcf_SMPolicyControl_Create",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("SM Policy Create");
 
     let body = match &request.http.content {
@@ -3291,6 +3372,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 sess.sm_policy_id
             );
 
+            // #1937: bound to the SMF that created it.
+            sess.owner = owner.clone();
             // Persist context data needed for outbound notifications
             sess.notification_uri = Some(notification_uri.to_string());
             sess.dnn = Some(dnn.to_string());
@@ -3502,7 +3585,7 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
+pub async fn handle_sm_policy_get(sm_policy_id: &str, request: &SbiRequest) -> SbiResponse {
     log::debug!("SM Policy Get: {sm_policy_id}");
 
     let ctx = pcf_self();
@@ -3512,6 +3595,16 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
         None
     };
 
+    if let Some(ref sess) = sess {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            sess.owner.as_deref(),
+            request,
+            "Npcf_SMPolicyControl_Get",
+        ) {
+            return refused;
+        }
+    }
     match sess {
         Some(sess) => {
             // Reconstruct the stored SmPolicyDecision from the persisted session
@@ -3610,7 +3703,7 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
     }
 }
 
-pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
+pub async fn handle_sm_policy_delete(sm_policy_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("SM Policy Delete: {sm_policy_id}");
 
     let ctx = pcf_self();
@@ -3621,6 +3714,16 @@ pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
         None
     };
 
+    if let Some(ref sess) = sess {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            sess.owner.as_deref(),
+            request,
+            "Npcf_SMPolicyControl_Delete",
+        ) {
+            return refused;
+        }
+    }
     match sess {
         Some(sess) => {
             // Remove first, then act on what THIS call removed (#767 review):
@@ -4155,6 +4258,16 @@ pub async fn handle_sm_policy_update_notify(
         None
     };
 
+    if let Some(ref sess) = sess {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            sess.owner.as_deref(),
+            request,
+            "Npcf_SMPolicyControl_Update",
+        ) {
+            return refused;
+        }
+    }
     match sess {
         Some(sess) => {
             // Process reported triggers from SMF. repPolicyCtrlReqTriggers
@@ -4961,6 +5074,14 @@ fn build_app_session_context(
 }
 
 pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
+    // #1937: the NF this association is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Npcf_PolicyAuthorization_Create",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("App Session Create");
 
     let body = match &request.http.content {
@@ -5004,6 +5125,7 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         context.app_add(bound_sess.id).map(|app0| {
             let mut app = app0;
             app.notif_uri = notif_uri.clone();
+            app.owner = owner.clone();
             context.app_update(&app);
             app
         })
@@ -5108,19 +5230,19 @@ async fn route_policy_authorization(
         // POST /app-sessions/pcscf-restoration (TS 29.514 §4.2.5) — must be
         // matched BEFORE anything treats parts[3] as an appSessionId.
         (4, "POST") if parts[3] == "pcscf-restoration" => handle_pcscf_restoration(request).await,
-        (4, "GET") => handle_app_session_get(parts[3]).await,
+        (4, "GET") => handle_app_session_get(parts[3], request).await,
         (4, "PATCH") => handle_app_session_modify(parts[3], request).await,
         // Non-spec bare DELETE, kept because it is harmless and predates the
         // spec custom operation below.
-        (4, "DELETE") => handle_app_session_delete(parts[3]).await,
+        (4, "DELETE") => handle_app_session_delete(parts[3], request).await,
         // POST /app-sessions/{appSessionId}/delete (TS 29.514 §4.2.4.2) — the
         // spec deregistration.
-        (5, "POST") if parts[4] == "delete" => handle_app_session_delete(parts[3]).await,
+        (5, "POST") if parts[4] == "delete" => handle_app_session_delete(parts[3], request).await,
         (5, "PUT") if parts[4] == "events-subscription" => {
             handle_events_subscription_put(parts[3], request).await
         }
         (5, "DELETE") if parts[4] == "events-subscription" => {
-            handle_events_subscription_delete(parts[3]).await
+            handle_events_subscription_delete(parts[3], request).await
         }
         _ => {
             log::warn!("Unknown policy-authorization request: {method} {uri}");
@@ -5194,6 +5316,14 @@ pub async fn handle_events_subscription_put(
             Some("SESSION_NOT_FOUND"),
         );
     };
+    // #1937: only the NF that created it, before anything is read or changed.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        app.owner.as_deref(),
+        request,
+        "Npcf_PolicyAuthorization_Subscribe",
+    ) {
+        return refused;
+    }
     let created = app.events_subsc.is_none();
     app.events_subsc = Some(body.clone());
     if let Ok(context) = ctx.read() {
@@ -5213,7 +5343,10 @@ pub async fn handle_events_subscription_put(
 
 /// `DELETE /app-sessions/{appSessionId}/events-subscription` — TS 29.514 §4.2.6
 /// `DeleteEventsSubsc`.
-pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiResponse {
+pub async fn handle_events_subscription_delete(
+    app_session_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("Events Subscription DELETE: {app_session_id}");
     let ctx = pcf_self();
     let app = ctx
@@ -5222,6 +5355,14 @@ pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiRespo
         .and_then(|context| context.app_find_by_app_session_id(app_session_id));
     match app {
         Some(mut app) => {
+            // #1937: only the NF that created it, before anything is read or changed.
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                app.owner.as_deref(),
+                request,
+                "Npcf_PolicyAuthorization_Unsubscribe",
+            ) {
+                return refused;
+            }
             app.events_subsc = None;
             if let Ok(context) = ctx.read() {
                 context.app_update(&app);
@@ -5492,7 +5633,7 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
-pub async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
+pub async fn handle_app_session_get(app_session_id: &str, request: &SbiRequest) -> SbiResponse {
     log::debug!("App Session Get: {app_session_id}");
 
     let ctx = pcf_self();
@@ -5502,6 +5643,16 @@ pub async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
         None
     };
 
+    if let Some(ref app) = app {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            app.owner.as_deref(),
+            request,
+            "Npcf_PolicyAuthorization_Get",
+        ) {
+            return refused;
+        }
+    }
     match app {
         Some(app) => SbiResponse::with_status(200)
             .with_json_body(&serde_json::json!({
@@ -5516,7 +5667,7 @@ pub async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
     }
 }
 
-pub async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
+pub async fn handle_app_session_delete(app_session_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("App Session Delete: {app_session_id}");
 
     let ctx = pcf_self();
@@ -5527,6 +5678,16 @@ pub async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
         None
     };
 
+    if let Some(ref app) = app {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            app.owner.as_deref(),
+            request,
+            "Npcf_PolicyAuthorization_Delete",
+        ) {
+            return refused;
+        }
+    }
     match app {
         Some(app) => {
             // Removing AF media components revokes their PCC rules at the
@@ -5575,6 +5736,16 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
     } else {
         None
     };
+    if let Some(ref app) = app {
+        // #1937: only the NF that created it, before anything is read or changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            app.owner.as_deref(),
+            request,
+            "Npcf_PolicyAuthorization_Update",
+        ) {
+            return refused;
+        }
+    }
 
     match app {
         Some(app) => {
@@ -12474,6 +12645,229 @@ mod tests {
             "notifId": notif_id,
             "eventSubs": events,
         })
+    }
+
+    /// #1937: AM, UE and SM policy associations and AF app sessions (and an
+    /// app session's events subscription) are read, updated and deleted only
+    /// by the NF that created them. Through the real router, each stranger
+    /// (foreign certificate, foreign token, certificate/token mismatch,
+    /// anonymous) gets 403 on every manage operation with the resource still
+    /// there; the owner then succeeds.
+    ///
+    /// REVERT-VERIFIED separately: with the AM delete check removed, a
+    /// stranger's AM DELETE is 204; with the SM delete check removed, a
+    /// stranger's `POST .../delete` succeeds; with the app-session GET check
+    /// removed, a stranger's GET is 200; with `app.owner = owner` dropped at
+    /// create, every app-session stranger passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn policy_associations_and_app_sessions_are_managed_by_their_creator_1937() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        const OTHER: &str = "0e0e0e0e-1937-4000-8000-0000000000ff";
+        // The owner is TEST_CONSUMER_1865, which `make_request` presents.
+        let strangers = |method: &str, uri: &str, body: Option<serde_json::Value>| {
+            let base = || {
+                let mut r = make_request(method, uri, body.clone());
+                r.oauth2_subject = None;
+                r
+            };
+            let mut cert = base();
+            cert.peer_cert_nf_instance_id = Some(OTHER.into());
+            let mut token = base();
+            token.oauth2_subject = Some(OTHER.into());
+            let mut mismatch = base();
+            mismatch.peer_cert_nf_instance_id = Some(TEST_CONSUMER_1865.into());
+            mismatch.oauth2_subject = Some(OTHER.into());
+            vec![
+                ("foreign certificate", cert),
+                ("foreign token", token),
+                ("certificate/token mismatch", mismatch),
+                ("anonymous", base()),
+            ]
+        };
+        let location_of = |resp: &SbiResponse| {
+            let loc = resp
+                .http
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                .map(|(_, v)| v.clone())
+                .expect("Location");
+            loc.find("/npcf-")
+                .map(|i| loc[i..].to_string())
+                .expect("a PCF path")
+        };
+        async fn status(req: SbiRequest) -> u16 {
+            pcf_sbi_request_handler(req).await.status
+        }
+
+        // ---- AM policy association ----
+        let am = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000001937",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1937",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(am.status, 201, "{:?}", am.http.content);
+        let am_path = location_of(&am);
+        for (method, body) in [
+            ("GET", None),
+            ("POST", Some(serde_json::json!({}))),
+            ("DELETE", None),
+        ] {
+            let uri = if method == "POST" {
+                format!("{am_path}/update")
+            } else {
+                am_path.clone()
+            };
+            for (who, req) in strangers(method, &uri, body.clone()) {
+                assert_eq!(status(req).await, 403, "AM {method} by {who}");
+            }
+        }
+        assert_eq!(
+            status(make_request("GET", &am_path, None)).await,
+            200,
+            "AM still there"
+        );
+        assert_eq!(
+            status(make_request("DELETE", &am_path, None)).await,
+            204,
+            "AM owner deletes"
+        );
+
+        // ---- UE policy association ----
+        let ue = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1937",
+                "supi": "imsi-001010000011937",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(ue.status, 201, "{:?}", ue.http.content);
+        let ue_path = location_of(&ue);
+        for (method, uri, body) in [
+            ("GET", ue_path.clone(), None),
+            (
+                "POST",
+                format!("{ue_path}/update"),
+                Some(serde_json::json!({})),
+            ),
+            ("DELETE", ue_path.clone(), None),
+        ] {
+            for (who, req) in strangers(method, &uri, body.clone()) {
+                assert_eq!(status(req).await, 403, "UE {method} by {who}");
+            }
+        }
+        assert_eq!(
+            status(make_request("GET", &ue_path, None)).await,
+            200,
+            "UE still there"
+        );
+        assert_eq!(
+            status(make_request("DELETE", &ue_path, None)).await,
+            204,
+            "UE owner deletes"
+        );
+
+        // ---- SM policy association, then an AF app session bound to it ----
+        let mut sm_body = full_create_body("imsi-001010000021937", 7);
+        sm_body["ipv4Address"] = serde_json::json!("10.45.19.37");
+        let sm = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(sm_body),
+        ))
+        .await;
+        assert_eq!(sm.status, 201, "{:?}", sm.http.content);
+        let sm_path = location_of(&sm);
+        let app = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(
+                "http://127.0.0.1:9/af-1937",
+                ("ueIpv4", "10.45.19.37"),
+            )),
+        ))
+        .await;
+        assert_eq!(app.status, 201, "{:?}", app.http.content);
+        let app_path = location_of(&app);
+        let events = serde_json::json!({
+            "events": [{"event": "QOS_NOTIF"}],
+            "notifUri": "http://127.0.0.1:9/af-1937-events"
+        });
+        for (method, uri, body) in [
+            ("GET", app_path.clone(), None),
+            ("PATCH", app_path.clone(), Some(serde_json::json!({}))),
+            (
+                "PUT",
+                format!("{app_path}/events-subscription"),
+                Some(events.clone()),
+            ),
+            ("DELETE", format!("{app_path}/events-subscription"), None),
+            (
+                "POST",
+                format!("{app_path}/delete"),
+                Some(serde_json::json!({})),
+            ),
+            ("DELETE", app_path.clone(), None),
+        ] {
+            for (who, req) in strangers(method, &uri, body.clone()) {
+                assert_eq!(status(req).await, 403, "app {method} {uri} by {who}");
+            }
+        }
+        for (method, uri, body) in [
+            ("GET", sm_path.clone(), None),
+            (
+                "POST",
+                format!("{sm_path}/update"),
+                Some(serde_json::json!({})),
+            ),
+            (
+                "POST",
+                format!("{sm_path}/delete"),
+                Some(serde_json::json!({})),
+            ),
+            ("DELETE", sm_path.clone(), None),
+        ] {
+            for (who, req) in strangers(method, &uri, body.clone()) {
+                assert_eq!(status(req).await, 403, "SM {method} {uri} by {who}");
+            }
+        }
+        assert_eq!(
+            status(make_request("GET", &app_path, None)).await,
+            200,
+            "app still there"
+        );
+        assert_eq!(
+            status(make_request("GET", &sm_path, None)).await,
+            200,
+            "SM still there"
+        );
+        assert_eq!(
+            status(make_request("DELETE", &app_path, None)).await,
+            204,
+            "the AF deletes its app session"
+        );
+        let r = status(make_request(
+            "POST",
+            &format!("{sm_path}/delete"),
+            Some(serde_json::json!({})),
+        ))
+        .await;
+        assert!(
+            (200..300).contains(&r),
+            "the SMF deletes its SM policy: {r}"
+        );
     }
 
     /// #1865: a policy control events subscription is read, replaced and

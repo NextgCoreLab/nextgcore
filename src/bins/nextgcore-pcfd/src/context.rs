@@ -163,6 +163,12 @@ pub struct PcfUeAm {
     pub serv_area_res_requested: bool,
     #[serde(default)]
     pub rfsp_requested: bool,
+    /// #1937: the verified identity of the NF that created it
+    /// (`nextgcore_sbi::owner_binding`); only it may read, update or delete
+    /// it. Absent in a snapshot written before #1937: restored ownerless,
+    /// which the production profile freezes.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -226,6 +232,7 @@ pub struct RouteSelectionDescriptor {
 impl PcfUeAm {
     pub fn new(id: u64, supi: &str) -> Self {
         Self {
+            owner: None,
             id,
             association_id: Uuid::new_v4().to_string(),
             supi: supi.to_string(),
@@ -622,6 +629,12 @@ pub struct PcfSess {
     /// `#[serde(default)]` for older snapshots.
     #[serde(default)]
     pub vplmn_qos: Option<crate::vplmn_qos::VplmnQosBound>,
+    /// #1937: the verified identity of the NF that created it
+    /// (`nextgcore_sbi::owner_binding`); only it may read, update or delete
+    /// it. Absent in a snapshot written before #1937: restored ownerless,
+    /// which the production profile freezes.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// The cap a demo installed on a session ([`PcfSess::demo_ambr_cap`]).
@@ -661,6 +674,7 @@ pub fn next_demo_cap_generation() -> u64 {
 impl PcfSess {
     pub fn new(id: u64, pcf_ue_sm_id: u64, psi: u8) -> Self {
         Self {
+            owner: None,
             id,
             sm_policy_id: Uuid::new_v4().to_string(),
             binding: PcfBinding::default(),
@@ -1220,11 +1234,18 @@ pub struct PcfApp {
     /// `serde(default)` so a snapshot written before #88 still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_subsc: Option<serde_json::Value>,
+    /// #1937: the verified identity of the NF that created it
+    /// (`nextgcore_sbi::owner_binding`); only it may read, update or delete
+    /// it. Absent in a snapshot written before #1937: restored ownerless,
+    /// which the production profile freezes.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl PcfApp {
     pub fn new(id: u64, sess_id: u64) -> Self {
         Self {
+            owner: None,
             id,
             app_session_id: Uuid::new_v4().to_string(),
             notif_uri: None,
