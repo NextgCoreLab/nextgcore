@@ -7216,7 +7216,7 @@ impl NgapServer {
                 &guard,
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                &state.amf_ue.allowed_nssai,
+                &guard.ngap_allowed_nssai(&state.amf_ue),
                 &state.amf_ue.ue_security_capability,
                 &kgnb,
                 Some(protected),
@@ -7695,7 +7695,12 @@ impl NgapServer {
         state.amf_ue.init_next_hop_chain();
 
         let tmsi = state.amf_ue.next_guti.tmsi;
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        // #2033: NGAP's Allowed NSSAI is mandatory; an unauthenticated emergency UE's
+        // is the emergency S-NSSAI, while the NAS Accept built above carries none.
+        let allowed_nssai = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ngap_allowed_nssai(&state.amf_ue);
         // #361: §6.7.3.6 requires the NGAP UE INITIAL CONTEXT SETUP to carry only the null
         // algorithms for an unauthenticated emergency session. Narrowed here, on the NAS
         // octets, because this is the one egress site that hands `ngap_asn1` the NAS-shaped
@@ -8709,7 +8714,11 @@ impl NgapServer {
             pdu_session_status,
             uplink_data_status.then_some(reactivation_failed),
         );
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        // #2033: NGAP's Allowed NSSAI, the emergency S-NSSAI for an emergency-only UE.
+        let allowed_nssai = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ngap_allowed_nssai(&state.amf_ue);
         let ue_security_capability = state.amf_ue.ue_security_capability.clone();
         let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
             .then_some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink));
@@ -17159,9 +17168,11 @@ impl NgapServer {
                     },
                 )
                 .collect(),
-            allowed_nssai: state
-                .amf_ue
-                .allowed_nssai
+            // #2033: mandatory in the Handover Request, as in the ICS.
+            allowed_nssai: crate::context::amf_self()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ngap_allowed_nssai(&state.amf_ue)
                 .iter()
                 .map(|s| nextgcore_ngap::types::SNssai {
                     sst: s.sst,

@@ -4474,6 +4474,8 @@ struct SentIcs {
     nas_pdu: Option<Vec<u8>>,
     items: Vec<SetupItem>,
     security_key: Vec<u8>,
+    /// #2033: the Allowed NSSAI, as `(sst, sd)`.
+    allowed_nssai: Vec<(u8, Option<u32>)>,
 }
 
 /// Decode `pdu` as an INITIAL CONTEXT SETUP REQUEST, or `None` for anything else.
@@ -4491,6 +4493,7 @@ fn decode_ics(pdu: &[u8]) -> Option<SentIcs> {
         nas_pdu: None,
         items: Vec::new(),
         security_key: Vec::new(),
+        allowed_nssai: Vec::new(),
     };
     for ie in req.protocol_i_es.0 {
         match ie.value {
@@ -4498,6 +4501,19 @@ fn decode_ics(pdu: &[u8]) -> Option<SentIcs> {
             V::Id_RAN_UE_NGAP_ID(id) => out.ran_ue_ngap_id = id.0,
             V::Id_NAS_PDU(n) => out.nas_pdu = Some(n.0),
             V::Id_SecurityKey(k) => out.security_key = k.0.into_vec(),
+            V::Id_AllowedNSSAI(a) => {
+                out.allowed_nssai =
+                    a.0.into_iter()
+                        .map(|it| {
+                            (
+                                it.s_nssai.sst.0.first().copied().unwrap_or_default(),
+                                it.s_nssai.sd.map(|sd| {
+                                    sd.0.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))
+                                }),
+                            )
+                        })
+                        .collect()
+            }
             V::Id_PDUSessionResourceSetupListCxtReq(l) => {
                 for it in l.0 {
                     out.items.push(SetupItem {
@@ -6323,4 +6339,100 @@ async fn an_idle_ues_deregistration_request_deregisters_it_1691() {
     }
     server.forced_amf_ue_ngap_id = None;
     server.forget_ue(old_id);
+}
+
+/// **#2033, TS 23.502 §4.12.2.3 / TS 38.413 §9.2.2.1 / TS 23.501 §5.16.4.1.** An
+/// unauthenticated emergency registration gets its Registration Accept. The NAS Accept
+/// carries no Allowed NSSAI ("The AMF shall not send the Allowed NSSAI in the
+/// Registration Accept message"), but the Initial Context Setup Request that carries it
+/// needs one (mandatory, SIZE(1..8)): it names the emergency S-NSSAI of the AMF's
+/// Emergency Configuration Data, else the default S-NSSAI. The empty list it used to
+/// pass did not encode, and the UE got nothing.
+///
+/// REVERT-VERIFIED: with `ngap_allowed_nssai` returning the UE's (empty) Allowed NSSAI
+/// again, no Initial Context Setup Request is sent and the first assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_emergency_registration_gets_its_accept_2033() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _policy = crate::emergency::emergency_policy_test_guard().await;
+    let _guami = ServeOneGuami::install();
+    struct EmergencySlice(Option<crate::context::SNssai>);
+    impl Drop for EmergencySlice {
+        fn drop(&mut self) {
+            let ctx = crate::context::amf_self();
+            ctx.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .emergency_s_nssai = self.0.take();
+        }
+    }
+    let _slice = {
+        let ctx = crate::context::amf_self();
+        let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+        EmergencySlice(guard.emergency_s_nssai.replace(crate::context::SNssai {
+            sst: 1,
+            sd: Some(0x00_20_33),
+        }))
+    };
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_203_301u64, 72);
+    let mut ctx = UeNasContext::new(ue, ran, ASSOC, false);
+    ctx.amf_ue.registration_type = crate::gmm_build::registration_type::EMERGENCY;
+    ctx.amf_ue.unauthenticated_emergency = true;
+    ctx.amf_ue.requested_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+    server.ue_auth_state.insert(ue, ctx);
+    server.emergency.handle_emergency_registration(ue, false);
+
+    let _ = server.complete_registration(ASSOC, ue, ran).await;
+
+    let ics: Vec<SentIcs> = take_sent_ngap(&mut server)
+        .iter()
+        .filter_map(|(_, p)| decode_ics(p))
+        .collect();
+    let [ics] = ics.as_slice() else {
+        panic!("one Initial Context Setup Request carries the Accept, got {ics:?}");
+    };
+    assert_eq!(ics.amf_ue_ngap_id, ue);
+    assert_eq!(
+        ics.allowed_nssai,
+        vec![(1, Some(0x00_20_33))],
+        "NGAP names the emergency S-NSSAI"
+    );
+    // NIA0/NEA0: the NAS PDU after its 7-octet security header is the plain Accept.
+    let nas = ics.nas_pdu.as_deref().expect("the Accept rides the ICS");
+    let accept = registration_accept_of_plain(&nas[7..]);
+    assert!(
+        accept.allowed_nssai.is_none(),
+        "the NAS Accept still omits the Allowed NSSAI (TS 23.502 §4.12.2.3)"
+    );
+    assert!(server
+        .ue_auth_state
+        .get(ue)
+        .is_some_and(|s| s.amf_ue.allowed_nssai.is_empty()));
+    server.forget_ue(ue);
+}
+
+/// **#2033.** The NGAP Allowed NSSAI: the UE's own when it has one; for an
+/// unauthenticated emergency UE without one, the emergency S-NSSAI, else the default.
+#[test]
+fn the_ngap_allowed_nssai_falls_back_to_the_emergency_slice_2033() {
+    let s = |sst, sd| crate::context::SNssai { sst, sd };
+    let mut ctx = crate::context::AmfContext::default();
+    let mut ue = UeNasContext::new(7_203_302, 1, ASSOC, false).amf_ue;
+    ue.allowed_nssai = vec![s(2, None)];
+    assert_eq!(ctx.ngap_allowed_nssai(&ue), vec![s(2, None)]);
+    ue.allowed_nssai.clear();
+    assert!(
+        ctx.ngap_allowed_nssai(&ue).is_empty(),
+        "an ordinary UE: as is"
+    );
+    ue.unauthenticated_emergency = true;
+    assert_eq!(ctx.ngap_allowed_nssai(&ue), vec![ctx.default_s_nssai()]);
+    ctx.emergency_s_nssai = Some(s(1, Some(0x2033)));
+    assert_eq!(ctx.ngap_allowed_nssai(&ue), vec![s(1, Some(0x2033))]);
+    ctx.emergency_s_nssai = Some(s(0, None));
+    assert_eq!(
+        ctx.ngap_allowed_nssai(&ue),
+        vec![ctx.default_s_nssai()],
+        "SST 0 is no slice"
+    );
 }

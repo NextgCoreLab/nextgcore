@@ -482,6 +482,10 @@ pub struct AmfContext {
     pub num_of_plmn_support: usize,
     /// PLMN support list
     pub plmn_support: Vec<PlmnSupport>,
+    /// #2033: the S-NSSAI of the AMF's Emergency Configuration Data (TS 23.501
+    /// §5.16.4.1: it "contains the S-NSSAI and Emergency DNN"), `amf.emergency.s_nssai`.
+    /// `None`: the [default S-NSSAI](Self::default_s_nssai).
+    pub emergency_s_nssai: Option<SNssai>,
 
     // Access Control
     /// Default reject cause
@@ -1474,6 +1478,7 @@ impl AmfContext {
             served_tai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA),
             num_of_plmn_support: 0,
             plmn_support: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
+            emergency_s_nssai: None,
             default_reject_cause: 0,
             num_of_access_control: 0,
             access_control: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
@@ -2264,6 +2269,28 @@ impl AmfContext {
             .find(|s| s.sst != 0)
             .cloned()
             .unwrap_or(SNssai { sst: 1, sd: None })
+    }
+
+    /// #2033: the S-NSSAI emergency services use, from the Emergency Configuration Data
+    /// (TS 23.501 §5.16.4.1), else this AMF's [default](Self::default_s_nssai).
+    pub fn emergency_s_nssai(&self) -> SNssai {
+        self.emergency_s_nssai
+            .clone()
+            .filter(|s| s.sst != 0)
+            .unwrap_or_else(|| self.default_s_nssai())
+    }
+
+    /// #2033: the Allowed NSSAI an NGAP message for `ue` carries. TS 38.413 makes it
+    /// mandatory, SIZE(1..8), in the Initial Context Setup Request and the Handover
+    /// Request; an unauthenticated emergency UE has none (TS 23.502 §4.12.2.3: "The AMF
+    /// shall not send the Allowed NSSAI in the Registration Accept message"), so NGAP
+    /// names the emergency S-NSSAI while the NAS Accept still omits the IE. It used to
+    /// be the empty list, which does not encode: the UE never got its Accept.
+    pub fn ngap_allowed_nssai(&self, ue: &AmfUe) -> Vec<SNssai> {
+        if ue.allowed_nssai.is_empty() && ue.unauthenticated_emergency {
+            return vec![self.emergency_s_nssai()];
+        }
+        ue.allowed_nssai.clone()
     }
 
     /// `candidate`, unless it is missing or names SST 0 (no slice), in which case the
