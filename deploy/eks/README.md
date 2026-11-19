@@ -513,6 +513,73 @@ Remove the patch before re-running `deploy-eks.sh`. `kubectl apply` keeps fields
 that `kubectl patch` added, so delete them with a JSON patch that removes the env
 entry, the volume mount and the volume.
 
+## UDM durable state (optional, off by default)
+
+By default udmd keeps its SDM subscriptions, its am-data subscriptions at the UDR
+(the "legs") and the am-data changes waiting for an AMF in memory (#1836). A udmd
+restart then loses them. The AMF's SDM subscription is gone without the AMF
+knowing, and provisioning changes stop reaching it until the UE registers again.
+The leg refresh and the AMF retry still work without a state file. Only the
+restart is not survived.
+
+With a state file (`NEXTGCORE_UDM_STATE_FILE` or `--state-file`), udmd writes all
+of them before it answers, and restores them at start. Its first leg refresh then
+re-points the UDR to the pod's new address.
+
+The profiles leave it **off**, and udmd logs `no UDM state file ... lost on
+restart` at start. The shipped Docker compose sets it on the `udm_state` volume.
+Here, `UDM_DURABLE_STATE` turns it on (#1885):
+
+```bash
+UDM_DURABLE_STATE=pvc ./deploy-eks.sh        # a gp3 claim: survives pod re-creation
+UDM_DURABLE_STATE=emptydir ./deploy-eks.sh   # no provisioner: container restarts only
+DRY_RUN=true UDM_DURABLE_STATE=pvc ./deploy-eks.sh   # render only
+```
+
+| `UDM_DURABLE_STATE` | What the udm pod gets |
+|---|---|
+| `auto` (default) | The live udm Deployment's mode, so a plain re-run keeps the state file. A fresh install, or `DRY_RUN`, is `false`. |
+| `false` | Memory-only, as before. |
+| `pvc` | `components/udm-durable-state`: PersistentVolumeClaim `udm-state` (gp3, ReadWriteOnce, 1Gi) mounted at `/var/lib/nextgcore`, `NEXTGCORE_UDM_STATE_FILE=/var/lib/nextgcore/udm-state.json`, one replica, strategy `Recreate`. |
+| `emptydir` | `k8s/components/udm-durable-state-emptydir`: the same mount and env on an `emptyDir`. |
+
+Both are kustomize components over `k8s/manifests/udm.yaml`
+(`k8s/components/udm-durable-state[-emptydir]`), so a plain `kubectl kustomize`
+overlay can use them too. deploy-eks.sh adds them through a throwaway
+kustomization over the profile, so no profile lists them. The pod's existing
+`fsGroup: 999` makes the volume writable by the image's non-root `nextgcore`
+user. No securityContext changes, and nothing is exposed.
+
+**The trade-off.** An `emptyDir` lives as long as the pod. It survives a udmd
+container restart (a crash, an OOM kill, a failed liveness probe). It does not
+survive the pod being deleted, evicted, rescheduled or replaced by a rollout:
+the new pod starts with no state, as with `false`. Surviving pod re-creation
+needs `pvc`, which needs the EBS CSI driver behind the `gp3` class (the
+CloudFormation template installs it). devtest1's only class, `gp2`, uses the
+in-tree provisioner, so a `pvc` claim stays Pending there and the udm pod with
+it.
+
+**One writer per file.** The state is one udmd instance's. With `pvc` the
+Deployment is pinned to one replica and `Recreate`, so a rollout stops the old
+pod before the new one mounts the claim. Do not scale it: a second replica would
+share the claim. `Recreate` covers rollouts only. A `kubectl delete pod` or a node
+drain starts the replacement while the old pod terminates, and on the same node
+a ReadWriteOnce claim lets both mount it for the grace period. A storage class
+whose CSI driver supports `ReadWriteOncePod` closes that window: set
+`accessModes: ["ReadWriteOncePod"]` in `components/udm-durable-state/pvc-gp3.yaml`
+before the first apply, since a bound claim's access modes cannot change.
+
+Turning it off again (`UDM_DURABLE_STATE=false`) removes the env, the mount and
+the volume, but `kubectl apply` does not delete the `udm-state` claim. Delete it
+yourself if the state should go. `auto` refuses a udm Deployment that a hand
+`kubectl patch` gave the env or a `udm-state` volume this script did not render.
+Remove the patch, or set the mode explicitly.
+
+CI renders all of this offline (`deploy/check_udm_state_volume.py`): the base and
+the default profiles carry no state volume, mount or env, and each mode carries
+all three, for `k8s/`, the 5g and 6g profiles, and the Helm chart
+(`udm.durableState`, see `deploy/helm/nextgcore/README.md`).
+
 ## Known limitations
 
 Infrastructure (see `Outputs.Caveats` in the template):

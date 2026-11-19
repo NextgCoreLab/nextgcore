@@ -174,6 +174,68 @@ pub(crate) fn setup_response_transfer(
     )
 }
 
+/// One MBS QoS flow with a standardized 5QI and ARP 8 / shall-not-trigger /
+/// not-pre-emptable, as every transfer this MB-SMF builds carries it.
+fn mbs_qos_flow(qfi: u8, five_qi: u8) -> g::MBS_QoSFlowsToBeSetupItem {
+    g::MBS_QoSFlowsToBeSetupItem {
+        mb_sqos_flow_identifier: g::QosFlowIdentifier(qfi),
+        mb_sqos_flow_level_qos_parameters: g::QosFlowLevelQosParameters {
+            qos_characteristics: g::QosCharacteristics::NonDynamic5QI(g::NonDynamic5QIDescriptor {
+                five_qi: g::FiveQI(five_qi),
+                priority_level_qos: None,
+                averaging_window: None,
+                maximum_data_burst_volume: None,
+                ie_extensions: None,
+            }),
+            allocation_and_retention_priority: g::AllocationAndRetentionPriority {
+                priority_level_arp: g::PriorityLevelARP(8),
+                pre_emption_capability: g::Pre_emptionCapability(
+                    g::Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION,
+                ),
+                pre_emption_vulnerability: g::Pre_emptionVulnerability(
+                    g::Pre_emptionVulnerability::NOT_PRE_EMPTABLE,
+                ),
+                ie_extensions: None,
+            },
+            gbr_qos_information: None,
+            reflective_qos_attribute: None,
+            additional_qos_flow_information: None,
+            ie_extensions: None,
+        },
+        ie_extensions: None,
+    }
+}
+
+/// `MBSSessionSetupOrModRequestTransfer` (TS 38.413 §9.3.5.x,
+/// `ngap-17.9.asn:7425`): the N2 MBS SM container of a broadcast
+/// Namf_MBSBroadcast_ContextCreate (TS 23.247 §7.3.1 step 2: "N2 SM information
+/// ([LL SSM], 5G QoS Profile)"), #1796. Carries the session's one MBS QoS flow.
+/// The LL SSM (`MBS-SessionTNLInfo5GC`) is optional and not included: without
+/// it the NG-RAN uses N3mb unicast transport (step 5b).
+pub(crate) fn setup_or_mod_request_transfer(
+    qfi: u8,
+    five_qi: u8,
+) -> Result<Vec<u8>, TransferError> {
+    const WHAT: &str = "MBSSessionSetupOrModRequestTransfer";
+    if qfi > MAX_QFI {
+        return Err(TransferError(format!("{WHAT}: QFI {qfi} > {MAX_QFI}")));
+    }
+    encode(
+        WHAT,
+        &g::MBSSessionSetupOrModRequestTransfer {
+            protocol_i_es: g::MBSSessionSetupOrModRequestTransferProtocolIEs(vec![
+                g::MBSSessionSetupOrModRequestTransferProtocolIEs_Entry {
+                    id: g::ProtocolIE_ID(g::ID_MBS_QO_S_FLOWS_TO_BE_SETUP_MOD_LIST),
+                    criticality: g::Criticality(g::Criticality::REJECT),
+                    value: g::MBSSessionSetupOrModRequestTransferProtocolIEs_EntryValue::Id_MBS_QoSFlowsToBeSetupModList(
+                        g::MBS_QoSFlowsToBeSetupList(vec![mbs_qos_flow(qfi, five_qi)]),
+                    ),
+                },
+            ]),
+        },
+    )
+}
+
 /// `MBS-DistributionSetupUnsuccessfulTransfer` (TS 38.413 §9.3.5.9) with Cause
 /// transport / transport-resource-unavailable and no Criticality Diagnostics.
 pub(crate) fn setup_unsuccessful_transfer(tmgi: NgapTmgi) -> Result<Vec<u8>, TransferError> {

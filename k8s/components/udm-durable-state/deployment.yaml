@@ -1,0 +1,29 @@
+# Strategic merge into k8s/manifests/udm.yaml: volumes, volumeMounts and env
+# merge by name, so the base entries stay.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udm
+  namespace: nextg-system
+spec:
+  replicas: 1
+  # The old pod stops before the new one mounts the claim: one writer (#1885).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: udm
+          env:
+            # #1836: SDM subscriptions, the UDR am-data subscriptions and the
+            # queued am-data changes survive a udmd restart.
+            - name: NEXTGCORE_UDM_STATE_FILE
+              value: /var/lib/nextgcore/udm-state.json
+          volumeMounts:
+            - name: udm-state
+              mountPath: /var/lib/nextgcore
+      volumes:
+        - name: udm-state
+          persistentVolumeClaim:
+            claimName: udm-state

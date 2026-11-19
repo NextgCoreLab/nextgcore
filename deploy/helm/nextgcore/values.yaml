@@ -319,6 +319,36 @@ udm:
   metrics:
     enabled: true
     port: 9090
+  # #1836/#1885: udmd's durable state file (SDM subscriptions, its am-data
+  # subscriptions at the UDR, and the am-data changes waiting for an AMF). Off:
+  # udmd runs memory-only and a restart loses them (it logs `no UDM state file`).
+  # On: the chart mounts a volume at mountPath and sets
+  # NEXTGCORE_UDM_STATE_FILE=<mountPath>/<fileName>.
+  #
+  # One writer per file: the state is per udmd instance. With durable state on,
+  # udm.replicas must be 1 (the render fails otherwise), the Deployment is
+  # Recreate (the old pod is gone before the new one mounts the claim), and a
+  # shared ReadWriteMany/ReadOnlyMany claim is refused.
+  durableState:
+    enabled: false
+    # pvc:      a PersistentVolumeClaim; survives pod re-creation (a delete, a
+    #           rollout, a node loss).
+    # emptyDir: survives a container restart in the same pod only. A deleted or
+    #           rescheduled pod starts with no state. For clusters with no
+    #           volume provisioner.
+    type: pvc
+    mountPath: /var/lib/nextgcore
+    fileName: udm-state.json
+    persistence:
+      # A claim created outside the chart, so it outlives `helm uninstall`.
+      # Empty: the chart creates <release>-udm-state, deleted with the release.
+      existingClaim: ""
+      # Empty: the cluster's default StorageClass. EKS: gp3 (EBS CSI).
+      storageClass: ""
+      # ReadWriteOnce or ReadWriteOncePod; ReadWriteMany is refused (two writers).
+      accessMode: ReadWriteOnce
+      # The file is small; 1Gi is the gp3 minimum.
+      size: 1Gi
 
 # UDR - Unified Data Repository
 udr:

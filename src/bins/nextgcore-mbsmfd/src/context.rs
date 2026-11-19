@@ -135,6 +135,9 @@ pub struct AmfMbsContext {
     pub port: u16,
     pub nf_instance_id: Option<String>,
     pub context_ref: String,
+    /// #1796: the token ending the `notifyUri` this ContextCreate gave the AMF,
+    /// by which its ContextStatusNotify is admitted and matched to the session.
+    pub notify_token: String,
     /// #1854: the TMGI it was created for, so its delete takes the same
     /// (AMF, TMGI) lane as a create for that TMGI ([`crate::lane`]). `None` when
     /// unknown.
@@ -157,6 +160,11 @@ fn boot_session_id_base() -> usize {
         .unwrap_or(1)
         .max(1)
 }
+
+/// #1796: the most AMF ContextStatusNotify tokens held at once. One is minted per
+/// ContextCreate and forgotten when its context is released; past the cap a
+/// ContextCreate is not sent.
+pub const MAX_AMF_NOTIFY_TOKENS: usize = 4096;
 
 /// MBS Session Context (TS 23.247 5.3)
 #[derive(Debug, Clone)]
@@ -697,6 +705,12 @@ pub struct MbSmfContext {
     /// clone written back by `session_update` can erase one. Lock order:
     /// `session_list` before this.
     amf_contexts: Mutex<HashMap<u64, Vec<AmfMbsContext>>>,
+    /// #1796: the live AMF ContextStatusNotify tokens, by token, with the session
+    /// each was minted for. Lock order: after `amf_contexts`.
+    amf_notify_tokens: Mutex<HashMap<String, u64>>,
+    /// #1796: `{scheme}://{advertised host:port}`, the base of the `notifyUri`s
+    /// this MB-SMF gives the AMF; `None` until startup sets it.
+    amf_notify_base: RwLock<Option<String>>,
 }
 
 impl MbSmfContext {
@@ -713,7 +727,64 @@ impl MbSmfContext {
             status_subs: Mutex::new(SubscriptionStore::new()),
             context_status_subs: Mutex::new(SubscriptionStore::new()),
             amf_contexts: Mutex::new(HashMap::new()),
+            amf_notify_tokens: Mutex::new(HashMap::new()),
+            amf_notify_base: RwLock::new(None),
         }
+    }
+
+    /// #1796: set the base of the AMF `notifyUri`s (from the advertised SBI address).
+    pub fn set_amf_notify_base(&self, base: impl Into<String>) {
+        if let Ok(mut b) = self.amf_notify_base.write() {
+            *b = Some(base.into());
+        }
+    }
+
+    /// #1796: the base of the AMF `notifyUri`s, once set.
+    pub fn amf_notify_base(&self) -> Option<String> {
+        self.amf_notify_base.read().ok()?.clone()
+    }
+
+    /// #1796: a fresh ContextStatusNotify token for session `id`, or `None` at
+    /// [`MAX_AMF_NOTIFY_TOKENS`].
+    pub fn mint_amf_notify_token(&self, id: u64) -> Option<String> {
+        let mut tokens = self.amf_notify_tokens.lock().ok()?;
+        if tokens.len() >= MAX_AMF_NOTIFY_TOKENS {
+            log::warn!("MBS: {MAX_AMF_NOTIFY_TOKENS} AMF notification tokens held; none minted");
+            return None;
+        }
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        tokens.insert(token.clone(), id);
+        Some(token)
+    }
+
+    /// #1796: the session a live ContextStatusNotify token was minted for.
+    pub fn amf_notify_session(&self, token: &str) -> Option<u64> {
+        self.amf_notify_tokens.lock().ok()?.get(token).copied()
+    }
+
+    /// #1796: forget a token whose AMF context is gone (or was never created).
+    pub fn forget_amf_notify_token(&self, token: &str) {
+        if let Ok(mut tokens) = self.amf_notify_tokens.lock() {
+            tokens.remove(token);
+        }
+    }
+
+    /// #1796: the AMF released the context of `token` itself (`releasedInd`):
+    /// drop its record, so the session's release does not delete it again, and
+    /// the token. Returns whether a record was dropped.
+    pub fn drop_amf_context_by_token(&self, token: &str) -> bool {
+        let dropped = self.amf_contexts.lock().is_ok_and(|mut map| {
+            let mut dropped = false;
+            for list in map.values_mut() {
+                let before = list.len();
+                list.retain(|c| c.notify_token != token);
+                dropped |= list.len() != before;
+            }
+            map.retain(|_, list| !list.is_empty());
+            dropped
+        });
+        self.forget_amf_notify_token(token);
+        dropped
     }
 
     /// #1758: record an AMF MBS context for session `id`, only while the session
@@ -907,6 +978,9 @@ impl MbSmfContext {
         }
         if let Ok(mut m) = self.amf_contexts.lock() {
             m.clear();
+        }
+        if let Ok(mut t) = self.amf_notify_tokens.lock() {
+            t.clear();
         }
     }
 

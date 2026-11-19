@@ -47,6 +47,10 @@ pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16 * 1024;
 /// bounding HPACK-decompressed header memory per request.
 pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 8 * 1024;
 
+/// #1811: maps a request's `(method, uri)` to the resource/operation-level
+/// OAuth2 scope it needs beyond the service-level scope, if any.
+pub type OAuth2ResourceScopeFn = fn(&str, &str) -> Option<&'static str>;
+
 /// Server configuration
 #[derive(Debug, Clone)]
 pub struct SbiServerConfig {
@@ -97,6 +101,14 @@ pub struct SbiServerConfig {
     /// still needs a valid bearer. Empty by default: every route requires a
     /// token. Not consulted when `require_oauth2` is off.
     pub oauth2_callback_exemptions: Vec<OAuth2CallbackExemption>,
+    /// #1811: the resource/operation-level scope a request needs on top of the
+    /// service-level one (TS 33.501 §13.4.1.2, TS 29.500 §6.7.3), given its
+    /// method and URI; normally [`crate::resource_scope::required_resource_scope`].
+    /// When it returns `Some`, a verified token whose scope lacks that entry is
+    /// refused 403 `insufficient_scope` before the handler runs. `None` (default)
+    /// checks the service-level scope only. Only consulted when `require_oauth2`
+    /// is enabled.
+    pub oauth2_resource_scopes: Option<OAuth2ResourceScopeFn>,
     /// Maximum request body size, in bytes, accepted before the body is
     /// buffered. Oversize requests are rejected with 413 (ProblemDetails)
     /// without allocating the full body. Defaults to
@@ -151,6 +163,7 @@ impl Default for SbiServerConfig {
             oauth2_jwks_uri: None,
             oauth2_expected_audience: None,
             oauth2_callback_exemptions: Vec::new(),
+            oauth2_resource_scopes: None,
             max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
             max_concurrent_streams: Some(DEFAULT_MAX_CONCURRENT_STREAMS),
             max_frame_size: Some(DEFAULT_MAX_FRAME_SIZE),
@@ -228,6 +241,14 @@ impl SbiServerConfig {
         exemptions: impl IntoIterator<Item = OAuth2CallbackExemption>,
     ) -> Self {
         self.oauth2_callback_exemptions.extend(exemptions);
+        self
+    }
+
+    /// Require, on top of the service-level scope, the resource-level scope
+    /// `scopes` names for each request (#1811). Only enforced when
+    /// `require_oauth2` is also enabled.
+    pub fn with_oauth2_resource_scopes(mut self, scopes: OAuth2ResourceScopeFn) -> Self {
+        self.oauth2_resource_scopes = Some(scopes);
         self
     }
 
@@ -322,6 +343,8 @@ struct OAuthVerifier {
     expected_audience: Option<String>,
     /// #1421: callback routes admitted on their own callback token instead.
     callback_exemptions: Vec<OAuth2CallbackExemption>,
+    /// #1811: the resource-level scope each request needs, if any.
+    resource_scopes: Option<OAuth2ResourceScopeFn>,
 }
 
 impl OAuthVerifier {
@@ -346,6 +369,7 @@ impl OAuthVerifier {
             keys,
             expected_audience: config.oauth2_expected_audience.clone(),
             callback_exemptions: config.oauth2_callback_exemptions.clone(),
+            resource_scopes: config.oauth2_resource_scopes,
         })
     }
 
@@ -363,10 +387,17 @@ impl OAuthVerifier {
     /// server can answer each with its own status and challenge. The signature
     /// and expiry are checked first and alone, so only a token that is genuinely
     /// this NRF's and current can reach the audience and scope checks.
+    ///
+    /// #1811: `resource_scope`, when `Some`, must ALSO be in the token's scope
+    /// (TS 33.501 §13.4.1.2 "additional scope"; TS 29.500 §6.7.3 "those two
+    /// scopes, together"), else 403 `insufficient_scope` naming it. It is checked
+    /// after the service-level scope, so a token for another service is refused
+    /// for that, and before the handler, so a refused request reads nothing.
     async fn authorize(
         &self,
         auth_header: Option<&str>,
         required_scope: Option<&str>,
+        resource_scope: Option<&str>,
     ) -> Result<String, BearerRefusal> {
         let claims = match &self.keys {
             OAuthKeySource::Static(jwks) => crate::oauth::authorize_bearer_aud(auth_header, jwks, None),
@@ -376,12 +407,31 @@ impl OAuthVerifier {
                     .into(),
             )),
         };
-        bearer_decision(
+        // #1811: the resource scope is read before `bearer_decision` consumes the
+        // claims, and refused only after it, so the refusal order is unchanged:
+        // token, audience, service scope, then resource scope.
+        let resource_refusal = match (&claims, resource_scope) {
+            (Ok(c), Some(scope)) if crate::oauth::check_token_scope(&c.scope, scope).is_err() => {
+                Some(BearerRefusal::InsufficientScope {
+                    scope: scope.to_string(),
+                    detail: format!(
+                        "the access token's scope does not include {scope}, which this \
+                         resource requires in addition to the service scope"
+                    ),
+                })
+            }
+            _ => None,
+        };
+        let sub = bearer_decision(
             claims,
             auth_header,
             self.expected_audience.as_deref(),
             required_scope,
-        )
+        )?;
+        match resource_refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(sub),
+        }
     }
 }
 
@@ -657,6 +707,37 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     }
                 };
 
+            // #1934 review M1: one path shape for every check that follows. A
+            // router that drops empty segments and a scope rule that does not
+            // read `//` differently, so a resource scope keyed on segment
+            // positions was skipped while the router still served the route.
+            // Refused here, before the callback exemption, the OAuth2 checks and
+            // the NF router, for every NF.
+            if let Some(defect) = path_segment_refusal(&sbi_request.header.uri) {
+                // The defect is in the ProblemDetails only: it is derived from the
+                // path, which may carry a callback token.
+                log::debug!(
+                    "cid={} {} {} refused 400: malformed path",
+                    sbi_request.correlation_id,
+                    sbi_request.header.method,
+                    crate::log_redact::redact_callback_tokens(&sbi_request.header.uri)
+                );
+                let body = serde_json::json!({
+                    "title": "Bad Request",
+                    "status": 400,
+                    "detail": format!("the request path has {defect}"),
+                    "cause": "INVALID_MSG_FORMAT",
+                })
+                .to_string();
+                let resp =
+                    SbiResponse::with_status(400).with_body(body, "application/problem+json");
+                return Ok(convert_response_with_identity(
+                    resp,
+                    server_identity.as_ref(),
+                    overload_reporter.as_ref(),
+                ));
+            }
+
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
             // configured key material before dispatching to the NF handler.
             // An invalid token is the caller's fault (401); not being able to
@@ -708,7 +789,14 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                 // TS 33.501 §13.4.1.2: reject a token whose scope does not
                 // authorize the invoked service (the decomposed apiName).
                 let required_scope = sbi_request.header.service_name.as_deref();
-                match verifier.authorize(auth, required_scope).await {
+                // #1811: and the resource-level scope the resource needs, if any.
+                let resource_scope = verifier.resource_scopes.and_then(|scope_for| {
+                    scope_for(&sbi_request.header.method, &sbi_request.header.uri)
+                });
+                match verifier
+                    .authorize(auth, required_scope, resource_scope)
+                    .await
+                {
                     // Record the identity THIS PROCESS verified, so a producer can
                     // bind authorization to the caller (issue #94).
                     Ok(sub) => sbi_request.oauth2_subject = Some(sub),
@@ -848,6 +936,41 @@ impl Http2Limits {
             builder.max_header_list_size(sz);
         }
     }
+}
+
+/// What makes the request path `path` (no query) refused before routing (a
+/// phrase naming the defect, never the path itself, which may carry a callback
+/// token), or `None` when it is well formed (#1934 review M1).
+///
+/// An SBI resource URI is `{apiRoot}/{apiName}/{apiVersion}/{apiSpecificResourceUriPart}`
+/// (TS 29.501 §4.4.1), a sequence of non-empty segments. Refused:
+/// - an empty segment (`//`, a leading `//`, a trailing `/`);
+/// - a dot segment, `.` or `..`, also percent-encoded (RFC 3986 §3.3, §6.2.2.2);
+/// - a percent-encoded `/` or `\` inside a segment, which a router that decodes
+///   would split where the scope check did not.
+///
+/// The bare root `/` is accepted. So every NF router and every per-path check
+/// (resource scopes, callback exemptions) sees the same segments, whichever way
+/// each one splits.
+pub fn path_segment_refusal(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    if rest.is_empty() {
+        return None;
+    }
+    for segment in rest.split('/') {
+        if segment.is_empty() {
+            return Some("an empty segment".to_string());
+        }
+        let lower = segment.to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") {
+            return Some("an encoded path separator in a segment".to_string());
+        }
+        let decoded = lower.replace("%2e", ".");
+        if decoded == "." || decoded == ".." {
+            return Some("a dot segment".to_string());
+        }
+    }
+    None
 }
 
 /// Convert hyper request to SbiRequest, enforcing `max_body_size` (T1.4).
@@ -2122,9 +2245,10 @@ mod tests {
             keys: OAuthKeySource::Unconfigured,
             expected_audience: None,
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
         let err = unconfigured
-            .authorize(Some("Bearer a.b.c"), None)
+            .authorize(Some("Bearer a.b.c"), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, BearerRefusal::KeysUnavailable(_)), "{err:?}");
@@ -2135,11 +2259,12 @@ mod tests {
             keys: OAuthKeySource::Static(serde_json::json!({"keys": []})),
             expected_audience: None,
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
-        let err = static_v.authorize(None, None).await.unwrap_err();
+        let err = static_v.authorize(None, None, None).await.unwrap_err();
         assert!(matches!(err, BearerRefusal::Absent(_)), "{err:?}");
         let err = static_v
-            .authorize(Some("Bearer a.b.c"), None)
+            .authorize(Some("Bearer a.b.c"), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, BearerRefusal::InvalidToken(_)), "{err:?}");
@@ -2151,9 +2276,10 @@ mod tests {
             )),
             expected_audience: None,
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
         let err = remote
-            .authorize(Some("Bearer a.b.c"), None)
+            .authorize(Some("Bearer a.b.c"), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, BearerRefusal::KeysUnavailable(_)), "{err:?}");
@@ -2648,6 +2774,11 @@ mod tests {
 
     /// Build an ES256 token with an explicit `aud` plus a matching JWKS.
     fn token_jwks_with_aud(aud: &str) -> (String, serde_json::Value) {
+        token_jwks_with_scope(aud, "nudm-sdm")
+    }
+
+    /// [`token_jwks_with_aud`] with an explicit `scope` claim (#1811).
+    fn token_jwks_with_scope(aud: &str, scope: &str) -> (String, serde_json::Value) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -2660,7 +2791,7 @@ mod tests {
             .as_secs()
             + 3600;
         let claims = serde_json::json!({
-            "iss": "NRF", "sub": "amf-1", "aud": aud, "scope": "nudm-sdm", "exp": exp
+            "iss": "NRF", "sub": "amf-1", "aud": aud, "scope": scope, "exp": exp
         });
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
         let sig: Signature = sk.sign(format!("{header}.{payload}").as_bytes());
@@ -2686,9 +2817,10 @@ mod tests {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("UDM".into()),
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
         let header = format!("Bearer {token}");
-        assert!(verifier.authorize(Some(&header), None).await.is_ok());
+        assert!(verifier.authorize(Some(&header), None, None).await.is_ok());
 
         // Same token, but the verifier expects "AMF": a claims mismatch
         // (#1766: 403 ACCESS_TOKEN_CLAIM_MISMATCH on the wire).
@@ -2696,8 +2828,12 @@ mod tests {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("AMF".into()),
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
-        let err = wrong.authorize(Some(&header), None).await.unwrap_err();
+        let err = wrong
+            .authorize(Some(&header), None, None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, BearerRefusal::ClaimMismatch { claim: "aud", .. }),
             "{err:?}"
@@ -2708,8 +2844,9 @@ mod tests {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
-        assert!(none.authorize(Some(&header), None).await.is_ok());
+        assert!(none.authorize(Some(&header), None, None).await.is_ok());
     }
 
     #[tokio::test]
@@ -2720,19 +2857,20 @@ mod tests {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
             callback_exemptions: Vec::new(),
+            resource_scopes: None,
         };
         let header = format!("Bearer {token}");
 
         // Invoked service is in scope -> authorized.
         assert!(verifier
-            .authorize(Some(&header), Some("nudm-sdm"))
+            .authorize(Some(&header), Some("nudm-sdm"), None)
             .await
             .is_ok());
 
         // A different service the token is not scoped for -> #1766: 403
         // insufficient_scope naming the scope needed.
         let err = verifier
-            .authorize(Some(&header), Some("nudm-uecm"))
+            .authorize(Some(&header), Some("nudm-uecm"), None)
             .await
             .unwrap_err();
         assert!(
@@ -2741,7 +2879,68 @@ mod tests {
         );
 
         // No required scope (e.g. a non-service path) -> scope check skipped.
-        assert!(verifier.authorize(Some(&header), None).await.is_ok());
+        assert!(verifier.authorize(Some(&header), None, None).await.is_ok());
+    }
+
+    /// #1811: a resource-level scope is required IN ADDITION to the service
+    /// scope. A token scoped for the service alone is refused 403
+    /// insufficient_scope naming the resource scope; one carrying both passes;
+    /// and a resource that needs none is unaffected.
+    #[tokio::test]
+    async fn resource_scope_is_required_on_top_of_the_service_scope_1811() {
+        use crate::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_READ as READ;
+        let verifier_for = |jwks: serde_json::Value| OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks),
+            expected_audience: None,
+            callback_exemptions: Vec::new(),
+            resource_scopes: Some(crate::resource_scope::required_resource_scope),
+        };
+
+        let (service_only, jwks) = token_jwks_with_scope("UDR", "nudr-dr");
+        let verifier = verifier_for(jwks);
+        let header = format!("Bearer {service_only}");
+        let err = verifier
+            .authorize(Some(&header), Some("nudr-dr"), Some(READ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == READ),
+            "{err:?}"
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status, 403);
+        let www = resp
+            .http
+            .get_header("WWW-Authenticate")
+            .cloned()
+            .unwrap_or_default();
+        assert!(www.contains("error=\"insufficient_scope\""), "{www}");
+        assert!(www.contains(&format!("scope=\"{READ}\"")), "{www}");
+        assert!(verifier
+            .authorize(Some(&header), Some("nudr-dr"), None)
+            .await
+            .is_ok());
+
+        let (both, jwks) = token_jwks_with_scope("UDR", &format!("nudr-dr {READ}"));
+        let verifier = verifier_for(jwks);
+        let header = format!("Bearer {both}");
+        assert!(verifier
+            .authorize(Some(&header), Some("nudr-dr"), Some(READ))
+            .await
+            .is_ok());
+
+        // The resource scope alone does not stand in for the service scope.
+        let (resource_only, jwks) = token_jwks_with_scope("UDR", READ);
+        let verifier = verifier_for(jwks);
+        let header = format!("Bearer {resource_only}");
+        let err = verifier
+            .authorize(Some(&header), Some("nudr-dr"), Some(READ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == "nudr-dr"),
+            "{err:?}"
+        );
     }
 
     /// #94: the SERVER populates `SbiRequest.oauth2_subject` from the verified
@@ -3567,7 +3766,7 @@ mod accept_path_tests {
 /// when their path carries a callback token the NF holds; nothing else is.
 #[cfg(test)]
 mod oauth2_callback_exemption_tests {
-    use super::{OAuth2CallbackExemption, SbiServer, SbiServerConfig};
+    use super::{path_segment_refusal, OAuth2CallbackExemption, SbiServer, SbiServerConfig};
     use crate::message::{SbiRequest, SbiResponse};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3640,6 +3839,53 @@ mod oauth2_callback_exemption_tests {
         (answer.status().as_u16(), www)
     }
 
+    /// #1934 review M1: the path shapes every check must agree on.
+    #[test]
+    fn malformed_paths_are_refused_before_routing_1934() {
+        for ok in [
+            "/",
+            "/nnsacf-nsac/v1/slices/local-configs/update",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription",
+            "/a/b.c/..d/x%20y",
+        ] {
+            assert_eq!(path_segment_refusal(ok), None, "{ok}");
+        }
+        for bad in [
+            "//nnsacf-nsac/v1/slices/local-configs/update",
+            "/nnsacf-nsac/v1//slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices//local-configs/update",
+            "/nnsacf-nsac/v1/slices/local-configs/update/",
+            "/nnsacf-nsac/v1/slices/./local-configs/update",
+            "/nnsacf-nsac/v1/x/../slices/local-configs/update",
+            "/nnsacf-nsac/v1/%2e%2E/slices",
+            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
+            "/nnsacf-nsac/v1/slices%5clocal-configs",
+        ] {
+            assert!(path_segment_refusal(bad).is_some(), "{bad}");
+        }
+    }
+
+    /// #1934: the server answers 400 for a malformed path before the OAuth2
+    /// check (no bearer here, and the answer is not 401) and before the handler.
+    #[tokio::test]
+    async fn the_server_refuses_a_malformed_path_before_auth_and_routing_1934() {
+        let (server, addr, seen) = start(empty_jwks()).await;
+        let before = seen.lock().unwrap().len();
+        for bad in [
+            format!("{CALLBACK}//{GOOD}"),
+            format!("{CALLBACK}/{GOOD}/"),
+            format!("{CALLBACK}/../{GOOD}"),
+        ] {
+            assert_eq!(send(addr, "POST", &bad).await.0, 400, "{bad}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), before, "no handler ran");
+        assert_eq!(
+            send(addr, "POST", &format!("{CALLBACK}/{GOOD}")).await.0,
+            204
+        );
+        server.stop().await.expect("stop");
+    }
+
     fn empty_jwks() -> Option<serde_json::Value> {
         Some(serde_json::json!({"keys": []}))
     }
@@ -3686,6 +3932,13 @@ mod oauth2_callback_exemption_tests {
         ];
         for path in &posts {
             let (status, www) = send(addr, "POST", path).await;
+            // #1934: a malformed spelling (empty, dot or encoded-separator
+            // segment) is refused 400 before the exemption is even consulted;
+            // every other one still needs a bearer.
+            if path_segment_refusal(path).is_some() {
+                assert_eq!(status, 400, "POST {path}");
+                continue;
+            }
             assert_eq!(status, 401, "POST {path}");
             assert!(
                 www.as_deref().is_some_and(|w| w.starts_with("Bearer")),

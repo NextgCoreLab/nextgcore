@@ -207,6 +207,17 @@ struct Args {
     #[arg(long, default_value = "64")]
     max_quotas: usize,
 
+    /// #1864: address of the admin listener (slice-quota provisioning and
+    /// utilization). Loopback only; anything else refuses to start.
+    #[arg(long, default_value = "127.0.0.1")]
+    admin_addr: String,
+
+    /// #1864: port of the admin listener. Unset (the default) serves no admin
+    /// listener: quotas then come from `nsacf.slice_quotas` and the spec's
+    /// `slices/local-configs/update`.
+    #[arg(long)]
+    admin_port: Option<u16>,
+
     /// NRF URI for registration
     #[arg(long, default_value = "http://127.0.0.1:7777")]
     nrf_uri: String,
@@ -243,6 +254,28 @@ fn with_nsacf_context<T>(f: impl FnOnce(&NsacfContext) -> T) -> Option<T> {
     let ctx = nsacf_self();
     let result = ctx.read().ok().map(|guard| f(&guard));
     result
+}
+
+/// #1795: the NSACF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with NSACF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Nsacf,
+        nrf_uri,
+    )
 }
 
 #[tokio::main]
@@ -379,8 +412,9 @@ async fn main() -> Result<()> {
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         nrf_uri_cfg.as_deref(),
     ));
@@ -395,7 +429,7 @@ async fn main() -> Result<()> {
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
-        sbi_server_config = sbi_server_config.with_expected_audience_nf_type(NfType::Nsacf);
+        sbi_server_config = nsacf_oauth2_claims(sbi_server_config);
 
         log::info!(
             "OAuth2 enforcement enabled (JWKS: {})",
@@ -405,6 +439,16 @@ async fn main() -> Result<()> {
                 .unwrap_or("UNCONFIGURED")
         );
     }
+
+    // #1795: the listener follows the SBI security profile.
+
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        nrf_uri_cfg.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
 
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
@@ -419,6 +463,24 @@ async fn main() -> Result<()> {
 
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
     log::info!("SBI HTTP/2 {scheme} server listening on {addr}");
+
+    // #1864: the admin extension, on its own loopback listener, only when asked.
+    let _admin_server = match args.admin_port {
+        Some(port) => {
+            let admin_addr = admin_listen_addr(&args.admin_addr, port)?;
+            let server = SbiServer::new(NextgcoreSbiServerConfig::new(admin_addr));
+            server
+                .start(nsacf_admin_request_handler)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start the admin listener: {e}"))?;
+            log::info!("NSACF admin listener (slice-quotas, utilization) on {admin_addr}");
+            Some(server)
+        }
+        None => {
+            log::info!("No NSACF admin listener (--admin-port unset)");
+            None
+        }
+    };
 
     // Register with NRF (config URI if present, else the CLI fallback)
     let sbi_ctx = global_context();
@@ -511,13 +573,86 @@ fn problem_details(status: u16, title: &str, detail: &str, cause: Option<&str>) 
     SbiResponse::with_status(status).with_body(body.to_string(), "application/problem+json")
 }
 
+/// #1864: the NextGCore admin-only extension (NOT TS 29.536 resources): direct
+/// slice-quota provisioning and utilization reporting. The spec way to change
+/// local NSAC configuration is the `slices/local-configs/update` custom op.
+fn is_admin_path(parts: &[&str]) -> bool {
+    matches!(
+        parts,
+        ["nnsacf-nsac", "v1", "slice-quotas"]
+            | ["nnsacf-nsac", "v1", "slice-quotas", _]
+            | ["nnsacf-nsac", "v1", "utilization"]
+    )
+}
+
+/// #1864: the admin listener's bind, refused unless it is loopback. The admin
+/// extension has no credential of its own, so who can reach the socket is the
+/// whole access control: an operator on the host (or in the pod), never a peer
+/// NF on the SBI network.
+fn admin_listen_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let addr =
+        nextgcore_core::sockaddr::parse_listen_addr(host, port).context("Invalid admin address")?;
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "--admin-addr {host} is not a loopback address: the NSACF admin listener \
+             (slice-quota provisioning) has no credential, so it binds loopback only (#1864)"
+        );
+    }
+    Ok(addr)
+}
+
+/// #1864: the NSACF admin listener's handler: the admin extension only. Every
+/// Nnsacf service is refused here, as the admin resources are on the SBI.
+async fn nsacf_admin_request_handler(request: SbiRequest) -> SbiResponse {
+    let method = request.header.method.clone();
+    let method = method.as_str();
+    let uri = request.header.uri.clone();
+    // #1867: logged through the redactor, as the SBI handler's line is; the admin
+    // listener (#1912) shares the URI shapes, so the same rule applies.
+    log::debug!(
+        "NSACF admin: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
+    let path = uri.split('?').next().unwrap_or(&uri);
+    let parts: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    match parts.as_slice() {
+        ["nnsacf-nsac", "v1", "slice-quotas"] => match method {
+            "POST" => handle_slice_quota_create(&request).await,
+            "GET" => handle_slice_quota_list().await,
+            _ => send_method_not_allowed(method, "slice-quotas"),
+        },
+        ["nnsacf-nsac", "v1", "slice-quotas", quota_id] => match method {
+            "GET" => handle_slice_quota_get(quota_id).await,
+            "DELETE" => handle_slice_quota_delete(quota_id).await,
+            _ => send_method_not_allowed(method, "slice-quotas/{id}"),
+        },
+        ["nnsacf-nsac", "v1", "utilization"] => match method {
+            "GET" => handle_utilization_report().await,
+            _ => send_method_not_allowed(method, "utilization"),
+        },
+        _ => problem_details(
+            404,
+            "Not Found",
+            &format!("{path} is not an NSACF administration resource"),
+            None,
+        ),
+    }
+}
+
 /// NSACF SBI request handler
 async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let method = method.as_str();
     let uri = request.header.uri.clone();
 
-    log::debug!("NSACF SBI: {method} {uri}");
+    log::debug!(
+        "NSACF SBI: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(&uri);
@@ -552,7 +687,10 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         //    central/primary HPLMN NSACF.
         // ------------------------------------------------------------------
         ["nnsacf-nsac", "v1", "slices", "local-configs", "update"] => match method {
-            "POST" => handle_local_configs_update(&request).await,
+            "POST" => match refuse_non_nsacf_certificate(&request) {
+                Some(refusal) => refusal,
+                None => handle_local_configs_update(&request).await,
+            },
             _ => send_method_not_allowed(method, "slices/local-configs/update"),
         },
         ["nnsacf-nsac", "v1", "slices", "roaming-quotas", "query"] => match method {
@@ -560,27 +698,17 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "slices/roaming-quotas/query"),
         },
 
-        // ------------------------------------------------------------------
-        // NextGCore admin-only extension (NOT a TS 29.536 resource): direct
-        // slice-quota provisioning. The spec way to provision local NSAC config
-        // is the `slices/local-configs/update` custom op above.
-        // ------------------------------------------------------------------
-        ["nnsacf-nsac", "v1", "slice-quotas"] => match method {
-            "POST" => handle_slice_quota_create(&request).await,
-            "GET" => handle_slice_quota_list().await,
-            _ => send_method_not_allowed(method, "slice-quotas"),
-        },
-        ["nnsacf-nsac", "v1", "slice-quotas", quota_id] => match method {
-            "GET" => handle_slice_quota_get(quota_id).await,
-            "DELETE" => handle_slice_quota_delete(quota_id).await,
-            _ => send_method_not_allowed(method, "slice-quotas/{id}"),
-        },
-
-        // Utilization reporting (NextGCore admin-only extension, NOT TS 29.536).
-        ["nnsacf-nsac", "v1", "utilization"] => match method {
-            "GET" => handle_utilization_report().await,
-            _ => send_method_not_allowed(method, "utilization"),
-        },
+        // #1864: the NextGCore admin extension (`slice-quotas`, `utilization`) is
+        // not on this listener. Quotas are operator-provisioned (TS 23.501
+        // §5.15.11), so an AMF or SMF holding an nnsacf-nsac token must not
+        // create or delete one. They are served by `nsacf_admin_request_handler`
+        // on the loopback admin listener (`--admin-port`).
+        parts if is_admin_path(parts) => problem_details(
+            404,
+            "Not Found",
+            &format!("{path} is an NSACF administration resource, not served on the SBI (#1864)"),
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Nnsacf_SliceEventExposure (TS 29.536)
@@ -1584,6 +1712,44 @@ fn custom_op_body(request: &SbiRequest) -> Result<serde_json::Value, SbiResponse
     })
 }
 
+/// The token claims this NSACF's listener requires once OAuth2 is on: `aud`
+/// NSACF, and (#1892) for `slices/local-configs/update` TS 29.536's
+/// `nnsacf-nsac:local-configs-update` as well as `nnsacf-nsac`. The NRF grants
+/// that scope to an NSACF only (`allowedOperationsPerNfType`, see
+/// [`build_nsacf_nf_profile`]); a token without it is refused 403
+/// insufficient_scope before the router runs, so no quota changes. One function
+/// so the tests run the listener's real posture.
+fn nsacf_oauth2_claims(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    config
+        .with_expected_audience_nf_type(NfType::Nsacf)
+        .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
+}
+
+/// The `403` for a `local-configs/update` from a caller whose verified client
+/// certificate names an NF type other than NSACF (#1892). TS 29.536 Table
+/// 6.1.9-1: the update comes "from a primary NSACF". A relay certificate (SCP,
+/// SEPP) says nothing about the consumer and is left to the token's
+/// `nnsacf-nsac:local-configs-update` scope; no certificate (`dev`) changes
+/// nothing.
+///
+/// #1934 review m1: an empty type list (a certificate without RFC 9310 NF types,
+/// or none at all under `dev`) is left to the token. Under production the token's
+/// `nnsacf-nsac:local-configs-update` scope is then the whole decision, and the
+/// NRF grants that scope to an NSACF only.
+fn refuse_non_nsacf_certificate(request: &SbiRequest) -> Option<SbiResponse> {
+    let types = &request.peer_cert_nf_types;
+    let is = |t: &str| types.iter().any(|c| c.eq_ignore_ascii_case(t));
+    if types.is_empty() || is("NSACF") || is("SCP") || is("SEPP") {
+        return None;
+    }
+    let why = format!(
+        "slices/local-configs/update is for a primary NSACF only (TS 29.536 Table 6.1.9-1); \
+         the requester's certificate names {types:?}"
+    );
+    log::debug!("{why}");
+    Some(nextgcore_sbi::server::send_forbidden(&why, None))
+}
+
 /// POST /nnsacf-nsac/v1/slices/local-configs/update  (TS 29.536 §6.1.3.4)
 ///
 /// Request: `ACUpdateData` — `snssai` (M), `maxUesNumber` (O), `maxPdusNumber`
@@ -2455,6 +2621,31 @@ fn emit_reports_for(s_nssai: &SNssai, cause: ReportCause<'_>) {
 /// single place to change.
 const NSACF_API_FULL_VERSION: &str = "1.3.0";
 
+/// The NF types allowed Nnsacf_NSAC (TS 29.536 §5.2.1, #1892): the AMF and the
+/// SMF, an SCP forwarding for them, and a primary NSACF for the
+/// `local-configs/update` custom operation.
+const NNSACF_NSAC_CONSUMERS: &[&str] = &["AMF", "SMF", "SCP", "NSACF"];
+
+/// Nnsacf_NSAC's `allowedOperationsPerNfType` (#1892): every allowed type gets
+/// the service-level scope, and only the NSACF also gets
+/// `nnsacf-nsac:local-configs-update`.
+fn nnsacf_nsac_allowed_operations() -> serde_json::Value {
+    let service = nextgcore_sbi::types::SbiServiceType::NnsacfNsac.to_name();
+    let map: serde_json::Map<String, serde_json::Value> = NNSACF_NSAC_CONSUMERS
+        .iter()
+        .map(|nf_type| {
+            let mut scopes = vec![service.to_string()];
+            if *nf_type == "NSACF" {
+                scopes.push(
+                    nextgcore_sbi::resource_scope::NNSACF_NSAC_LOCAL_CONFIGS_UPDATE.to_string(),
+                );
+            }
+            (nf_type.to_string(), serde_json::json!(scopes))
+        })
+        .collect();
+    serde_json::Value::Object(map)
+}
+
 /// The NSACF NFProfile (TS 29.510 §6.1.6.2.2) registered with the NRF; its host
 /// sits where its type belongs (#1324).
 fn build_nsacf_nf_profile(
@@ -2480,8 +2671,13 @@ fn build_nsacf_nf_profile(
                 // so consumers never expect home/visited delegation (ueAdmissionList).
                 "supportedFeatures": SUPPORTED_FEATURES,
                 // TS 29.510 §6.1.6.2.3: per-service scoping. NSAC is consumed by the
-                // AMF/SMF (and an SCP forwarding for them).
-                "allowedNfTypes": ["AMF", "SMF", "SCP"]
+                // AMF/SMF (and an SCP forwarding for them), and by a primary NSACF
+                // updating this one's local configuration (#1892).
+                "allowedNfTypes": NNSACF_NSAC_CONSUMERS,
+                // #1892, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: the NRF grants
+                // `nnsacf-nsac:local-configs-update` to an NSACF only. Once the map
+                // is present it must name every allowed type with all its scopes.
+                "allowedOperationsPerNfType": nnsacf_nsac_allowed_operations()
             }, {
                 "serviceInstanceId": format!("{}-nnsacf-slice-ee", nf_instance_id),
                 // Named from the typed service enum rather than a literal, so the
@@ -2499,7 +2695,7 @@ fn build_nsacf_nf_profile(
             }],
             // The NF-level list is the UNION over the services: a consumer type barred
             // here can never reach any of them.
-            "allowedNfTypes": ["AMF", "SMF", "SCP", "NEF", "NWDAF", "AF", "DCCF"],
+            "allowedNfTypes": ["AMF", "SMF", "SCP", "NSACF", "NEF", "NWDAF", "AF", "DCCF"],
             "heartBeatTimer": 10
         }),
         sbi_addr,
@@ -2667,6 +2863,26 @@ nsacf:
     /// `_ctx_guard` — a bare `_` would drop it immediately).
     static GLOBAL_CTX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// The SBI and the #1864 admin listener behind one test port, so a test can
+    /// provision through the admin extension and then drive admission control
+    /// with one client. Production serves them on two listeners; the split is
+    /// pinned by `the_admin_extension_is_not_on_the_sbi_1864`.
+    async fn sbi_and_admin_for_tests(request: SbiRequest) -> SbiResponse {
+        let path = request
+            .header
+            .uri
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if is_admin_path(&parts) {
+            nsacf_admin_request_handler(request).await
+        } else {
+            nsacf_sbi_request_handler(request).await
+        }
+    }
+
     async fn start_nsacf_server() -> (SbiServer, u16, tokio::sync::MutexGuard<'static, ()>) {
         let guard = GLOBAL_CTX_TEST_LOCK.lock().await;
         nsacf_context_init(64);
@@ -2677,10 +2893,67 @@ nsacf:
             port_listener,
         );
         server
-            .start(nsacf_sbi_request_handler)
+            .start(sbi_and_admin_for_tests)
             .await
             .expect("server start");
         (server, port, guard)
+    }
+
+    /// #1864 (TS 23.501 §5.15.11: quotas are operator-provisioned): the SBI
+    /// handler does not serve the admin extension to any NF, token or not; the
+    /// admin handler serves it and nothing else; the admin listener binds
+    /// loopback only.
+    #[tokio::test]
+    async fn the_admin_extension_is_not_on_the_sbi_1864() {
+        let _guard = GLOBAL_CTX_TEST_LOCK.lock().await;
+        nsacf_context_init(64);
+        let create = || {
+            let mut r = SbiRequest::post("/nnsacf-nsac/v1/slice-quotas").with_body(
+                json!({"sNssai": {"sst": 1}, "maxUes": 5, "maxPduSessions": 5}).to_string(),
+                "application/json",
+            );
+            // An AMF with a verified token: still not an operator.
+            r.oauth2_subject = Some("aaaaaaaa-1864-4000-8000-00000000000a".into());
+            r
+        };
+        let count = || nsacf_self().read().unwrap().quota_count();
+        let before = count();
+        for req in [
+            create(),
+            SbiRequest::get("/nnsacf-nsac/v1/slice-quotas"),
+            SbiRequest::delete("/nnsacf-nsac/v1/slice-quotas/quota-1"),
+            SbiRequest::get("/nnsacf-nsac/v1/utilization"),
+        ] {
+            let uri = req.header.uri.clone();
+            let resp = nsacf_sbi_request_handler(req).await;
+            assert_eq!(resp.status, 404, "{uri}");
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("administration resource, not served on the SBI"),
+                "{uri}: {:?}",
+                resp.http.content
+            );
+        }
+        assert_eq!(count(), before, "the SBI created no quota");
+
+        // The admin listener's handler serves it ...
+        let resp = nsacf_admin_request_handler(create()).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(count(), before + 1);
+        // ... and no Nnsacf service.
+        let resp =
+            nsacf_admin_request_handler(SbiRequest::post("/nnsacf-nsac/v1/slices/ues")).await;
+        assert_eq!(resp.status, 404);
+
+        assert!(admin_listen_addr("127.0.0.1", 7790).is_ok());
+        assert!(admin_listen_addr("::1", 7790).is_ok());
+        for host in ["0.0.0.0", "10.0.0.5", "::"] {
+            let err = admin_listen_addr(host, 7790).expect_err(host).to_string();
+            assert!(err.contains("loopback only"), "{host}: {err}");
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2690,6 +2963,16 @@ nsacf:
     /// Mint an ES256 access token (matching the NRF's token shape) with the
     /// given `aud`, signed by `sk` and tagged with `kid`.
     fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str) -> String {
+        build_es256_token_scoped(sk, kid, aud, "nnsacf-nsac")
+    }
+
+    /// [`build_es256_token`] with the `scope` claim given (#1892).
+    fn build_es256_token_scoped(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -2702,7 +2985,7 @@ nsacf:
         let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
         let claims = serde_json::json!({
             "iss": "NRF", "sub": "amf-1", "aud": aud,
-            "scope": "nnsacf-nsac", "exp": exp, "iat": 0
+            "scope": scope, "exp": exp, "iat": 0
         })
         .to_string();
         let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
@@ -2736,13 +3019,176 @@ nsacf:
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
-        cfg = cfg.with_expected_audience_nf_type(NfType::Nsacf);
+        cfg = nsacf_oauth2_claims(cfg);
         let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(nsacf_sbi_request_handler)
             .await
             .expect("server start");
         (server, port, guard)
+    }
+
+    /// #1892, TS 29.536 Table 6.1.9-1: `slices/local-configs/update` needs
+    /// `nnsacf-nsac:local-configs-update` on top of the service scope. A token
+    /// carrying `nnsacf-nsac` alone (what the NRF grants an AMF or SMF) is
+    /// refused 403 insufficient_scope by the listener and the slice's ceiling is
+    /// unchanged; the same request with the resource scope (a primary NSACF's
+    /// token) is applied. The AMF's own NSAC operation still needs only the
+    /// service scope.
+    #[tokio::test]
+    async fn local_configs_update_needs_the_resource_scope_1892() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port, _ctx_guard) =
+            start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let send = |scope: &str, path: &str, body: serde_json::Value| {
+            let token = build_es256_token_scoped(&sk, "nrf-es256", "NSACF", scope);
+            let req = SbiRequest::post(path)
+                .with_body(body.to_string(), "application/json")
+                .with_header("Authorization", format!("Bearer {token}"));
+            let client = &client;
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                    .await
+                    .expect("bounded")
+                    .expect("response")
+            }
+        };
+        let update = "/nnsacf-nsac/v1/slices/local-configs/update";
+        let full = "nnsacf-nsac nnsacf-nsac:local-configs-update";
+        let ceiling = |scope: &'static str| {
+            let send = &send;
+            async move {
+                let resp = send(
+                    scope,
+                    "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+                    quota_update_request(92),
+                )
+                .await;
+                assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+                let v: serde_json::Value =
+                    serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+                v["maxUesNumber"].clone()
+            }
+        };
+
+        assert_eq!(
+            send(full, update, ac_update_data(92, 7, 9)).await.status,
+            204
+        );
+        assert_eq!(ceiling(full).await, 7);
+
+        let resp = send("nnsacf-nsac", update, ac_update_data(92, 1000, 1000)).await;
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        assert!(
+            problem.to_string().contains("local-configs-update"),
+            "the refusal names the missing scope: {problem}"
+        );
+        assert_eq!(ceiling(full).await, 7, "the refused update changed nothing");
+
+        // #1934 review M1: no other spelling of the route reaches it with the
+        // service scope alone. nsacfd's router drops empty segments where the scope
+        // table does not, so `//` used to be routed here unscoped (204). The SBI
+        // server now refuses every such path 400 before the scope check and the
+        // router; `%2F` would only reach the router as one segment, and is refused
+        // the same way.
+        for spelling in [
+            "/nnsacf-nsac/v1//slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices//local-configs/update",
+            "//nnsacf-nsac/v1/slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices/local-configs/update/",
+            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
+            "/nnsacf-nsac/v1/slices/./local-configs/update",
+        ] {
+            let resp = send("nnsacf-nsac", spelling, ac_update_data(92, 1000, 1000)).await;
+            assert_eq!(resp.status, 400, "{spelling}: {:?}", resp.http.content);
+        }
+        assert_eq!(ceiling(full).await, 7, "no spelling changed the ceiling");
+
+        // The service scope alone still serves an AMF's NSAC operation.
+        let resp = send(
+            "nnsacf-nsac",
+            "/nnsacf-nsac/v1/slices/ues",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_ne!(resp.status, 401);
+        assert!(
+            !resp
+                .http
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("insufficient_scope"),
+            "{:?}",
+            resp.http.content
+        );
+
+        server.stop().await.expect("stop");
+    }
+
+    /// #1892: a verified client certificate that names a type other than NSACF
+    /// (an AMF holding an nnsacf-nsac token) cannot update local configuration;
+    /// an NSACF, a relay (SCP) or no certificate (`dev`) passes to the handler.
+    #[tokio::test]
+    async fn local_configs_update_refuses_a_non_nsacf_certificate_1892() {
+        let _guard = GLOBAL_CTX_TEST_LOCK.lock().await;
+        nsacf_context_init(64);
+        let update = |types: &[&str], max_ues: u64| {
+            let mut req = SbiRequest::post("/nnsacf-nsac/v1/slices/local-configs/update")
+                .with_body(
+                    ac_update_data(93, max_ues, 9).to_string(),
+                    "application/json",
+                );
+            req.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            req
+        };
+        let resp = nsacf_sbi_request_handler(update(&["AMF"], 1000)).await;
+        assert_eq!(resp.status, 403);
+        assert!(
+            resp.http
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("primary NSACF only"),
+            "{:?}",
+            resp.http.content
+        );
+        for (types, n) in [(&["NSACF"][..], 3), (&["SCP"][..], 4), (&[][..], 5)] {
+            let resp = nsacf_sbi_request_handler(update(types, n)).await;
+            assert_eq!(resp.status, 204, "{types:?}: {:?}", resp.http.content);
+        }
+    }
+
+    /// #1892, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: the profile lets the NRF grant
+    /// `nnsacf-nsac:local-configs-update` to an NSACF only, and still grants every
+    /// allowed type the service scope.
+    #[test]
+    fn the_profile_grants_the_local_configs_scope_to_an_nsacf_only_1892() {
+        let p = build_nsacf_nf_profile(
+            "nsacf-1892",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let nsac = &p["nfServices"][0];
+        assert_eq!(nsac["serviceName"], "nnsacf-nsac");
+        let allowed = nsac["allowedNfTypes"].as_array().unwrap();
+        assert!(allowed.contains(&serde_json::json!("NSACF")), "{allowed:?}");
+        let ops = &nsac["allowedOperationsPerNfType"];
+        assert_eq!(
+            ops["NSACF"],
+            serde_json::json!(["nnsacf-nsac", "nnsacf-nsac:local-configs-update"])
+        );
+        for t in ["AMF", "SMF", "SCP"] {
+            assert_eq!(ops[t], serde_json::json!(["nnsacf-nsac"]), "{t}");
+        }
+        assert!(p["allowedNfTypes"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("NSACF")));
     }
 
     #[test]
@@ -2823,16 +3269,23 @@ nsacf:
             start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
-        // Valid token whose aud includes "NSACF" reaches the handler: the
-        // slice-quota list is served (200), NOT 401/403.
+        // Valid token whose aud includes "NSACF" reaches the router: an unknown
+        // resource is the router's own 404, NOT the gate's 401/403. (#1864: the
+        // slice-quota list this used is no longer on the SBI.)
         let token = build_es256_token(&sk, "nrf-es256", "NSACF");
-        let req = SbiRequest::get("/nnsacf-nsac/v1/slice-quotas")
+        let req = SbiRequest::get("/nnsacf-nsac/v1/no-such-resource")
             .with_header("Authorization", format!("Bearer {token}"));
         let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 200, "valid token reaches handler (200)");
+        assert_eq!(resp.status, 404, "valid token reaches the router");
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Resource not found"));
 
         server.stop().await.expect("stop");
     }
@@ -5211,5 +5664,19 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming NSACF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Nsacf,
+            super::sbi_listener_config,
+        );
     }
 }
