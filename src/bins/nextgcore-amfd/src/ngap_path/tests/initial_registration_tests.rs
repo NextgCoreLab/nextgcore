@@ -811,6 +811,8 @@ fn am_policy_of_1774(server: &NgapServer, amf_ue_ngap_id: u64) -> (Option<String
 async fn a_callback_while_authentication_waits_on_the_ausf_is_kept_1774() {
     let supi = "imsi-001010000177401";
     let (_ausf, ausf_port, seen, release) = holding_ausf_1774(supi).await;
+    // #1933: the AM policy termination the test sends resolves the PCF; before the AUSF lock.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     let _env = AusfEnvGuard::acquire(ausf_port).await;
     // The context first: the server shares its UE store with the Namf router, and an
     // init after the server is built would leave the two on different stores.
@@ -853,6 +855,8 @@ async fn a_callback_while_authentication_waits_on_the_ausf_is_kept_1774() {
 async fn a_callback_while_the_ausf_confirms_is_kept_1774() {
     let supi = "imsi-001010000177402";
     let (_ausf, ausf_port, seen, release) = holding_ausf_1774(supi).await;
+    // #1933: the AM policy termination the test sends resolves the PCF; before the AUSF lock.
+    let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
     let _env = AusfEnvGuard::acquire(ausf_port).await;
     // The context first: the server shares its UE store with the Namf router, and an
     // init after the server is built would leave the two on different stores.
