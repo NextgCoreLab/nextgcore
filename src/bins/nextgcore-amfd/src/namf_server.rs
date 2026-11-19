@@ -269,6 +269,13 @@ pub(crate) fn as_test_consumer(mut request: SbiRequest) -> SbiRequest {
     request
 }
 
+/// [`namf_request_handler`] as [`TEST_CONSUMER_1865`], for the crate's other
+/// test modules (#1865), so they pass under both SBI profiles.
+#[cfg(test)]
+pub(crate) async fn test_namf_request_handler(request: SbiRequest) -> SbiResponse {
+    namf_request_handler(as_test_consumer(request)).await
+}
+
 pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
@@ -4335,7 +4342,17 @@ pub(crate) fn take_over_transferred_event_subscriptions(
         // allocates, which is the unconditionally-correct branch.
         let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
         let sub = EventSubscription {
-            owner: None,
+            // #1865: a transferred subscription carries no verified creator, only
+            // the consumer's `nfId` (TS 29.518 Table 6.2.6.2.3-1: "NF instance
+            // identity of the NF service consumer"). It is bound to that, so the
+            // consumer that proves that NF instance manages it here; left
+            // ownerless it would be frozen under production and the consumer,
+            // told its new ID by SUBSCRIPTION_ID_CHANGE, could never cancel it.
+            owner: entry
+                .get("nfId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(String::from),
             subscription_id: subscription_id.clone(),
             notify_uri: notify_uri.to_string(),
             notify_correlation_id: entry
@@ -17573,12 +17590,29 @@ mod tests {
              consumer"
         );
 
+        // #1865: bound to the consumer the transferred `nfId` names, the only
+        // identity a transferred subscription carries. REVERT-VERIFIED: with the
+        // takeover's owner left `None` this assertion fails.
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        );
+        let delete = |who: &str| {
+            let mut r = SbiRequest::delete(format!("/namf-evts/v1/subscriptions/{stored_id}"));
+            r.oauth2_subject = Some(who.to_string());
+            r
+        };
+        assert_eq!(
+            namf_request_handler(delete("bbbbbbbb-1865-4000-8000-0000000000b2"))
+                .await
+                .status,
+            403,
+            "another NF cannot cancel the transferred subscription"
+        );
+
         // It is also reachable the way a consumer would next use it: the DELETE
         // §6.2.3.3.3 defines resolves this id.
-        let resp = namf_request_handler(SbiRequest::delete(format!(
-            "/namf-evts/v1/subscriptions/{stored_id}"
-        )))
-        .await;
+        let resp = namf_request_handler(delete("3fa85f64-5717-4562-b3fc-2c963f66afa6")).await;
         assert_eq!(
             resp.status, 204,
             "the id the consumer was told must resolve to a DELETABLE resource"
@@ -17924,12 +17958,12 @@ mod subscription_owner_tests_1865 {
             "n2NotifyCallbackUri": "http://127.0.0.1:9/pws-1865",
             "nfId": "cbcf-1865",
         });
-        let subscribe = || {
+        let pws_subscription = || {
             SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
                 .with_json_body(&data)
                 .unwrap()
         };
-        let resp = namf_request_handler(as_cert(subscribe(), OWNER)).await;
+        let resp = namf_request_handler(as_cert(pws_subscription(), OWNER)).await;
         assert_eq!(resp.status, 201, "{:?}", resp.http.content);
         let id = body(&resp)["n2NotifySubscriptionId"]
             .as_str()
@@ -17943,7 +17977,7 @@ mod subscription_owner_tests_1865 {
                 .is_some()
         };
         // Naming the owner's nfId does not replace the owner's subscription.
-        let resp = namf_request_handler(as_cert(subscribe(), OTHER)).await;
+        let resp = namf_request_handler(as_cert(pws_subscription(), OTHER)).await;
         assert_eq!(resp.status, 201);
         assert!(held(), "another NF's duplicate does not remove the owner's");
         let uri = format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{id}");

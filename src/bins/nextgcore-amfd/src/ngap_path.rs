@@ -30036,7 +30036,7 @@ mod tests {
 
         // The path of the URI the UDM holds, POSTed verbatim.
         let path = &uri[uri.find("/namf-callback/").expect("callback path")..];
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(path.to_string())
                 .with_json_body(&serde_json::json!({
                     "deregReason": "SUBSCRIPTION_WITHDRAWN",
@@ -30147,7 +30147,7 @@ mod tests {
 
         // The path of the URI the UDM holds, POSTed verbatim.
         let path = &uri[uri.find("/namf-callback/").expect("callback path")..];
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(path.to_string())
                 .with_json_body(&serde_json::json!({
                     "subscriptionId": "sub-1748",
@@ -30230,7 +30230,7 @@ mod tests {
         ue_ctx.policy_association_id = Some("am-pol-602".to_string());
         ngap.ue_auth_state.insert(key, ue_ctx);
 
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(format!(
                 "/namf-callback/v1/{supi}/dereg-notify/tok-602"
             ))
@@ -30351,7 +30351,7 @@ mod tests {
         ue.amf_ue.ue_policy_association.notify_token = Some("uep-t".to_string());
         ngap.ue_auth_state.insert(id, ue);
         let notify = |path: String, body: serde_json::Value| {
-            crate::namf_server::namf_request_handler(
+            crate::namf_server::test_namf_request_handler(
                 nextgcore_sbi::message::SbiRequest::post(path)
                     .with_json_body(&body)
                     .expect("json"),
@@ -38017,7 +38017,7 @@ mod tests {
         .expect("sink start");
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({
                     "subscription": {
@@ -38196,7 +38196,7 @@ mod tests {
         if immediate {
             event["immediateFlag"] = serde_json::json!(true);
         }
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({
                     "subscription": {
@@ -38584,7 +38584,7 @@ mod tests {
                 "count",
             ),
         ] {
-            let resp = crate::namf_server::namf_request_handler(
+            let resp = crate::namf_server::test_namf_request_handler(
                 nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                     .with_json_body(&serde_json::json!({ "subscription": body }))
                     .expect("json"),
@@ -39088,7 +39088,7 @@ mod tests {
         .await
         .expect("sink start");
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({
                     "subscription": {
@@ -39434,7 +39434,7 @@ mod tests {
             "application/vnd.3gpp.ngap",
             bytes::Bytes::copy_from_slice(&transfer),
         ));
-        let resp = crate::namf_server::namf_request_handler(req).await;
+        let resp = crate::namf_server::test_namf_request_handler(req).await;
         assert_eq!(
             resp.status, 202,
             "not refused for a location-only page: {:?}",
@@ -39760,7 +39760,7 @@ mod tests {
             guard.amf_ue_publish(&ue.amf_ue, 51, 1);
         }
         let subscribe = |supi: &str, tag: &str| {
-            crate::namf_server::namf_request_handler(
+            crate::namf_server::test_namf_request_handler(
                 nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                     .with_json_body(&serde_json::json!({ "subscription": {
                         "eventList": [{ "type": "LOCATION_REPORT", "immediateFlag": true }],
@@ -39884,7 +39884,7 @@ mod tests {
                 "count",
             ),
         ] {
-            let resp = crate::namf_server::namf_request_handler(
+            let resp = crate::namf_server::test_namf_request_handler(
                 nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                     .with_json_body(&serde_json::json!({ "subscription": body }))
                     .expect("json"),
@@ -40011,7 +40011,7 @@ mod tests {
                 "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
                 "supi": supi,
             });
-            let resp = crate::namf_server::namf_request_handler(
+            let resp = crate::namf_server::test_namf_request_handler(
                 nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                     .with_json_body(&serde_json::json!({ "subscription": body }))
                     .expect("json"),
@@ -40277,7 +40277,7 @@ mod tests {
         if immediate {
             event["immediateFlag"] = serde_json::json!(true);
         }
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({ "subscription": {
                     "eventList": [event],
@@ -40483,7 +40483,7 @@ mod tests {
             "path": "/subscription/eventList",
             "value": [{ "type": "REACHABILITY_REPORT" }],
         }]);
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::patch(format!("/namf-evts/v1/subscriptions/{sub_id}"))
                 .with_json_body(&patch)
                 .expect("json"),
@@ -40636,7 +40636,7 @@ mod tests {
         }
         ngap.ue_auth_state.insert(ue_id, stored);
         let (sink, port, mut rx) = notify_sink().await;
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({ "subscription": {
                     "eventList": [{ "type": "REACHABILITY_REPORT" }],
@@ -44408,7 +44408,7 @@ mod tests {
             ue.security_context_available = true;
             guard.amf_ue_publish(&ue, 1727, 9_727);
         }
-        let created = crate::namf_server::namf_request_handler(
+        let created = crate::namf_server::test_namf_request_handler(
             SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({ "subscription": {
                     "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
@@ -46287,7 +46287,7 @@ mod tests {
 
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (sink, port, mut rx) = notify_sink().await;
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({ "subscription": {
                     "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
@@ -48334,7 +48334,7 @@ mod eps_to_5gs_tests {
         // #1645: the UE arrived at this AMF from the EPS: one CONNECTED report and one
         // REACHABLE to a "UE Reachable for DL Traffic" subscriber, from this handler
         // (counted on this thread).
-        let dl_traffic = crate::namf_server::namf_request_handler(
+        let dl_traffic = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({ "subscription": {
                     "eventList": [{
