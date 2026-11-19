@@ -327,6 +327,7 @@ async fn main() -> Result<()> {
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
     let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    warn_ignored_debug_routes(sbi_profile);
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
         sbi_profile,
         require_oauth2,
@@ -569,10 +570,33 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// Whether the non-spec debug routes (`/activate`, `/members*`) are exposed.
 /// Off by default so the SBI surface is exactly the TS 29.532 resource set;
 /// enabled by setting `MBSMF_DEBUG_ROUTES` (any non-empty value). [mbsmfd-10]
+///
+/// #1944 (R32 on #2057): never under the `production` SBI profile. The routes
+/// add any SUPI to a session and establish N4mb towards a `upfAddr` the body
+/// names, which no TS 29.532 operation lets a consumer do; the variable is
+/// ignored there (and [`warn_ignored_debug_routes`] says so at startup).
 fn debug_routes_enabled() -> bool {
-    std::env::var("MBSMF_DEBUG_ROUTES")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    debug_routes_allowed(
+        std::env::var("MBSMF_DEBUG_ROUTES").ok().as_deref(),
+        nextgcore_sbi::security::SbiProfile::resolve(),
+    )
+}
+
+/// [`debug_routes_enabled`] for a given variable value and SBI profile.
+fn debug_routes_allowed(value: Option<&str>, profile: nextgcore_sbi::security::SbiProfile) -> bool {
+    value.is_some_and(|v| !v.is_empty()) && !profile.is_production()
+}
+
+/// #1944 (R32 on #2057): a WARN at startup when `MBSMF_DEBUG_ROUTES` is set
+/// under the production profile, where it is ignored.
+fn warn_ignored_debug_routes(profile: nextgcore_sbi::security::SbiProfile) {
+    let set = std::env::var("MBSMF_DEBUG_ROUTES").is_ok_and(|v| !v.is_empty());
+    if set && profile.is_production() {
+        log::warn!(
+            "MBSMF_DEBUG_ROUTES is set but ignored: the debug routes (/activate, /members) are \
+             never served under the production SBI profile (#1944)"
+        );
+    }
 }
 
 /// Parse session pool ID from string like "mbs-sess-123"
@@ -4597,6 +4621,20 @@ mod tests {
         ))
         .await;
         assert_eq!(rsp.status, 400, "/contexts/update exists (400, not 404)");
+    }
+
+    /// #1944 (R32 on #2057): `MBSMF_DEBUG_ROUTES` turns the debug routes on
+    /// under the dev profile only; under production they are never served.
+    ///
+    /// REVERT-VERIFIED: with the profile not consulted, the production
+    /// assertion fails.
+    #[test]
+    fn debug_routes_are_never_served_under_production_1944() {
+        use nextgcore_sbi::security::SbiProfile;
+        assert!(debug_routes_allowed(Some("1"), SbiProfile::Dev));
+        assert!(!debug_routes_allowed(Some("1"), SbiProfile::Production));
+        assert!(!debug_routes_allowed(Some(""), SbiProfile::Dev));
+        assert!(!debug_routes_allowed(None, SbiProfile::Dev));
     }
 
     #[test]
