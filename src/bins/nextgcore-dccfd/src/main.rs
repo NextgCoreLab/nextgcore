@@ -132,17 +132,27 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         // GET/PUT/DELETE /ndccf-datamanagement/v1/subscriptions/{subscriptionId}
         ["ndccf-datamanagement", "v1", "subscriptions", sub_id] => match method {
             "GET" => match dccf_context_get_subscription(sub_id) {
-                // #112: echo the stored resource, not a bespoke
-                // `{"subscriptionId":..,"status":"ACTIVE"}` body that no schema
-                // defines and that a consumer cannot deserialise.
-                Some(stored) => SbiResponse::ok()
-                    .with_json_body(&stored.resource)
-                    .unwrap_or_else(|_| SbiResponse::ok()),
+                // #1909: only the consumer that created it reads it back.
+                Some(stored) => {
+                    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                        stored.owner.as_deref(),
+                        &req,
+                        "DataManagement read",
+                    ) {
+                        return refused;
+                    }
+                    // #112: echo the stored resource, not a bespoke
+                    // `{"subscriptionId":..,"status":"ACTIVE"}` body that no schema
+                    // defines and that a consumer cannot deserialise.
+                    SbiResponse::ok()
+                        .with_json_body(&stored.resource)
+                        .unwrap_or_else(|_| SbiResponse::ok())
+                }
                 None => send_not_found("subscription not found", None),
             },
             // #112: `UpdateNWDAFDataSubscription` was absent and PUT answered 405.
             "PUT" => handle_dm_update(sub_id, &req).await,
-            "DELETE" => handle_dm_unsubscribe(sub_id).await,
+            "DELETE" => handle_dm_unsubscribe(sub_id, &req).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
@@ -163,9 +173,17 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         // POST /ndccf-contextdocument/v1/contexts
         ["ndccf-contextdocument", "v1", "contexts"] => match method {
             "POST" => {
+                // #1909: bound to the consumer's verified identity.
+                let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+                    &req,
+                    "ContextDocument create",
+                ) {
+                    Ok(owner) => owner,
+                    Err(refused) => return *refused,
+                };
                 let ctx_id = uuid::Uuid::new_v4().to_string();
                 log::info!("[DCCF] ContextDocument context created ctx_id={ctx_id}");
-                dccf_context_add_analytics_context(ctx_id.clone());
+                dccf_context_add_analytics_context_owned(ctx_id.clone(), owner);
                 let body = format!(r#"{{"contextId":"{ctx_id}"}}"#);
                 SbiResponse::created().with_body(body, "application/json")
             }
@@ -174,15 +192,33 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
 
         // GET/DELETE /ndccf-contextdocument/v1/contexts/{contextId}
         ["ndccf-contextdocument", "v1", "contexts", ctx_id] => match method {
-            "GET" => {
-                if dccf_context_has_analytics_context(ctx_id) {
+            "GET" => match dccf_context_analytics_context_owner(ctx_id) {
+                // #1909: only the consumer that created it.
+                Some(owner) => {
+                    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                        owner.as_deref(),
+                        &req,
+                        "ContextDocument read",
+                    ) {
+                        return refused;
+                    }
                     let body = format!(r#"{{"contextId":"{ctx_id}"}}"#);
                     SbiResponse::ok().with_body(body, "application/json")
-                } else {
-                    send_not_found("context not found", None)
                 }
-            }
+                None => send_not_found("context not found", None),
+            },
             "DELETE" => {
+                // #1909: only the consumer that created it, before removing; an
+                // unknown context stays an idempotent 204 as before.
+                if let Some(owner) = dccf_context_analytics_context_owner(ctx_id) {
+                    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                        owner.as_deref(),
+                        &req,
+                        "ContextDocument delete",
+                    ) {
+                        return refused;
+                    }
+                }
                 dccf_context_remove_analytics_context(ctx_id);
                 SbiResponse::no_content()
             }
@@ -648,6 +684,14 @@ fn parse_subsc(req: &SbiRequest) -> Result<data_mgmt::DataManagementSubsc, Box<S
 /// mandatory `Location` header and echoes the resource, and the subscription's
 /// scope is recorded so the fan-out can be keyed on it.
 async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
+    // #1909: bound to the consumer's verified identity, before anything is
+    // read or stored.
+    let owner =
+        match nextgcore_sbi::owner_binding::owner_for_new_resource(req, "DataManagement subscribe")
+        {
+            Ok(owner) => owner,
+            Err(refused) => return *refused,
+        };
     let sub = match parse_subsc(req) {
         Ok(s) => s,
         Err(resp) => return *resp,
@@ -667,6 +711,7 @@ async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
         notif_corr_id: sub.notif_corr_id.clone(),
         scope: scope.clone(),
         resource: sub.clone(),
+        owner,
     });
     if !stored {
         return nextgcore_sbi::server::send_error(
@@ -742,8 +787,16 @@ impl Drop for SubscribeRollback {
 /// updates an existing subscription and does not create one at a
 /// consumer-chosen id.
 async fn handle_dm_update(sub_id: &str, req: &SbiRequest) -> SbiResponse {
-    if !dccf_context_has_subscription(sub_id) {
+    let Some(existing) = dccf_context_get_subscription(sub_id) else {
         return send_not_found("subscription not found", None);
+    };
+    // #1909: only the consumer that created it, before the body is read.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        req,
+        "DataManagement update",
+    ) {
+        return refused;
     }
     let sub = match parse_subsc(req) {
         Ok(s) => s,
@@ -760,6 +813,8 @@ async fn handle_dm_update(sub_id: &str, req: &SbiRequest) -> SbiResponse {
         notif_corr_id: sub.notif_corr_id.clone(),
         scope,
         resource: sub.clone(),
+        // #1909: a replacement keeps its creator.
+        owner: existing.owner,
     });
     SbiResponse::ok()
         .with_json_body(&sub)
@@ -771,7 +826,18 @@ async fn handle_dm_update(sub_id: &str, req: &SbiRequest) -> SbiResponse {
 /// Releases this consumer's claim on its producer subscription, and deletes that
 /// producer subscription when it was the last consumer — refcounted, so one
 /// consumer unsubscribing cannot cut off another's data.
-async fn handle_dm_unsubscribe(sub_id: &str) -> SbiResponse {
+async fn handle_dm_unsubscribe(sub_id: &str, req: &SbiRequest) -> SbiResponse {
+    // #1909: only the consumer that created it, before its producer claim is
+    // released.
+    if let Some(existing) = dccf_context_get_subscription(sub_id) {
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            existing.owner.as_deref(),
+            req,
+            "DataManagement unsubscribe",
+        ) {
+            return refused;
+        }
+    }
     if !remove_consumer_subscription(sub_id).await {
         return send_not_found("subscription not found", None);
     }
@@ -1107,6 +1173,20 @@ mod data_management_tests {
     /// wipe a subscription a `context::tests` case was mid-way through asserting
     /// on.
     use context::GLOBAL_TEST_LOCK as TEST_GUARD;
+
+    /// #1909: the verified consumer these tests call the router as.
+    const TEST_CONSUMER_1909: &str = "c0c0c0c0-1909-4000-8000-0000000000c0";
+
+    /// #1909: the router as [`TEST_CONSUMER_1909`] unless the request already
+    /// names a verified identity. Shadows the glob import, so the subscriptions
+    /// these tests create are owned and manageable under either SBI profile; a
+    /// test that needs an anonymous caller calls `super::dccf_request_handler`.
+    async fn dccf_request_handler(mut req: SbiRequest) -> SbiResponse {
+        if req.peer_cert_nf_instance_id.is_none() && req.oauth2_subject.is_none() {
+            req.oauth2_subject = Some(TEST_CONSUMER_1909.to_string());
+        }
+        super::dccf_request_handler(req).await
+    }
 
     /// #1785: also selects the Dev SBI profile, which every test here needs for its
     /// loopback-plaintext peers (the default is Production, whose peer clients
@@ -2692,6 +2772,147 @@ mod data_management_tests {
             gone.stop().await.ok();
         });
         clear_subscriptions();
+    }
+
+    const OWNER_1909: &str = "aaaaaaaa-1909-4000-8000-0000000000a1";
+    const OTHER_1909: &str = "bbbbbbbb-1909-4000-8000-0000000000b2";
+
+    fn with_1909(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
+        r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        r.oauth2_subject = token.map(str::to_string);
+        r
+    }
+
+    /// A foreign certificate, a foreign token, the owner's certificate with a
+    /// foreign token, and nobody (sent past the test shim).
+    async fn intruders_get_403(r: impl Fn() -> SbiRequest, what: &str) {
+        for (who, req) in [
+            (
+                "foreign certificate",
+                with_1909(r(), Some(OTHER_1909), None),
+            ),
+            ("foreign token", with_1909(r(), None, Some(OTHER_1909))),
+            (
+                "mismatched pair",
+                with_1909(r(), Some(OWNER_1909), Some(OTHER_1909)),
+            ),
+        ] {
+            assert_eq!(
+                dccf_request_handler(req).await.status,
+                403,
+                "{what} by {who}"
+            );
+        }
+        assert_eq!(
+            super::dccf_request_handler(r()).await.status,
+            403,
+            "{what} by an anonymous caller"
+        );
+    }
+
+    /// #1909: a data-management subscription is read, replaced and deleted only
+    /// by the consumer that created it; a mismatched create stores nothing.
+    /// REVERT-VERIFIED: each of the read, update and unsubscribe checks replaced
+    /// by `None` makes the matching intruder assertion fail; the create binding
+    /// dropped (owner `None`) fails the owner assertion.
+    #[test]
+    fn a_data_management_subscription_is_managed_only_by_its_creator_1909() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let body = subscribe_body("corr-1909", "http://127.0.0.1:9/cb-1909", "NF_LOAD");
+            let create = || {
+                SbiRequest::post(DM_SUBSCRIPTIONS_PATH).with_body(body.clone(), "application/json")
+            };
+            // A certificate and token that disagree create nothing.
+            let before = context::dccf_context_subscription_count();
+            let resp =
+                dccf_request_handler(with_1909(create(), Some(OWNER_1909), Some(OTHER_1909))).await;
+            assert_eq!(resp.status, 403);
+            assert_eq!(context::dccf_context_subscription_count(), before);
+
+            let resp = dccf_request_handler(with_1909(create(), Some(OWNER_1909), None)).await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            let id = created_id(&resp);
+            assert_eq!(
+                dccf_context_get_subscription(&id)
+                    .and_then(|s| s.owner)
+                    .as_deref(),
+                Some(OWNER_1909),
+                "bound to the verified certificate"
+            );
+            let uri = format!("{DM_SUBSCRIPTIONS_PATH}/{id}");
+            let replacement = subscribe_body("corr-1909", "http://127.0.0.1:9/hijack", "NF_LOAD");
+            intruders_get_403(|| SbiRequest::get(uri.clone()), "GET").await;
+            intruders_get_403(
+                || SbiRequest::put(uri.clone()).with_body(replacement.clone(), "application/json"),
+                "PUT",
+            )
+            .await;
+            intruders_get_403(|| SbiRequest::delete(uri.clone()), "DELETE").await;
+            let held = dccf_context_get_subscription(&id).expect("still stored");
+            assert_eq!(
+                held.notify_uri, "http://127.0.0.1:9/cb-1909",
+                "nothing applied"
+            );
+
+            // The owner, by token: replace keeps the owner, then delete.
+            let put = with_1909(
+                SbiRequest::put(uri.clone()).with_body(replacement.clone(), "application/json"),
+                None,
+                Some(OWNER_1909),
+            );
+            assert_eq!(dccf_request_handler(put).await.status, 200);
+            assert_eq!(
+                dccf_context_get_subscription(&id)
+                    .and_then(|s| s.owner)
+                    .as_deref(),
+                Some(OWNER_1909),
+                "a replacement keeps its creator"
+            );
+            let get = with_1909(SbiRequest::get(uri.clone()), None, Some(OWNER_1909));
+            assert_eq!(dccf_request_handler(get).await.status, 200);
+            let delete = with_1909(SbiRequest::delete(uri.clone()), None, Some(OWNER_1909));
+            assert_eq!(dccf_request_handler(delete).await.status, 204);
+            assert!(dccf_context_get_subscription(&id).is_none());
+        });
+        clear_subscriptions();
+    }
+
+    /// #1909: an analytics context document is read and deleted only by the
+    /// consumer that created it.
+    /// REVERT-VERIFIED: the read check and the delete check, each replaced by
+    /// `None`, make the matching intruder assertion fail.
+    #[test]
+    fn an_analytics_context_is_managed_only_by_its_creator_1909() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        init();
+        futures_lite_block_on(async {
+            let create = with_1909(
+                SbiRequest::post("/ndccf-contextdocument/v1/contexts"),
+                Some(OWNER_1909),
+                None,
+            );
+            let resp = dccf_request_handler(create).await;
+            assert_eq!(resp.status, 201);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let id = body["contextId"].as_str().unwrap().to_string();
+            assert_eq!(
+                context::dccf_context_analytics_context_owner(&id),
+                Some(Some(OWNER_1909.to_string()))
+            );
+            let uri = format!("/ndccf-contextdocument/v1/contexts/{id}");
+            intruders_get_403(|| SbiRequest::get(uri.clone()), "GET").await;
+            intruders_get_403(|| SbiRequest::delete(uri.clone()), "DELETE").await;
+            assert!(dccf_context_has_analytics_context(&id), "still there");
+            let get = with_1909(SbiRequest::get(uri.clone()), Some(OWNER_1909), None);
+            assert_eq!(dccf_request_handler(get).await.status, 200);
+            let delete = with_1909(SbiRequest::delete(uri.clone()), Some(OWNER_1909), None);
+            assert_eq!(dccf_request_handler(delete).await.status, 204);
+            assert!(!dccf_context_has_analytics_context(&id));
+        });
     }
 }
 

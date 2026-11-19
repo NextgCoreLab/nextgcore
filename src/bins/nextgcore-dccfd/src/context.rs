@@ -33,6 +33,11 @@ pub struct DccfSubscription {
     /// Stored rather than re-synthesised so the echo cannot drift from what the
     /// consumer sent.
     pub resource: DataManagementSubsc,
+    /// #1909: the verified NF Instance ID of the consumer that created the
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// read, replace or delete it. Never the self-declared `nfId`. `None` when
+    /// created with no verified identity (`dev`). In memory only.
+    pub owner: Option<String>,
 }
 
 /// A producer `EventExposure` subscription the DCCF created on consumers' behalf
@@ -67,8 +72,9 @@ struct DccfContext {
     subscriptions: HashSet<String>,
     /// Subscription metadata (ID -> callback URI)
     subscription_map: HashMap<String, DccfSubscription>,
-    /// Active analytics context IDs (Ndccf_ContextDocument)
-    analytics_contexts: HashSet<String>,
+    /// Active analytics context IDs (Ndccf_ContextDocument) -> the verified
+    /// consumer that created it (#1909), `None` when created anonymously (`dev`).
+    analytics_contexts: HashMap<String, Option<String>>,
     /// Producer subscriptions the DCCF holds on consumers' behalf, keyed by a
     /// canonical form of their scope (#112).
     producer_subs: HashMap<String, ProducerSubscription>,
@@ -113,7 +119,7 @@ pub fn dccf_context_init(max_subscriptions: usize) {
         Mutex::new(DccfContext {
             subscriptions: HashSet::new(),
             subscription_map: HashMap::new(),
-            analytics_contexts: HashSet::new(),
+            analytics_contexts: HashMap::new(),
             producer_subs: HashMap::new(),
             max_subscriptions,
             fanout_count: 0,
@@ -144,6 +150,7 @@ pub fn dccf_context_add_subscription_with_uri(sub_id: String, notify_uri: String
         notif_corr_id: String::new(),
         scope: SubscriptionScope::default(),
         resource: DataManagementSubsc::default(),
+        owner: None,
     })
 }
 
@@ -220,13 +227,38 @@ pub fn dccf_context_subscription_count() -> usize {
 // ---------------------------------------------------------------------------
 
 /// Registers an analytics context binding.
+#[cfg(test)]
 pub fn dccf_context_add_analytics_context(ctx_id: String) {
-    ctx().lock().unwrap().analytics_contexts.insert(ctx_id);
+    dccf_context_add_analytics_context_owned(ctx_id, None);
+}
+
+/// Registers an analytics context binding created by `owner` (#1909).
+pub fn dccf_context_add_analytics_context_owned(ctx_id: String, owner: Option<String>) {
+    ctx()
+        .lock()
+        .unwrap()
+        .analytics_contexts
+        .insert(ctx_id, owner);
 }
 
 /// Returns true if the analytics context exists.
 pub fn dccf_context_has_analytics_context(ctx_id: &str) -> bool {
-    ctx().lock().unwrap().analytics_contexts.contains(ctx_id)
+    ctx()
+        .lock()
+        .unwrap()
+        .analytics_contexts
+        .contains_key(ctx_id)
+}
+
+/// The consumer an analytics context was created by: `None` when it does not
+/// exist, `Some(owner)` when it does (#1909).
+pub fn dccf_context_analytics_context_owner(ctx_id: &str) -> Option<Option<String>> {
+    ctx()
+        .lock()
+        .unwrap()
+        .analytics_contexts
+        .get(ctx_id)
+        .cloned()
 }
 
 /// Removes an analytics context binding.
@@ -539,7 +571,7 @@ mod tests {
             Mutex::new(DccfContext {
                 subscriptions: HashSet::new(),
                 subscription_map: HashMap::new(),
-                analytics_contexts: HashSet::new(),
+                analytics_contexts: HashMap::new(),
                 producer_subs: HashMap::new(),
                 max_subscriptions: 16,
                 fanout_count: 0,
