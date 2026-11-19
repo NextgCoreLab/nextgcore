@@ -1894,13 +1894,23 @@ async fn main() -> Result<()> {
         nextgcore_sbi::security::SbiProfile::resolve(),
         server_tls.as_ref(),
     );
-    policy.require_subscriber_identity = verification;
+    // #1952: a declared TLS terminator (trust_forwarded_client_cert) also lets
+    // the NRF verify a subscriber: the forwarded certificate identity counts. So
+    // a dev NRF behind one, which sees plaintext, still binds subscriptions. The
+    // NF-type rule does NOT follow it: a forwarded identity carries no NF types,
+    // so every registration would be refused (documented in nrf.md).
+    policy.require_subscriber_identity = verification || policy.trust_forwarded_client_cert;
     policy.require_registrant_nf_types = verification;
     if !verification {
         log::warn!(
-            "nrfd-1926: dev SBI profile and no TLS client-certificate verification: \
-             NFStatusSubscribe needs no verified identity, and a registrant may register as \
-             any NF type"
+            "nrfd-1926: dev SBI profile and no TLS client-certificate verification: a \
+             registrant may register as any NF type{}",
+            if policy.require_subscriber_identity {
+                " (NFStatusSubscribe still needs a verified identity: a TLS terminator is \
+                 declared, #1952)"
+            } else {
+                ", and NFStatusSubscribe needs no verified identity"
+            }
         );
     }
     if policy.require_subscriber_identity {
@@ -5493,10 +5503,11 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
 ///   6.1.8-1, 6.2.8-1): `nnrf-nfm`, `nnrf-disc`, or a `nnrf-nfm:` / `nnrf-disc:`
 ///   resource scope;
 /// - when the caller's verified certificate names NF types (RFC 9310), the
-///   asserted `nfType` is one of them. A certificate naming none, or a CCA,
-///   leaves `nfType` asserted, as the registration that follows is: #1611 binds
-///   that registration to the certificate, and the NRF's own profile decides
-///   which types its services allow, as for any producer.
+///   asserted `nfType` is one of them. Where the NRF requires verified NF types
+///   ([`registrant_nf_types_required`], #1917/#1926), a certificate naming none,
+///   a forwarded identity and a CCA get no token at all (#1952). Elsewhere (a
+///   dev NRF without TLS) they leave `nfType` asserted, as the registration that
+///   follows does.
 ///
 /// `Err` is the reason appended to the `invalid_client` description.
 fn unregistered_nrf_api_consumer(
@@ -5543,6 +5554,22 @@ fn unregistered_nrf_api_consumer(
             ", and nfType {nf_type:?} is not among the NF types of its client certificate \
              ({cert_types:?})"
         ));
+    }
+    // #1952: where NF management needs the certificate's NF type (#1917, #1926),
+    // so does this bootstrap grant: an asserted nfType is not put in a token the
+    // NRF would then trust. Only a client certificate THIS NRF verified, naming
+    // the type in its NFTypes, proves it; a certificate naming none, a forwarded
+    // identity and a CCA do not.
+    if registrant_nf_types_required() {
+        let verified = authentication.via_transport
+            && direct
+            && cert_types.iter().any(|t| t.eq_ignore_ascii_case(nf_type));
+        if !verified {
+            return Err(format!(
+                ", and nfType {nf_type:?} cannot be verified: no client certificate this NRF \
+                 verified names it in RFC 9310 NFTypes (TS 33.310 §6.1.3c.3)"
+            ));
+        }
     }
     NfProfile::from_json(&serde_json::json!({
         "nfInstanceId": identity,
@@ -13898,6 +13925,72 @@ mod nrf_api_tokens_tests_1667 {
         assert_eq!(refused.status, 401, "NFRegister without a token");
     }
 
+    /// **#1952.** Where the NRF requires verified NF types (#1917/#1926), the
+    /// bootstrap grant does too: an unregistered NF whose certificate names no
+    /// NF type gets no nnrf token claiming AUSF (or anything); one naming AUSF
+    /// does. Under a dev NRF without TLS the asserted type is still accepted.
+    ///
+    /// REVERT-VERIFIED: with the `registrant_nf_types_required()` block removed
+    /// from `unregistered_nrf_api_consumer`, the typeless request gets 200 and
+    /// the first assertion fails.
+    #[tokio::test]
+    async fn a_typeless_certificate_gets_no_nrf_token_where_types_are_required_1952() {
+        use super::registrant_nf_type_tests_1917::REQUIRED;
+        let _self_entry = self_entry_test_lock().lock().await;
+        let id = "19520000-0000-4000-8000-00000000000a";
+        assert!(nf_manager().get(id).is_none(), "unregistered");
+        let policy = NrfPolicy::default();
+        let nrf = json!({"targetNfType": "NRF"});
+        let ask = |types: &'static [&'static str]| {
+            token_req(id, "AUSF", nrf.clone(), "nnrf-disc", Some((id, types)))
+        };
+
+        let resp = REQUIRED
+            .scope(
+                true,
+                handle_access_token_request_with_policy(&ask(&[]), &policy),
+            )
+            .await;
+        assert_eq!(
+            resp.status,
+            400,
+            "typeless, types required: {}",
+            error_of(&resp)
+        );
+        assert!(
+            error_of(&resp).contains("cannot be verified"),
+            "refused for the unverified type: {}",
+            error_of(&resp)
+        );
+
+        let resp = REQUIRED
+            .scope(
+                true,
+                handle_access_token_request_with_policy(&ask(&["AUSF"]), &policy),
+            )
+            .await;
+        assert_eq!(
+            resp.status,
+            200,
+            "a certificate naming AUSF: {}",
+            error_of(&resp)
+        );
+
+        let resp = REQUIRED
+            .scope(
+                false,
+                handle_access_token_request_with_policy(&ask(&[]), &policy),
+            )
+            .await;
+        assert_eq!(
+            resp.status,
+            200,
+            "dev without TLS keeps the asserted type: {}",
+            error_of(&resp)
+        );
+        assert!(nf_manager().get(id).is_none(), "a token registers nothing");
+    }
+
     /// The bootstrap grant is only for this NRF's APIs, and only on proof: an
     /// unregistered NF is still refused `invalid_client` with no proven
     /// identity, for another target, for a non-NRF scope, or as an nfType its
@@ -15450,7 +15543,7 @@ mod verification_required_tests_1926 {
             .expect("verification_required is called");
         assert!(tls_at < at, "the listener's TLS is resolved first");
         for policy in [
-            "policy.require_subscriber_identity = verification;",
+            "policy.require_subscriber_identity = verification || policy.trust_forwarded_client_cert;",
             "policy.require_registrant_nf_types = verification;",
         ] {
             assert!(main[at..].contains(policy), "{policy}");
