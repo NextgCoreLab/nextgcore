@@ -1816,8 +1816,14 @@ mod tests {
         let ie = [0x11, 0x05, 0x41, 0x02, 0x0a, 0x0b, 0x0c];
         let at = accept.windows(ie.len()).position(|w| w == ie);
         assert!(at.is_some(), "the Rejected NSSAI IE: {accept:02x?}");
-        let allowed = accept.windows(2).position(|w| w == [0x15, 0x02]).expect("allowed");
-        assert!(allowed < at.unwrap(), "after the Allowed NSSAI (§8.2.7 order)");
+        let allowed = accept
+            .windows(2)
+            .position(|w| w == [0x15, 0x02])
+            .expect("allowed");
+        assert!(
+            allowed < at.unwrap(),
+            "after the Allowed NSSAI (§8.2.7 order)"
+        );
         assert_eq!(
             encode_rejected_nssai_value(&[crate::context::SNssai { sst: 3, sd: None }], 1),
             vec![0x11, 0x03],

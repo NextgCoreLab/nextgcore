@@ -660,7 +660,10 @@ pub(crate) mod tests {
         assert!(!out.all_rejected(&allowed));
         assert_eq!(asked, vec![1, 2, 3], "every S-NSSAI is asked for");
         assert_eq!(held, (true, true), "SST 1 and 3 stay admitted");
-        assert!(decreased.is_empty(), "nothing is counted out: {decreased:?}");
+        assert!(
+            decreased.is_empty(),
+            "nothing is counted out: {decreased:?}"
+        );
     }
 
     /// #1876, #1942: a registration whose every S-NSSAI is rejected is rejected, so
@@ -674,7 +677,15 @@ pub(crate) mod tests {
         clear_for_test();
         let (srv, port, seen) = nsacf(&[1, 2], Arc::new(AtomicU16::new(204))).await;
         let supi = "imsi-001010000018761";
-        admit_registration(supi, "3GPP_ACCESS", &[snssai(3)], "127.0.0.1", port, "amf-1876").await;
+        admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(3)],
+            "127.0.0.1",
+            port,
+            "amf-1876",
+        )
+        .await;
         let allowed = [snssai(1), snssai(2)];
 
         let out =
@@ -744,7 +755,10 @@ pub(crate) mod tests {
         let parked_now = pending_count();
         clear_for_test();
 
-        assert!(out.granted && out.rejected.is_empty(), "degrade-open admits");
+        assert!(
+            out.granted && out.rejected.is_empty(),
+            "degrade-open admits"
+        );
         assert!(!held, "but counted nothing to undo");
         assert_eq!(
             parked_now, 0,
