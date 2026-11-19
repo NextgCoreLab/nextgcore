@@ -5872,11 +5872,18 @@ mod tests {
             "POST" => SbiRequest::post(uri),
             other => panic!("make_request: unsupported method {other}"),
         };
-        match body {
+        let mut req = match body {
             Some(b) => req.with_json_body(&b).expect("encode test body"),
             None => req,
-        }
+        };
+        // #1865: a verified consumer, so the subscriptions these tests create are
+        // owned and behave the same under either SBI profile.
+        req.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+        req
     }
+
+    /// #1865: the NF Instance ID every `make_request` speaks as.
+    const TEST_CONSUMER_1865: &str = "c0c0c0c0-1865-4000-8000-0000000000cf";
 
     /// #91 criterion 4: `Npcf_UEPolicyControl_Update` ACTS on the request instead of
     /// returning a canned 200.
@@ -12414,6 +12421,124 @@ mod tests {
         })
     }
 
+    /// #1865: a policy control events subscription is read, replaced and
+    /// removed only by the consumer that created it. A foreign certificate, a
+    /// foreign token, an anonymous caller and a certificate/token mismatch each
+    /// get 403 and leave it untouched; the owner then succeeds.
+    ///
+    /// REVERT-VERIFIED: with the GET check dropped the GET assertion fails;
+    /// with the PUT check dropped the PUT assertion fails; with the DELETE
+    /// check dropped the DELETE assertion fails; with `owner` not passed to
+    /// `event_sub_add` (`None`) the foreign callers pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_event_exposure_subscription_is_managed_only_by_its_creator_1865() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let body = |uri: &str| event_subsc_body(uri, "notif-1865", &["PLMN_CH"]);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(body("http://127.0.0.1:9/pc-1865")),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let location = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .expect("Location");
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let stored = || {
+            crate::context::pcf_self()
+                .read()
+                .unwrap()
+                .event_sub_find_by_subscription_id(&id)
+        };
+        assert_eq!(
+            stored().and_then(|s| s.owner).as_deref(),
+            Some(TEST_CONSUMER_1865),
+            "bound to the verified consumer at create"
+        );
+
+        const OTHER: &str = "0e0e0e0e-1865-4000-8000-0000000000ff";
+        let as_caller = |method: &str, cert: Option<&str>, token: Option<&str>| {
+            let b = (method == "PUT").then(|| body("http://127.0.0.1:9/hijacked"));
+            let mut r = make_request(method, &location, b);
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+        for (cert, token) in [
+            (Some(OTHER), None),
+            (None, Some(OTHER)),
+            (None, None),
+            (Some(TEST_CONSUMER_1865), Some(OTHER)),
+        ] {
+            for method in ["GET", "PUT", "DELETE"] {
+                let resp = pcf_sbi_request_handler(as_caller(method, cert, token)).await;
+                assert_eq!(
+                    resp.status, 403,
+                    "{method} by cert={cert:?} token={token:?} must be refused"
+                );
+            }
+            assert_eq!(
+                stored().expect("still stored").notif_uri,
+                "http://127.0.0.1:9/pc-1865",
+                "unchanged after the refusals"
+            );
+        }
+
+        let owner = Some(TEST_CONSUMER_1865);
+        assert_eq!(
+            pcf_sbi_request_handler(as_caller("GET", owner, None))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            pcf_sbi_request_handler(as_caller("PUT", owner, None))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            stored().and_then(|s| s.owner).as_deref(),
+            owner,
+            "a replacement keeps its creator"
+        );
+        assert_eq!(
+            pcf_sbi_request_handler(as_caller("DELETE", owner, None))
+                .await
+                .status,
+            204
+        );
+        assert!(stored().is_none());
+
+        // A certificate/token mismatch at create is refused and stores nothing.
+        let mut mixed = make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(body("http://127.0.0.1:9/mixed")),
+        );
+        mixed.peer_cert_nf_instance_id = Some(TEST_CONSUMER_1865.into());
+        mixed.oauth2_subject = Some(OTHER.into());
+        assert_eq!(pcf_sbi_request_handler(mixed).await.status, 403);
+        assert!(
+            !crate::context::pcf_self()
+                .read()
+                .unwrap()
+                .event_subs_wanting("PLMN_CH", None)
+                .iter()
+                .any(|s| s.notif_uri == "http://127.0.0.1:9/mixed"),
+            "nothing stored"
+        );
+    }
+
     /// #90 criterion 1: the two-resource CRUD exists and answers the spec's
     /// status codes, with a `Location` header on create.
     ///
@@ -12830,6 +12955,7 @@ mod tests {
                 None,
                 Some(1),
                 serde_json::json!({}),
+                None,
             )
             .expect("subscription added");
 
