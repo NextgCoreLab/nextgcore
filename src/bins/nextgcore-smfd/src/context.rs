@@ -2539,6 +2539,9 @@ impl SmfContext {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect::<std::collections::BTreeMap<_, _>>(),
             "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
+            // #1875: the release-side cleanups still owed a peer, so a restart does
+            // not forget them.
+            "pendingCleanups": crate::reconcile::snapshot(),
         })
     }
 
@@ -2783,6 +2786,24 @@ impl SmfContext {
         if let Ok(mut map) = self.failed_up_paths.write() {
             map.extend(failed_up_paths);
         }
+        // #1875: absent before it existed, which means none owed. Per record, so one
+        // whose schema moved does not discard the rest.
+        let pending_cleanups: Vec<crate::reconcile::Cleanup> = doc
+            .get("pendingCleanups")
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.into_iter()
+                    .filter_map(|v| match serde_json::from_value(v) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            log::warn!("skipping unreadable SMF pending cleanup: {e}");
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::reconcile::restore(pending_cleanups);
         if let Ok(mut map) = self.session_upfs.write() {
             map.extend(session_upfs);
         }
@@ -4882,6 +4903,37 @@ mod tests {
         ctx.set_state_file(path.to_path_buf())
             .expect("arming a fresh state file must succeed");
         ctx
+    }
+
+    /// #1875: a parked release cleanup is written into the snapshot and restored from
+    /// it, so a restart does not forget a cleanup still owed a peer.
+    ///
+    /// REVERT-VERIFIED: with `pendingCleanups` left out of the snapshot, this fails:
+    /// the restarted SMF holds nothing parked.
+    #[tokio::test]
+    async fn a_parked_cleanup_survives_a_restart_1875() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let path = temp_state_path("pending-cleanups-1875");
+        let owed = crate::reconcile::Cleanup::UecmDeregister {
+            supi: "imsi-001010000018755".to_string(),
+            psi: 9,
+        };
+        {
+            let ctx = ctx_with_state(&path);
+            crate::reconcile::restore(vec![owed.clone()]);
+            ctx.persist();
+        }
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        crate::reconcile::clear_for_test();
+
+        let _restarted = ctx_with_state(&path);
+        let restored = crate::reconcile::snapshot();
+        crate::reconcile::clear_for_test();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(written.contains("pendingCleanups"), "{written}");
+        assert_eq!(restored, vec![owed], "restored at boot");
     }
 
     fn binding(

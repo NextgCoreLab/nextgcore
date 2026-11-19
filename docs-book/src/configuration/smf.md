@@ -229,7 +229,21 @@ With an NSACF configured (`NSACF_URI`) or discoverable, every PDU session is cou
 - **Count-out.** Every release sends the DECREASE, alongside the UDM cleanup. A same-PSI re-establishment on the same S-NSSAI waits for the old session's DECREASE if it is already sent, and takes the admission over if it is not (then neither a DECREASE nor a new INCREASE is sent). A re-establishment on another S-NSSAI waits for neither.
 - **Shutdown and boot.** A shutdown that releases the association counts out every session still admitted, alongside the #39 fan-out and the Association Release, within the shutdown deadline. A durable shutdown counts nothing out: the sessions continue. At boot, a snapshot session that cannot be restored is counted out.
 
-`smf_nsac_decrease_failures_total` counts the DECREASEs the NSACF refused or did not answer. Each such session stays counted at the NSACF. Precautionary DECREASEs are not counted.
+`smf_nsac_decrease_failures_total` counts the DECREASEs the NSACF refused or did not answer, the reconciler's retries included. Precautionary DECREASEs are not counted. (Before #1875 each such session stayed counted at the NSACF for good; that no longer holds.)
+
+## Release-cleanup reconciler (#1875)
+
+A release (or a create's rollback) owes four peers a cleanup: the NSACF DECREASE, the SM Policy Association delete (TS 29.512 §4.2.5), the Nudm_UECM_Deregistration and the Nudm_SDM_Unsubscribe (TS 23.502 §4.3.4.2 steps 14-15). One that fails or times out is parked and retried every 30 s until the peer accepts it; a 404 counts as accepted, because the peer does not hold the record. A 4xx the PCF refuses with is not retried.
+
+- **Bounded.** At most 4096 parked cleanups. Parking one more evicts the oldest, which is logged at error and counted `abandoned`. One pass sends for at most 30 s.
+- **Durable.** The parked set is written into the state snapshot (`pendingCleanups`) and restored at boot, when the durable state is configured (`--state-file` / `NEXTGCORE_SMF_STATE_FILE`). Without it the set is memory-only, like the sessions.
+- **Never against a live session.** A DECREASE or deregistration names a (SUPI, PSI). A new session for that pair supersedes it: its INCREASE or registration is the live one, so nothing is sent. A session for the pair still being created defers it to the next pass.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `smf_release_cleanups_pending` | gauge | `kind`: `nsac_decrease`, `sm_policy_delete`, `uecm_deregister`, `sdm_unsubscribe` | cleanups parked now |
+| `smf_release_cleanups_parked_total` | counter | `kind` | cleanups that failed and were parked |
+| `smf_release_cleanups_reconciled_total` | counter | `kind`, `result`: `delivered`, `superseded`, `refused`, `abandoned` | parked cleanups the reconciler ended, and how |
 
 ## Restoration signalling (#193)
 

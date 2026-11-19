@@ -60,6 +60,7 @@ mod policy;
 #[cfg(test)]
 mod property_tests;
 mod qos_mon; // #1390: QOS_MON through per QoS flow QoS monitoring (N4 SRR, N2 id 181)
+mod reconcile; // #1875: parked release-side cleanups, retried until delivered
 mod restoration; // #193: restoration signalling for resources the UPF no longer holds
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
 mod session_metrics; // #1368: PDU session establishment counters (TS 28.552 §5.3.1)
@@ -136,6 +137,7 @@ fn render_metrics() -> String {
         nrf_client: true,
     });
     session_metrics::render(&mut out);
+    reconcile::render(&mut out);
     out.push_str(&render_smf_families());
     n6_delay::render(&mut out);
     out
@@ -169,7 +171,7 @@ fn render_smf_families() -> String {
          # HELP smf_pfcp_unauthorized_messages_total PFCP messages refused or dropped because their sender is no UPF of this SMF, or reported on another UPF's session\n\
          # TYPE smf_pfcp_unauthorized_messages_total counter\n\
          smf_pfcp_unauthorized_messages_total {}\n\
-         # HELP smf_sm_policy_delete_failures_total SM Policy Association terminations (Npcf_SMPolicyControl_Delete) that failed after every attempt; each leaves an association at the PCF\n\
+         # HELP smf_sm_policy_delete_failures_total SM Policy Association terminations (Npcf_SMPolicyControl_Delete) that failed after every attempt; each is parked for the release-cleanup reconciler (smf_release_cleanups_*)\n\
          # TYPE smf_sm_policy_delete_failures_total counter\n\
          smf_sm_policy_delete_failures_total {}\n\
          # HELP smf_up_path_failures_total Remote GTP-U peers a UPF reported a user plane path failure toward (PFCP Node Report, TS 29.244 §5.10A)\n\
@@ -187,7 +189,7 @@ fn render_smf_families() -> String {
          # HELP smf_up_path_sessions_released_total Sessions released because their path was still down after SMF_UP_PATH_FAILURE_HOLD_SECS\n\
          # TYPE smf_up_path_sessions_released_total counter\n\
          smf_up_path_sessions_released_total {}\n\
-         # HELP smf_nsac_decrease_failures_total NSACF DECREASEs (Nnsacf_NSAC_NumOfPDUsUpdate) that failed or timed out; each leaves a PDU session counted at the NSACF\n\
+         # HELP smf_nsac_decrease_failures_total NSACF DECREASEs (Nnsacf_NSAC_NumOfPDUsUpdate) that failed or timed out, the reconciler's retries included; each failed one is parked for the release-cleanup reconciler (smf_release_cleanups_*)\n\
          # TYPE smf_nsac_decrease_failures_total counter\n\
          smf_nsac_decrease_failures_total {}\n\
          # HELP smf_ipv4_pool_stale_releases_total UE IPv4 addresses released while already free: each is a double free\n\
@@ -693,6 +695,48 @@ pub(crate) async fn rollback_nsac_as(
     if !admitted {
         return true;
     }
+    let accepted = nsac_decrease_once(nf_id, nsacf, plmn, supi, psi, sst, sd).await;
+    if !accepted {
+        // #1875: a DECREASE that failed is retried until the NSACF takes it; each one
+        // lost used to shrink the slice's quota for good (TS 23.502 §4.2.11.4).
+        reconcile::park(nsac_cleanup(nf_id, nsacf, plmn, supi, psi, sst, sd));
+    }
+    accepted
+}
+
+/// #1875: the parked form of a DECREASE [`rollback_nsac_as`] could not deliver.
+fn nsac_cleanup(
+    nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> reconcile::Cleanup {
+    reconcile::Cleanup::NsacDecrease {
+        supi: supi.to_string(),
+        psi,
+        sst,
+        sd: sd.map(str::to_string),
+        nf_id: nf_id.map(str::to_string),
+        nsacf: nsacf.cloned(),
+        plmn: plmn.map(|(mcc, mnc)| (mcc.to_string(), mnc.to_string())),
+    }
+}
+
+/// One NSACF DECREASE for (SUPI, PSI), at the NSACF the INCREASE went to when known,
+/// else one resolved afresh. Whether the NSACF accepted it; parks nothing (the
+/// reconciler's own attempt, #1875).
+pub(crate) async fn nsac_decrease_once(
+    nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
     let pinned = nsacf.cloned();
     let resolved = match pinned {
         Some(nsacf) => Some(nsacf),
@@ -1204,6 +1248,9 @@ async fn main() -> Result<()> {
              sessions, policy bindings and IPv4 allocations are memory-only and lost on restart"
         );
     }
+    // #1875: the release-side cleanups that failed (restored above with the state, when
+    // it is durable) are retried from here on, for the life of the process.
+    drop(reconcile::spawn_reconciler());
 
     // Initialize SMF state machine
     let mut smf_sm = SmfFsm::new();
@@ -5859,9 +5906,21 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                 if let Some(ref pol_id) =
                     (!decision.is_config_default).then_some(decision.sm_policy_id.clone())
                 {
-                    if let Some(pcf) = policy::resolve_pcf_endpoint().await {
-                        if let Err(e) = policy::sm_policy_delete(&pcf, pol_id).await {
-                            log::warn!("SM policy rollback delete failed: {e}");
+                    let deleted = match policy::resolve_pcf_endpoint().await {
+                        Some(pcf) => policy::sm_policy_delete(&pcf, pol_id).await,
+                        None => Err(policy::PolicyError::Transport("PCF unresolved".into())),
+                    };
+                    match deleted {
+                        Ok(()) | Err(policy::PolicyError::Rejected { status: 404, .. }) => {}
+                        Err(policy::PolicyError::Rejected { status, detail }) if status < 500 => {
+                            log::warn!("SM policy rollback delete refused: {status} {detail}");
+                        }
+                        Err(e) => {
+                            // #1875: retried until the PCF takes it.
+                            log::warn!("SM policy rollback delete failed: {e}; parked");
+                            reconcile::park(reconcile::Cleanup::SmPolicyDelete {
+                                sm_policy_id: pol_id.clone(),
+                            });
                         }
                     }
                 }
@@ -8534,8 +8593,8 @@ pub(crate) async fn abandon_gsm_procedure_for_test(sm_context_ref: &str) {
 }
 
 /// SM Policy Association terminations that failed after every attempt (#719
-/// review m2); each one leaves an association at the PCF until the PCF's own
-/// supervision removes it. Exported as `smf_sm_policy_delete_failures_total`.
+/// review m2); each one is parked for the reconciler (#1875), which retries it until
+/// the PCF takes it. Exported as `smf_sm_policy_delete_failures_total`.
 static SM_POLICY_DELETE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// How many Npcf_SMPolicyControl_Delete attempts one termination makes, and the
@@ -8620,9 +8679,13 @@ async fn delete_sm_policy(pol_id: &str) {
             Err(e) => {
                 log::warn!(
                     "SM policy delete for {pol_id} failed after {attempt} attempt(s): {e} \
-                     (continuing release; the association stays at the PCF)"
+                     (continuing release; parked for the reconciler)"
                 );
                 SM_POLICY_DELETE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                // #1875: retried until the PCF takes it, rather than left at the PCF.
+                reconcile::park(reconcile::Cleanup::SmPolicyDelete {
+                    sm_policy_id: pol_id.to_string(),
+                });
             }
         }
     }
@@ -9365,11 +9428,11 @@ async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<
         {
             policy::NSAC_DECREASE_FAILURES.fetch_add(1, Ordering::Relaxed);
             log::warn!(
-                "[{}] NSACF DECREASE for PSI {} timed out; the session stays counted at the \
-                 NSACF",
+                "[{}] NSACF DECREASE for PSI {} timed out; parked for the reconciler",
                 binding.supi,
                 binding.psi
             );
+            reconcile::park(reconcile::Cleanup::nsac_of(binding));
         }
     }
     if let Some(e) = entry {
@@ -9448,15 +9511,23 @@ async fn release_udm_cleanup(binding: &context::PolicyBinding, entry: Option<&Re
     // smContextRef no longer resolves; without the deregistration it accumulates
     // serving-SMF records for released sessions, so a procedure resolving the serving
     // SMF through the UDM resolves a released session to this SMF.
+    //
+    // #1875: either one that fails (or times out) is parked and retried until the UDM
+    // takes it. Only with the UDM leg on: off, neither was ever created.
     if let Some(sub_id) = &binding.sdm_subscription_id {
-        if tokio::time::timeout(
+        let done = tokio::time::timeout(
             UDM_RELEASE_TIMEOUT,
             udm::unsubscribe_sm_data(&binding.supi, sub_id),
         )
-        .await
-        .is_err()
-        {
+        .await;
+        if done.is_err() {
             log::warn!("[{}] Nudm_SDM_Unsubscribe timed out", binding.supi);
+        }
+        if !matches!(done, Ok(true)) && udm::enabled() {
+            reconcile::park(reconcile::Cleanup::SdmUnsubscribe {
+                supi: binding.supi.clone(),
+                subscription_id: sub_id.clone(),
+            });
         }
     }
     if !entry.is_none_or(ReleaseEntry::begin_deregistration) {
@@ -9468,18 +9539,23 @@ async fn release_udm_cleanup(binding: &context::PolicyBinding, entry: Option<&Re
         );
         return;
     }
-    if tokio::time::timeout(
+    let done = tokio::time::timeout(
         UDM_RELEASE_TIMEOUT,
         udm::deregister_serving_smf(&binding.supi, binding.psi),
     )
-    .await
-    .is_err()
-    {
+    .await;
+    if done.is_err() {
         log::warn!(
             "[{}] Nudm_UECM_Deregistration (PSI {}) timed out",
             binding.supi,
             binding.psi
         );
+    }
+    if !matches!(done, Ok(true)) && udm::enabled() {
+        reconcile::park(reconcile::Cleanup::UecmDeregister {
+            supi: binding.supi.clone(),
+            psi: binding.psi,
+        });
     }
     if let Some(e) = entry {
         e.finish();
@@ -23448,6 +23524,420 @@ mod tests {
 
         assert_eq!(n, 1);
         assert_eq!(after - before, 1, "a 500 is a failed DECREASE");
+    }
+
+    // ---- #1875: release-side cleanups that fail are parked and reconciled ----
+
+    type Seen1875 = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// One SBI peer playing the NSACF, PCF and UDM, answering every request with
+    /// `status` as it stands when the request arrives. Recorded as (method, uri, body).
+    async fn flaky_peer_1875(
+        status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    ) -> (nextgcore_sbi::server::SbiServer, Seen1875) {
+        let seen: Seen1875 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                let status = status.load(Ordering::SeqCst);
+                async move {
+                    sink.lock().unwrap().push((
+                        req.header.method.clone(),
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ));
+                    SbiResponse::with_status(status)
+                }
+            })
+            .await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        std::env::set_var("NSACF_URI", &base);
+        std::env::set_var("PCF_URI", &base);
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        (srv, seen)
+    }
+
+    fn stop_flaky_peer_1875() {
+        std::env::remove_var("NSACF_URI");
+        std::env::remove_var("PCF_URI");
+        stop_udm_leg();
+    }
+
+    /// Whether a parked cleanup matches `f`.
+    fn parked_1875(f: impl Fn(&reconcile::Cleanup) -> bool) -> bool {
+        reconcile::snapshot().iter().any(f)
+    }
+
+    fn sent_1875(seen: &Seen1875, f: impl Fn(&str, &str, &str) -> bool) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, u, b)| f(m, u, b))
+            .count()
+    }
+
+    /// #1875: a NSACF DECREASE that fails is parked, retried while the NSACF still
+    /// fails, and delivered once it recovers; then it is no longer parked.
+    ///
+    /// REVERT-VERIFIED: with `rollback_nsac_as` not parking, this fails: nothing is
+    /// parked, so the slice stays one session short for good.
+    #[tokio::test]
+    async fn a_failed_nsac_decrease_is_reconciled_when_the_nsacf_recovers_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let (peer, seen) = flaky_peer_1875(status.clone()).await;
+        let supi = "imsi-001010000018751";
+        let is_ours = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::NsacDecrease { supi: s, psi: 4, .. } if s == supi);
+        let delivered = || reconcile::RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+
+        let accepted = rollback_nsac(true, supi, 4, 1, Some("010203")).await;
+        let parked_at_release = parked_1875(is_ours);
+        reconcile::reconcile_once().await;
+        let parked_while_down = parked_1875(is_ours);
+        status.store(204, Ordering::SeqCst);
+        reconcile::reconcile_once().await;
+        let parked_after = parked_1875(is_ours);
+        let decreases = sent_1875(&seen, |_, u, b| {
+            u.contains("/nnsacf-nsac/") && b.contains("DECREASE") && b.contains(supi)
+        });
+        let delivered_after = delivered();
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert!(!accepted, "the NSACF refused the first DECREASE");
+        assert!(parked_at_release, "so it is parked");
+        assert!(parked_while_down, "and stays parked while the NSACF fails");
+        assert!(!parked_after, "until the NSACF takes it");
+        assert_eq!(decreases, 3, "one at release, one per pass");
+        assert_eq!(delivered_after - before, 1, "counted as delivered");
+    }
+
+    /// #1875: an SM Policy Association termination that fails every attempt is
+    /// parked and delivered once the PCF recovers.
+    ///
+    /// REVERT-VERIFIED: with `delete_sm_policy` not parking, this fails: nothing is
+    /// parked, and the association stays at the PCF.
+    #[tokio::test]
+    async fn a_failed_sm_policy_delete_is_reconciled_when_the_pcf_recovers_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let (peer, seen) = flaky_peer_1875(status.clone()).await;
+        let is_ours = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::SmPolicyDelete { sm_policy_id } if sm_policy_id == "pol-1875");
+
+        let _ = spawn_sm_policy_delete("pol-1875".to_string()).await;
+        let parked_at_release = parked_1875(is_ours);
+        status.store(204, Ordering::SeqCst);
+        reconcile::reconcile_once().await;
+        let parked_after = parked_1875(is_ours);
+        let deletes = sent_1875(&seen, |_, u, _| u.ends_with("/sm-policies/pol-1875/delete"));
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert!(
+            parked_at_release,
+            "a delete that failed every attempt is parked"
+        );
+        assert!(!parked_after, "and delivered once the PCF answers");
+        assert_eq!(
+            deletes,
+            SM_POLICY_DELETE_ATTEMPTS as usize + 1,
+            "the release's attempts, then the reconciler's one"
+        );
+    }
+
+    /// #1875: a release whose Nudm_SDM_Unsubscribe and Nudm_UECM_Deregistration both
+    /// fail parks both, and both are delivered once the UDM recovers.
+    ///
+    /// REVERT-VERIFIED: with `release_udm_cleanup` not parking, this fails: neither
+    /// is parked, and the UDM keeps both records.
+    #[tokio::test]
+    async fn failed_udm_release_cleanups_are_reconciled_when_the_udm_recovers_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let (peer, seen) = flaky_peer_1875(status.clone()).await;
+        let supi = "imsi-001010000018752";
+        let mut binding = context::PolicyBinding::snapshot_default();
+        binding.supi = supi.to_string();
+        binding.psi = 6;
+        binding.sdm_subscription_id = Some("sub-1875".to_string());
+        let uecm = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::UecmDeregister { supi: s, psi: 6 } if s == supi);
+        let sdm = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::SdmUnsubscribe { subscription_id, .. } if subscription_id == "sub-1875");
+
+        release_udm_cleanup(&binding, None).await;
+        let parked_at_release = (parked_1875(uecm), parked_1875(sdm));
+        status.store(204, Ordering::SeqCst);
+        reconcile::reconcile_once().await;
+        let parked_after = (parked_1875(uecm), parked_1875(sdm));
+        let deregs = sent_1875(&seen, |m, u, _| {
+            m == "DELETE" && u.ends_with(&format!("{supi}/registrations/smf-registrations/6"))
+        });
+        let unsubs = sent_1875(&seen, |m, u, _| {
+            m == "DELETE" && u.ends_with("/sdm-subscriptions/sub-1875")
+        });
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert_eq!(parked_at_release, (true, true), "both are parked");
+        assert_eq!(parked_after, (false, false), "both are delivered");
+        assert_eq!((deregs, unsubs), (2, 2), "once at release, once reconciled");
+    }
+
+    /// #1875: a parked DECREASE or UECM deregistration names a (SUPI, PSI), not a
+    /// session. A new session holding the pair supersedes it (nothing is sent: it
+    /// would remove the live session's count or registration), and one still being
+    /// created defers it.
+    ///
+    /// REVERT-VERIFIED: with `reconcile::holder` answering `None` always, this fails:
+    /// both DELETEs go out against the live session.
+    #[tokio::test]
+    async fn a_new_session_for_the_pair_supersedes_a_parked_cleanup_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204));
+        let (peer, seen) = flaky_peer_1875(status).await;
+        let (live, creating) = ("imsi-001010000018753", "imsi-001010000018754");
+        for supi in [live, creating] {
+            reconcile::park(reconcile::Cleanup::UecmDeregister {
+                supi: supi.to_string(),
+                psi: 7,
+            });
+            reconcile::park(reconcile::Cleanup::NsacDecrease {
+                supi: supi.to_string(),
+                psi: 7,
+                sst: 1,
+                sd: None,
+                nf_id: Some("smf-1875".to_string()),
+                nsacf: None,
+                plmn: None,
+            });
+        }
+        let reference = seed_established_session(live, 7, std::net::Ipv4Addr::new(10, 45, 18, 75));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.nsac_admitted = true;
+                // On the parked DECREASE's own slice (R27: another slice's does not
+                // supersede it, `a_live_session_on_another_slice_..._1900`).
+                b.sst = 1;
+            }
+        }
+        // Registered, no binding yet: a create in flight.
+        let (creating_ref, _) =
+            register_sm_context(&smf_self().read().unwrap(), creating, 7).expect("register");
+        let superseded = || {
+            (
+                reconcile::RECONCILED.get(&["uecm_deregister", "superseded"]),
+                reconcile::RECONCILED.get(&["nsac_decrease", "superseded"]),
+            )
+        };
+        let before = superseded();
+
+        reconcile::reconcile_once().await;
+        let after = superseded();
+        let sent = seen.lock().unwrap().clone();
+        let deferred = parked_1875(
+            |c| matches!(c, reconcile::Cleanup::UecmDeregister { supi, .. } if supi == creating),
+        ) && parked_1875(
+            |c| matches!(c, reconcile::Cleanup::NsacDecrease { supi, .. } if supi == creating),
+        );
+        let live_parked = parked_1875(|c| match c {
+            reconcile::Cleanup::UecmDeregister { supi, .. }
+            | reconcile::Cleanup::NsacDecrease { supi, .. } => supi == live,
+            _ => false,
+        });
+        forget_seeded_session(&reference);
+        forget_seeded_session(&creating_ref);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 18, 75));
+        }
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert!(sent.is_empty(), "nothing is sent for a held pair: {sent:?}");
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (1, 1),
+            "the live session's pair supersedes both"
+        );
+        assert!(!live_parked, "and they are no longer parked");
+        assert!(deferred, "a create in flight defers them");
+    }
+
+    /// R27 #1900: the NSACF counts per (UE, PSI, S-NSSAI), so a live session for the
+    /// pair on ANOTHER slice does not supersede a parked DECREASE for the old one: it
+    /// is sent, or the old slice's quota leaks.
+    ///
+    /// REVERT-VERIFIED: with the guard matching on (SUPI, PSI) only, this fails: the
+    /// DECREASE is counted `superseded` and never sent.
+    #[tokio::test]
+    async fn a_live_session_on_another_slice_does_not_supersede_a_decrease_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let (peer, seen) =
+            flaky_peer_1875(std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204))).await;
+        let supi = "imsi-001010000019001";
+        let reference = seed_established_session(supi, 7, std::net::Ipv4Addr::new(10, 45, 19, 1));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.nsac_admitted = true;
+                b.sst = 2;
+            }
+        }
+        reconcile::park(reconcile::Cleanup::NsacDecrease {
+            supi: supi.to_string(),
+            psi: 7,
+            sst: 1,
+            sd: None,
+            nf_id: Some("smf-1900".to_string()),
+            nsacf: None,
+            plmn: None,
+        });
+        let delivered = || reconcile::RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+
+        reconcile::reconcile_once().await;
+        let sent = sent_1875(&seen, |_, u, b| {
+            u.contains("/nnsacf-nsac/") && b.contains("DECREASE") && b.contains(supi)
+        });
+        let after = delivered();
+        forget_seeded_session(&reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 19, 1));
+        }
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert_eq!(sent, 1, "the old slice's DECREASE is sent");
+        assert_eq!(after - before, 1, "and delivered");
+    }
+
+    /// R27 #1900: a reconciler DECREASE on the wire is in flight for its (SUPI, PSI),
+    /// so a create for the pair on the same S-NSSAI counts in only after it lands.
+    /// Otherwise the new session's INCREASE (a no-op at the NSACF, whose entry the old
+    /// count still holds) could land first, and the DECREASE then counts it out.
+    ///
+    /// REVERT-VERIFIED: with the attempt taking no `ReleaseInFlight` entry, this
+    /// fails: the NSACF sees INC then DEC.
+    #[tokio::test]
+    async fn a_create_waits_for_a_reconciler_decrease_on_the_wire_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let (nsacf, seen) = recording_nsacf(
+            204,
+            204,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let supi = "imsi-001010000019003";
+        reconcile::park(reconcile::Cleanup::NsacDecrease {
+            supi: supi.to_string(),
+            psi: 11,
+            sst: 1,
+            sd: Some("010203".to_string()),
+            nf_id: Some("smf-1900".to_string()),
+            nsacf: None,
+            plmn: None,
+        });
+
+        let pass = tokio::spawn(reconcile::reconcile_once());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            11,
+            &n1(
+                11,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let _ = pass.await;
+        let order = nsac_order(&seen, supi);
+        let leftover = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi)
+            .map(|(r, _)| r.clone());
+        if let Some(r) = leftover {
+            let _ = release_sm_context_locally(&r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        reconcile::clear_for_test();
+
+        assert_eq!(resp.status, 201);
+        assert_eq!(order.first().map(String::as_str), Some("DEC"), "{order:?}");
+        assert_eq!(
+            &order[..2],
+            ["DEC", "INC"],
+            "the DECREASE lands first: {order:?}"
+        );
+    }
+
+    /// R27 #1900: `park` writes the set into the durable snapshot at once, so a
+    /// cleanup parked just before a crash is not lost.
+    ///
+    /// REVERT-VERIFIED: with `persist()` dropped from `park`, this fails: the state
+    /// file does not name the parked cleanup.
+    #[tokio::test]
+    async fn a_parked_cleanup_is_in_the_state_file_at_once_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        reconcile::clear_for_test();
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-smf-park-1900-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let armed = ArmedStateFile::arm(&path, "19001", 0x1900, 0x1900);
+        reconcile::park(reconcile::Cleanup::SdmUnsubscribe {
+            supi: "imsi-001010000019002".to_string(),
+            subscription_id: "sub-park-1900".to_string(),
+        });
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        reconcile::clear_for_test();
+        drop(armed);
+
+        assert!(
+            written.contains("sub-park-1900"),
+            "the parked cleanup is in the state file: {written}"
+        );
     }
 
     /// #1072 review m2: an INCREASE that is never answered fails open and is

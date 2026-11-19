@@ -113,6 +113,16 @@ Counted at the Nsmf_PDUSession_CreateSMContext answer (TS 29.502 §5.2.2.2), mod
 | `smf_session_abandoned_released_total` | counter | | of those, the ones that had established a session: released (N4 session, SM policy, address, NSACF, UECM, SDM, EASDF) because the AMF never received its `smContextRef` |
 | `smf_session_failure_cause_total` | counter | `cause`: the 5GSM cause of the PDU SESSION ESTABLISHMENT REJECT (0..255, TS 24.501 §9.11.4.2), or `none` when the answer carries no N1 reject | refusals by cause |
 
+### SMF release-cleanup reconciler (`src/bins/nextgcore-smfd/src/reconcile.rs`, #1875)
+
+Release-side cleanups (NSACF DECREASE, SM policy delete, UECM deregistration, SDM unsubscribe) that failed, parked and retried until delivered. See [SMF configuration](configuration/smf.md#release-cleanup-reconciler-1875).
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `smf_release_cleanups_pending` | gauge | `kind` | cleanups parked now |
+| `smf_release_cleanups_parked_total` | counter | `kind` | cleanups that failed and were parked |
+| `smf_release_cleanups_reconciled_total` | counter | `kind`, `result` (`delivered`, `superseded`, `refused`, `abandoned`) | parked cleanups the reconciler ended |
+
 ### NRF families (`src/bins/nextgcore-nrfd/src/metrics.rs`, #1334)
 
 | Metric | Type | Labels | Counts |
