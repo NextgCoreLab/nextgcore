@@ -7699,6 +7699,99 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the #1753 check removed, the `EES` request is 200
     /// with `aud: "EES"`, and the first assertion names it.
+    /// R26 on #1922: the real token endpoint, end to end. A PCF names the slice
+    /// of a permissive UDR in `requesterSnssaiList`. While that UDR is the only
+    /// one registered, the K-read scope is granted (the control: no stray UDR
+    /// is refusing it). Once a standard UDR is registered too, SUSPENDED and on
+    /// another slice, it still accepts the aud=UDR token, so the scope is
+    /// withheld.
+    ///
+    /// REVERT-VERIFIED: with the handler passing `&producers` instead of
+    /// `&acceptors` to `authorize_access_token_for` (the pre-R26 call), the
+    /// second request is granted the K-read scope and the second assertion fails.
+    #[tokio::test]
+    async fn the_token_endpoint_withholds_k_read_when_any_udr_would_refuse_it_1828() {
+        use serde_json::json;
+        const READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
+        let mgr = nf_manager();
+        let pcf_id = "18280000-0000-4000-8000-0000000000f1";
+        let permissive_id = "18280000-0000-4000-8000-0000000000a1";
+        let standard_id = "18280000-0000-4000-8000-0000000000a2";
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": pcf_id, "nfType": "PCF", "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let udr = |id: &str, pcf_scopes: serde_json::Value, sst: u64, status: &str| {
+            NfProfile::from_json(&json!({
+                "nfInstanceId": id, "nfType": "UDR", "nfStatus": status,
+                "sNssais": [{"sst": sst, "sd": "182800"}],
+                "nfServices": [{
+                    "serviceInstanceId": "udr-dr", "serviceName": "nudr-dr",
+                    "allowedNfTypes": ["UDM", "PCF"],
+                    "allowedOperationsPerNfType": {
+                        "UDM": ["nudr-dr", READ],
+                        "PCF": pcf_scopes
+                    }
+                }],
+            }))
+            .unwrap()
+        };
+        mgr.register(udr(
+            permissive_id,
+            json!(["nudr-dr", READ]),
+            99,
+            "REGISTERED",
+        ))
+        .unwrap();
+
+        let policy = policy_without_client_auth();
+        let ask = || {
+            let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            r.http.set_content(
+                json!({
+                    "grant_type": "client_credentials", "nfInstanceId": pcf_id,
+                    "nfType": "PCF", "targetNfType": "UDR",
+                    "scope": format!("nudr-dr {READ}"),
+                    "requesterSnssaiList": [{"sst": 99, "sd": "182800"}],
+                })
+                .to_string(),
+            );
+            r
+        };
+        let granted_scope = |resp: &SbiResponse| -> String {
+            assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            body["scope"].as_str().unwrap_or_default().to_string()
+        };
+
+        let alone = granted_scope(&handle_access_token_request_with_policy(&ask(), &policy).await);
+        assert!(
+            alone.split(' ').any(|s| s == READ),
+            "control: the permissive UDR alone grants it ({alone:?})"
+        );
+
+        // SUSPENDED (missed heartbeats) and on another slice: out of the
+        // operative, requester-filtered set, yet it accepts the token once it
+        // resumes.
+        mgr.register(udr(standard_id, json!(["nudr-dr"]), 1, "SUSPENDED"))
+            .unwrap();
+        let both = granted_scope(&handle_access_token_request_with_policy(&ask(), &policy).await);
+        assert!(
+            !both.split(' ').any(|s| s == READ),
+            "the suspended standard UDR accepts the aud=UDR token too, whatever slice the \
+             PCF named, so no K-read scope ({both:?})"
+        );
+        assert!(both.split(' ').any(|s| s == "nudr-dr"), "{both:?}");
+
+        for id in [pcf_id, permissive_id, standard_id] {
+            mgr.deregister(id).ok();
+        }
+    }
+
     #[tokio::test]
     async fn no_token_is_issued_for_a_target_type_outside_ts29510_1753() {
         use serde_json::json;
