@@ -652,7 +652,8 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = crate::app::handle_sdm_subscribe(supi, &req).await;
+        let resp =
+            crate::app::handle_sdm_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
         assert_eq!(resp.status, 201);
         wait_idle().await;
         serde_json::from_str::<Value>(resp.http.content.as_deref().expect("body")).expect("json")
@@ -806,9 +807,13 @@ mod tests {
         assert_eq!(ue.gpsi.as_deref(), Some("msisdn-4917759"), "the new GPSI");
 
         assert_eq!(
-            crate::app::handle_sdm_unsubscribe(supi, &sdm_id)
-                .await
-                .status,
+            crate::app::handle_sdm_unsubscribe(
+                supi,
+                &sdm_id,
+                &crate::app::as_test_consumer(&SbiRequest::default())
+            )
+            .await
+            .status,
             204
         );
         wait_idle().await;
@@ -892,9 +897,13 @@ mod tests {
         );
 
         assert_eq!(
-            crate::app::handle_sdm_unsubscribe(supi, &refusing_id)
-                .await
-                .status,
+            crate::app::handle_sdm_unsubscribe(
+                supi,
+                &refusing_id,
+                &crate::app::as_test_consumer(&SbiRequest::default())
+            )
+            .await
+            .status,
             204
         );
         wait_idle().await;

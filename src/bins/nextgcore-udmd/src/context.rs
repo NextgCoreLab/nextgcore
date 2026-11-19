@@ -367,6 +367,11 @@ pub struct UdmSdmSubscription {
     pub callback_reference: Option<String>,
     /// Monitored resource URIs
     pub monitored_resource_uris: Vec<String>,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Never the self-declared `nfInstanceId`. `None` when
+    /// created with no verified identity (`dev`) or internally.
+    pub owner: Option<String>,
 }
 
 impl UdmSdmSubscription {
@@ -380,6 +385,7 @@ impl UdmSdmSubscription {
             nf_instance_id: None,
             callback_reference: None,
             monitored_resource_uris: Vec::new(),
+            owner: None,
         }
     }
 
@@ -398,6 +404,7 @@ impl UdmSdmSubscription {
             nf_instance_id,
             callback_reference,
             monitored_resource_uris,
+            owner: None,
         }
     }
 }
@@ -466,6 +473,11 @@ pub struct UdmEeSubscription {
     /// the AMF-detected events of this subscription (TS 23.502 §4.15.3.2.3 step
     /// 3a, #1440). `None` while none is held; see [`crate::ee_amf`].
     pub amf_leg: Option<AmfEeLeg>,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Never the self-declared `nfInstanceId`. `None` when
+    /// created with no verified identity (`dev`) or internally.
+    pub owner: Option<String>,
 }
 
 /// The UDM's subscription at an AMF on behalf of one Nudm_EE subscription
@@ -503,6 +515,7 @@ impl UdmEeSubscription {
             raw: String::new(),
             monitoring_configurations: Vec::new(),
             amf_leg: None,
+            owner: None,
         };
         sub.set_raw(raw);
         sub
