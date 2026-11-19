@@ -1465,6 +1465,12 @@ pub async fn run() -> Result<()> {
     // standalone 5GC, and taking the daemon down would turn an interworking misconfiguration
     // into a total 5G outage. `n26_open` forces the switch back off in that case, so
     // `iwk_n26_posture` cannot advertise an interface that has no socket.
+    //
+    // #2073: N26 is the explicit exception to the #2056 production rule that a configured
+    // listener that cannot be bound is fatal at start-up (docs-book configuration/overview.md,
+    // "The N26 exception"). Interworking without N26 is a specified mode (TS 23.501 §5.17.2.3),
+    // and the UE is told so (IWK N26 = 1), so the degraded AMF is a conformant one; a metrics
+    // listener has no such fallback.
     {
         let n26_bind: Option<SocketAddr> = std::env::var("AMF_N26_ADDR").ok().and_then(|addr| {
             let port: u16 = std::env::var("AMF_N26_PORT")

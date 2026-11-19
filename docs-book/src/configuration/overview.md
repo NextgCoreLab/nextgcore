@@ -274,6 +274,12 @@ this repo's `udmd` serves from the UDR's identity data (it answered `501` before
 
 Under the production SBI profile, an NF that cannot bind a listener it is configured with exits at start-up with status `78` (`EX_CONFIG`), logging the NF, the listener and the address. This covers its `/metrics` endpoint and the udmd NES and nsacfd SLA-observe metrics listeners. It does so before serving anything, so the orchestrator reports a crash loop rather than an NF that runs on silently without metrics. Under `dev` the NF logs a warning and runs on without the listener, which was the behaviour of every profile before #2056.
 
+**The N26 exception (#2073).** amfd's N26 GTP-C listener (`AMF_N26_ADDR`, `AMF_N26_INTERWORKING`) and mmed's (`mme.n26.server`, `MME_N26_INTERWORKING`) stay non-fatal under every profile, production included. They are the one deliberate exception to the rule above. Interworking without N26 is a specified mode (TS 23.501 §5.17.2.3), so an N26 socket that does not come up degrades the NF to a conformant one rather than a broken one:
+- the AMF forces its N26 posture off, so every UE is told IWK N26 = 1, "interworking without N26 supported";
+- the MME rejects an inter-system TAU from 5GS with EMM cause #9, as TS 24.301 requires of an MME without N26.
+
+Taking either daemon down instead would turn an interworking misconfiguration into a total 5G or LTE outage. The failure is logged at error level.
+
 ### Request paths every SBI server refuses (#1934, #1939)
 
 Before routing, before the callback exemption and before any OAuth2 or resource-scope check, every nextgcore-sbi server answers `400 INVALID_MSG_FORMAT` to a request path that has:

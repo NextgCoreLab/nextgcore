@@ -67,6 +67,72 @@ fn a_taken_metrics_port_is_tolerated_under_dev_2056() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("SURVIVED-2056"));
 }
 
+/// The lines (0-based) of the listener call sites in `prod`: `serve_metrics(` from
+/// `nes_energy`, or a bare `serve_metrics(` call.
+fn listener_sites(prod: &[&str]) -> Vec<usize> {
+    prod.iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("nes_energy::serve_metrics(") || l.contains(" serve_metrics("))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// How far after its call site a listener's bind-failure arm may call the handler.
+/// The furthest today is mmed's, 24 lines.
+const HANDLER_WINDOW: usize = 30;
+
+/// #2073 (R31 on #2063): the listener call sites in `prod` whose OWN bind failure does
+/// not reach `listener_bind_failed(`. Each site needs a call to the handler after it,
+/// within [`HANDLER_WINDOW`] lines and before the next site, so a second, unwired
+/// listener in a file whose first one is wired is still found. #2056 checked each file,
+/// so any one call anywhere in the file covered every listener in it.
+fn unwired_listener_sites(prod: &[&str]) -> Vec<usize> {
+    let sites = listener_sites(prod);
+    sites
+        .iter()
+        .enumerate()
+        .filter(|(n, &site)| {
+            let next = sites.get(n + 1).copied().unwrap_or(prod.len());
+            let end = next.min(site + HANDLER_WINDOW).min(prod.len());
+            !prod[site..end]
+                .iter()
+                .any(|l| l.contains("listener_bind_failed("))
+        })
+        .map(|(_, &site)| site)
+        .collect()
+}
+
+/// #2073: the guard counts call sites, not files. A file with one wired listener and a
+/// second, unwired one fails it; two wired ones and a single wired one pass.
+///
+/// REVERT-VERIFIED: with the check per file again (any handler call in the file covers
+/// every site), this fails: the unwired second site is not reported.
+#[test]
+fn the_listener_guard_checks_each_call_site_2073() {
+    let wired = [
+        "    match nextgcore_metrics::nes_energy::serve_metrics(addr, render) {",
+        "        Ok(_) => {}",
+        "        Err(e) => nextgcore_metrics::nf::listener_bind_failed(\"X\", \"m\", addr, &e),",
+        "    }",
+    ];
+    let unwired =
+        ["    let _ = nextgcore_metrics::nes_energy::serve_metrics(addr2, render).await;"];
+    let check = |parts: &[&[&str]]| {
+        let lines: Vec<&str> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+        (listener_sites(&lines).len(), unwired_listener_sites(&lines))
+    };
+
+    assert_eq!(check(&[&wired]), (1, vec![]));
+    assert_eq!(check(&[&wired, &wired]), (2, vec![]));
+    assert_eq!(
+        check(&[&wired, &unwired]),
+        (2, vec![4]),
+        "the second, unwired site is found"
+    );
+    // The unwired one first: the wired one's handler, after it, does not cover it.
+    assert_eq!(check(&[&unwired, &wired]), (2, vec![0]));
+}
+
 /// #2056: every NF that binds a metrics (or NES/SLA) listener itself, outside its
 /// tests, sends a bind failure through `listener_bind_failed`, so none of them runs
 /// on silently under production.
@@ -111,12 +177,11 @@ fn every_nf_listener_bind_failure_goes_through_the_shared_handler_2056() {
                         && w[1].trim_end().ends_with('{')
                 })
                 .unwrap_or(lines.len());
-            let prod = lines[..end].join("\n");
-            if prod.contains("nes_energy::serve_metrics(") || prod.contains(" serve_metrics(") {
-                checked += 1;
-                if !prod.contains("listener_bind_failed(") {
-                    missing.push(f.display().to_string());
-                }
+            // #2073: each listener call site, not each file.
+            let prod = &lines[..end];
+            checked += listener_sites(prod).len();
+            for site in unwired_listener_sites(prod) {
+                missing.push(format!("{}:{}", f.display(), site + 1));
             }
         }
     }
@@ -128,4 +193,33 @@ fn every_nf_listener_bind_failure_goes_through_the_shared_handler_2056() {
         missing.is_empty(),
         "these NFs bind a listener without the #2056 handler: {missing:?}"
     );
+}
+
+/// #2073: the N26 listeners of amfd and mmed, the one exception to the #2056 rule, say so
+/// at their call sites, so the exception is a documented decision and not a site the
+/// guard above merely does not look at.
+///
+/// REVERT-VERIFIED: with either call site's #2073 note removed, this fails.
+#[test]
+fn the_n26_listeners_are_the_documented_exception_2073() {
+    let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crate is at <root>/libs/nextgcore-metrics")
+        .join("bins");
+    for (file, call) in [
+        ("nextgcore-amfd/src/lib.rs", "n26_path::n26_open(n26_bind"),
+        ("nextgcore-mmed/src/main.rs", "n26_path::n26_open()"),
+    ] {
+        let text = std::fs::read_to_string(bins.join(file)).expect(file);
+        let at = text
+            .find(call)
+            .unwrap_or_else(|| panic!("{file}: the N26 call site"));
+        // The note sits in the comment block just above the call.
+        let note = text[..at].rfind("explicit exception to the #2056 production rule");
+        assert!(
+            note.is_some_and(|n| at - n < 4000),
+            "{file}: the N26 bind failure is the #2056 exception and must say so at its call site"
+        );
+    }
 }
