@@ -2417,6 +2417,33 @@ impl AmfContext {
     /// for the paging strategy): adding to or pumping the GLOBAL context's paging map
     /// panics when nobody holds the lock, so a test that misses it fails on its own,
     /// deterministically when it runs alone. A local `AmfContext::new()` is exempt.
+    /// Test-only: whether `self` is the process-global context (not a local
+    /// `AmfContext::new()`), identified by the address of its paging map (#1974).
+    #[cfg(test)]
+    fn is_global_context(&self) -> bool {
+        GLOBAL_PAGING_MAP_ADDR.get().copied() == Some(std::ptr::addr_of!(self.paging_map) as usize)
+    }
+
+    /// Test-only enforcement of the lock declared for one of the GLOBAL context's
+    /// NGAP-task queues (#1974, as [`Self::assert_paging_map_lock_held`] does for the
+    /// paging map): enqueuing on or draining the queue panics when nobody holds
+    /// `lock`. A drain takes EVERY queued item, so a test that enqueues without the
+    /// lock has its item taken, and sent on a sibling's server, by a sibling's drain
+    /// (seen as `an_unbound_ue_context_is_not_connected`'s "nothing is sent" and
+    /// `a_setup_that_does_not_go_out_rolls_the_activation_back`'s injected send
+    /// failure spent on a sibling's transfer). With this check such a test fails on
+    /// its own, deterministically. A local `AmfContext::new()` is exempt.
+    #[cfg(test)]
+    #[track_caller]
+    fn assert_queue_lock_held(&self, lock: &tokio::sync::Mutex<()>, queue: &str) {
+        if self.is_global_context() && lock.try_lock().is_ok() {
+            panic!(
+                "the global {queue} was used with its test lock free: take the lock \
+                 declared for it in this test (#1974)"
+            );
+        }
+    }
+
     #[cfg(test)]
     #[track_caller]
     fn assert_paging_map_lock_held(&self) {
@@ -2659,14 +2686,26 @@ impl AmfContext {
     }
 
     /// Enqueue a positioning downlink for NGAP-task egress (TS 23.273).
+    #[cfg_attr(test, track_caller)]
     pub fn positioning_dl_add(&self, item: PendingPositioningDl) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::POSITIONING_DL_LOCK,
+            "positioning downlink queue",
+        );
         if let Ok(mut q) = self.positioning_dl_queue.write() {
             q.push(item);
         }
     }
 
     /// Drain all pending positioning downlinks (called by the NGAP server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn positioning_dl_drain(&self) -> Vec<PendingPositioningDl> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::POSITIONING_DL_LOCK,
+            "positioning downlink queue",
+        );
         match self.positioning_dl_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
@@ -2675,21 +2714,36 @@ impl AmfContext {
 
     /// Enqueue a network-initiated deregistration for NGAP-task egress (WSB-4,
     /// TS 23.502 §4.2.2.3.3 / TS 24.501 §5.5.2.3).
+    #[cfg_attr(test, track_caller)]
     pub fn network_dereg_add(&self, item: PendingNetworkDereg) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(&DEREG_QUEUE_TEST_LOCK, "network deregistration queue");
         if let Ok(mut q) = self.network_dereg_queue.write() {
             q.push(item);
         }
     }
 
     /// Enqueue an N1N2MessageTransfer for a CM-CONNECTED UE (#666).
+    #[cfg_attr(test, track_caller)]
     pub fn connected_downlink_add(&self, item: PendingConnectedDownlink) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::CONNECTED_DOWNLINK_LOCK,
+            "connected-UE downlink queue",
+        );
         if let Ok(mut q) = self.connected_downlink_queue.write() {
             q.push(item);
         }
     }
 
     /// Drain every pending connected-UE transfer (called by the NGAP server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn connected_downlink_drain(&self) -> Vec<PendingConnectedDownlink> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::CONNECTED_DOWNLINK_LOCK,
+            "connected-UE downlink queue",
+        );
         match self.connected_downlink_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
@@ -2698,7 +2752,13 @@ impl AmfContext {
 
     /// #1776: queue a UE Context Modification of the UE's UE-AMBR for the NGAP task.
     /// A UE already queued stays queued once.
+    #[cfg_attr(test, track_caller)]
     pub fn ue_ambr_modification_add(&self, amf_ue_ngap_id: u64) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::UE_AMBR_MODIFICATION_LOCK,
+            "UE-AMBR modification queue",
+        );
         let mut q = self
             .ue_ambr_modification_queue
             .write()
@@ -2707,7 +2767,13 @@ impl AmfContext {
     }
 
     /// #1776: take every queued UE-AMBR modification (called by the NGAP server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn ue_ambr_modification_drain(&self) -> Vec<u64> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::UE_AMBR_MODIFICATION_LOCK,
+            "UE-AMBR modification queue",
+        );
         let mut q = self
             .ue_ambr_modification_queue
             .write()
@@ -2734,7 +2800,10 @@ impl AmfContext {
 
     /// Drain all pending network-initiated deregistrations (called by the NGAP
     /// server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn network_dereg_drain(&self) -> Vec<PendingNetworkDereg> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(&DEREG_QUEUE_TEST_LOCK, "network deregistration queue");
         match self.network_dereg_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
@@ -6417,9 +6486,33 @@ pub(crate) static PAGING_MAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 /// a fresh implicit-deregistration deadline over the expired one the sibling had just set,
 /// and the sibling's UE was never deregistered. Declared beside the global it guards, so
 /// there is one lock for it rather than one per test module.
+///
+/// #1974: it is the lock of EVERY whole-store sweep, and the NAS procedure timers
+/// (`NgapServer::process_nas_timers`, T3550/T3555/T3560/T3570/T3522) sweep the same
+/// store the same way: a sibling's NAS-timer pass retransmitted
+/// `t3555_retransmits_then_aborts_keeping_the_current_guti`'s expired T3555 a second
+/// time ("expiry 3 must retransmit", `Some(4)`), or aborted it. So the NAS-timer
+/// sweep takes this lock too, rather than a second lock over the same store, and
+/// [`assert_ue_store_sweep_lock_held`] enforces it at both sweeps. Taken FIRST,
+/// before `CONTEXT_GUARD`, `SmfEnvGuard` and every queue lock, as the existing
+/// sweeping tests already do.
 #[cfg(test)]
 pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+/// Test-only enforcement of [`REACHABILITY_SWEEP_TEST_LOCK`] (#1974): each sweep of
+/// the process-global UE store calls this first, and it panics when nobody holds the
+/// lock, so a sweeping test that misses it fails on its own, deterministically.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_ue_store_sweep_lock_held() {
+    if REACHABILITY_SWEEP_TEST_LOCK.try_lock().is_ok() {
+        panic!(
+            "the process-global UE store was swept with REACHABILITY_SWEEP_TEST_LOCK free: \
+             take it in this test (#1974)"
+        );
+    }
+}
 
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {
