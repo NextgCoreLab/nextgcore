@@ -193,6 +193,102 @@ pub(crate) fn clear_for_test() {
     with(|m| m.clear());
 }
 
+/// An SRR operation, for the `N4Hold` test seam (#1997).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SrrOp {
+    /// The Create SRR of [`install`], once its SRR ID is reserved.
+    Create,
+    /// The Remove SRR of [`settle`], once the entry is [`SrrState::Removing`].
+    Remove,
+}
+
+/// Armed [`N4Hold`]s, each taken by the first SRR operation of its kind (#1997).
+/// A process-global of this module: guarded, like [`SESSIONS`], by [`TEST_LOCK`].
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static N4_HOLDS_FOR_TEST: Mutex<
+    Vec<(
+        SrrOp,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>,
+> = Mutex::new(Vec::new());
+
+/// A test seam (#1997): the next SRR operation of a kind signals `reached` with
+/// its state already taken under the lock (the SRR ID reserved, or the entry
+/// Removing) and waits for [`Self::release`] before it sends its N4 request. A
+/// test then orders a DELETE against a new subscription deterministically,
+/// where a `join!` left the order to the scheduler: under load the new
+/// subscription's install yielded before its reservation, X's Remove returned
+/// first, and its ID was then legitimately free (TS 29.244 Table 7.5.4.19-1).
+/// Dropping it, a failed assertion included, disarms it and releases a waiter.
+#[cfg(test)]
+pub(crate) struct N4Hold {
+    op: SrrOp,
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    proceed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl N4Hold {
+    pub(crate) fn arm(op: SrrOp) -> Self {
+        let hold = Self {
+            op,
+            reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+            proceed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        N4_HOLDS_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((op, hold.reached.clone(), hold.proceed.clone()));
+        hold
+    }
+
+    /// Wait (at most 15 s, then panic) until the held operation has reached the
+    /// hold.
+    pub(crate) async fn reached(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), self.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("no {:?} SRR reached its hold in 15 s", self.op));
+    }
+
+    /// Let the held operation send its N4 request.
+    pub(crate) fn release(&self) {
+        self.proceed.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for N4Hold {
+    fn drop(&mut self) {
+        N4_HOLDS_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, r, _)| !std::sync::Arc::ptr_eq(r, &self.reached));
+        self.release();
+    }
+}
+
+/// Stop at an armed `N4Hold` for `op`, if any.
+#[cfg(test)]
+async fn n4_hold(op: SrrOp) {
+    let hold = {
+        let mut holds = N4_HOLDS_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        holds
+            .iter()
+            .position(|(o, _, _)| *o == op)
+            .map(|i| holds.remove(i))
+    };
+    if let Some((_, reached, proceed)) = hold {
+        reached.notify_one();
+        proceed.notified().await;
+    }
+}
+
+/// No holds outside tests.
+#[cfg(not(test))]
+async fn n4_hold(_op: SrrOp) {}
+
 /// The SRR IDs installed on a session (sorted), for tests and logs.
 pub fn srr_ids(sm_context_ref: &str) -> Vec<u8> {
     let mut v: Vec<u8> = with(|m| {
@@ -646,6 +742,7 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
             return false;
         }
     };
+    n4_hold(SrrOp::Create).await;
     let params = crate::n4_build::SessionModificationParams {
         create_srrs: vec![(srr_id, vec![control_for(b.qfi, period)])],
         ..Default::default()
@@ -766,6 +863,7 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
                 }
             }
             Next::Remove => {
+                n4_hold(SrrOp::Remove).await;
                 send_remove(r, id, sub_id).await;
                 // #1390 review round 2: only now is the SRR ID free, and `stop`
                 // is decided now, counting SRRs installed or being installed.
