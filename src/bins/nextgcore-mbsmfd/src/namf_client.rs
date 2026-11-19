@@ -849,6 +849,9 @@ mod tests {
 
         assert_eq!(crate::reconcile::reconcile_once().await, 0, "still refused");
         assert_eq!(crate::reconcile::pending_count(), 1, "kept, not dropped");
+        // #1961: the AMF that refused is backing off; the next pass is after it.
+        tokio::time::sleep(crate::reconcile::BACKOFF_BASE + std::time::Duration::from_millis(50))
+            .await;
 
         assert_eq!(
             crate::reconcile::reconcile_once().await,
@@ -1778,6 +1781,17 @@ mod tests {
 
         assert_eq!(crate::reconcile::reconcile_once().await, 0, "refused");
         assert!(admitted(&token), "a refused pass applies nothing");
+        // #1961: the refusal backs the AMF off; a pass inside the backoff sends
+        // nothing and keeps the record (and its token).
+        assert_eq!(crate::reconcile::reconcile_once().await, 0, "backing off");
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            1,
+            "kept through the backoff"
+        );
+        assert!(admitted(&token), "the backoff keeps the token");
+        tokio::time::sleep(crate::reconcile::BACKOFF_BASE + std::time::Duration::from_millis(50))
+            .await;
         assert_eq!(crate::reconcile::reconcile_once().await, 1, "404");
         assert!(!admitted(&token), "the reconciler's 404 ends the token");
         assert_eq!(
@@ -1839,6 +1853,38 @@ mod tests {
         crate::reconcile::park(vec![blank(crate::reconcile::MAX_PENDING)]);
         assert!(!admitted(&token), "an abandoned delete takes its token");
         crate::reconcile::clear_for_test();
+    }
+
+    /// **#1985** x #1961: a parked delete that expires after `MAX_AGE` is given
+    /// up, so its context is no longer tracked and its tokens go with it.
+    ///
+    /// REVERT-VERIFIED: with `reconcile_once` not handing expired records to
+    /// `forget_abandoned`, "an expired delete takes its token" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_parked_delete_takes_its_token_1985() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        crate::mbsmf_context_init(256);
+        let blank = crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            nf_instance_id: None,
+            context_ref: "expire-1985".to_string(),
+            notify_token: String::new(),
+            tmgi: None,
+        };
+        let (record, token) = released_record_1985(blank, [0x0e, 0x19, 0x85]);
+        crate::reconcile::park(vec![record]);
+        assert!(admitted(&token), "kept while it is parked");
+        crate::reconcile::backdate_for_test(
+            crate::reconcile::MAX_AGE + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(crate::reconcile::reconcile_once().await, 0);
+        let left = crate::reconcile::pending_count();
+        let kept = admitted(&token);
+        crate::reconcile::clear_for_test();
+        assert_eq!(left, 0, "expired");
+        assert!(!kept, "an expired delete takes its token");
     }
 
     /// **#1985** (cancellation): a reconcile pass aborted while its delete is in

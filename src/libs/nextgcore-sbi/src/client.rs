@@ -401,7 +401,21 @@ pub struct SbiClient {
     /// #1915: whether a 307/308 is followed at all (after the checks). `false`
     /// hands every redirect back to the caller verbatim.
     follow_redirects: bool,
+    /// #1986: `(target NF type, scope, producer instance)` triples whose fresh
+    /// token the producer ALSO refused with `invalid_token`, until when the
+    /// refusal is believed to persist ([`TOKEN_REFUSAL_BACKOFF`]). #2023: the
+    /// instance ([`refusing_instance`]) keeps one misconfigured producer behind
+    /// an SCP from suspending the resend for its healthy peers.
+    token_refusals: Arc<StdMutex<HashMap<(NfType, String, String), Instant>>>,
 }
+
+/// #1986: how long a persistent `invalid_token` refusal (the fresh token was
+/// refused too, e.g. the NRF keeps minting an `aud` the producer rejects)
+/// suspends the evict-and-resend for that target and scope. Each request then
+/// costs one producer hit and no NRF fetch, instead of two and one. Short, so a
+/// fixed NRF or producer is picked up within seconds: the first refusal after
+/// it evicts and resends again.
+const TOKEN_REFUSAL_BACKOFF: Duration = Duration::from_secs(10);
 
 impl SbiClient {
     /// Create a new SBI client
@@ -422,6 +436,7 @@ impl SbiClient {
             bindings: Arc::new(StdMutex::new(HashMap::new())),
             target_policy: None,
             follow_redirects: true,
+            token_refusals: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -869,6 +884,10 @@ impl SbiClient {
     ///   producer failing until the cached token expired. `insufficient_scope`
     ///   (a fresh token carries the same scope) and a caller-supplied
     ///   `Authorization` are left alone.
+    /// * **#1986**: when the fresh token is refused with `invalid_token` too,
+    ///   the refusal is taken as persistent for that target and scope for
+    ///   [`TOKEN_REFUSAL_BACKOFF`]: its `invalid_token` answers are returned
+    ///   without an eviction or a resend until then.
     pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
         // The token is ours to replace only when this client attaches it: OAuth2
         // applies to the request, and the caller set no Authorization. It is
@@ -911,6 +930,26 @@ impl SbiClient {
         {
             return Ok(response);
         }
+        let refusal = (target, scope.clone(), refusing_instance(&resend, &response));
+        let now = Instant::now();
+        {
+            let mut refusals = self
+                .token_refusals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            refusals.retain(|_, until| *until > now);
+            if refusals.contains_key(&refusal) {
+                log::debug!(
+                    "{} {}: {} invalid_token again within the refusal backoff for {} \
+                     scope '{scope}'; not resending",
+                    resend.header.method,
+                    crate::log_redact::redact_callback_tokens(&resend.header.uri),
+                    response.status,
+                    target.to_str()
+                );
+                return Ok(response);
+            }
+        }
         log::warn!(
             "{} {}: the producer refused our access token ({} invalid_token); evicting \
              the cached {} token for scope '{scope}' and resending once with a fresh one",
@@ -923,7 +962,36 @@ impl SbiClient {
         oauth2
             .invalidate_token_if(&oauth2.self_consumer(), target, &scope, rejected)
             .await;
-        Box::pin(self.send_with_overload_reaction(resend)).await
+        let request_of_resend = resend.clone();
+        let response = Box::pin(self.send_with_overload_reaction(resend)).await?;
+        // #1986: the fresh token refused as well is not a stale token: back off.
+        if matches!(response.status, 401 | 403)
+            && response
+                .http
+                .get_header("WWW-Authenticate")
+                .and_then(|v| bearer_challenge_error(v))
+                .is_some_and(|e| e == "invalid_token")
+        {
+            log::warn!(
+                "the producer refused a fresh {} token for scope '{scope}' too ({} \
+                 invalid_token); not resending for that target and scope for {}s",
+                target.to_str(),
+                response.status,
+                TOKEN_REFUSAL_BACKOFF.as_secs()
+            );
+            // #2023: the instance that refused the fresh token, which behind an
+            // SCP may not be the one that refused the first.
+            let refusal = (
+                target,
+                scope.clone(),
+                refusing_instance(&request_of_resend, &response),
+            );
+            self.token_refusals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(refusal, Instant::now() + TOKEN_REFUSAL_BACKOFF);
+        }
+        Ok(response)
     }
 
     /// #65: the TS 29.500 §6.4/§6.5 reaction that used to be missing entirely.
@@ -1826,6 +1894,31 @@ fn bearer_challenge_error(www_authenticate: &str) -> Option<String> {
 /// service-level scope plus the resource-level scope the operation needs, if
 /// any (TS 29.500 §6.7.3; [`crate::resource_scope`]). A producer that enforces
 /// a resource scope refuses a token for the service alone.
+/// #2023: which producer instance refused a token, as a backoff key: the
+/// `3gpp-Sbi-Producer-Id` the answer carries (TS 29.500; set by the
+/// producer, kept by an SCP), else the instance the request named
+/// (`3gpp-Sbi-Target-apiRoot`, `3gpp-Sbi-Target-Nf-Id`,
+/// `3gpp-Sbi-Discovery-target-nf-instance-id`), else `""`: this client's one
+/// producer (direct communication, where each client addresses one).
+fn refusing_instance(request: &SbiRequest, response: &SbiResponse) -> String {
+    use crate::constants::{custom_header, discovery_header};
+    let named = |v: Option<&String>| {
+        v.map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    named(response.http.get_header(custom_header::PRODUCER_ID))
+        .or_else(|| named(request.http.get_header(custom_header::TARGET_APIROOT)))
+        .or_else(|| named(request.http.get_header(custom_header::TARGET_NF_ID)))
+        .or_else(|| {
+            named(
+                request
+                    .http
+                    .get_header(discovery_header::TARGET_NF_INSTANCE_ID),
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn request_access_scope(request: &SbiRequest) -> String {
     crate::resource_scope::access_token_scope(
         &derive_scope_from_uri(&request.header.uri),
@@ -3021,6 +3114,100 @@ mod tests {
                 counts.producer_hits.load(SeqCst)
             ),
             (2, 2)
+        );
+    }
+
+    /// **#1986.** A refusal that persists (the fresh token is refused too) is
+    /// not resent again for [`TOKEN_REFUSAL_BACKOFF`]: the next request costs
+    /// one producer hit and no NRF fetch, and another scope is not affected.
+    /// Once the backoff is over, the next refusal evicts and resends again.
+    ///
+    /// REVERT-VERIFIED: without the backoff, the second request costs two more
+    /// hits and one more fetch and the first assertion after it fails.
+    #[tokio::test]
+    async fn a_persistent_invalid_token_backs_off_the_resend_1986() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) = serve_rotating_token_producer(
+            &["token-1", "token-2", "token-3", "token-4"],
+            403,
+            "invalid_token",
+        )
+        .await;
+        let (client, _) = client_1676(addr);
+        let counted = || {
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst),
+            )
+        };
+        let get = || SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+        assert_eq!(client.send_request(get()).await.expect("sent").status, 403);
+        assert_eq!(counted(), (2, 2), "one evict-and-resend");
+        assert_eq!(client.send_request(get()).await.expect("sent").status, 403);
+        assert_eq!(counted(), (2, 3), "backing off: one hit, no fetch");
+        // Another scope is not backed off by this one's refusal.
+        assert_eq!(
+            client
+                .send_request(SbiRequest::get("/nudm-uecm/v1/imsi-1/registrations"))
+                .await
+                .expect("sent")
+                .status,
+            403
+        );
+        assert_eq!(counted(), (4, 5), "another scope still evicts and resends");
+        // The backoff over, a refusal evicts and resends again, and a token the
+        // producer now accepts (token-5) is used.
+        for until in client.token_refusals.lock().unwrap().values_mut() {
+            *until = Instant::now();
+        }
+        assert_eq!(client.send_request(get()).await.expect("sent").status, 200);
+        assert_eq!(counted(), (5, 7), "after the backoff, one evict-and-resend");
+    }
+
+    /// **#2023.** Behind an SCP one client reaches many instances of a type: the
+    /// backoff a persistent refusal by one instance starts does not suspend the
+    /// evict-and-resend for another. Keyed by the instance the request names
+    /// (here `3gpp-Sbi-Discovery-target-nf-instance-id`) or the answer's
+    /// `3gpp-Sbi-Producer-Id`.
+    ///
+    /// REVERT-VERIFIED: with the instance left out of the key, instance B's
+    /// refusal is not resent and the first assertion after it fails (403).
+    #[tokio::test]
+    async fn the_refusal_backoff_is_per_producer_instance_2023() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1", "token-2"], 403, "invalid_token").await;
+        let (client, _) = client_1676(addr);
+        let counted = || {
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst),
+            )
+        };
+        let to = |instance: &str| {
+            let mut r = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+            r.http.set_header(
+                crate::constants::discovery_header::TARGET_NF_INSTANCE_ID,
+                instance,
+            );
+            r
+        };
+        let a = "20230000-0000-4000-8000-00000000000a";
+        let b = "20230000-0000-4000-8000-00000000000b";
+        assert_eq!(client.send_request(to(a)).await.expect("sent").status, 403);
+        assert_eq!(counted(), (2, 2), "instance A refuses the fresh token too");
+        // Instance B, through the same client, still gets its one resend.
+        assert_eq!(client.send_request(to(b)).await.expect("sent").status, 200);
+        assert_eq!(counted(), (3, 4), "B: evicted and resent");
+        // And the Producer-Id of the answer, when given, is the instance.
+        let other = SbiResponse::with_status(403)
+            .with_header(crate::constants::custom_header::PRODUCER_ID, "nfinst=CCCC");
+        assert_eq!(refusing_instance(&to(a), &other), "nfinst=cccc");
+        assert_eq!(
+            refusing_instance(&SbiRequest::get("/x"), &SbiResponse::with_status(403)),
+            ""
         );
     }
 

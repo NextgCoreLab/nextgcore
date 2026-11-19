@@ -906,6 +906,8 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // #1933: the Registration Accept resolves the PCF for the UE policy create.
     let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     // Paging reads the strategy (#1588).
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
@@ -1934,6 +1936,8 @@ async fn a_modify_indication_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
 /// re-activation failed (TS 24.501 §8.2.7.15).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registration_update_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_031u64, 61u32);
     registered_ue_with_guti(&mut server, ue, ran);
@@ -2035,6 +2039,8 @@ async fn n2_sm_relays_to_a_blackholed_smf_do_not_hold_the_ngap_task() {
 /// Accept goes out in a setup request on the released connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registration_update_released_during_its_join_sends_no_accept() {
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_051u64, 81u32);
@@ -2139,6 +2145,8 @@ async fn a_path_switch_whose_ue_goes_idle_during_its_join_is_failed() {
 /// progressed (a new join, the old one gone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeated_registration_request_during_the_join_follows_5_5_1_3_8_e() {
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_071u64, 91u32);
     registered_ue_with_guti(&mut server, ue, ran);
@@ -2395,4 +2403,117 @@ async fn a_release_before_the_connected_report_reports_no_idle_1645() {
         sink_a.stop().await.expect("sink stop");
         sink_b.stop().await.expect("sink stop");
     }
+}
+
+/// **#1924.** An NG Reset that supersedes a Service Request's SMF activations
+/// before they started (they were still waiting for a permit) resolves the join
+/// that waited on them at once. Their outcomes never arrive, so before, the join
+/// lingered until its deadline: the flake of
+/// `a_release_before_the_connected_report_reports_no_idle_1645` under load, made
+/// deterministic here with an offload that has no permits to give.
+///
+/// REVERT-VERIFIED: with `resolve_superseded_join_parts` not called from the NG
+/// Reset handler, the join is still open and the assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ng_reset_that_supersedes_waiting_activations_closes_their_join_1924() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let _guami = ServeOneGuami::install();
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, _seen) = slow_up_cnx_smf(Duration::from_millis(400)).await;
+    let mut server = capturing_ngap_server().await;
+    // No permits: every offloaded exchange waits, as under heavy load.
+    server.sbi_offload = crate::sbi_offload::SbiOffload::new(0);
+    seed_gnb_session(&server, 1).await;
+    let (old, new) = (19_240_001u64, 19_240_002u64);
+    let pdu = idle_ue_with_two_sessions(
+        &mut server,
+        old,
+        new,
+        fast_port,
+        slow_port,
+        ("isr-1924-fast", "isr-1924-slow"),
+    );
+    server
+        .handle_initial_ue_message(1, &pdu)
+        .await
+        .expect("handled");
+    assert_eq!(
+        server.smf_joins.len(),
+        1,
+        "the join waits for both activations"
+    );
+
+    let item = nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+        amf_ue_ngap_id: Some(new),
+        ran_ue_ngap_id: None,
+    };
+    server
+        .handle_ng_reset(
+            1,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                item,
+            ])),
+        )
+        .await
+        .expect("handled");
+    assert!(
+        server.smf_joins.is_empty(),
+        "the superseded activations will never answer: their join is closed now"
+    );
+    assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
+    server.forget_ue(new);
+}
+
+/// **#1924 (R31 M1).** The other NG-release caller: an SCTP association lost
+/// (restart, closure, or NG Setup without retention, TS 38.413 §8.7.1.1)
+/// during an idle Service Request releases the UE's NG connection as an NG
+/// Reset does, superseding the activations still waiting for a permit. Their
+/// join is closed straight away, not after `SMF_JOIN_MAX_WAIT`.
+///
+/// REVERT-VERIFIED: with `resolve_superseded_join_parts` dropped from
+/// `reset_ue_associations_of`, the join is still open and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_association_loss_that_supersedes_waiting_activations_closes_their_join_1924() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let _guami = ServeOneGuami::install();
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, _seen) = slow_up_cnx_smf(Duration::from_millis(400)).await;
+    let mut server = capturing_ngap_server().await;
+    // No permits: every offloaded exchange waits, as under heavy load.
+    server.sbi_offload = crate::sbi_offload::SbiOffload::new(0);
+    seed_gnb_session(&server, 1).await;
+    let (old, new) = (19_240_011u64, 19_240_012u64);
+    let pdu = idle_ue_with_two_sessions(
+        &mut server,
+        old,
+        new,
+        fast_port,
+        slow_port,
+        ("isr-1924-assoc-fast", "isr-1924-assoc-slow"),
+    );
+    server
+        .handle_initial_ue_message(1, &pdu)
+        .await
+        .expect("handled");
+    assert_eq!(
+        server.smf_joins.len(),
+        1,
+        "the join waits for both activations"
+    );
+
+    server
+        .reset_ue_associations_of(1, "SCTP association lost (test)")
+        .await;
+    assert!(
+        server.smf_joins.is_empty(),
+        "the superseded activations will never answer: their join is closed now"
+    );
+    assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
+    server.forget_ue(new);
 }

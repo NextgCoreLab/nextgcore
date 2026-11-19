@@ -21,6 +21,13 @@
 //!   whenever it changes, and restored from it at boot, so a restart does not forget
 //!   a cleanup it still owes. Like the sessions, only when the durable state is
 //!   configured (`--state-file` / `NEXTGCORE_SMF_STATE_FILE`).
+//! - No peer starves the others (#1961, the #1954 / #1972 pattern): once a cleanup
+//!   to a peer (an NSACF, the PCF, the UDM) fails, that peer backs off
+//!   ([`BACKOFF_BASE`], doubling to [`BACKOFF_MAX`]) and its other cleanups wait, in
+//!   this pass and later ones; one tried and failed goes to the BACK of the queue,
+//!   one not reached (or deferred) keeps its place at the front. One parked longer
+//!   than [`MAX_AGE`] ends as `expired`; the age is counted from when this process
+//!   parked or restored it.
 //! - Safe against re-use: a NSACF DECREASE or a UECM deregistration names a
 //!   (SUPI, PSI), not a session. A new session for the same pair supersedes it (its
 //!   INCREASE or registration is the live one), and one still being created defers
@@ -133,7 +140,8 @@ const KINDS: [&str; 4] = [
 /// `smf_release_cleanups_reconciled_total{kind,result}`: parked cleanups the
 /// reconciler ended: `delivered` (the peer accepted, or no longer held the record),
 /// `superseded` (a new session for the same SUPI and PSI holds it), `refused` (the
-/// peer answered a 4xx a retry cannot change), or `abandoned` (evicted at the bound).
+/// peer answered a 4xx a retry cannot change), `abandoned` (evicted at the bound), or
+/// `expired` (parked longer than [`MAX_AGE`], #1961).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "smf_release_cleanups_reconciled_total",
@@ -154,19 +162,101 @@ pub static PARKED: nextgcore_metrics::nf::CounterFamily = nextgcore_metrics::nf:
 /// Tests that read or write it hold `crate::context::PROCESS_STATE_TEST_LOCK`: the
 /// set is SMF process state, written by every release a test drives, and it is
 /// snapshotted with the rest of that state.
-fn pending() -> &'static Mutex<VecDeque<Cleanup>> {
-    static PENDING: Mutex<VecDeque<Cleanup>> = Mutex::new(VecDeque::new());
+fn pending() -> &'static Mutex<VecDeque<Parked>> {
+    static PENDING: Mutex<VecDeque<Parked>> = Mutex::new(VecDeque::new());
     &PENDING
 }
 
-fn lock() -> std::sync::MutexGuard<'static, VecDeque<Cleanup>> {
+/// One parked cleanup, and when this process parked (or restored) it (#1961).
+#[derive(Debug, Clone)]
+struct Parked {
+    cleanup: Cleanup,
+    /// Wall-clock, so a test can set it back past [`MAX_AGE`].
+    since: std::time::SystemTime,
+}
+
+impl Parked {
+    fn new(cleanup: Cleanup) -> Self {
+        Parked {
+            cleanup,
+            since: std::time::SystemTime::now(),
+        }
+    }
+}
+
+/// #1961: how long an entry stays parked before it is given up (`expired`): a
+/// peer that has not answered for a day is gone (decommissioned), not
+/// restarting, so its entries end rather than wait to be evicted.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// #1961 (the #1954 / #1972 pattern): the first wait before a peer whose
+/// request failed is tried again, doubled after each further failure up to
+/// [`BACKOFF_MAX`], and cleared by a success. A peer that is backing off is
+/// skipped for the rest of the pass and for later passes until its wait ends,
+/// so a blackholed peer costs one request timeout per backoff period and
+/// cannot starve the entries for healthy peers behind it.
+#[cfg(not(test))]
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
+/// The longest a failing peer is left alone between attempts.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
+
+/// Per peer: when it may next be tried, and the current backoff.
+fn backoff() -> &'static Mutex<Backoff> {
+    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
+        std::sync::LazyLock::new(Default::default);
+    &BACKOFF
+}
+
+fn backing_off(peer: &str) -> bool {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
+}
+
+fn note_failure(peer: &str) {
+    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    let wait = map
+        .get(peer)
+        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
+    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
+}
+
+fn note_success(peer: &str) {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(peer);
+}
+
+/// The peer a cleanup goes to: the NSACF it names (else the resolved one), the
+/// PCF, or the UDM.
+fn peer_of(c: &Cleanup) -> String {
+    match c {
+        Cleanup::NsacDecrease { nsacf: Some(e), .. } => format!("nsacf {}:{}", e.host, e.port),
+        Cleanup::NsacDecrease { nsacf: None, .. } => "nsacf".to_string(),
+        Cleanup::SmPolicyDelete { .. } => "pcf".to_string(),
+        Cleanup::UecmDeregister { .. } | Cleanup::SdmUnsubscribe { .. } => "udm".to_string(),
+    }
+}
+
+fn lock() -> std::sync::MutexGuard<'static, VecDeque<Parked>> {
     pending().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn holds(set: &VecDeque<Parked>, c: &Cleanup) -> bool {
+    set.iter().any(|p| p.cleanup == *c)
+}
+
 /// Evict down to [`MAX_PENDING`], oldest first.
-fn evict(set: &mut VecDeque<Cleanup>) {
+fn evict(set: &mut VecDeque<Parked>) {
     while set.len() > MAX_PENDING {
-        if let Some(old) = set.pop_front() {
+        if let Some(Parked { cleanup: old, .. }) = set.pop_front() {
             log::error!(
                 "{}: abandoned; {MAX_PENDING} release cleanups are already pending",
                 old.describe()
@@ -187,7 +277,7 @@ fn persist() {
 pub fn park(cleanup: Cleanup) {
     {
         let mut set = lock();
-        if set.contains(&cleanup) {
+        if holds(&set, &cleanup) {
             return;
         }
         log::warn!(
@@ -195,7 +285,7 @@ pub fn park(cleanup: Cleanup) {
             cleanup.describe()
         );
         PARKED.inc(&[cleanup.kind()]);
-        set.push_back(cleanup);
+        set.push_back(Parked::new(cleanup));
         evict(&mut set);
     }
     persist();
@@ -203,15 +293,15 @@ pub fn park(cleanup: Cleanup) {
 
 /// The parked set, for the durable snapshot.
 pub fn snapshot() -> Vec<Cleanup> {
-    lock().iter().cloned().collect()
+    lock().iter().map(|p| p.cleanup.clone()).collect()
 }
 
 /// Restore parked cleanups from a snapshot (boot). Not counted as parked again.
 pub fn restore(cleanups: Vec<Cleanup>) {
     let mut set = lock();
     for c in cleanups {
-        if !set.contains(&c) {
-            set.push_back(c);
+        if !holds(&set, &c) {
+            set.push_back(Parked::new(c));
         }
     }
     evict(&mut set);
@@ -219,7 +309,7 @@ pub fn restore(cleanups: Vec<Cleanup>) {
 
 /// How many cleanups of `kind` are parked.
 pub fn pending_count(kind: &str) -> usize {
-    lock().iter().filter(|c| c.kind() == kind).count()
+    lock().iter().filter(|p| p.cleanup.kind() == kind).count()
 }
 
 /// What a live session for (SUPI, PSI) means for a cleanup naming that pair.
@@ -392,41 +482,66 @@ async fn attempt(c: &Cleanup) -> Attempt {
 }
 
 /// One reconcile pass: retry the parked cleanups, oldest first, for at most
-/// [`MAX_PASS`]. One that fails, is deferred, or is not reached within the pass
-/// is parked again, ahead of anything parked meanwhile. Returns how many ended.
+/// [`MAX_PASS`]. One older than [`MAX_AGE`] ends as `expired`.
+///
+/// #1961: once a cleanup to a peer fails, that peer backs off and its other
+/// cleanups are not tried this pass (nor until the backoff ends); one tried and
+/// failed goes to the BACK of the queue, one deferred or not reached keeps its
+/// place at the FRONT. Returns how many ended.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<Cleanup> = lock().drain(..).collect();
+    let batch: Vec<Parked> = lock().drain(..).collect();
     if batch.is_empty() {
         return 0;
     }
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut still = Vec::new();
-    for c in batch {
-        if tokio::time::Instant::now() >= deadline {
-            still.push(c);
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for p in batch {
+        let c = &p.cleanup;
+        if p.since.elapsed().unwrap_or_default() > MAX_AGE {
+            log::error!("{}: expired after {MAX_AGE:?}", c.describe());
+            RECONCILED.inc(&[c.kind(), "expired"]);
+            ended += 1;
             continue;
         }
-        let result = match attempt(&c).await {
+        let peer = peer_of(c);
+        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+            untried.push(p);
+            continue;
+        }
+        let result = match attempt(c).await {
             Attempt::Delivered => "delivered",
             Attempt::Superseded => "superseded",
             Attempt::Refused => "refused",
-            Attempt::Deferred | Attempt::Failed => {
-                still.push(c);
+            Attempt::Deferred => {
+                untried.push(p);
+                continue;
+            }
+            Attempt::Failed => {
+                note_failure(&peer);
+                failed.push(p);
                 continue;
             }
         };
+        note_success(&peer);
         log::info!("{}: reconciled ({result})", c.describe());
         RECONCILED.inc(&[c.kind(), result]);
         ended += 1;
     }
     {
         let mut set = lock();
-        // Back at the FRONT, in order: they are older than anything parked while
-        // this pass ran, and eviction takes the oldest.
-        for c in still.into_iter().rev() {
-            if !set.contains(&c) {
-                set.push_front(c);
+        // Not reached or deferred: back at the FRONT, in order (older than anything
+        // parked while this pass ran, and eviction takes the oldest). Tried and
+        // failed: at the BACK.
+        for p in untried.into_iter().rev() {
+            if !holds(&set, &p.cleanup) {
+                set.push_front(p);
+            }
+        }
+        for p in failed {
+            if !holds(&set, &p.cleanup) {
+                set.push_back(p);
             }
         }
         evict(&mut set);
@@ -475,6 +590,7 @@ pub fn render(out: &mut String) {
 #[cfg(test)]
 pub fn clear_for_test() {
     lock().clear();
+    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 #[cfg(test)]
@@ -515,6 +631,96 @@ mod tests {
             Some(&policy_delete(MAX_PENDING)),
             "parked once"
         );
+    }
+
+    /// #1961: a peer that accepts the connection and never answers, so each
+    /// request to it costs the client's whole timeout. Returns its port; the
+    /// accepted sockets are held for the life of the test process.
+    fn blackhole_1961() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    fn decrease_at(port: u16, n: usize) -> Cleanup {
+        Cleanup::NsacDecrease {
+            supi: format!("imsi-00101000001961{n}"),
+            psi: 5,
+            sst: 1,
+            sd: None,
+            nf_id: Some("smf-1961".into()),
+            nsacf: Some(policy::NsacfEndpoint {
+                host: "127.0.0.1".into(),
+                port,
+            }),
+            plmn: None,
+        }
+    }
+
+    /// #1961: DECREASEs toward a blackholed NSACF ahead of one toward a healthy
+    /// NSACF no longer starve it: the healthy one is delivered within two passes,
+    /// and the blackholed ones stay parked.
+    /// REVERT-VERIFIED: with the old order restored (every not-ended cleanup
+    /// re-parked at the front, no backoff), the healthy DECREASE is never reached
+    /// and "the healthy NSACF gets its DECREASE" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_nsacf_does_not_starve_a_healthy_one_1961() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        clear_for_test();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            },
+        )
+        .await;
+        let dead = blackhole_1961();
+        for n in 0..3 {
+            park(decrease_at(dead, n));
+        }
+        park(decrease_at(addr.port(), 9));
+        let delivered = || RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+        for _ in 0..2 {
+            reconcile_once().await;
+        }
+        let got = delivered() - before;
+        let left = snapshot();
+        clear_for_test();
+        let _ = tokio::time::timeout(Duration::from_secs(1), srv.stop()).await;
+        assert_eq!(got, 1, "the healthy NSACF gets its DECREASE");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(left.len(), 3, "the blackholed ones stay parked: {left:?}");
+    }
+
+    /// #1961: a cleanup parked longer than [`MAX_AGE`] ends as `expired`.
+    /// REVERT-VERIFIED: with the age check removed it is attempted instead and
+    /// stays parked.
+    #[tokio::test]
+    async fn a_cleanup_older_than_max_age_expires_1961() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        clear_for_test();
+        park(decrease_at(9, 7));
+        lock()[0].since = std::time::SystemTime::now() - MAX_AGE - Duration::from_secs(1);
+        let expired = || RECONCILED.get(&["nsac_decrease", "expired"]);
+        let before = expired();
+        reconcile_once().await;
+        let got = expired() - before;
+        let left = snapshot().len();
+        clear_for_test();
+        assert_eq!((got, left), (1, 0));
     }
 
     /// #1875: every kind survives a JSON round trip in the shape the snapshot

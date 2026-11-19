@@ -10122,6 +10122,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_transfer_connected_ue() {
+        // #1974: this transfer enqueues on the process-global connected-UE downlink
+        // queue, which the NGAP pump tests drain whole; take its lock and take this
+        // UE's transfer back out, or a sibling's pump sends it (and spends that
+        // test's injected send failure on it).
+        let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
         let supi = "imsi-001010000060020";
         let ue = setup_ue(supi, true, true);
         setup_sess(&ue, 5);
@@ -10133,6 +10138,11 @@ mod tests {
             body_json(&resp)["cause"].as_str(),
             Some("N1_N2_TRANSFER_INITIATED")
         );
+        let queued = amf_self()
+            .read()
+            .expect("ctx lock")
+            .connected_downlink_remove_for(&[ue.id]);
+        assert_eq!(queued.len(), 1, "this transfer's one queued downlink");
     }
 
     /// #1674 (the #1670 review), TS 24.501 §9.11.3.39 / TS 29.500 §5.2.7.2: an
@@ -10141,6 +10151,11 @@ mod tests {
     /// of exactly 65 535 octets is accepted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_n1_over_a_payload_container_is_refused_before_the_200_1674() {
+        // #1974: this transfer enqueues on the process-global connected-UE downlink
+        // queue, which the NGAP pump tests drain whole; take its lock and take this
+        // UE's transfer back out, or a sibling's pump sends it (and spends that
+        // test's injected send failure on it).
+        let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
         let supi = "imsi-001010000167401";
         let ue = setup_ue(supi, true, true);
         setup_sess(&ue, 5);
@@ -10186,6 +10201,10 @@ mod tests {
             resp.status, 413,
             "an over-long LPP is refused before the relay too"
         );
+        let _ = amf_self()
+            .read()
+            .expect("ctx lock")
+            .connected_downlink_remove_for(&[ue.id]);
     }
 
     /// #1674: a notification's answer is capped at `MAX_SMALL_RESPONSE_BODY`.
@@ -10231,10 +10250,14 @@ mod tests {
     /// is built, and the transfer is accepted (200) — the SM path is skipped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_lpp_to_connected_ue_relays() {
+        // #1974: this transfer enqueues on the process-global positioning downlink
+        // queue, which the NGAP pump tests drain whole; take its lock and take this
+        // UE's item back out, or a sibling's pump sends it.
+        let _q = updp_queue_test_lock().lock().await;
         // Unique SUPI: test_ue_context_transfer_roundtrip also registered
         // imsi-001010000060030 in the shared process-global supi_hash.
         let supi = "imsi-001010000060036";
-        setup_ue(supi, true, true);
+        let ue = setup_ue(supi, true, true);
 
         let body = json!({
             "n1MessageContainer": {
@@ -10256,6 +10279,11 @@ mod tests {
             body_json(&resp)["cause"].as_str(),
             Some("N1_N2_TRANSFER_INITIATED")
         );
+        assert_eq!(
+            drain_downlinks_for(ue.id).len(),
+            1,
+            "this transfer's one downlink"
+        );
     }
 
     /// LCS: an LMF push of NRPPa (n2InfoContainer.nrppaInfo, ngapIeType
@@ -10263,8 +10291,12 @@ mod tests {
     /// UE-associated NRPPa DL transport is built, and the transfer is accepted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_nrppa_to_connected_ue_relays() {
+        // #1974: this transfer enqueues on the process-global positioning downlink
+        // queue, which the NGAP pump tests drain whole; take its lock and take this
+        // UE's item back out, or a sibling's pump sends it.
+        let _q = updp_queue_test_lock().lock().await;
         let supi = "imsi-001010000060031";
-        setup_ue(supi, true, true);
+        let ue = setup_ue(supi, true, true);
 
         let body = json!({
             "n2InfoContainer": {
@@ -10291,6 +10323,11 @@ mod tests {
         assert_eq!(
             body_json(&resp)["cause"].as_str(),
             Some("N1_N2_TRANSFER_INITIATED")
+        );
+        assert_eq!(
+            drain_downlinks_for(ue.id).len(),
+            1,
+            "this transfer's one downlink"
         );
     }
 
@@ -11013,8 +11050,12 @@ mod tests {
     /// context (TS 29.518 N1N2MessageTransferReqData, yaml:2771-2774).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_lpp_transfer_captures_lcs_correlation() {
+        // #1974: this transfer enqueues on the process-global positioning downlink
+        // queue, which the NGAP pump tests drain whole; take its lock and take this
+        // UE's item back out, or a sibling's pump sends it.
+        let _q = updp_queue_test_lock().lock().await;
         let supi = "imsi-001010000060043";
-        setup_ue(supi, true, true);
+        let ue = setup_ue(supi, true, true);
 
         let body = json!({
             "n1MessageContainer": {
@@ -11034,6 +11075,11 @@ mod tests {
             ));
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 200);
+        assert_eq!(
+            drain_downlinks_for(ue.id).len(),
+            1,
+            "this transfer's one downlink"
+        );
 
         let ctx = amf_self();
         let guard = ctx.read().expect("ctx lock");
@@ -12646,10 +12692,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
+        // #1974: the UE-AMBR change reaches the process-global UE-AMBR modification
+        // queue, which the NGAP pump tests drain whole; its lock, after the dereg
+        // queue's (see `test_support::UE_AMBR_MODIFICATION_LOCK`).
+        let _ambr = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017481";
         // CM-IDLE (a CM-CONNECTED UE: see
         // `a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776`).
-        let _ue = setup_ue(supi, false, true);
+        let ue = setup_ue(supi, false, true);
         let body = am_data_change(
             supi,
             json!([
@@ -12669,6 +12719,10 @@ mod tests {
             kept.expect("kept")["subscribedUeAmbr"]["downlink"],
             "10 Mbps"
         );
+        amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_ambr_modification_remove_for(&[ue.id]);
     }
 
     /// #1748 (failure-path check 2): the same notification delivered twice (a UDM

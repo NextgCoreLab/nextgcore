@@ -4280,6 +4280,8 @@ async fn an_update_accept_with_a_5g_guti_arms_t3550() {
 /// Revert-verified: committing the ID when the CUC is built sends nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_racs_cuc_whose_t3555_exhausts_leaves_the_id_owed() {
+    // #1974: the NAS-timer sweep walks the whole process-global UE store.
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
     let _racs = crate::racs::tests::guard();
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_889_002u64, 82);
@@ -5066,6 +5068,8 @@ async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session
 #[allow(clippy::await_holding_lock)]
 async fn a_page_answered_by_an_initial_registration_is_stopped_and_notified() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
@@ -5725,6 +5729,8 @@ async fn abort_with_sessions(
 /// `forget_ue` and nothing released them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborted_procedure_releases_the_sessions_before_forgetting_the_ue() {
+    // #1974: the NAS-timer sweep walks the whole process-global UE store.
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
     for (n, abort) in [
         Abort::RegistrationReject,
         Abort::T3560Exhausted,

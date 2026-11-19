@@ -399,6 +399,10 @@ const UNSUBSCRIBE_MAX_PASS: std::time::Duration = std::time::Duration::from_secs
 #[cfg(test)]
 const UNSUBSCRIBE_MAX_PASS: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How many AMFs one pass sends parked unsubscribes to at once (#1987): each AMF
+/// is a lane, so dead AMFs cost a timeout each in parallel, not in turn.
+const UNSUBSCRIBE_MAX_LANES: usize = 64;
+
 /// `udm_ee_amf_unsubscribes_reconciled_total{result}`: parked AMF unsubscribes
 /// the reconciler ended, `delivered` (2xx or 404), `abandoned` (evicted at the
 /// bound) or `expired` (parked longer than [`UNSUBSCRIBE_MAX_AGE`]).
@@ -495,17 +499,20 @@ pub fn clear_parked_unsubscribes_for_test() {
 /// R30: no AMF can starve the others. Once a DELETE to an AMF (its authority)
 /// fails in a pass, its other parked unsubscribes wait for the next pass instead of
 /// each costing a timeout; and an unsubscribe that was tried goes to the BACK of
-/// the queue, while one this pass did not reach keeps its place at the front. So
-/// a blackholed AMF ahead of a healthy one delays the healthy one by at most one
-/// timeout per pass, never for good.
+/// the queue, while one this pass did not reach keeps its place at the front.
+///
+/// #1987: each AMF is its own lane, and up to [`UNSUBSCRIBE_MAX_LANES`] lanes send
+/// at once, so a healthy AMF's unsubscribe is not queued behind the timeouts of
+/// dead AMFs ahead of it: it was, by about one pass per six dead AMFs.
 pub async fn reconcile_unsubscribes_once() -> usize {
     let batch: Vec<ParkedUnsubscribe> = lock_parked().drain(..).collect();
     let deadline = tokio::time::Instant::now() + UNSUBSCRIBE_MAX_PASS;
     let mut ended = 0;
-    let mut untried = Vec::new();
-    let mut failed = Vec::new();
-    let mut failing_amfs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for parked in batch {
+    // The lanes, in the order of each AMF's first turn; each holds its entries in
+    // turn order, with their place in the batch.
+    let mut lanes: Vec<Vec<(usize, ParkedUnsubscribe)>> = Vec::new();
+    let mut lane_of: HashMap<String, usize> = HashMap::new();
+    for (place, parked) in batch.into_iter().enumerate() {
         if parked.since.elapsed() > UNSUBSCRIBE_MAX_AGE {
             log::error!(
                 "Namf_EventExposure_Unsubscribe {} expired after {UNSUBSCRIBE_MAX_AGE:?}",
@@ -516,16 +523,64 @@ pub async fn reconcile_unsubscribes_once() -> usize {
             continue;
         }
         let amf = authority(&parked.uri).unwrap_or(&parked.uri).to_string();
-        if tokio::time::Instant::now() >= deadline || failing_amfs.contains(&amf) {
-            untried.push(parked);
+        let lane = *lane_of.entry(amf).or_insert_with(|| {
+            lanes.push(Vec::new());
+            lanes.len() - 1
+        });
+        lanes[lane].push((place, parked));
+    }
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(UNSUBSCRIBE_MAX_LANES));
+    let mut sending = tokio::task::JoinSet::new();
+    let mut outcomes: Vec<(usize, ParkedUnsubscribe, UnsubscribeOutcome)> = Vec::new();
+    for lane in lanes {
+        // A lane waits for a free slot, in turn order; one that gets none before
+        // the deadline is not tried this pass.
+        let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, gate.clone().acquire_owned()).await
+        else {
+            outcomes.extend(
+                lane.into_iter()
+                    .map(|(place, p)| (place, p, UnsubscribeOutcome::Untried)),
+            );
             continue;
+        };
+        sending.spawn(async move {
+            let _slot = slot;
+            let mut failed = false;
+            let mut out = Vec::with_capacity(lane.len());
+            for (place, parked) in lane {
+                let outcome = if failed || tokio::time::Instant::now() >= deadline {
+                    UnsubscribeOutcome::Untried
+                } else if try_amf_unsubscribe(&parked.uri).await {
+                    UnsubscribeOutcome::Delivered
+                } else {
+                    failed = true;
+                    UnsubscribeOutcome::Failed
+                };
+                out.push((place, parked, outcome));
+            }
+            out
+        });
+    }
+    while let Some(lane) = sending.join_next().await {
+        // A lane cannot panic short of a bug; what it held is then lost, as a
+        // dropped pass loses its batch.
+        if let Ok(lane) = lane {
+            outcomes.extend(lane);
         }
-        if try_amf_unsubscribe(&parked.uri).await {
-            UNSUBSCRIBES_RECONCILED.inc(&["delivered"]);
-            ended += 1;
-        } else {
-            failing_amfs.insert(amf);
-            failed.push(parked);
+    }
+    outcomes.sort_by_key(|(place, _, _)| *place);
+
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for (_, parked, outcome) in outcomes {
+        match outcome {
+            UnsubscribeOutcome::Delivered => {
+                UNSUBSCRIBES_RECONCILED.inc(&["delivered"]);
+                ended += 1;
+            }
+            UnsubscribeOutcome::Failed => failed.push(parked),
+            UnsubscribeOutcome::Untried => untried.push(parked),
         }
     }
     let mut set = lock_parked();
@@ -543,6 +598,13 @@ pub async fn reconcile_unsubscribes_once() -> usize {
     }
     evict_unsubscribes(&mut set);
     ended
+}
+
+/// What one pass did with a parked AMF unsubscribe.
+enum UnsubscribeOutcome {
+    Delivered,
+    Failed,
+    Untried,
 }
 
 /// Run [`reconcile_unsubscribes_once`] every [`UNSUBSCRIBE_RECONCILE_PERIOD`].
@@ -1420,6 +1482,68 @@ mod tests {
         assert_eq!(delivered, 1, "the healthy AMF's unsubscribe is delivered");
         assert!(!still.contains(&live));
         assert_eq!(still.len(), 3, "the blackholed ones stay parked: {still:?}");
+    }
+
+    /// #1987: eight dead AMFs, each with an unsubscribe parked ahead of a healthy
+    /// AMF's, do not delay it: one pass delivers it. Sent in turn, the dead ones
+    /// cost 8 x 450 ms against the 500 ms pass, and the healthy one waited passes.
+    /// The 450 ms call timeout leaves the healthy DELETE room on a loaded host.
+    ///
+    /// REVERT-VERIFIED: with `UNSUBSCRIBE_MAX_LANES` at 1 (the lanes sent in turn,
+    /// as before), this fails: nothing is delivered in the first pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn dead_amfs_ahead_do_not_delay_a_healthy_one_1987() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        AMF_CALL_TIMEOUT_MS.store(450, Ordering::Relaxed);
+        // Eight AMFs that accept connections and never answer.
+        let mut holes = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            holes.push(blackhole.local_addr().unwrap().to_string());
+            held.push(tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((c, _)) = blackhole.accept().await {
+                    conns.push(c);
+                }
+            }));
+        }
+        let (_amf, healthy, seen) = recorder(|_| SbiResponse::with_status(204)).await;
+        let dead: Vec<String> = holes
+            .iter()
+            .enumerate()
+            .map(|(n, hole)| format!("http://{hole}/namf-evts/v1/subscriptions/dead-1987-{n}"))
+            .collect();
+        for uri in &dead {
+            park_unsubscribe(uri);
+        }
+        let live = format!("http://{healthy}/namf-evts/v1/subscriptions/live-1987");
+        park_unsubscribe(&live);
+
+        reconcile_unsubscribes_once().await;
+        let delivered = seen.lock().unwrap().len();
+        let still: Vec<String> = lock_parked()
+            .iter()
+            .map(|p| p.uri.clone())
+            .filter(|u| dead.contains(u) || *u == live)
+            .collect();
+        clear_parked_unsubscribes_for_test();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        for h in held {
+            h.abort();
+        }
+
+        assert_eq!(
+            delivered, 1,
+            "the healthy AMF's unsubscribe is sent in one pass"
+        );
+        assert!(!still.contains(&live));
+        assert_eq!(still.len(), 8, "the dead AMFs' stay parked: {still:?}");
     }
 
     /// **#1449 review 2.** A PATCH of `callbackReference` re-subscribes at the AMF

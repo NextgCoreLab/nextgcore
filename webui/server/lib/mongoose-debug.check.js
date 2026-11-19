@@ -34,4 +34,60 @@ assert.strictEqual(out.split(REDACTED).length - 1, 5, `every key field redacted:
 const doc = { security: { k: K } };
 assert.strictEqual(redact(doc).security.k, REDACTED);
 assert.strictEqual(doc.security.k, K);
+// #1983: index-suffixed and positional paths, off-schema names, BigInt.
+const { sanitizeDebugEnv, isKeyField } = require('./mongoose-debug');
+for (const k of ['security.k.0', 'security.opc.$', 'security.k.$[]', 'ki', 'permanentKeyValue',
+  'encPermanentKey', 'OPcKey', 'clientSecret']) {
+  assert.ok(isKeyField(k), `${k} is key material`);
+}
+for (const k of ['security.amf', 'security.sqn', 'imsi', 'key_id', 'kind']) {
+  assert.ok(!isKeyField(k), `${k} is not key material`);
+}
+const more = [];
+const dbg2 = mongooseDebug({ NODE_ENV: 'development', NEXTGCORE_SBI_PROFILE: 'dev' }, (l) =>
+  more.push(l));
+dbg2('subscribers', 'updateOne', { imsi: '1' },
+  { $set: { 'security.k.0': K, ki: K, permanentKeyValue: OPC, 'security.sqn': 10n } });
+assert.ok(!more[0].includes(K) && !more[0].includes(OPC), `leaked: ${more[0]}`);
+assert.ok(more[0].includes('"10"'), `the BigInt is shown, not thrown: ${more[0]}`);
+
+// #2006: an own toJSON cannot hand JSON.stringify K, nor can a prototype's.
+const viaToJson = [];
+const dbg3 = mongooseDebug({ NODE_ENV: 'development', NEXTGCORE_SBI_PROFILE: 'dev' }, (l) =>
+  viaToJson.push(l));
+dbg3('subscribers', 'insertOne', { security: { toJSON() { return { k: K }; } } });
+dbg3('subscribers', 'insertOne', { security: { toJSON() { return K; } } });
+class Wrapped { constructor() { this.imsi = '1'; } toJSON() { return { imsi: '1', opc: OPC }; } }
+dbg3('subscribers', 'insertOne', { doc: Object.assign(Object.create(Wrapped.prototype), { imsi: '1' }) });
+dbg3('subscribers', 'insertOne', { doc: new Wrapped() });
+for (const l of viaToJson) {
+  assert.ok(!l.includes(K) && !l.includes(OPC), `toJSON leaked: ${l}`);
+}
+
+// #1983: DEBUG never enables mquery/mongoose query logging.
+assert.strictEqual(sanitizeDebugEnv({}), undefined);
+for (const raw of ['mquery', '*', 'mquery*,express:*', 'mongoose:*']) {
+  const out = sanitizeDebugEnv({ DEBUG: raw });
+  assert.ok(/-mquery\*/.test(out) && /-mongoose\*/.test(out), `${raw} -> ${out}`);
+  assert.ok(!out.split(',').some((ns) => /^(mquery|mongoose)/.test(ns)), `${raw} -> ${out}`);
+}
+assert.ok(sanitizeDebugEnv({ DEBUG: 'express:*' }).startsWith('express:*,'));
+
+// #2021: an account's password hash and salt are redacted too, at any depth and
+// in a dotted path; a name that merely contains them is not.
+const HASH = 'f1e2d3c4b5a6978877665544332211ffeeddccbbaa99887766554433221100aa';
+const SALT = '9a8b7c6d5e4f3a2b1c0d';
+const accounts = [];
+const dbg4 = mongooseDebug({ NODE_ENV: 'development', NEXTGCORE_SBI_PROFILE: 'dev' }, (l) =>
+  accounts.push(l));
+dbg4('accounts', 'insertOne', { username: 'admin', hash: HASH, salt: SALT });
+dbg4('accounts', 'updateOne', { username: 'admin' }, { $set: { 'auth.hash': HASH, 'auth.Salt': SALT } });
+for (const l of accounts) {
+  assert.ok(!l.includes(HASH) && !l.includes(SALT), `password material logged: ${l}`);
+}
+assert.ok(accounts[0].includes('admin'), 'the username is still shown');
+for (const k of ['hashAlgorithm', 'saltRounds', 'hashtag']) {
+  assert.ok(!isKeyField(k), `${k} is not key material`);
+}
+
 console.log('mongoose-debug: ok');
