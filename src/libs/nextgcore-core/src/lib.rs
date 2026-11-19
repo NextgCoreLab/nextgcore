@@ -4,6 +4,7 @@
 //! the NextGCore codebase. It is a direct port of lib/core/ from the C implementation.
 
 pub mod async_timer; // Async timer manager for NF event loops
+pub mod backoff; // per-peer retry backoff and oldest-first eviction for reconcilers (#1994)
 pub mod conv; // Conversion utilities (nextgcore-conv.h)
 pub mod distributed_timer;
 pub mod errno; // Error codes (nextgcore-errno.h)

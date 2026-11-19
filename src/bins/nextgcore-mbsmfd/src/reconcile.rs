@@ -85,37 +85,9 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
 /// The longest a failing peer is left alone between attempts.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 
-type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
-
-/// Per peer: when it may next be tried, and the current backoff.
-fn backoff() -> &'static Mutex<Backoff> {
-    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
-        std::sync::LazyLock::new(Default::default);
-    &BACKOFF
-}
-
-fn backing_off(peer: &str) -> bool {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(peer)
-        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
-}
-
-fn note_failure(peer: &str) {
-    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    let wait = map
-        .get(peer)
-        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
-    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
-}
-
-fn note_success(peer: &str) {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(peer);
-}
+/// Per peer: its backoff (#1994: the shared one), guarded like the parked set.
+static BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(BACKOFF_BASE, BACKOFF_MAX);
 
 /// The peer a record's ContextDelete goes to: its AMF.
 fn peer_of(c: &AmfMbsContext) -> String {
@@ -138,20 +110,6 @@ pub fn park(contexts: Vec<AmfMbsContext>) {
         if set.iter().any(|p| p.ctx == c) {
             continue;
         }
-        if set.len() >= MAX_PENDING {
-            if let Some(Parked { ctx: old, .. }) = set.pop_front() {
-                log::error!(
-                    "MBS: abandoning the ContextDelete of AMF {}:{} MBS context {}: {} \
-                     deletes are already pending",
-                    old.host,
-                    old.port,
-                    old.context_ref,
-                    MAX_PENDING
-                );
-                RECONCILED.inc(&["abandoned"]);
-                abandoned.push(old);
-            }
-        }
         log::warn!(
             "MBS: AMF {}:{} MBS context {} is parked; its ContextDelete is retried every {:?}",
             c.host,
@@ -163,6 +121,7 @@ pub fn park(contexts: Vec<AmfMbsContext>) {
             ctx: c,
             since: std::time::SystemTime::now(),
         });
+        abandoned.extend(evict(&mut set));
     }
     drop(set);
     forget_abandoned(&abandoned);
@@ -199,6 +158,36 @@ fn forget_abandoned(abandoned: &[AmfMbsContext]) {
 /// [`PENDING_TEST_LOCK`].
 #[cfg(test)]
 pub static BEFORE_FORGET_SEAM: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+/// Evict down to [`MAX_PENDING`], the oldest by park time first, wherever
+/// rotation has put it (#1994: it popped the front, which rotation makes the
+/// next to be tried, not the oldest). Returns the evicted contexts, whose
+/// notify tokens the caller forgets with the set unlocked (#1985).
+fn evict(set: &mut VecDeque<Parked>) -> Vec<AmfMbsContext> {
+    let mut abandoned = Vec::new();
+    for Parked { ctx: old, .. } in
+        nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
+    {
+        log::error!(
+            "MBS: abandoning the ContextDelete of AMF {}:{} MBS context {}: {} \
+             deletes are already pending",
+            old.host,
+            old.port,
+            old.context_ref,
+            MAX_PENDING
+        );
+        RECONCILED.inc(&["abandoned"]);
+        abandoned.push(old);
+    }
+    abandoned
+}
+
+/// #1994: forget the backoff of an AMF with nothing left parked, so one that
+/// never comes back does not stay in the map for good.
+fn prune_backoff(set: &VecDeque<Parked>) {
+    let live: std::collections::HashSet<String> = set.iter().map(|p| peer_of(&p.ctx)).collect();
+    BACKOFF.retain(|peer| live.contains(peer));
+}
 
 /// How many ContextDeletes are parked: the
 /// `nextgcore_mbsmf_amf_context_deletes_pending` gauge.
@@ -284,7 +273,7 @@ pub async fn reconcile_once() -> usize {
             continue;
         }
         let peer = peer_of(&p.ctx);
-        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
             pass.untried.push(p);
             continue;
         }
@@ -298,7 +287,7 @@ pub async fn reconcile_once() -> usize {
                 RECONCILED.inc(&["reused"]);
             }
             Some(outcome @ (ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone)) => {
-                note_success(&peer);
+                BACKOFF.note_success(&peer);
                 log::info!(
                     "MBS: reconciler released AMF {}:{} MBS context {}",
                     c.host,
@@ -312,7 +301,7 @@ pub async fn reconcile_once() -> usize {
                 ended += 1;
             }
             Some(ContextDeleteOutcome::Failed) => {
-                note_failure(&peer);
+                BACKOFF.note_failure(&peer);
                 pass.failed.extend(p);
             }
         }
@@ -358,21 +347,13 @@ impl Drop for Repark {
                         set.push_back(p);
                     }
                 }
-                while set.len() > MAX_PENDING {
-                    if let Some(Parked { ctx: old, .. }) = set.pop_front() {
-                        log::error!(
-                            "MBS: abandoning the ContextDelete of AMF {}:{} MBS context {}: {} \
-                             deletes are already pending",
-                            old.host,
-                            old.port,
-                            old.context_ref,
-                            MAX_PENDING
-                        );
-                        RECONCILED.inc(&["abandoned"]);
-                        gone.push(old);
-                    }
-                }
+                gone.extend(evict(&mut set));
             }
+        }
+        // #1994: whether the pass ended or was cancelled, a peer with nothing
+        // left parked loses its backoff.
+        if let Ok(set) = pending().lock() {
+            prune_backoff(&set);
         }
         forget_abandoned(&gone);
     }
@@ -414,7 +395,7 @@ pub fn clear_for_test() {
     if let Ok(mut set) = pending().lock() {
         set.clear();
     }
-    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    BACKOFF.clear();
 }
 
 /// Make every parked record look parked `by` earlier (#1961 / #1985 tests of
@@ -469,6 +450,60 @@ mod tests {
             "the oldest (ref 0) was the one evicted"
         );
         clear_for_test();
+    }
+
+    /// #1994: eviction takes the oldest wherever rotation has put it. A failed
+    /// ContextDelete goes to the back, so the front is the next to be tried, not
+    /// the oldest.
+    ///
+    /// REVERT-VERIFIED: with `evict` popping the front, as before, this fails:
+    /// the younger front entry is evicted and the oldest kept.
+    #[tokio::test]
+    async fn eviction_takes_the_oldest_after_rotation_1994() {
+        let _g = PENDING_TEST_LOCK.lock().await;
+        clear_for_test();
+        park((0..MAX_PENDING).map(ctx).collect());
+        // A pass tried the oldest and it failed: it is at the back now.
+        {
+            let mut set = pending().lock().unwrap();
+            let oldest = set.pop_front().expect("parked");
+            set.push_back(oldest);
+        }
+        park(vec![ctx(MAX_PENDING)]);
+        let held: Vec<String> = pending()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.ctx.context_ref.clone())
+            .collect();
+        clear_for_test();
+
+        assert_eq!(held.len(), MAX_PENDING);
+        assert!(!held.contains(&"0".to_string()), "the oldest went");
+        assert!(held.contains(&"1".to_string()), "not the front");
+    }
+
+    /// #1994: a pass forgets the backoff of an AMF with nothing parked, and keeps
+    /// that of one still holding parked ContextDeletes.
+    ///
+    /// REVERT-VERIFIED: with `prune_backoff` a no-op, this fails: the AMF with
+    /// nothing parked keeps its backoff.
+    #[tokio::test]
+    async fn an_amf_with_nothing_parked_is_pruned_1994() {
+        let _g = PENDING_TEST_LOCK.lock().await;
+        clear_for_test();
+        let gone = "127.0.0.1:19941";
+        let kept = peer_of(&ctx(1994));
+        BACKOFF.note_failure(gone);
+        BACKOFF.note_failure(&kept);
+        // Backing off, so not contacted: it stays parked.
+        park(vec![ctx(1994)]);
+        reconcile_once().await;
+        let after = (BACKOFF.current(gone), BACKOFF.current(&kept));
+        clear_for_test();
+
+        assert_eq!(after.0, None, "nothing parked: pruned");
+        assert_eq!(after.1, Some(BACKOFF_BASE), "still parked: kept");
     }
 
     /// #1961: a peer that accepts the connection and never answers, so each
