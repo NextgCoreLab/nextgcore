@@ -546,6 +546,15 @@ pub struct SbiRequest {
     /// never "any type". It may be non-empty when the certificate has NFTypes but
     /// no URI SAN.
     pub peer_cert_nf_types: Vec<String>,
+    /// #1990: the peer presented a client certificate this process **verified**,
+    /// with or without a URI SAN or NFTypes. `false` for plaintext, TLS without
+    /// client authentication, and programmatic requests.
+    ///
+    /// A producer that trusts a forwarded-certificate header from a declared
+    /// terminator must not trust it from a client that authenticated directly:
+    /// that client is the peer, and a certificate of its own that names no NF
+    /// instance is not an invitation to assert one in a header.
+    pub peer_cert_present: bool,
     /// `sub` of the OAuth2 access token this process **verified** — the NF
     /// Instance ID of the service consumer (TS 33.501 §13.4.1.2, TS 29.510
     /// §5.4.2.2.2 `AccessTokenClaims.sub`).
