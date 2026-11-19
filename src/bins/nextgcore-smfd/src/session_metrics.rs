@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 static SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static FAILURES: AtomicU64 = AtomicU64::new(0);
+/// #1874: establishments whose caller went away before they were answered.
+static ABANDONED: AtomicU64 = AtomicU64::new(0);
+/// #1874: of those, the ones that had established a session, released for it.
+static ABANDONED_RELEASED: AtomicU64 = AtomicU64::new(0);
 /// Failures by 5GSM cause; slot 256 is "no N1 reject".
 static FAILURE_CAUSES: [AtomicU64; 257] = [const { AtomicU64::new(0) }; 257];
 
@@ -64,6 +68,16 @@ pub fn observe_establishment(response: &SbiResponse) {
     FAILURE_CAUSES[slot].fetch_add(1, Ordering::Relaxed);
 }
 
+/// #1874: an establishment dropped by its caller before it was answered.
+pub fn observe_abandoned() {
+    ABANDONED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// #1874: an abandoned establishment that had established its session, released.
+pub fn observe_abandoned_release() {
+    ABANDONED_RELEASED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Render the session establishment families.
 pub fn render(out: &mut String) {
     let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
@@ -87,6 +101,20 @@ pub fn render(out: &mut String) {
         "counter",
         "PDU session establishments refused (SM.PduSessionCreationFail)",
         get(&FAILURES),
+    );
+    write_metric(
+        out,
+        "smf_session_abandoned_total",
+        "counter",
+        "PDU session establishments whose caller went away before they were answered (#1874); each still runs to completion or to its rollback",
+        get(&ABANDONED),
+    );
+    write_metric(
+        out,
+        "smf_session_abandoned_released_total",
+        "counter",
+        "Abandoned establishments that had established their session, released because the AMF never received its smContextRef (#1874)",
+        get(&ABANDONED_RELEASED),
     );
     write_header(
         out,
