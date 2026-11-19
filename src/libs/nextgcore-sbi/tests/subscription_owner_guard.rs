@@ -39,14 +39,6 @@ const EXEMPT: &[(&str, &str)] = &[
         "nextgcore-ucmfd",
         "#1862: per-resource ownership in progress; moves onto owner_binding",
     ),
-    (
-        "nextgcore-dccfd",
-        "#1909: subscription ownership filed separately (not in #1865's list)",
-    ),
-    (
-        "nextgcore-nssfd",
-        "#1909: subscription ownership filed separately (not in #1865's list)",
-    ),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -164,6 +156,8 @@ fn every_nf_serving_subscriptions_binds_them_to_their_creator() {
         "nextgcore-mbsmfd",
         "nextgcore-nsacfd",
         "nextgcore-eesd",
+        "nextgcore-dccfd",
+        "nextgcore-nssfd",
     ] {
         assert!(
             serving.iter().any(|s| s == expected),
