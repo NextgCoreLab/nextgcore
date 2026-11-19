@@ -443,8 +443,8 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}"),
         },
         // PIND-09: per-element liveness keep-alive (TS 23.542 §8.8).
-        ["pinapp", "v1", "pins", _pin_id, "elements", element_id, "heartbeat"] => match method {
-            "PUT" => handle_element_heartbeat(element_id).await,
+        ["pinapp", "v1", "pins", pin_id, "elements", element_id, "heartbeat"] => match method {
+            "PUT" => handle_element_heartbeat(pin_id, element_id, &request).await,
             _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}/heartbeat"),
         },
         // PIN Element Relay (PIN-7)
@@ -856,10 +856,18 @@ async fn handle_element_get(element_id: &str) -> SbiResponse {
 /// PIND-09: handle a per-element keep-alive (PUT
 /// `.../elements/{id}/heartbeat`). Resets the element's liveness deadline so
 /// the background reaper does not deregister it.
-async fn handle_element_heartbeat(element_id: &str) -> SbiResponse {
+/// PIND-09 keep-alive. #1873: honours `{pinId}` and the caller (the element
+/// itself, or the PIN owner / a PEMC), so a stale or foreign PINE cannot keep
+/// another owner's element alive.
+async fn handle_element_heartbeat(
+    pin_id: &str,
+    element_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let caller = caller_supi(request);
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
-        context.element_heartbeat(element_id)
+        context.element_heartbeat(pin_id, element_id, caller.as_deref())
     } else {
         Err(PinContextError::NotFound)
     };
@@ -871,6 +879,10 @@ async fn handle_element_heartbeat(element_id: &str) -> SbiResponse {
                 "result": "HEARTBEAT_ACK",
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(PinContextError::PemcRequiresOwner) => send_pin_forbidden(
+            &PinContextError::PemcRequiresOwner,
+            "urn:nextgcore:pin:heartbeat-authorization-failed",
+        ),
         Err(_) => send_not_found(
             &format!("Element {element_id} not found"),
             Some("ELEMENT_NOT_FOUND"),
@@ -927,7 +939,8 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
 
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
-        context.element_set_relay(element_id, relay_path)
+        // #1873: authorized against the caller before anything changes.
+        context.element_set_relay(element_id, relay_path, caller_supi(request).as_deref())
     } else {
         Err(PinContextError::NotFound)
     };
@@ -942,6 +955,11 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
         ),
         Err(PinContextError::RelayOnlyForPegc) => send_pin_forbidden(
             &PinContextError::RelayOnlyForPegc,
+            "urn:nextgcore:pin:relay-authorization-failed",
+        ),
+        // #1873: the caller is neither the PEGC nor the PIN's owner/PEMC.
+        Err(PinContextError::PemcRequiresOwner) => send_pin_forbidden(
+            &PinContextError::PemcRequiresOwner,
             "urn:nextgcore:pin:relay-authorization-failed",
         ),
         Err(_) => {
@@ -1499,26 +1517,46 @@ mod tests {
         let _g = lock_globals();
         pin_context_init(1024, 86_400, 30);
         OAUTH2_ENABLED.store(false, Ordering::Relaxed);
-        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
 
-        let elem_id = {
+        let (pin_id, elem_id) = {
             let ctx = pin_self();
             let guard = ctx.read().expect("ctx read");
             let pin = guard.pin_create("Home", "imsi-hb-owner").expect("seed pin");
-            guard
+            let elem = guard
                 .element_register(
                     &pin.pin_id,
                     PinElementRegistration::new(PinElementType::Element, "10.0.0.8", 8800),
                     None,
                 )
                 .expect("seed element")
-                .element_id
+                .element_id;
+            (pin.pin_id, elem)
+        };
+        let heartbeat = |pin: &str, elem: &str, caller: Option<&str>| {
+            let mut r = SbiRequest::put(format!("/pinapp/v1/pins/{pin}/elements/{elem}/heartbeat"));
+            if let Some(c) = caller {
+                r = r.with_header("x-caller-supi", c);
+            }
+            block_on(pin_sbi_request_handler(r)).status
         };
 
-        let ok = block_on(handle_element_heartbeat(&elem_id));
-        assert_eq!(ok.status, 200, "heartbeat on a known element acks");
-
-        let missing = block_on(handle_element_heartbeat("pe-absent-999"));
-        assert_eq!(missing.status, 404, "heartbeat on unknown element is 404");
+        assert_eq!(
+            heartbeat(&pin_id, &elem_id, Some("imsi-hb-owner")),
+            200,
+            "the owner's heartbeat on a known element acks"
+        );
+        assert_eq!(
+            heartbeat(&pin_id, "pe-absent-999", Some("imsi-hb-owner")),
+            404
+        );
+        // #1873: the caller and the {pinId} segment are honoured.
+        assert_eq!(heartbeat(&pin_id, &elem_id, Some("imsi-hb-stranger")), 403);
+        assert_eq!(heartbeat(&pin_id, &elem_id, None), 403);
+        assert_eq!(
+            heartbeat("pin-elsewhere", &elem_id, Some("imsi-hb-owner")),
+            404
+        );
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
     }
 }
