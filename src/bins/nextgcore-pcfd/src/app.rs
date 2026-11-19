@@ -1758,6 +1758,58 @@ pub async fn handle_am_policy_delete(pol_asso_id: &str, request: &SbiRequest) ->
     }
 }
 
+/// #1992 (R32 on #1988): the caller check for an AM/UE policy association
+/// update, admitting AMF relocation (TS 29.507 §4.2.3.2, TS 29.525 §4.2.3.2):
+/// "the new AMF shall also invoke this procedure to update the Notification URI
+/// and the GUAMI" (AM; the UE policy update needs the Notification URI only).
+///
+/// `Ok(None)`: the caller is the owner. `Ok(Some(new))`: a relocation, and
+/// `new` (the caller's verified NF Instance ID) becomes the owner. It is
+/// admitted only when the body carries the relocation members, the caller
+/// proved an identity, and its certificate is AMF-typed (no NFTypes, AMF, or a
+/// relay whose token named the consumer), as smfd's #1899 AMF change. `Err` is
+/// the 403 to send; nothing has changed yet.
+///
+/// Residual: any verified AMF can relocate an association. TS 29.507 gives the
+/// PCF no way to check the GUAMI against the caller, so nothing narrower is
+/// possible here.
+fn owner_or_amf_relocation(
+    owner: Option<&str>,
+    request: &SbiRequest,
+    body: &serde_json::Value,
+    needs_guami: bool,
+    operation: &str,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(owner, request, operation)
+    else {
+        return Ok(None);
+    };
+    let refused = Box::new(refused);
+    let relocating = body
+        .get("notificationUri")
+        .and_then(|v| v.as_str())
+        .is_some()
+        && (!needs_guami || body.get("guami").is_some_and(|g| g.is_object()));
+    let caller = match nextgcore_sbi::owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        _ => return Err(refused),
+    };
+    let types = &request.peer_cert_nf_types;
+    let amf_typed = types.is_empty()
+        || types.iter().any(|t| {
+            t.eq_ignore_ascii_case("AMF")
+                || nextgcore_sbi::owner_binding::RELAY_NF_TYPES
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(t))
+        });
+    if relocating && amf_typed {
+        log::info!("{operation}: AMF relocation, the association now belongs to {caller}");
+        Ok(Some(caller))
+    } else {
+        Err(refused)
+    }
+}
+
 pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("AM Policy Update: {pol_asso_id}");
 
@@ -1785,13 +1837,17 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         );
     };
     // #1937: only the NF that created it, before anything is read or changed.
-    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+    // #1992: or a new AMF relocating it (TS 29.507 §4.2.3.2).
+    let relocated_to = match owner_or_amf_relocation(
         ue_am.owner.as_deref(),
         request,
+        &update_data,
+        true,
         "Npcf_AMPolicyControl_Update",
     ) {
-        return refused;
-    }
+        Ok(new) => new,
+        Err(refused) => return *refused,
+    };
 
     // TS 29.507 §4.2.3.1: apply the PolicyAssociationUpdateRequest, then
     // re-evaluate. Before #89 the body was deserialised into `_update_data` and
@@ -1799,6 +1855,9 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // GUAMI or ask for different triggers and the PCF would keep using the old
     // ones while answering 200.
     let mut updated = ue_am.clone();
+    if let Some(new) = relocated_to {
+        updated.owner = Some(new);
+    }
     let mut changed = Vec::new();
 
     if let Some(uri) = update_data.get("notificationUri").and_then(|v| v.as_str()) {
@@ -2820,13 +2879,20 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         );
     };
     // #1937: only the NF that created it, before anything is read or changed.
-    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+    // #1992: or a new AMF relocating it (TS 29.525 §4.2.3.2: the Notification
+    // URI only).
+    // The new owner is recorded once the update is applied, so a request
+    // refused below changes nothing.
+    let relocated_to = match owner_or_amf_relocation(
         existing.owner.as_deref(),
         request,
+        &data,
+        false,
         "Npcf_UEPolicyControl_Update",
     ) {
-        return refused;
-    }
+        Ok(new) => new,
+        Err(refused) => return *refused,
+    };
     let supi = existing.supi.clone();
 
     // `notificationUri` (§5.6.2.4): where subsequent notifications go. Applied first
@@ -2933,6 +2999,9 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // unconditionally rather than only on a "significant" change: §4.2.4 does not
     // define significance, and a consumer that can be told less than every update is
     // a consumer that has to poll.
+    if let Some(new) = relocated_to {
+        ue_policy::ue_policy_set_owner(pol_asso_id, Some(new));
+    }
     let notified = sbi_path::pcf_send_ue_policy_update_notify(pol_asso_id);
     if !notified {
         log::warn!(
@@ -12653,6 +12722,151 @@ mod tests {
             "notifId": notif_id,
             "eventSubs": events,
         })
+    }
+
+    /// #1992 (R32 on #1988): a new AMF relocating an AM policy association
+    /// (TS 29.507 §4.2.3.2: an update carrying the Notification URI and the
+    /// GUAMI) takes it over, and the old AMF is then refused; a caller that is
+    /// not AMF-typed, one without `guami`, and an anonymous one get 403 and
+    /// change nothing. A UE policy association relocates with the Notification
+    /// URI alone (TS 29.525 §4.2.3.2).
+    /// REVERT-VERIFIED: with `owner_or_amf_relocation` refusing every
+    /// non-owner, the new AMF's update answers 403; with the `amf_typed` test
+    /// dropped, the SMF-typed caller takes it over; with the guami requirement
+    /// dropped, the guami-less update takes it over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_new_amf_relocating_an_association_takes_it_over_1992() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        const NEW_AMF: &str = "aaaaaaaa-1992-4000-8000-0000000000a2";
+        let location_of = |resp: &SbiResponse| {
+            let loc = resp
+                .http
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                .map(|(_, v)| v.clone())
+                .expect("Location");
+            loc.find("/npcf-")
+                .map(|i| loc[i..].to_string())
+                .expect("a PCF path")
+        };
+        let as_caller = |mut r: SbiRequest, token: Option<&str>, types: &[&str]| {
+            r.oauth2_subject = token.map(str::to_string);
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let relocation = serde_json::json!({
+            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/new-1992",
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "020041" },
+        });
+        // The AM policy is created by TEST_CONSUMER_1865 (the old AMF).
+        let am = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000001992",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/old-1992",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(am.status, 201, "{:?}", am.http.content);
+        let am_path = location_of(&am);
+        let update = format!("{am_path}/update");
+        let owner_of_am = || {
+            let id = am_path.rsplit('/').next().unwrap().to_string();
+            pcf_self()
+                .read()
+                .unwrap()
+                .ue_am_find_by_association_id(&id)
+                .and_then(|a| a.owner)
+        };
+        let mut no_guami = relocation.clone();
+        no_guami.as_object_mut().unwrap().remove("guami");
+        for (who, req) in [
+            (
+                "not AMF-typed",
+                as_caller(
+                    make_request("POST", &update, Some(relocation.clone())),
+                    Some(NEW_AMF),
+                    &["SMF"],
+                ),
+            ),
+            (
+                "no guami",
+                as_caller(
+                    make_request("POST", &update, Some(no_guami)),
+                    Some(NEW_AMF),
+                    &["AMF"],
+                ),
+            ),
+            (
+                "anonymous",
+                as_caller(
+                    make_request("POST", &update, Some(relocation.clone())),
+                    None,
+                    &[],
+                ),
+            ),
+        ] {
+            let resp = pcf_sbi_request_handler(req).await;
+            assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
+            assert_eq!(owner_of_am().as_deref(), Some(TEST_CONSUMER_1865), "{who}");
+        }
+        // The new AMF relocates it, and owns it.
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &update, Some(relocation.clone())),
+            Some(NEW_AMF),
+            &["AMF"],
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(owner_of_am().as_deref(), Some(NEW_AMF));
+        // The old AMF is now refused.
+        let resp = pcf_sbi_request_handler(make_request("GET", &am_path, None)).await;
+        assert_eq!(resp.status, 403, "the old AMF no longer owns it");
+
+        // A UE policy association relocates with the Notification URI alone.
+        let ue = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/old-1992",
+                "supi": "imsi-001010000011992",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(ue.status, 201, "{:?}", ue.http.content);
+        let ue_path = location_of(&ue);
+        let ue_id = ue_path.rsplit('/').next().unwrap().to_string();
+        let ue_reloc = serde_json::json!({
+            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/new-1992"
+        });
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &format!("{ue_path}/update"), Some(ue_reloc.clone())),
+            Some(NEW_AMF),
+            &["SMF"],
+        ))
+        .await;
+        assert_eq!(resp.status, 403, "UE: not AMF-typed");
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &format!("{ue_path}/update"), Some(ue_reloc)),
+            Some(NEW_AMF),
+            &[],
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(
+            ue_policy::ue_policy_find(&ue_id)
+                .and_then(|a| a.owner)
+                .as_deref(),
+            Some(NEW_AMF)
+        );
     }
 
     /// #1937: AM, UE and SM policy associations and AF app sessions (and an
