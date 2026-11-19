@@ -59,8 +59,8 @@ pub mod nf_addressing; // the NF host in ipv4Addresses / ipv6Addresses / fqdn by
 pub mod nf_instance_id; // This NF's own pinnable nfInstanceId (issue #187)
 pub mod nrf_tls; // how this NF dials its NRF: https + client certificate (#1617)
 pub mod oauth;
-pub mod owner_binding; // a resource is managed by the consumer that created it (#1865)
 pub mod overload;
+pub mod owner_binding; // a resource is managed by the consumer that created it (#1865)
 pub mod peer_cert; // NF identity from a verified TLS peer certificate (issue #186)
 #[cfg(feature = "6g-extensions")]
 pub mod pubsub;

@@ -39,6 +39,16 @@
 //!   delete it. It keeps working until it lapses or the NF drops it, and its
 //!   consumer re-creates it, this time bound (the rule nrfd #1809 settled on).
 //!
+//! An NF that persists resources across a restart restores pre-binding ones
+//! ownerless, so under production they are frozen; one whose resources carry a
+//! lifetime must cap the restored lifetime (nrfd caps at 24 h, #1831), or a
+//! frozen resource nobody may remove can outlive the upgrade indefinitely.
+//!
+//! This module reproduces the API of the per-NF copies written for #1860,
+//! #1861 and #1862 (same names and signatures), so those move onto it by
+//! replacing the copy with `use nextgcore_sbi::owner_binding;`; the one rule
+//! they then gain is the production freeze above.
+//!
 //! # Use
 //!
 //! ```ignore
