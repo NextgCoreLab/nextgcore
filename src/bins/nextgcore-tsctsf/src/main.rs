@@ -56,6 +56,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_sbi::context::SbiContext;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{
     send_bad_request, send_error, send_internal_error, send_method_not_allowed, send_not_found,
     SbiServer, SbiServerConfig,
@@ -504,8 +505,8 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["ntsctsf-time-synchronization", "v1", "subscriptions", subscription_id] => match method {
-            "GET" => handle_caps_subscription_get(subscription_id).await,
-            "DELETE" => handle_caps_unsubscribe(subscription_id).await,
+            "GET" => handle_caps_subscription_get(subscription_id, &request).await,
+            "DELETE" => handle_caps_unsubscribe(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
 
@@ -537,8 +538,8 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["ntsctsf-qos-tsctsf", "v1", "subscriptions", subscription_id] => match method {
-            "GET" => handle_qos_tsc_subscription_get(subscription_id).await,
-            "DELETE" => handle_qos_tsc_unsubscribe(subscription_id).await,
+            "GET" => handle_qos_tsc_subscription_get(subscription_id, &request).await,
+            "DELETE" => handle_qos_tsc_unsubscribe(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
 
@@ -830,10 +831,17 @@ async fn handle_config_delete(config_id: &str) -> SbiResponse {
 /// POST /ntsctsf-time-synchronization/v1/subscriptions — CapsSubscribe
 /// (§5.2.27.2.6). 201 + Location + the minted Subscription Correlation ID.
 async fn handle_caps_subscribe(request: &SbiRequest) -> SbiResponse {
-    let (data, sub) = match parse_typed_body::<context::CapsSubscription>(request) {
+    // #1865: bound to the verified identity of its creator, checked before the
+    // body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    let (data, mut sub) = match parse_typed_body::<context::CapsSubscription>(request) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
+    sub.owner = owner;
     if let Err(err) = sub.validate() {
         return send_bad_request(&err.detail(), Some(err.cause()));
     }
@@ -874,16 +882,24 @@ async fn handle_caps_subscribe(request: &SbiRequest) -> SbiResponse {
 }
 
 /// GET /ntsctsf-time-synchronization/v1/subscriptions/{subscriptionId} — 200/404.
-async fn handle_caps_subscription_get(subscription_id: &str) -> SbiResponse {
+async fn handle_caps_subscription_get(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = tsctsf_self();
     let sub = match ctx.read() {
         Ok(c) => c.caps_sub_find(subscription_id),
         Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
     };
     match sub {
-        Some(sub) => SbiResponse::with_status(200)
-            .with_json_body(&sub)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        // #1865: read by the consumer that subscribed only.
+        Some(sub) => {
+            if let Some(refused) =
+                owner_binding::refuse_non_owner(sub.owner.as_deref(), request, "Get")
+            {
+                return refused;
+            }
+            SbiResponse::with_status(200)
+                .with_json_body(&sub)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
         None => send_not_found(
             &format!("Subscription {subscription_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
@@ -892,9 +908,21 @@ async fn handle_caps_subscription_get(subscription_id: &str) -> SbiResponse {
 }
 
 /// DELETE /ntsctsf-time-synchronization/v1/subscriptions/{subscriptionId} —
-/// CapsUnsubscribe (§5.2.27.2.7). 204/404.
-async fn handle_caps_unsubscribe(subscription_id: &str) -> SbiResponse {
+/// CapsUnsubscribe (§5.2.27.2.7). 204/404/403: only the consumer that
+/// subscribed may unsubscribe (#1865), checked before anything is removed.
+async fn handle_caps_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = tsctsf_self();
+    let existing = match ctx.read() {
+        Ok(c) => c.caps_sub_find(subscription_id),
+        Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
+    };
+    if let Some(existing) = existing {
+        if let Some(refused) =
+            owner_binding::refuse_non_owner(existing.owner.as_deref(), request, "CapsUnsubscribe")
+        {
+            return refused;
+        }
+    }
     let removed = match ctx.read() {
         Ok(c) => c.caps_sub_remove(subscription_id),
         Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
@@ -1241,10 +1269,17 @@ async fn report_capability_change() {
 
 /// POST /ntsctsf-qos-tsctsf/v1/subscriptions — Subscribe (§5.2.27.3).
 async fn handle_qos_tsc_subscribe(request: &SbiRequest) -> SbiResponse {
-    let (data, sub) = match parse_typed_body::<context::QosTscSubscription>(request) {
+    // #1865: bound to the verified identity of its creator, checked before the
+    // body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    let (data, mut sub) = match parse_typed_body::<context::QosTscSubscription>(request) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
+    sub.owner = owner;
     if let Err(err) = sub.validate() {
         return send_bad_request(&err.detail(), Some(err.cause()));
     }
@@ -1281,16 +1316,27 @@ async fn handle_qos_tsc_subscribe(request: &SbiRequest) -> SbiResponse {
 }
 
 /// GET /ntsctsf-qos-tsctsf/v1/subscriptions/{subscriptionId} — 200/404.
-async fn handle_qos_tsc_subscription_get(subscription_id: &str) -> SbiResponse {
+async fn handle_qos_tsc_subscription_get(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     let ctx = tsctsf_self();
     let sub = match ctx.read() {
         Ok(c) => c.qos_tsc_sub_find(subscription_id),
         Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
     };
     match sub {
-        Some(s) => SbiResponse::with_status(200)
-            .with_json_body(&s)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        // #1865: read by the consumer that subscribed only.
+        Some(s) => {
+            if let Some(refused) =
+                owner_binding::refuse_non_owner(s.owner.as_deref(), request, "Get")
+            {
+                return refused;
+            }
+            SbiResponse::with_status(200)
+                .with_json_body(&s)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
         None => send_not_found(
             &format!("Subscription {subscription_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
@@ -1299,9 +1345,21 @@ async fn handle_qos_tsc_subscription_get(subscription_id: &str) -> SbiResponse {
 }
 
 /// DELETE /ntsctsf-qos-tsctsf/v1/subscriptions/{subscriptionId} — Unsubscribe
-/// (§5.2.27.3). 204/404.
-async fn handle_qos_tsc_unsubscribe(subscription_id: &str) -> SbiResponse {
+/// (§5.2.27.3). 204/404/403: only the consumer that subscribed may
+/// unsubscribe (#1865), checked before anything is removed.
+async fn handle_qos_tsc_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = tsctsf_self();
+    let existing = match ctx.read() {
+        Ok(c) => c.qos_tsc_sub_find(subscription_id),
+        Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
+    };
+    if let Some(existing) = existing {
+        if let Some(refused) =
+            owner_binding::refuse_non_owner(existing.owner.as_deref(), request, "Unsubscribe")
+        {
+            return refused;
+        }
+    }
     let removed = match ctx.read() {
         Ok(c) => c.qos_tsc_sub_remove(subscription_id),
         Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
@@ -1683,6 +1741,127 @@ mod tests {
         crate::context::PROCESS_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    // #1865: these tests act as ONE verified consumer. Under the default
+    // (production) SBI profile an anonymous create is refused, and whether a
+    // sibling has already set the `dev` override depends on test order. So this
+    // wrapper shadows the glob-imported router and gives a request with no
+    // identity the verified token of [`TEST_CONSUMER_1865`]; the #1865 tests call
+    // `super::tsctsf_sbi_request_handler` directly.
+    const TEST_CONSUMER_1865: &str = "cccccccc-1865-4000-8000-00000000000c";
+
+    async fn tsctsf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
+        if request.oauth2_subject.is_none() && request.peer_cert_nf_instance_id.is_none() {
+            request.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+        }
+        super::tsctsf_sbi_request_handler(request).await
+    }
+
+    const OWNER_1865: &str = "aaaaaaaa-1865-4000-8000-00000000000a";
+    const OTHER_1865: &str = "bbbbbbbb-1865-4000-8000-00000000000b";
+
+    fn owned_1865(mut request: SbiRequest) -> SbiRequest {
+        request.oauth2_subject = Some(OWNER_1865.to_string());
+        request
+    }
+
+    /// Every caller that is not [`OWNER_1865`], each labelled.
+    fn strangers_1865(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
+        let mut foreign_cert = request();
+        foreign_cert.peer_cert_nf_instance_id = Some(OTHER_1865.to_string());
+        let mut foreign_token = request();
+        foreign_token.oauth2_subject = Some(OTHER_1865.to_string());
+        let mut mismatch = request();
+        mismatch.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        mismatch.oauth2_subject = Some(OTHER_1865.to_string());
+        vec![
+            ("foreign certificate", foreign_cert),
+            ("foreign token", foreign_token),
+            ("anonymous", request()),
+            ("certificate/token mismatch", mismatch),
+        ]
+    }
+
+    /// #1865: a time-sync capability subscription and a QoS/TSC subscription
+    /// are each read and removed only by the consumer that created it; every
+    /// other caller gets 403 and the subscription stays; the owner then
+    /// succeeds; a create whose certificate and token disagree stores nothing.
+    /// Through the real router. REVERT-VERIFIED separately: the CapsUnsubscribe
+    /// check removed (a stranger's caps DELETE returns 204); the caps GET check
+    /// removed (200); the QoS Unsubscribe check removed (204); the QoS GET check
+    /// removed (200); the caps create binding removed (the mismatched create
+    /// returns 201); the QoS create binding removed (201).
+    #[test]
+    fn subscriptions_are_managed_by_their_creator_1865() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            for (collection, body) in [
+                (
+                    "/ntsctsf-time-synchronization/v1/subscriptions",
+                    serde_json::json!({
+                        "notificationTargetAddr": "http://af-1865/notify",
+                        "afServiceId": "af-svc-1865",
+                    }),
+                ),
+                (
+                    "/ntsctsf-qos-tsctsf/v1/subscriptions",
+                    serde_json::json!({
+                        "notificationTargetAddr": "http://af-1865/notify",
+                        "events": ["QOS_NOT_GUARANTEED"],
+                    }),
+                ),
+            ] {
+                let created =
+                    super::tsctsf_sbi_request_handler(owned_1865(post(collection, body.clone())))
+                        .await;
+                assert_eq!(created.status, 201, "{collection}");
+                let created: serde_json::Value =
+                    serde_json::from_str(created.http.content.as_deref().unwrap()).unwrap();
+                let id = created["subscriptionId"].as_str().unwrap().to_string();
+                assert!(
+                    created.get("owner").is_none(),
+                    "the owner never reaches the wire: {created}"
+                );
+                let uri = format!("{collection}/{id}");
+                for (who, req) in strangers_1865(|| SbiRequest::get(uri.clone())) {
+                    let resp = super::tsctsf_sbi_request_handler(req).await;
+                    assert_eq!(resp.status, 403, "{who} GET {collection}");
+                }
+                for (who, req) in strangers_1865(|| SbiRequest::delete(uri.clone())) {
+                    let resp = super::tsctsf_sbi_request_handler(req).await;
+                    assert_eq!(resp.status, 403, "{who} DELETE {collection}");
+                }
+                let still =
+                    super::tsctsf_sbi_request_handler(owned_1865(SbiRequest::get(uri.clone())))
+                        .await;
+                assert_eq!(
+                    still.status, 200,
+                    "{collection}: still stored, owner reads it"
+                );
+                let mut by_cert = SbiRequest::delete(uri.clone());
+                by_cert.peer_cert_nf_instance_id = Some(OWNER_1865.to_uppercase());
+                assert_eq!(super::tsctsf_sbi_request_handler(by_cert).await.status, 204);
+                let gone =
+                    super::tsctsf_sbi_request_handler(owned_1865(SbiRequest::delete(uri.clone())))
+                        .await;
+                assert_eq!(gone.status, 404, "{collection}: removed");
+
+                let mut mixed = post(collection, body);
+                mixed.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+                mixed.oauth2_subject = Some(OTHER_1865.to_string());
+                assert_eq!(
+                    super::tsctsf_sbi_request_handler(mixed).await.status,
+                    403,
+                    "{collection}: a mismatched creator"
+                );
+            }
+            let ctx = tsctsf_self();
+            let ctx = ctx.read().unwrap();
+            assert_eq!(ctx.caps_sub_count(), 0, "no caps subscription stored");
+            assert_eq!(ctx.qos_tsc_sub_count(), 0, "no QoS subscription stored");
+        });
     }
 
     /// Reset the process-global context. Callers must hold [`lock_globals`].

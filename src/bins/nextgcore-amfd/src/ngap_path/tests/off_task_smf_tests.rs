@@ -2253,7 +2253,7 @@ async fn a_release_before_the_connected_report_reports_no_idle_1645() {
         supi: &str,
         port: u16,
     ) -> (crate::namf_server::EventSubscriptionGuard, String) {
-        let resp = crate::namf_server::namf_request_handler(
+        let resp = crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({ "subscription": {
                     "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT", "immediateFlag": true }],

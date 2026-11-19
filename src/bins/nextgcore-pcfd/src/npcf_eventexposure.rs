@@ -20,6 +20,7 @@
 
 use crate::context::{pcf_self, PcEventSubscription};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{send_bad_request, send_method_not_allowed_with_allow, send_not_found};
 
 /// URI prefix of the individual subscription resource, per the OpenAPI
@@ -180,6 +181,12 @@ fn parse_subsc(body: &str) -> Result<ParsedSubsc, Box<SbiResponse>> {
 /// `POST /npcf-eventexposure/v1/subscriptions` — create an Individual Policy
 /// Control Events Subscription. 201 with a `Location` header (TS 29.523 §4.2).
 pub async fn handle_create(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, decided before anything
+    // is parsed or stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "EventExposure Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = &request.http.content else {
         return send_bad_request("Missing request body", Some("MISSING_BODY"));
     };
@@ -200,6 +207,7 @@ pub async fn handle_create(request: &SbiRequest) -> SbiResponse {
         parsed.group_id,
         parsed.max_report_nbr,
         parsed.raw.clone(),
+        owner,
     ) else {
         return SbiResponse::with_status(500);
     };
@@ -222,13 +230,19 @@ pub async fn handle_create(request: &SbiRequest) -> SbiResponse {
         .with_header("Location", &location)
 }
 
-/// `GET /npcf-eventexposure/v1/subscriptions/{subscriptionId}`.
-pub async fn handle_get(sub_id: &str) -> SbiResponse {
+/// `GET /npcf-eventexposure/v1/subscriptions/{subscriptionId}`, by its owner
+/// only (#1865).
+pub async fn handle_get(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = pcf_self();
     let sub = ctx
         .read()
         .ok()
         .and_then(|c| c.event_sub_find_by_subscription_id(sub_id));
+    if let Some(refused) = sub.as_ref().and_then(|s| {
+        owner_binding::refuse_non_owner(s.owner.as_deref(), request, "EventExposure Get")
+    }) {
+        return refused;
+    }
     match sub {
         // Echoed verbatim: the resource is what the consumer sent, including
         // members this build does not interpret.
@@ -250,10 +264,6 @@ pub async fn handle_get(sub_id: &str) -> SbiResponse {
 /// subscription rather than starting a new one, so a consumer cannot reset its
 /// own `maxReportNbr` budget by re-PUTting the same document.
 pub async fn handle_update(sub_id: &str, request: &SbiRequest) -> SbiResponse {
-    let Some(body) = &request.http.content else {
-        return send_bad_request("Missing request body", Some("MISSING_BODY"));
-    };
-
     let ctx = pcf_self();
     let existing = ctx
         .read()
@@ -264,6 +274,16 @@ pub async fn handle_update(sub_id: &str, request: &SbiRequest) -> SbiResponse {
             &format!("Policy control events subscription {sub_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
+    };
+    // #1865: only the consumer that subscribed may replace it, checked before the
+    // body is read.
+    if let Some(refused) =
+        owner_binding::refuse_non_owner(existing.owner.as_deref(), request, "EventExposure Modify")
+    {
+        return refused;
+    }
+    let Some(body) = &request.http.content else {
+        return send_bad_request("Missing request body", Some("MISSING_BODY"));
     };
 
     let parsed = match parse_subsc(body) {
@@ -282,6 +302,8 @@ pub async fn handle_update(sub_id: &str, request: &SbiRequest) -> SbiResponse {
         max_report_nbr: parsed.max_report_nbr,
         report_count: existing.report_count,
         raw: parsed.raw.clone(),
+        // A replacement keeps its creator: a PUT is not a transfer.
+        owner: existing.owner.clone(),
     };
 
     let Ok(context) = ctx.read() else {
@@ -301,9 +323,19 @@ pub async fn handle_update(sub_id: &str, request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(500))
 }
 
-/// `DELETE /npcf-eventexposure/v1/subscriptions/{subscriptionId}` — 204.
-pub async fn handle_delete(sub_id: &str) -> SbiResponse {
+/// `DELETE /npcf-eventexposure/v1/subscriptions/{subscriptionId}` — 204, by the
+/// consumer that subscribed only (#1865): another gets 403 and it stays.
+pub async fn handle_delete(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = pcf_self();
+    let existing = ctx
+        .read()
+        .ok()
+        .and_then(|c| c.event_sub_find_by_subscription_id(sub_id));
+    if let Some(refused) = existing.and_then(|s| {
+        owner_binding::refuse_non_owner(s.owner.as_deref(), request, "EventExposure Unsubscribe")
+    }) {
+        return refused;
+    }
     let removed = ctx.read().ok().and_then(|c| c.event_sub_remove(sub_id));
     match removed {
         Some(sub) => {
@@ -330,9 +362,9 @@ pub async fn handle_delete(sub_id: &str) -> SbiResponse {
 pub async fn route(parts: &[&str], method: &str, uri: &str, request: &SbiRequest) -> SbiResponse {
     match (parts.get(2), parts.len(), method) {
         (Some(&"subscriptions"), 3, "POST") => handle_create(request).await,
-        (Some(&"subscriptions"), 4, "GET") => handle_get(parts[3]).await,
+        (Some(&"subscriptions"), 4, "GET") => handle_get(parts[3], request).await,
         (Some(&"subscriptions"), 4, "PUT") => handle_update(parts[3], request).await,
-        (Some(&"subscriptions"), 4, "DELETE") => handle_delete(parts[3]).await,
+        (Some(&"subscriptions"), 4, "DELETE") => handle_delete(parts[3], request).await,
         // A known resource reached with the wrong method answers 405 WITH an
         // Allow header, which is what #229 established for the Nudm surface;
         // anything else is a resource this service does not have.

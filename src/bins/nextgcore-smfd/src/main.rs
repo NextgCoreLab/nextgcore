@@ -54,7 +54,7 @@ mod n4_build;
 mod n4_handler;
 mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod n6_delay; // #1502: N6 delay measurement, provisioned over N4 association (TS 29.244 §5.33.8)
-mod owner_binding; // #1860: SM contexts bound to the verified serving AMF
+use nextgcore_sbi::owner_binding; // #1860, on the shared #1865 helper
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
@@ -3045,7 +3045,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // GET /nsmf-event-exposure/v1/subscriptions/{subId}
         ("nsmf-event-exposure", "subscriptions", "GET") => match resource_id {
-            Some(sub_id) => handle_event_subscription_get(sub_id).await,
+            Some(sub_id) => handle_event_subscription_read(sub_id, &request).await,
             None => send_bad_request("Missing subscription ID", None),
         },
 
@@ -3058,7 +3058,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // DELETE /nsmf-event-exposure/v1/subscriptions/{subId}
         ("nsmf-event-exposure", "subscriptions", "DELETE") => {
             if let Some(sub_id) = resource_id {
-                handle_event_unsubscribe(sub_id).await
+                handle_event_unsubscribe(sub_id, &request).await
             } else {
                 send_bad_request("Missing subscription ID", None)
             }
@@ -12450,6 +12450,15 @@ async fn handle_pdu_session_release(pdu_session_ref: &str) -> SbiResponse {
 /// schema in TS 29.508) and stored nothing, so the id it handed out referenced
 /// nothing and no notification could ever be sent to it.
 async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the consumer's verified identity, decided before anything
+    // is parsed or stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "EventExposure Subscribe",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = request
         .http
         .content
@@ -12463,7 +12472,7 @@ async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
     };
     let id = uuid::Uuid::new_v4().to_string();
     let sub = match event_exposure::parse_subscription(&body, id.clone()) {
-        Ok(sub) => sub,
+        Ok(sub) => event_exposure::EventSubscription { owner, ..sub },
         Err(e) => return send_bad_request(&e.detail(), Some(e.cause())),
     };
     log::info!(
@@ -12481,6 +12490,30 @@ async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
         .with_header("Location", event_exposure::resource_path(&id))
         .with_json_body(&document)
         .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+/// `GET /nsmf-event-exposure/v1/subscriptions/{subId}` by its owner only
+/// (#1865): another consumer gets 403 and learns nothing of the document.
+async fn handle_event_subscription_read(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    if let Some(refused) = event_subscription_refusal(subscription_id, request, "EventExposure Get")
+    {
+        return refused;
+    }
+    handle_event_subscription_get(subscription_id).await
+}
+
+/// #1865: `Some(403)` when the subscription exists and `request` is not the
+/// consumer that created it. Unknown ids fall through to the caller's 404.
+fn event_subscription_refusal(
+    subscription_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let sub = event_exposure::find(subscription_id)?;
+    nextgcore_sbi::owner_binding::refuse_non_owner(sub.owner.as_deref(), request, operation)
 }
 
 /// `GET /nsmf-event-exposure/v1/subscriptions/{subId}` (TS 29.508 §4.2.2.3), #79.
@@ -12509,6 +12542,18 @@ async fn handle_event_subscription_get(subscription_id: &str) -> SbiResponse {
 /// `PUT` to an unknown id is a `404`, not a create: the id space belongs to the
 /// SMF, so honouring a consumer-chosen one would let a consumer mint resources.
 async fn handle_event_subscription_put(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that subscribed may replace it, checked before the
+    // body is read.
+    let Some(existing) = event_exposure::find(subscription_id) else {
+        return event_subscription_not_found(subscription_id);
+    };
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "EventExposure Modify",
+    ) {
+        return refused;
+    }
     let Some(body) = request
         .http
         .content
@@ -12521,7 +12566,11 @@ async fn handle_event_subscription_put(subscription_id: &str, request: &SbiReque
         );
     };
     let sub = match event_exposure::parse_subscription(&body, subscription_id.to_string()) {
-        Ok(sub) => sub,
+        // The replacement keeps its creator: a PUT is not a transfer.
+        Ok(sub) => event_exposure::EventSubscription {
+            owner: existing.owner,
+            ..sub
+        },
         Err(e) => return send_bad_request(&e.detail(), Some(e.cause())),
     };
     let qos_mon_sub = sub.clone();
@@ -12543,7 +12592,14 @@ async fn handle_event_subscription_put(subscription_id: &str, request: &SbiReque
 /// consumer could not tell a successful unsubscribe from a subscription that had
 /// never existed — which matters, because the latter means its notifications were
 /// never going to arrive.
-async fn handle_event_unsubscribe(subscription_id: &str) -> SbiResponse {
+async fn handle_event_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the consumer that subscribed may cancel it, checked before
+    // anything is removed or its QoS monitoring stopped.
+    if let Some(refused) =
+        event_subscription_refusal(subscription_id, request, "EventExposure Unsubscribe")
+    {
+        return refused;
+    }
     match event_exposure::remove(subscription_id) {
         Some(_) => {
             log::info!("Event subscription {subscription_id} removed");
@@ -28719,6 +28775,10 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
+        // #1865: an anonymous create is refused under production (the shared
+        // owner_binding rule), so the ownerless context this test needs is made
+        // under dev; the checks below pass the profile explicitly.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let reference = create_as_1860("imsi-001010000011899", 6, None).await;
         assert_eq!(lookup_policy_binding(&reference).unwrap().serving_amf, None);
         let op = "UpdateSMContext";
@@ -29091,7 +29151,21 @@ mod tests {
 
     // ---- #79: Nsmf_EventExposure, UDM interaction, H-SMF -------------------
 
+    /// #1865: the verified consumer every `events_request` speaks as, so the
+    /// subscriptions these tests create are owned and profile-independent.
+    const EVENTS_CONSUMER_1865: &str = "c0c0c0c0-1865-4000-8000-00000000000e";
+
     fn events_request(method: &str, path: &str, body: Option<serde_json::Value>) -> SbiRequest {
+        let mut req = anonymous_events_request(method, path, body);
+        req.oauth2_subject = Some(EVENTS_CONSUMER_1865.to_string());
+        req
+    }
+
+    fn anonymous_events_request(
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> SbiRequest {
         let mut req = match method {
             "POST" => SbiRequest::post(path.to_string()),
             "GET" => SbiRequest::get(path.to_string()),
@@ -29237,6 +29311,108 @@ mod tests {
                 "a subscription without {missing} must be refused"
             );
         }
+        event_exposure::clear_for_test();
+    }
+
+    /// #1865: an event subscription is read, replaced and removed only by the
+    /// consumer that created it. A foreign certificate, a foreign token, an
+    /// anonymous caller and a certificate/token mismatch each get 403 and leave
+    /// it untouched; the owner then succeeds.
+    ///
+    /// REVERT-VERIFIED: with `event_subscription_refusal` returning `None` the
+    /// GET and DELETE assertions fail; with the PUT's `refuse_non_owner` dropped
+    /// the PUT assertion fails (the foreign caller's 200); with the owner not
+    /// recorded at create (`owner: None`) the foreign callers pass.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_event_subscription_is_managed_only_by_its_creator_1865() {
+        let _g = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        let resp = smf_sbi_request_handler(events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body(
+                "http://127.0.0.1:9/cb",
+                Some("imsi-1865"),
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "body: {:?}", resp.http.content);
+        let location = resp
+            .http
+            .get_header("location")
+            .expect("Location")
+            .to_string();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        assert_eq!(
+            event_exposure::find(&id).and_then(|s| s.owner).as_deref(),
+            Some(EVENTS_CONSUMER_1865),
+            "bound to the verified consumer at create"
+        );
+
+        const OTHER: &str = "0e0e0e0e-1865-4000-8000-0000000000ff";
+        let as_caller = |method: &str, cert: Option<&str>, token: Option<&str>| {
+            let body = (method == "PUT")
+                .then(|| subscription_body("http://127.0.0.1:9/hijacked", Some("imsi-1865")));
+            let mut r = anonymous_events_request(method, &location, body);
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+        for (cert, token) in [
+            (Some(OTHER), None),
+            (None, Some(OTHER)),
+            (None, None),
+            (Some(EVENTS_CONSUMER_1865), Some(OTHER)),
+        ] {
+            for method in ["GET", "PUT", "DELETE"] {
+                let resp = smf_sbi_request_handler(as_caller(method, cert, token)).await;
+                assert_eq!(
+                    resp.status, 403,
+                    "{method} by cert={cert:?} token={token:?} must be refused"
+                );
+            }
+            let stored = event_exposure::find(&id).expect("still stored after the refusals");
+            assert_eq!(stored.notif_uri, "http://127.0.0.1:9/cb", "unchanged");
+        }
+
+        // The owner, by certificate this time, succeeds.
+        let owner = Some(EVENTS_CONSUMER_1865);
+        assert_eq!(
+            smf_sbi_request_handler(as_caller("GET", owner, None))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            smf_sbi_request_handler(as_caller("PUT", owner, None))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            event_exposure::find(&id).and_then(|s| s.owner).as_deref(),
+            owner,
+            "a replacement keeps its creator"
+        );
+        assert_eq!(
+            smf_sbi_request_handler(as_caller("DELETE", owner, None))
+                .await
+                .status,
+            204
+        );
+        assert!(event_exposure::find(&id).is_none());
+
+        // A certificate/token mismatch at create is refused and stores nothing.
+        let mut mixed = anonymous_events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body("http://127.0.0.1:9/cb", None)),
+        );
+        mixed.peer_cert_nf_instance_id = Some(EVENTS_CONSUMER_1865.into());
+        mixed.oauth2_subject = Some(OTHER.into());
+        assert_eq!(smf_sbi_request_handler(mixed).await.status, 403);
+        assert_eq!(event_exposure::count(), 0, "nothing stored");
         event_exposure::clear_for_test();
     }
 

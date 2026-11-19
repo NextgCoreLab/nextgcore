@@ -167,14 +167,57 @@ pub fn require_oauth2_aud(
     expected_scope: &str,
     audiences: &[&str],
 ) -> Option<SbiResponse> {
+    verify_request(req, expected_scope, audiences)
+        .err()
+        .map(|refused| *refused)
+}
+
+/// [`require_oauth2`] that also records the verified token's `sub` on the
+/// request as [`SbiRequest::oauth2_subject`] (#1865).
+///
+/// eesd verifies the bearer in this per-route gate, not in the SBI server
+/// (its listener runs neither `require_oauth2` nor mTLS client verification),
+/// so without this the request would reach the handler with no verified
+/// identity and `nextgcore_sbi::owner_binding` could bind nothing. The `sub`
+/// is the consumer this EES authenticated (the EEC or EAS, TS 33.558 §6.2):
+/// what a resource it creates is bound to. A request admitted on a callback
+/// token carries no bearer and gets no subject.
+pub fn authorize(req: &mut SbiRequest, expected_scope: &str) -> Option<SbiResponse> {
+    authorize_aud(req, expected_scope, &[])
+}
+
+/// [`authorize`] with [`require_oauth2_aud`]'s audience check.
+pub fn authorize_aud(
+    req: &mut SbiRequest,
+    expected_scope: &str,
+    audiences: &[&str],
+) -> Option<SbiResponse> {
+    match verify_request(req, expected_scope, audiences) {
+        Ok(subject) => {
+            if let Some(sub) = subject.filter(|s| !s.trim().is_empty()) {
+                req.oauth2_subject = Some(sub);
+            }
+            None
+        }
+        Err(refused) => Some(*refused),
+    }
+}
+
+/// The gate over a request: `Ok(Some(sub))` for a verified bearer,
+/// `Ok(None)` for an admitted callback, `Err` the refusal.
+fn verify_request(
+    req: &SbiRequest,
+    expected_scope: &str,
+    audiences: &[&str],
+) -> Result<Option<String>, Box<SbiResponse>> {
     if callback_admitted(req) {
-        return None;
+        return Ok(None);
     }
     // Clone the configured JWKS out of the lock so verification happens without
     // holding the guard.
     let jwks = auth_jwks().read().ok().and_then(|g| g.clone());
     let auth_header = req.http.get_header("authorization").map(String::as_str);
-    require_oauth2_with_aud(auth_header, expected_scope, audiences, jwks.as_ref())
+    verify_bearer(auth_header, expected_scope, audiences, jwks.as_ref()).map(Some)
 }
 
 /// The audiences the `eees-eeccontextreloc` route accepts (#1664 review M1):
@@ -216,20 +259,32 @@ pub(crate) fn require_oauth2_with_aud(
     audiences: &[&str],
     jwks: Option<&serde_json::Value>,
 ) -> Option<SbiResponse> {
+    verify_bearer(auth_header, expected_scope, audiences, jwks)
+        .err()
+        .map(|refused| *refused)
+}
+
+/// [`require_oauth2_with_aud`] returning the verified token's `sub`.
+fn verify_bearer(
+    auth_header: Option<&str>,
+    expected_scope: &str,
+    audiences: &[&str],
+    jwks: Option<&serde_json::Value>,
+) -> Result<String, Box<SbiResponse>> {
     let Some(jwks) = jwks else {
-        return Some(send_unauthorized(
+        return Err(Box::new(send_unauthorized(
             "OAuth2 authorization not configured (CAPIF/NRF JWKS missing)",
             Some("UNAUTHORIZED"),
-        ));
+        )));
     };
 
     let claims = match authorize_bearer(auth_header, jwks) {
         Ok(c) => c,
         Err(_) => {
-            return Some(send_unauthorized(
+            return Err(Box::new(send_unauthorized(
                 "Missing or invalid OAuth2 access token",
                 Some("UNAUTHORIZED"),
-            ));
+            )));
         }
     };
 
@@ -238,20 +293,20 @@ pub(crate) fn require_oauth2_with_aud(
             .iter()
             .any(|aud| nextgcore_sbi::oauth::check_audience(&claims.aud, aud).is_ok())
     {
-        return Some(send_unauthorized(
+        return Err(Box::new(send_unauthorized(
             "Access token audience is not this EES",
             Some("UNAUTHORIZED"),
-        ));
+        )));
     }
 
     if !claims.scope.split_whitespace().any(|s| s == expected_scope) {
-        return Some(send_forbidden(
+        return Err(Box::new(send_forbidden(
             &format!("Access token scope does not permit '{expected_scope}'"),
             Some("INSUFFICIENT_SCOPE"),
-        ));
+        )));
     }
 
-    None
+    Ok(claims.sub)
 }
 
 #[cfg(test)]

@@ -1351,6 +1351,12 @@ pub struct PcEventSubscription {
     pub report_count: u32,
     /// The received document, echoed verbatim on GET.
     pub raw: serde_json::Value,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed
+    /// (`nextgcore_sbi::owner_binding`), the only one that may read, replace or
+    /// remove it. `None` when it subscribed with no verified identity (`dev`)
+    /// or was restored from a state file written before #1865.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl PcEventSubscription {
@@ -1648,6 +1654,7 @@ impl PcfContext {
         group_id: Option<String>,
         max_report_nbr: Option<u32>,
         raw: serde_json::Value,
+        owner: Option<String>,
     ) -> Option<PcEventSubscription> {
         let sub = {
             let mut list = write_through_poison(&self.event_sub_list);
@@ -1666,6 +1673,7 @@ impl PcfContext {
                 max_report_nbr,
                 report_count: 0,
                 raw,
+                owner,
             };
             hash.insert(sub.subscription_id.clone(), id);
             list.insert(id, sub.clone());
@@ -4553,6 +4561,7 @@ mod tests {
                     Some("group-1".to_string()),
                     Some(3),
                     serde_json::json!({"notifId": "n-restart", "vendorExtra": 42}),
+                    Some("aaaaaaaa-1865-4000-8000-0000000000cc".to_string()),
                 )
                 .expect("subscription added");
             ctx.event_sub_count_report(sub.id);
@@ -4576,6 +4585,11 @@ mod tests {
         );
         // The verbatim document is what a GET echoes, so it must survive too.
         assert_eq!(sub.raw["vendorExtra"], 42);
+        // #1865: so does its creator, or a restart would open it to every caller.
+        assert_eq!(
+            sub.owner.as_deref(),
+            Some("aaaaaaaa-1865-4000-8000-0000000000cc")
+        );
 
         // The subscription is still selectable by the matching rules.
         assert_eq!(

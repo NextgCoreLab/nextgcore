@@ -1214,7 +1214,7 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
         guard.sess_update(&sess);
     }
     let post = |path: String| async move {
-        crate::namf_server::namf_request_handler(
+        crate::namf_server::test_namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(path)
                 .with_json_body(&serde_json::json!({"statusInfo": {"resourceStatus": "ACTIVE"}}))
                 .expect("json"),
@@ -2879,7 +2879,7 @@ fn psi5_nonce(id: u64) -> Option<String> {
 
 /// The status of a POST of `body` to `path` on this AMF's SBI router.
 async fn namf_post(path: String, body: serde_json::Value) -> u16 {
-    crate::namf_server::namf_request_handler(
+    crate::namf_server::test_namf_request_handler(
         nextgcore_sbi::message::SbiRequest::post(path)
             .with_json_body(&body)
             .expect("json"),
