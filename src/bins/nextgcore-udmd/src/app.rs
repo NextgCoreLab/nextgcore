@@ -88,8 +88,9 @@ struct Args {
     max_sess: usize,
 
     /// The state file (#1836): SDM subscriptions, the UDR am-data subscriptions and
-    /// the am-data changes waiting for delivery survive a restart in it. Without it
-    /// (and without NEXTGCORE_UDM_STATE_FILE) they are memory-only.
+    /// the am-data changes waiting for delivery survive a restart in it, as an
+    /// append-only log (#1896; a #1836 snapshot there is migrated). Without it (and
+    /// without NEXTGCORE_UDM_STATE_FILE) they are memory-only.
     #[arg(long)]
     state_file: Option<String>,
 }
@@ -2565,7 +2566,10 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
                 "SDM subscription limit reached",
             );
         }
-        if let Err(e) = crate::sdm_udr::persist_locked(&held).await {
+        if let Err(e) =
+            crate::sdm_udr::persist_locked(&held, &[crate::sdm_udr::Rec::Sub(&subscription_id)])
+                .await
+        {
             log::error!("[{supi}] SDM subscription not written to the state file: {e}");
             if let Ok(context) = udm_self().read() {
                 context.sdm_subscription_remove(&subscription_id);
@@ -2623,7 +2627,10 @@ pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRes
             .read()
             .ok()
             .and_then(|context| context.sdm_subscription_remove(subscription_id));
-        if let Err(e) = crate::sdm_udr::persist_locked(&held).await {
+        if let Err(e) =
+            crate::sdm_udr::persist_locked(&held, &[crate::sdm_udr::Rec::Sub(subscription_id)])
+                .await
+        {
             log::error!("[{supi}] SDM unsubscribe not written to the state file: {e}");
             if let (Some(sub), Ok(context)) = (removed, udm_self().read()) {
                 context.sdm_subscription_insert(sub);
