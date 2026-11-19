@@ -405,6 +405,24 @@ pub async fn ensure_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) 
         ue_context_id: Some(ue_context_id.to_string()),
         armed: true,
     };
+    // #1877: the create, its commit included, runs on its own task. Awaited inline,
+    // a create whose caller went away (the DetermineLocation consumer disconnected)
+    // dropped `in_flight` after the AMF had made the subscription: the entry was
+    // abandoned and the AMF's subscription recorded nowhere, so nothing deleted it.
+    let (amf, ue_context_id) = (amf.clone(), ue_context_id.to_string());
+    let _ = tokio::spawn(async move {
+        create_n1n2_subscription(&amf, &ue_context_id, request, in_flight).await;
+    })
+    .await;
+}
+
+/// The N1N2 subscription create and its commit (#1877: on its own task).
+async fn create_n1n2_subscription(
+    amf: &DiscoveredAmf,
+    ue_context_id: &str,
+    request: SbiRequest,
+    in_flight: InFlightCreate,
+) {
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
@@ -697,6 +715,20 @@ pub async fn ensure_non_ue_nrppa_subscription(amf: &DiscoveredAmf, nf_id: &str) 
         ue_context_id: None,
         armed: true,
     };
+    // #1877: on its own task, as `ensure_n1n2_subscription`'s create.
+    let amf = amf.clone();
+    let _ = tokio::spawn(async move {
+        create_non_ue_nrppa_subscription(&amf, request, in_flight).await;
+    })
+    .await;
+}
+
+/// The non-UE NRPPa subscription create and its commit (#1877: on its own task).
+async fn create_non_ue_nrppa_subscription(
+    amf: &DiscoveredAmf,
+    request: SbiRequest,
+    in_flight: InFlightCreate,
+) {
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {

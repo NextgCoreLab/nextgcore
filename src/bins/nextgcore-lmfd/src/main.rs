@@ -9956,6 +9956,8 @@ mod callback_tokens_1518 {
         seen: Arc<Mutex<Vec<(String, String)>>>,
         subscribe_status: Arc<std::sync::atomic::AtomicU16>,
         transfer_status: Arc<std::sync::atomic::AtomicU16>,
+        /// #1877: how long a subscribe is held before it is answered (ms).
+        subscribe_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     async fn stand_in_amf() -> StandInAmf {
@@ -9963,25 +9965,32 @@ mod callback_tokens_1518 {
         let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let subscribe_status = Arc::new(std::sync::atomic::AtomicU16::new(201));
         let transfer_status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let subscribe_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
-        let (s, sub, tr) = (
+        let (s, sub, tr, delay) = (
             seen.clone(),
             subscribe_status.clone(),
             transfer_status.clone(),
+            subscribe_delay_ms.clone(),
         );
         server
             .start(move |req: SbiRequest| {
-                let (s, sub, tr) = (s.clone(), sub.clone(), tr.clone());
+                let (s, sub, tr, delay) = (s.clone(), sub.clone(), tr.clone(), delay.clone());
                 async move {
                     let uri = req.header.uri.clone();
-                    let mut seen = s.lock().unwrap();
-                    seen.push((uri.clone(), req.http.content.clone().unwrap_or_default()));
+                    let n = {
+                        let mut seen = s.lock().unwrap();
+                        seen.push((uri.clone(), req.http.content.clone().unwrap_or_default()));
+                        seen.len()
+                    };
                     if uri.ends_with("/subscriptions") {
+                        let held = delay.load(Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(held)).await;
                         let status = sub.load(Ordering::SeqCst);
                         SbiResponse::with_status(status)
                             .with_json_body(&serde_json::json!({
-                                "n1n2NotifySubscriptionId": format!("s{}", seen.len()),
+                                "n1n2NotifySubscriptionId": format!("s{n}"),
                             }))
                             .unwrap()
                     } else {
@@ -10001,6 +10010,7 @@ mod callback_tokens_1518 {
             seen,
             subscribe_status,
             transfer_status,
+            subscribe_delay_ms,
         }
     }
 
@@ -10032,6 +10042,57 @@ mod callback_tokens_1518 {
             404 => false,
             other => panic!("unexpected {other}"),
         }
+    }
+
+    /// #1877: a DetermineLocation whose consumer went away while the AMF was making
+    /// the N1N2 subscription leaves it recorded, its token admitted, not orphaned at
+    /// the AMF: the create and its commit run on their own task.
+    ///
+    /// REVERT-VERIFIED: with the create awaited inline again, this fails: the entry
+    /// is abandoned and the AMF's subscription is recorded nowhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscribe_cancelled_mid_create_is_still_recorded_1877() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+        let ue = "imsi-001010000018774";
+        let amf = stand_in_amf().await;
+        amf.subscribe_delay_ms.store(300, Ordering::SeqCst);
+        {
+            let mut ensure = Box::pin(namf_client::ensure_n1n2_subscription(&amf.amf, ue));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while amf.subscribed_n1_tokens().is_empty() {
+                assert!(tokio::time::Instant::now() < deadline, "never subscribed");
+                if tokio::time::timeout(std::time::Duration::from_millis(5), &mut ensure)
+                    .await
+                    .is_ok()
+                {
+                    panic!("finished before the AMF answered");
+                }
+            }
+            // Dropped here: the consumer went away.
+        }
+        let key = amf.amf.subscription_key(ue);
+        let recorded = || {
+            lmf_self()
+                .read()
+                .unwrap()
+                .amf_subscription_get(&key)
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorded().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let id = recorded();
+        let token = amf.subscribed_n1_tokens()[0].clone();
+        let still_admitted = admitted(&token).await;
+        amf.server.stop().await.ok();
+
+        assert_eq!(id.as_deref(), Some("s1"), "the AMF's subscription is recorded");
+        assert!(still_admitted, "and its token admitted");
     }
 
     /// #1518, restarts of both peers. The subscription is made once and reused;
