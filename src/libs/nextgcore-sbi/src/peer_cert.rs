@@ -78,6 +78,35 @@ pub fn nf_instance_id_from_der(der: &[u8]) -> Option<String> {
         .find_map(normalize_uri_san)
 }
 
+/// Every URI SubjectAltName of a DER-encoded certificate, trimmed, in order
+/// (#2000: a TLS terminator allowlisted by SPIFFE ID whose certificate also
+/// carries a `urn:uuid:` SAN is matched on any of them, not only on the one
+/// [`nf_instance_id_from_der`] selects). Empty when the certificate cannot be
+/// parsed or names no URI.
+pub fn uri_sans_from_der(der: &[u8]) -> Vec<String> {
+    let Ok(cert) = Certificate::from_der(der) else {
+        return Vec::new();
+    };
+    let Some(san) = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|exts| exts.iter().find(|e| e.extn_id == SubjectAltName::OID))
+        .and_then(|e| SubjectAltName::from_der(e.extn_value.as_bytes()).ok())
+    else {
+        return Vec::new();
+    };
+    san.0
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::UniformResourceIdentifier(uri) => Some(uri.as_str().trim()),
+            _ => None,
+        })
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The RFC 9310 NFTypes certificate extension, `id-pe-nftype`
 /// (1.3.6.1.5.5.7.1.34). TS 33.310 §6.1.3c.3: "nfTypes shall contain NF type for
 /// the Network Function instance formatted according to RFC 9310".
@@ -282,6 +311,36 @@ pub(crate) mod tests {
             nf_instance_id_from_der(&der).as_deref(),
             Some("https://amf.example.org:443")
         );
+    }
+
+    /// #2000: every URI SAN, in order and verbatim, DNS-IDs excluded.
+    #[test]
+    fn lists_every_uri_san_2000() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        let mut params = CertificateParams::new(Vec::new()).expect("params");
+        params.subject_alt_names = vec![
+            SanType::URI(
+                "urn:uuid:4947a69a-f61b-4bc1-b9da-47c9c5d14b64"
+                    .try_into()
+                    .expect("ia5"),
+            ),
+            SanType::DnsName("envoy.example.org".try_into().expect("ia5")),
+            SanType::URI(
+                "spiffe://cluster.local/ns/5gc/sa/envoy"
+                    .try_into()
+                    .expect("ia5"),
+            ),
+        ];
+        let key = KeyPair::generate().expect("key");
+        let der = params.self_signed(&key).expect("cert").der().to_vec();
+        assert_eq!(
+            uri_sans_from_der(&der),
+            [
+                "urn:uuid:4947a69a-f61b-4bc1-b9da-47c9c5d14b64",
+                "spiffe://cluster.local/ns/5gc/sa/envoy"
+            ]
+        );
+        assert!(uri_sans_from_der(b"not a certificate").is_empty());
     }
 
     /// **Issue #186.** The NF Instance ID is recovered from a real certificate's
