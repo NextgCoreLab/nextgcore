@@ -1554,6 +1554,13 @@ static NEF_LOOKUP_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
 > = std::sync::OnceLock::new();
 
+/// #2025: the one test lock for [`NEF_LOOKUP_CACHE`], declared beside it. Every
+/// test that reads or writes the cache holds it, so tests run in parallel
+/// cannot see each other's answers (or a `clear()` when it fills up).
+#[cfg(test)]
+pub(crate) static NEF_LOOKUP_CACHE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 fn nef_lookup_cache(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
     NEF_LOOKUP_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -3297,6 +3304,43 @@ mod nef_lookup_cache_tests_1998 {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::Arc;
 
+    /// **#2025.** Every test fn in this file that touches the NEF lookup cache
+    /// (`cached_nef_lookup(`, `caller_is_nef(`, `nef_lookup_cache()`) holds
+    /// [`NEF_LOOKUP_CACHE_TEST_LOCK`]: a test that does not can race another
+    /// one's entries, as R30's probe raced the #1998 test.
+    ///
+    /// REVERT-VERIFIED: with the lock taken out of the #1998 test, this fails
+    /// naming it.
+    #[test]
+    fn every_test_touching_the_nef_lookup_cache_holds_its_lock_2025() {
+        let src = include_str!("main.rs");
+        let tests = &src[src.find("#[cfg(test)]\nmod ").expect("test modules")..];
+        let touches = ["cached_nef_lookup(", "caller_is_nef(", "nef_lookup_cache()"];
+        let mut unlocked = Vec::new();
+        let mut checked = 0;
+        for chunk in tests
+            .split("\n    async fn ")
+            .chain(tests.split("\n    fn "))
+            .skip(1)
+        {
+            let name: String = chunk.chars().take_while(|c| *c != '(').collect();
+            // The fn body: up to the next item at this indentation.
+            let body = chunk.split("\n    }\n").next().unwrap_or(chunk);
+            if name.contains("_2025") || !touches.iter().any(|t| body.contains(t)) {
+                continue;
+            }
+            checked += 1;
+            if !body.contains("NEF_LOOKUP_CACHE_TEST_LOCK.lock()") {
+                unlocked.push(name);
+            }
+        }
+        assert!(checked >= 1, "the scan finds the #1998 test");
+        assert!(
+            unlocked.is_empty(),
+            "tests touching the cache without its lock: {unlocked:?}"
+        );
+    }
+
     /// **#1998.** A second provisioning request by the same verified NEF costs
     /// no NRF query; a refusal is reused too; a failed lookup is not cached (it
     /// keeps failing closed and the next request asks again); an expired answer
@@ -3307,6 +3351,7 @@ mod nef_lookup_cache_tests_1998 {
     /// with a failed lookup cached as `false`, the second failure is `Ok`.
     #[tokio::test]
     async fn the_nef_lookup_is_cached_by_verified_id_and_fails_closed_1998() {
+        let _cache = NEF_LOOKUP_CACHE_TEST_LOCK.lock().await;
         let asked = Arc::new(AtomicUsize::new(0));
         let counting = |answer: Result<bool, String>| {
             let asked = asked.clone();
