@@ -501,6 +501,11 @@ pub struct SacSubscription {
     /// Unix seconds of the last report, for PERIODIC pacing. Not persisted, so a
     /// restart reports at the next event rather than waiting out the old period.
     pub last_report_at: u64,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed, the
+    /// only one that may modify or unsubscribe (TS 33.501 §13.4.1). Never the
+    /// self-declared `nfId`. `None` when it subscribed with no verified
+    /// identity (`dev`). Subscriptions are not persisted, so none is restored.
+    pub owner: Option<String>,
 }
 
 /// Why a subscription is (or is not) reporting right now.
@@ -2181,6 +2186,7 @@ mod tests {
             notify_correlation_id: None,
             over_threshold: false,
             last_report_at: 0,
+            owner: None,
         });
         ctx.subscription_add(SacSubscription {
             subscription_id: "s2".to_string(),
@@ -2197,6 +2203,7 @@ mod tests {
             notify_correlation_id: None,
             over_threshold: false,
             last_report_at: 0,
+            owner: None,
         });
 
         assert_eq!(ctx.subscriptions_matching(&SNssai::new(1, None)).len(), 2);
