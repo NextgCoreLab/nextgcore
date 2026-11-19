@@ -2803,7 +2803,12 @@ mod tests {
         let id = sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/u").await;
         let token = leg_token(supi).expect("leg");
         break_it(&dir);
-        let resp = crate::app::handle_sdm_unsubscribe(supi, &id).await;
+        let resp = crate::app::handle_sdm_unsubscribe(
+            supi,
+            &id,
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         assert_eq!(
             (
                 resp.status,
