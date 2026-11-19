@@ -169,6 +169,11 @@ pub struct PcfUeAm {
     /// which the production profile freezes.
     #[serde(default)]
     pub owner: Option<String>,
+    /// #1992 (R32 on #1988): for a record restored ownerless (written before
+    /// #1937), the Unix time it lapses; set at restore under production, where
+    /// an ownerless record is frozen and could otherwise never be removed.
+    #[serde(default)]
+    pub ownerless_until: Option<i64>,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -233,6 +238,7 @@ impl PcfUeAm {
     pub fn new(id: u64, supi: &str) -> Self {
         Self {
             owner: None,
+            ownerless_until: None,
             id,
             association_id: Uuid::new_v4().to_string(),
             supi: supi.to_string(),
@@ -509,6 +515,43 @@ pub enum SessCreateError {
     Limit,
 }
 
+/// #1992 (R32 on #1988): how long a record restored without an owner lives
+/// under production, where it is frozen (nobody can manage it), so the SMF or
+/// AMF holding it is answered 404 within a day instead of 403 forever. As the
+/// ucmfd cap (#1975), it is written back when applied.
+pub const OWNERLESS_LAPSE_SECS: i64 = 24 * 3600;
+
+/// Unix time in seconds (#1992 lapses).
+pub(crate) fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// #1992: a restored record's lapse under `lapse` (the production profile):
+/// `(keep, capped)`. An owned record is kept as it is. An ownerless one gets
+/// `now + OWNERLESS_LAPSE_SECS` if it has no lapse yet (`capped`), and is
+/// dropped once that has passed.
+fn restored_lapse(
+    owner: &Option<String>,
+    until: &mut Option<i64>,
+    now: i64,
+    lapse: bool,
+) -> (bool, bool) {
+    if !lapse || owner.is_some() {
+        return (true, false);
+    }
+    match *until {
+        Some(t) if t <= now => (false, false),
+        Some(_) => (true, false),
+        None => {
+            *until = Some(now + OWNERLESS_LAPSE_SECS);
+            (true, true)
+        }
+    }
+}
+
 /// Port of pcf_sess_t from context.h
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PcfSess {
@@ -635,6 +678,11 @@ pub struct PcfSess {
     /// which the production profile freezes.
     #[serde(default)]
     pub owner: Option<String>,
+    /// #1992 (R32 on #1988): for a record restored ownerless (written before
+    /// #1937), the Unix time it lapses; set at restore under production, where
+    /// an ownerless record is frozen and could otherwise never be removed.
+    #[serde(default)]
+    pub ownerless_until: Option<i64>,
 }
 
 /// The cap a demo installed on a session ([`PcfSess::demo_ambr_cap`]).
@@ -675,6 +723,7 @@ impl PcfSess {
     pub fn new(id: u64, pcf_ue_sm_id: u64, psi: u8) -> Self {
         Self {
             owner: None,
+            ownerless_until: None,
             id,
             sm_policy_id: Uuid::new_v4().to_string(),
             binding: PcfBinding::default(),
@@ -1240,12 +1289,18 @@ pub struct PcfApp {
     /// which the production profile freezes.
     #[serde(default)]
     pub owner: Option<String>,
+    /// #1992 (R32 on #1988): for a record restored ownerless (written before
+    /// #1937), the Unix time it lapses; set at restore under production, where
+    /// an ownerless record is frozen and could otherwise never be removed.
+    #[serde(default)]
+    pub ownerless_until: Option<i64>,
 }
 
 impl PcfApp {
     pub fn new(id: u64, sess_id: u64) -> Self {
         Self {
             owner: None,
+            ownerless_until: None,
             id,
             app_session_id: Uuid::new_v4().to_string(),
             notif_uri: None,
@@ -1439,6 +1494,10 @@ pub struct PcfContext {
     unrestorable_associations: RwLock<Vec<UnrestorableAssociation>>,
     /// App session list (by pool ID)
     app_list: RwLock<HashMap<u64, PcfApp>>,
+    /// #1992: the earliest `ownerless_until` among restored records
+    /// (`i64::MAX` when none), so [`Self::sweep_lapsed_ownerless`] is O(1)
+    /// until something can actually lapse.
+    next_ownerless_lapse: std::sync::atomic::AtomicI64,
     /// SUPI -> UE AM ID hash
     supi_am_hash: RwLock<HashMap<String, u64>>,
     /// SUPI -> UE SM ID hash
@@ -1572,6 +1631,7 @@ impl PcfContext {
             sess_list: RwLock::new(HashMap::new()),
             unrestorable_associations: RwLock::new(Vec::new()),
             app_list: RwLock::new(HashMap::new()),
+            next_ownerless_lapse: std::sync::atomic::AtomicI64::new(i64::MAX),
             supi_am_hash: RwLock::new(HashMap::new()),
             supi_sm_hash: RwLock::new(HashMap::new()),
             ipv4addr_hash: RwLock::new(HashMap::new()),
@@ -1645,11 +1705,29 @@ impl PcfContext {
     /// An unreadable snapshot is an **error**: the caller should refuse to start
     /// rather than answer "no such association" for associations that exist.
     pub fn set_state_file(&mut self, path: std::path::PathBuf) -> Result<usize, PcfStateError> {
+        // #1992: ownerless records lapse only where they are frozen.
+        self.set_state_file_with(path, nextgcore_sbi::owner_binding::identity_required())
+    }
+
+    /// [`Self::set_state_file`] with the #1992 ownerless lapse explicitly on or
+    /// off (it follows the production profile).
+    pub(crate) fn set_state_file_with(
+        &mut self,
+        path: std::path::PathBuf,
+        lapse: bool,
+    ) -> Result<usize, PcfStateError> {
         use nextgcore_core::state_store::{Loaded, StateStore};
         self.state = StateStore::new(Some(path.clone()));
         match self.state.load()? {
             Loaded::Snapshot(doc) => {
-                let restored = self.restore_from(&doc, &path);
+                let restored = self.restore_from(&doc, &path, lapse);
+                if let Ok((_, true)) = restored {
+                    // #1992 (as #1975 for ucmfd): a cap applied at restore is
+                    // written back at once, or every restart would grant
+                    // another 24 h.
+                    self.persist();
+                }
+                let restored = restored.map(|(n, _)| n);
                 if restored.is_err() {
                     // The store is not poisoned (the load itself succeeded), so a
                     // caller that logs and carries on could otherwise overwrite a
@@ -1899,11 +1977,14 @@ impl PcfContext {
         });
     }
 
+    /// `Ok((restored, capped))`: `capped` when a #1992 ownerless lapse was
+    /// applied, so the caller must write the state back.
     fn restore_from(
         &self,
         doc: &serde_json::Value,
         path: &std::path::Path,
-    ) -> Result<usize, PcfStateError> {
+        lapse: bool,
+    ) -> Result<(usize, bool), PcfStateError> {
         let found = doc
             .get("version")
             .and_then(|v| v.as_u64())
@@ -1972,8 +2053,38 @@ impl PcfContext {
                     .collect()
             })
             .unwrap_or_default();
-        let apps: Vec<PcfApp> = records(doc, "apps");
+        let mut apps: Vec<PcfApp> = records(doc, "apps");
         let event_subs: Vec<PcEventSubscription> = records(doc, "eventSubs");
+        // #1992 (R32 on #1988): under production an ownerless record is
+        // frozen, so it lapses OWNERLESS_LAPSE_SECS after the first restart
+        // that finds it, and one already past its lapse is not restored. An
+        // app session goes with a lapsed SM policy.
+        let now = unix_now_secs();
+        let mut capped = false;
+        let mut earliest = i64::MAX;
+        let mut ue_ams = ue_ams;
+        let mut sessions = sessions;
+        let mut keep = |owner: &Option<String>, until: &mut Option<i64>, what: &str| {
+            let (kept, c) = restored_lapse(owner, until, now, lapse);
+            capped |= c;
+            if let Some(t) = *until {
+                if kept {
+                    earliest = earliest.min(t);
+                }
+            }
+            if !kept {
+                log::warn!("dropping a restored ownerless {what}: it lapsed (#1992)");
+            }
+            kept
+        };
+        ue_ams.retain_mut(|r| keep(&r.owner, &mut r.ownerless_until, "AM policy association"));
+        sessions.retain_mut(|r| keep(&r.owner, &mut r.ownerless_until, "SM policy association"));
+        let live_sessions: std::collections::HashSet<u64> = sessions.iter().map(|s| s.id).collect();
+        apps.retain_mut(|r| {
+            live_sessions.contains(&r.sess_id)
+                && keep(&r.owner, &mut r.ownerless_until, "app session")
+        });
+        self.next_ownerless_lapse.store(earliest, Ordering::SeqCst);
         let restored = ue_ams.len() + ue_sms.len() + sessions.len() + apps.len() + event_subs.len();
         if !unrestorable.is_empty() {
             log::error!(
@@ -2093,7 +2204,65 @@ impl PcfContext {
             self.next_app_id.load(Ordering::SeqCst),
             self.next_event_sub_id.load(Ordering::SeqCst),
         );
-        Ok(restored)
+        Ok((restored, capped))
+    }
+
+    /// #1992: remove every restored ownerless record whose lapse has passed
+    /// (an app session with its SM policy). O(1) until the earliest lapse;
+    /// called at the top of each PCF request. Returns how many were removed.
+    pub fn sweep_lapsed_ownerless(&self, now: i64) -> usize {
+        if now < self.next_ownerless_lapse.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let lapsed = |owner: &Option<String>, until: Option<i64>| {
+            owner.is_none() && until.is_some_and(|t| t <= now)
+        };
+        let ams: Vec<u64> = read_through_poison(&self.ue_am_list)
+            .values()
+            .filter(|r| lapsed(&r.owner, r.ownerless_until))
+            .map(|r| r.id)
+            .collect();
+        let sesss: Vec<u64> = read_through_poison(&self.sess_list)
+            .values()
+            .filter(|r| lapsed(&r.owner, r.ownerless_until))
+            .map(|r| r.id)
+            .collect();
+        let apps: Vec<u64> = read_through_poison(&self.app_list)
+            .values()
+            .filter(|r| lapsed(&r.owner, r.ownerless_until))
+            .map(|r| r.id)
+            .collect();
+        let mut removed = 0;
+        for id in ams {
+            removed += usize::from(self.ue_am_remove(id).is_some());
+        }
+        for id in sesss {
+            removed += usize::from(self.sess_remove_with_apps(id).is_some());
+        }
+        for id in apps {
+            removed += usize::from(self.app_remove(id).is_some());
+        }
+        // The next lapse still pending, if any.
+        let next = read_through_poison(&self.ue_am_list)
+            .values()
+            .filter_map(|r| r.owner.is_none().then_some(r.ownerless_until).flatten())
+            .chain(
+                read_through_poison(&self.sess_list)
+                    .values()
+                    .filter_map(|r| r.owner.is_none().then_some(r.ownerless_until).flatten()),
+            )
+            .chain(
+                read_through_poison(&self.app_list)
+                    .values()
+                    .filter_map(|r| r.owner.is_none().then_some(r.ownerless_until).flatten()),
+            )
+            .min()
+            .unwrap_or(i64::MAX);
+        self.next_ownerless_lapse.store(next, Ordering::SeqCst);
+        if removed > 0 {
+            log::warn!("{removed} restored ownerless record(s) lapsed and were removed (#1992)");
+        }
+        removed
     }
 
     /// Write the snapshot after a mutation. A no-op with no state file, and
@@ -3501,6 +3670,96 @@ mod tests {
         ctx.set_state_file(path.to_path_buf())
             .expect("arming a fresh state file must succeed");
         ctx
+    }
+
+    // ── #1992: restored ownerless records lapse under production ──
+
+    fn ctx_with_state_lapsing(path: &std::path::Path) -> PcfContext {
+        let mut ctx = PcfContext::new();
+        ctx.init(100, 200);
+        ctx.set_state_file_with(path.to_path_buf(), true)
+            .expect("arming the state file");
+        ctx
+    }
+
+    /// #1992 (R32 on #1988): an ownerless (pre-#1937) record restored under
+    /// production gets a lapse 24 h out, written back at once, so a second
+    /// restart does not move it later; an owned record gets none.
+    /// REVERT-VERIFIED: with `set_state_file_with` not persisting after a cap,
+    /// the second restart re-caps from its own clock and the lapse moves later.
+    #[test]
+    fn a_restored_ownerless_record_gets_a_lapse_that_does_not_move_1992() {
+        let path = temp_state_path("lapse-1992");
+        let (ue_am, _, sess, app) = {
+            let ctx = ctx_with_state(&path);
+            populate(&ctx)
+        };
+        let first = ctx_with_state_lapsing(&path);
+        let until = |c: &PcfContext| {
+            (
+                c.ue_am_find_by_id(ue_am.id).and_then(|r| r.ownerless_until),
+                c.sess_find_by_id(sess.id).and_then(|r| r.ownerless_until),
+                c.app_find_by_id(app.id).and_then(|r| r.ownerless_until),
+            )
+        };
+        let (am1, sess1, app1) = until(&first);
+        let now = unix_now_secs();
+        for t in [am1, sess1, app1] {
+            let t = t.expect("an ownerless record gets a lapse");
+            assert!(t > now && t <= now + OWNERLESS_LAPSE_SECS, "{t} vs {now}");
+        }
+        drop(first);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = ctx_with_state_lapsing(&path);
+        assert_eq!(
+            until(&second),
+            (am1, sess1, app1),
+            "the lapse does not move later"
+        );
+        // An owned record gets none.
+        let ctx = ctx_with_state(&temp_state_path("lapse-owned-1992"));
+        let mut am = ctx.ue_am_add("imsi-001010000091992").unwrap();
+        am.owner = Some("aaaaaaaa-1992-4000-8000-0000000000a1".into());
+        ctx.ue_am_update(&am);
+        let mut kept = None;
+        let (keep, capped) = restored_lapse(&am.owner, &mut kept, now, true);
+        assert!(keep && !capped && kept.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1992: a record whose lapse has passed is not restored, and the sweep
+    /// removes one that lapses while the PCF runs (an app session with its SM
+    /// policy). REVERT-VERIFIED: with `restored_lapse` keeping a passed lapse,
+    /// the lapsed AM policy is restored; with the sweep a no-op, the running
+    /// one stays.
+    #[test]
+    fn a_lapsed_ownerless_record_is_removed_1992() {
+        let path = temp_state_path("lapsed-1992");
+        let (ue_am, _, sess, app) = {
+            let ctx = ctx_with_state(&path);
+            let made = populate(&ctx);
+            let mut am = made.0.clone();
+            am.ownerless_until = Some(1);
+            ctx.ue_am_update(&am);
+            made
+        };
+        let restored = ctx_with_state_lapsing(&path);
+        assert!(
+            restored.ue_am_find_by_id(ue_am.id).is_none(),
+            "a passed lapse is not restored"
+        );
+        assert!(restored.sess_find_by_id(sess.id).is_some());
+        // The session lapses while running: the sweep removes it and its app.
+        let until = restored
+            .sess_find_by_id(sess.id)
+            .unwrap()
+            .ownerless_until
+            .unwrap();
+        assert_eq!(restored.sweep_lapsed_ownerless(until - 1), 0, "not yet");
+        assert!(restored.sweep_lapsed_ownerless(until) >= 1);
+        assert!(restored.sess_find_by_id(sess.id).is_none());
+        assert!(restored.app_find_by_id(app.id).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── #193: an association the PCF cannot restore ──

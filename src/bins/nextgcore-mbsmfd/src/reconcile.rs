@@ -102,6 +102,7 @@ pub static PENDING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const
 /// Park `contexts` for the reconciler. A record already parked is not added twice,
 /// so a re-driven release does not send two deletes for one context.
 pub fn park(contexts: Vec<AmfMbsContext>) {
+    let mut abandoned = Vec::new();
     let Ok(mut set) = pending().lock() else {
         return;
     };
@@ -120,14 +121,28 @@ pub fn park(contexts: Vec<AmfMbsContext>) {
             ctx: c,
             since: std::time::SystemTime::now(),
         });
-        evict(&mut set);
+        abandoned.extend(evict(&mut set));
+    }
+    drop(set);
+    forget_abandoned(&abandoned);
+}
+
+/// #1985: an abandoned delete's context is no longer tracked, so its notify
+/// tokens go (the bound on the tokens parked deletes keep). Called with the
+/// pending set unlocked: forgetting reads the global context, and
+/// `record_amf_context` takes the pending set under that read (`unpark`).
+fn forget_abandoned(abandoned: &[AmfMbsContext]) {
+    for c in abandoned {
+        crate::forget_amf_notify_token(c);
     }
 }
 
 /// Evict down to [`MAX_PENDING`], the oldest by park time first, wherever
 /// rotation has put it (#1994: it popped the front, which rotation makes the
-/// next to be tried, not the oldest).
-fn evict(set: &mut VecDeque<Parked>) {
+/// next to be tried, not the oldest). Returns the evicted contexts, whose
+/// notify tokens the caller forgets with the set unlocked (#1985).
+fn evict(set: &mut VecDeque<Parked>) -> Vec<AmfMbsContext> {
+    let mut abandoned = Vec::new();
     for Parked { ctx: old, .. } in
         nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
     {
@@ -140,7 +155,9 @@ fn evict(set: &mut VecDeque<Parked>) {
             MAX_PENDING
         );
         RECONCILED.inc(&["abandoned"]);
+        abandoned.push(old);
     }
+    abandoned
 }
 
 /// #1994: forget the backoff of an AMF with nothing left parked, so one that
@@ -200,38 +217,54 @@ pub const MAX_PASS: Duration = Duration::from_millis(500);
 /// are not tried this pass (nor until the backoff ends); a record tried and failed
 /// goes to the BACK of the queue, one not reached keeps its place at the FRONT.
 /// Returns how many the AMF accepted.
+///
+/// #1985 (cancellation): the batch is held by a [`Repark`] guard, so a pass dropped
+/// mid-way (its task aborted) re-parks every record it had not ended, including
+/// the one in flight -- whose context still exists at the AMF and whose notify
+/// tokens are still held. If that delete did land, the next pass's 404 ends it.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<Parked> = match pending().lock() {
+    let batch: VecDeque<Parked> = match pending().lock() {
         Ok(mut set) => set.drain(..).collect(),
         Err(_) => return 0,
     };
+    let mut pass = Repark {
+        untried: Vec::new(),
+        inflight: None,
+        rest: batch,
+        failed: Vec::new(),
+        expired: Vec::new(),
+    };
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut untried = Vec::new();
-    let mut failed = Vec::new();
-    for p in batch {
-        let c = &p.ctx;
+    while let Some(p) = pass.rest.pop_front() {
         if p.since.elapsed().unwrap_or_default() > MAX_AGE {
             log::error!(
                 "MBS: the ContextDelete of AMF {}:{} MBS context {} expired after {MAX_AGE:?}",
-                c.host,
-                c.port,
-                c.context_ref
+                p.ctx.host,
+                p.ctx.port,
+                p.ctx.context_ref
             );
             RECONCILED.inc(&["expired"]);
+            // #1985: given up on, so the context is no longer tracked and its
+            // notify tokens go (as for an abandoned delete), once the guard drops.
+            pass.expired.push(p.ctx);
             continue;
         }
-        let peer = peer_of(c);
+        let peer = peer_of(&p.ctx);
         if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
-            untried.push(p);
+            pass.untried.push(p);
             continue;
         }
+        let c = p.ctx.clone();
+        pass.inflight = Some(p);
         // #1854: in the (AMF, TMGI) lane, the in-use check and the send together.
-        match crate::delete_in_lane(c).await {
+        let outcome = crate::delete_in_lane(&c).await;
+        let p = pass.inflight.take();
+        match outcome {
             None => {
                 RECONCILED.inc(&["reused"]);
             }
-            Some(ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone) => {
+            Some(outcome @ (ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone)) => {
                 BACKOFF.note_success(&peer);
                 log::info!(
                     "MBS: reconciler released AMF {}:{} MBS context {}",
@@ -239,32 +272,69 @@ pub async fn reconcile_once() -> usize {
                     c.port,
                     c.context_ref
                 );
+                // #1985: the context ends here, so do its notify tokens: at once
+                // on a 404, after the grace on a 204 (late NG-RAN answers).
+                crate::retire_amf_notify_token(&c, outcome);
                 RECONCILED.inc(&["deleted"]);
                 ended += 1;
             }
             Some(ContextDeleteOutcome::Failed) => {
                 BACKOFF.note_failure(&peer);
-                failed.push(p);
+                pass.failed.extend(p);
             }
         }
     }
-    if let Ok(mut set) = pending().lock() {
-        // Not reached: back at the FRONT, in order (older than anything parked while
-        // this pass ran, and eviction takes the oldest). Tried and failed: at the BACK.
-        for p in untried.into_iter().rev() {
-            if !set.iter().any(|q| q.ctx == p.ctx) {
-                set.push_front(p);
-            }
-        }
-        for p in failed {
-            if !set.iter().any(|q| q.ctx == p.ctx) {
-                set.push_back(p);
-            }
-        }
-        evict(&mut set);
-        prune_backoff(&set);
-    }
+    drop(pass);
     ended
+}
+
+/// #1985: the records of one [`reconcile_once`] pass it has not ended. Dropping
+/// it -- at the end of the pass, or when the pass is cancelled -- puts them back:
+/// those not reached (`untried`), the one in flight and the rest of the batch at
+/// the FRONT, in order (they are older than anything parked while the pass ran,
+/// and eviction takes the oldest); those tried and failed at the BACK (#1961).
+/// The notify tokens of evicted and `expired` records are forgotten with the
+/// pending set unlocked.
+struct Repark {
+    untried: Vec<Parked>,
+    inflight: Option<Parked>,
+    rest: VecDeque<Parked>,
+    failed: Vec<Parked>,
+    expired: Vec<AmfMbsContext>,
+}
+
+impl Drop for Repark {
+    fn drop(&mut self) {
+        let front: Vec<Parked> = self
+            .untried
+            .drain(..)
+            .chain(self.inflight.take())
+            .chain(self.rest.drain(..))
+            .collect();
+        let failed: Vec<Parked> = self.failed.drain(..).collect();
+        let mut gone: Vec<AmfMbsContext> = self.expired.drain(..).collect();
+        if !front.is_empty() || !failed.is_empty() {
+            if let Ok(mut set) = pending().lock() {
+                for p in front.into_iter().rev() {
+                    if !set.iter().any(|q| q.ctx == p.ctx) {
+                        set.push_front(p);
+                    }
+                }
+                for p in failed {
+                    if !set.iter().any(|q| q.ctx == p.ctx) {
+                        set.push_back(p);
+                    }
+                }
+                gone.extend(evict(&mut set));
+            }
+        }
+        // #1994: whether the pass ended or was cancelled, a peer with nothing
+        // left parked loses its backoff.
+        if let Ok(set) = pending().lock() {
+            prune_backoff(&set);
+        }
+        forget_abandoned(&gone);
+    }
 }
 
 /// Run [`reconcile_once`] every [`RECONCILE_PERIOD`] for the life of the process.
@@ -304,6 +374,17 @@ pub fn clear_for_test() {
         set.clear();
     }
     BACKOFF.clear();
+}
+
+/// Make every parked record look parked `by` earlier (#1961 / #1985 tests of
+/// [`MAX_AGE`]). Hold [`PENDING_TEST_LOCK`].
+#[cfg(test)]
+pub fn backdate_for_test(by: Duration) {
+    if let Ok(mut set) = pending().lock() {
+        for p in set.iter_mut() {
+            p.since -= by;
+        }
+    }
 }
 
 #[cfg(test)]
