@@ -1217,6 +1217,8 @@ pub(crate) async fn delete_in_lane(c: &AmfMbsContext) -> Option<namf_client::Con
         .read()
         .is_ok_and(|ctx| ctx.amf_context_in_use(c))
     {
+        // #1930: its notify tokens went to the session that holds the context now
+        // (`record_amf_context`), and go with the context's own release.
         log::info!(
             "MBS: AMF {}:{} MBS context {} is in use again; its ContextDelete is dropped",
             c.host,
@@ -1291,10 +1293,11 @@ fn retire_amf_notify_token(c: &AmfMbsContext, outcome: namf_client::ContextDelet
 }
 
 /// #1796: the AMF context `c` is released (or given up on): its
-/// ContextStatusNotify token is no longer admitted.
+/// ContextStatusNotify tokens are no longer admitted (#1930: every token of that
+/// context, whichever session's create minted it).
 fn forget_amf_notify_token(c: &AmfMbsContext) {
     if let Ok(ctx) = mbsmf_self().read() {
-        ctx.forget_amf_notify_token(&c.notify_token);
+        ctx.forget_amf_context_tokens(c);
     }
 }
 
