@@ -4,7 +4,7 @@ The BSF (Binding Support Function, `nextgcore-bsfd`) stores and serves PCF bindi
 
 Configuration is split between a YAML file (default path `/etc/nextgcore/bsf.yaml`, overridable with `-c/--config`; the docker deployment passes `-c /etc/nextgcore/bsf.yaml`) and command-line flags. For the SBI, the CLI `--sbi-addr`/`--sbi-port` beat the YAML `bsf.sbi.server[0]` address/port, which beat `127.0.0.1`/`7777` (#1312; the YAML used to override the flags). What is registered with the NRF is set apart from the bind: `--sbi-advertise`, `NEXTGCORE_SBI_ADVERTISE`, the YAML `advertise`, then the bind address, never a wildcard; everything else — TLS flags, session capacity, log level — is CLI-only. The environment variables it reads are `OTEL_EXPORTER_OTLP_ENDPOINT` and `NEXTGCORE_SBI_ADVERTISE`.
 
-> **Honesty note:** BSF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Known gaps visible in the source: the `--tls` flag does **not** enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in `sbi_path.rs`); the daemon is **memory-only** by decision — bindings and subscriptions do not survive a restart, see [Durability](#durability-bsfd-is-a-memory-only-nf); and `nnrf_handler.rs`'s `handle_nf_status_notify` has no non-test caller, so inbound NF-status notifications are observed by nothing (the legacy `bsf_sbi_send_request` / `bsf_sbi_discover_and_send` placeholders that used to be named here were deleted by #234, along with the consumer-side discovery path they belonged to).
+> **Honesty note:** BSF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Known gaps visible in the source: the listener follows `NEXTGCORE_SBI_PROFILE` (#1795: mutually-authenticated TLS and a required token under the default `production`, `--tls` under `dev`); the daemon is **memory-only** by decision — bindings and subscriptions do not survive a restart, see [Durability](#durability-bsfd-is-a-memory-only-nf); and `nnrf_handler.rs`'s `handle_nf_status_notify` has no non-test caller, so inbound NF-status notifications are observed by nothing (the legacy `bsf_sbi_send_request` / `bsf_sbi_discover_and_send` placeholders that used to be named here were deleted by #234, along with the consumer-side discovery path they belonged to).
 
 ## Example configuration
 
@@ -69,7 +69,7 @@ The daemon deserializes only the fields above; unknown YAML keys are silently ig
 
 - **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). Logs go to stderr; no file sink is wired (see `--log-file` below).
 - **`global.max.ue` / `global.max.peer` are inert.** No `global` section exists in the deserialize structs; session capacity is the CLI flag `--max-sess`.
-- **`bsf.sbi.tls.*` (`enabled`/`cert`/`key`/`ca`/`min_version`) is inert.** No `tls` field exists in `SbiYaml`. TLS-related knobs are the CLI flags `--tls`/`--tls-cert`/`--tls-key` — and even those only affect the advertised scheme (see Behavior notes). The `TLS_ENABLED`/`SBI_SCHEME` variables mentioned in the YAML comment, and the `TLS_CERT`/`TLS_KEY` environment variables set by `docker-compose.yml`, are not read by this binary.
+- **`bsf.sbi.tls.*` (`enabled`/`cert`/`key`/`ca`/`min_version`) is inert.** No `tls` field exists in `SbiYaml`. TLS on the listener comes from the SBI profile, or under `dev` from the CLI flags `--tls`/`--tls-cert`/`--tls-key` (#1795). The `TLS_ENABLED`/`SBI_SCHEME` variables mentioned in the YAML comment, and the `TLS_CERT`/`TLS_KEY` environment variables set by `docker-compose.yml`, are not read by this binary.
 
 ## Command-line flags
 
@@ -85,9 +85,9 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | `--sbi-addr` | string | `bsf.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI server bind address; beats the YAML (#1312). |
 | `--sbi-advertise` | string | unset | The SBI host advertised to the NRF and in callback URIs (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `bsf.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `bsf.sbi.server[0].port`, else `7777` | SBI server port; beats the YAML (#1312). |
-| `--tls` | flag | off | Sets `tls_enabled` in the legacy context config; switches the advertised URI scheme to `https` but does not enable TLS on the HTTP/2 listener (see Behavior notes). |
-| `--tls-cert` | path | unset | TLS certificate path (stored in the legacy context config only). |
-| `--tls-key` | path | unset | TLS key path (stored in the legacy context config only). |
+| `--tls` | flag | off | Under the `dev` SBI profile, serves the listener over TLS and advertises `https` (#1795). Under `production` (the default) the listener serves mutually-authenticated TLS whatever this says. |
+| `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` | TLS certificate for `--tls`. |
+| `--tls-key` | path | `/etc/nextgcore/tls/server.key` | TLS key for `--tls`. |
 | `--nrf-uri` | string | unset | NRF URI fallback when `bsf.sbi.client.nrf` is absent. With neither set, NRF registration is skipped and the BSF runs standalone. |
 | `--max-sess` | usize | `1024` | Maximum number of PDU-session bindings in the context pool. |
 

@@ -222,6 +222,30 @@ const DEFAULT_SERVER_CERT: &str = "/etc/nextgcore/tls/server.crt";
 const DEFAULT_SERVER_KEY: &str = "/etc/nextgcore/tls/server.key";
 const DEFAULT_CLIENT_CA: &str = "/etc/nextgcore/tls/ca.crt";
 
+/// #1795: the NRF's listener under the SBI security profile. Under
+/// `production` it must serve TLS (TS 33.501 §13.1.0): with none configured
+/// this is a startup error, where it used to be a warning over a cleartext
+/// listener every production NF then failed to reach. The TLS itself stays the
+/// NRF's own (`nrf.sbi.server[0].tls`, its environment or `--tls`): the NRF is
+/// the token issuer and the root its peers bootstrap from, so a client
+/// certificate stays optional (#1617 step 2) and its token gate stays
+/// `nrf.sbi.oauth2.require_server`. Under `dev` cleartext is still allowed.
+fn check_listener_profile(
+    profile: nextgcore_sbi::security::SbiProfile,
+    server_tls: Option<&NrfServerTls>,
+) -> anyhow::Result<()> {
+    if profile.is_production() && server_tls.is_none() {
+        anyhow::bail!(
+            "the SBI profile is production but the NRF has no TLS configured, and it does not \
+             serve cleartext under production (TS 33.501 §13.1.0). Enable TLS \
+             (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls), or select \
+             {}=dev explicitly",
+            nextgcore_sbi::security::SBI_PROFILE_ENV
+        );
+    }
+    Ok(())
+}
+
 /// The TLS command-line flags.
 #[derive(Debug, Default, Clone)]
 struct TlsFlags {
@@ -1699,6 +1723,11 @@ async fn main() -> Result<()> {
             .and_then(|v| v.first())
             .and_then(|s| s.tls.as_ref()),
     )?;
+    // #1795: under the production SBI profile the NRF never serves cleartext.
+    check_listener_profile(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        server_tls.as_ref(),
+    )?;
     if let Some(tls) = &server_tls {
         tls.check_files()?;
     } else {
@@ -1709,13 +1738,7 @@ async fn main() -> Result<()> {
             "the NRF serves cleartext h2c: no NF can present a client certificate, so every \
              NFRegister / NFUpdate / NFDeregister is refused 400 INVALID_CLIENT (#1617). \
              Enable TLS (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls) \
-             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh).{}",
-            if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
-                " The SBI profile is production too: every NF on it dials its NRF over https \
-                 and cannot reach this one."
-            } else {
-                ""
-            }
+             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh)."
         );
     }
 
@@ -3178,6 +3201,15 @@ fn query_params(uri: &str) -> Vec<(String, String)> {
 
 /// Handle Subscription Create request
 async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+    handle_subscription_create_under(request, nextgcore_sbi::security::SbiProfile::resolve()).await
+}
+
+/// [`handle_subscription_create`] under an explicit SBI profile, so a test can
+/// drive the production path without the process-global override (#1869).
+async fn handle_subscription_create_under(
+    request: &SbiRequest,
+    profile: nextgcore_sbi::security::SbiProfile,
+) -> SbiResponse {
     log::info!("Subscription Create");
 
     // #1809: the verified identity this subscription is bound to, checked
@@ -3212,6 +3244,22 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
+    // #1869: under production the notification is sent over TLS with a token, so
+    // a cleartext callback is refused here, before anything is stored (TS 29.500
+    // §5.2.7.2: 400 with `invalidParams` naming the attribute).
+    if let Err(reason) =
+        nextgcore_nrfd::sbi_path::check_notification_uri(&notification_uri, profile)
+    {
+        let body = serde_json::json!({
+            "title": "Bad Request",
+            "status": 400,
+            "detail": reason,
+            "cause": "MANDATORY_IE_INCORRECT",
+            "invalidParams": [{ "param": "/nfStatusNotificationUri", "reason": reason }],
+        });
+        return SbiResponse::with_status(400)
+            .with_body(body.to_string(), "application/problem+json");
+    }
 
     // Generate subscription ID
     let subscription_id = uuid::Uuid::new_v4().to_string();
@@ -11146,6 +11194,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_replacement_notifies_profile_changed_over_the_wire() {
         use serde_json::json;
+        // #1869: the subscriber is a loopback h2c callback, which only the dev
+        // profile dials. Set and left set (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use std::sync::Mutex as StdMutex;
 
         // A deliberately unique nfType: `nf_manager()` is process-global and
@@ -11555,11 +11606,53 @@ mod tests {
         req.http.set_content(body.to_string());
         // #1809: a verified subscriber, as the production policy requires.
         req.peer_cert_nf_instance_id = Some("nrfd68-subscriber".into());
-        handle_subscription_create(&req).await
+        // These tests subscribe http callbacks: the dev profile, set on the call
+        // rather than through the process-global override (#1869).
+        handle_subscription_create_under(&req, nextgcore_sbi::security::SbiProfile::Dev).await
     }
 
     fn problem_of(resp: &SbiResponse) -> serde_json::Value {
         serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON")
+    }
+
+    /// #1869: under production an http nfStatusNotificationUri is a 400 with
+    /// `invalidParams` naming it, and nothing is stored; https is accepted.
+    #[tokio::test]
+    async fn production_subscribe_refuses_an_http_notification_uri_1869() {
+        use nextgcore_sbi::security::SbiProfile;
+        let uri = format!("http://amf-1869-{}.example/cb", uuid::Uuid::new_v4());
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": uri }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(resp.status, 400);
+        let problem = problem_of(&resp);
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+        assert_eq!(
+            problem["invalidParams"][0]["param"],
+            "/nfStatusNotificationUri"
+        );
+        assert!(
+            !nextgcore_nrfd::nnrf_handler::nf_manager()
+                .list_subscriptions()
+                .iter()
+                .any(|s| s.notification_uri == uri),
+            "a refused subscription must not be stored"
+        );
+
+        let https = uri.replacen("http://", "https://", 1);
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": https }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(
+            resp.status, 201,
+            "an https callback is accepted under production"
+        );
     }
 
     #[tokio::test]
@@ -14036,10 +14129,12 @@ mod subscription_owner_tests_1809 {
     }
 
     /// Subscribe as `cert`/`token_sub` and return the new subscription's id.
+    /// https (#1869): an http callback is refused under the production
+    /// profile, which an unset environment resolves to.
     async fn subscribe_as(cert: Option<&str>, token_sub: Option<&str>) -> String {
         let req = SbiRequest::post("/nnrf-nfm/v1/subscriptions").with_body(
             json!({
-                "nfStatusNotificationUri": "http://consumer.invalid/notify",
+                "nfStatusNotificationUri": "https://consumer.invalid/notify",
                 "reqNfInstanceId": OWNER,
             })
             .to_string(),
@@ -14237,7 +14332,7 @@ mod subscription_owner_tests_1809 {
     #[tokio::test]
     async fn under_production_an_anonymous_subscribe_is_refused() {
         assert!(NrfPolicy::default().require_subscriber_identity);
-        let uri = "http://anonymous-1809.invalid/notify";
+        let uri = "https://anonymous-1809.invalid/notify";
         let r = nrf_sbi_request_handler(subscribe_req(None, None, uri)).await;
         assert_invalid_client(&r, "no verified identity", "anonymous");
         assert!(
@@ -14254,7 +14349,7 @@ mod subscription_owner_tests_1809 {
     /// `subscription_owner`, the mixed caller gets 201.
     #[tokio::test]
     async fn a_caller_whose_identities_disagree_cannot_subscribe() {
-        let uri = "http://mixed-1809.invalid/notify";
+        let uri = "https://mixed-1809.invalid/notify";
         let r = nrf_sbi_request_handler(subscribe_req(Some(OWNER), Some(OTHER), uri)).await;
         assert_invalid_client(&r, "does not match its other verified identity", "mixed");
         assert!(
@@ -14390,5 +14485,33 @@ mod subscription_owner_tests_1809 {
         assert_eq!(r.status, 404);
         let r = nrf_sbi_request_handler(patch("no-such-1809", Some(OTHER), None)).await;
         assert_eq!(r.status, 404);
+    }
+}
+
+/// #1795: the NRF's listener follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::*;
+    use nextgcore_sbi::security::SbiProfile;
+
+    /// REVERT-VERIFIED: with the production arm of `check_listener_profile`
+    /// removed, a cleartext NRF is admitted under production and this fails.
+    #[test]
+    fn the_nrf_never_serves_cleartext_under_production_1795() {
+        let err = check_listener_profile(SbiProfile::Production, None)
+            .expect_err("a cleartext NRF is refused under production");
+        assert!(
+            err.to_string().contains("does not serve cleartext"),
+            "{err}"
+        );
+        let tls = NrfServerTls {
+            cert: "/c".into(),
+            key: "/k".into(),
+            ca: "/ca".into(),
+            client_auth: ClientAuth::Optional,
+        };
+        check_listener_profile(SbiProfile::Production, Some(&tls))
+            .expect("the NRF's own TLS is admitted under production");
+        check_listener_profile(SbiProfile::Dev, None).expect("dev keeps its cleartext NRF");
     }
 }

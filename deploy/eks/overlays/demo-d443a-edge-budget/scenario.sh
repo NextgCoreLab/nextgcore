@@ -237,8 +237,8 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
       # NEXTGCORE_SBI_PROFILE=dev as on every base NF (k8s/manifests): eesd's SBI
       # client is then h2c like theirs, except toward the NRF, which it dials over
       # TLS with its own certificate (Secret nf-tls-ees and the NEXTGCORE_NRF_TLS_*
-      # env of ees.yaml, #1617). eesd's own server and its per-operation OAuth2
-      # gate do not read the profile.
+      # env of ees.yaml, #1617). ees.yaml already sets it (#1795: eesd's listener
+      # follows the profile); its per-operation OAuth2 gate does not read it.
       "${K[@]}" set env deploy/ees -c ees NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/tmp/d443a-cca/cca.key \
         NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/tmp/d443a-cca-pub NEXTGCORE_SBI_PROFILE=dev >/dev/null || bad "ees CCA env"
       "${K[@]}" patch deploy/ees --type=json -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--nrf-uri\"},{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"https://nrf.${NAMESPACE}.svc.cluster.local:7777\"}]" \
