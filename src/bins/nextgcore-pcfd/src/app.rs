@@ -1758,26 +1758,26 @@ pub async fn handle_am_policy_delete(pol_asso_id: &str, request: &SbiRequest) ->
     }
 }
 
-/// #1992 (R32 on #1988): the caller check for an AM/UE policy association
-/// update, admitting AMF relocation (TS 29.507 §4.2.3.2, TS 29.525 §4.2.3.2):
-/// "the new AMF shall also invoke this procedure to update the Notification URI
-/// and the GUAMI" (AM; the UE policy update needs the Notification URI only).
+/// #1992 (R32 on #1988, R30 on #2013): the caller check for an AM/UE policy
+/// association update, admitting AMF relocation (TS 29.507 §4.2.3.2, TS
+/// 29.525 §4.2.3.2: the new AMF updates the Notification URI and the GUAMI).
 ///
 /// `Ok(None)`: the caller is the owner. `Ok(Some(new))`: a relocation, and
 /// `new` (the caller's verified NF Instance ID) becomes the owner. It is
-/// admitted only when the body carries the relocation members, the caller
-/// proved an identity, and its certificate is AMF-typed (no NFTypes, AMF, or a
-/// relay whose token named the consumer), as smfd's #1899 AMF change. `Err` is
-/// the 403 to send; nothing has changed yet.
-///
-/// Residual: any verified AMF can relocate an association. TS 29.507 gives the
-/// PCF no way to check the GUAMI against the caller, so nothing narrower is
-/// possible here.
-fn owner_or_amf_relocation(
+/// admitted only when all of these hold, and refused 403 otherwise, with
+/// nothing changed:
+/// - the body carries `notificationUri` and a `guami` (for UE policies too);
+/// - the caller proved an identity, over a certificate: directly, with that
+///   certificate's own NFTypes naming AMF (no NFTypes is refused), or through
+///   an SCP/SEPP certificate with the verified token `sub` as the identity. A
+///   token with no certificate is refused;
+/// - the NRF holds an AMF profile for that identity whose `guamiList` includes
+///   the claimed GUAMI ([`sbi_path::amf_serves_guami`]). Behind an SCP this is
+///   what types the caller. The check fails closed.
+async fn owner_or_amf_relocation(
     owner: Option<&str>,
     request: &SbiRequest,
     body: &serde_json::Value,
-    needs_guami: bool,
     operation: &str,
 ) -> Result<Option<String>, Box<SbiResponse>> {
     let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(owner, request, operation)
@@ -1785,29 +1785,40 @@ fn owner_or_amf_relocation(
         return Ok(None);
     };
     let refused = Box::new(refused);
-    let relocating = body
+    if body
         .get("notificationUri")
         .and_then(|v| v.as_str())
-        .is_some()
-        && (!needs_guami || body.get("guami").is_some_and(|g| g.is_object()));
+        .is_none()
+    {
+        return Err(refused);
+    }
+    let Some(guami) = body.get("guami").and_then(ue_policy::AmfGuami::from_json) else {
+        return Err(refused);
+    };
     let caller = match nextgcore_sbi::owner_binding::verified_consumer_id(request) {
         Ok(Some(caller)) => caller,
         _ => return Err(refused),
     };
     let types = &request.peer_cert_nf_types;
-    let amf_typed = types.is_empty()
-        || types.iter().any(|t| {
-            t.eq_ignore_ascii_case("AMF")
-                || nextgcore_sbi::owner_binding::RELAY_NF_TYPES
-                    .iter()
-                    .any(|r| r.eq_ignore_ascii_case(t))
-        });
-    if relocating && amf_typed {
-        log::info!("{operation}: AMF relocation, the association now belongs to {caller}");
-        Ok(Some(caller))
-    } else {
-        Err(refused)
+    let via_relay = types.iter().any(|t| {
+        nextgcore_sbi::owner_binding::RELAY_NF_TYPES
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(t))
+    });
+    // Not through a relay: the caller's own certificate must name AMF. A token
+    // with no certificate has no NFTypes, so it is refused here too.
+    if !via_relay && !types.iter().any(|t| t.eq_ignore_ascii_case("AMF")) {
+        return Err(refused);
     }
+    if !sbi_path::amf_serves_guami(&caller, &guami).await {
+        log::debug!(
+            "{operation}: relocation refused: the NRF has no AMF profile for {caller} serving \
+             the claimed GUAMI"
+        );
+        return Err(refused);
+    }
+    log::info!("{operation}: AMF relocation, the association now belongs to {caller}");
+    Ok(Some(caller))
 }
 
 pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
@@ -1842,9 +1853,10 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         ue_am.owner.as_deref(),
         request,
         &update_data,
-        true,
         "Npcf_AMPolicyControl_Update",
-    ) {
+    )
+    .await
+    {
         Ok(new) => new,
         Err(refused) => return *refused,
     };
@@ -2887,9 +2899,10 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         existing.owner.as_deref(),
         request,
         &data,
-        false,
         "Npcf_UEPolicyControl_Update",
-    ) {
+    )
+    .await
+    {
         Ok(new) => new,
         Err(refused) => return *refused,
     };
@@ -12759,16 +12772,21 @@ mod tests {
         })
     }
 
-    /// #1992 (R32 on #1988): a new AMF relocating an AM policy association
-    /// (TS 29.507 §4.2.3.2: an update carrying the Notification URI and the
-    /// GUAMI) takes it over, and the old AMF is then refused; a caller that is
-    /// not AMF-typed, one without `guami`, and an anonymous one get 403 and
-    /// change nothing. A UE policy association relocates with the Notification
-    /// URI alone (TS 29.525 §4.2.3.2).
-    /// REVERT-VERIFIED: with `owner_or_amf_relocation` refusing every
-    /// non-owner, the new AMF's update answers 403; with the `amf_typed` test
-    /// dropped, the SMF-typed caller takes it over; with the guami requirement
-    /// dropped, the guami-less update takes it over.
+    /// #1992 (R32 on #1988, R30 on #2013): a new AMF relocating an AM or UE
+    /// policy association (TS 29.507 §4.2.3.2, TS 29.525 §4.2.3.2: the update
+    /// carries the Notification URI and the GUAMI) takes it over only if the NRF
+    /// holds an AMF profile for the caller's verified identity whose `guamiList`
+    /// includes that GUAMI. A direct certificate must also name AMF in its own
+    /// NFTypes; a token with no certificate is refused. Everyone else gets 403
+    /// and changes nothing: an SMF-typed certificate, a certificate with no
+    /// NFTypes, no `guami` (for UE policies too), a token with no certificate, an
+    /// AMF claiming a GUAMI it does not serve, an AMF the NRF does not know, a
+    /// non-AMF behind the SCP, and an anonymous caller.
+    /// REVERT-VERIFIED: with the NRF check (`amf_serves_guami`) always true, the
+    /// AMF claiming a GUAMI it does not serve takes it over; with the
+    /// direct-certificate NFTypes check dropped (no NFTypes accepted), the
+    /// no-NFTypes certificate and the token-only caller do; with the `guami`
+    /// requirement dropped, the guami-less AM update does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn a_new_amf_relocating_an_association_takes_it_over_1992() {
@@ -12776,7 +12794,48 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::test_support::init_context();
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         const NEW_AMF: &str = "aaaaaaaa-1992-4000-8000-0000000000a2";
+        const OTHER_AMF: &str = "bbbbbbbb-1992-4000-8000-0000000000b2";
+        const SMF: &str = "cccccccc-1992-4000-8000-0000000000c3";
+        const SCP: &str = "dddddddd-1992-4000-8000-0000000000d4";
+        // A stand-in NRF: NEW_AMF serves GUAMI 020041, OTHER_AMF 020099, and SMF
+        // is an SMF.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        nrf.start(|req: SbiRequest| async move {
+            let uri = req
+                .http
+                .get_param("target-nf-instance-id")
+                .cloned()
+                .unwrap_or_default();
+            let profile = |id: &str, ty: &str, amf_id: &str| {
+                serde_json::json!({
+                    "nfInstanceId": id, "nfType": ty, "nfStatus": "REGISTERED",
+                    "amfInfo": { "guamiList": [
+                        { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id }
+                    ]},
+                })
+            };
+            let instances = if uri.contains(NEW_AMF) {
+                vec![profile(NEW_AMF, "AMF", "020041")]
+            } else if uri.contains(OTHER_AMF) {
+                vec![profile(OTHER_AMF, "AMF", "020099")]
+            } else if uri.contains(SMF) {
+                vec![profile(SMF, "SMF", "020041")]
+            } else {
+                vec![]
+            };
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({ "nfInstances": instances }))
+                .unwrap_or_else(|_| SbiResponse::with_status(500))
+        })
+        .await
+        .expect("stand-in NRF starts");
+        let _nrf_guard =
+            crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{}", addr.port())).await;
+
         let location_of = |resp: &SbiResponse| {
             let loc = resp
                 .http
@@ -12789,15 +12848,25 @@ mod tests {
                 .map(|i| loc[i..].to_string())
                 .expect("a PCF path")
         };
-        let as_caller = |mut r: SbiRequest, token: Option<&str>, types: &[&str]| {
-            r.oauth2_subject = token.map(str::to_string);
-            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
-            r
+        // (certificate id, certificate NFTypes, token sub)
+        let as_caller =
+            |mut r: SbiRequest, cert: Option<&str>, types: &[&str], token: Option<&str>| {
+                r.peer_cert_nf_instance_id = cert.map(str::to_string);
+                r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+                r.oauth2_subject = token.map(str::to_string);
+                r
+            };
+        let guami = |amf_id: &str| serde_json::json!({ "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id });
+        let relocation = |kind: &str, g: Option<serde_json::Value>| {
+            let mut b = serde_json::json!({
+                "notificationUri": format!("http://127.0.0.1:9/namf-callback/v1/{kind}/new-1992"),
+            });
+            if let Some(g) = g {
+                b["guami"] = g;
+            }
+            b
         };
-        let relocation = serde_json::json!({
-            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/new-1992",
-            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "020041" },
-        });
+
         // The AM policy is created by TEST_CONSUMER_1865 (the old AMF).
         let am = pcf_sbi_request_handler(make_request(
             "POST",
@@ -12812,60 +12881,108 @@ mod tests {
         assert_eq!(am.status, 201, "{:?}", am.http.content);
         let am_path = location_of(&am);
         let update = format!("{am_path}/update");
+        let am_id = am_path.rsplit('/').next().unwrap().to_string();
         let owner_of_am = || {
-            let id = am_path.rsplit('/').next().unwrap().to_string();
             pcf_self()
                 .read()
                 .unwrap()
-                .ue_am_find_by_association_id(&id)
+                .ue_am_find_by_association_id(&am_id)
                 .and_then(|a| a.owner)
         };
-        let mut no_guami = relocation.clone();
-        no_guami.as_object_mut().unwrap().remove("guami");
-        for (who, req) in [
+        let am_reloc = || relocation("am-policy", Some(guami("020041")));
+        let refused: Vec<(&str, SbiRequest)> = vec![
             (
-                "not AMF-typed",
+                "SMF-typed certificate",
                 as_caller(
-                    make_request("POST", &update, Some(relocation.clone())),
-                    Some(NEW_AMF),
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SMF),
                     &["SMF"],
+                    None,
+                ),
+            ),
+            (
+                "certificate with no NFTypes",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(NEW_AMF),
+                    &[],
+                    None,
                 ),
             ),
             (
                 "no guami",
                 as_caller(
-                    make_request("POST", &update, Some(no_guami)),
+                    make_request("POST", &update, Some(relocation("am-policy", None))),
                     Some(NEW_AMF),
                     &["AMF"],
+                    None,
+                ),
+            ),
+            (
+                "a token with no certificate",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    None,
+                    &[],
+                    Some(NEW_AMF),
+                ),
+            ),
+            (
+                "an AMF claiming a GUAMI it does not serve",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SCP),
+                    &["SCP"],
+                    Some(OTHER_AMF),
+                ),
+            ),
+            (
+                "an AMF the NRF does not know",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some("eeeeeeee-1992-4000-8000-0000000000e5"),
+                    &["AMF"],
+                    None,
+                ),
+            ),
+            (
+                "a non-AMF behind the SCP",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SCP),
+                    &["SCP"],
+                    Some(SMF),
                 ),
             ),
             (
                 "anonymous",
                 as_caller(
-                    make_request("POST", &update, Some(relocation.clone())),
+                    make_request("POST", &update, Some(am_reloc())),
                     None,
                     &[],
+                    None,
                 ),
             ),
-        ] {
+        ];
+        for (who, req) in refused {
             let resp = pcf_sbi_request_handler(req).await;
             assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
             assert_eq!(owner_of_am().as_deref(), Some(TEST_CONSUMER_1865), "{who}");
         }
-        // The new AMF relocates it, and owns it.
+        // The new AMF, directly with its AMF certificate, relocates it.
         let resp = pcf_sbi_request_handler(as_caller(
-            make_request("POST", &update, Some(relocation.clone())),
+            make_request("POST", &update, Some(am_reloc())),
             Some(NEW_AMF),
             &["AMF"],
+            None,
         ))
         .await;
         assert_eq!(resp.status, 200, "{:?}", resp.http.content);
         assert_eq!(owner_of_am().as_deref(), Some(NEW_AMF));
-        // The old AMF is now refused.
         let resp = pcf_sbi_request_handler(make_request("GET", &am_path, None)).await;
         assert_eq!(resp.status, 403, "the old AMF no longer owns it");
 
-        // A UE policy association relocates with the Notification URI alone.
+        // A UE policy association needs the GUAMI too, and the same check.
         let ue = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-ue-policy-control/v1/policies",
@@ -12879,20 +12996,25 @@ mod tests {
         assert_eq!(ue.status, 201, "{:?}", ue.http.content);
         let ue_path = location_of(&ue);
         let ue_id = ue_path.rsplit('/').next().unwrap().to_string();
-        let ue_reloc = serde_json::json!({
-            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/new-1992"
-        });
+        let ue_update = format!("{ue_path}/update");
         let resp = pcf_sbi_request_handler(as_caller(
-            make_request("POST", &format!("{ue_path}/update"), Some(ue_reloc.clone())),
+            make_request("POST", &ue_update, Some(relocation("ue-policy", None))),
+            Some(SCP),
+            &["SCP"],
             Some(NEW_AMF),
-            &["SMF"],
         ))
         .await;
-        assert_eq!(resp.status, 403, "UE: not AMF-typed");
+        assert_eq!(resp.status, 403, "UE: no guami");
+        // Behind an SCP, the new AMF's token: the NRF check is what admits it.
         let resp = pcf_sbi_request_handler(as_caller(
-            make_request("POST", &format!("{ue_path}/update"), Some(ue_reloc)),
+            make_request(
+                "POST",
+                &ue_update,
+                Some(relocation("ue-policy", Some(guami("020041")))),
+            ),
+            Some(SCP),
+            &["SCP"],
             Some(NEW_AMF),
-            &[],
         ))
         .await;
         assert_eq!(resp.status, 200, "{:?}", resp.http.content);
@@ -12902,6 +13024,8 @@ mod tests {
                 .as_deref(),
             Some(NEW_AMF)
         );
+        drop(_nrf_guard);
+        nrf.stop().await.ok();
     }
 
     /// #1937: AM, UE and SM policy associations and AF app sessions (and an
