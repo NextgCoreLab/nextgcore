@@ -296,9 +296,11 @@ async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
         assert!(!binding_id.is_empty());
 
         // Deregister (DELETE /pcfBindings/{id}) -> 204 from the real handler.
-        assert!(pcf_deregister_bsf_binding(&binding_id)
-            .await
-            .expect("bsf delete ok"));
+        assert_eq!(
+            pcf_deregister_bsf_binding(&binding_id).await,
+            nextgcore_pcfd::sbi_path::BsfDeregistration::Delivered,
+            "bsf delete ok"
+        );
     };
     tokio::time::timeout(Duration::from_secs(15), run)
         .await
@@ -412,9 +414,11 @@ async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
             "the BSF must hold the UE's new address: {stored}"
         );
 
-        assert!(pcf_deregister_bsf_binding(&binding_id)
-            .await
-            .expect("bsf delete ok"));
+        assert_eq!(
+            pcf_deregister_bsf_binding(&binding_id).await,
+            nextgcore_pcfd::sbi_path::BsfDeregistration::Delivered,
+            "bsf delete ok"
+        );
     };
     tokio::time::timeout(Duration::from_secs(15), run)
         .await
