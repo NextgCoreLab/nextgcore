@@ -1,0 +1,20 @@
+# EKS: udmd's durable state file on a gp3 PersistentVolumeClaim (#1885).
+#
+# k8s/components/udm-durable-state (the claim, the mount, the env, one Recreate
+# replica), with the claim on gp3 (EBS CSI, installed by the CloudFormation
+# template), as profiles/5g/patches/storage-class.yaml does for MongoDB: an
+# unbound claim would leave the udm pod Pending.
+#
+# deploy-eks.sh adds it with UDM_DURABLE_STATE=pvc; see README.md, "UDM durable
+# state".
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+components:
+  - ../../../../k8s/components/udm-durable-state
+
+patches:
+  - path: pvc-gp3.yaml
+    target:
+      kind: PersistentVolumeClaim
+      name: udm-state

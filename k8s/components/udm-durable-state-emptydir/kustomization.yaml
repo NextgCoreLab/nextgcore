@@ -1,0 +1,20 @@
+# udmd's durable state file on an emptyDir (#1836, #1885), for clusters with no
+# volume provisioner.
+#
+# The trade-off: an emptyDir lives as long as the pod. It survives a udmd
+# container restart (a crash, an OOM kill, a liveness failure), and udmd
+# restores its SDM subscriptions, UDR legs and queued am-data changes. It does
+# NOT survive the pod being deleted, evicted, rescheduled or replaced by a
+# rollout: the new pod starts with no state, as without this component. For
+# that, use ../udm-durable-state (a PersistentVolumeClaim).
+#
+# Each pod has its own emptyDir, so each replica writes its own file.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# target by kind and name, not namespace (see ../udm-durable-state).
+patches:
+  - path: deployment.yaml
+    target:
+      kind: Deployment
+      name: udm

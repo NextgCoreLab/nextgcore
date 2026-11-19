@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: udm-state
+  namespace: nextg-system
+spec:
+  storageClassName: gp3

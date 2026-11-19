@@ -208,6 +208,21 @@ impl ConnectTarget {
     }
 }
 
+/// A host the client is about to dial OTHER than the one it was built for: a
+/// 307/308 redirect's target or an overload alternate (#1915). Handed to the
+/// caller's [`SbiTargetPolicy`] before any byte is sent there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SbiTarget {
+    pub scheme: UriScheme,
+    pub host: String,
+    pub port: u16,
+}
+
+/// A caller's rule for which [`SbiTarget`]s this client may reach (#1915).
+/// `Err` carries the reason; the target is then never dialled, so neither the
+/// request nor its `Authorization` reach it.
+pub type SbiTargetPolicy = Arc<dyn Fn(&SbiTarget) -> Result<(), String> + Send + Sync>;
+
 /// SBI Client configuration
 #[derive(Debug, Clone)]
 pub struct SbiClientConfig {
@@ -380,6 +395,12 @@ pub struct SbiClient {
     /// keyed by producer, echoed back as `3gpp-Sbi-Routing-Binding` on later
     /// requests to the same producer (TS 29.500 §6.12.2).
     bindings: Arc<StdMutex<HashMap<String, String>>>,
+    /// #1915: the caller's rule for redirect and alternate targets, checked
+    /// after the built-in no-downgrade rule. `None`: that rule alone.
+    target_policy: Option<SbiTargetPolicy>,
+    /// #1915: whether a 307/308 is followed at all (after the checks). `false`
+    /// hands every redirect back to the caller verbatim.
+    follow_redirects: bool,
 }
 
 impl SbiClient {
@@ -399,6 +420,54 @@ impl SbiClient {
             overload: Arc::new(OverloadRegistry::new()),
             alternates: Arc::new(Vec::new()),
             bindings: Arc::new(StdMutex::new(HashMap::new())),
+            target_policy: None,
+            follow_redirects: true,
+        }
+    }
+
+    /// Check every redirect and alternate target against `policy` before it is
+    /// dialled (#1915, TS 29.500 §6.10.9: a consumer applies its own security
+    /// policy to the target a redirect names). A target the policy refuses is
+    /// never contacted: a redirect to it fails the request, an alternate is
+    /// skipped. Applies after the built-in rule that `https` never redirects to
+    /// `http`.
+    pub fn with_target_policy(mut self, policy: SbiTargetPolicy) -> Self {
+        self.target_policy = Some(policy);
+        self
+    }
+
+    /// Never follow a 307/308: hand it back to the caller verbatim (#1915).
+    pub fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
+    }
+
+    /// Whether `target` is this client's configured origin: the same scheme,
+    /// normalised host and port (#1915).
+    fn same_origin(&self, target: &ConnectTarget) -> bool {
+        target.scheme == self.config.scheme
+            && target.port == self.config.port
+            && target.host == canonical_host(&self.config.host)
+    }
+
+    /// Whether this client may dial `target`, a host other than the configured
+    /// one (#1915). Built-in: a client configured for `https` never moves to
+    /// `http` (no downgrade, so no bearer or SUPI in cleartext). Then the
+    /// caller's [`SbiTargetPolicy`], if any.
+    fn check_target(&self, target: &ConnectTarget) -> Result<(), String> {
+        if self.config.scheme == UriScheme::Https && target.scheme != UriScheme::Https {
+            return Err(format!(
+                "{} would downgrade an https client to cleartext",
+                target.base_uri()
+            ));
+        }
+        match &self.target_policy {
+            Some(policy) => policy(&SbiTarget {
+                scheme: target.scheme,
+                host: target.host.clone(),
+                port: target.port,
+            }),
+            None => Ok(()),
         }
     }
 
@@ -1099,6 +1168,8 @@ impl SbiClient {
     fn first_healthy_alternate(&self, now: Instant) -> Option<ConnectTarget> {
         self.alternates
             .iter()
+            // #1915: an alternate the target policy refuses is never chosen.
+            .filter(|alt| self.check_target(alt).is_ok())
             .find(|alt| {
                 self.overload
                     .effective_oci(&alt.base_uri(), now)
@@ -1192,11 +1263,16 @@ impl SbiClient {
                             // so this cannot break the default or E2E paths -- it
                             // only stops a deployment that wanted authentication
                             // from silently losing it.
+                            // #1867: the URI can be a callback carrying its
+                            // notified NF's token (`.../dereg-notify/{token}`),
+                            // so it is logged redacted, as on every other path
+                            // (#940). The error is redacted too: it is free text.
                             log::error!(
                                 "OAuth2 token acquisition failed; refusing to send {} {} \
-                                 unauthenticated: {e}",
+                                 unauthenticated: {}",
                                 request.header.method,
-                                request.header.uri
+                                crate::log_redact::redact_callback_tokens(&request.header.uri),
+                                crate::log_redact::redact_callback_tokens(&e.to_string())
                             );
                             return Err(SbiError::AuthenticationFailed(format!(
                                 "could not obtain an access token for scope '{scope}': {e}"
@@ -1322,9 +1398,40 @@ impl SbiClient {
             let response = self.send_once(&request, target.as_ref()).await?;
 
             // sbi-04: follow a 307/308 redirect when a budget remains.
-            if matches!(response.status, 307 | 308) {
+            if self.follow_redirects && matches!(response.status, 307 | 308) {
                 match next_redirect(&response)? {
                     Some((new_uri, new_target)) => {
+                        // #1915, safe by default: with no caller policy only a
+                        // same-origin redirect is followed. A cross-origin one
+                        // goes back to the caller unfollowed, as with
+                        // `without_redirects`, so the request and its
+                        // Authorization never reach an origin nobody admitted
+                        // (credentials never cross origins, as in curl and
+                        // browsers). A caller that wants cross-origin redirects
+                        // (TS 29.500 §6.10.9) opts in with `with_target_policy`.
+                        if self.target_policy.is_none() && !self.same_origin(&new_target) {
+                            log::debug!(
+                                "not following a cross-origin {} redirect to {}: no target \
+                                 policy admits other origins",
+                                response.status,
+                                new_target.base_uri()
+                            );
+                            return Ok(response);
+                        }
+                        // #1915: the redirect target is checked before anything
+                        // is sent there. Refused, it is never dialled, so the
+                        // request and its Authorization stay here.
+                        if let Err(reason) = self.check_target(&new_target) {
+                            log::warn!(
+                                "refusing {} redirect to {}: {reason}",
+                                response.status,
+                                new_target.base_uri()
+                            );
+                            return Err(SbiError::ClientError(format!(
+                                "redirect to {} refused: {reason}",
+                                new_target.base_uri()
+                            )));
+                        }
                         if redirects_left == 0 {
                             return Err(SbiError::ClientError(
                                 "redirect loop: exceeded maximum redirects".into(),
@@ -1764,38 +1871,118 @@ fn next_redirect(response: &SbiResponse) -> SbiResult<Option<(String, ConnectTar
 
 /// Parse an absolute `scheme://host[:port][/...]` URI into a dial target.
 /// Defaults the port to 80 (`http`) / 443 (`https`) when absent.
+///
+/// #1915 review: the authority is normalised before any policy sees it, so a
+/// string-compare allow-list cannot be fooled. Userinfo (`a@b`) is refused; the
+/// authority ends at the first `/`, `?` or `#`; an IPv6 literal is unbracketed
+/// (`[::1]` with no port takes the default); and the host goes through
+/// [`canonical_host`], so `127.1`, `0x7f.1` and `2130706433` all become
+/// `127.0.0.1`.
 fn parse_connect_target(uri: &str) -> SbiResult<ConnectTarget> {
+    let invalid = |why: &str| SbiError::InvalidUri(format!("redirect target {why}: {uri}"));
     let (scheme, rest) = if let Some(r) = uri.strip_prefix("https://") {
         (UriScheme::Https, r)
     } else if let Some(r) = uri.strip_prefix("http://") {
         (UriScheme::Http, r)
     } else {
-        return Err(SbiError::InvalidUri(format!(
-            "redirect target is not an absolute URI: {uri}"
-        )));
+        return Err(invalid("is not an absolute URI"));
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => {
-            let port = p.parse::<u16>().map_err(|_| {
-                SbiError::InvalidUri(format!("invalid port in redirect target: {uri}"))
-            })?;
-            (h.to_string(), port)
-        }
-        None => {
-            let default_port = match scheme {
-                UriScheme::Https => 443,
-                _ => 80,
-            };
-            (authority.to_string(), default_port)
-        }
+    let default_port = match scheme {
+        UriScheme::Https => 443,
+        _ => 80,
     };
-    if host.is_empty() {
-        return Err(SbiError::InvalidUri(format!(
-            "redirect target has no host: {uri}"
-        )));
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        return Err(invalid("carries userinfo"));
     }
+    let parse_port = |p: &str| p.parse::<u16>().map_err(|_| invalid("has an invalid port"));
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (v6, after) = inner
+            .split_once(']')
+            .ok_or_else(|| invalid("has an unterminated IPv6 literal"))?;
+        let v6: std::net::Ipv6Addr = v6
+            .parse()
+            .map_err(|_| invalid("has an invalid IPv6 literal"))?;
+        let port = match after {
+            "" => default_port,
+            p => parse_port(
+                p.strip_prefix(':')
+                    .ok_or_else(|| invalid("has an invalid port"))?,
+            )?,
+        };
+        (v6.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), parse_port(p)?),
+            None => (authority.to_string(), default_port),
+        }
+    };
+    let is_v6 = host.parse::<std::net::Ipv6Addr>().is_ok();
+    if host.is_empty() || (host.contains(':') && !is_v6) {
+        return Err(invalid("has no usable host"));
+    }
+    let host = if is_v6 { host } else { canonical_host(&host) };
     Ok(ConnectTarget { scheme, host, port })
+}
+
+/// A host as policies compare it (#1915): lowercase, no trailing root dot, no
+/// IPv6 brackets, and an IPv4 literal in any inet_aton form (`127.1`,
+/// `0x7f.1`, `017700000001`, `2130706433`) rewritten dotted-quad, because the
+/// resolver dials all of those as the same address.
+fn canonical_host(host: &str) -> String {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        return v6.to_string();
+    }
+    match inet_aton(&host) {
+        Some(v4) => v4.to_string(),
+        None => host,
+    }
+}
+
+/// inet_aton(3): one to four parts, each decimal, `0x` hex or leading-`0`
+/// octal, the last part filling the remaining bytes. `None` for anything that
+/// is not such a literal (a DNS name).
+fn inet_aton(s: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let num = |p: &str| -> Option<u64> {
+        if p.is_empty() {
+            return None;
+        }
+        if let Some(h) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            return if h.is_empty() {
+                Some(0)
+            } else {
+                u64::from_str_radix(h, 16).ok()
+            };
+        }
+        if p.len() > 1 && p.starts_with('0') {
+            return u64::from_str_radix(&p[1..], 8).ok();
+        }
+        p.parse::<u64>().ok()
+    };
+    let vals: Vec<u64> = parts.iter().map(|p| num(p)).collect::<Option<_>>()?;
+    let (last, head) = vals.split_last()?;
+    if head.iter().any(|v| *v > 255) {
+        return None;
+    }
+    let rest_bits = 8 * (4 - head.len() as u32);
+    if rest_bits < 64 && *last >= 1u64 << rest_bits {
+        return None;
+    }
+    let mut ip: u64 = 0;
+    for (i, v) in head.iter().enumerate() {
+        ip |= v << (24 - 8 * i as u32);
+    }
+    ip |= last;
+    Some(std::net::Ipv4Addr::from(ip as u32))
 }
 
 /// sbi-05: which response status codes are retryable. Mirrors the HTTP arms of
@@ -3310,7 +3497,9 @@ mod tests {
         )
         .await;
 
-        let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
+        // #1915: a cross-origin redirect is followed only on an explicit opt-in.
+        let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port())
+            .with_target_policy(admit_all());
         let request =
             SbiRequest::post("/nudm-sdm/v2/imsi-1/x").with_body("payload-307", "text/plain");
         let response = client
@@ -3347,7 +3536,9 @@ mod tests {
         )
         .await;
 
-        let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
+        // #1915: a cross-origin redirect is followed only on an explicit opt-in.
+        let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port())
+            .with_target_policy(admit_all());
         let response = client
             .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
             .await
@@ -4309,5 +4500,298 @@ mod tests {
         let ended = watch.records();
         assert!(ended.is_empty(), "no connection to {peer} ended: {ended:?}");
         server.stop().await.expect("stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #1915: redirect and alternate targets are checked before any dial
+    // ------------------------------------------------------------------
+
+    fn only_host(host: &'static str) -> SbiTargetPolicy {
+        Arc::new(move |t: &SbiTarget| {
+            if t.host == host {
+                Ok(())
+            } else {
+                Err(format!("{} is not {host}", t.host))
+            }
+        })
+    }
+
+    /// #1915: a redirect to a host the caller's policy refuses is never dialled,
+    /// so the request and its Authorization never reach it; the request fails
+    /// naming the refusal. The same redirect with a policy admitting the host is
+    /// followed, so the zero is the policy's.
+    #[tokio::test]
+    async fn a_redirect_the_target_policy_refuses_is_never_dialled_1915() {
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let final_addr = serve_echo_method_body(final_count.clone()).await;
+        let redir_count = Arc::new(AtomicUsize::new(0));
+        // `localhost` reaches the same listener as 127.0.0.1, so following it
+        // would be observable on `final_count`.
+        let redir = serve_fixed(
+            307,
+            vec![(
+                "Location".to_string(),
+                format!("http://localhost:{}/redirected", final_addr.port()),
+            )],
+            "redirecting",
+            redir_count.clone(),
+        )
+        .await;
+        let request = || {
+            SbiRequest::post("/nudm-uecm/v1/imsi-1/registrations")
+                .with_header("Authorization", "Bearer must-not-leave")
+                .with_body("payload", "text/plain")
+        };
+
+        let refusing = SbiClient::with_host_port("127.0.0.1", redir.port())
+            .with_target_policy(only_host("127.0.0.1"));
+        let err = refusing.send_request(request()).await.unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(
+            final_count.load(Ordering::SeqCst),
+            0,
+            "the refused target is never dialled"
+        );
+
+        let admitting = SbiClient::with_host_port("127.0.0.1", redir.port())
+            .with_target_policy(only_host("localhost"));
+        let response = admitting.send_request(request()).await.expect("followed");
+        assert_eq!(response.status, 200);
+        assert_eq!(final_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// #1915: an https client never follows a redirect to http (no downgrade),
+    /// with or without a caller policy; https stays admissible.
+    #[test]
+    fn an_https_client_never_redirects_to_cleartext_1915() {
+        let client = SbiClient::new(SbiClientConfig::new("udm.example", 443).with_https());
+        let to = |scheme| ConnectTarget {
+            scheme,
+            host: "udm2.example".to_string(),
+            port: 8443,
+        };
+        let err = client.check_target(&to(UriScheme::Http)).unwrap_err();
+        assert!(err.contains("downgrade"), "{err}");
+        assert!(client.check_target(&to(UriScheme::Https)).is_ok());
+        let with_policy = client.with_target_policy(Arc::new(|_: &SbiTarget| Ok(())));
+        assert!(with_policy.check_target(&to(UriScheme::Http)).is_err());
+    }
+
+    /// #1915: `without_redirects` hands the 307 back verbatim and dials nothing.
+    #[tokio::test]
+    async fn without_redirects_a_307_is_returned_not_followed_1915() {
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let final_addr = serve_echo_method_body(final_count.clone()).await;
+        let redir = serve_fixed(
+            307,
+            vec![(
+                "Location".to_string(),
+                format!("http://{final_addr}/redirected"),
+            )],
+            "redirecting",
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", redir.port()).without_redirects();
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await
+            .expect("a 307 is a response");
+        assert_eq!(response.status, 307);
+        assert_eq!(final_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// #1915: the OCI alternate path runs the same check, so an alternate the
+    /// policy refuses is never chosen and never dialled.
+    #[tokio::test]
+    async fn an_alternate_the_target_policy_refuses_is_never_dialled_1915() {
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let primary = serve_fixed(
+            503,
+            vec![oci_header(60)],
+            "overloaded",
+            primary_hits.clone(),
+        )
+        .await;
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let alternate = serve_fixed(200, vec![], "served", alt_hits.clone()).await;
+        let client = SbiClient::with_host_port("127.0.0.1", primary.port())
+            .with_alternate_targets([("localhost", alternate.port())])
+            .with_target_policy(only_host("127.0.0.1"));
+
+        let _ = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await;
+        let _ = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await;
+        assert_eq!(
+            alt_hits.load(Ordering::SeqCst),
+            0,
+            "a refused alternate is never dialled"
+        );
+    }
+
+    fn admit_all() -> SbiTargetPolicy {
+        Arc::new(|_: &SbiTarget| Ok(()))
+    }
+
+    /// #1915, safe by default: with no target policy a cross-origin 307 (here
+    /// another port) is handed back unfollowed and the other origin gets
+    /// nothing; a same-origin redirect is still followed.
+    #[tokio::test]
+    async fn by_default_a_cross_origin_redirect_is_returned_not_followed_1915() {
+        let other_count = Arc::new(AtomicUsize::new(0));
+        let other = serve_echo_method_body(other_count.clone()).await;
+        let redir = serve_fixed(
+            307,
+            vec![("Location".to_string(), format!("http://{other}/moved"))],
+            "redirecting",
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", redir.port());
+        let response = client
+            .send_request(
+                SbiRequest::get("/nudm-sdm/v2/imsi-1/x")
+                    .with_header("Authorization", "Bearer must-not-leave"),
+            )
+            .await
+            .expect("a 307 is a response");
+        assert_eq!(response.status, 307, "returned to the caller, not followed");
+        assert_eq!(
+            other_count.load(Ordering::SeqCst),
+            0,
+            "the other origin got nothing"
+        );
+
+        // Same origin (`127.1` is 127.0.0.1, same port): followed by default.
+        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let seen = port.clone();
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let port = seen.load(Ordering::SeqCst);
+                async move {
+                    if req.header.uri.starts_with("/start") {
+                        SbiResponse::with_status(307)
+                            .with_header("Location", format!("http://127.1:{port}/end"))
+                    } else {
+                        SbiResponse::with_status(200)
+                    }
+                }
+            })
+            .await;
+        port.store(addr.port(), Ordering::SeqCst);
+        let response = SbiClient::with_host_port("127.0.0.1", addr.port())
+            .send_request(SbiRequest::get("/start"))
+            .await
+            .expect("same-origin redirect followed");
+        assert_eq!(
+            response.status, 200,
+            "a same-origin redirect is followed by default"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    /// #1915: end to end, an https client that receives a 307 to `http://`
+    /// dials nothing there, with no policy (cross-origin, returned) and with an
+    /// admit-all policy (the no-downgrade rule refuses it).
+    #[tokio::test]
+    async fn an_https_redirect_to_cleartext_dials_nothing_end_to_end_1915() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("cert");
+        let dir = tempfile::Builder::new()
+            .prefix("sbi-1915-")
+            .tempdir()
+            .expect("dir");
+        let key_path = dir.path().join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        let key_path = key_path.to_string_lossy().into_owned();
+        let cert_path = cert_path.to_string_lossy().into_owned();
+
+        let plain_count = Arc::new(AtomicUsize::new(0));
+        let plain = serve_echo_method_body(plain_count.clone()).await;
+        let location = format!("http://localhost:{}/downgraded", plain.port());
+        let (server, addr) = crate::test_support::sbi_server_on_free_port_with(
+            |addr| {
+                crate::server::SbiServerConfig::new(addr)
+                    .with_tls(key_path.clone(), cert_path.clone())
+            },
+            move |_req: SbiRequest| {
+                let location = location.clone();
+                async move { SbiResponse::with_status(307).with_header("Location", location) }
+            },
+        )
+        .await;
+        let https_client = || {
+            let mut config = SbiClientConfig::new("localhost", addr.port()).with_https();
+            config.ca_cert = Some(cert_path.clone());
+            SbiClient::new(config)
+        };
+        let request = || {
+            SbiRequest::get("/nudm-sdm/v2/imsi-1/x").with_header("Authorization", "Bearer secret")
+        };
+
+        let response = https_client()
+            .send_request(request())
+            .await
+            .expect("the 307 itself arrives over TLS");
+        assert_eq!(response.status, 307, "cross-origin: handed back");
+
+        let err = https_client()
+            .with_target_policy(admit_all())
+            .send_request(request())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("downgrade"), "{err}");
+        assert_eq!(
+            plain_count.load(Ordering::SeqCst),
+            0,
+            "nothing reached the cleartext host"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    /// #1915 review m1/m2: what a policy is handed is normalised. Userinfo is
+    /// refused, `?`/`#` end the authority, IPv4 literals in any inet_aton form
+    /// are dotted-quad, IPv6 is unbracketed with the scheme's default port.
+    #[test]
+    fn redirect_targets_are_normalised_before_any_policy_1915() {
+        let t = |u: &str| parse_connect_target(u).map(|t| (t.host, t.port));
+        assert!(t("http://good.example@127.0.0.1:80/x").is_err(), "userinfo");
+        assert_eq!(
+            t("http://127.1:8080/x").unwrap(),
+            ("127.0.0.1".to_string(), 8080)
+        );
+        assert_eq!(t("http://0x7f.1/x").unwrap(), ("127.0.0.1".to_string(), 80));
+        assert_eq!(
+            t("http://2130706433:81").unwrap(),
+            ("127.0.0.1".to_string(), 81)
+        );
+        assert_eq!(
+            t("http://017700000001/").unwrap(),
+            ("127.0.0.1".to_string(), 80)
+        );
+        assert_eq!(t("https://[::1]/x").unwrap(), ("::1".to_string(), 443));
+        assert_eq!(
+            t("https://[::1]:8443/x").unwrap(),
+            ("::1".to_string(), 8443)
+        );
+        assert_eq!(
+            t("http://UDM.Example.:7777?x").unwrap(),
+            ("udm.example".to_string(), 7777)
+        );
+        assert!(t("http://127.0.0.1#@evil.example/x").is_ok_and(|(h, _)| h == "127.0.0.1"));
+        assert!(t("http://[::1/x").is_err());
+        assert!(
+            t("http://1.2.3.4.5/x").is_ok_and(|(h, _)| h == "1.2.3.4.5"),
+            "not an IPv4 literal"
+        );
+        assert_eq!(canonical_host("[FD00::1]"), "fd00::1");
     }
 }

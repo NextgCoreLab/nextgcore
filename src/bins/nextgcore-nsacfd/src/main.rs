@@ -256,6 +256,28 @@ fn with_nsacf_context<T>(f: impl FnOnce(&NsacfContext) -> T) -> Option<T> {
     result
 }
 
+/// #1795: the NSACF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with NSACF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Nsacf,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -390,8 +412,9 @@ async fn main() -> Result<()> {
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         nrf_uri_cfg.as_deref(),
     ));
@@ -416,6 +439,16 @@ async fn main() -> Result<()> {
                 .unwrap_or("UNCONFIGURED")
         );
     }
+
+    // #1795: the listener follows the SBI security profile.
+
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        nrf_uri_cfg.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
 
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
@@ -574,7 +607,12 @@ async fn nsacf_admin_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let method = method.as_str();
     let uri = request.header.uri.clone();
-    log::debug!("NSACF admin: {method} {uri}");
+    // #1867: logged through the redactor, as the SBI handler's line is; the admin
+    // listener (#1912) shares the URI shapes, so the same rule applies.
+    log::debug!(
+        "NSACF admin: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
     let path = uri.split('?').next().unwrap_or(&uri);
     let parts: Vec<&str> = path
         .trim_start_matches('/')
@@ -611,7 +649,10 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = method.as_str();
     let uri = request.header.uri.clone();
 
-    log::debug!("NSACF SBI: {method} {uri}");
+    log::debug!(
+        "NSACF SBI: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(&uri);
@@ -5379,5 +5420,19 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming NSACF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Nsacf,
+            super::sbi_listener_config,
+        );
     }
 }

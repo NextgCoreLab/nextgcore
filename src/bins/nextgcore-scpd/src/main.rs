@@ -132,6 +132,34 @@ struct Args {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// #1795: the SCP's listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or
+/// `scp.sbi.tls` said) and the client certificate verified against its CA
+/// (TS 33.501 §13.1.0, §13.3). No access token is required OF the SCP: in
+/// indirect communication the token a consumer sends is for the producer,
+/// which verifies it (TS 33.501 §13.4.1.2), so an SCP that demanded one for
+/// itself would refuse every proxied request. A missing certificate fails
+/// startup, naming it. Under `dev` the config is left as the SCP's own TLS
+/// settings made it.
+fn sbi_listener_config(
+    config: nextgcore_sbi::server::SbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+) -> nextgcore_sbi::SbiResult<nextgcore_sbi::server::SbiServerConfig> {
+    let policy = nextgcore_sbi::security::SbiSecurityPolicy {
+        oauth2_required: false,
+        ..policy.clone()
+    };
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        &policy,
+        nextgcore_sbi::types::NfType::Scp,
+        // Only read for a token requirement, which the SCP does not have.
+        "",
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -264,7 +292,11 @@ async fn main() -> Result<()> {
     // TLS: --tls forces on; otherwise honour scp.sbi.tls.enabled. cert/key
     // come from the flag first, then the config.
     let tls_cfg = scp_yaml.section().sbi.as_ref().and_then(|s| s.tls.as_ref());
-    let tls_enabled = args.tls || tls_cfg.and_then(|t| t.enabled).unwrap_or(false);
+    let own_tls = args.tls || tls_cfg.and_then(|t| t.enabled).unwrap_or(false);
+    // #1795: the listener serves TLS under its own setting or the production
+    // SBI profile, and the lifecycle state says what it serves.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let tls_enabled = own_tls || sbi_profile.is_production();
     let tls_cert = args
         .tls_cert
         .clone()
@@ -342,7 +374,7 @@ async fn main() -> Result<()> {
         &http_config.addr,
         "--sbi-addr (or SCP_SBI_ADDR, or scp.sbi.server[0].address in the config file)",
     );
-    if tls_enabled {
+    if own_tls {
         match (&tls_key, &tls_cert) {
             (Some(key), Some(cert)) => {
                 http_config = http_config.with_tls(key.clone(), cert.clone());
@@ -352,6 +384,13 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // #1795: the listener follows the SBI security profile.
+    let http_config = sbi_listener_config(
+        http_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
     let http_server = nextgcore_sbi::server::SbiServer::new(http_config);
     let handler_proxy = scp_proxy.clone();
     http_server
@@ -697,5 +736,89 @@ scp:
         ));
         assert_eq!(connect_default, Duration::from_secs(2));
         assert_eq!(request_default, Duration::from_secs(10));
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::sbi_listener_config;
+    use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+    use nextgcore_sbi::server::SbiServerConfig;
+    use nextgcore_sbi::types::UriScheme;
+    use std::net::SocketAddr;
+
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production case serves cleartext and the first assertion fails.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        let dir = std::env::temp_dir().join(format!(
+            "scpd-1795-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("scp.crt"),
+                key: file("scp.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+
+        for base in [
+            SbiServerConfig::new(addr),
+            SbiServerConfig::new(addr).with_tls("/own.key", "/own.crt"),
+        ] {
+            let prod = sbi_listener_config(base, SbiProfile::Production, &policy)
+                .expect("production applies");
+            assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
+            assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+            assert!(prod.verify_client, "and verifies the client certificate");
+            assert_eq!(
+                prod.verify_client_cacert.as_deref(),
+                Some(policy.tls_paths.ca_cert.as_str())
+            );
+            assert!(
+                !prod.require_oauth2,
+                "a proxied request carries the producer's token, not one for the SCP"
+            );
+        }
+
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: dir.join("absent.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = sbi_listener_config(SbiServerConfig::new(addr), SbiProfile::Production, &missing)
+            .expect_err("no cleartext fallback");
+        assert!(err.to_string().contains("absent.crt"), "{err}");
+
+        let dev =
+            sbi_listener_config(SbiServerConfig::new(addr), SbiProfile::Dev, &policy).unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http, "dev stays cleartext");
+        assert!(!dev.verify_client);
+        let dev_tls = sbi_listener_config(
+            SbiServerConfig::new(addr).with_tls("/own.key", "/own.crt"),
+            SbiProfile::Dev,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(dev_tls.cert.as_deref(), Some("/own.crt"), "dev keeps --tls");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

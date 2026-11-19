@@ -306,6 +306,29 @@ fn load_oauth2_jwks(path: &str) {
     }
 }
 
+/// #1795: the EES's listener under the SBI security profile. The EES is an
+/// edge-enablement server (TS 23.558), not a 5GC SBI NF: its callers are EECs
+/// on UEs and EASes, which hold no operator client certificate and no
+/// NRF-issued token, and its own per-operation gate (`auth`) does the token
+/// checks TS 33.558 asks for. So `production` here means TLS from `policy`'s
+/// certificate paths, whatever `--tls` said, and a startup failure naming a
+/// missing certificate rather than cleartext. Under `dev` the config is left
+/// as `--tls` made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        &policy.server_tls_only(),
+        nextgcore_sbi::types::NfType::Ees,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -430,6 +453,17 @@ async fn main() -> Result<()> {
     // shared mechanism (#1519) on the server AND consulted by eesd's per-route
     // gate (`auth::require_oauth2`), which is the one eesd actually runs.
     let sbi_server_config = install_callback_exemptions(sbi_server_config);
+    // #1795: the listener follows the SBI security profile, and everything
+    // that advertises this listener's scheme reads it off the result.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        args.nrf_uri.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    let serves_tls = sbi_server_config.scheme == nextgcore_sbi::types::UriScheme::Https;
     let sbi_server = SbiServer::new(sbi_server_config);
 
     log::info!("Starting EES SBI server on {addr}");
@@ -443,7 +477,7 @@ async fn main() -> Result<()> {
     if let Some(nrf_uri) = args.nrf_uri.as_deref() {
         match sbi.registration_host() {
             Ok(host) => {
-                let scheme = if args.tls { "https" } else { "http" };
+                let scheme = if serves_tls { "https" } else { "http" };
                 nrf_af::start(nrf_uri, host, scheme, sbi_port).await
             }
             Err(why) => log::error!("{why} (NRF registration skipped: no 5GC access tokens)"),
@@ -455,7 +489,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "demo-d443a-edge-budget")]
     let _metrics = if edge_budget::serving() {
         match sbi.registration_host() {
-            Ok(host) => edge_budget::spawn_subscriber(args.tls, host, sbi_port),
+            Ok(host) => edge_budget::spawn_subscriber(serves_tls, host, sbi_port),
             Err(why) => nextgcore_demo::demo_log!(
                 error,
                 edge_budget::DEMO_KEY,
@@ -483,7 +517,7 @@ async fn main() -> Result<()> {
             ecs_registration::start_ecs_registration(
                 args.ecs_uri.as_deref(),
                 &ees_id,
-                args.tls,
+                serves_tls,
                 host,
                 sbi_port,
             )
@@ -579,7 +613,10 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("EES SBI: {method} {}", request_log_uri(uri));
+    log::debug!(
+        "EES SBI: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&request_log_uri(uri))
+    );
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -6534,5 +6571,98 @@ mod relocation_pull_token_1664_tests {
             without_token,
             relocation::PullOutcome::Failed("S-EES answered 401".to_string())
         );
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::*;
+    use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+    use nextgcore_sbi::types::UriScheme;
+
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production case serves cleartext and the first assertion fails.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        let dir = std::env::temp_dir().join(format!(
+            "eesd-1795-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("ees.crt"),
+                key: file("ees.key"),
+                // No CA on disk either: a TLS-only server verifies no client (#1848).
+                ca_cert: dir.join("absent-ca.crt").display().to_string(),
+                client_cert: None,
+                client_key: None,
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let nrf = "https://127.0.0.10:7777";
+
+        let prod = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Production,
+            &policy,
+            nrf,
+        )
+        .expect("production applies");
+        assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
+        assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+        assert!(
+            !prod.verify_client,
+            "an EEC presents no operator certificate"
+        );
+        assert!(
+            !prod.require_oauth2,
+            "the per-operation gate, not the server, checks EEC/EAS tokens"
+        );
+
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: dir.join("absent.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Production,
+            &missing,
+            nrf,
+        )
+        .expect_err("no cleartext fallback");
+        assert!(err.to_string().contains("absent.crt"), "{err}");
+
+        let dev = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Dev,
+            &policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http, "dev stays cleartext");
+        let dev_tls = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr).with_tls("/own.key", "/own.crt"),
+            SbiProfile::Dev,
+            &policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev_tls.cert.as_deref(), Some("/own.crt"), "dev keeps --tls");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

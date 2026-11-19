@@ -39,6 +39,27 @@ static OAUTH2_ENABLED: AtomicBool = AtomicBool::new(false);
 /// transports (PIND-10).
 static TRUST_CALLER_SUPI_HEADER: AtomicBool = AtomicBool::new(false);
 
+/// #1849: `--trust-caller-supi-header` takes the caller's SUPI from a request
+/// header nobody verified, so under the `production` SBI profile starting with
+/// it is an error: there the caller identity must come from an authenticated
+/// source (the verified token `sub`, PIND-10; TS 33.501 §13.4.1, TS 23.542
+/// §8). Under `dev` it still works, for lab stacks.
+fn refuse_trusted_supi_header_under_production(
+    profile: nextgcore_sbi::security::SbiProfile,
+    trust_caller_supi_header: bool,
+) -> Result<(), String> {
+    if profile.is_production() && trust_caller_supi_header {
+        return Err(format!(
+            "the SBI profile is production, which does not run the lab-only \
+             --trust-caller-supi-header: it lets any client that completes TLS claim any \
+             SUPI. Take the caller identity from a verified token (--require-oauth2), or \
+             select {}=dev explicitly",
+            nextgcore_sbi::security::SBI_PROFILE_ENV
+        ));
+    }
+    Ok(())
+}
+
 fn oauth2_enabled() -> bool {
     OAUTH2_ENABLED.load(Ordering::Relaxed)
 }
@@ -100,8 +121,11 @@ struct Args {
     require_oauth2: bool,
 
     /// PIND-10: trust the bespoke `x-caller-supi` header as a caller-identity
-    /// source. Default false (the header is unverified and forgeable); enable
-    /// only on a mutually-authenticated intra-core transport.
+    /// source. LAB USE ONLY. Default false (the header is unverified and
+    /// forgeable): with it on, any client that completes TLS can act as any
+    /// subscriber. Refused at startup under the `production` SBI profile
+    /// (#1849), where the caller identity comes from a verified access token
+    /// (`--require-oauth2`).
     #[arg(long, default_value = "false")]
     trust_caller_supi_header: bool,
 
@@ -139,6 +163,29 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         shutdown.store(true, Ordering::SeqCst);
     })
     .expect("value expected");
+}
+
+/// #1795: the PIN server's listener under the SBI security profile. pind is
+/// not a 5GC SBI NF (module docs): its callers are PIN elements, which hold no
+/// NRF-issued token and no operator client certificate. So `production` here
+/// means TLS from `policy`'s certificate paths, whatever `--tls` said, and a
+/// startup failure naming a missing certificate rather than cleartext. No
+/// client certificate is demanded, and access tokens stay with
+/// `--require-oauth2` (PIND-10). Under `dev` the config is left as `--tls`
+/// made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        &policy.server_tls_only(),
+        nextgcore_sbi::types::NfType::Af,
+        nrf_uri,
+    )
 }
 
 #[tokio::main]
@@ -188,7 +235,13 @@ async fn main() -> Result<()> {
         };
     }
 
-    // PIND-10: caller-identity trust policy.
+    // PIND-10: caller-identity trust policy. #1849: the forgeable header
+    // source is lab-only and does not run under production.
+    refuse_trusted_supi_header_under_production(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        args.trust_caller_supi_header,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     OAUTH2_ENABLED.store(args.require_oauth2, Ordering::Relaxed);
     TRUST_CALLER_SUPI_HEADER.store(args.trust_caller_supi_header, Ordering::Relaxed);
 
@@ -232,6 +285,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    // #1795: the listener follows the SBI security profile.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &args.nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting PIN application server on {addr}");
     sbi_server
@@ -411,7 +473,10 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("PIN SBI: {method} {uri}");
+    log::debug!(
+        "PIN SBI: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -957,6 +1022,25 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
 // PIN server (TS 23.542 §6.4.7-6.4.9 PIN-6/7/8), not a discoverable 5GC SBI
 // NF, so it no longer registers with the NRF. The `--nrf-uri` flag is now
 // used only to locate the NRF JWKS endpoint when OAuth2 is enforced (PIND-10).
+
+#[cfg(test)]
+mod supi_header_tests_1849 {
+    use super::refuse_trusted_supi_header_under_production;
+    use nextgcore_sbi::security::SbiProfile;
+
+    /// REVERT-VERIFIED: with the production arm removed, the header source is
+    /// admitted under production and the first assertion fails.
+    #[test]
+    fn production_refuses_the_trusted_supi_header_1849() {
+        let err = refuse_trusted_supi_header_under_production(SbiProfile::Production, true)
+            .expect_err("a forgeable caller identity is refused under production");
+        assert!(err.contains("--trust-caller-supi-header"), "{err}");
+        refuse_trusted_supi_header_under_production(SbiProfile::Production, false)
+            .expect("production without the flag starts");
+        refuse_trusted_supi_header_under_production(SbiProfile::Dev, true)
+            .expect("dev keeps the lab flag");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1520,5 +1604,96 @@ mod tests {
 
         let missing = block_on(handle_element_heartbeat("pe-absent-999"));
         assert_eq!(missing.status, 404, "heartbeat on unknown element is 404");
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::*;
+    use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+    use nextgcore_sbi::types::UriScheme;
+
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production case serves cleartext and the first assertion fails.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        let dir = std::env::temp_dir().join(format!(
+            "pind-1795-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        // No client certificate on disk: pind must not need one.
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("pin.crt"),
+                key: file("pin.key"),
+                // No CA on disk either: a TLS-only server verifies no client (#1848).
+                ca_cert: dir.join("absent-ca.crt").display().to_string(),
+                client_cert: Some(dir.join("absent-client.crt").display().to_string()),
+                client_key: Some(dir.join("absent-client.key").display().to_string()),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: SocketAddr = "127.0.0.1:7815".parse().unwrap();
+        let nrf = "https://127.0.0.10:7777";
+
+        let prod = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Production,
+            &policy,
+            nrf,
+        )
+        .expect("production applies");
+        assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
+        assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+        assert!(
+            !prod.verify_client,
+            "PIN elements present no operator certificate"
+        );
+        assert!(!prod.require_oauth2, "nor an NRF-issued token");
+
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: dir.join("absent.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Production,
+            &missing,
+            nrf,
+        )
+        .expect_err("no cleartext fallback");
+        assert!(err.to_string().contains("absent.crt"), "{err}");
+
+        let dev = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Dev,
+            &policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http, "dev stays cleartext");
+        let dev_tls = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr).with_tls("/own.key", "/own.crt"),
+            SbiProfile::Dev,
+            &policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev_tls.cert.as_deref(), Some("/own.crt"), "dev keeps --tls");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
