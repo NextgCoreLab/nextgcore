@@ -202,6 +202,11 @@ static STATE_LOG: Mutex<Option<Arc<Mutex<crate::state_log::StateLog>>>> = Mutex:
 /// touching state.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Tests only: a delivery task panics instead of sending (#1896 follow-up), to show a
+/// delivery that ends without an answer is resent, not dropped.
+#[cfg(test)]
+static PANIC_DELIVERY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The first wait before a consumer's notification is resent, in ms (doubling).
 static RETRY_BASE_MS: AtomicU64 = AtomicU64::new(1_000);
 /// The longest wait between two resends.
@@ -814,6 +819,11 @@ pub async fn wait_idle() {
 /// am-data and this UDM has a callback address to give. `true` when the leg is
 /// wanted and the UDR subscribe failed, so it is worth retrying.
 pub async fn reconcile(supi: &str) -> bool {
+    // #1896 follow-up: a reconcile that a restart (`GENERATION`) overtook keeps
+    // nothing. It decided on the state before the restart, and writing that into
+    // the restarted state removed what the restart had restored.
+    let generation = GENERATION.load(Ordering::SeqCst);
+    let current = || GENERATION.load(Ordering::SeqCst) == generation;
     let lock = supi_lock(supi);
     let mut retry = false;
     {
@@ -826,21 +836,28 @@ pub async fn reconcile(supi: &str) -> bool {
                         "[{supi}] subscribed at the UDR for am-data changes: {}",
                         new_leg.subscription_path
                     );
-                    {
+                    let kept = {
                         // The leg first, so the UDR's first notification on it is
                         // admitted; the read that tells what was missed follows.
                         let held = STATE_LOCK.lock().await;
-                        set_leg(supi, Some(new_leg));
-                        let mut t = told(supi).unwrap_or_default();
-                        t.resync = true;
-                        set_told(supi, Some(t));
-                        if let Err(e) =
-                            persist_locked(&held, &[Rec::Leg(supi), Rec::Told(supi)]).await
-                        {
-                            log::error!("[{supi}] UDR leg not written to the state file: {e}");
+                        if !current() {
+                            false
+                        } else {
+                            set_leg(supi, Some(new_leg));
+                            let mut t = told(supi).unwrap_or_default();
+                            t.resync = true;
+                            set_told(supi, Some(t));
+                            if let Err(e) =
+                                persist_locked(&held, &[Rec::Leg(supi), Rec::Told(supi)]).await
+                            {
+                                log::error!("[{supi}] UDR leg not written to the state file: {e}");
+                            }
+                            true
                         }
+                    };
+                    if kept {
+                        Box::pin(resync(supi)).await;
                     }
-                    Box::pin(resync(supi)).await;
                 }
                 // The SDM subscription stands; the leg is retried with backoff.
                 Err(e) => {
@@ -852,21 +869,29 @@ pub async fn reconcile(supi: &str) -> bool {
                 "[{supi}] no advertised SBI address: am-data changes are not subscribed at the UDR"
             ),
             (false, Some(old), _) => {
-                {
+                let kept = {
                     let held = STATE_LOCK.lock().await;
-                    set_leg(supi, None);
-                    set_told(supi, None);
-                    if let Err(e) = persist_locked(&held, &[Rec::Leg(supi), Rec::Told(supi)]).await
-                    {
-                        log::error!("[{supi}] UDR leg removal not written: {e}");
+                    if current() {
+                        set_leg(supi, None);
+                        set_told(supi, None);
+                        if let Err(e) =
+                            persist_locked(&held, &[Rec::Leg(supi), Rec::Told(supi)]).await
+                        {
+                            log::error!("[{supi}] UDR leg removal not written: {e}");
+                        }
                     }
+                    current()
+                };
+                if kept {
+                    udr_unsubscribe(supi, &old).await;
                 }
-                udr_unsubscribe(supi, &old).await;
             }
             (false, None, _) if told(supi).is_some() => {
                 let held = STATE_LOCK.lock().await;
-                set_told(supi, None);
-                let _ = persist_locked(&held, &[Rec::Told(supi)]).await;
+                if current() {
+                    set_told(supi, None);
+                    let _ = persist_locked(&held, &[Rec::Told(supi)]).await;
+                }
             }
             _ => {}
         }
@@ -998,6 +1023,8 @@ async fn read_am_data(supi: &str) -> Option<Value> {
 /// overtook is retaken; one that cannot be made leaves `resync` set, and
 /// [`refresh_legs`] retries it.
 async fn resync(supi: &str) {
+    // #1896 follow-up: as in `reconcile`, a restart in between keeps nothing.
+    let generation = GENERATION.load(Ordering::SeqCst);
     for _ in 0..3 {
         let Some(before) = told(supi) else {
             return;
@@ -1006,6 +1033,9 @@ async fn resync(supi: &str) {
             return;
         };
         let held = STATE_LOCK.lock().await;
+        if GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
         let Some(mut now) = told(supi) else {
             return;
         };
@@ -1504,16 +1534,33 @@ async fn drain(supi: &str, generation: u64) {
         let mut again = BTreeSet::new();
         if crate::notify::notifications_enabled() {
             let mut each = tokio::task::JoinSet::new();
+            let mut task_sub = HashMap::new();
             for sub in targets {
                 let (supi, changes) = (supi.to_string(), head.changes.clone());
-                each.spawn(async move {
-                    let outcome = deliver(&supi, &sub, &changes).await;
-                    (sub.id, outcome)
+                let id = sub.id.clone();
+                let task = each.spawn(async move {
+                    #[cfg(test)]
+                    if PANIC_DELIVERY.load(Ordering::SeqCst) {
+                        panic!("delivery task panicked (test)");
+                    }
+                    deliver(&supi, &sub, &changes).await
                 });
+                task_sub.insert(task.id(), id);
             }
-            while let Some(done) = each.join_next().await {
-                if let Ok((id, Delivery::Retry)) = done {
-                    again.insert(id);
+            while let Some(done) = each.join_next_with_id().await {
+                match done {
+                    Ok((_, Delivery::Done)) => {}
+                    Ok((task, Delivery::Retry)) => {
+                        again.extend(task_sub.get(&task).cloned());
+                    }
+                    // #1896 follow-up: a delivery task that ended without an
+                    // outcome (it panicked, or was cancelled) has no answer from
+                    // its consumer, so the change is resent to it. Before, it
+                    // counted as answered, and the change could be dropped.
+                    Err(e) => {
+                        log::warn!("[{supi}] am-data delivery task ended without an answer: {e}");
+                        again.extend(task_sub.get(&e.id()).cloned());
+                    }
                 }
             }
         }
@@ -1762,6 +1809,7 @@ mod tests {
         init_state(None).await.expect("memory-only");
         RETRY_BASE_MS.store(50, Ordering::SeqCst);
         RETRY_WINDOW_MS.store(600_000, Ordering::SeqCst);
+        PANIC_DELIVERY.store(false, Ordering::SeqCst);
         let port = udr_base.rsplit(':').next().expect("port");
         std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
         std::env::set_var("UDR_SBI_PORT", port);
@@ -2963,6 +3011,7 @@ mod tests {
     /// REVERT-VERIFIED: with the migration's compaction skipped, the file is still
     /// the snapshot ("rewritten as a log"), and the change appended to it then makes
     /// the second start fail.
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn a_1836_snapshot_is_migrated_to_the_log_1896() {
@@ -3055,5 +3104,142 @@ mod tests {
         clear_legs();
         init_state(None).await.expect("memory-only");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **#1896 follow-up, the CI flake.** A reconcile that a restart overtook keeps
+    /// nothing. The race behind run 44455660789's "the queue": an SDM subscribe's
+    /// reconcile decided, before the test's simulated crash, that its SUPI wanted a
+    /// leg and had none, subscribed at the UDR, and wrote after the crash. It wrote
+    /// a fresh leg and the crash-emptied queue into the state file, so the file lost
+    /// the queue the restart had to find. (Caught with a backtrace on the queue's
+    /// removal: `spawn_reconcile_attempt` -> `reconcile` -> `resync`.)
+    ///
+    /// Here the restored SUPI has its SDM subscription and queue but no leg. The test
+    /// holds the state lock, so the reconcile it spawns decides (subscription, no
+    /// leg), subscribes at the UDR and waits for the lock. The crash happens under the
+    /// held lock, then the reconcile runs on.
+    ///
+    /// REVERT-VERIFIED: with the generation fence removed from `reconcile` and
+    /// `resync`, the file loses the queue ("the queue") and gains a leg.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_reconcile_a_restart_overtook_keeps_nothing_1896() {
+        let (_udr, udr_base, udr_state) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        set_notify_base(Some("http://127.0.0.1:1".to_string()));
+        let supi = "imsi-001010000018963";
+        let snapshot = Snapshot {
+            sdm_subscriptions: vec![SavedSdmSubscription {
+                id: "sdm-18963".to_string(),
+                supi: supi.to_string(),
+                nf_instance_id: Some("amf-18963".to_string()),
+                callback_reference: Some("http://127.0.0.1:9/cb/sdm-notify/r".to_string()),
+                monitored_resource_uris: vec![format!("/nudm-sdm/v2/{supi}/am-data")],
+            }],
+            legs: HashMap::new(),
+            queues: HashMap::from([(
+                supi.to_string(),
+                VecDeque::from([Queued {
+                    changes: vec![json!({"op": "REPLACE", "path": "/gpsis",
+                                         "newValue": ["msisdn-2"]})],
+                    pending: None,
+                }]),
+            )]),
+            told: HashMap::new(),
+        };
+        let path = temp_state_path("1896-overtaken");
+        nextgcore_core::state_store::write_snapshot(
+            &path,
+            &serde_json::to_value(&snapshot).expect("doc"),
+        )
+        .expect("a #1836 file");
+        assert_eq!(init_state(Some(path.clone())).await, Ok(1));
+
+        {
+            let _state = STATE_LOCK.lock().await;
+            spawn_reconcile(supi);
+            // Wait until it has decided and subscribed at the UDR.
+            for _ in 0..500 {
+                let posted = udr_state
+                    .lock()
+                    .expect("udr")
+                    .seen
+                    .iter()
+                    .any(|(m, _, _)| m == "POST");
+                if posted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                udr_state
+                    .lock()
+                    .expect("udr")
+                    .seen
+                    .iter()
+                    .any(|(m, _, _)| m == "POST"),
+                "the reconcile subscribed before the crash"
+            );
+            // The crash, while the reconcile waits for the lock.
+            clear_legs();
+            udm_self().read().expect("ctx").ue_remove_all();
+        }
+        wait_idle().await;
+
+        let persisted = match crate::state_log::StateLog::open(&path).expect("opens").1 {
+            crate::state_log::Opened::Log { ops, .. } => replay(ops).expect("replays"),
+            crate::state_log::Opened::Legacy(_) => panic!("rewritten as a log"),
+        };
+        assert!(persisted.queues.contains_key(supi), "the queue");
+        assert!(
+            !persisted.legs.contains_key(supi),
+            "no leg from before the restart"
+        );
+        clear_legs();
+        init_state(None).await.expect("memory-only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **#1896 follow-up.** A delivery task that ends without an outcome (here it
+    /// panics) has no answer from its consumer: the change is resent to it, and its
+    /// queue is kept. Before, the drain counted such a task as answered, removed the
+    /// change, and wrote the queue's removal.
+    ///
+    /// REVERT-VERIFIED: with a `JoinError` counted as answered again, the queue is
+    /// gone after one attempt ("resent, not dropped").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_delivery_that_ends_without_an_answer_is_resent_1896() {
+        let (_udr, udr_base, _udr_state) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base.clone()));
+        let supi = "imsi-001010000018962";
+        sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/p").await;
+        let token = leg_token(supi).expect("leg");
+        PANIC_DELIVERY.store(true, Ordering::SeqCst);
+        let notify = udr_notify(
+            supi,
+            &format!("{udm_base}{}", data_change_path(supi, &token)),
+            &json!({"gpsis": ["msisdn-1"]}),
+            &json!({"gpsis": ["msisdn-2"]}),
+        );
+        assert_eq!(
+            post(
+                &format!("{udm_base}{}", data_change_path(supi, &token)),
+                &notify
+            )
+            .await,
+            204
+        );
+        // Let several attempts end (RETRY_BASE_MS is 50 ms under `setup`).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let kept = lock(&QUEUES)
+            .as_ref()
+            .and_then(|m| m.get(supi).map(VecDeque::len))
+            .unwrap_or(0);
+        PANIC_DELIVERY.store(false, Ordering::SeqCst);
+        assert_eq!(kept, 1, "resent, not dropped");
+        crash().await;
     }
 }
