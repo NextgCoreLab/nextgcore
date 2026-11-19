@@ -1619,6 +1619,280 @@ mod tests {
         );
         ctx.read().unwrap().session_remove(c.id);
     }
+
+    /// #1985: a released session's context record with a fresh notify token, as
+    /// its ContextCreate left it, ready for its release's ContextDelete.
+    fn released_record_1985(
+        mut context: crate::context::AmfMbsContext,
+        svc: [u8; 3],
+    ) -> (crate::context::AmfMbsContext, String) {
+        let ctx = crate::mbsmf_self();
+        let s = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi_1758(svc), crate::MbsSessionType::Broadcast)
+            .expect("session");
+        let token = ctx
+            .read()
+            .unwrap()
+            .mint_amf_notify_token(s.id)
+            .expect("token");
+        context.notify_token = token.clone();
+        assert!(ctx.read().unwrap().record_amf_context(s.id, context));
+        let taken = ctx.read().unwrap().take_amf_contexts(s.id);
+        ctx.read().unwrap().session_remove(s.id);
+        (taken.into_iter().next().expect("record"), token)
+    }
+
+    fn admitted(token: &str) -> bool {
+        crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .amf_notify_session(token)
+            .is_some()
+    }
+
+    /// **#1985**, both peers: a ContextDelete parked after its retry budget keeps
+    /// the released session's notify token, because the context still exists at
+    /// the AMF. A later session on the TMGI is handed that same context by amfd's
+    /// real handler, which keeps notifying the FIRST create's notifyUri; so when
+    /// the stand-in NG-RAN drops the session, amfd's `releasedInd` arrives on A's
+    /// token at this MB-SMF's real listener and B's record is dropped.
+    ///
+    /// A's deletes are sent without an access token, so the OAuth2-gated amfd
+    /// refuses each (401) and the record is parked; B's create carries one.
+    ///
+    /// REVERT-VERIFIED: with the retry task forgetting the tokens before it parks
+    /// (main), "a parked delete keeps the token" fails, and with it and "A's token
+    /// is B's now" skipped, "B is notified on A's token" times out (amfd's notify
+    /// on A's token is answered 404).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_delete_keeps_the_token_a_reusing_session_is_notified_on_1985() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let ngap = stand_in_ngap();
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr)
+            .with_oauth2_callback_exemptions(crate::oauth2_callback_exemptions());
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(json!({ "keys": [] }));
+        let mbsmf = SbiServer::on_listener(cfg, listener);
+        mbsmf
+            .start(crate::mbsmf_sbi_request_handler)
+            .await
+            .expect("mbsmfd listener");
+        let ctx = crate::mbsmf_self();
+        ctx.read()
+            .unwrap()
+            .set_amf_notify_base(format!("http://127.0.0.1:{}", addr.port()));
+        let tmgi = tmgi_1758([0x09, 0x19, 0x85]);
+
+        let a = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("A");
+        let a_ref = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                oauth2.clone(),
+                crate::create_amf_mbs_context(a.id, tmgi.clone(), amf.clone(), leg()),
+            )
+            .await
+            .expect("A's context");
+        ctx.read().unwrap().session_remove(a.id);
+        let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+        let a_token = a_contexts[0].notify_token.clone();
+        // Unscoped: no access token, so every delete is refused and it is parked.
+        assert!(!crate::release_amf_contexts(a_contexts).await);
+        eventually("A's delete is parked after the budget", || {
+            crate::reconcile::pending_count() == 1
+        })
+        .await;
+        assert!(amf_holds(&a_ref), "the AMF still holds A's context");
+        assert!(admitted(&a_token), "a parked delete keeps the token");
+
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("B");
+        let b_ref = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                oauth2,
+                crate::create_amf_mbs_context(b.id, tmgi.clone(), amf, leg()),
+            )
+            .await
+            .expect("B's context");
+        assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            0,
+            "B's record unparks it"
+        );
+        assert_eq!(
+            ctx.read().unwrap().amf_notify_session(&a_token),
+            Some(b.id),
+            "A's token is B's now"
+        );
+
+        ngap.live.lock().unwrap().clear();
+        nextgcore_amfd::context::amf_mcast().broadcast_rescan();
+        eventually("B is notified on A's token", || {
+            ctx.read().unwrap().amf_contexts_of(b.id).is_empty()
+        })
+        .await;
+        assert!(!amf_holds(&b_ref));
+        assert!(!admitted(&a_token), "releasedInd ends the context's tokens");
+        ctx.read().unwrap().session_remove(b.id);
+    }
+
+    /// **#1985**: a parked delete never re-recorded still ends its tokens: the
+    /// reconciler's 404 forgets them at once. A re-driven park of the same record
+    /// is one delete (retries are idempotent), and a refused pass keeps them.
+    ///
+    /// REVERT-VERIFIED: with the `retire_amf_notify_token` call removed from
+    /// `reconcile_once`, "the reconciler's 404 ends the token" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcilers_404_ends_a_parked_contexts_token_1985() {
+        use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        crate::mbsmf_context_init(256);
+        let budget = crate::AMF_RELEASE_RETRY_DELAYS.len() + 1;
+        // The first attempt, every retry and one pass are refused; then 404.
+        let mut statuses = vec![503u16; budget + 1];
+        statuses.push(404);
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &statuses).await;
+        let (record, token) = released_record_1985(context, [0x0a, 0x19, 0x85]);
+        assert!(!crate::release_amf_contexts(vec![record.clone()]).await);
+        eventually("parked after the budget", || {
+            crate::reconcile::pending_count() == 1
+        })
+        .await;
+        assert!(admitted(&token), "a parked delete keeps the token");
+        crate::reconcile::park(vec![record]);
+        assert_eq!(crate::reconcile::pending_count(), 1, "parked once");
+
+        assert_eq!(crate::reconcile::reconcile_once().await, 0, "refused");
+        assert!(admitted(&token), "a refused pass applies nothing");
+        assert_eq!(crate::reconcile::reconcile_once().await, 1, "404");
+        assert!(!admitted(&token), "the reconciler's 404 ends the token");
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            budget + 2,
+            "one delete a pass"
+        );
+        assert_eq!(crate::reconcile::pending_count(), 0);
+    }
+
+    /// **#1985**: the reconciler's 204 ends a parked context's token after the
+    /// grace, not at once: the AMF may still report the release's late NG-RAN
+    /// answers on it (#1796).
+    ///
+    /// REVERT-VERIFIED: with the `retire_amf_notify_token` call removed from
+    /// `reconcile_once`, "gone after the grace" times out; with it forgetting at
+    /// once (`Gone`), "admitted through the grace" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcilers_204_ends_a_parked_contexts_token_after_the_grace_1985() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        crate::mbsmf_context_init(256);
+        let budget = crate::AMF_RELEASE_RETRY_DELAYS.len() + 1;
+        let (_server, context, _deletes, _arrived, _release) =
+            scripted_amf(false, &vec![503u16; budget]).await;
+        let (record, token) = released_record_1985(context, [0x0b, 0x19, 0x85]);
+        assert!(!crate::release_amf_contexts(vec![record]).await);
+        eventually("parked after the budget", || {
+            crate::reconcile::pending_count() == 1
+        })
+        .await;
+        assert_eq!(crate::reconcile::reconcile_once().await, 1, "204");
+        assert!(admitted(&token), "admitted through the grace");
+        eventually("gone after the grace", || !admitted(&token)).await;
+    }
+
+    /// **#1985** bound: a parked delete evicted at `MAX_PENDING` is abandoned, and
+    /// so are its context's tokens.
+    ///
+    /// REVERT-VERIFIED: with `forget_abandoned` forgetting nothing, "an abandoned
+    /// delete takes its token" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_parked_delete_takes_its_token_1985() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        crate::mbsmf_context_init(256);
+        let blank = |n: usize| crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            nf_instance_id: None,
+            context_ref: format!("evict-1985-{n}"),
+            notify_token: String::new(),
+            tmgi: None,
+        };
+        let (record, token) = released_record_1985(blank(usize::MAX), [0x0c, 0x19, 0x85]);
+        crate::reconcile::park(vec![record]);
+        crate::reconcile::park((0..crate::reconcile::MAX_PENDING - 1).map(blank).collect());
+        assert!(admitted(&token), "kept while it is parked");
+        crate::reconcile::park(vec![blank(crate::reconcile::MAX_PENDING)]);
+        assert!(!admitted(&token), "an abandoned delete takes its token");
+        crate::reconcile::clear_for_test();
+    }
+
+    /// **#1985** (cancellation): a reconcile pass aborted while its delete is in
+    /// flight re-parks that record, so its context's token still has a path to its
+    /// end (the next pass) rather than being orphaned.
+    ///
+    /// REVERT-VERIFIED: with `Repark` dropping the in-flight record, "a cancelled
+    /// pass re-parks its in-flight delete" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_pass_re_parks_its_in_flight_delete_1985() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        crate::mbsmf_context_init(256);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // Accepts and never answers: the delete stays in flight.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let a = accepted.clone();
+        let hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+                a.notify_one();
+            }
+        });
+        let context = crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            port,
+            nf_instance_id: None,
+            context_ref: "cancel-1985".to_string(),
+            notify_token: String::new(),
+            tmgi: None,
+        };
+        let (record, token) = released_record_1985(context, [0x0d, 0x19, 0x85]);
+        crate::reconcile::park(vec![record]);
+        let pass = tokio::spawn(crate::reconcile::reconcile_once());
+        accepted.notified().await;
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            0,
+            "drained into the pass"
+        );
+        pass.abort();
+        let _ = pass.await;
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            1,
+            "a cancelled pass re-parks its in-flight delete"
+        );
+        assert!(admitted(&token), "and its token");
+        crate::reconcile::clear_for_test();
+        hole.abort();
+    }
 }
 
 /// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or

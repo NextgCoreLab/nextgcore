@@ -1260,9 +1260,12 @@ fn release_retries(mut failed: Vec<AmfMbsContext>) {
                 c.context_ref,
                 AMF_RELEASE_RETRY_DELAYS.len()
             );
-            forget_amf_notify_token(c);
         }
         // #1817: not dropped. The reconciler keeps retrying until the AMF answers.
+        // #1985: its notify tokens are kept: the context still exists at the AMF,
+        // and a session that reuses it is notified on them. They go with the
+        // context's end: the reconciler's 204 (after the grace) or 404, a
+        // `releasedInd`, the reconciler's eviction, or the token cap's reclaim.
         reconcile::park(failed);
     });
 }

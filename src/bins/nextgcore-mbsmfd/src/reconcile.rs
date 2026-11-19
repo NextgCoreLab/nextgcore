@@ -59,6 +59,7 @@ pub static PENDING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const
 /// Park `contexts` for the reconciler. A record already parked is not added twice,
 /// so a re-driven release does not send two deletes for one context.
 pub fn park(contexts: Vec<AmfMbsContext>) {
+    let mut abandoned = Vec::new();
     let Ok(mut set) = pending().lock() else {
         return;
     };
@@ -77,6 +78,7 @@ pub fn park(contexts: Vec<AmfMbsContext>) {
                     MAX_PENDING
                 );
                 RECONCILED.inc(&["abandoned"]);
+                abandoned.push(old);
             }
         }
         log::warn!(
@@ -87,6 +89,18 @@ pub fn park(contexts: Vec<AmfMbsContext>) {
             RECONCILE_PERIOD
         );
         set.push_back(c);
+    }
+    drop(set);
+    forget_abandoned(&abandoned);
+}
+
+/// #1985: an abandoned delete's context is no longer tracked, so its notify
+/// tokens go (the bound on the tokens parked deletes keep). Called with the
+/// pending set unlocked: forgetting reads the global context, and
+/// `record_amf_context` takes the pending set under that read (`unpark`).
+fn forget_abandoned(abandoned: &[AmfMbsContext]) {
+    for c in abandoned {
+        crate::forget_amf_notify_token(c);
     }
 }
 
@@ -136,42 +150,81 @@ pub const MAX_PASS: Duration = Duration::from_millis(500);
 /// [`MAX_PASS`]. A 2xx or 404 ends one; a failure, or not reaching it within the
 /// pass, re-parks it (ahead of anything parked meanwhile). A record a live session
 /// holds again is dropped, not sent (R24). Returns how many the AMF accepted.
+///
+/// #1985 (cancellation): the batch is held by a [`Repark`] guard, so a pass dropped
+/// mid-way (its task aborted) re-parks every record it had not ended, including
+/// the one in flight -- whose context still exists at the AMF and whose notify
+/// tokens are still held. If that delete did land, the next pass's 404 ends it.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<AmfMbsContext> = match pending().lock() {
+    let batch: VecDeque<AmfMbsContext> = match pending().lock() {
         Ok(mut set) => set.drain(..).collect(),
         Err(_) => return 0,
     };
+    let mut pass = Repark {
+        still: Vec::new(),
+        inflight: None,
+        rest: batch,
+    };
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut still = Vec::new();
-    for c in batch {
+    while let Some(c) = pass.rest.pop_front() {
         if tokio::time::Instant::now() >= deadline {
-            still.push(c);
+            pass.still.push(c);
             continue;
         }
+        pass.inflight = Some(c.clone());
         // #1854: in the (AMF, TMGI) lane, the in-use check and the send together.
-        match crate::delete_in_lane(&c).await {
+        let outcome = crate::delete_in_lane(&c).await;
+        pass.inflight = None;
+        match outcome {
             None => {
                 RECONCILED.inc(&["reused"]);
             }
-            Some(ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone) => {
+            Some(outcome @ (ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone)) => {
                 log::info!(
                     "MBS: reconciler released AMF {}:{} MBS context {}",
                     c.host,
                     c.port,
                     c.context_ref
                 );
+                // #1985: the context ends here, so do its notify tokens: at once
+                // on a 404, after the grace on a 204 (late NG-RAN answers).
+                crate::retire_amf_notify_token(&c, outcome);
                 RECONCILED.inc(&["deleted"]);
                 ended += 1;
             }
-            Some(ContextDeleteOutcome::Failed) => still.push(c),
+            Some(ContextDeleteOutcome::Failed) => pass.still.push(c),
         }
     }
-    if !still.is_empty() {
+    drop(pass);
+    ended
+}
+
+/// #1985: the records of one [`reconcile_once`] pass it has not ended: those that
+/// failed or were not reached (`still`), the one in flight, and the rest of the
+/// batch. Dropping it -- at the end of the pass, or when the pass is cancelled --
+/// re-parks them all at the FRONT, in order: they are older than anything parked
+/// while the pass ran, and eviction takes the oldest.
+struct Repark {
+    still: Vec<AmfMbsContext>,
+    inflight: Option<AmfMbsContext>,
+    rest: VecDeque<AmfMbsContext>,
+}
+
+impl Drop for Repark {
+    fn drop(&mut self) {
+        let back: Vec<AmfMbsContext> = self
+            .still
+            .drain(..)
+            .chain(self.inflight.take())
+            .chain(self.rest.drain(..))
+            .collect();
+        if back.is_empty() {
+            return;
+        }
+        let mut abandoned = Vec::new();
         if let Ok(mut set) = pending().lock() {
-            // Back at the FRONT, in order: they are older than anything parked
-            // while this pass ran, and eviction takes the oldest.
-            for c in still.into_iter().rev() {
+            for c in back.into_iter().rev() {
                 if !set.contains(&c) {
                     set.push_front(c);
                 }
@@ -187,11 +240,12 @@ pub async fn reconcile_once() -> usize {
                         MAX_PENDING
                     );
                     RECONCILED.inc(&["abandoned"]);
+                    abandoned.push(old);
                 }
             }
         }
+        forget_abandoned(&abandoned);
     }
-    ended
 }
 
 /// Run [`reconcile_once`] every [`RECONCILE_PERIOD`] for the life of the process.
