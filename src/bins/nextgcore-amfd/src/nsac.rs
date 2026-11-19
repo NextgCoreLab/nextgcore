@@ -970,9 +970,15 @@ pub(crate) mod tests {
 
         spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let out =
-            admit_registration(supi, "3GPP_ACCESS", &[snssai(1)], "127.0.0.1", port, "amf-1945")
-                .await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            port,
+            "amf-1945",
+        )
+        .await;
         let order = applied_n(&applied, 3).await;
         clear_for_test();
         srv.stop().await.ok();
