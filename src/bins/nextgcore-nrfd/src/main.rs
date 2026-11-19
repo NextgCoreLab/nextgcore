@@ -6371,6 +6371,60 @@ mod tests {
     const AUTH_SUBS_READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
     const AUTH_SUBS_MODIFY: &str = "nudr-dr:subscription-data:authentication-subscription:modify";
 
+    /// #1918: the AUSF profile ausfd registers (`build_nf_profile`, pinned by
+    /// ausfd's `the_profile_grants_the_deregister_scope_to_the_udm_only_1918`).
+    /// The two must stay in step: this is the NRF half of that exchange.
+    fn ausf_with_deregister_scope() -> NfProfile {
+        auth_producer(
+            "AUSF",
+            serde_json::json!([{
+                "serviceInstanceId": "ausf-auth",
+                "serviceName": "nausf-auth",
+                "allowedNfTypes": ["AMF", "UDM", "SCP"],
+                "allowedOperationsPerNfType": {
+                    "AMF": ["nausf-auth"],
+                    "UDM": ["nausf-auth", nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS],
+                    "SCP": ["nausf-auth"]
+                }
+            }]),
+            Some(serde_json::json!(["AMF", "UDM", "SCP"])),
+        )
+    }
+
+    /// #1918: the NRF grants the UDM the AUSF's Deregister resource scope with
+    /// the service scope, and an AMF only the service scope, so a token carrying
+    /// `nausf-auth:ue-authentications` proves a UDM even through an SCP.
+    #[test]
+    fn the_deregister_scope_is_granted_to_the_udm_only_1918() {
+        let ausf = ausf_with_deregister_scope();
+        let requested: Vec<String> = vec![
+            "nausf-auth".into(),
+            nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS.into(),
+        ];
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the UDM is authorized");
+        assert_eq!(udm, requested, "the UDM gets both scopes");
+        let amf = authorize_access_token(
+            &auth_consumer("AMF"),
+            "AMF",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the AMF keeps its service scope");
+        assert_eq!(amf, vec!["nausf-auth".to_string()]);
+    }
+
     /// #1811: only the UDM is granted the AuthenticationSubscription scope.
     /// A PCF or NEF asking for it gets the service scope alone (RFC 6749 §3.3
     /// lets the server narrow the request), so its token cannot read K at the

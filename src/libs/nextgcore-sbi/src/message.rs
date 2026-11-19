@@ -561,6 +561,16 @@ pub struct SbiRequest {
     /// claims, so a producer could enforce "a valid token exists" but never "the
     /// caller is who this resource belongs to" (issue #94).
     pub oauth2_subject: Option<String>,
+    /// The verified access token's `scope` claim (space-delimited, TS 29.510
+    /// `AccessTokenClaims.scope`), set exactly when [`Self::oauth2_subject`] is:
+    /// the server's OAuth2 gate verified this token, and every scope it checked
+    /// (service, and resource if the listener requires one) is in it.
+    ///
+    /// For a producer that ADMITS an operation on a resource-level scope the gate
+    /// does not require (#1918: the AUSF's Deregister for a UDM reached through
+    /// an SCP, TS 29.509 `nausf-auth:ue-authentications`). `None` means no token
+    /// was verified, never "no scope".
+    pub oauth2_scope: Option<String>,
 }
 
 impl SbiRequest {
