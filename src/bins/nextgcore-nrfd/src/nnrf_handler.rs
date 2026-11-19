@@ -2166,6 +2166,68 @@ fn identity_in_range(digits: &str, range: &serde_json::Value) -> Option<bool> {
 /// Longest `SupiRange`/`IdentityRange` `pattern` this NRF compiles (#1879).
 /// TS 29.510 sets no limit; real patterns are a PLMN prefix and a digit class.
 const MAX_RANGE_PATTERN_LEN: usize = 512;
+/// Most `pattern` ranges one profile may declare across its
+/// supiRanges/gpsiRanges (R32 on #1957 M1): enforced at NFRegister/NFUpdate
+/// (400), and a profile restored over it is excluded at discovery rather than
+/// compiled. Real profiles declare a handful.
+pub const MAX_RANGE_PATTERNS_PER_PROFILE: usize = 64;
+
+/// The identity-info containers whose ranges carry patterns.
+const RANGE_INFOS: &[&str] = &["udmInfo", "udrInfo", "ausfInfo"];
+
+/// Every `pattern` string a profile declares in its supiRanges/gpsiRanges, as
+/// (JSON pointer, pattern).
+fn profile_range_patterns(profile: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for info in RANGE_INFOS {
+        for key in ["supiRanges", "gpsiRanges"] {
+            let Some(ranges) = profile
+                .get(*info)
+                .and_then(|i| i.get(key))
+                .and_then(|v| v.as_array())
+            else {
+                continue;
+            };
+            for (k, r) in ranges.iter().enumerate() {
+                if let Some(p) = r.get("pattern").and_then(|v| v.as_str()) {
+                    out.push((format!("/{info}/{key}/{k}/pattern"), p.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Why a profile's range patterns are refused at NFRegister/NFUpdate (R32 on
+/// #1957), as (`invalidParams` pointer, reason): too many patterns, or one
+/// longer than [`MAX_RANGE_PATTERN_LEN`]. A pattern this NRF cannot evaluate
+/// is still accepted (it excludes the candidate at discovery).
+pub fn range_pattern_violation(profile: &serde_json::Value) -> Option<(String, String)> {
+    let patterns = profile_range_patterns(profile);
+    if patterns.len() > MAX_RANGE_PATTERNS_PER_PROFILE {
+        return Some((
+            patterns[MAX_RANGE_PATTERNS_PER_PROFILE].0.clone(),
+            format!(
+                "{} range patterns declared; this NRF accepts at most {MAX_RANGE_PATTERNS_PER_PROFILE} \
+                 per profile",
+                patterns.len()
+            ),
+        ));
+    }
+    patterns
+        .into_iter()
+        .find(|(_, p)| p.len() > MAX_RANGE_PATTERN_LEN)
+        .map(|(at, p)| {
+            (
+                at,
+                format!(
+                    "a {}-byte range pattern; this NRF accepts at most {MAX_RANGE_PATTERN_LEN}",
+                    p.len()
+                ),
+            )
+        })
+}
+
 /// Compiled-program and lazy-DFA budgets per pattern, so one registered profile
 /// cannot make every discovery that reaches it expensive (#1879).
 const RANGE_PATTERN_SIZE_LIMIT: usize = 256 * 1024;
@@ -2191,22 +2253,33 @@ fn range_pattern(pattern: &str) -> Option<std::sync::Arc<regex::bytes::Regex>> {
         return None;
     }
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(hit) = cache.get(pattern) {
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(pattern) {
         return hit.clone();
     }
-    let compiled = regex::bytes::RegexBuilder::new(&format!("^(?:{pattern})$"))
-        .unicode(false)
-        .size_limit(RANGE_PATTERN_SIZE_LIMIT)
-        .dfa_size_limit(RANGE_PATTERN_SIZE_LIMIT)
-        .nest_limit(32)
-        .build()
+    // R32 on #1957 M1: compiled OUTSIDE the lock, so one slow compile never
+    // serialises other discoveries behind it.
+    let build = |re: &str| {
+        regex::bytes::RegexBuilder::new(re)
+            .unicode(false)
+            .size_limit(RANGE_PATTERN_SIZE_LIMIT)
+            .dfa_size_limit(RANGE_PATTERN_SIZE_LIMIT)
+            .nest_limit(32)
+            .build()
+    };
+    // R32 on #1957: the pattern must parse ON ITS OWN first. An unbalanced
+    // `)` would otherwise close the `^(?:` wrap early (`imsi-001)|(?:` became
+    // `^(?:imsi-001)|(?:)$`, matching every identity); ECMA-262 rejects such a
+    // pattern too. A pattern that parses alone is balanced, so wrapping it
+    // cannot change its grouping.
+    let compiled = build(pattern)
+        .and_then(|_| build(&format!("^(?:{pattern})$")))
         .map_err(|e| {
             // debug, not warn: the pattern is whatever a registrant sent.
             log::debug!("NF Discovery: range pattern {pattern:?} is not evaluated: {e}");
         })
         .ok()
         .map(Arc::new);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= RANGE_PATTERN_CACHE_CAP {
         cache.clear();
     }
@@ -2251,6 +2324,13 @@ fn identity_matches(info: &serde_json::Value, query: &DiscoveryQuery) -> bool {
         };
         if ranges.is_empty() {
             return true;
+        }
+        // R32 on #1957: a profile over the per-profile pattern cap (one
+        // restored from before the cap) is excluded rather than compiled.
+        if ranges.iter().filter(|r| r.get("pattern").is_some()).count()
+            > MAX_RANGE_PATTERNS_PER_PROFILE
+        {
+            return false;
         }
         // #1879: a `pattern` range matches the whole identity string; a
         // `start`/`end` range compares its digit run, and does not apply to an
@@ -3324,6 +3404,17 @@ mod tests {
         ] {
             assert_eq!(identity_in_pattern(id, &p(bad)), Some(false), "{bad}");
         }
+        // R32 on #1957: an unbalanced `)` cannot escape the full-match wrap.
+        // REVERT-VERIFIED: with the bare-pattern parse removed this matches
+        // every identity (`^(?:imsi-001)|(?:)$`).
+        assert_eq!(
+            identity_in_pattern("imsi-999990000000001", &p("imsi-001)|(?:")),
+            Some(false)
+        );
+        assert_eq!(
+            identity_in_pattern("imsi-001", &p("imsi-001)|(?:")),
+            Some(false)
+        );
         // The same shapes within budget do match, so the refusals above are the
         // budget's and not the identity's.
         assert_eq!(
@@ -3394,6 +3485,44 @@ mod tests {
         assert!(identity_matches(
             &serde_json::json!({}),
             &query(Some("imsi-1"), None)
+        ));
+    }
+
+    /// R32 on #1957 M1: the per-profile pattern cap, checked at registration
+    /// (pointer and reason for `invalidParams`) and again at discovery for a
+    /// profile restored over it. REVERT-VERIFIED: with the discovery check
+    /// removed the over-cap candidate is evaluated and admitted.
+    #[test]
+    fn the_range_pattern_cap_is_enforced_1879() {
+        let ranges = |n: usize| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|k| serde_json::json!({ "pattern": format!("imsi-{k}.*") }))
+                .collect()
+        };
+        let cap = MAX_RANGE_PATTERNS_PER_PROFILE;
+        let profile = |n| serde_json::json!({ "udmInfo": { "supiRanges": ranges(n) } });
+        assert_eq!(range_pattern_violation(&profile(cap)), None);
+        let (at, why) = range_pattern_violation(&profile(cap + 1)).unwrap();
+        assert_eq!(at, format!("/udmInfo/supiRanges/{cap}/pattern"));
+        assert!(why.contains(&(cap + 1).to_string()), "{why}");
+        let long = serde_json::json!({ "ausfInfo": { "gpsiRanges": [
+            { "pattern": "a".repeat(MAX_RANGE_PATTERN_LEN + 1) }
+        ]}});
+        assert_eq!(
+            range_pattern_violation(&long).map(|v| v.0).as_deref(),
+            Some("/ausfInfo/gpsiRanges/0/pattern")
+        );
+        // At discovery, a restored over-cap list excludes the candidate even
+        // though its first pattern would match.
+        let restored = serde_json::json!({ "supiRanges": ranges(cap + 1) });
+        let query = DiscoveryQuery {
+            supi: Some("imsi-0123".into()),
+            ..Default::default()
+        };
+        assert!(!identity_matches(&restored, &query));
+        assert!(identity_matches(
+            &serde_json::json!({ "supiRanges": ranges(cap) }),
+            &query
         ));
     }
 
