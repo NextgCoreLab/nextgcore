@@ -2865,6 +2865,34 @@ impl PcfContext {
         out
     }
 
+    /// #1877 (R27 on #1976): store a BSF binding on session `id`, only if it still
+    /// exists and still serves `sm_policy_id`, without writing anything else back
+    /// (a find-then-`sess_update` of a clone overwrote a policy update made in
+    /// between). Under the same `sess_list` write lock `sess_remove` takes, so it is
+    /// ordered against a delete. Whether it was stored.
+    pub fn sess_set_binding(
+        &self,
+        id: u64,
+        sm_policy_id: &str,
+        resource_uri: &str,
+        binding_id: &str,
+    ) -> bool {
+        let stored = {
+            let mut sess_list = write_through_poison(&self.sess_list);
+            match sess_list.get_mut(&id) {
+                Some(sess) if sess.sm_policy_id == sm_policy_id => {
+                    sess.binding.store(resource_uri, binding_id);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if stored {
+            self.persist();
+        }
+        stored
+    }
+
     pub fn sess_update(&self, sess: &PcfSess) -> bool {
         let updated = self.sess_update_locked(sess);
         // Guards dropped inside the helper -- see sess_remove.

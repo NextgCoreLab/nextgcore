@@ -961,19 +961,28 @@ impl BsfContext {
         }
 
         if let Some(sess) = sess_list.remove(&id) {
-            // Remove from IPv4 hash
+            // #1877 (R27 on #1976): an address index entry goes only when it still
+            // names THIS binding. A newer binding for the same UE address (a PDU
+            // session re-established with a new SM policy) re-pointed it, and an
+            // unconditional remove dropped the newer binding from discovery by UE
+            // address (TS 29.521 §5.2.2.4) while it stayed stored.
             if let (Ok(mut hash), Some(addr)) = (self.ipv4addr_hash.write(), sess.ipv4addr) {
-                hash.remove(&addr);
+                if hash.get(&addr) == Some(&id) {
+                    hash.remove(&addr);
+                }
             }
-            // Remove from IPv6 hash
             if let (Ok(mut hash), Some(ref prefix)) =
                 (self.ipv6prefix_hash.write(), &sess.ipv6prefix)
             {
-                hash.remove(&prefix.hash_key());
+                let key = prefix.hash_key();
+                if hash.get(&key) == Some(&id) {
+                    hash.remove(&key);
+                }
             }
-            // Remove from MAC hash
             if let (Ok(mut hash), Some(ref mac)) = (self.mac_hash.write(), &sess.mac_addr48) {
-                hash.remove(mac);
+                if hash.get(mac) == Some(&id) {
+                    hash.remove(mac);
+                }
             }
             log::debug!("BSF session removed (id={id})");
             return Ok(Some(sess));
@@ -1916,6 +1925,44 @@ mod tests {
         let ctx = BsfContext::new();
         assert!(!ctx.is_initialized());
         assert_eq!(ctx.sess_count(), 0);
+    }
+
+    /// #1877 (R27 on #1976): removing an old binding keeps a newer binding for the
+    /// same UE address (and IPv6 prefix and MAC) discoverable by that address.
+    ///
+    /// REVERT-VERIFIED: with the index entries removed unconditionally, this fails:
+    /// the newer binding is no longer found by its UE address.
+    #[test]
+    fn removing_an_old_binding_keeps_the_new_one_found_by_address_1877() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let mac = "02-00-00-00-18-76";
+        let old = ctx
+            .sess_add_binding(Some("10.18.76.1"), Some("fd18::1/128"), Some(mac))
+            .expect("old");
+        let new = ctx
+            .sess_add_binding(Some("10.18.76.1"), Some("fd18::1/128"), Some(mac))
+            .expect("new");
+        assert_ne!(old.id, new.id);
+
+        ctx.sess_remove(old.id);
+
+        let by_v4 = ctx.sess_find_by_ipv4addr("10.18.76.1").map(|s| s.id);
+        let by_v6 = ctx.sess_find_by_ipv6prefix("fd18::1/128").map(|s| s.id);
+        let by_mac = ctx.sess_find_by_mac(mac).map(|s| s.id);
+        assert_eq!(
+            by_v4,
+            Some(new.id),
+            "the new binding is found by its UE address"
+        );
+        assert_eq!(by_v6, Some(new.id), "and by its IPv6 prefix");
+        assert_eq!(by_mac, Some(new.id), "and by its MAC address");
+
+        ctx.sess_remove(new.id);
+        assert!(
+            ctx.sess_find_by_ipv4addr("10.18.76.1").is_none(),
+            "and gone with it"
+        );
     }
 
     #[test]
