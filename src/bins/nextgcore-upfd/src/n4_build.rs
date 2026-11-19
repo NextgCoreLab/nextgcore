@@ -112,6 +112,8 @@ pub mod pfcp_ie {
     /// since #306. NOTE 3 (`29244-k00.txt:22672`) makes the two **exclusive**: a
     /// request either names URRs or asks for all of them.
     pub const QUERY_URR: u16 = 77;
+    /// TS 29.244 Table 8.1.2-1 (29244-k00.txt:27160), §8.2.90.
+    pub const QUERY_URR_REFERENCE: u16 = 125;
     pub const CAUSE: u16 = 19;
     pub const SOURCE_INTERFACE: u16 = 20;
     pub const F_TEID: u16 = 21;
@@ -274,6 +276,10 @@ pub struct UsageReport {
     pub duration_measurement: Option<u32>,
     pub time_of_first_packet: Option<u32>,
     pub time_of_last_packet: Option<u32>,
+    /// #1835: the Query URR Reference (IE 125, TS 29.244 §8.2.90) of the Session
+    /// Modification Request whose query this report answers. Present only then
+    /// (Table 7.5.5.2-1), and set to the value that request carried.
+    pub query_urr_reference: Option<u32>,
 }
 
 /// Usage Report Trigger flags
@@ -642,6 +648,10 @@ impl PfcpMessageBuilder {
         }
         if let Some(t) = report.time_of_last_packet {
             inner.add_u32(pfcp_ie::TIME_OF_LAST_PACKET, t);
+        }
+        // #1835: Table 7.5.5.2-1 / 7.5.8.3-1, after Usage Information.
+        if let Some(r) = report.query_urr_reference {
+            inner.add_u32(pfcp_ie::QUERY_URR_REFERENCE, r);
         }
         self.add_tlv(ie_type, &inner.build())
     }
