@@ -51,6 +51,12 @@ spec:
             {{- include "nextgcore.configMounts" (dict "nf" "nrf" "rewritten" false) | nindent 12 }}
           env:
             {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "nrf") | nindent 12 }}
+            - name: NEXTGCORE_SBI_PROFILE
+              # #1869: under the production profile the NRF accepts, and dials,
+              # only https nfStatusNotificationUris, so it follows the same
+              # global.sbiProfile as the NFs subscribing at it. Its TLS listener
+              # is its own config (#1617) either way.
+              value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
             {{- if .Values.nrf.metrics.enabled }}

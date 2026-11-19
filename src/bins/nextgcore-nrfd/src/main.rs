@@ -3201,6 +3201,15 @@ fn query_params(uri: &str) -> Vec<(String, String)> {
 
 /// Handle Subscription Create request
 async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+    handle_subscription_create_under(request, nextgcore_sbi::security::SbiProfile::resolve()).await
+}
+
+/// [`handle_subscription_create`] under an explicit SBI profile, so a test can
+/// drive the production path without the process-global override (#1869).
+async fn handle_subscription_create_under(
+    request: &SbiRequest,
+    profile: nextgcore_sbi::security::SbiProfile,
+) -> SbiResponse {
     log::info!("Subscription Create");
 
     // #1809: the verified identity this subscription is bound to, checked
@@ -3235,6 +3244,22 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
+    // #1869: under production the notification is sent over TLS with a token, so
+    // a cleartext callback is refused here, before anything is stored (TS 29.500
+    // §5.2.7.2: 400 with `invalidParams` naming the attribute).
+    if let Err(reason) =
+        nextgcore_nrfd::sbi_path::check_notification_uri(&notification_uri, profile)
+    {
+        let body = serde_json::json!({
+            "title": "Bad Request",
+            "status": 400,
+            "detail": reason,
+            "cause": "MANDATORY_IE_INCORRECT",
+            "invalidParams": [{ "param": "/nfStatusNotificationUri", "reason": reason }],
+        });
+        return SbiResponse::with_status(400)
+            .with_body(body.to_string(), "application/problem+json");
+    }
 
     // Generate subscription ID
     let subscription_id = uuid::Uuid::new_v4().to_string();
@@ -11169,6 +11194,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_replacement_notifies_profile_changed_over_the_wire() {
         use serde_json::json;
+        // #1869: the subscriber is a loopback h2c callback, which only the dev
+        // profile dials. Set and left set (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use std::sync::Mutex as StdMutex;
 
         // A deliberately unique nfType: `nf_manager()` is process-global and
@@ -11578,11 +11606,53 @@ mod tests {
         req.http.set_content(body.to_string());
         // #1809: a verified subscriber, as the production policy requires.
         req.peer_cert_nf_instance_id = Some("nrfd68-subscriber".into());
-        handle_subscription_create(&req).await
+        // These tests subscribe http callbacks: the dev profile, set on the call
+        // rather than through the process-global override (#1869).
+        handle_subscription_create_under(&req, nextgcore_sbi::security::SbiProfile::Dev).await
     }
 
     fn problem_of(resp: &SbiResponse) -> serde_json::Value {
         serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON")
+    }
+
+    /// #1869: under production an http nfStatusNotificationUri is a 400 with
+    /// `invalidParams` naming it, and nothing is stored; https is accepted.
+    #[tokio::test]
+    async fn production_subscribe_refuses_an_http_notification_uri_1869() {
+        use nextgcore_sbi::security::SbiProfile;
+        let uri = format!("http://amf-1869-{}.example/cb", uuid::Uuid::new_v4());
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": uri }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(resp.status, 400);
+        let problem = problem_of(&resp);
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+        assert_eq!(
+            problem["invalidParams"][0]["param"],
+            "/nfStatusNotificationUri"
+        );
+        assert!(
+            !nextgcore_nrfd::nnrf_handler::nf_manager()
+                .list_subscriptions()
+                .iter()
+                .any(|s| s.notification_uri == uri),
+            "a refused subscription must not be stored"
+        );
+
+        let https = uri.replacen("http://", "https://", 1);
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": https }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(
+            resp.status, 201,
+            "an https callback is accepted under production"
+        );
     }
 
     #[tokio::test]
@@ -14059,10 +14129,12 @@ mod subscription_owner_tests_1809 {
     }
 
     /// Subscribe as `cert`/`token_sub` and return the new subscription's id.
+    /// https (#1869): an http callback is refused under the production
+    /// profile, which an unset environment resolves to.
     async fn subscribe_as(cert: Option<&str>, token_sub: Option<&str>) -> String {
         let req = SbiRequest::post("/nnrf-nfm/v1/subscriptions").with_body(
             json!({
-                "nfStatusNotificationUri": "http://consumer.invalid/notify",
+                "nfStatusNotificationUri": "https://consumer.invalid/notify",
                 "reqNfInstanceId": OWNER,
             })
             .to_string(),
@@ -14260,7 +14332,7 @@ mod subscription_owner_tests_1809 {
     #[tokio::test]
     async fn under_production_an_anonymous_subscribe_is_refused() {
         assert!(NrfPolicy::default().require_subscriber_identity);
-        let uri = "http://anonymous-1809.invalid/notify";
+        let uri = "https://anonymous-1809.invalid/notify";
         let r = nrf_sbi_request_handler(subscribe_req(None, None, uri)).await;
         assert_invalid_client(&r, "no verified identity", "anonymous");
         assert!(
@@ -14277,7 +14349,7 @@ mod subscription_owner_tests_1809 {
     /// `subscription_owner`, the mixed caller gets 201.
     #[tokio::test]
     async fn a_caller_whose_identities_disagree_cannot_subscribe() {
-        let uri = "http://mixed-1809.invalid/notify";
+        let uri = "https://mixed-1809.invalid/notify";
         let r = nrf_sbi_request_handler(subscribe_req(Some(OWNER), Some(OTHER), uri)).await;
         assert_invalid_client(&r, "does not match its other verified identity", "mixed");
         assert!(

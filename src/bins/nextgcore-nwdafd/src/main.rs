@@ -698,13 +698,12 @@ async fn main() -> Result<()> {
                 nrf_uri: args.nrf_uri.clone(),
                 // #1421: the tokenised callback, so an OAuth2-required
                 // listener can admit the NRF's bearer-less notification.
-                callback_uri: format!(
-                    "http://{}{}",
-                    nextgcore_sbi::uri_encode::uri_authority(
-                        sbi.advertise.as_deref().unwrap_or("127.0.0.1"),
-                        sbi_port
-                    ),
-                    nrf_collector::callback_path()
+                // #1869: the scheme is the listener's, as the NFProfile's is
+                // (#1791); a hard-coded http was refused by a production NRF.
+                callback_uri: nf_status_callback_uri(
+                    sbi_scheme,
+                    sbi.advertise.as_deref().unwrap_or("127.0.0.1"),
+                    sbi_port,
                 ),
             });
         }
@@ -1493,6 +1492,22 @@ async fn register_with_nrf(
     }
 }
 
+/// The tokenised `nfStatusNotificationUri` this NWDAF subscribes at the NRF
+/// with (#1421), on the scheme its SBI listener actually serves (#1869): under
+/// production the NRF only accepts, and only dials, an `https` callback.
+fn nf_status_callback_uri(
+    scheme: nextgcore_sbi::types::UriScheme,
+    host: &str,
+    port: u16,
+) -> String {
+    format!(
+        "{}://{}{}",
+        scheme.as_str(),
+        nextgcore_sbi::uri_encode::uri_authority(host, port),
+        nrf_collector::callback_path()
+    )
+}
+
 /// Parse host and port from a URI string (e.g., "http://localhost:7777")
 fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     let without_scheme = uri
@@ -1814,6 +1829,23 @@ mod tests {
         assert!(
             resp.http.content.as_deref().is_none_or(str::is_empty),
             "the 204 must carry an empty body"
+        );
+    }
+
+    /// #1869: the NF status callback follows the listener scheme; it was
+    /// hard-coded http, which a production NRF refuses.
+    #[test]
+    fn the_nf_status_callback_follows_the_listener_scheme_1869() {
+        use nextgcore_sbi::types::UriScheme;
+        let https = nf_status_callback_uri(UriScheme::Https, "nwdaf.5gc.example", 8443);
+        assert!(
+            https.starts_with("https://nwdaf.5gc.example:8443/nnwdaf-callback/v1/"),
+            "{https}"
+        );
+        let http = nf_status_callback_uri(UriScheme::Http, "fd00::1", 7777);
+        assert!(
+            http.starts_with("http://[fd00::1]:7777/nnwdaf-callback/v1/"),
+            "{http}"
         );
     }
 
@@ -2187,6 +2219,9 @@ mod g21_strict_peer_tests {
     #[tokio::test]
     async fn test_g21_strict_peer_nrf_load_ingestion() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        // #1869: the real nrfd notifier dials this loopback h2c callback, which
+        // only the dev profile does. Set and left set (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
         // Real nwdafd SBI server on a free localhost port.
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -3059,6 +3094,9 @@ mod callback_oauth2_1421_tests {
     #[tokio::test]
     async fn the_nrf_status_notify_is_admitted_on_its_token_only() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        // #1869: the real nrfd notifier dials this loopback h2c callback, which
+        // only the dev profile does. Set and left set (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port) = oauth2_listener().await;
         let base = format!("http://127.0.0.1:{port}");
         let id = "nwdaf-1421-amf";
