@@ -604,7 +604,7 @@ fn nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16, scheme: &str)
     let provisioning = service(
         nextgcore_sbi::types::SbiServiceType::NucmfProvisioning.to_name(),
         PROVISIONING_API_FULL_VERSION,
-        &["NEF", "SCP"],
+        &["NEF", "AF", "SCP"],
     );
     nextgcore_sbi::nf_addressing::classify_profile_host(
         json!({
@@ -613,7 +613,7 @@ fn nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16, scheme: &str)
             "nfStatus": "REGISTERED",
             "ipv4Addresses": [sbi_addr],
             "nfServices": [uecm, provisioning],
-            "allowedNfTypes": ["AMF", "MME", "NEF", "SCP"],
+            "allowedNfTypes": ["AMF", "MME", "NEF", "AF", "SCP"],
             "heartBeatTimer": 10,
         }),
         sbi_addr,
@@ -750,6 +750,14 @@ fn handle(
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     log::debug!("UCMF SBI: {method} {path}");
 
+    // #1916: Nucmf_Provisioning is the NEF's and the AF's (TS 29.675 §4.1.3.2),
+    // never an AMF's, whatever nucmf token it holds. Refused before any lookup.
+    if parts.first() == Some(&PROVISIONING_API) {
+        if let Some(refusal) = refuse_provisioning_consumer(request) {
+            return (refusal, Vec::new());
+        }
+    }
+
     match parts.as_slice() {
         [UECM_API, "v1", "dic-entries"] => match method {
             "GET" => (resolve(&read_state(ucmf), request), Vec::new()),
@@ -779,10 +787,10 @@ fn handle(
             _ => (send_method_not_allowed(method, "provisionings"), Vec::new()),
         },
         [PROVISIONING_API, "v1", "provisionings", id] => match method {
-            "GET" => (get_provisioning(&read_state(ucmf), id), Vec::new()),
+            "GET" => (get_provisioning(&read_state(ucmf), id, request), Vec::new()),
             "PUT" => replace_provisioning(&mut write_state(ucmf), id, request, now),
             "PATCH" => patch_provisioning(&mut write_state(ucmf), id, request, now),
-            "DELETE" => delete_provisioning(&mut write_state(ucmf), id, now),
+            "DELETE" => delete_provisioning(&mut write_state(ucmf), id, request, now),
             _ => (
                 send_method_not_allowed(method, "provisionings/{provisioningId}"),
                 Vec::new(),
@@ -1299,7 +1307,13 @@ fn create_provisioning(
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
     };
-    match u.create_provisioning(&configs, supp_feat, now) {
+    // #1916: bound to the creating NEF / AF's verified identity; disagreeing
+    // identities create nothing.
+    let owner = match provisioning_owner_in(request, production_profile()) {
+        Ok(owner) => owner,
+        Err(refusal) => return (*refusal, Vec::new()),
+    };
+    match u.create_provisioning_owned(&configs, supp_feat, now, owner) {
         (Some(p), failed, note) => {
             let response = SbiResponse::created()
                 .with_header(
@@ -1318,7 +1332,10 @@ fn create_provisioning(
     }
 }
 
-fn get_provisioning(u: &Ucmf, id: &str) -> SbiResponse {
+fn get_provisioning(u: &Ucmf, id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Some(refusal) = refuse_non_creator(u, id, request, "Get provisioning") {
+        return refusal;
+    }
     match u.provisioning(id) {
         Some(p) => SbiResponse::ok()
             .with_json_body(&racs_data_body(p, &[]))
@@ -1357,6 +1374,99 @@ fn provisioning_update_response(
     }
 }
 
+/// TS 29.675 §4.1.3.2: the known Nucmf_Provisioning consumers.
+const PROVISIONING_CONSUMER_NF_TYPES: &[&str] = &["NEF", "AF"];
+
+/// The `403` for a caller whose verified client certificate names an NF type
+/// that is not a Nucmf_Provisioning consumer (#1916). A relay certificate (SCP,
+/// SEPP) says nothing about the consumer, so it is left to the token, whose
+/// `nucmf-provisioning` scope the NRF grants only to the NF types this UCMF's
+/// profile allows ([`nf_profile`]). No certificate (`dev`) changes nothing.
+fn refuse_provisioning_consumer(request: &SbiRequest) -> Option<SbiResponse> {
+    let types = &request.peer_cert_nf_types;
+    let is = |set: &[&str]| {
+        types
+            .iter()
+            .any(|t| set.iter().any(|s| s.eq_ignore_ascii_case(t)))
+    };
+    if types.is_empty() || is(owner_binding::RELAY_NF_TYPES) || is(PROVISIONING_CONSUMER_NF_TYPES) {
+        return None;
+    }
+    let why = format!(
+        "Nucmf_Provisioning is consumed by the NEF and the AF only (TS 29.675 §4.1.3.2); \
+         the requester's certificate names {types:?}"
+    );
+    log::debug!("{why}");
+    Some(nextgcore_sbi::server::send_forbidden(&why, None))
+}
+
+/// The `403` for a caller other than the NEF / AF that created provisioning
+/// `id` (#1916), or `None` to go on (also when there is no such resource, so the
+/// handler answers its own `404`).
+fn refuse_non_creator(
+    u: &Ucmf,
+    id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    refuse_non_creator_in(u, id, request, operation, production_profile())
+}
+
+fn refuse_non_creator_in(
+    u: &Ucmf,
+    id: &str,
+    request: &SbiRequest,
+    operation: &str,
+    production: bool,
+) -> Option<SbiResponse> {
+    let p = u.provisioning(id)?;
+    if p.owner.is_none() && production {
+        // DECISIONS 2026-11-18: an ownerless record is frozen under production.
+        // A provisioning can come from a NEF or an AF, so the first caller is not
+        // adopted: with the sequential IDs those records carry, it would be
+        // whoever guessed first.
+        let why = format!(
+            "provisioning {id} predates its owner binding and is frozen under the production \
+             SBI profile"
+        );
+        log::debug!("{operation} refused: {why}");
+        return Some(nextgcore_sbi::server::send_forbidden(
+            &format!("{operation}: {why}"),
+            None,
+        ));
+    }
+    owner_binding::refuse_non_owner(p.owner.as_deref(), request, operation)
+}
+
+/// Whether this process runs the production SBI profile (#1916).
+fn production_profile() -> bool {
+    nextgcore_sbi::security::SbiProfile::resolve().is_production()
+}
+
+/// The owner a Nucmf_Provisioning_Create records (#1916): the caller's verified
+/// identity. Under production a caller with none is refused `403` before
+/// anything is provisioned, so every new provisioning has an owner. The
+/// production listener already demands a token and a client certificate (#1845),
+/// so this is defence in depth, not the only gate.
+fn provisioning_owner_in(
+    request: &SbiRequest,
+    production: bool,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    const OP: &str = "Nucmf_Provisioning_Create";
+    match owner_binding::owner_for_new_resource(request, OP)? {
+        None if production => {
+            let why = "the requester has no verified identity; under the production SBI \
+                       profile every provisioning is bound to its creator (TS 33.501 §13.4.1)";
+            log::debug!("{OP} refused: {why}");
+            Err(Box::new(nextgcore_sbi::server::send_forbidden(
+                &format!("{OP}: {why}"),
+                None,
+            )))
+        }
+        owner => Ok(owner),
+    }
+}
+
 /// TS 29.675 §5.2.2.3: `PUT /provisionings/{id}`.
 fn replace_provisioning(
     u: &mut Ucmf,
@@ -1364,6 +1474,9 @@ fn replace_provisioning(
     request: &SbiRequest,
     now: DateTime<Utc>,
 ) -> (SbiResponse, Vec<Notification>) {
+    if let Some(refusal) = refuse_non_creator(u, id, request, "Nucmf_Provisioning_Update") {
+        return (refusal, Vec::new());
+    }
     let (configs, supp_feat) = match racs_configs(request) {
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
@@ -1378,6 +1491,9 @@ fn patch_provisioning(
     request: &SbiRequest,
     now: DateTime<Utc>,
 ) -> (SbiResponse, Vec<Notification>) {
+    if let Some(refusal) = refuse_non_creator(u, id, request, "Nucmf_Provisioning_Update") {
+        return (refusal, Vec::new());
+    }
     let (configs, _) = match racs_configs(request) {
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
@@ -1389,8 +1505,12 @@ fn patch_provisioning(
 fn delete_provisioning(
     u: &mut Ucmf,
     id: &str,
+    request: &SbiRequest,
     now: DateTime<Utc>,
 ) -> (SbiResponse, Vec<Notification>) {
+    if let Some(refusal) = refuse_non_creator(u, id, request, "Nucmf_Provisioning_Delete") {
+        return (refusal, Vec::new());
+    }
     match u.delete_provisioning(id, now) {
         Some(note) => (SbiResponse::no_content(), note.into_iter().collect()),
         None => (
@@ -1481,6 +1601,10 @@ mod tests {
     }
 
     fn ucmf() -> RwLock<Ucmf> {
+        // #1916: the router now reads the SBI profile (production refuses an
+        // anonymous provisioning). These tests drive it as `dev`, and never reset
+        // the override; a test that means production passes it in explicitly.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         RwLock::new(Ucmf::new(0x05, ModeOfOperation::B))
     }
 
@@ -1833,6 +1957,169 @@ mod tests {
         assert_eq!(r.status, 403);
         let (_, notes) = handle(&u, &assign_request("35123456", &[1]), now());
         assert!(notes.is_empty(), "no subscription was created");
+    }
+
+    const NEF_A_1916: &str = "aaaaaaaa-1916-4000-8000-00000000000a";
+    const NEF_B_1916: &str = "bbbbbbbb-1916-4000-8000-00000000000b";
+
+    /// #1916, TS 29.675 §4.2.3-§4.2.4 / TS 33.501 §13.4.1: a provisioning is
+    /// bound to the NEF that created it. Another NEF, or an anonymous caller,
+    /// gets 403 on GET, PUT, PATCH and DELETE, and the dictionary entry it
+    /// provisioned keeps resolving unchanged; the creator then manages it.
+    #[test]
+    fn only_the_creating_nef_manages_a_provisioning_1916() {
+        let u = ucmf();
+        let create = as_nf_1862(
+            with_json(
+                req("POST", "/nucmf-provisioning/v1/provisionings"),
+                provisioning_body("0a0b"),
+            ),
+            Some(NEF_A_1916),
+        );
+        let (r, _) = handle(&u, &create, now());
+        assert_eq!(r.status, 201);
+        let doc = r.http.get_header("Location").unwrap().to_string();
+        let doc = &doc[doc.find("/nucmf-provisioning").unwrap()..];
+        let id = doc.rsplit('/').next().unwrap().to_string();
+        let resolves_0a0b = |u: &RwLock<Ucmf>| {
+            read_state(u)
+                .provisioning(&id)
+                .is_some_and(|p| p.configs[MAN]["racsParam5Gs"] == "0a0b")
+        };
+        assert!(resolves_0a0b(&u));
+
+        for who in [Some(NEF_B_1916), None] {
+            for r in [
+                req("GET", doc),
+                with_json(req("PUT", doc), provisioning_body("0c")),
+                with_json(req("PATCH", doc), json!({"racsConfigs": {MAN: null}})),
+                req("DELETE", doc),
+            ] {
+                let method = r.header.method.clone();
+                let (r, notes) = handle(&u, &as_nf_1862(r, who), now());
+                assert_eq!(r.status, 403, "{method} by {who:?}");
+                assert!(
+                    body(&r)["detail"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(&format!("belongs to NF instance {NEF_A_1916}")),
+                    "{method} by {who:?}: {}",
+                    body(&r)
+                );
+                assert!(notes.is_empty());
+            }
+        }
+        assert!(resolves_0a0b(&u), "the provisioning is untouched");
+
+        let (r, _) = handle(
+            &u,
+            &as_nf_1862(
+                with_json(req("PUT", doc), provisioning_body("0c")),
+                Some(NEF_A_1916),
+            ),
+            now(),
+        );
+        assert_eq!(r.status, 200, "the creator replaces it: {:?}", body(&r));
+        let (r, _) = handle(&u, &as_nf_1862(req("GET", doc), Some(NEF_A_1916)), now());
+        assert_eq!(body(&r)["racsConfigs"][MAN]["racsParam5Gs"], "0c");
+        let (r, _) = handle(&u, &as_nf_1862(req("DELETE", doc), Some(NEF_A_1916)), now());
+        assert_eq!(r.status, 204, "and deletes it");
+    }
+
+    /// #1916, TS 29.675 §4.1.3.2: only the NEF and the AF consume
+    /// Nucmf_Provisioning. A caller whose verified certificate names another NF
+    /// type (an AMF holding a nucmf token) is refused before anything is
+    /// created; a NEF or AF certificate, or one relayed through an SCP, is not.
+    #[test]
+    fn an_amf_certificate_cannot_provision_1916() {
+        let u = ucmf();
+        let create = |types: &[&str]| {
+            let mut r = with_json(
+                req("POST", "/nucmf-provisioning/v1/provisionings"),
+                provisioning_body("0a0b"),
+            );
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let (r, _) = handle(&u, &create(&["AMF"]), now());
+        assert_eq!(r.status, 403);
+        assert!(
+            body(&r)["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("consumed by the NEF and the AF only"),
+            "{}",
+            body(&r)
+        );
+        assert!(
+            read_state(&u).provisioning("1").is_none(),
+            "nothing created"
+        );
+        // The same refusal on an existing resource, before its lookup.
+        let (r, _) = handle(&u, &create(&["NEF"]), now());
+        assert_eq!(r.status, 201);
+        let mut del = req("DELETE", "/nucmf-provisioning/v1/provisionings/1");
+        del.peer_cert_nf_types = vec!["AMF".into()];
+        assert_eq!(handle(&u, &del, now()).0.status, 403);
+        assert!(read_state(&u).provisioning("1").is_some());
+        // An AF, a NEF, or a relay (whose certificate is not the consumer's) passes.
+        for types in ["AF", "NEF", "SCP"] {
+            let mut get = req("GET", "/nucmf-provisioning/v1/provisionings/1");
+            get.peer_cert_nf_types = vec![types.into()];
+            assert_eq!(handle(&u, &get, now()).0.status, 200, "{types}");
+        }
+    }
+
+    /// #1916 (DECISIONS 2026-11-18): under the production profile an anonymous
+    /// create provisions nothing, and an ownerless provisioning (restored from a
+    /// pre-#1916 state file) is frozen for every caller. Under `dev` both are as
+    /// before. The profile is passed in: flipping the process-wide override would
+    /// race the tests that set Dev.
+    #[test]
+    fn production_refuses_anonymous_creates_and_freezes_ownerless_provisionings_1916() {
+        let anon = with_json(
+            req("POST", "/nucmf-provisioning/v1/provisionings"),
+            provisioning_body("0a0b"),
+        );
+        assert_eq!(provisioning_owner_in(&anon, true).unwrap_err().status, 403);
+        assert_eq!(provisioning_owner_in(&anon, false).ok(), Some(None));
+        assert_eq!(
+            provisioning_owner_in(&as_nf_1862(anon.clone(), Some(NEF_A_1916)), true).ok(),
+            Some(Some(NEF_A_1916.to_string()))
+        );
+
+        let u = ucmf();
+        assert_eq!(handle(&u, &anon, now()).0.status, 201, "dev: ownerless");
+        let state = read_state(&u);
+        for who in [Some(NEF_A_1916), Some(NEF_B_1916), None] {
+            let r = as_nf_1862(req("DELETE", "/nucmf-provisioning/v1/provisionings/1"), who);
+            let refused = refuse_non_creator_in(&state, "1", &r, "Delete", true)
+                .unwrap_or_else(|| panic!("{who:?} reached a frozen provisioning"));
+            assert_eq!(refused.status, 403);
+            assert!(body(&refused)["detail"]
+                .as_str()
+                .unwrap()
+                .contains("frozen"));
+            assert!(refuse_non_creator_in(&state, "1", &r, "Delete", false).is_none());
+        }
+    }
+
+    /// #1916: the provisioning routes use the production-aware helpers, so the
+    /// rules above are what the router applies. Each call appears twice: at its
+    /// site and in this test.
+    #[test]
+    fn the_provisioning_routes_judge_under_the_real_profile_1916() {
+        let src = include_str!("main.rs");
+        assert_eq!(
+            src.matches("provisioning_owner_in(request, production_profile())")
+                .count(),
+            2
+        );
+        assert_eq!(
+            src.matches("refuse_non_creator_in(u, id, request, operation, production_profile())")
+                .count(),
+            2
+        );
     }
 
     const MAN: &str = "000007ed900000000abc";

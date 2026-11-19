@@ -5449,6 +5449,82 @@ mod tests {
         );
     }
 
+    /// #1934 review M1, checked on udrd: no spelling of the AuthenticationSubscription
+    /// path gets K out of the real OAuth2 listener with a service-scope-only token.
+    /// An empty segment (`//` in either place), a trailing `/` and a dot segment are
+    /// refused 400 by the SBI server before the scope check and the router, so the
+    /// two can never disagree on what the path names. The well-formed path is the
+    /// scope check's 403, and the UDM still reads it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_path_spelling_reads_k_without_its_scope_1934() {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_AUTH_SUBSCRIPTION_MODIFY as MODIFY, NUDR_DR_AUTH_SUBSCRIPTION_READ as READ,
+        };
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _store = DbiTestStore::enable().await;
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = udr_oauth2_listener(NextgcoreSbiServerConfig::new(udr_addr));
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = SbiServer::on_listener(cfg, udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let bearer = |scope: &str| {
+            format!(
+                "Bearer {}",
+                stand_in::es256_access_token(&sk, stand_in::TEST_NRF_KID, "UDR", scope)
+            )
+        };
+        let service_only = bearer("nudr-dr");
+        let udm = bearer(&format!("nudr-dr {READ} {MODIFY}"));
+        let supi = "imsi-001010000019340";
+        let tail = "authentication-data/authentication-subscription";
+        let path = format!("/nudr-dr/v2/subscription-data/{supi}/{tail}");
+        let k = "465b5ce8b199b49faa5f0a2ee238a6bc";
+        let send = |req: SbiRequest, auth: &str| {
+            let req = req.with_header("authorization", auth.to_string());
+            let client = &client;
+            async move { client.send_request(req).await.expect("response") }
+        };
+        let put = SbiRequest::put(&path)
+            .with_json_body(&json!({
+                "authenticationMethod": "5G_AKA",
+                "encPermanentKey": k,
+                "encOpcKey": "e8ed289deba952e4283b54e88e6183ca",
+                "authenticationManagementField": "8000",
+                "sequenceNumber": {"sqnScheme": "NON_TIME_BASED", "sqn": "000000000020"}
+            }))
+            .expect("json");
+        assert_eq!(send(put, &udm).await.status, 201);
+
+        let mut answers = Vec::new();
+        for spelling in [
+            format!("/nudr-dr/v2//subscription-data/{supi}/{tail}"),
+            format!("/nudr-dr/v2/subscription-data//{supi}/{tail}"),
+            format!("{path}/"),
+            format!("/nudr-dr/v2/subscription-data/{supi}/authentication-data/./authentication-subscription"),
+        ] {
+            let r = send(SbiRequest::get(&spelling), &service_only).await;
+            answers.push((spelling, r));
+        }
+        let refused = send(SbiRequest::get(&path), &service_only).await;
+        let served = send(SbiRequest::get(&path), &udm).await;
+        udr.stop().await.expect("stop");
+
+        for (spelling, r) in &answers {
+            assert_eq!(r.status, 400, "{spelling}: {:?}", r.http.content);
+            assert!(
+                !r.http.content.as_deref().unwrap_or("").contains(k),
+                "{spelling}"
+            );
+        }
+        assert_eq!(refused.status, 403);
+        assert_eq!(served.status, 200, "{:?}", served.http.content);
+        assert!(served.http.content.as_deref().unwrap_or("").contains(k));
+    }
+
     /// #1811: the REAL router behind the UDR's OAuth2 listener
     /// (`udr_oauth2_listener`, the one `main` builds). The AuthenticationSubscription
     /// resource holds K and OPc, so a token scoped for `nudr-dr` alone -- all a
