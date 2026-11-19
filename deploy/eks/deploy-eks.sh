@@ -13,6 +13,8 @@
 #   ENABLE_DATAPLANE=true ./deploy-eks.sh        # privileged UPF w/ real TUN
 #   EPHEMERAL_STORAGE=true ./deploy-eks.sh       # MongoDB on emptyDir (no EBS CSI)
 #   AMF_UE_CONTEXT_STORE=true ./deploy-eks.sh    # #686: UE contexts survive an AMF restart
+#   UDM_DURABLE_STATE=pvc ./deploy-eks.sh        # #1885: udmd's state file on a gp3 PVC
+#                                                #   (emptydir: container restarts only)
 #   RECREATE_MONGODB=true ./deploy-eks.sh        # allow recreating the mongodb
 #                                                #   StatefulSet (data loss, see below)
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
@@ -67,6 +69,20 @@ RECREATE_MONGODB="${RECREATE_MONGODB:-false}"
 # default. The base manifest already pins the AMF's nfInstanceId, which restoration
 # needs. The records hold NAS keys in clear, in the UDR's MongoDB.
 AMF_UE_CONTEXT_STORE="${AMF_UE_CONTEXT_STORE:-false}"
+# #1836/#1885: udmd's durable state file (SDM subscriptions, its am-data
+# subscriptions at the UDR, the am-data changes waiting for an AMF).
+#   false    memory-only, as before: a udmd restart loses them.
+#   pvc      components/udm-durable-state: a gp3 claim, survives pod re-creation.
+#   emptydir k8s/components/udm-durable-state-emptydir: survives a container
+#            restart only; a deleted or rescheduled pod starts with no state.
+# "auto" (the default) adopts the live udm Deployment's mode, so a plain re-run
+# never drops the state file (as ENABLE_DATAPLANE, #662). A fresh install
+# resolves auto to false.
+UDM_DURABLE_STATE="${UDM_DURABLE_STATE:-auto}"
+case "${UDM_DURABLE_STATE}" in
+  auto|false|pvc|emptydir) ;;
+  *) printf 'UDM_DURABLE_STATE must be auto, false, pvc or emptydir, not %s\n' "${UDM_DURABLE_STATE}" >&2; exit 1 ;;
+esac
 
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn  ]\033[0m %s\n' "$*"; }
@@ -123,7 +139,8 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   # lib/live_modes.py with fixture tests.
   LIVE_STS_JSON="$(mktemp -t nextg-live-sts-XXXXXX.json)"
   LIVE_DP_JSON="$(mktemp -t nextg-live-dp-XXXXXX.json)"
-  trap 'rm -f "${LIVE_STS_JSON}" "${LIVE_DP_JSON}"' EXIT
+  LIVE_UDM_JSON="$(mktemp -t nextg-live-udm-XXXXXX.json)"
+  trap 'rm -f "${LIVE_STS_JSON}" "${LIVE_DP_JSON}" "${LIVE_UDM_JSON}"' EXIT
   kubectl get statefulset mongodb -n "${NAMESPACE}" -o json > "${LIVE_STS_JSON}" 2>/dev/null \
     || : > "${LIVE_STS_JSON}"
   : > "${LIVE_DP_JSON}"
@@ -131,6 +148,8 @@ if [[ "${DRY_RUN}" != "true" ]]; then
     kubectl get deployment "${PROFILE_DATAPLANE_DEPLOYMENT}" -n "${NAMESPACE}" -o json \
       > "${LIVE_DP_JSON}" 2>/dev/null || : > "${LIVE_DP_JSON}"
   fi
+  kubectl get deployment udm -n "${NAMESPACE}" -o json > "${LIVE_UDM_JSON}" 2>/dev/null \
+    || : > "${LIVE_UDM_JSON}"
   LIVE_STORAGE="$(python3 "${SCRIPT_DIR}/lib/live_modes.py" storage "${LIVE_STS_JSON}")"
   LIVE_DATAPLANE="$(python3 "${SCRIPT_DIR}/lib/live_modes.py" dataplane "${LIVE_DP_JSON}" \
     "${PROFILE_DATAPLANE_DEPLOYMENT:-upf}")"
@@ -140,6 +159,15 @@ if [[ "${DRY_RUN}" != "true" ]]; then
       ephemeral) EPHEMERAL_STORAGE=true;  STORAGE_NOTE=" (auto: kept from the live StatefulSet)" ;;
       pvc)       EPHEMERAL_STORAGE=false; STORAGE_NOTE=" (auto: kept from the live StatefulSet)" ;;
       *)         EPHEMERAL_STORAGE=false; STORAGE_NOTE=" (auto: fresh install)" ;;
+    esac
+  fi
+  UDM_STATE_NOTE=""
+  if [[ "${UDM_DURABLE_STATE}" == "auto" ]]; then
+    LIVE_UDM_STATE="$(python3 "${SCRIPT_DIR}/lib/live_modes.py" udm-state "${LIVE_UDM_JSON}")"
+    case "${LIVE_UDM_STATE}" in
+      pvc|emptydir|false) UDM_DURABLE_STATE="${LIVE_UDM_STATE}"; UDM_STATE_NOTE=" (auto: kept from the live udm)" ;;
+      absent) UDM_DURABLE_STATE=false; UDM_STATE_NOTE=" (auto: fresh install)" ;;
+      *) die "the live udm Deployment sets NEXTGCORE_UDM_STATE_FILE or a udm-state volume this script did not render (a kubectl patch?). Remove it (README.md, \"UDM durable state\") or set UDM_DURABLE_STATE=false|pvc|emptydir." ;;
     esac
   fi
   DATAPLANE_NOTE=""
@@ -164,6 +192,7 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   data plane     : ${ENABLE_DATAPLANE}${DATAPLANE_NOTE}
   mongo storage  : $([[ "${EPHEMERAL_STORAGE}" == "true" ]] && echo "emptyDir (EPHEMERAL - data lost on restart)" || echo "gp3 PVC")${STORAGE_NOTE}
   AMF UE store   : ${AMF_UE_CONTEXT_STORE}
+  UDM state file : ${UDM_DURABLE_STATE}${UDM_STATE_NOTE}
 
 EOF
   read -r -p "Apply to this cluster? [y/N] " reply
@@ -177,17 +206,50 @@ else
   # No cluster to read: "auto" renders a fresh install.
   [[ "${EPHEMERAL_STORAGE}" == "auto" ]] && EPHEMERAL_STORAGE=false
   [[ "${ENABLE_DATAPLANE}" == "auto" ]] && ENABLE_DATAPLANE=false
+  [[ "${UDM_DURABLE_STATE}" == "auto" ]] && UDM_DURABLE_STATE=false
 fi
 
 # --- render ----------------------------------------------------------------
 
 RENDERED="$(mktemp -t nextg-eks-XXXXXX.yaml)"
-trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
+trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}" "${LIVE_UDM_JSON:-}"' EXIT
 
 log "rendering kustomize overlay..."
+RENDER_SRC="${PROFILE_RENDER_DIR:-${PROFILE_DIR}}"
+# #1885: the UDM state component goes on through a throwaway kustomization over
+# the profile, so no profile has to list it. kustomize refuses absolute paths,
+# hence relative ones from the temporary directory.
+UDM_WRAP=""
+if [[ "${UDM_DURABLE_STATE}" != "false" ]]; then
+  [[ " ${PROFILE_CORE_NFS[*]} " == *" udm:"* ]] \
+    || die "UDM_DURABLE_STATE=${UDM_DURABLE_STATE}: profile ${PROFILE_NAME} runs no udm"
+  case "${UDM_DURABLE_STATE}" in
+    pvc)      UDM_COMPONENT="${SCRIPT_DIR}/components/udm-durable-state" ;;
+    emptydir) UDM_COMPONENT="${CORE_DIR}/k8s/components/udm-durable-state-emptydir" ;;
+  esac
+  UDM_WRAP="$(mktemp -d -t nextg-udm-state-XXXXXX)"
+  python3 - "${UDM_WRAP}" "${RENDER_SRC}" "${UDM_COMPONENT}" "${NAMESPACE}" <<'PY' \
+    || die "UDM state kustomization failed"
+import os, sys
+wrap, src, comp = (os.path.realpath(a) for a in sys.argv[1:4])
+ns = sys.argv[4]
+with open(os.path.join(wrap, 'kustomization.yaml'), 'w') as f:
+    f.write('apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n'
+            f'namespace: {ns}\n'
+            f'resources:\n  - {os.path.relpath(src, wrap)}\n'
+            f'components:\n  - {os.path.relpath(comp, wrap)}\n')
+PY
+  RENDER_SRC="${UDM_WRAP}"
+  log "UDM durable state: ${UDM_DURABLE_STATE} ($(basename "${UDM_COMPONENT}"))"
+fi
+render_rc=0
 # shellcheck disable=SC2086  # PROFILE_KUSTOMIZE_FLAGS is a word list
-kubectl kustomize ${PROFILE_KUSTOMIZE_FLAGS} "${PROFILE_RENDER_DIR:-${PROFILE_DIR}}" > "${RENDERED}" \
-  || die "kustomize render failed"
+kubectl kustomize ${PROFILE_KUSTOMIZE_FLAGS} "${RENDER_SRC}" > "${RENDERED}" || render_rc=$?
+if [[ -n "${UDM_WRAP}" ]]; then
+  rm -f "${UDM_WRAP}/kustomization.yaml"
+  rmdir "${UDM_WRAP}"
+fi
+[[ "${render_rc}" -eq 0 ]] || die "kustomize render failed"
 
 # Profile-specific transforms of the rendered manifests, in place (a no-op for
 # 5g). Runs before the generic rewrites below, so it sees the Kind-local image
@@ -419,7 +481,7 @@ if [[ "${ENABLE_DATAPLANE}" == "true" && -n "${PROFILE_DATAPLANE_DEPLOYMENT}" ]]
   # `cmd | python3 - <<PY` overrides the piped stdin (shellcheck SC2259), so
   # the transform would read the script instead of the manifests.
   SWAP_PY="$(mktemp -t nextg-upf-swap-XXXXXX.py)"
-  trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${SWAP_PY}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
+  trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${SWAP_PY}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}" "${LIVE_UDM_JSON:-}"' EXIT
   cat > "${SWAP_PY}" <<'PY'
 import sys, yaml
 patch = yaml.safe_load(open(sys.argv[1]))
@@ -792,7 +854,7 @@ profile_rollout
 # (IMAGE_TAG=latest) moving underneath an unchanged spec -- hence that warning.
 log "verifying running pods match the deployed images..."
 PODS_JSON="${RENDERED}.pods.json"
-trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}" "${PEER_A_JSON}" "${PEER_B_JSON}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
+trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}" "${PEER_A_JSON}" "${PEER_B_JSON}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}" "${LIVE_UDM_JSON:-}"' EXIT
 
 # #1353: "replacements not Ready" (exit 2) can be a pod in a designed restart rather
 # than a failing rollout -- PROFILE=epc's epc-peers-check.sh liveness restarts a pod

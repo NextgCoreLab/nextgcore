@@ -13,6 +13,15 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Added
+- udmd's durable state file (#1836) gets a volume on Kubernetes (#1885). The Helm chart's
+  `udm.durableState` (off by default) mounts a ReadWriteOnce claim, or an emptyDir, at
+  `/var/lib/nextgcore` and sets `NEXTGCORE_UDM_STATE_FILE`; the kustomize components
+  `k8s/components/udm-durable-state[-emptydir]` do the same for `k8s/`, and
+  `UDM_DURABLE_STATE=pvc|emptydir` for `deploy-eks.sh` (gp3; `auto` keeps the live mode). One
+  writer per file: one `Recreate` replica, and the chart refuses `udm.replicas > 1` or a
+  ReadWriteMany claim with durable state on. An emptyDir survives a container restart, not a pod
+  reschedule. CI renders every mode offline and checks the volume, mount and env appear only when
+  enabled.
 - amfd records when it learnt a UE's location (nextgsim#488). Every User Location Information
   the RAN reports (InitialUEMessage, Uplink NAS Transport, Handover Notify, Path Switch) stamps
   `ue_location_timestamp`, so on the default path `NrLocation.ueLocationTimestamp` (TS 29.571
