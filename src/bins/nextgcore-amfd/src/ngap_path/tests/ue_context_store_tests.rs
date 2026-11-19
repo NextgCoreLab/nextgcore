@@ -371,6 +371,15 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
         .unwrap_or_else(|| panic!("the SMF is given this AMF's addresses: {calls:?}"));
     let body: serde_json::Value = serde_json::from_str(&calls[serving].1).expect("json");
     assert_eq!(body["servingNfId"], instance);
+    // #1931 (R31 m3 on #1899): the SMF admits an AMF change only from the AMF whose
+    // verified identity (its access token's `sub`, the `nfInstanceId` this AMF's
+    // token client asks the NRF as) IS the `servingNfId`. If the two ever diverged,
+    // every AMF change would be refused 403.
+    assert_eq!(
+        body["servingNfId"].as_str(),
+        Some(crate::amf_oauth2_client("http://127.0.0.1:1").nf_instance_id()),
+        "servingNfId must be the identity this AMF's access tokens carry"
+    );
     assert_eq!(
         body["smContextStatusUri"],
         crate::sbi_path::sm_context_status_uri(

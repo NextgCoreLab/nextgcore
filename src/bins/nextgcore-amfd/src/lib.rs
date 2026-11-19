@@ -389,6 +389,20 @@ pub(crate) fn attach_oauth2(
     }
 }
 
+/// The outbound OAuth2 client this AMF requests its access tokens with. It asks
+/// as this process's AMF NF Instance ID, which the NRF issues as the token's
+/// `sub`: the identity an SMF binds an SM context to (#1860) and the one this
+/// AMF names as `servingNfId` on an AMF change, so the two must stay one value
+/// (#1931).
+pub(crate) fn amf_oauth2_client(nrf_uri: &str) -> Arc<nextgcore_sbi::oauth::OAuth2Client> {
+    Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+        nrf_uri,
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+            .to_string(),
+        nextgcore_sbi::types::NfType::Amf,
+    ))
+}
+
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
 /// matched-sim path is untouched. Honors `NEXTGCORE_SBI_OAUTH2_REQUIRE` first
 /// (overlay-friendly), then the yaml `<nf>.sbi.oauth2.require` (root-key
@@ -431,14 +445,7 @@ async fn apply_oauth2_enforcement(
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Amf);
     if let Some(uri) = nrf_uri.as_deref() {
-        let nf_instance_id =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
-                .to_string();
-        let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
-            uri,
-            nf_instance_id,
-            nextgcore_sbi::types::NfType::Amf,
-        ))));
+        let _ = OAUTH2_CLIENT.set(Some(amf_oauth2_client(uri)));
         // #1667: the same client gives this NF's own NRF calls their access token.
         nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     }
