@@ -496,13 +496,26 @@ mod tests {
                 );
 
                 let id = format!("mbs-sess-{}", session.id);
-                assert_eq!(crate::handle_mbs_session_release(&id).await.status, 204);
+                assert_eq!(
+                    crate::handle_mbs_session_release(
+                        &id,
+                        &nextgcore_sbi::message::SbiRequest::default()
+                    )
+                    .await
+                    .status,
+                    204
+                );
                 assert!(
                     !amf_holds(&context_ref),
                     "after release the AMF holds no context for the session"
                 );
                 assert_eq!(
-                    crate::handle_mbs_session_release(&id).await.status,
+                    crate::handle_mbs_session_release(
+                        &id,
+                        &nextgcore_sbi::message::SbiRequest::default()
+                    )
+                    .await
+                    .status,
                     404,
                     "a repeated release is idempotent"
                 );
@@ -861,7 +874,10 @@ mod tests {
 
         // A is released; its ContextDelete is held at the AMF.
         let a_id = format!("mbs-sess-{}", a_session.id);
-        let release = tokio::spawn(async move { crate::handle_mbs_session_release(&a_id).await });
+        let release = tokio::spawn(async move {
+            crate::handle_mbs_session_release(&a_id, &nextgcore_sbi::message::SbiRequest::default())
+                .await
+        });
         arrived.notified().await;
         // B, on the same TMGI, is created while that delete is in flight.
         let b_session = session(&ctx);
@@ -992,8 +1008,9 @@ mod tests {
         assert!(ctx.read().unwrap().record_amf_context(session.id, context));
 
         let id = format!("mbs-sess-{}", session.id);
+        let anonymous = nextgcore_sbi::message::SbiRequest::default();
         tokio::select! {
-            _ = crate::handle_mbs_session_release(&id) => {
+            _ = crate::handle_mbs_session_release(&id, &anonymous) => {
                 panic!("the AMF holds the delete; the release cannot finish")
             }
             _ = arrived.notified() => {}
