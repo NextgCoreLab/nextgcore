@@ -7187,6 +7187,99 @@ async fn pfcp_deactivate_dl_far(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
 /// n2SmInfoType (all inbound values of TS 29.502 Table 6.1.6.3.3-1 that can
 /// arrive on /modify) and on upCnxState.
 async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
+    // #1899 review M1: an AMF change is recorded before the rest of the request is
+    // validated, so a request answered 4xx/5xx would still have moved the owner
+    // and rebound the status URI. Whatever this request recorded is put back when
+    // it fails, so a rejected request applies nothing.
+    let before = ServingAmfState::read(sm_context_ref);
+    let resp = handle_sm_context_update_inner(sm_context_ref, request).await;
+    if resp.status >= 400 {
+        if let Some(before) = before {
+            before.restore_if_rebound_by(sm_context_ref, request);
+        }
+    }
+    resp
+}
+
+/// The serving-AMF state an AMF change rewrites (#1899 review M1): the bound
+/// owner and the status URI, on the policy binding and on the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServingAmfState {
+    serving_amf: Option<String>,
+    binding_status_uri: Option<String>,
+    sess_status_uri: Option<String>,
+}
+
+impl ServingAmfState {
+    fn read(sm_context_ref: &str) -> Option<Self> {
+        let handle = smf_self();
+        let ctx = handle.read().ok()?;
+        let bindings = ctx.policy_bindings.read().ok()?;
+        let b = bindings.get(sm_context_ref)?;
+        Some(Self {
+            serving_amf: b.serving_amf.clone(),
+            binding_status_uri: b.sm_context_status_uri.clone(),
+            sess_status_uri: ctx
+                .sess_find_by_sm_context_ref(sm_context_ref)
+                .and_then(|s| s.sm_context_status_uri),
+        })
+    }
+
+    /// Put `self` back if `request` was an AMF change and the context still holds
+    /// exactly what it recorded. A later change by another request is left alone.
+    fn restore_if_rebound_by(self, sm_context_ref: &str, request: &SbiRequest) {
+        let Some(body) = request
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        else {
+            return;
+        };
+        let (Some(serving), Some(status_uri)) = (
+            body["servingNfId"].as_str(),
+            body["smContextStatusUri"].as_str(),
+        ) else {
+            return;
+        };
+        let handle = smf_self();
+        let Ok(ctx) = handle.read() else {
+            return;
+        };
+        let mut restored = false;
+        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+            if let Some(b) = bindings.get_mut(sm_context_ref) {
+                let ours = b.sm_context_status_uri.as_deref() == Some(status_uri)
+                    && (b.serving_amf == self.serving_amf
+                        || b.serving_amf.as_deref() == Some(serving));
+                if ours
+                    && (b.sm_context_status_uri != self.binding_status_uri
+                        || b.serving_amf != self.serving_amf)
+                {
+                    b.sm_context_status_uri = self.binding_status_uri.clone();
+                    b.serving_amf = self.serving_amf.clone();
+                    restored = true;
+                }
+            }
+        }
+        if restored {
+            if let Some(mut sess) = ctx
+                .sess_find_by_sm_context_ref(sm_context_ref)
+                .filter(|s| s.sm_context_status_uri.as_deref() == Some(status_uri))
+            {
+                sess.sm_context_status_uri = self.sess_status_uri.clone();
+                ctx.sess_update(&sess);
+            }
+            ctx.persist();
+            log::info!(
+                "SM Context Update for ref={sm_context_ref} failed: the AMF change to {serving} \
+                 is undone"
+            );
+        }
+    }
+}
+
+async fn handle_sm_context_update_inner(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Update request for ref={sm_context_ref}");
 
     // Parse request body for N2 SM Info (gNB TEID)
@@ -11546,7 +11639,14 @@ fn refuse_sm_context_caller(
     if !sm_context_exists(sm_context_ref) {
         return None;
     }
-    let owner = sm_context_owner(sm_context_ref)?;
+    let Some(owner) = sm_context_owner(sm_context_ref) else {
+        return refuse_ownerless_sm_context_caller(
+            sm_context_ref,
+            request,
+            operation,
+            nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+        );
+    };
     let new_serving = amf_change
         .then(|| {
             let body: serde_json::Value =
@@ -11591,6 +11691,107 @@ fn refuse_sm_context_caller(
         &format!("{operation}: {why}"),
         None,
     ))
+}
+
+/// #1899 review M2 (DECISIONS 2026-11-18: under production an ownerless record
+/// is frozen, and where the spec defines a single owner the first verified
+/// caller is adopted): an SM context with no owner, i.e. one restored from a
+/// snapshot written before #1860 (it keeps its bare sequential reference, which
+/// the AMF holds) or one created under `dev`.
+///
+/// Under `dev` it is managed as before. Under production:
+/// - a request that rebinds it (`servingNfId` or `smContextStatusUri`, the N1N2
+///   redirect vector) is refused `403`;
+/// - a caller with no verified identity, or whose client certificate names NF
+///   types without AMF (or a relay), is refused `403`;
+/// - otherwise the caller is the serving AMF (TS 29.502 §5.2.2.3-§5.2.2.5: the
+///   SM context has exactly one consumer) and is adopted as its owner before the
+///   handler runs, so from then on the context is bound like a new one.
+fn refuse_ownerless_sm_context_caller(
+    sm_context_ref: &str,
+    request: &SbiRequest,
+    operation: &str,
+    production: bool,
+) -> Option<SbiResponse> {
+    if !production {
+        return None;
+    }
+    let refuse = |why: String| {
+        log::debug!("{operation} of ownerless SM context {sm_context_ref} refused: {why}");
+        Some(nextgcore_sbi::server::send_forbidden(
+            &format!("{operation}: {why}"),
+            None,
+        ))
+    };
+    let rebinds = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .is_some_and(|b| !b["servingNfId"].is_null() || !b["smContextStatusUri"].is_null());
+    if rebinds {
+        return refuse(
+            "the SM context predates its serving-AMF binding and may not be rebound; \
+             an AMF change needs a bound context"
+                .into(),
+        );
+    }
+    let caller = match owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        Ok(None) => {
+            return refuse("the requester has no verified identity".into());
+        }
+        Err(why) => return refuse(why),
+    };
+    let types = &request.peer_cert_nf_types;
+    let amf_typed = types.is_empty()
+        || types.iter().any(|t| {
+            t.eq_ignore_ascii_case("AMF")
+                || owner_binding::RELAY_NF_TYPES
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(t))
+        });
+    if !amf_typed {
+        return refuse(format!(
+            "only the serving AMF manages an SM context; the requester's certificate names \
+             {types:?}"
+        ));
+    }
+    if !adopt_sm_context_owner(sm_context_ref, &caller) {
+        // Another request adopted it first: judge this one against that owner.
+        // With no binding to adopt into, the context stays frozen.
+        return match sm_context_owner(sm_context_ref) {
+            Some(owner) => owner_binding::refuse_non_owner(Some(&owner), request, operation),
+            None => refuse("the SM context has no policy binding to bind an owner to".into()),
+        };
+    }
+    log::info!(
+        "SM context {sm_context_ref} had no serving-AMF binding; {caller} is adopted as its owner"
+    );
+    None
+}
+
+/// Bind an ownerless SM context to `owner` (#1899 review M2). `false` when it
+/// already had an owner (a racing request adopted it) or is gone.
+fn adopt_sm_context_owner(sm_context_ref: &str, owner: &str) -> bool {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return false;
+    };
+    let adopted = match ctx.policy_bindings.write() {
+        Ok(mut bindings) => match bindings.get_mut(sm_context_ref) {
+            Some(b) if b.serving_amf.is_none() => {
+                b.serving_amf = Some(owner.to_string());
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if adopted {
+        ctx.persist();
+    }
+    adopted
 }
 
 fn sm_context_exists(sm_context_ref: &str) -> bool {
@@ -11816,6 +12017,15 @@ async fn handle_pdu_session_create(_request: &SbiRequest) -> SbiResponse {
 /// instead of proceeding on a session that was never built. All three operations
 /// answer the same way, because a partner that cannot create can never legitimately
 /// update or release either, and leaving those at `2xx` would say otherwise.
+///
+/// **No caller binding is needed while this holds (#1891).** Update and Release
+/// look nothing up and change nothing, for any caller and any reference, and no
+/// session carries a `pduSessionRef` (one used to be minted as the bare session
+/// index and never read). An implementation of this service must mint the
+/// reference with `owner_binding::unguessable_id` and bind it to the creating
+/// V-SMF / I-SMF's verified identity, refusing any other caller `403` before a
+/// side effect (TS 29.502 §5.2.2.8-§5.2.2.9, TS 33.501 §13.4.1), as #1860 does for
+/// `sm-contexts`, before Update or Release answers anything but `501`.
 fn hsmf_not_implemented(operation: &str) -> SbiResponse {
     nextgcore_sbi::server::send_error(
         501,
@@ -27102,6 +27312,152 @@ mod tests {
         );
     }
 
+    /// #1899 review M1: an AMF change in a request that is then rejected moves
+    /// nothing. B names itself (so the caller check admits it) but the request
+    /// carries `PATH_SWITCH_REQ` with no `n2SmInfo`, which is answered 400: the
+    /// context stays A's, with A's status URI, and A still manages it.
+    #[tokio::test]
+    async fn a_rejected_amf_change_moves_nothing_1899() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000001899", 5, Some(AMF_A_1860)).await;
+        let uri_before = lookup_policy_binding(&reference)
+            .expect("bound")
+            .sm_context_status_uri;
+        let sess_uri_before = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .and_then(|s| s.sm_context_status_uri);
+
+        let resp = smf_sbi_request_handler(sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({
+                "servingNfId": AMF_B_1860,
+                "smContextStatusUri": "http://amf-b.example/nsmf-callback/status",
+                "n2SmInfoType": "PATH_SWITCH_REQ",
+            }),
+            Some(AMF_B_1860),
+        ))
+        .await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+
+        let binding = lookup_policy_binding(&reference).expect("bound");
+        assert_eq!(
+            binding.serving_amf.as_deref(),
+            Some(AMF_A_1860),
+            "a rejected AMF change must not move the owner"
+        );
+        assert_eq!(binding.sm_context_status_uri, uri_before);
+        assert_eq!(
+            smf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_context_ref(&reference)
+                .and_then(|s| s.sm_context_status_uri),
+            sess_uri_before
+        );
+        let retrieve = |who| sm_op_1860(&reference, "retrieve", serde_json::json!({}), who);
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_A_1860)))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_B_1860)))
+                .await
+                .status,
+            403
+        );
+    }
+
+    /// #1899 review M2: under production an ownerless SM context (restored from
+    /// before #1860, or created under `dev`) is frozen against a rebind, an
+    /// anonymous caller and a non-AMF certificate, and the first verified AMF is
+    /// adopted as its owner, after which it is bound like any other. Under `dev`
+    /// it is managed as before.
+    #[tokio::test]
+    async fn an_ownerless_sm_context_is_frozen_then_adopted_under_production_1899() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000011899", 6, None).await;
+        assert_eq!(lookup_policy_binding(&reference).unwrap().serving_amf, None);
+        let op = "UpdateSMContext";
+
+        // Dev: as before.
+        let anon = sm_op_1860(&reference, "modify", serde_json::json!({}), None);
+        assert!(refuse_ownerless_sm_context_caller(&reference, &anon, op, false).is_none());
+
+        // Production: refused, and still ownerless.
+        let rebind = sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({ "smContextStatusUri": "http://evil.example/status" }),
+            Some(AMF_B_1860),
+        );
+        let mut smf_cert = sm_op_1860(&reference, "retrieve", serde_json::json!({}), None);
+        smf_cert.peer_cert_nf_instance_id = Some(AMF_B_1860.to_string());
+        smf_cert.peer_cert_nf_types = vec!["SMF".to_string()];
+        for (req, expect) in [
+            (&rebind, "may not be rebound"),
+            (&anon, "no verified identity"),
+            (&smf_cert, "only the serving AMF"),
+        ] {
+            let resp = refuse_ownerless_sm_context_caller(&reference, req, op, true)
+                .unwrap_or_else(|| panic!("{expect}: admitted"));
+            assert_eq!(resp.status, 403);
+            assert!(
+                detail_1860(&resp).contains(expect),
+                "{}",
+                detail_1860(&resp)
+            );
+            assert_eq!(lookup_policy_binding(&reference).unwrap().serving_amf, None);
+        }
+
+        // The first verified AMF is adopted, and then the context is A's.
+        let a = sm_op_1860(
+            &reference,
+            "retrieve",
+            serde_json::json!({}),
+            Some(AMF_A_1860),
+        );
+        assert!(refuse_ownerless_sm_context_caller(&reference, &a, op, true).is_none());
+        assert_eq!(
+            lookup_policy_binding(&reference)
+                .unwrap()
+                .serving_amf
+                .as_deref(),
+            Some(AMF_A_1860)
+        );
+        let b = sm_op_1860(
+            &reference,
+            "retrieve",
+            serde_json::json!({}),
+            Some(AMF_B_1860),
+        );
+        assert_eq!(smf_sbi_request_handler(b).await.status, 403);
+        assert_eq!(smf_sbi_request_handler(a).await.status, 200);
+    }
+
+    /// #1899 review M2: the router judges an ownerless context under the process's
+    /// real SBI profile. Tests call the gate with the profile passed in (flipping
+    /// the process-wide override would race every sibling that sets Dev), so this
+    /// pins that the router's call is the profile, not a constant.
+    #[test]
+    fn the_router_passes_the_real_profile_to_the_ownerless_gate_1899() {
+        let src = include_str!("main.rs");
+        let call = "refuse_ownerless_sm_context_caller(\n            sm_context_ref,\n            \
+                    request,\n            operation,\n            \
+                    nextgcore_sbi::security::SbiProfile::resolve().is_production(),\n        );";
+        assert_eq!(src.matches(call).count(), 1);
+    }
+
     /// #1860: a caller whose access token and client certificate name different NF
     /// instances creates nothing.
     #[tokio::test]
@@ -27689,6 +28045,49 @@ mod tests {
             assert_eq!(json["cause"], serde_json::json!("NOT_IMPLEMENTED"));
             assert_eq!(json["status"], serde_json::json!(501));
         }
+    }
+
+    /// #1891: the H-SMF `pdu-sessions` Update and Release cannot touch a session,
+    /// whoever asks and whatever reference they guess.
+    ///
+    /// The issue's premise was a sequential `pduSessionRef` with no caller binding.
+    /// The routes already answered `501` without a lookup, but every session was
+    /// given `pduSessionRef = "{index}"`, so the first implementation to resolve it
+    /// would have inherited the gap. Now no session carries one, and a stranger's
+    /// modify or release by the index, or by the `smContextRef`, leaves it intact.
+    #[tokio::test]
+    async fn a_stranger_cannot_reach_a_session_through_the_pdu_sessions_routes_1891() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        smf_context_init(64, 256, 512);
+        let sess = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let ue = context.ue_add_by_supi("imsi-001010000001891").expect("ue");
+            context.sess_add_by_psi(ue.id, 5).expect("session")
+        };
+        assert_eq!(
+            sess.pdu_session_ref, None,
+            "this SMF is never the H-SMF, so no session has a pduSessionRef"
+        );
+        let index = sess.index.to_string();
+        let sm_ref = sess.sm_context_ref.clone().expect("smContextRef");
+        for r in [index.as_str(), sm_ref.as_str()] {
+            for op in ["modify", "release"] {
+                let path = format!("/nsmf-pdusession/v1/pdu-sessions/{r}/{op}");
+                let mut req = events_request("POST", &path, Some(serde_json::json!({})));
+                req.oauth2_subject = Some("bbbbbbbb-0000-4000-8000-000000001891".into());
+                let resp = smf_sbi_request_handler(req).await;
+                assert_eq!(resp.status, 501, "POST {path}");
+            }
+        }
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let after = context
+            .sess_find_by_index(sess.index)
+            .expect("the session survives every stranger's release");
+        assert_eq!(after.sm_context_ref, sess.sm_context_ref);
+        context.sess_remove(sess.id);
     }
 
     /// #79 criteria 1 + 2: the subscribed session-AMBR and default 5QI are applied,

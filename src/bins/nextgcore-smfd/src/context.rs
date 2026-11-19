@@ -1200,7 +1200,12 @@ pub struct SmfSess {
     pub sm_context_ref: Option<String>,
     /// SM Context Status URI
     pub sm_context_status_uri: Option<String>,
-    /// PDU Session Reference
+    /// PDU Session Reference: the `pduSessionRef` an H-SMF / SMF minted for this
+    /// session on the `pdu-sessions` service (TS 29.502 §5.2.2.7), so set only on
+    /// the V-SMF / I-SMF side of a home-routed or I-SMF session. This SMF has no
+    /// such split, so nothing sets it (#1891): it used to be the bare session index
+    /// on every session, which made every session look home-routed and handed a
+    /// sequential reference to a service with no caller binding.
     pub pdu_session_ref: Option<String>,
     /// PDU Session Resource URI
     pub pdu_session_resource_uri: Option<String>,
@@ -3315,7 +3320,6 @@ impl SmfContext {
         sess.smf_n4_seid = n4_seid;
         sess.smf_n4_teid = n4_seid as u32;
         sess.sm_context_ref = Some(mint_sm_context_ref(index));
-        sess.pdu_session_ref = Some(format!("{index}"));
         sess.charging.id = index;
 
         smf_n4_seid_hash.insert(n4_seid, id);
@@ -3520,14 +3524,6 @@ impl SmfContext {
                 // to its bare index only, as before.
                 None => !sm_context_ref.contains('-'),
             })
-    }
-
-    /// Find session by PDU session ref
-    pub fn sess_find_by_pdu_session_ref(&self, pdu_session_ref: &str) -> Option<SmfSess> {
-        if let Ok(index) = pdu_session_ref.parse::<u32>() {
-            return self.sess_find_by_index(index);
-        }
-        None
     }
 
     /// Find session by IPv4 address

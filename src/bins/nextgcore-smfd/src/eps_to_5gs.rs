@@ -1234,7 +1234,6 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     // The PDN connection becomes PDU session `psi`, still `epc` until execution completes.
     sess.psi = psi;
     sess.sm_context_ref = Some(sm_context_ref.clone());
-    sess.pdu_session_ref = Some(sm_context_ref.clone());
     sess.sm_context_status_uri = body["smContextStatusUri"].as_str().map(str::to_string);
     sess.full_dnn = sess.session_name.clone();
     sess.handover.eps_to_5gs = true;
@@ -1259,7 +1258,6 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     {
         fresh.psi = sess.psi;
         fresh.sm_context_ref = sess.sm_context_ref.clone();
-        fresh.pdu_session_ref = sess.pdu_session_ref.clone();
         fresh.sm_context_status_uri = sess.sm_context_status_uri.clone();
         fresh.full_dnn = sess.full_dnn.clone();
         fresh.handover = sess.handover.clone();
@@ -2002,7 +2000,6 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
                 }
                 sess.psi = 0;
                 sess.sm_context_ref = None;
-                sess.pdu_session_ref = None;
                 ctx.persist();
             }
             // #1072 round 2 m8: and the 5G count the preparation took is given back,
