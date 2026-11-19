@@ -342,6 +342,75 @@ impl EesContext {
             .cloned()
     }
 
+    /// #1937: the records of `store` that `visible` admits, given each one's
+    /// owner. The owner map is copied first, so no store lock is held while
+    /// the owner lock is taken.
+    fn visible_in<T: Clone>(
+        &self,
+        kind: Owned,
+        store: &RwLock<HashMap<String, T>>,
+        visible: &dyn Fn(Option<&str>) -> bool,
+    ) -> Vec<T> {
+        let owners = self.owners.read().map(|o| o.clone()).unwrap_or_default();
+        store
+            .read()
+            .map(|m| {
+                m.iter()
+                    .filter(|(id, _)| {
+                        visible(owners.get(&(kind, (*id).clone())).map(String::as_str))
+                    })
+                    .map(|(_, v)| v.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #1937: the EAS registrations `visible` admits by owner.
+    pub fn eas_list_visible(&self, visible: &dyn Fn(Option<&str>) -> bool) -> Vec<EasRegistration> {
+        self.visible_in(Owned::EasRegistration, &self.registrations, visible)
+    }
+
+    /// #1937: the EEC registrations `visible` admits by owner.
+    pub fn eec_list_visible(&self, visible: &dyn Fn(Option<&str>) -> bool) -> Vec<EecRegistration> {
+        self.visible_in(Owned::EecRegistration, &self.eec_registrations, visible)
+    }
+
+    /// #1937: the discovery subscriptions `visible` admits by owner.
+    pub fn disc_sub_list_visible(
+        &self,
+        visible: &dyn Fn(Option<&str>) -> bool,
+    ) -> Vec<EasDiscoverySubscription> {
+        self.visible_in(
+            Owned::DiscoverySubscription,
+            &self.disc_subscriptions,
+            visible,
+        )
+    }
+
+    /// #1937: the ACR management event subscriptions `visible` admits.
+    pub fn acrmgnt_sub_list_visible(
+        &self,
+        visible: &dyn Fn(Option<&str>) -> bool,
+    ) -> Vec<AcrMgntEventsSubscription> {
+        self.visible_in(
+            Owned::AcrMgntSubscription,
+            &self.acr_mgnt_subscriptions,
+            visible,
+        )
+    }
+
+    /// #1937: the ACT status subscriptions `visible` admits by owner.
+    pub fn act_status_sub_list_visible(
+        &self,
+        visible: &dyn Fn(Option<&str>) -> bool,
+    ) -> Vec<ACTStatusSubsc> {
+        self.visible_in(
+            Owned::ActStatusSubscription,
+            &self.act_status_subscriptions,
+            visible,
+        )
+    }
+
     /// #1865 tests: how many `kind` resources are stored.
     #[cfg(test)]
     pub fn resource_count(&self, kind: Owned) -> usize {
