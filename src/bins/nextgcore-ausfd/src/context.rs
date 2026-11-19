@@ -62,8 +62,17 @@ impl AuthEvent {
 pub struct AusfUe {
     /// Unique pool ID
     pub id: u64,
-    /// Context ID (string representation of pool index)
+    /// The `authCtxId` of the current authentication (TS 29.509 §5.2.2.2.2):
+    /// a random UUID, so it cannot be guessed and does not repeat across an
+    /// AUSF restart (#1872). Replaced by [`new_auth_ctx_id`] on every new
+    /// authentication of the UE, which retires the previous one.
     pub ctx_id: String,
+    /// #1872: the verified identity of the NF (the AMF/SEAF) that started the
+    /// current authentication: its access-token `sub`, else its client
+    /// certificate's NF Instance ID. Only that NF may confirm it, continue its
+    /// EAP session or delete it. `None` when the creator proved no identity (a
+    /// dev stack without tokens or mTLS), which binds nothing.
+    pub owner: Option<String>,
     /// SUCI (Subscription Concealed Identifier)
     pub suci: String,
     /// SUPI (Subscription Permanent Identifier)
@@ -106,6 +115,7 @@ impl std::fmt::Debug for AusfUe {
         let mut d = f.debug_struct("AusfUe");
         d.field("id", &self.id);
         d.field("ctx_id", &self.ctx_id);
+        d.field("owner", &self.owner);
         d.field("suci", &self.suci);
         d.field("supi", &self.supi);
         d.field("serving_network_name", &self.serving_network_name);
@@ -126,12 +136,21 @@ impl std::fmt::Debug for AusfUe {
     }
 }
 
+/// #1872: a fresh `authCtxId`. A random (v4) UUID: 122 random bits, so it is
+/// unguessable, and unique across restarts, unlike the pool index it replaces,
+/// which restarted at 1 and let a stale confirmation or DELETE reach another
+/// UE's context.
+pub fn new_auth_ctx_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 impl AusfUe {
     /// Create a new AUSF UE
     pub fn new(id: u64, suci: &str) -> Self {
         Self {
             id,
-            ctx_id: id.to_string(),
+            ctx_id: new_auth_ctx_id(),
+            owner: None,
             suci: suci.to_string(),
             supi: None,
             serving_network_name: None,
@@ -411,6 +430,8 @@ pub struct AusfContext {
     suci_hash: RwLock<HashMap<String, u64>>,
     /// SUPI hash (SUPI -> pool ID)
     supi_hash: RwLock<HashMap<String, u64>>,
+    /// #1872: authCtxId -> pool ID. LOCK ORDER: after `supi_hash`.
+    ctx_hash: RwLock<HashMap<String, u64>>,
     /// Per-SUPI SoR/UPU anchor store (TS 33.501 §6.14.1): latest KAUSF +
     /// Counter_SoR/Counter_UPU. Separate from `ue_list` on purpose — it
     /// SURVIVES `DELETE .../ue-authentications/{authCtxId}` (§6.1.4.1a tears
@@ -436,6 +457,7 @@ impl AusfContext {
             ue_list: RwLock::new(HashMap::new()),
             suci_hash: RwLock::new(HashMap::new()),
             supi_hash: RwLock::new(HashMap::new()),
+            ctx_hash: RwLock::new(HashMap::new()),
             anchor_store: RwLock::new(HashMap::new()),
             next_ue_id: AtomicUsize::new(1),
             max_num_of_ue: 0,
@@ -489,10 +511,12 @@ impl AusfContext {
             return None;
         }
 
+        let mut ctx_hash = self.ctx_hash.write().ok()?;
         let id = self.next_ue_id.fetch_add(1, Ordering::SeqCst) as u64;
         let ue = AusfUe::new(id, suci);
 
         suci_hash.insert(suci.to_string(), id);
+        ctx_hash.insert(ue.ctx_id.clone(), id);
         ue_list.insert(id, ue.clone());
 
         log::debug!("[{suci}] AUSF UE added (id={id})");
@@ -504,9 +528,11 @@ impl AusfContext {
         let mut ue_list = self.ue_list.write().ok()?;
         let mut suci_hash = self.suci_hash.write().ok()?;
         let mut supi_hash = self.supi_hash.write().ok()?;
+        let mut ctx_hash = self.ctx_hash.write().ok()?;
 
         if let Some(ue) = ue_list.remove(&id) {
             suci_hash.remove(&ue.suci);
+            ctx_hash.remove(&ue.ctx_id);
             if let Some(ref supi) = ue.supi {
                 supi_hash.remove(supi);
             }
@@ -518,14 +544,16 @@ impl AusfContext {
 
     /// Remove all UEs
     pub fn ue_remove_all(&self) {
-        if let (Ok(mut ue_list), Ok(mut suci_hash), Ok(mut supi_hash)) = (
+        if let (Ok(mut ue_list), Ok(mut suci_hash), Ok(mut supi_hash), Ok(mut ctx_hash)) = (
             self.ue_list.write(),
             self.suci_hash.write(),
             self.supi_hash.write(),
+            self.ctx_hash.write(),
         ) {
             ue_list.clear();
             suci_hash.clear();
             supi_hash.clear();
+            ctx_hash.clear();
         }
     }
 
@@ -566,8 +594,11 @@ impl AusfContext {
 
     /// Find UE by context ID
     pub fn ue_find_by_ctx_id(&self, ctx_id: &str) -> Option<AusfUe> {
-        let id: u64 = ctx_id.parse().ok()?;
-        self.ue_find_by_id(id)
+        // Lock order ue_list < ctx_hash (matches ue_add/ue_remove/ue_update).
+        let ue_list = self.ue_list.read().ok()?;
+        let ctx_hash = self.ctx_hash.read().ok()?;
+        let id = ctx_hash.get(ctx_id)?;
+        ue_list.get(id).cloned()
     }
 
     /// Find UE by pool ID
@@ -580,8 +611,15 @@ impl AusfContext {
     pub fn ue_update(&self, ue: &AusfUe) -> bool {
         let mut ue_list = self.ue_list.write().unwrap();
         let mut supi_hash = self.supi_hash.write().unwrap();
+        let mut ctx_hash = self.ctx_hash.write().unwrap();
 
         if let Some(existing) = ue_list.get_mut(&ue.id) {
+            // #1872: a new authentication's authCtxId retires the previous one,
+            // so a confirmation or DELETE for the old one finds nothing.
+            if existing.ctx_id != ue.ctx_id {
+                ctx_hash.remove(&existing.ctx_id);
+                ctx_hash.insert(ue.ctx_id.clone(), ue.id);
+            }
             // Update SUPI hash if SUPI changed
             if existing.supi != ue.supi {
                 if let Some(ref old_supi) = existing.supi {

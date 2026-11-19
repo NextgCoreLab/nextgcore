@@ -382,6 +382,17 @@ pub(crate) struct PendingContextTransfer {
 /// AMF would then keep a context the UE has moved away from (TS 23.502 §4.2.2.2.2
 /// step 10). See [`StatusUpdateTicket`].
 ///
+/// #1820: a send that got NO answer (it timed out or the transport failed) may still
+/// be applied by the old AMF later, after the lane's next update. So the lane is then
+/// UNSETTLED, and a later status supersedes it: the latest update, once answered, is
+/// sent once more after [`STATUS_UPDATE_SETTLE`], so it is the last the old AMF
+/// applies. TS 29.518 §5.2.2.2.2 gives the request no sequence number and the old AMF
+/// applies what arrives, so re-sending the latest outcome is the only ordering a
+/// consumer can impose. Re-sends stop when one is answered, when a newer outcome
+/// supersedes the update (it then settles the lane), or after
+/// [`MAX_SETTLE_RESENDS`]. The lane key's host is normalised
+/// ([`normalise_peer_host`]), so two spellings of one AMF share one lane.
+///
 /// Returns the task, which only the tests use.
 fn spawn_registration_status_update(
     pending: PendingContextTransfer,
@@ -390,12 +401,12 @@ fn spawn_registration_status_update(
     let handle = tokio::runtime::Handle::try_current().ok()?;
     // Issued here on the caller's task, not inside the spawned one, so that the
     // order of the tickets is the order in which the outcomes were decided.
-    let ticket = StatusUpdateTicket::issue(StatusUpdateKey {
-        peer_host: pending.peer_host.clone(),
-        peer_port: pending.peer_port,
-        context_id: pending.presented.to_context_id(),
-    });
-    Some(handle.spawn(async move {
+    let ticket = StatusUpdateTicket::issue(StatusUpdateKey::new(
+        &pending.peer_host,
+        pending.peer_port,
+        pending.presented.to_context_id(),
+    ));
+    Some(handle.spawn(Box::pin(async move {
         let _turn = ticket.lane.lock().await;
         if !ticket.is_latest() {
             log::debug!(
@@ -412,23 +423,94 @@ fn spawn_registration_status_update(
             );
             return;
         }
-        if let Err(e) = crate::sbi_path::call_amf_registration_status_update(
-            &pending.peer_host,
-            pending.peer_port,
-            &pending.presented,
-            transferred,
-        )
-        .await
-        {
-            log::warn!(
-                "[{}] RegistrationStatusUpdate to {}:{} failed ({e}); the old AMF releases \
-                 its copy on its own guard timer (TS 23.502 §4.2.2.2.2 step 5)",
+        let mut resends = 0;
+        loop {
+            let answered = match crate::sbi_path::call_amf_registration_status_update(
+                &pending.peer_host,
+                pending.peer_port,
+                &pending.presented,
+                transferred,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] RegistrationStatusUpdate to {}:{} failed ({e}); the old AMF \
+                         releases its copy on its own guard timer (TS 23.502 §4.2.2.2.2 \
+                         step 5)",
+                        pending.supi,
+                        pending.peer_host,
+                        pending.peer_port
+                    );
+                    matches!(e, crate::sbi_path::SbiError::PeerStatus { .. })
+                }
+            };
+            // An unanswered send leaves the lane unsettled; an answered one settles
+            // it only when no earlier unanswered send can still land after it.
+            let unsettled = ticket.record(answered, resends > 0);
+            if !unsettled || resends >= MAX_SETTLE_RESENDS {
+                break;
+            }
+            // A later status supersedes this one: wait out the window in which an
+            // unanswered send can still be applied, then send this one again,
+            // unless a newer outcome took over meanwhile.
+            // Armed before the check, so a newer outcome issued in between still
+            // wakes it.
+            let superseded = ticket.superseded.notified();
+            tokio::pin!(superseded);
+            superseded.as_mut().enable();
+            if !ticket.is_latest() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(STATUS_UPDATE_SETTLE) => {}
+                _ = superseded => break,
+            }
+            if !ticket.is_latest() {
+                break;
+            }
+            resends += 1;
+            log::info!(
+                "[{}] RegistrationStatusUpdate to {}:{} re-sent ({resends}): an earlier \
+                 unanswered update may have landed after it (#1820)",
                 pending.supi,
                 pending.peer_host,
                 pending.peer_port
             );
         }
-    }))
+    })))
+}
+
+/// #1820: how long after an answered update the lane waits before re-sending it,
+/// when an earlier send went unanswered: the client's request timeout, the time a
+/// request the AMF abandoned can still have been in flight, and as much again.
+const STATUS_UPDATE_SETTLE: std::time::Duration = std::time::Duration::from_millis(
+    2 * crate::sbi_path::REGISTRATION_STATUS_UPDATE_TIMEOUT.as_millis() as u64,
+);
+
+/// #1820: re-sends of the latest update an unsettled lane makes at most. Past them
+/// the old AMF's guard timer is the remedy (TS 23.502 §4.2.2.2.2 step 5).
+const MAX_SETTLE_RESENDS: u32 = 3;
+
+/// #1820: the lane key's form of a peer host, so two spellings of one AMF share a
+/// lane: an IP literal (bracketed or not) in its canonical text form, and a name
+/// lower-cased without a trailing dot. Two NAMES for one AMF, or a name and its
+/// address, still get two lanes: telling them apart would need resolution.
+fn normalise_peer_host(host: &str) -> String {
+    let h = host.trim();
+    let bare = h
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(h);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        Ok(ip) => ip.to_string(),
+        Err(_) => bare.trim_end_matches('.').to_ascii_lowercase(),
+    }
 }
 
 /// #1769: which context, at which old AMF, a RegistrationStatusUpdate is about.
@@ -440,11 +522,28 @@ struct StatusUpdateKey {
     context_id: String,
 }
 
+impl StatusUpdateKey {
+    /// #1820: the key of `context_id` at the old AMF `peer_host`:`peer_port`, its
+    /// host normalised ([`normalise_peer_host`]).
+    fn new(peer_host: &str, peer_port: u16, context_id: String) -> Self {
+        Self {
+            peer_host: normalise_peer_host(peer_host),
+            peer_port,
+            context_id,
+        }
+    }
+}
+
 /// #1769: one key's lane. `lane` is held while an update is sent, so the sends are
 /// one at a time. `latest` is the newest ticket issued for the key.
 struct StatusUpdateLane {
     latest: u64,
     lane: Arc<Mutex<()>>,
+    /// #1820: an earlier send got no answer and may still be applied after a later
+    /// one, so the latest update has to be sent again once answered.
+    unsettled: bool,
+    /// #1820: woken when a newer outcome is issued, so a settle wait yields to it.
+    superseded: Arc<tokio::sync::Notify>,
 }
 
 /// #1769: the per-key lanes. An entry lives while some ticket for its key does, so
@@ -474,6 +573,7 @@ struct StatusUpdateTicket {
     key: StatusUpdateKey,
     seq: u64,
     lane: Arc<Mutex<()>>,
+    superseded: Arc<tokio::sync::Notify>,
 }
 
 impl StatusUpdateTicket {
@@ -485,10 +585,38 @@ impl StatusUpdateTicket {
             .or_insert_with(|| StatusUpdateLane {
                 latest: seq,
                 lane: Arc::new(Mutex::new(())),
+                unsettled: false,
+                superseded: Arc::new(tokio::sync::Notify::new()),
             });
         entry.latest = seq;
+        // A ticket waiting out a settle delay yields to this newer one.
+        entry.superseded.notify_waiters();
         let lane = Arc::clone(&entry.lane);
-        Self { key, seq, lane }
+        let superseded = Arc::clone(&entry.superseded);
+        Self {
+            key,
+            seq,
+            lane,
+            superseded,
+        }
+    }
+
+    /// #1820: record how this ticket's send ended, and return whether the lane is
+    /// still unsettled. An unanswered send unsettles it. An answered one settles it
+    /// when it is a re-send (sent after the settle wait), or when the lane was
+    /// already settled; a first answered send on an unsettled lane leaves it
+    /// unsettled, because the earlier unanswered one can still land after it.
+    fn record(&self, answered: bool, resend: bool) -> bool {
+        let mut lanes = status_update_lanes();
+        let Some(entry) = lanes.get_mut(&self.key) else {
+            return false;
+        };
+        if !answered {
+            entry.unsettled = true;
+        } else if resend {
+            entry.unsettled = false;
+        }
+        entry.unsettled
     }
 
     /// Whether no later outcome for the same key has been decided since this one.
@@ -2186,20 +2314,7 @@ impl NgapServer {
         // A no-op unless the posture just changed, and the posture is off by default.
         self.sync_ngap_overload().await?;
 
-        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
-        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
-        self.process_positioning_downlinks().await;
-
-        // Execute any network-initiated deregistrations the Namf_Callback
-        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
-        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
-        // Dormant when none pending.
-        self.process_network_deregs().await;
-
-        // Deliver every N1N2MessageTransfer the Namf handler queued for a
-        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
-        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
-        self.process_connected_downlinks().await;
+        self.process_ue_associated_handoffs().await;
 
         self.process_racs_reassignments();
         self.process_sbi_outcomes().await;
@@ -2265,6 +2380,32 @@ impl NgapServer {
 
         let outcome = self.receive_n2_or_sbi_report().await?;
         Ok(poll_again_at_once(outcome))
+    }
+
+    /// The step of [`Self::poll`] that sends the UE-associated work the Namf SBI
+    /// handlers queued, in this order. #1776 review: one step, so that a test can
+    /// drive the production wiring of each queue. The rest of `poll` drains
+    /// process-global queues that sibling tests fill and wait on, so tests do not
+    /// call `poll` itself (see `poll_wake_tests`).
+    pub(crate) async fn process_ue_associated_handoffs(&mut self) {
+        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
+        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
+        self.process_positioning_downlinks().await;
+
+        // Execute any network-initiated deregistrations the Namf_Callback
+        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
+        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
+        // Dormant when none pending.
+        self.process_network_deregs().await;
+
+        // Deliver every N1N2MessageTransfer the Namf handler queued for a
+        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
+        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
+        self.process_connected_downlinks().await;
+
+        // Send the UE Context Modifications the Nudm_SDM notify handler queued for
+        // a changed subscribed UE-AMBR (#1776, TS 23.502 §4.5.1). Dormant when none.
+        self.process_ue_ambr_modifications().await;
     }
 
     /// Wait for N2 for up to [`SCTP_RECV_TIMEOUT`], ended early by an off-task SBI
@@ -2495,6 +2636,29 @@ impl NgapServer {
                     log::warn!("Initial Context Setup Failure from gNB");
                     self.handle_initial_context_setup_failure(association_id, data)
                         .await?;
+                }
+            }
+            Some(40) => {
+                // UE Context Modification (procedure code 40, TS 38.413 §8.3.4, #1776):
+                // the Request is AMF->gNB, so what arrives is its Response or Failure.
+                if data[0] == 0x20 || data[0] == 0x40 {
+                    Box::pin(self.handle_ue_context_modification_outcome(association_id, data))
+                        .await?;
+                } else {
+                    // Answered as before this arm (the `_` arm's Error Indication).
+                    log::warn!(
+                        "UEContextModificationRequest is AMF->gNB; unexpected from association \
+                         {association_id}"
+                    );
+                    let (amf_ue_ngap_id, ran_ue_ngap_id, cause) =
+                        Self::unhandled_procedure_error_indication(procedure_code, data);
+                    self.send_error_indication(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        cause,
+                    )
+                    .await?;
                 }
             }
             Some(29) => {
@@ -4753,12 +4917,7 @@ impl NgapServer {
                 // the N11 SM Context Create so the session-AMBR is reduced too.
                 if req.redcap_indication {
                     state.amf_ue.redcap_indication = true;
-                    if state.amf_ue.ue_ambr.downlink > 150_000_000 {
-                        state.amf_ue.ue_ambr.downlink = 150_000_000; // 150 Mbps DL
-                    }
-                    if state.amf_ue.ue_ambr.uplink > 50_000_000 {
-                        state.amf_ue.ue_ambr.uplink = 50_000_000; // 50 Mbps UL
-                    }
+                    state.amf_ue.cap_ue_ambr_for_redcap();
                     log::info!("UE indicates RedCap (Reduced Capability) device");
                 }
 
@@ -6725,6 +6884,9 @@ impl NgapServer {
         {
             state.amf_ue.ue_ambr.uplink = ul;
         }
+        // #1776 review: the subscribed value replaced the RedCap cap the Registration
+        // Request set; a RedCap UE stays capped.
+        state.amf_ue.cap_ue_ambr_for_redcap();
 
         // GPSI (UDM am-data `gpsis`, TS 29.503 §5.2.2.2.1) — the UE's external
         // identity, conveyed onward on N11 (issue #205). Assigned unconditionally
@@ -11587,6 +11749,122 @@ impl NgapServer {
         }
     }
 
+    /// #1776, TS 23.502 §4.5.1: drain the UEs whose subscribed UE-AMBR a Nudm_SDM
+    /// data change notification changed, and send each CM-CONNECTED one's NG-RAN
+    /// node a UE CONTEXT MODIFICATION REQUEST (TS 38.413 §8.3.4) with the UE-AMBR it
+    /// holds NOW: several changes queued before this drain go out as one request
+    /// with the latest. A UE CM-IDLE or gone by now is sent nothing and leaves
+    /// nothing behind: the UE-AMBR is held in its context, and the Initial Context
+    /// Setup of its next NG connection carries it.
+    pub(crate) async fn process_ue_ambr_modifications(&mut self) {
+        let pending = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.ue_ambr_modification_drain()
+        };
+        for amf_ue_ngap_id in pending {
+            if let Err(e) = self.send_ue_ambr_modification(amf_ue_ngap_id).await {
+                log::warn!("UE {amf_ue_ngap_id}: UE Context Modification (UE-AMBR) not sent: {e}");
+            }
+        }
+    }
+
+    /// One queued UE-AMBR modification ([`Self::process_ue_ambr_modifications`]).
+    async fn send_ue_ambr_modification(&mut self, amf_ue_ngap_id: u64) -> Result<()> {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            log::debug!(
+                "UE {amf_ue_ngap_id}: no NG context any more; its UE-AMBR modification is dropped"
+            );
+            return Ok(());
+        };
+        if state.is_cm_idle() || !state.is_bound() {
+            log::info!(
+                "UE {amf_ue_ngap_id}: CM-IDLE; the changed UE-AMBR goes in its next Initial \
+                 Context Setup"
+            );
+            return Ok(());
+        }
+        let ue_ambr = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+        let pdu = crate::ngap_asn1::build_ue_context_modification_request_asn1(
+            amf_ue_ngap_id,
+            state.ran_ue_ngap_id,
+            ue_ambr,
+        )
+        .ok_or_else(|| anyhow::anyhow!("the UE Context Modification Request did not encode"))?;
+        self.send_to_association(state.association_id, &pdu).await?;
+        log::info!(
+            "UE {amf_ue_ngap_id}: UE Context Modification Request sent with UE-AMBR \
+             DL {} / UL {} bps (TS 38.413 §8.3.4)",
+            ue_ambr.0,
+            ue_ambr.1
+        );
+        Ok(())
+    }
+
+    /// #1776: the NG-RAN node's UE CONTEXT MODIFICATION RESPONSE or FAILURE
+    /// (TS 38.413 §8.3.4.2 / §8.3.4.3) to a UE-AMBR modification.
+    ///
+    /// Either way the AMF keeps the subscribed UE-AMBR it holds (DECISIONS: the
+    /// subscription is the UDM's, TS 23.502 §4.5.1 "the AMF adds or modifies the user
+    /// profile", and was answered 204; the AN update is the action taken on it). On a
+    /// Failure the node keeps the UE-AMBR it had (§8.3.4.3 "the UE context update
+    /// cannot be performed"), so the failure is logged with its cause, and the next
+    /// procedure that hands the UE-AMBR to NG-RAN (an Initial Context Setup, a
+    /// Handover Request) carries the held one. No UE state changes on either answer.
+    async fn handle_ue_context_modification_outcome(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        use crate::ngap_asn1::UeContextModificationOutcomeDecode::{Decoded, Failed, Undecodable};
+        match crate::ngap_asn1::decode_ue_context_modification_outcome_asn1(data) {
+            Decoded {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Err(e) = self
+                        .send_criticality_error_indication(association_id, &report)
+                        .await
+                    {
+                        log::warn!("Failed to send ErrorIndication: {e}");
+                    }
+                }
+                let held = amf_ue_ngap_id
+                    .and_then(|id| self.ue_auth_state.get(id))
+                    .map(|s| (s.amf_ue.ue_ambr.downlink, s.amf_ue.ue_ambr.uplink));
+                match cause {
+                    None => log::info!(
+                        "UE Context Modification Response: amf_ue_ngap_id={amf_ue_ngap_id:?}, \
+                         ran_ue_ngap_id={ran_ue_ngap_id:?} (association {association_id}); \
+                         NG-RAN enforces the UE-AMBR (DL, UL) {held:?}"
+                    ),
+                    Some(cause) => log::warn!(
+                        "UE Context Modification Failure: amf_ue_ngap_id={amf_ue_ngap_id:?}, \
+                         ran_ue_ngap_id={ran_ue_ngap_id:?}, cause={cause:?} (association \
+                         {association_id}); NG-RAN keeps its previous UE-AMBR, the AMF keeps \
+                         the subscribed {held:?} for the next Initial Context Setup"
+                    ),
+                }
+                Ok(())
+            }
+            Failed(diagnostics) => {
+                log::warn!(
+                    "UE Context Modification outcome carries not-comprehended IEs marked \
+                     reject ({diagnostics:?}); unsuccessfully terminated (TS 38.413 \
+                     §10.3.4.2), handled locally"
+                );
+                Ok(())
+            }
+            Undecodable => {
+                self.report_transfer_syntax_error(association_id, "UE Context Modification outcome")
+                    .await
+            }
+        }
+    }
+
     /// Deliver one queued N1N2MessageTransfer to its UE (#666, #757).
     ///
     /// The UE's NG connection is read NOW, not when the transfer was queued. A UE
@@ -11739,12 +12017,34 @@ impl NgapServer {
     ) {
         use crate::context::ConnectedN2;
         use crate::namf_handler::PagedN2;
+        let (n2, paged) = match &item.n2 {
+            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
+            _ if item.n1_only => (None, PagedN2::N1Only),
+            ConnectedN2::None => (None, PagedN2::Setup),
+            ConnectedN2::Release => (None, PagedN2::Release),
+            ConnectedN2::Setup(t) => (t.clone(), PagedN2::Setup),
+            ConnectedN2::Modify(t) => (Some(t.clone()), PagedN2::Modify),
+        };
+        let mut sess = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
+        };
         // #749: the UE is already being paged for another transfer. Its paging
         // context holds that one, and this transfer was already answered 200, so
         // it can neither overwrite it nor be refused. It waits in the queue: once
         // the UE answers it is CM-CONNECTED and delivered as such, and if the page
-        // fails it pages for itself.
-        if crate::namf_handler::paging_ongoing(item.amf_ue_ngap_id) {
+        // fails it pages for itself. #1837: checked and queued as one step, so an
+        // SBI transfer racing this one is never overwritten.
+        if !crate::namf_handler::initiate_paging_for_idle_ue(
+            amf_ue,
+            sess.as_mut(),
+            item.n1.clone(),
+            n2,
+            paged,
+            Some(item.pdu_session_id),
+            item.failure_notify_uri.as_deref(),
+        ) {
             log::info!(
                 "UE {}: N1N2 transfer for PSI {} waits for the paging already ongoing",
                 item.amf_ue_ngap_id,
@@ -11755,28 +12055,6 @@ impl NgapServer {
             guard.connected_downlink_add(item);
             return;
         }
-        let (n2, paged) = match item.n2 {
-            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
-            _ if item.n1_only => (None, PagedN2::N1Only),
-            ConnectedN2::None => (None, PagedN2::Setup),
-            ConnectedN2::Release => (None, PagedN2::Release),
-            ConnectedN2::Setup(t) => (t, PagedN2::Setup),
-            ConnectedN2::Modify(t) => (Some(t), PagedN2::Modify),
-        };
-        let mut sess = {
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
-        };
-        crate::namf_handler::initiate_paging_for_idle_ue(
-            amf_ue,
-            sess.as_mut(),
-            item.n1,
-            n2,
-            paged,
-            Some(item.pdu_session_id),
-            item.failure_notify_uri.as_deref(),
-        );
         if let Some(sess) = &sess {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -21123,6 +21401,7 @@ impl NgapServer {
     ///   cleared.
     /// - Its queued connected downlinks are dropped; one carrying a failure-notify URI
     ///   is notified the same way (#1689 review).
+    /// - Its queued UE-AMBR modification is dropped (#1776).
     fn stop_paging_on_deregistration(&self, amf_ue_ngap_id: u64) {
         let supi = self
             .ue_auth_state
@@ -21134,6 +21413,8 @@ impl NgapServer {
             let pages = guard.paging_take_for_ue(amf_ue_ngap_id);
             let mut ids = vec![amf_ue_ngap_id];
             ids.extend(pages.iter().map(|p| p.amf_ue_ngap_id));
+            // #1776: and no UE Context Modification goes to a deregistering UE.
+            guard.ue_ambr_modification_remove_for(&ids);
             (pages, guard.connected_downlink_remove_for(&ids))
         };
         for paging in &pages {
@@ -21141,7 +21422,7 @@ impl NgapServer {
             log::info!(
                 "Paging stopped for UE {} on its deregistration{}",
                 paging.amf_ue_ngap_id,
-                if paging.failure_notify_uri.is_some() {
+                if !paging.failure_notify_targets().is_empty() {
                     ", requester notified (FAILURE_CAUSE_UNSPECIFIED)"
                 } else {
                     ""
@@ -21174,15 +21455,15 @@ impl NgapServer {
     /// A page ended without its UE answering: notify the requester with `cause` and
     /// clear the session's paging state, so a later transfer is not refused as
     /// "paging ongoing".
+    ///
+    /// #1837: every requester the page holds is notified, each at its own URI: the
+    /// page's own transfer and each transfer that joined it
+    /// (`PagingContext::failure_notify_targets`, TS 29.518 §5.2.2.3.1).
     fn paging_ended(&self, paging: &crate::context::PagingContext, cause: &str) {
         // #1760: the UE did not answer; its last known location is reported.
         crate::namf_server::first_locations_after_page(paging, None);
-        if let Some(uri) = &paging.failure_notify_uri {
-            crate::namf_server::send_n1n2_failure_notification(
-                uri.clone(),
-                cause,
-                paging.n1n2_msg_data_uri.clone(),
-            );
+        for (uri, n1n2_msg_data_uri) in paging.failure_notify_targets() {
+            crate::namf_server::send_n1n2_failure_notification(uri, cause, n1n2_msg_data_uri);
         }
         clear_session_paging(paging);
     }
@@ -21195,7 +21476,7 @@ impl NgapServer {
             "Paging abandoned for UE {}: no response after {} attempt(s){}",
             paging.amf_ue_ngap_id,
             u32::from(paging.retransmit_count) + 1,
-            if paging.failure_notify_uri.is_some() {
+            if !paging.failure_notify_targets().is_empty() {
                 ", requester notified (UE_NOT_RESPONDING)"
             } else {
                 ""
@@ -23537,6 +23818,7 @@ mod tests {
     mod racs_handler_tests;
     mod racs_mapping_tests;
     mod reject_path_tests;
+    mod ue_context_modification_tests;
     /// #686: UE contexts survive an AMF restart.
     mod ue_context_store_tests;
     /// #999: every handler's undecodable arm answers TS 38.413 §10.2.
@@ -27547,7 +27829,7 @@ mod tests {
     /// builder, so the copy from the UE context is the one under test.
     fn queue_paging(ngap: &NgapServer, ue: u64) {
         let amf_ue = ngap.ue_auth_state.get(ue).expect("UE").amf_ue;
-        crate::namf_handler::initiate_paging_for_idle_ue(
+        assert!(crate::namf_handler::initiate_paging_for_idle_ue(
             &amf_ue,
             None,
             None,
@@ -27555,7 +27837,7 @@ mod tests {
             crate::namf_handler::PagedN2::Setup,
             None,
             None,
-        );
+        ));
     }
 
     /// The associations the PAGINGs for 5G-TMSI `tmsi` went out on, in send order.
@@ -39233,7 +39515,8 @@ mod tests {
     /// session 5, and the subscription is told the UE's current location.
     ///
     /// REVERT-VERIFIED: with `paging_ongoing` counting a location-only page again
-    /// (`paging_holds_transfer` ignoring `location_only`), the transfer is refused
+    /// (`paging_holds_transfer` ignoring `location_only`; since #1837 the same
+    /// check is `paging_add`'s refusal), the transfer is refused
     /// ("not refused for a location-only page"); with `paging_add` not carrying the
     /// waiting subscriptions over, nothing is reported ("a LOCATION_REPORT must be
     /// delivered" via "the subscription still waits on the page").
@@ -44810,6 +45093,122 @@ mod tests {
         );
         assert_eq!(lane_count_1769(port), 0, "no lane is left behind");
         peer.stop().await.expect("stop");
+    }
+
+    /// **#1820**: a NOT_TRANSFERRED that times out (the old AMF holds it past the
+    /// client's request timeout and applies it later) is followed by the TRANSFERRED
+    /// of the retry. The TRANSFERRED is sent once the timed-out one is abandoned, not
+    /// after the 30 s client default, and because the lane is unsettled it is sent
+    /// again after the settle wait, so it is the last the old AMF applies even though
+    /// the late NOT_TRANSFERRED landed after its first send.
+    ///
+    /// REVERT-VERIFIED: with `record` never marking the lane unsettled, there is no
+    /// re-send and the late NOT_TRANSFERRED is the last applied ("the late
+    /// NOT_TRANSFERRED landed after the first send, and the re-send after it"); with the status update sent on the
+    /// default `peer_client` (30 s timeout), the TRANSFERRED waits behind the
+    /// unreachable send ("sent once the timed-out update is abandoned").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_update_cannot_land_last_1820() {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let hold = crate::sbi_path::REGISTRATION_STATUS_UPDATE_TIMEOUT + Duration::from_millis(500);
+        let holds = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let applied = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let (h, a) = (holds.clone(), applied.clone());
+        peer.start(move |req: SbiRequest| {
+            let (holds, applied) = (h.clone(), a.clone());
+            async move {
+                let body: serde_json::Value =
+                    serde_json::from_str(req.http.content.as_deref().unwrap_or("{}"))
+                        .unwrap_or_default();
+                let status = body["transferStatus"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let apply = move || {
+                    holds.store(status != "TRANSFERRED", std::sync::atomic::Ordering::SeqCst);
+                    applied.lock().expect("applied").push(status);
+                };
+                if body["transferStatus"] == "NOT_TRANSFERRED" {
+                    // Delayed past the client's timeout, and applied regardless.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(hold).await;
+                        apply();
+                    });
+                    tokio::time::sleep(hold * 2).await;
+                } else {
+                    apply();
+                }
+                SbiResponse::ok()
+                    .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                    .expect("json")
+            }
+        })
+        .await
+        .expect("old AMF starts");
+        let port = addr.port();
+
+        let first =
+            spawn_registration_status_update(pending_1769(port, 18201), false).expect("runtime");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second =
+            spawn_registration_status_update(pending_1769(port, 18201), true).expect("runtime");
+        let started = std::time::Instant::now();
+        let mut sent = false;
+        while started.elapsed() < crate::sbi_path::REGISTRATION_STATUS_UPDATE_TIMEOUT * 3 {
+            if applied
+                .lock()
+                .expect("applied")
+                .iter()
+                .any(|s| s == "TRANSFERRED")
+            {
+                sent = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(sent, "sent once the timed-out update is abandoned");
+        first.await.expect("first");
+        second.await.expect("second");
+        let applied = applied.lock().expect("applied").clone();
+        assert_eq!(
+            applied,
+            ["TRANSFERRED", "NOT_TRANSFERRED", "TRANSFERRED"],
+            "the late NOT_TRANSFERRED landed after the first send, and the re-send after it"
+        );
+        assert!(
+            !holds.load(std::sync::atomic::Ordering::SeqCst),
+            "the TRANSFERRED is applied last"
+        );
+        assert_eq!(lane_count_1769(port), 0, "no lane is left behind");
+        peer.stop().await.expect("stop");
+    }
+
+    /// **#1820**: two spellings of one old AMF's host share one lane, so their
+    /// updates are ordered against each other.
+    ///
+    /// REVERT-VERIFIED: with the raw host as the key, the spellings get a lane each.
+    #[test]
+    fn two_spellings_of_one_amf_share_a_lane_1820() {
+        assert_eq!(normalise_peer_host("[::1]"), "::1");
+        assert_eq!(normalise_peer_host("0:0:0:0:0:0:0:1"), "::1");
+        assert_eq!(normalise_peer_host("::ffff:10.0.0.1"), "10.0.0.1");
+        assert_eq!(
+            normalise_peer_host(" AMF1.Example.ORG. "),
+            "amf1.example.org"
+        );
+        let port = 18_202;
+        let key = |host: &str| StatusUpdateKey::new(host, port, "5g-guti-1820".to_string());
+        let a = StatusUpdateTicket::issue(key("[0:0:0:0:0:0:0:1]"));
+        let b = StatusUpdateTicket::issue(key("::1"));
+        assert_eq!(lane_count_1769(port), 1, "one lane for one AMF");
+        assert!(Arc::ptr_eq(&a.lane, &b.lane));
+        drop(a);
+        drop(b);
+        assert_eq!(lane_count_1769(port), 0);
     }
 
     fn taken_over_1731(supi: &str) -> Vec<crate::context::EventSubscription> {
