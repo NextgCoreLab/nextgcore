@@ -20,9 +20,12 @@ async fn known_bad_pcf_binding_gets_real_400() {
         "snssai": { "sst": 1 },
         "ipv4Addr": "10.45.0.1",
     });
-    let req = SbiRequest::post("/nbsf-management/v1/pcfBindings")
+    let mut req = SbiRequest::post("/nbsf-management/v1/pcfBindings")
         .with_json_body(&bad)
         .expect("serialize");
+    // #1937: a verified PCF, as the production profile requires of a creator,
+    // so the request reaches validation.
+    req.oauth2_subject = Some("19370000-0000-4000-8000-00000000bf01".into());
     let resp = nextgcore_bsfd::bsf_sbi_request_handler(req).await;
 
     assert_eq!(

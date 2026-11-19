@@ -574,7 +574,7 @@ async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
         ("nbsf-management", "pcfBindings", "GET") => handle_pcf_binding_discovery(&request).await,
         ("nbsf-management", "pcfBindings", "DELETE") if parts.len() >= 4 => {
             let binding_id = parts[3];
-            handle_pcf_binding_delete(binding_id).await
+            handle_pcf_binding_delete(binding_id, &request).await
         }
         ("nbsf-management", "pcfBindings", "PATCH") if parts.len() >= 4 => {
             let binding_id = parts[3];
@@ -591,7 +591,7 @@ async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
             handle_pcf_ue_binding_discovery(&request).await
         }
         ("nbsf-management", "pcf-ue-bindings", "DELETE") if parts.len() >= 4 => {
-            handle_pcf_ue_binding_delete(parts[3]).await
+            handle_pcf_ue_binding_delete(parts[3], &request).await
         }
         ("nbsf-management", "pcf-ue-bindings", "PATCH") if parts.len() >= 4 => {
             handle_pcf_ue_binding_update(parts[3], &request).await
@@ -607,7 +607,7 @@ async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
             handle_pcf_mbs_binding_discovery(&request).await
         }
         ("nbsf-management", "pcf-mbs-bindings", "DELETE") if parts.len() >= 4 => {
-            handle_pcf_mbs_binding_delete(parts[3]).await
+            handle_pcf_mbs_binding_delete(parts[3], &request).await
         }
         ("nbsf-management", "pcf-mbs-bindings", "PATCH") if parts.len() >= 4 => {
             handle_pcf_mbs_binding_update(parts[3], &request).await
@@ -822,6 +822,15 @@ fn parse_pcf_ip_endpoints(v: &serde_json::Value) -> Vec<context::PcfIpEndpoint> 
 async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     log::info!("PCF Binding Create");
 
+    // #1937: the PCF this binding is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Nbsf_Management_Register",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+
     let body = match &request.http.content {
         Some(content) => content,
         None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
@@ -1012,6 +1021,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
 
     match sess {
         Some(mut sess) => {
+            sess.owner = owner;
             sess.dnn = Some(dnn.to_string());
             let sd = binding_data
                 .get("snssai")
@@ -1624,7 +1634,7 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
+async fn handle_pcf_binding_delete(binding_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("PCF Binding Delete: {binding_id}");
 
     let ctx = bsf_self();
@@ -1634,10 +1644,30 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
 
     match sess_id {
         Some(id) => {
-            // The session is read BEFORE removal: the notification identifies the
-            // binding that went away, and after sess_remove there is nothing left
-            // to describe it with.
-            let removed_sess = ctx.read().ok().and_then(|context| context.sess_remove(id));
+            // #1937: only the PCF that registered it, checked against the
+            // binding stored under `id` at removal time, under the same lock
+            // (a pool id reused by another PCF's binding in between is not
+            // removed), before anything is unpersisted or notified. Unknown
+            // stays 404 below.
+            let removed = ctx.read().ok().map(|context| {
+                context.sess_remove_checked(id, |sess| {
+                    match nextgcore_sbi::owner_binding::refuse_non_owner(
+                        sess.owner.as_deref(),
+                        request,
+                        "Nbsf_Management_Deregister",
+                    ) {
+                        Some(refused) => Err(Box::new(refused)),
+                        None => Ok(()),
+                    }
+                })
+            });
+            // The session is taken out by the removal itself: the notification
+            // identifies the binding that went away.
+            let removed_sess = match removed {
+                Some(Ok(sess)) => sess,
+                Some(Err(refused)) => return *refused,
+                None => None,
+            };
             if let Some(ref sess) = removed_sess {
                 // Guard dropped above; unpersist off-thread.
                 context::unpersist_binding_async(binding_id.to_string()).await;
@@ -1745,6 +1775,14 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                 Some("BINDING_NOT_FOUND"),
             );
         };
+        // #1937: only the PCF that registered it, before anything is changed.
+        if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            sess.owner.as_deref(),
+            request,
+            "Nbsf_Management_Update",
+        ) {
+            return refused;
+        }
 
         // pcfFqdn
         match patch_str(&update_data, "pcfFqdn") {
@@ -1922,8 +1960,14 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
         }
 
         // Write the updated session back; the context guard is released when
-        // this block ends, before the persistence await.
-        context.sess_update(&sess);
+        // this block ends, before the persistence await. #1937: refused when
+        // the id now holds another PCF's binding, so it is not overwritten.
+        if !context.sess_update(&sess) {
+            return send_not_found(
+                &format!("PCF Binding {binding_id} not found"),
+                Some("BINDING_NOT_FOUND"),
+            );
+        }
         sess
     };
 
@@ -2021,6 +2065,14 @@ fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
 }
 
 async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
+    // #1937: the PCF this binding is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Nbsf_Management_Register",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("PCF UE Binding Create");
     let body = match &request.http.content {
         Some(c) => c,
@@ -2070,6 +2122,7 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
 
     let binding_id = uuid::Uuid::new_v4().to_string();
     let binding = context::PcfUeBinding {
+        owner,
         binding_id: binding_id.clone(),
         supi: supi.map(|s| s.to_string()),
         gpsi: gpsi.map(|s| s.to_string()),
@@ -2173,13 +2226,27 @@ async fn handle_pcf_ue_binding_discovery(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_pcf_ue_binding_delete(binding_id: &str) -> SbiResponse {
+async fn handle_pcf_ue_binding_delete(binding_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = bsf_self();
-    match ctx
-        .read()
-        .ok()
-        .and_then(|g| g.ue_binding_remove(binding_id))
-    {
+    // #1937: only the registering PCF, checked under the removal's lock.
+    let removed = ctx.read().ok().map(|g| {
+        g.ue_binding_remove_checked(binding_id, |b| {
+            match nextgcore_sbi::owner_binding::refuse_non_owner(
+                b.owner.as_deref(),
+                request,
+                "Nbsf_Management_Deregister",
+            ) {
+                Some(refused) => Err(Box::new(refused)),
+                None => Ok(()),
+            }
+        })
+    });
+    let removed = match removed {
+        Some(Ok(removed)) => removed,
+        Some(Err(refused)) => return *refused,
+        None => None,
+    };
+    match removed {
         Some(removed) => {
             log::info!("PCF UE Binding {binding_id} deleted");
             spawn_bsf_notifications(
@@ -2226,6 +2293,14 @@ async fn handle_pcf_ue_binding_update(binding_id: &str, request: &SbiRequest) ->
             Some("BINDING_NOT_FOUND"),
         );
     };
+    // #1937: only the registering PCF, before anything is changed.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        b.owner.as_deref(),
+        request,
+        "Nbsf_Management_Update",
+    ) {
+        return refused;
+    }
 
     // Apply merge-patch: string fields (null = clear, string = set, absent = keep).
     macro_rules! patch_opt {
@@ -2399,6 +2474,14 @@ fn mbs_binding_json(b: &context::PcfMbsBinding) -> serde_json::Value {
 }
 
 async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
+    // #1937: the PCF this binding is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "Nbsf_Management_Register",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     log::info!("PCF MBS Binding Create");
     let body = match &request.http.content {
         Some(c) => c,
@@ -2498,6 +2581,7 @@ async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
 
     let binding_id = uuid::Uuid::new_v4().to_string();
     let binding = context::PcfMbsBinding {
+        owner,
         binding_id: binding_id.clone(),
         mbs_session_id: mbs_session_id.clone(),
         pcf_fqdn: pcf_fqdn.map(|s| s.to_string()),
@@ -2623,13 +2707,27 @@ async fn handle_pcf_mbs_binding_discovery(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_pcf_mbs_binding_delete(binding_id: &str) -> SbiResponse {
+async fn handle_pcf_mbs_binding_delete(binding_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = bsf_self();
-    match ctx
-        .read()
-        .ok()
-        .and_then(|g| g.mbs_binding_remove(binding_id))
-    {
+    // #1937: only the registering PCF, checked under the removal's lock.
+    let removed = ctx.read().ok().map(|g| {
+        g.mbs_binding_remove_checked(binding_id, |b| {
+            match nextgcore_sbi::owner_binding::refuse_non_owner(
+                b.owner.as_deref(),
+                request,
+                "Nbsf_Management_Deregister",
+            ) {
+                Some(refused) => Err(Box::new(refused)),
+                None => Ok(()),
+            }
+        })
+    });
+    let removed = match removed {
+        Some(Ok(removed)) => removed,
+        Some(Err(refused)) => return *refused,
+        None => None,
+    };
+    match removed {
         Some(_) => {
             log::info!("PCF MBS Binding {binding_id} deleted");
             SbiResponse::with_status(204)
@@ -2670,6 +2768,14 @@ async fn handle_pcf_mbs_binding_update(binding_id: &str, request: &SbiRequest) -
             Some("BINDING_NOT_FOUND"),
         );
     };
+    // #1937: only the registering PCF, before anything is changed.
+    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+        b.owner.as_deref(),
+        request,
+        "Nbsf_Management_Update",
+    ) {
+        return refused;
+    }
 
     match patch_str(&data, "pcfFqdn") {
         Patch::Clear => b.pcf_fqdn = None,
@@ -4963,6 +5069,309 @@ mod tests {
             "supi": supi,
             "events": events,
         })
+    }
+
+    /// R32 on #1959: pcf-ue-bindings and pcf-mbs-bindings are updated and
+    /// deleted only by the PCF that registered them, like PDU bindings. Every
+    /// stranger gets 403 on PATCH and DELETE with the binding unchanged and
+    /// still there; the owner then succeeds.
+    ///
+    /// REVERT-VERIFIED: with the UE DELETE check removed (`Ok(())` in its
+    /// `ue_binding_remove_checked` closure) the stranger's UE DELETE is 204;
+    /// with the MBS PATCH check removed the stranger's MBS PATCH is 200; with
+    /// `owner` dropped from the UE create the strangers pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ue_and_mbs_bindings_are_managed_only_by_their_pcf_1937() {
+        bsf_context_init(1024);
+        const OWNER: &str = "aaaaaaaa-1937-4000-8000-0000000000c1";
+        const OTHER: &str = "0e0e0e0e-1937-4000-8000-0000000000cf";
+        let as_caller = |mut r: SbiRequest, cert: Option<&str>, token: Option<&str>| {
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+        for (collection, body, fqdn_member) in [
+            (
+                "/nbsf-management/v1/pcf-ue-bindings",
+                serde_json::json!({
+                    "supi": "imsi-001019900193701",
+                    "pcfForUeFqdn": "pcf-ue-1937.example.org",
+                }),
+                "pcfForUeFqdn",
+            ),
+            (
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                serde_json::json!({
+                    "mbsSessionId": {"tmgi": {"mbsServiceId": "193700",
+                                               "plmnId": {"mcc": "001", "mnc": "01"}}},
+                    "pcfFqdn": "pcf-mbs-1937.example.org",
+                }),
+                "pcfFqdn",
+            ),
+        ] {
+            let create = as_caller(
+                SbiRequest::post(collection).with_json_body(&body).unwrap(),
+                None,
+                Some(OWNER),
+            );
+            let resp = bsf_sbi_request_handler(create).await;
+            assert_eq!(resp.status, 201, "{collection}: {:?}", resp.http.content);
+            let location = resp
+                .http
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                .map(|(_, v)| v.clone())
+                .expect("Location");
+            let path = location
+                .find("/nbsf-management/")
+                .map(|i| location[i..].to_string())
+                .unwrap();
+            let original = body[fqdn_member].clone();
+            let read = || {
+                let path = path.clone();
+                async move {
+                    let r = bsf_sbi_request_handler(SbiRequest::get(path)).await;
+                    (r.status == 200).then(|| {
+                        serde_json::from_str::<serde_json::Value>(
+                            r.http.content.as_deref().unwrap_or("{}"),
+                        )
+                        .unwrap()
+                    })
+                }
+            };
+            let patch = |cert: Option<&str>, token: Option<&str>| {
+                as_caller(
+                    SbiRequest::patch(path.clone()).with_body(
+                        serde_json::json!({ fqdn_member: "hijacked.example.org" }).to_string(),
+                        "application/merge-patch+json",
+                    ),
+                    cert,
+                    token,
+                )
+            };
+            let delete = |cert: Option<&str>, token: Option<&str>| {
+                as_caller(SbiRequest::delete(path.clone()), cert, token)
+            };
+            for (cert, token, what) in [
+                (Some(OTHER), None, "another PCF's certificate"),
+                (None, Some(OTHER), "another PCF's token"),
+                (
+                    Some(OWNER),
+                    Some(OTHER),
+                    "a certificate and token that disagree",
+                ),
+                (None, None, "an anonymous caller"),
+            ] {
+                let r = bsf_sbi_request_handler(patch(cert, token)).await;
+                assert_eq!(
+                    r.status, 403,
+                    "{path} PATCH by {what}: {:?}",
+                    r.http.content
+                );
+                let r = bsf_sbi_request_handler(delete(cert, token)).await;
+                assert_eq!(
+                    r.status, 403,
+                    "{path} DELETE by {what}: {:?}",
+                    r.http.content
+                );
+                let now = read()
+                    .await
+                    .unwrap_or_else(|| panic!("{path}: gone after {what}"));
+                assert_eq!(now[fqdn_member], original, "{path}: unchanged by {what}");
+            }
+            let r = bsf_sbi_request_handler(patch(Some(OWNER), None)).await;
+            assert_eq!(
+                r.status, 200,
+                "{path}: the owner updates: {:?}",
+                r.http.content
+            );
+            let r = bsf_sbi_request_handler(delete(None, Some(OWNER))).await;
+            assert_eq!(
+                r.status, 204,
+                "{path}: the owner deletes: {:?}",
+                r.http.content
+            );
+            assert!(read().await.is_none());
+        }
+    }
+
+    /// R32 on #1959: the owner check and the removal are one step. A pool id
+    /// freed and handed to another PCF's binding is checked as THAT binding,
+    /// so a deregister aimed at the old one is refused instead of removing
+    /// the new one; and a write-back of the old binding does not overwrite it.
+    ///
+    /// REVERT-VERIFIED: with `sess_remove_checked` skipping its `check`, the
+    /// new PCF's binding is removed and the first assertion fails; with the
+    /// owner comparison dropped from `sess_update`, the stale write-back
+    /// succeeds.
+    #[test]
+    fn a_reused_pool_id_is_checked_as_the_binding_it_now_holds_1937() {
+        bsf_context_init(1024);
+        const A: &str = "aaaaaaaa-1937-4000-8000-0000000000a1";
+        const B: &str = "bbbbbbbb-1937-4000-8000-0000000000b2";
+        let ctx = bsf_self();
+        let guard = ctx.read().unwrap();
+        // PCF A's binding was checked by a deregister (and read by an update)...
+        let mut held_by_a = guard
+            .sess_add_binding(Some("10.45.193.7"), None, None)
+            .expect("sess");
+        held_by_a.owner = Some(A.into());
+        // ...but the id is now PCF B's: A's binding went, the pool id was reused.
+        let mut b = held_by_a.clone();
+        b.owner = Some(B.into());
+        assert!(
+            guard.sess_update(&b),
+            "a fresh register binds an ownerless record"
+        );
+
+        let only_a = |sess: &BsfSess| {
+            if sess.owner.as_deref() == Some(A) {
+                Ok(())
+            } else {
+                Err("not A's")
+            }
+        };
+        assert!(
+            matches!(guard.sess_remove_checked(b.id, only_a), Err("not A's")),
+            "checked as B's binding, so A's deregister is refused"
+        );
+        assert!(
+            guard.sess_find_by_binding_id(&b.binding_id).is_some(),
+            "B's binding survives"
+        );
+        assert!(
+            !guard.sess_update(&held_by_a),
+            "A's stale write-back does not overwrite B's binding"
+        );
+        assert_eq!(
+            guard
+                .sess_find_by_binding_id(&b.binding_id)
+                .and_then(|s| s.owner)
+                .as_deref(),
+            Some(B)
+        );
+        let _ = guard.sess_remove(b.id);
+    }
+
+    /// #1937: a PCF binding is updated (TS 29.521 §5.2.2.4) or deregistered
+    /// (§5.2.2.3) only by the PCF that registered it. Another PCF's
+    /// certificate or token, a certificate/token pair that disagree and an
+    /// anonymous caller get 403 with the binding unchanged and still
+    /// discoverable; the owner's PATCH and DELETE succeed. A mismatched
+    /// register stores nothing.
+    ///
+    /// REVERT-VERIFIED: with the DELETE check removed the foreign DELETE is
+    /// 204; with the PATCH check removed the foreign PATCH is 200; with
+    /// `sess.owner = owner` dropped the foreign callers pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcf_binding_is_managed_only_by_the_pcf_that_registered_it_1937() {
+        bsf_context_init(1024);
+        const OWNER: &str = "aaaaaaaa-1937-4000-8000-0000000000b1";
+        const OTHER: &str = "0e0e0e0e-1937-4000-8000-0000000000ff";
+        let binding = |ip: &str| {
+            serde_json::json!({
+                "supi": "imsi-001010000001937",
+                "dnn": "internet",
+                "snssai": {"sst": 1},
+                "ipv4Addr": ip,
+                "pcfFqdn": "pcf-1937.example.org",
+            })
+        };
+        let as_caller = |mut r: SbiRequest, cert: Option<&str>, token: Option<&str>| {
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+
+        // A mismatched register stores nothing.
+        let mismatched = as_caller(
+            SbiRequest::post("/nbsf-management/v1/pcfBindings")
+                .with_json_body(&binding("10.45.19.2"))
+                .unwrap(),
+            Some(OWNER),
+            Some(OTHER),
+        );
+        let resp = bsf_sbi_request_handler(mismatched).await;
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        assert!(
+            bsf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.45.19.2")
+                .is_none(),
+            "a refused register stores nothing"
+        );
+
+        let create = as_caller(
+            SbiRequest::post("/nbsf-management/v1/pcfBindings")
+                .with_json_body(&binding("10.45.19.1"))
+                .unwrap(),
+            None,
+            Some(OWNER),
+        );
+        let resp = bsf_sbi_request_handler(create).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let location = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .expect("Location");
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let stored = || {
+            bsf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.sess_find_by_binding_id(&id))
+        };
+        assert_eq!(stored().and_then(|s| s.owner).as_deref(), Some(OWNER));
+
+        let patch = |cert: Option<&str>, token: Option<&str>| {
+            as_caller(
+                SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}")).with_body(
+                    serde_json::json!({"pcfFqdn": "hijacked.example.org"}).to_string(),
+                    "application/merge-patch+json",
+                ),
+                cert,
+                token,
+            )
+        };
+        let delete = |cert: Option<&str>, token: Option<&str>| {
+            as_caller(
+                SbiRequest::delete(format!("/nbsf-management/v1/pcfBindings/{id}")),
+                cert,
+                token,
+            )
+        };
+        for (cert, token, what) in [
+            (Some(OTHER), None, "another PCF's certificate"),
+            (None, Some(OTHER), "another PCF's token"),
+            (
+                Some(OWNER),
+                Some(OTHER),
+                "a certificate and token that disagree",
+            ),
+            (None, None, "an anonymous caller"),
+        ] {
+            let r = bsf_sbi_request_handler(patch(cert, token)).await;
+            assert_eq!(r.status, 403, "{what} PATCH: {:?}", r.http.content);
+            assert_eq!(
+                stored().and_then(|s| s.pcf_fqdn).as_deref(),
+                Some("pcf-1937.example.org"),
+                "{what}: unchanged"
+            );
+            let r = bsf_sbi_request_handler(delete(cert, token)).await;
+            assert_eq!(r.status, 403, "{what} DELETE: {:?}", r.http.content);
+            assert!(stored().is_some(), "{what}: still registered");
+        }
+
+        let r = bsf_sbi_request_handler(patch(Some(OWNER), None)).await;
+        assert_eq!(r.status, 200, "the owner updates: {:?}", r.http.content);
+        let r = bsf_sbi_request_handler(delete(None, Some(&OWNER.to_uppercase()))).await;
+        assert_eq!(r.status, 204, "the owner deregisters: {:?}", r.http.content);
+        assert!(stored().is_none());
     }
 
     /// #1865: an Nbsf_Management subscription is replaced and removed only by the
