@@ -73,6 +73,24 @@
 //!   can be restored under production, and the owner is not written anywhere.
 //!   A restarted peer recovers through the 404 handling below.
 //!
+//! **Retried creates** (#2048; TS 29.500 §5.2.8 "detection of duplicated
+//! request message", the `idempotency-key` of `3gpp-Sbi-Request-Info`
+//! §5.2.3.3.12, 29500-j70.txt l.4144-4151, l.4223-4226, l.5302-5331):
+//!
+//! - A Register or Subscribe carrying a key, retransmitted by the same owner
+//!   with the same body inside [`IDEMPOTENCY_WINDOW_SECS`], is answered 201 with
+//!   the Location of what it created and its current representation; nothing is
+//!   created, replaced, subscribed, logged as new or counted. The check and the
+//!   insert share one lock and no await, so a retry while the MTLF's Subscribe
+//!   for that registration is still in flight finds the registration too.
+//! - The key lives on the record it created ([`CreateKey`]): bounded by the
+//!   map's cap, gone with the record (a deleted one is not resurrected), and a
+//!   replay is answered before the cap is checked.
+//! - A create without a key is never merged (the detection is optional). Both
+//!   clients here send one: the MTLF one per registration for its Subscribe,
+//!   the AnLF one per Register until it is answered 201; `retrans=true` on a
+//!   retry.
+//!
 //! The notify callback `/nnwdaf-callback/v1/mlmodel-monitor-notify/{token}`
 //! authenticates by its 122-bit token (TS 33.501 §13.4.1: no OAuth2 on
 //! notifications) and has the same OAuth2-enforcement limitation as the model
@@ -124,6 +142,125 @@ pub const ORPHAN_GRACE_SECS: u64 = 120;
 pub const REGISTER_RETRY_SECS: u64 = 10;
 /// The cause of a refused create at the cap (TS 29.500 Table 5.2.7.2-1).
 pub const INSUFFICIENT_RESOURCES: &str = "INSUFFICIENT_RESOURCES";
+/// #2048: how long a create's `idempotency-key` (TS 29.500 §5.2.8, "the
+/// server may consider an idempotency key as expired after an operator
+/// configurable timer") still replays the resource it created, seconds. It
+/// covers the longest retry span of either client here: the MTLF's Subscribe
+/// is at most 6 attempts with 60 s of backoff between them
+/// ([`subscribe_at_anlf_retrying`]), each attempt an NRF discovery and a POST of
+/// at most 5 s connect + 10 s request each (the nwdafd peer clients; the
+/// `nextgcore-sbi` client's own retry is off, `RetryPolicy::max_attempts` 1),
+/// so 240 s from the first POST to the last; the AnLF's Register retries every
+/// [`REGISTER_RETRY_SECS`]. It equals [`REGISTRATION_EXPIRY_SECS`]: a retry
+/// later than that would find no live registration to replay anyway.
+pub const IDEMPOTENCY_WINDOW_SECS: u64 = 300;
+/// The longest `idempotency-key` accepted (a UUID, RFC 9562, is 36).
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+/// #2048: the TS 29.500 §5.2.8 duplicate-detection record of a create, kept on
+/// the record it created, so it is bounded by the map's cap and goes with the
+/// record (a deleted record is never replayed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateKey {
+    /// The verified creator; a replay must come from the same one.
+    owner: Option<String>,
+    /// The `idempotency-key` of the request's `3gpp-Sbi-Request-Info`.
+    key: String,
+    /// SHA-256 of the request body, canonicalised (object keys sorted).
+    body: [u8; 32],
+    /// When the create was processed, unix seconds.
+    at: u64,
+}
+
+impl CreateKey {
+    fn new(owner: &Option<String>, key: String, body: &Value, at: u64) -> Self {
+        Self {
+            owner: owner.clone(),
+            key,
+            body: fingerprint(body),
+            at,
+        }
+    }
+
+    /// Whether `retry` is a retransmission of this create: the same owner,
+    /// key and body, inside [`IDEMPOTENCY_WINDOW_SECS`].
+    fn replayed_by(&self, retry: &CreateKey) -> bool {
+        let same_owner = match (&self.owner, &retry.owner) {
+            (None, None) => true,
+            (Some(a), Some(b)) => owner_binding::same_nf_instance_id(a, b),
+            _ => false,
+        };
+        same_owner
+            && self.key == retry.key
+            && self.body == retry.body
+            && retry.at.saturating_sub(self.at) < IDEMPOTENCY_WINDOW_SECS
+    }
+}
+
+/// `v` with every object's keys in sorted order, so two bodies that are the
+/// same JSON hash the same whatever their member order.
+fn canonical(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), canonical(&o[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
+fn fingerprint(body: &Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(canonical(body).to_string().as_bytes()).into()
+}
+
+/// The `idempotency-key` of `request`'s `3gpp-Sbi-Request-Info` header (TS
+/// 29.500 §5.2.3.3.12): `Ok(None)` without one; `Err` for an empty, overlong
+/// or non-printable one.
+pub fn idempotency_key(request: &SbiRequest) -> Result<Option<String>, String> {
+    let Some(info) = request
+        .http
+        .get_header(nextgcore_sbi::constants::custom_header::REQUEST_INFO)
+    else {
+        return Ok(None);
+    };
+    for param in info.split(';') {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("idempotency-key") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        if value.is_empty()
+            || value.len() > MAX_IDEMPOTENCY_KEY_LEN
+            || !value.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(format!(
+                "3gpp-Sbi-Request-Info idempotency-key must be 1..={MAX_IDEMPOTENCY_KEY_LEN} \
+                 printable characters"
+            ));
+        }
+        return Ok(Some(value.to_string()));
+    }
+    Ok(None)
+}
+
+/// The `3gpp-Sbi-Request-Info` value a client sends with create `key`: the
+/// key, and `retrans=true` on a retransmission (§5.2.3.3.12).
+pub fn request_info(key: &str, retrans: bool) -> String {
+    if retrans {
+        format!("idempotency-key={key}; retrans=true")
+    } else {
+        format!("idempotency-key={key}")
+    }
+}
 
 /// One MTLF-side registration (an `MLModelMonitorReg`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +280,11 @@ pub struct Registration {
     /// deregister it. `None` only for a registration created with no verified
     /// identity under the `dev` profile (frozen under `production`).
     pub owner: Option<String>,
+    /// #2048: the create's duplicate-detection record, if it carried a key.
+    pub create_key: Option<CreateKey>,
+    /// #2048: the `idempotency-key` of this registration's Subscribe at the
+    /// AnLF, the same on every retry of it.
+    pub subscribe_key: String,
 }
 
 /// One AnLF-side subscription (an `MLModelMonitorSub`).
@@ -157,6 +299,9 @@ pub struct MonitorSub {
     /// #1937: the verified NF instance (the MTLF) that created it; only it may
     /// update or delete it. `None` as for [`Registration::owner`].
     pub owner: Option<String>,
+    /// #2048: the create's duplicate-detection record, if it carried a key;
+    /// an update keeps it.
+    pub create_key: Option<CreateKey>,
 }
 
 /// The registration the AnLF holds at the MTLF.
@@ -174,6 +319,16 @@ pub struct Wanted {
     pub host: String,
     pub port: u16,
     pub model_id: u64,
+}
+
+/// #2048: the AnLF's Register not yet answered 201, and its `idempotency-key`,
+/// reused while it is retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRegister {
+    host: String,
+    port: u16,
+    model_id: u64,
+    key: String,
 }
 
 /// The AnLF's view of its registration's health, in the reporter's clock.
@@ -210,6 +365,8 @@ pub struct Monitor {
     held: Mutex<Option<HeldRegistration>>,
     wanted: Mutex<Option<Wanted>>,
     upkeep: Mutex<Upkeep>,
+    /// #2048: the Register being retried, see [`PendingRegister`].
+    pending_register: Mutex<Option<PendingRegister>>,
     /// Serialises Register / Deregister at the MTLF.
     registering: tokio::sync::Mutex<()>,
     /// A reporter-started Register is in flight.
@@ -245,6 +402,7 @@ impl Monitor {
             held: Mutex::new(None),
             wanted: Mutex::new(None),
             upkeep: Mutex::new(Upkeep::default()),
+            pending_register: Mutex::new(None),
             registering: tokio::sync::Mutex::new(()),
             reconciling: AtomicBool::new(false),
             sent: AtomicU64::new(0),
@@ -382,6 +540,8 @@ impl Monitor {
                 last_seen: unix_now(),
                 auditing: false,
                 owner: None,
+                create_key: None,
+                subscribe_key: new_key(),
             },
         );
         lock(&self.feedback).register_model_with(
@@ -389,6 +549,22 @@ impl Monitor {
             FEEDBACK_WINDOW,
             f64::from(crate::model_retrain::DEFAULT_ACCURACY_THRESHOLD) / 100.0,
         );
+    }
+
+    /// Age every create's duplicate-detection record by `secs` (tests).
+    #[cfg(test)]
+    pub(crate) fn age_create_keys_for_test(&self, secs: u64) {
+        let age = |k: &mut Option<CreateKey>| {
+            if let Some(k) = k {
+                k.at = k.at.saturating_sub(secs);
+            }
+        };
+        lock(&self.registrations)
+            .values_mut()
+            .for_each(|r| age(&mut r.create_key));
+        lock(&self.subscriptions)
+            .values_mut()
+            .for_each(|s| age(&mut s.create_key));
     }
 
     /// Record an accuracy report for registration `id` (tests).
@@ -453,6 +629,11 @@ fn body_json(request: &SbiRequest) -> Option<Value> {
         .content
         .as_deref()
         .and_then(|c| serde_json::from_str(c).ok())
+}
+
+/// A fresh `idempotency-key` (a UUID, as §5.2.3.3.12 suggests).
+fn new_key() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn uint(v: Option<&Value>) -> Option<u64> {
@@ -587,6 +768,10 @@ pub fn handle_register(
         Ok(r) => r,
         Err(e) => return send_bad_request(&e, Some("MANDATORY_IE_MISSING")),
     };
+    let key = match idempotency_key(request) {
+        Ok(k) => k,
+        Err(e) => return send_bad_request(&e, Some("INVALID_MSG_FORMAT")),
+    };
     let owner = match owner_binding::owner_for_new_resource_with(
         request,
         "Nnwdaf_MLModelMonitor_Register",
@@ -620,9 +805,37 @@ pub fn handle_register(
         .as_deref()
         .and_then(|c| ctx.ml_prov_accuracy_threshold(crate::model_retrain::MODEL_EVENT, c))
         .unwrap_or(crate::model_retrain::DEFAULT_ACCURACY_THRESHOLD);
-    let id = m.id("reg");
-    let replaced: Vec<String> = {
+    let echo = json!({
+        "consumerId": consumer_id,
+        "modelId": model_id,
+        "modelAccuInd": body.get("modelAccuInd").cloned().unwrap_or(json!(true)),
+        "mLEvent": crate::model_retrain::MODEL_EVENT.as_str(),
+    });
+    let create_key = key.map(|k| CreateKey::new(&owner, k, &body, unix_now()));
+    let (id, replaced) = {
         let mut regs = lock(&m.registrations);
+        // #2048, TS 29.500 §5.2.8: a retransmission of a create already
+        // processed (the 201 was lost) answers the registration it created,
+        // decided under the lock it was inserted under, so a retry while that
+        // registration's Subscribe is still in flight finds it too. Nothing is
+        // replaced, spawned, counted or logged as new.
+        if let Some(retry) = &create_key {
+            if let Some(existing) = regs
+                .iter()
+                .find(|(_, r)| r.create_key.as_ref().is_some_and(|k| k.replayed_by(retry)))
+                .map(|(k, _)| k.clone())
+            {
+                nextgcore_demo::demo_log!(
+                    info,
+                    DEMO_KEY,
+                    "MLModelMonitor Register retransmitted: registrationId={existing} (idempotency-key)"
+                );
+                return created(
+                    format!("/{SERVICE_NAME}/v1/registrations/{existing}"),
+                    &echo,
+                );
+            }
+        }
         let replaced: Vec<String> = regs
             .iter()
             .filter(|(_, r)| {
@@ -636,6 +849,7 @@ pub fn handle_register(
         if regs.len() - replaced.len() >= m.cap {
             return insufficient_resources("MLModelMonitor registrations", m.cap);
         }
+        let id = m.id("reg");
         regs.insert(
             id.clone(),
             Registration {
@@ -646,9 +860,11 @@ pub fn handle_register(
                 last_seen: unix_now(),
                 auditing: false,
                 owner,
+                create_key,
+                subscribe_key: new_key(),
             },
         );
-        replaced
+        (id, replaced)
     };
     for old in replaced {
         m.drop_registration(&old, true);
@@ -672,15 +888,7 @@ pub fn handle_register(
     // §6.2E.2 step 5: "the NWDAF containing MTLF may subscribe to the NWDAF
     // containing AnLF".
     tokio::spawn(subscribe_at_anlf_retrying(m, id.clone()));
-    created(
-        format!("/{SERVICE_NAME}/v1/registrations/{id}"),
-        &json!({
-            "consumerId": consumer_id,
-            "modelId": model_id,
-            "modelAccuInd": body.get("modelAccuInd").cloned().unwrap_or(json!(true)),
-            "mLEvent": crate::model_retrain::MODEL_EVENT.as_str(),
-        }),
-    )
+    created(format!("/{SERVICE_NAME}/v1/registrations/{id}"), &echo)
 }
 
 /// The MLModelMonitorSub the MTLF sends for a registration.
@@ -733,7 +941,16 @@ pub fn endpoint_of(result: &Value, instance: &str) -> Option<(String, u16)> {
 /// §6.2E.2 step 5: find the registering AnLF at the NRF by `consumerId` and
 /// subscribe to its accuracy reports. Records the subscription on success; if
 /// the registration ended meanwhile, unsubscribes again.
-pub async fn subscribe_at_anlf(m: &Monitor, registration_id: &str) -> Result<String, String> {
+///
+/// #2048: every attempt for one registration carries the same
+/// `idempotency-key` (TS 29.500 §5.2.8), `retrans=true` from the second on, so
+/// an AnLF that processed an attempt whose 201 was lost answers that
+/// subscription again instead of creating a second one.
+pub async fn subscribe_at_anlf(
+    m: &Monitor,
+    registration_id: &str,
+    retrans: bool,
+) -> Result<String, String> {
     let reg = m
         .registration(registration_id)
         .ok_or("the registration is gone")?;
@@ -764,8 +981,15 @@ pub async fn subscribe_at_anlf(m: &Monitor, registration_id: &str) -> Result<Str
         .ok_or_else(|| format!("the NRF knows no {SERVICE_NAME} at NWDAF {consumer}"))?;
     let body = subscription_body(m, registration_id, reg.model_id, threshold);
     let c = m.client(&host, port);
+    let post = SbiRequest::post(&format!("/{SERVICE_NAME}/v1/subscriptions"))
+        .with_json_body(&body)
+        .map_err(|e| format!("MLModelMonitorSub does not serialise: {e}"))?
+        .with_header(
+            nextgcore_sbi::constants::custom_header::REQUEST_INFO,
+            request_info(&reg.subscribe_key, retrans),
+        );
     let resp = c
-        .post_json(&format!("/{SERVICE_NAME}/v1/subscriptions"), &body)
+        .send_request(post)
         .await
         .map_err(|e| format!("Nnwdaf_MLModelMonitor_Subscribe to {consumer} failed: {e}"))?;
     if resp.status != 201 {
@@ -810,8 +1034,8 @@ pub async fn subscribe_at_anlf(m: &Monitor, registration_id: &str) -> Result<Str
 /// Subscribe at the AnLF, retrying 2 s doubling to 30 s, at most 6 attempts.
 pub async fn subscribe_at_anlf_retrying(m: &'static Monitor, registration_id: String) {
     let mut backoff = Duration::from_secs(2);
-    for _ in 0..6 {
-        match subscribe_at_anlf(m, &registration_id).await {
+    for attempt in 0..6 {
+        match subscribe_at_anlf(m, &registration_id, attempt > 0).await {
             Ok(_) => return,
             Err(e) if m.registration(&registration_id).is_none() => {
                 nextgcore_demo::demo_log!(info, DEMO_KEY, "{e}; not retrying");
@@ -1102,8 +1326,39 @@ async fn register_locked(
         "modelAccuInd": true,
         "mLEvent": crate::model_retrain::MODEL_EVENT.as_str(),
     });
+    // #2048, TS 29.500 §5.2.8: one `idempotency-key` per Register, reused by
+    // every retry of it (`retrans=true`) until one is answered 201, so an MTLF
+    // that processed a Register whose 201 was lost answers that registration
+    // again instead of replacing it (and its Subscribe at this AnLF).
+    let (key, retrans) = {
+        let mut pending = lock(&m.pending_register);
+        match pending.as_ref() {
+            Some(p)
+                if (p.host.as_str(), p.port, p.model_id) == (mtlf.0.as_str(), mtlf.1, model_id) =>
+            {
+                (p.key.clone(), true)
+            }
+            _ => {
+                let key = new_key();
+                *pending = Some(PendingRegister {
+                    host: mtlf.0.clone(),
+                    port: mtlf.1,
+                    model_id,
+                    key: key.clone(),
+                });
+                (key, false)
+            }
+        }
+    };
+    let post = SbiRequest::post(&format!("/{SERVICE_NAME}/v1/registrations"))
+        .with_json_body(&body)
+        .map_err(|e| format!("MLModelMonitorReg does not serialise: {e}"))?
+        .with_header(
+            nextgcore_sbi::constants::custom_header::REQUEST_INFO,
+            request_info(&key, retrans),
+        );
     let resp = c
-        .post_json(&format!("/{SERVICE_NAME}/v1/registrations"), &body)
+        .send_request(post)
         .await
         .map_err(|e| format!("Nnwdaf_MLModelMonitor_Register failed: {e}"))?;
     if resp.status != 201 {
@@ -1117,6 +1372,7 @@ async fn register_locked(
         .get_header("Location")
         .and_then(|l| l.rsplit('/').next().map(String::from))
         .ok_or("the 201 carries no Location")?;
+    *lock(&m.pending_register) = None;
     let held = HeldRegistration {
         id: id.clone(),
         model_id,
@@ -1271,6 +1527,7 @@ pub fn parse_subscription(body: &Value) -> Result<MonitorSub, String> {
         period_secs,
         last_report: None,
         owner: None,
+        create_key: None,
     })
 }
 
@@ -1317,6 +1574,10 @@ pub fn handle_subscribe(
                 Ok(s) => s,
                 Err(bad) => return *bad,
             };
+            let key = match idempotency_key(request) {
+                Ok(k) => k,
+                Err(e) => return send_bad_request(&e, Some("INVALID_MSG_FORMAT")),
+            };
             let owner = match owner_binding::owner_for_new_resource_with(
                 request,
                 "Nnwdaf_MLModelMonitor_Subscribe",
@@ -1325,8 +1586,36 @@ pub fn handle_subscribe(
                 Ok(owner) => owner,
                 Err(refused) => return *refused,
             };
-            let sub = MonitorSub { owner, ..sub };
+            // `parse` succeeded, so the body is JSON.
+            let body = body_json(request).unwrap_or_default();
+            let create_key = key.map(|k| CreateKey::new(&owner, k, &body, unix_now()));
+            let sub = MonitorSub {
+                owner,
+                create_key,
+                ..sub
+            };
             let mut subs = lock(&m.subscriptions);
+            // #2048, TS 29.500 §5.2.8: a retransmission of a create already
+            // processed (its 201 was lost) answers that subscription as it is
+            // now, 201 with the same Location; decided under the lock it was
+            // inserted under, before the cap, so it is never refused for room
+            // it already holds.
+            if let Some(retry) = &sub.create_key {
+                if let Some((existing, held)) = subs
+                    .iter()
+                    .find(|(_, s)| s.create_key.as_ref().is_some_and(|k| k.replayed_by(retry)))
+                {
+                    nextgcore_demo::demo_log!(
+                        info,
+                        DEMO_KEY,
+                        "MLModelMonitor Subscribe retransmitted: subscription {existing} (idempotency-key)"
+                    );
+                    return created(
+                        format!("/{SERVICE_NAME}/v1/subscriptions/{existing}"),
+                        &sub_json(existing, held),
+                    );
+                }
+            }
             if subs.len() >= m.cap {
                 return insufficient_resources("MLModelMonitor subscriptions", m.cap);
             }
@@ -1359,10 +1648,13 @@ pub fn handle_subscribe(
                 Ok(s) => s,
                 Err(bad) => return *bad,
             };
-            // An update keeps the reporting phase and the owner.
+            // An update keeps the reporting phase, the owner and the create's
+            // duplicate-detection record (#2048: a late retransmission of the
+            // create answers the resource as it is now).
             let sub = MonitorSub {
                 last_report: old.last_report,
                 owner: old.owner.clone(),
+                create_key: old.create_key.clone(),
                 ..sub
             };
             let echo = sub_json(id, &sub);
