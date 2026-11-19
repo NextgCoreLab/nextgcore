@@ -940,11 +940,17 @@ impl NgapServer {
 async fn takeover_pcf(pinned: Option<(String, u16)>) -> (String, u16) {
     match pinned {
         Some(pcf) => pcf,
-        None => crate::sbi_path::resolve_nf_endpoint_async(
-            crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
-        )
-        .await
-        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777)),
+        None => {
+            // #1974 (from #1973's review): this resolves the PCF too, so it is held to
+            // `SMF_ENV_LOCK` like the other PCF resolution sites (#1933).
+            #[cfg(test)]
+            crate::test_support::assert_pcf_env_lock_held();
+            crate::sbi_path::resolve_nf_endpoint_async(
+                crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+            )
+            .await
+            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777))
+        }
     }
 }
 

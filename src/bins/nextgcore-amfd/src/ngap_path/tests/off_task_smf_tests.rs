@@ -906,6 +906,8 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // #1933: the Registration Accept resolves the PCF for the UE policy create.
     let _pcf = crate::test_support::SMF_ENV_LOCK.lock().await;
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     // Paging reads the strategy (#1588).
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
@@ -1934,6 +1936,8 @@ async fn a_modify_indication_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
 /// re-activation failed (TS 24.501 §8.2.7.15).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registration_update_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_031u64, 61u32);
     registered_ue_with_guti(&mut server, ue, ran);
@@ -2035,6 +2039,8 @@ async fn n2_sm_relays_to_a_blackholed_smf_do_not_hold_the_ngap_task() {
 /// Accept goes out in a setup request on the released connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registration_update_released_during_its_join_sends_no_accept() {
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_051u64, 81u32);
@@ -2139,6 +2145,8 @@ async fn a_path_switch_whose_ue_goes_idle_during_its_join_is_failed() {
 /// progressed (a new join, the old one gone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeated_registration_request_during_the_join_follows_5_5_1_3_8_e() {
+    // #1974: this test resolves the AUSF (process-global endpoint).
+    let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_071u64, 91u32);
     registered_ue_with_guti(&mut server, ue, ran);

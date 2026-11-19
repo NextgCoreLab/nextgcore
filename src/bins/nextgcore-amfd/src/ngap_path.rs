@@ -2330,8 +2330,10 @@ impl NgapServer {
     }
 
     /// The timers of this server's own UEs, run first on every [`Self::poll`]. Unlike
-    /// the rest of `poll`, nothing here drains a process-global queue, so a unit test
-    /// can drive it without taking work other tests own (#1120 review).
+    /// the rest of `poll`, nothing here drains a process-global queue (#1120 review).
+    /// But the NAS and reachability timers sweep the process-global UE store (#341),
+    /// so a unit test that drives this takes `context::REACHABILITY_SWEEP_TEST_LOCK`
+    /// (#1974).
     async fn process_local_timers(&mut self) -> Result<()> {
         // Check GMM procedure timers (T3550/T3555/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
@@ -14858,6 +14860,9 @@ impl NgapServer {
     /// Driven from the same poll as the retransmission timers, so there is one clock in
     /// this path rather than two that can disagree.
     async fn process_reachability_timers(&mut self) -> Result<()> {
+        // #1974: the sweep walks the whole process-global UE store.
+        #[cfg(test)]
+        crate::context::assert_ue_store_sweep_lock_held();
         let now = Instant::now();
         let due: Vec<u64> = self
             .ue_auth_state
@@ -15000,6 +15005,9 @@ impl NgapServer {
     /// then apply the per-timer abnormal action (TS 24.501 Sections 5.4.1.3.7,
     /// 5.4.3.7, 5.5.1.2.8, 5.5.2.3.6)
     async fn process_nas_timers(&mut self) -> Result<()> {
+        // #1974: the sweep walks the whole process-global UE store.
+        #[cfg(test)]
+        crate::context::assert_ue_store_sweep_lock_held();
         let now = Instant::now();
         let due: Vec<u64> = self
             .ue_auth_state
@@ -15050,13 +15058,20 @@ impl NgapServer {
             );
             let association_id = state.association_id;
             let ran_ue_ngap_id = state.ran_ue_ngap_id;
-            match retx.timer {
+            let timer = retx.timer;
+            // #1974: one UE's abnormal action failing (typically the UE Context
+            // Release Command to an association that is gone, after `release_ue` has
+            // already forgotten the UE) is that UE's failure, logged here. It used to
+            // be `?`-propagated, which ended the sweep there: every later due UE in this
+            // pass was skipped, and `poll` skipped the rest of its local timers too.
+            let outcome: Result<()> = match timer {
                 NasProcTimer::T3550 => {
                     // Abort; the network considers the new GUTI valid
                     // (TS 24.501 Section 5.5.1.2.8 case c)
                     state.registered = true;
                     state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    Ok(())
                 }
                 NasProcTimer::T3560 => {
                     // Abort authentication/SMC and release the N1 connection.
@@ -15069,7 +15084,7 @@ impl NgapServer {
                     // is added beside it.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                     self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                        .await?;
+                        .await
                 }
                 NasProcTimer::T3570 => {
                     if state.pei_requested {
@@ -15077,13 +15092,13 @@ impl NgapServer {
                         state.pei_requested = false;
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
                         self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
-                            .await?;
+                            .await
                     } else {
                         // SUCI identification aborted: release. `release_ue` -> `forget_ue`
                         // owns the removal; see the T3560 arm.
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
                         self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                            .await?;
+                            .await
                     }
                 }
                 NasProcTimer::T3555 => {
@@ -15122,6 +15137,7 @@ impl NgapServer {
                         state.amf_ue.next_guti.tmsi
                     );
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    Ok(())
                 }
                 NasProcTimer::T3522 => {
                     // Implicit deregistration (TS 24.501 Section 5.5.2.3.6).
@@ -15137,8 +15153,11 @@ impl NgapServer {
                     // are terminated too. Before `release_ue`, which drops the ids.
                     self.terminate_policy_associations(amf_ue_ngap_id);
                     self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
-                        .await?;
+                        .await
                 }
+            };
+            if let Err(e) = outcome {
+                log::warn!("{timer:?} abort for UE {amf_ue_ngap_id} did not complete: {e}");
             }
         }
         Ok(())
@@ -30806,6 +30825,8 @@ mod tests {
     /// neither.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_t3522_exhaustion_terminates_the_policy_associations() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
         set_pcf_env(port);
@@ -31517,6 +31538,8 @@ mod tests {
     /// Command is retransmitted on the reset association.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ng_reset_aborts_the_kept_ues_procedures() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
@@ -31607,6 +31630,8 @@ mod tests {
     /// T3522 UE is kept; without `terminate_policy_associations` no PCF DELETE comes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_aborts_the_ues_nas_procedure() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
         // #1588: this test reads the paging strategy.
@@ -39425,8 +39450,8 @@ mod tests {
             .remove(id);
     }
 
-    /// #1832: a subscription for `events` about `supi` (or any UE when `None`),
-    /// with `options`. Returns the sink, its receiver, the response and its id.
+    /// #1832: a subscription for `events` about `supi` (or any UE when `None`, or
+    /// the group `<id>` when `supi` is `group:<id>`), with `options`. Returns the sink, its receiver, the response and its id.
     async fn subscription_1832(
         supi: Option<&str>,
         tag: &str,
@@ -39463,7 +39488,11 @@ mod tests {
             "options": options,
         });
         match supi {
-            Some(s) => subscription["supi"] = serde_json::json!(s),
+            // #1974: `group:<id>` targets a group, which no fire point matches.
+            Some(s) => match s.strip_prefix("group:") {
+                Some(group) => subscription["groupId"] = serde_json::json!(group),
+                None => subscription["supi"] = serde_json::json!(s),
+            },
             None => subscription["anyUE"] = serde_json::json!(true),
         }
         let resp = crate::namf_server::namf_request_handler(
@@ -39719,12 +39748,21 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with an arbitrary count evicted at the bound, the new UE's
     /// claim is granted ("a new UE at the bound is refused").
+    ///
+    /// #1974: a GROUP subscription, not an any-UE one. The count map's bound is the
+    /// same for both (each is a multi-UE subscription, so neither ends at one UE's
+    /// maximum), but an any-UE subscription is matched by EVERY sibling test's
+    /// location fire, and one such fire landing while this test fills the map took
+    /// the last slot ("left: Refused" at `imsi-b{MAX-1}`). The fire points run in
+    /// hundreds of tests that do not take `CONTEXT_GUARD`, so no lock can keep them
+    /// out; `event_subscriptions_matching_ue` matches no group subscription, so no
+    /// sibling's fire can reach this one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn max_reports_counts_are_not_evicted_1832() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let (sink, _rx, resp, sub_id) = subscription_1832(
-            None,
+            Some("group:1832-bound-group"),
             "1832-bound",
             serde_json::json!([{ "type": "LOCATION_REPORT" }]),
             serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 1 }),
@@ -43459,6 +43497,8 @@ mod tests {
     /// either_guti` pins the other half — that the retained identity then resolves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn t3555_retransmits_then_aborts_keeping_the_current_guti() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_200_011u64;
@@ -43520,6 +43560,57 @@ mod tests {
         );
     }
 
+    /// #1974: one UE's abnormal action failing does not end the NAS-timer sweep. UE A's
+    /// T3560 is exhausted and its release goes to an association this AMF does not
+    /// have ("Association not found"); UE B, later in the same pass, still has its
+    /// expired T3555 retransmitted, and the pass reports success.
+    ///
+    /// REVERT-VERIFIED: with the abort's error `?`-propagated again, the pass ends at
+    /// A and B is never reached ("a later due UE is still swept").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_abort_does_not_end_the_nas_timer_sweep_1974() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // The sweep takes due UEs in id order, so A comes first.
+        let (a, b) = (7_197_401u64, 7_197_402u64);
+        let (max_count, _) = NasProcTimer::T3560.config(&ngap.timer_configs);
+        let mut ue_a = UeNasContext::new(a, 74, 19_740_001, false);
+        ue_a.amf_ue.supi = Some("imsi-001010001974001".to_string());
+        ngap.ue_auth_state.insert(a, ue_a);
+        ngap.arm_retx(a, NasProcTimer::T3560, vec![0x00, 0x04]);
+        ngap.ue_auth_state
+            .insert(b, UeNasContext::new(b, 75, 19_740_001, false));
+        ngap.arm_retx(b, NasProcTimer::T3555, vec![0x00, 0x2E]);
+        for (id, retries) in [(a, max_count), (b, 0)] {
+            ngap.ue_auth_state.with_mut(id, |state| {
+                let retx = state.retx.as_mut().expect("armed");
+                retx.retries = retries;
+                retx.deadline = Instant::now() - Duration::from_secs(1);
+            });
+        }
+
+        let pass = ngap.process_nas_timers().await;
+
+        assert!(
+            !ngap.ue_auth_state.contains(a),
+            "precondition: A's exhausted T3560 was aborted (release_ue forgot it)"
+        );
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(b)
+                .and_then(|s| s.retx)
+                .map(|r| r.retries),
+            Some(1),
+            "a later due UE is still swept after an earlier UE's abort failed"
+        );
+        assert!(
+            pass.is_ok(),
+            "one UE's failure is not the sweep's: {pass:?}"
+        );
+        ngap.forget_ue(b);
+    }
+
     /// Criterion 8: an EMERGENCY registration reaches the emergency handler from the live
     /// NAS path (TS 24.501 §5.5.1.2, TS 23.167), **and #361: with no AUSF reachable it now
     /// CONTINUES as an unauthenticated emergency registration rather than being refused.**
@@ -43555,6 +43646,8 @@ mod tests {
         // order against the emergency module's own tests. The guard also resets the posture to
         // the shipped default (permitted), which is what this test needs.
         let _policy = crate::emergency::emergency_policy_test_guard().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_200_012u64;
         ngap.emergency
@@ -43687,6 +43780,8 @@ mod tests {
     ) {
         crate::context::amf_context_init(64, 1024, 4096);
         let _policy = crate::emergency::emergency_policy_test_guard().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         let mut ngap = test_ngap_server().await;
         // A distinct literal id from every sibling test: the emergency contexts and the NAS
         // store are process-global and keyed on it, so a shared id would have one test's
@@ -44076,6 +44171,8 @@ mod tests {
     /// sites, where the state was re-inserted before the send and so used to linger.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ausf_failure_whose_reject_cannot_be_sent_still_releases_the_ue() {
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_359_001u64;
@@ -44675,6 +44772,8 @@ mod tests {
         // beside it in `congestion.rs`, not a private one here that could not order
         // against the congestion module's own tests.
         let _guard = crate::congestion::congestion_test_guard().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         let previous = crate::congestion::set_forced(true);
         assert!(
             ngap.nas_congestion_backoff().is_some(),
@@ -44933,6 +45032,8 @@ mod tests {
         // The AMF context and `served_guami` are process-global, so this serialises
         // with every other test that writes them, on the EXISTING guard.
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
 
@@ -46483,6 +46584,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_ausf_after_a_transfer_hands_the_context_back_1731() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -46750,6 +46853,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn after_an_aborted_reallocation_the_ue_may_present_either_guti() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
 
@@ -47791,6 +47896,8 @@ mod tests {
     /// UE keeps its entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         // #1588: this test reads the paging strategy.
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);

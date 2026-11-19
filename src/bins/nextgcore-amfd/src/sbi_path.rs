@@ -862,6 +862,11 @@ pub fn amf_sbi_send_request(_nf_instance_id: &str, _xact: &SbiXact) -> SbiResult
 
 /// Discover NF endpoint for the given service type using SbiContext cache + env var fallback
 fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // #1974: the AUSF endpoint is process-global; see `test_support::AUSF_ENV_LOCK`.
+    #[cfg(test)]
+    if matches!(service_type, SbiServiceType::NausfAuth) {
+        crate::test_support::assert_ausf_env_lock_held();
+    }
     // Map AMF SbiServiceType to nextgcore_sbi SbiServiceType and env var names
     let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
@@ -2398,6 +2403,11 @@ pub async fn call_ausf_5g_aka_confirm(
 /// Unlike `resolve_nf_endpoint`, this is safe to call from async context
 /// (no `Handle::block_on`).
 pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // #1974: the AUSF endpoint is process-global; see `test_support::AUSF_ENV_LOCK`.
+    #[cfg(test)]
+    if matches!(service_type, SbiServiceType::NausfAuth) {
+        crate::test_support::assert_ausf_env_lock_held();
+    }
     let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
             nextgcore_sbi::types::SbiServiceType::NausfAuth,
