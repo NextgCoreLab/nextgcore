@@ -30,8 +30,7 @@ data:
     nrf:
       serving:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
       sbi:
         server:
           - address: 0.0.0.0
@@ -83,20 +82,17 @@ data:
             port: {{ .Values.amf.service.ngapPort }}
       guami:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
           amf_id:
             region: {{ .Values.amf.config.amfId.region }}
             set: {{ .Values.amf.config.amfId.set }}
       tai:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
           tac: {{ .Values.amf.config.tai.tac }}
       plmn_support:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
           s_nssai:
             {{- toYaml .Values.amf.config.nssai | nindent 12 }}
       security:

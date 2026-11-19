@@ -74,6 +74,11 @@ global:
     peer: 64
   # Shared by amf/nrf guami, tai and plmn_support, and by the subscribers the
   # mongodb-init Job seeds. Changing the PLMN here must match the simulator's.
+  # #2069: both are STRINGS, quoted ("001", "070"), and on the command line
+  # --set-string: a number has lost its leading zeros (an unquoted 070 is even
+  # octal 56), so the chart refuses it rather than guess. An MCC is 3 digits,
+  # an MNC 2 or 3 (TS 23.003 §2.2); MNC 70 and 070 are different PLMNs.
+  # subscriber.imsi must start with them.
   plmn:
     mcc: "999"
     mnc: "70"
@@ -132,6 +137,7 @@ mongodb:
         memory: 64Mi
 
 # Subscriber seeded by the mongodb-init Job. Must match the UE's USIM config.
+# imsi is a quoted string (--set-string) of global.plmn (#2069).
 subscriber:
   imsi: "999700000000001"
   key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
