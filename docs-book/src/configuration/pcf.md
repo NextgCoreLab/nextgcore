@@ -72,7 +72,7 @@ The daemon deserializes only the fields above; unknown YAML keys are silently ig
 - **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). No file output is wired (the `-l/--log-file` flag is accepted but unused).
 - **`global.max.ue` / `global.max.peer` are inert.** Context capacities come from the CLI flags `--max-ue` (1024) and `--max-sess` (4096).
 - **No `pcf.metrics.server[]`** (removed from the shipped config, #1312): the daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- **`pcf.tls.*` is inert.** No code reads this section. Even the CLI `--tls`/`--tls-cert`/`--tls-key` flags only flow into the legacy `SbiServerConfig` (`sbi_path.rs`), where they flip the *advertised* URI scheme to `https` in the legacy NF-instance builder; the live HTTP/2 listener is created from `NextgcoreSbiServerConfig::new(addr)` without any TLS wiring and serves cleartext h2c.
+- **`pcf.tls.*` is inert.** No code reads this section. The CLI `--tls`/`--tls-cert`/`--tls-key` flags serve the live listener over TLS under the `dev` SBI profile (#1795). Under `production` (the default) it serves mutually-authenticated TLS and requires an access token whatever they say, and the advertised scheme says `https` either way.
 
 ## Command-line flags
 

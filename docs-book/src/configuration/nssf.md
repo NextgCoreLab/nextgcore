@@ -98,7 +98,7 @@ From the clap `Args` struct in `src/bins/nextgcore-nssfd/src/main.rs`:
 | `--sbi-addr` | string | `nssf.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI bind address; beats the YAML (#1312). |
 | `--sbi-advertise` | string | unset | The SBI host advertised to the NRF and in callback URIs (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `nssf.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `nssf.sbi.server[0].port`, else `7777` | SBI port; beats the YAML (#1312). |
-| `--tls` | flag | off | Recorded in the legacy `SbiServerConfig` (`sbi_path.rs`) only; the actual HTTP/2 listener in `main.rs` is built without TLS, so the SBI server always speaks cleartext HTTP/2. |
+| `--tls` | flag | off | Serves the listener over TLS from `--tls-cert`/`--tls-key` (default `/etc/nextgcore/tls/server.{crt,key}`) under the `dev` SBI profile (#1795). Under `production` (the default) the listener serves mutually-authenticated TLS and requires an access token whatever this flag says, and the NSSAI-availability caller binding follows that token requirement. |
 | `--tls-cert` | path | unset | Same caveat as `--tls`. |
 | `--tls-key` | path | unset | Same caveat as `--tls`. |
 | `--max-nf` | usize | `512` | Maximum NSI entries and home contexts in the context pools; also the denominator of the NRF `/load` gauge. |

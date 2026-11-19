@@ -234,6 +234,28 @@ fn apply_oauth2_enforcement(
     cfg
 }
 
+/// #1795: the MB-SMF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with MB-SMF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Mbsmf,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -285,7 +307,8 @@ async fn main() -> Result<()> {
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
-    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr)
+        .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
     if args.tls {
         let cert = args
             .tls_cert
@@ -302,8 +325,9 @@ async fn main() -> Result<()> {
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         Some(&args.nrf_uri),
     ));
@@ -313,9 +337,30 @@ async fn main() -> Result<()> {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
+    // #1795: the listener follows the SBI security profile.
+
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &args.nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
+    // #1796: the AMF's ContextStatusNotify comes back to the advertised address.
+    if let Ok(context) = mbsmf_self().read() {
+        context.set_amf_notify_base(format!(
+            "{}://{}",
+            sbi_scheme,
+            nextgcore_sbi::uri_encode::uri_authority(
+                sbi.advertise.as_deref().unwrap_or("127.0.0.1"),
+                sbi_port
+            )
+        ));
+    }
 
     log::info!("Starting MB-SMF SBI server on {addr}");
 
@@ -468,6 +513,12 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "PATCH" => handle_mbs_session_update(session_id, &request).await,
             "DELETE" => handle_mbs_session_release(session_id).await,
             _ => send_method_not_allowed(method, "mbs-sessions/{id}"),
+        },
+        // #1796: the AMF's Namf_MBSBroadcast ContextStatusNotify to the notifyUri
+        // this MB-SMF minted for a ContextCreate.
+        ["nmbsmf-mbssession", "v1", "amf-context-status", token] => match method {
+            "POST" => handle_amf_context_status_notify(token, &request).await,
+            _ => send_method_not_allowed(method, "amf-context-status/{token}"),
         },
         // Nmbsmf_TMGI service (TS 29.532 §5.2, TS29532_Nmbsmf_TMGI.yaml). [mbsmfd-04]
         ["nmbsmf-tmgi", "v1", "tmgi"] => match method {
@@ -679,33 +730,50 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
             // #1758: the create and its record run on their own task, so a consumer
             // that disconnects mid-ContextCreate cannot leave an AMF context no
             // release will ever delete; see [`create_amf_mbs_context`].
-            match namf_client::discover_amf().await {
-                Some(amf) => match spawn_detached(create_amf_mbs_context(
-                    session.id,
-                    session.tmgi.clone(),
-                    amf.clone(),
-                ))
-                .await
-                .ok()
-                .flatten()
-                {
-                    Some(context_ref) => log::info!(
-                        "MBS session {session_id}: AMF {}:{} created MBS context {context_ref}",
-                        amf.host,
-                        amf.port
-                    ),
+            // #1796: see [`amf_leg_for`].
+            let amf_leg = amf_leg_for(
+                session_type,
+                req.mbs_session.mbs_service_area.clone(),
+                body,
+                &session,
+            );
+            if amf_leg.is_none() && session_type == MbsSessionType::Broadcast {
+                log::warn!(
+                    "MBS session {session_id}: a broadcast session without an mbsServiceArea \
+                     has no NG-RAN to set up; no AMF ContextCreate"
+                );
+            }
+            match amf_leg {
+                None => {}
+                Some(leg) => match namf_client::discover_amf().await {
+                    Some(amf) => match spawn_detached(create_amf_mbs_context(
+                        session.id,
+                        session.tmgi.clone(),
+                        amf.clone(),
+                        leg,
+                    ))
+                    .await
+                    .ok()
+                    .flatten()
+                    {
+                        Some(context_ref) => log::info!(
+                            "MBS session {session_id}: AMF {}:{} created MBS context {context_ref}",
+                            amf.host,
+                            amf.port
+                        ),
+                        None => log::warn!(
+                            "MBS session {session_id}: AMF {}:{} did not create an MBS context; \
+                             the RAN does not have this session",
+                            amf.host,
+                            amf.port
+                        ),
+                    },
                     None => log::warn!(
-                        "MBS session {session_id}: AMF {}:{} did not create an MBS context; \
-                         the RAN does not have this session",
-                        amf.host,
-                        amf.port
+                        "MBS session {session_id}: no serving AMF discovered (NRF unconfigured, \
+                         unreachable, or no AMF advertises namf-mbs-bc); the RAN does not have \
+                         this session"
                     ),
                 },
-                None => log::warn!(
-                    "MBS session {session_id}: no serving AMF discovered (NRF unconfigured, \
-                     unreachable, or no AMF advertises namf-mbs-bc); the RAN does not have \
-                     this session"
-                ),
             }
 
             // mbsmfd-06: respond with CreateRspData{ mbsSession }.
@@ -935,28 +1003,92 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
     }
 }
 
+/// #1796: what the AMF is given for a newly created session, or `None` when no
+/// AMF broadcast MBS context is to be created. Only a BROADCAST session has one
+/// (Namf_MBSBroadcast is TS 23.247 §7.3's procedure; a multicast session reaches
+/// the RAN through the SMF and Namf_MBSCommunication, §7.2), and only with an MBS
+/// service area: without it the AMF has no NG-RAN to set up.
+fn amf_leg_for(
+    session_type: MbsSessionType,
+    mbs_service_area: Option<serde_json::Value>,
+    body: &str,
+    session: &MbsSession,
+) -> Option<namf_client::AmfLeg> {
+    match (session_type, mbs_service_area) {
+        (MbsSessionType::Broadcast, Some(area)) => Some(namf_client::AmfLeg {
+            mbs_service_area: area,
+            snssai: requested_snssai(body),
+            qfi: session.qfi,
+            five_qi: session.fiveqi,
+        }),
+        _ => None,
+    }
+}
+
+/// #1796: the S-NSSAI of the MBS session the consumer created
+/// (`mbsSession.snssai`, TS 29.571 `MbsSession`), which ContextCreate must carry
+/// (TS 29.518 Table 6.5.6.2.2-1). A create that named none gets SST 1 (eMBB,
+/// TS 23.501 §5.15.2.2), the standardized slice an MBS session defaults to here.
+fn requested_snssai(body: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("mbsSession")?.get("snssai").cloned())
+        .filter(|s| {
+            s.get("sst")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|v| v <= 255)
+        })
+        .unwrap_or_else(|| serde_json::json!({ "sst": 1 }))
+}
+
 /// #1758: Namf_MBSBroadcast ContextCreate on `amf` for session `session_id`, and
 /// its record, so the session's release can delete it. When the session was
 /// released while the create was in flight (the release found nothing to delete),
 /// the new context is deleted here instead, so the AMF never keeps one this MB-SMF
 /// does not record.
+///
+/// #1796: the request carries a `notifyUri` ending in a token minted here, so the
+/// AMF's ContextStatusNotify for this context is admitted; a create that did not
+/// produce a context forgets it.
 async fn create_amf_mbs_context(
     session_id: u64,
     tmgi: Tmgi,
     amf: namf_client::DiscoveredAmf,
+    leg: namf_client::AmfLeg,
 ) -> Option<namf_client::MbsContextRef> {
+    let (base, token) = {
+        let ctx = mbsmf_self();
+        let guard = ctx.read().ok()?;
+        let Some(base) = guard.amf_notify_base() else {
+            log::warn!(
+                "MBS session {session_id}: no notifyUri base configured; no AMF ContextCreate"
+            );
+            return None;
+        };
+        (base, guard.mint_amf_notify_token(session_id)?)
+    };
+    let forget = |token: &str| {
+        if let Ok(c) = mbsmf_self().read() {
+            c.forget_amf_notify_token(token);
+        }
+    };
     // #1854: the create and its record run in the (AMF, TMGI) lane, so a delete of
     // the context a released session held on the same TMGI is either done before
     // this create (which then gets a fresh context) or sees this record and is
     // dropped. The AMF's ContextCreate is idempotent on the TMGI, so without the
     // lane this create could be handed a context an in-flight delete then removes.
     let lane = lane::enter(&amf.host, amf.port, Some(&tmgi)).await;
-    let context_ref = namf_client::context_create(&amf, &tmgi).await?;
+    let Some(context_ref) = namf_client::context_create(&amf, &tmgi, &leg, &base, &token).await
+    else {
+        forget(&token);
+        return None;
+    };
     let record = AmfMbsContext {
         host: amf.host,
         port: amf.port,
         nf_instance_id: amf.nf_instance_id,
         context_ref: context_ref.clone(),
+        notify_token: token,
         tmgi: Some(tmgi),
     };
     let recorded = mbsmf_self()
@@ -1007,14 +1139,17 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
     for c in contexts {
         match delete_in_lane(&c).await {
             None => {}
-            Some(namf_client::ContextDeleteOutcome::Deleted)
-            | Some(namf_client::ContextDeleteOutcome::Gone) => {
+            Some(
+                outcome @ (namf_client::ContextDeleteOutcome::Deleted
+                | namf_client::ContextDeleteOutcome::Gone),
+            ) => {
                 log::info!(
                     "MBS: AMF {}:{} released MBS context {}",
                     c.host,
                     c.port,
                     c.context_ref
                 );
+                retire_amf_notify_token(&c, outcome);
             }
             Some(namf_client::ContextDeleteOutcome::Failed) => failed.push(c),
         }
@@ -1057,8 +1192,10 @@ fn release_retries(mut failed: Vec<AmfMbsContext>) {
             for c in failed {
                 // R24, #1854: in its lane, and not when a session reusing the TMGI
                 // got this same context back.
-                if delete_in_lane(&c).await == Some(namf_client::ContextDeleteOutcome::Failed) {
-                    still.push(c);
+                match delete_in_lane(&c).await {
+                    None => {}
+                    Some(namf_client::ContextDeleteOutcome::Failed) => still.push(c),
+                    Some(outcome) => retire_amf_notify_token(&c, outcome),
                 }
             }
             failed = still;
@@ -1075,10 +1212,112 @@ fn release_retries(mut failed: Vec<AmfMbsContext>) {
                 c.context_ref,
                 AMF_RELEASE_RETRY_DELAYS.len()
             );
+            forget_amf_notify_token(c);
         }
         // #1817: not dropped. The reconciler keeps retrying until the AMF answers.
         reconcile::park(failed);
     });
+}
+
+/// #1796 (R29): how long a released AMF context's notify token is still admitted
+/// after the AMF's 204. The AMF reports a Release Response Transfer that arrives
+/// after its ContextDelete answered, and the NG-RANs it could not reach, until its
+/// own release timeout (amfd `RELEASE_RESPONSE_TIMEOUT`, 10 s) -- so this outlasts it.
+#[cfg(not(test))]
+const AMF_NOTIFY_GRACE: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const AMF_NOTIFY_GRACE: Duration = Duration::from_millis(200);
+
+/// #1796: retire the notify token of a context the AMF released. On a 204 the
+/// AMF may still notify the release's late NG-RAN answers, so the token stays
+/// admitted for [`AMF_NOTIFY_GRACE`]; on a 404 the AMF holds nothing and it goes now.
+fn retire_amf_notify_token(c: &AmfMbsContext, outcome: namf_client::ContextDeleteOutcome) {
+    if outcome != namf_client::ContextDeleteOutcome::Deleted {
+        forget_amf_notify_token(c);
+        return;
+    }
+    let c = c.clone();
+    // Detached: the forget must outlive the release that scheduled it.
+    drop(spawn_detached(async move {
+        tokio::time::sleep(AMF_NOTIFY_GRACE).await;
+        forget_amf_notify_token(&c);
+    }));
+}
+
+/// #1796: the AMF context `c` is released (or given up on): its
+/// ContextStatusNotify token is no longer admitted.
+fn forget_amf_notify_token(c: &AmfMbsContext) {
+    if let Ok(ctx) = mbsmf_self().read() {
+        ctx.forget_amf_notify_token(&c.notify_token);
+    }
+}
+
+/// `POST {AMF_NOTIFY_PREFIX}/{token}` — the AMF's Namf_MBSBroadcast
+/// ContextStatusNotify (TS 29.518 §5.6.2.5), #1796. The token must be one this
+/// MB-SMF minted for a ContextCreate and has not forgotten (404 otherwise, which
+/// the AMF treats as gone). `mbsSessionId` is required. A `releasedInd` means the
+/// AMF released the context itself, so its record is dropped and the session's
+/// release will not delete it again. Answered 204: these notifications carry no
+/// Broadcast Session Transport Request Transfer, the only content that needs a
+/// 200 with a response (step 2a).
+async fn handle_amf_context_status_notify(token: &str, request: &SbiRequest) -> SbiResponse {
+    let ctx = mbsmf_self();
+    let Some(session_id) = ctx.read().ok().and_then(|c| c.amf_notify_session(token)) else {
+        return send_not_found("No such AMF MBS context notification resource", None);
+    };
+    let Some(body) = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    else {
+        return send_bad_request(
+            "ContextStatusNotification is not JSON",
+            Some("INVALID_MSG_FORMAT"),
+        );
+    };
+    if body.get("mbsSessionId").is_none() {
+        return send_bad_request(
+            "ContextStatusNotification.mbsSessionId is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    }
+    let containers = body
+        .get("n2MbsSmInfoList")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    log::info!(
+        "MBS session {session_id}: AMF ContextStatusNotify with {containers} N2 container(s), \
+         operationStatus {:?}, operationEvents {}",
+        body.get("operationStatus")
+            .and_then(serde_json::Value::as_str),
+        body.get("operationEvents")
+            .map_or(0, |e| e.as_array().map_or(0, Vec::len)),
+    );
+    if body.get("releasedInd").and_then(serde_json::Value::as_bool) == Some(true) {
+        let dropped = ctx.read().is_ok_and(|c| c.drop_amf_context_by_token(token));
+        log::warn!(
+            "MBS session {session_id}: the AMF released its broadcast MBS context \
+             (record dropped: {dropped}); the RAN no longer has this session"
+        );
+    }
+    SbiResponse::with_status(204)
+}
+
+/// #1796: the AMF sends its ContextStatusNotify to the `notifyUri` this MB-SMF
+/// minted, without an access token (as amfd sends every notification), so the
+/// OAuth2 gate admits that route only on a token this MB-SMF holds -- the same
+/// callback-token scheme as #1518.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    vec![nextgcore_sbi::server::OAuth2CallbackExemption::new(
+        "POST",
+        format!("{}/{{token}}", namf_client::AMF_NOTIFY_PREFIX),
+        |cb| {
+            mbsmf_self()
+                .read()
+                .is_ok_and(|c| c.amf_notify_session(cb.token).is_some())
+        },
+    )]
 }
 
 /// Handle MBS Session Release (TS 23.247 7.2.3)
@@ -2650,6 +2889,44 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
+    /// #1796: only a broadcast session with an MBS service area gets an AMF
+    /// ContextCreate, carrying the consumer's S-NSSAI (SST 1 when it named none)
+    /// and the session's QoS flow.
+    ///
+    /// REVERT-VERIFIED: with the session type not checked, the multicast session
+    /// gets an AMF leg.
+    #[test]
+    fn only_a_broadcast_session_with_an_area_gets_an_amf_context_1796() {
+        let tmgi = Tmgi::default();
+        let session = MbsSession::new(1, tmgi, MbsSessionType::Broadcast);
+        let area = serde_json::json!({ "taiList": [ { "plmnId": { "mcc": "001", "mnc": "01" },
+                                                       "tac": "000001" } ] });
+        let body = r#"{"mbsSession":{"serviceType":"BROADCAST","snssai":{"sst":2,"sd":"0000aa"}}}"#;
+        assert!(
+            amf_leg_for(
+                MbsSessionType::Multicast,
+                Some(area.clone()),
+                body,
+                &session
+            )
+            .is_none(),
+            "a multicast session has no AMF broadcast context"
+        );
+        assert!(amf_leg_for(MbsSessionType::Broadcast, None, body, &session).is_none());
+        let leg = amf_leg_for(
+            MbsSessionType::Broadcast,
+            Some(area.clone()),
+            body,
+            &session,
+        )
+        .expect("a broadcast session with an area");
+        assert_eq!(leg.mbs_service_area, area);
+        assert_eq!(leg.snssai, serde_json::json!({ "sst": 2, "sd": "0000aa" }));
+        assert_eq!((leg.qfi, leg.five_qi), (session.qfi, session.fiveqi));
+        let leg = amf_leg_for(MbsSessionType::Broadcast, Some(area), "{}", &session).unwrap();
+        assert_eq!(leg.snssai, serde_json::json!({ "sst": 1 }));
+    }
+
     use super::*;
     // #417: the Setup Response is read back by the generated codec's strict
     // decode and pinned whole against the hand-derived octets
@@ -4673,5 +4950,19 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming MB-SMF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Mbsmf,
+            super::sbi_listener_config,
+        );
     }
 }

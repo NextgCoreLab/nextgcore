@@ -615,8 +615,12 @@ for d in docs:
         # undiscoverable. The dev opt-out only works on the NF's OWN container
         # -- it once sat on the busybox rewrite-advertise-addr init container in
         # ausf/smf/udm, and was missing outright from the other four.
+        # #1795: every other SBI NF's listener follows the profile too.
         if kind == 'Deployment' and name in ('amf', 'ausf', 'smf', 'udm',
-                                             'udr', 'pcf', 'nssf', 'bsf'):
+                                             'udr', 'pcf', 'nssf', 'bsf',
+                                             'nef', 'nwdaf', 'ees', 'easdf', 'lmf',
+                                             'mbsmf', 'nsacf', 'ucmf', 'pin', 'dccf',
+                                             'scp', 'sepp', 'tsctsf'):
             nf = next((c for c in pod.get('containers', []) if c['name'] == name), None)
             has_profile = nf is not None and any(
                 e['name'] == 'NEXTGCORE_SBI_PROFILE' for e in nf.get('env', []))

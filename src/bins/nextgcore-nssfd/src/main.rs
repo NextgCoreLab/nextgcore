@@ -331,6 +331,28 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const NOTIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// #1795: the NSSF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with NSSF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: NextgcoreSbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Nssf,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -579,7 +601,9 @@ async fn main() -> Result<()> {
     let sbi_config = SbiServerConfig {
         addr: sbi.host.clone(),
         port: sbi.port,
-        tls_enabled: args.tls,
+        // #1795: the listener below serves TLS under `--tls` or the production
+        // profile, so what this NF publishes says so too.
+        tls_enabled: args.tls || nextgcore_sbi::security::SbiProfile::resolve().is_production(),
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
     };
@@ -597,24 +621,24 @@ async fn main() -> Result<()> {
         "--sbi-addr (or nssf.sbi.server[0].address in the config file)",
     );
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
-    // #94: one knob governs both authentication and the caller-to-resource
-    // binding, because binding is only meaningful against an authenticated
-    // identity. Recorded before the `if` so the log below reports the posture
-    // actually installed.
-    set_strict_availability_authz(require_oauth2);
-    if !require_oauth2 {
-        log::warn!(
-            "SBI OAuth2 enforcement is DISABLED by configuration: incoming requests are not \
-             authenticated, and NSSAI-availability writes therefore cannot be bound to the \
-             AMF that owns the document — any reachable NF can overwrite any AMF's slice \
-             picture (TS 33.501 §13.4.1). This is a documented escape hatch, not a default."
+    // #1795: `--tls` reaches the listener it advertises (under `dev`; the
+    // profile's certificate wins under `production`).
+    if args.tls {
+        sbi_server_config = sbi_server_config.with_tls(
+            args.tls_key
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/server.key"),
+            args.tls_cert
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/server.crt"),
         );
     }
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         nrf_uri_cfg.as_deref(),
     ));
@@ -637,6 +661,27 @@ async fn main() -> Result<()> {
                 .oauth2_jwks_uri
                 .as_deref()
                 .unwrap_or("UNCONFIGURED")
+        );
+    }
+    // #1795: the listener follows the SBI security profile.
+    let sbi_server_config = sbi_listener_config(
+        sbi_server_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        nrf_uri_cfg.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    // #94: one posture governs both authentication and the caller-to-resource
+    // binding, because binding is only meaningful against an authenticated
+    // identity. #1795: read off the listener as installed, so the production
+    // profile's token requirement turns the binding on too.
+    set_strict_availability_authz(sbi_server_config.require_oauth2);
+    if !sbi_server_config.require_oauth2 {
+        log::warn!(
+            "SBI OAuth2 enforcement is DISABLED by configuration: incoming requests are not \
+             authenticated, and NSSAI-availability writes therefore cannot be bound to the \
+             AMF that owns the document — any reachable NF can overwrite any AMF's slice \
+             picture (TS 33.501 §13.4.1). This is a documented escape hatch, not a default."
         );
     }
     // #1791: the NFProfile advertises the scheme this listener serves.
@@ -7565,5 +7610,19 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming NSSF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Nssf,
+            super::sbi_listener_config,
+        );
     }
 }
