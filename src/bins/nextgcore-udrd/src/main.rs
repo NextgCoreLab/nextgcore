@@ -351,13 +351,46 @@ fn sbi_listener_config(
     policy: &nextgcore_sbi::security::SbiSecurityPolicy,
     nrf_uri: &str,
 ) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
-    nextgcore_sbi::security::apply_sbi_security_policy(
+    let config = nextgcore_sbi::security::apply_sbi_security_policy(
         config,
         profile,
         policy,
         nextgcore_sbi::types::NfType::Udr,
         nrf_uri,
-    )
+    )?;
+    // #1811: whenever the listener requires a token, whether the knob or the
+    // production profile asked for it, the AuthenticationSubscription resource
+    // (K, OPc, SQN) needs its TS 29.505 resource scope too.
+    Ok(if config.require_oauth2 {
+        config.with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
+    } else {
+        config
+    })
+}
+
+/// The OAuth2 posture of the UDR's listener when `require_oauth2` is on: every
+/// request needs a valid NRF-issued bearer whose `aud` names the UDR and whose
+/// scope covers what it invokes. The verification keys are the caller's to set.
+fn udr_oauth2_listener(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    let mut config = config;
+    config.require_oauth2 = true;
+    // Issue #64 gap 3: assert the token's `aud` names the UDR.
+    //
+    // Without this `oauth2_expected_audience` stays None, the server calls
+    // `authorize_bearer_aud(.., None)` and the audience check is SKIPPED -- so a
+    // token the NRF minted for any other producer was accepted here, on the NF
+    // that holds subscriber data. TS 33.501 13.4.1.2 requires the producer to
+    // verify it is the intended audience. Every other OAuth2-enforcing NF
+    // already did this; the UDR was the one that did not.
+    //
+    // #1811: and the AuthenticationSubscription resource (K, OPc, SQN) needs its
+    // TS 29.505 resource scope as well as `nudr-dr`, which the NRF grants only to
+    // a UDM (UDR_RESOURCE_SCOPES). The server refuses a token without it, 403
+    // insufficient_scope, before the router runs, so a refused request reads
+    // nothing.
+    config
+        .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr)
+        .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
 }
 
 #[tokio::main]
@@ -544,20 +577,10 @@ async fn main() -> Result<()> {
     if require_oauth2 {
         // Verify bearer tokens against the NRF's published keys (auth stage
         // 4b). With no NRF URI configured the server fails closed.
-        sbi_server_config.require_oauth2 = true;
+        sbi_server_config = udr_oauth2_listener(sbi_server_config);
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
-        // Issue #64 gap 3: assert the token's `aud` names the UDR.
-        //
-        // Without this `oauth2_expected_audience` stays None, the server calls
-        // `authorize_bearer_aud(.., None)` and the audience check is SKIPPED -- so a
-        // token the NRF minted for any other producer was accepted here, on the NF
-        // that holds subscriber data. TS 33.501 13.4.1.2 requires the producer to
-        // verify it is the intended audience. Every other OAuth2-enforcing NF
-        // already did this; the UDR was the one that did not.
-        sbi_server_config =
-            sbi_server_config.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr);
         log::info!(
             "OAuth2 enforcement enabled (JWKS: {})",
             sbi_server_config
@@ -584,6 +607,9 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
+
+    // #1775: report provisioning changes of a watched UE's am-data.
+    spawn_am_data_watch();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDR_METRICS_PORT (9090). Non-fatal, like smfd's.
@@ -3126,6 +3152,30 @@ async fn handle_subscription_data_subs(
                 {
                     return missing_mandatory("monitoredResourceUris");
                 }
+                // #1775 review, TS 29.504 §5.2.2.6.2: a suggested `expiry` is
+                // confirmed as it is (no later than suggested), and the subscription
+                // is removed once it passes. One that cannot be read, or has passed
+                // already, is refused rather than silently made unlimited.
+                if let Some(expiry) = body.get("expiry") {
+                    let at = expiry
+                        .as_str()
+                        .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed);
+                    match at {
+                        None => {
+                            return send_bad_request(
+                                "expiry is not a DateTime (RFC 3339)",
+                                Some("INVALID_MSG_FORMAT"),
+                            )
+                        }
+                        Some(at) if at <= nextgcore_sbi::datetime::now_epoch_secs() as i64 => {
+                            return send_bad_request(
+                                "expiry has passed already",
+                                Some("MANDATORY_IE_INCORRECT"),
+                            )
+                        }
+                        Some(_) => {}
+                    }
+                }
                 let cb = cb.to_string();
                 let mut stored_body = body;
                 let sub = ds.sub_create(SubKind::SubscriptionData, &cb, serde_json::Value::Null);
@@ -3136,6 +3186,9 @@ async fn handle_subscription_data_subs(
                     );
                 }
                 ds.sub_set_body(&sub.id, stored_body.clone(), None);
+                // #1775: what a subscriber to am-data is told of is measured from
+                // the am-data as it is now, not from the first watch pass.
+                am_data_watch_baseline(&sub.id).await;
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
@@ -3173,18 +3226,18 @@ async fn handle_subscription_data_subs(
         },
         // Document: /subscription-data/subs-to-notify/{subsId}
         Some(subs_id) => match method {
-            "GET" => match ds.sub_get(subs_id) {
-                Some(sub) if sub.kind == SubKind::SubscriptionData => SbiResponse::with_status(200)
+            "GET" => match live_subscription_data_sub(subs_id) {
+                Some(sub) => SbiResponse::with_status(200)
                     .with_body(sub.body.to_string(), "application/json"),
-                _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+                None => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
             },
             "PATCH" => {
-                let Some(sub) = ds.sub_get(subs_id) else {
+                // #1836: an expired subscription is gone (TS 29.504 §5.2.2.6.2:
+                // "after which the subscription becomes invalid"), so the UDM's
+                // refresh learns it must subscribe again.
+                let Some(sub) = live_subscription_data_sub(subs_id) else {
                     return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
                 };
-                if sub.kind != SubKind::SubscriptionData {
-                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
-                }
                 let patch_body = match parse_json_body(request) {
                     Ok(v) => v,
                     Err(resp) => return *resp,
@@ -3195,6 +3248,7 @@ async fn handle_subscription_data_subs(
                         Some("INVALID_MSG_FORMAT"),
                     );
                 };
+                // Every item is checked before any is applied (#1836).
                 let mut body = sub.body;
                 for patch in items {
                     let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or("");
@@ -3206,7 +3260,16 @@ async fn handle_subscription_data_subs(
                             Some("INVALID_MSG_FORMAT"),
                         );
                     }
-                    if let (Some(obj), Some(value)) = (body.as_object_mut(), patch.get("value")) {
+                    let Some(value) = patch.get("value") else {
+                        return send_bad_request(
+                            &format!("{op} {path} without a value"),
+                            Some("INVALID_MSG_FORMAT"),
+                        );
+                    };
+                    if let Err(resp) = check_subscription_data_member(key, value) {
+                        return *resp;
+                    }
+                    if let Some(obj) = body.as_object_mut() {
                         obj.insert(key.to_string(), value.clone());
                     }
                 }
@@ -3227,6 +3290,434 @@ async fn handle_subscription_data_subs(
             _ => send_method_not_allowed(method, "subscription-data/subs-to-notify/{subsId}"),
         },
     }
+}
+
+/// Subscription-data subscription `id`, unless it is not one or has expired
+/// (TS 29.504 §5.2.2.6.2). An expired one is removed on the way (#1836).
+fn live_subscription_data_sub(id: &str) -> Option<data_store::StoredSub> {
+    let ds = data_store::store();
+    let sub = ds
+        .sub_get(id)
+        .filter(|s| s.kind == SubKind::SubscriptionData)?;
+    if data_store::sub_expired(&sub, nextgcore_sbi::datetime::now_epoch_secs() as i64) {
+        log::info!("subscription-data subscription {id} expired: removed");
+        ds.sub_remove(id);
+        return None;
+    }
+    Some(sub)
+}
+
+/// Whether a PATCH may set member `key` of a `SubscriptionDataSubscriptions`
+/// (TS 29.505) to `value` (#1836): an `expiry` must be a future DateTime, as at the
+/// subscribe; `callbackReference` a string; `monitoredResourceUris` a non-empty
+/// array of strings (mandatory members, so not unset by a PATCH either).
+fn check_subscription_data_member(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), Box<SbiResponse>> {
+    let bad = |what: &str, cause: &str| Err(Box::new(send_bad_request(what, Some(cause))));
+    match key {
+        "expiry" => match value
+            .as_str()
+            .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
+        {
+            None => bad("expiry is not a DateTime (RFC 3339)", "INVALID_MSG_FORMAT"),
+            Some(at) if at <= nextgcore_sbi::datetime::now_epoch_secs() as i64 => {
+                bad("expiry has passed already", "MANDATORY_IE_INCORRECT")
+            }
+            Some(_) => Ok(()),
+        },
+        "callbackReference" if !value.is_string() => {
+            bad("callbackReference is not a URI", "MANDATORY_IE_INCORRECT")
+        }
+        "monitoredResourceUris"
+            if !value
+                .as_array()
+                .is_some_and(|a| !a.is_empty() && a.iter().all(serde_json::Value::is_string)) =>
+        {
+            bad(
+                "monitoredResourceUris is not a non-empty array of URIs",
+                "MANDATORY_IE_INCORRECT",
+            )
+        }
+        "subscriptionId" => bad("subscriptionId is not modifiable", "MANDATORY_IE_INCORRECT"),
+        _ => Ok(()),
+    }
+}
+
+// ============================================================================
+// am-data provisioning watch (#1775)
+// ============================================================================
+//
+// TS 23.502 §4.5.1 / §4.5.2: when a subscriber's profile changes in the UDR, the
+// UDR notifies the UDM (Nudr_DM_Notify, TS 29.505 §5.4.2.6) and the UDM notifies
+// the AMF (Nudm_SDM_Notification). The am-data this UDR serves is built from the
+// subscriber database, which an operator provisions directly (the WebUI writes
+// MongoDB, not this UDR), so no UDR write path sees the change. The watcher reads
+// the am-data of each UE a subscription-data subscription watches, every
+// `UDR_AM_DATA_WATCH_MS`, and tells each subscription what changed since the
+// am-data it was last told of.
+//
+// Per-subscription state (`AM_DATA_NOTIFIED_COLLECTION`): the am-data the
+// subscription was last told of, persisted with the store. It advances when the
+// subscriber answers 2xx, or a 4xx other than 404 (a refusal: the same change is
+// not resent, so a subscriber answering 400 is not sent it in a loop). A 404 means
+// the subscription is gone at the subscriber, and it is removed here. No answer, or
+// a 5xx, leaves the state, so the change is resent once a backoff has passed; a
+// subscriber failing for an hour is removed. Each subscription gets at most one
+// notification per pass, and passes run one after another, so a later change
+// cannot overtake an earlier one. Bounds, concurrency, expiry and the once-per-pass
+// persist: see `am_data_watch_pass_with` (#1775 review).
+
+/// The watch period env var, in milliseconds; `0` turns the watch off.
+const AM_DATA_WATCH_ENV: &str = "UDR_AM_DATA_WATCH_MS";
+/// The default watch period: the longest a provisioning change waits to be told.
+const DEFAULT_AM_DATA_WATCH_MS: u64 = 5_000;
+
+fn am_data_watch_period() -> Option<std::time::Duration> {
+    let ms = std::env::var(AM_DATA_WATCH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AM_DATA_WATCH_MS);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Start the am-data watch, unless `UDR_AM_DATA_WATCH_MS` is 0.
+fn spawn_am_data_watch() {
+    let Some(period) = am_data_watch_period() else {
+        log::info!("{AM_DATA_WATCH_ENV}=0: am-data provisioning changes are not reported");
+        return;
+    };
+    log::info!("am-data provisioning watch every {} ms", period.as_millis());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            am_data_watch_pass().await;
+        }
+    });
+}
+
+/// `supi`'s am-data as this UDR serves it, or `None` when it cannot be read now.
+async fn read_am_data(supi: &str) -> Option<serde_json::Value> {
+    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string()).await
+    {
+        Ok(data) => Some(build_am_data(&data)),
+        Err(e) => {
+            log::debug!("[{supi}] am-data watch: subscriber data not read: {e:?}");
+            None
+        }
+    }
+}
+
+/// Record the am-data subscription `sub_id` starts from, if it watches am-data.
+async fn am_data_watch_baseline(sub_id: &str) {
+    let Some((supi, _)) = data_store::am_data_watchers()
+        .into_iter()
+        .find(|(_, s)| s.id == sub_id)
+    else {
+        return;
+    };
+    if let Some(now) = read_am_data(&supi).await {
+        data_store::store().doc_put(data_store::AM_DATA_NOTIFIED_COLLECTION, sub_id, now);
+    }
+}
+
+/// The most am-data subscriptions one watch pass serves, env var and default
+/// (#1775 review MAJOR-2). A pass takes them round-robin from where the previous
+/// one stopped, so every subscription is still served, and one pass costs at most
+/// this many MongoDB reads and notifications however many subscriptions there are.
+const AM_DATA_WATCH_MAX_ENV: &str = "UDR_AM_DATA_WATCH_MAX_PER_PASS";
+const DEFAULT_AM_DATA_WATCH_MAX: usize = 512;
+/// The most MongoDB reads, and separately the most notifications, in flight at
+/// once in a pass.
+const AM_DATA_WATCH_CONCURRENCY: usize = 32;
+/// The longest wait before a subscriber that did not answer, or answered 5xx, is
+/// tried again: the wait doubles from the watch period up to this.
+const AM_DATA_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+/// A subscriber that has not answered, or answered only 5xx, for this long (and at
+/// least [`AM_DATA_DEAD_MIN_FAILURES`] times) is gone: its subscription is removed,
+/// as on a 404. A UDM that restarted answers 404 on its old tokens; this covers the
+/// one that is gone with its address (a replaced pod).
+const AM_DATA_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+const AM_DATA_DEAD_MIN_FAILURES: u32 = 5;
+
+fn am_data_watch_max() -> usize {
+    std::env::var(AM_DATA_WATCH_MAX_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_AM_DATA_WATCH_MAX)
+}
+
+/// The failures in a row of one subscription's notifications.
+#[derive(Debug, Clone, Copy)]
+struct WatchFailures {
+    count: u32,
+    first: std::time::Instant,
+    next_try: std::time::Instant,
+}
+
+/// Subscription id -> its failures in a row, while it has some. Held in memory: a
+/// UDR restart tries every subscriber again at once.
+static AM_DATA_FAILURES: std::sync::Mutex<
+    Option<std::collections::HashMap<String, WatchFailures>>,
+> = std::sync::Mutex::new(None);
+
+/// The id of the last subscription the previous pass served (round-robin cursor).
+static AM_DATA_CURSOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn am_data_failures(
+) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, WatchFailures>>> {
+    AM_DATA_FAILURES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The wait after failure `count` (1-based): the watch period doubling, at most
+/// [`AM_DATA_BACKOFF_MAX`].
+fn am_data_backoff(count: u32) -> std::time::Duration {
+    let base = am_data_watch_period()
+        .unwrap_or(std::time::Duration::from_millis(DEFAULT_AM_DATA_WATCH_MS));
+    base.saturating_mul(1u32 << count.saturating_sub(1).min(16))
+        .min(AM_DATA_BACKOFF_MAX)
+}
+
+/// What one subscription's notification came to.
+enum WatchOutcome {
+    /// 2xx, or a refusal (4xx other than 404): the state advances to the am-data.
+    Advance(serde_json::Value, bool),
+    /// 404: the subscription is gone at the subscriber.
+    Gone,
+    /// No answer, or 5xx: resent once its backoff has passed.
+    Failed,
+}
+
+/// One watch pass at monotonic time `now` and wall-clock `now_epoch` (seconds):
+/// tell each am-data subscription due now of a change since what it was last told.
+/// Returns how many notifications were answered 2xx.
+///
+/// #1775 review MAJOR-2:
+/// - expired subscriptions (TS 29.504 `expiry`) are removed first, and not told;
+/// - at most [`am_data_watch_max`] subscriptions are served, round-robin;
+/// - a subscriber that failed is skipped until its backoff has passed, and removed
+///   once it has failed for [`AM_DATA_DEAD_AFTER`];
+/// - the am-data reads, and then the notifications, run concurrently (at most
+///   [`AM_DATA_WATCH_CONCURRENCY`] at once). Each subscription gets at most one
+///   notification per pass, and the passes run one after another, so its changes
+///   still arrive in order;
+/// - the state is written to the store without a snapshot each, and persisted once
+///   at the end of the pass, on a blocking thread.
+async fn am_data_watch_pass_at(now: std::time::Instant, now_epoch: i64) -> usize {
+    am_data_watch_pass_with(now, now_epoch, am_data_watch_max()).await
+}
+
+/// [`am_data_watch_pass_at`] serving at most `max` subscriptions.
+async fn am_data_watch_pass_with(now: std::time::Instant, now_epoch: i64, max: usize) -> usize {
+    use data_store::AM_DATA_NOTIFIED_COLLECTION as NOTIFIED;
+    let ds = data_store::store();
+    let mut dirty = false;
+
+    // Expired subscription-data subscriptions go, for every notifier.
+    for sub in ds.subs_matching(SubKind::SubscriptionData, |s| {
+        data_store::sub_expired(s, now_epoch)
+    }) {
+        log::info!("subscription-data subscription {} expired: removed", sub.id);
+        ds.sub_remove(&sub.id);
+    }
+
+    let watchers = data_store::am_data_watchers();
+    // State of a subscription that is gone, or no longer watches am-data, goes.
+    let live: std::collections::HashSet<String> =
+        watchers.iter().map(|(_, s)| s.id.clone()).collect();
+    for (id, _) in ds.doc_list(NOTIFIED) {
+        if !live.contains(&id) {
+            dirty |= ds.doc_remove_deferred(NOTIFIED, &id);
+        }
+    }
+    if let Some(f) = am_data_failures().as_mut() {
+        f.retain(|id, _| live.contains(id));
+    }
+
+    // Round-robin from after the previous pass's last one; skip the backed-off.
+    let due: Vec<(String, data_store::StoredSub)> = {
+        let failures = am_data_failures();
+        let mut cursor = AM_DATA_CURSOR.lock().unwrap_or_else(|e| e.into_inner());
+        let (due, next) = am_data_due(&watchers, cursor.as_deref(), max, |id| {
+            failures
+                .as_ref()
+                .and_then(|f| f.get(id))
+                .is_some_and(|f| f.next_try > now)
+        });
+        *cursor = next;
+        due
+    };
+
+    // One MongoDB read per SUPI, concurrently.
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(AM_DATA_WATCH_CONCURRENCY));
+    let mut supis: Vec<String> = due.iter().map(|(supi, _)| supi.clone()).collect();
+    supis.sort();
+    supis.dedup();
+    let mut reads = tokio::task::JoinSet::new();
+    for supi in supis {
+        let limit = limit.clone();
+        reads.spawn(async move {
+            let _permit = limit.acquire_owned().await.ok();
+            let now = read_am_data(&supi).await;
+            (supi, now)
+        });
+    }
+    let mut read: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    while let Some(done) = reads.join_next().await {
+        if let Ok((supi, Some(now))) = done {
+            read.insert(supi, now);
+        }
+    }
+
+    // One notification per changed subscription, concurrently.
+    let mut sends = tokio::task::JoinSet::new();
+    for (supi, sub) in due {
+        let Some(now_data) = read.get(&supi).cloned() else {
+            continue;
+        };
+        let Some(told) = ds.doc_get(NOTIFIED, &sub.id) else {
+            ds.doc_put_deferred(NOTIFIED, &sub.id, now_data);
+            dirty = true;
+            continue;
+        };
+        if told == now_data {
+            continue;
+        }
+        let limit = limit.clone();
+        sends.spawn(async move {
+            let _permit = limit.acquire_owned().await.ok();
+            let changes = data_store::am_data_changes(&told, &now_data);
+            let payload = data_store::data_change_notify(
+                &sub,
+                &supi,
+                &data_store::am_data_path(&supi),
+                changes,
+            );
+            let target = nextgcore_sbi::log_redact::redact_last_segment(&sub.notify_uri);
+            let outcome = match data_store::deliver_notification(&sub.notify_uri, &payload).await {
+                Ok(status) if (200..300).contains(&status) => {
+                    log::info!("[{supi}] am-data change notified to {target}: {status}");
+                    WatchOutcome::Advance(now_data, true)
+                }
+                Ok(404) => {
+                    log::info!(
+                        "[{supi}] {target} answered 404: subscription {} is gone, removed",
+                        sub.id
+                    );
+                    WatchOutcome::Gone
+                }
+                Ok(status) if (400..500).contains(&status) => {
+                    log::warn!(
+                        "[{supi}] {target} refused the am-data change ({status}); not resent"
+                    );
+                    WatchOutcome::Advance(now_data, false)
+                }
+                Ok(status) => {
+                    log::warn!("[{supi}] {target} answered {status}; resent after a backoff");
+                    WatchOutcome::Failed
+                }
+                Err(e) => {
+                    log::warn!("[{supi}] {e}; resent after a backoff");
+                    WatchOutcome::Failed
+                }
+            };
+            (sub.id, outcome)
+        });
+    }
+    let mut delivered = 0;
+    while let Some(done) = sends.join_next().await {
+        let Ok((id, outcome)) = done else {
+            continue;
+        };
+        match outcome {
+            WatchOutcome::Advance(now_data, ok) => {
+                ds.doc_put_deferred(NOTIFIED, &id, now_data);
+                dirty = true;
+                delivered += usize::from(ok);
+                if let Some(f) = am_data_failures().as_mut() {
+                    f.remove(&id);
+                }
+            }
+            WatchOutcome::Gone => {
+                ds.sub_remove(&id);
+                dirty |= ds.doc_remove_deferred(NOTIFIED, &id);
+                if let Some(f) = am_data_failures().as_mut() {
+                    f.remove(&id);
+                }
+            }
+            WatchOutcome::Failed => {
+                let mut failures = am_data_failures();
+                let f = failures
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .entry(id.clone())
+                    .or_insert(WatchFailures {
+                        count: 0,
+                        first: now,
+                        next_try: now,
+                    });
+                f.count += 1;
+                f.next_try = now + am_data_backoff(f.count);
+                let dead = f.count >= AM_DATA_DEAD_MIN_FAILURES
+                    && now.saturating_duration_since(f.first) >= AM_DATA_DEAD_AFTER;
+                if dead {
+                    let count = f.count;
+                    failures.as_mut().map(|m| m.remove(&id));
+                    drop(failures);
+                    log::warn!(
+                        "am-data subscription {id}: no answer for {} s ({count} tries): the \
+                         subscriber is gone, removed",
+                        AM_DATA_DEAD_AFTER.as_secs()
+                    );
+                    ds.sub_remove(&id);
+                    dirty |= ds.doc_remove_deferred(NOTIFIED, &id);
+                }
+            }
+        }
+    }
+    if dirty {
+        let _ = tokio::task::spawn_blocking(|| data_store::store().persist_now()).await;
+    }
+    delivered
+}
+
+/// The subscriptions a pass serves, out of `watchers` (sorted by id): at most `max`,
+/// starting after `cursor` (the id the previous pass stopped at) and wrapping round,
+/// skipping those `backed_off`. With the cursor the next pass starts from: the last
+/// one served when some were left out, `None` when every one was served.
+fn am_data_due(
+    watchers: &[(String, data_store::StoredSub)],
+    cursor: Option<&str>,
+    max: usize,
+    backed_off: impl Fn(&str) -> bool,
+) -> (Vec<(String, data_store::StoredSub)>, Option<String>) {
+    let start = cursor.map_or(0, |c| watchers.partition_point(|(_, s)| s.id.as_str() <= c));
+    let due: Vec<(String, data_store::StoredSub)> = watchers[start..]
+        .iter()
+        .chain(watchers[..start].iter())
+        .filter(|(_, s)| !backed_off(&s.id))
+        .take(max)
+        .cloned()
+        .collect();
+    let next = if due.len() < watchers.len() {
+        due.last().map(|(_, s)| s.id.clone())
+    } else {
+        None
+    };
+    (due, next)
+}
+
+/// One watch pass now ([`am_data_watch_pass_at`]).
+async fn am_data_watch_pass() -> usize {
+    am_data_watch_pass_at(
+        std::time::Instant::now(),
+        nextgcore_sbi::datetime::now_epoch_secs() as i64,
+    )
+    .await
 }
 
 // ============================================================================
@@ -4204,6 +4695,56 @@ const UDR_SERVICES: &[(&str, &str, &[&str])] = &[
     ("nudr-group-id-map", "v1", &["UDM", "AUSF", "NRF", "SCP"]),
 ];
 
+/// #1811: the resource/operation-level scopes of a UDR service, and the ONE NF
+/// type each is registered for in `allowedOperationsPerNfType` (TS 29.510
+/// Table 6.1.6.2.3-1 NOTE 11), so the NRF grants it to that type only.
+///
+/// The AuthenticationSubscription resource holds K, OPc/TOPc and SQN. TS 33.501
+/// §6.1.1 keeps the long-term key in the ARPF, which TS 23.501 §6.2.7 co-locates
+/// with the UDM: the UDM is its only legitimate reader (Nudm_UEAU) and writer
+/// (the SQN PATCH after a resynchronisation, TS 33.102 Annex C.3). Spellings are
+/// TS 29.505's (`nextgcore_sbi::resource_scope`).
+const UDR_RESOURCE_SCOPES: &[(&str, &str, &str)] = &[
+    (
+        "nudr-dr",
+        nextgcore_sbi::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_READ,
+        "UDM",
+    ),
+    (
+        "nudr-dr",
+        nextgcore_sbi::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_MODIFY,
+        "UDM",
+    ),
+];
+
+/// The `allowedOperationsPerNfType` of UDR service `name`, or `None` when the
+/// service has no resource-level scope (#1811).
+///
+/// NOTE 11: once the map is present it must name EVERY NF type allowed the
+/// service, with all its scopes, the service-level one included -- a type left
+/// out is barred from the whole service. So each of `allowed` gets the
+/// service-level scope, and only the type [`UDR_RESOURCE_SCOPES`] names gets a
+/// resource scope.
+fn udr_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::Value> {
+    if !UDR_RESOURCE_SCOPES.iter().any(|(svc, _, _)| *svc == name) {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = allowed
+        .iter()
+        .map(|nf_type| {
+            let mut scopes = vec![name.to_string()];
+            scopes.extend(
+                UDR_RESOURCE_SCOPES
+                    .iter()
+                    .filter(|(svc, _, t)| *svc == name && t == nf_type)
+                    .map(|(_, scope, _)| scope.to_string()),
+            );
+            (nf_type.to_string(), serde_json::json!(scopes))
+        })
+        .collect();
+    Some(serde_json::Value::Object(map))
+}
+
 /// Build the UDR's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
 ///
 /// Split out of `register_with_nrf` so the advertised service list and API
@@ -4221,7 +4762,7 @@ fn build_udr_nf_profile(
     let services: Vec<serde_json::Value> = UDR_SERVICES
         .iter()
         .map(|(name, version, allowed)| {
-            serde_json::json!({
+            let mut service = serde_json::json!({
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 // apiFullVersion must agree with the URI version, not lag it.
@@ -4233,7 +4774,11 @@ fn build_udr_nf_profile(
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
-            })
+            });
+            if let Some(ops) = udr_allowed_operations(name, allowed) {
+                service["allowedOperationsPerNfType"] = ops;
+            }
+            service
         })
         .collect();
 
@@ -4340,6 +4885,190 @@ mod tests {
         assert_eq!(pct_decode("%+1"), "%+1");
         assert_eq!(pct_decode("imsi%2D001010000000001"), "imsi-001010000000001");
         assert_eq!(pct_decode("x%41"), "xA");
+    }
+
+    /// #1811: the registered nudr-dr service names, in
+    /// `allowedOperationsPerNfType`, every NF type `allowedNfTypes` admits with
+    /// the service-level scope (TS 29.510 Table 6.1.6.2.3-1 NOTE 11: a type left
+    /// out would be barred from the whole service), and grants the
+    /// AuthenticationSubscription scopes to the UDM alone.
+    #[test]
+    fn the_profile_grants_the_auth_subscription_scopes_to_the_udm_only_1811() {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_AUTH_SUBSCRIPTION_MODIFY as MODIFY, NUDR_DR_AUTH_SUBSCRIPTION_READ as READ,
+        };
+        let profile = build_udr_nf_profile(
+            "udr-1811",
+            "10.45.0.11",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let service = |name: &str| {
+            profile["nfServices"]
+                .as_array()
+                .expect("nfServices")
+                .iter()
+                .find(|s| s["serviceName"] == name)
+                .cloned()
+                .expect("service registered")
+        };
+        let dr = service("nudr-dr");
+        let ops = dr["allowedOperationsPerNfType"]
+            .as_object()
+            .expect("nudr-dr registers allowedOperationsPerNfType");
+        assert_eq!(ops["UDM"], json!(["nudr-dr", READ, MODIFY]));
+        let allowed: Vec<&str> = dr["allowedNfTypes"]
+            .as_array()
+            .expect("allowedNfTypes")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ops.len(), allowed.len(), "one entry per allowed NF type");
+        for nf_type in allowed.iter().filter(|t| **t != "UDM") {
+            assert_eq!(ops[*nf_type], json!(["nudr-dr"]), "{nf_type}");
+        }
+        assert!(
+            service("nudr-group-id-map")
+                .get("allowedOperationsPerNfType")
+                .is_none(),
+            "Nudr_GroupIDmap defines no resource scope (TS 29.504 §6.2.7)"
+        );
+    }
+
+    /// #1811: the REAL router behind the UDR's OAuth2 listener
+    /// (`udr_oauth2_listener`, the one `main` builds). The AuthenticationSubscription
+    /// resource holds K and OPc, so a token scoped for `nudr-dr` alone -- all a
+    /// PCF or NEF is granted -- is refused 403 `insufficient_scope` naming the
+    /// TS 29.505 resource scope, and nothing is read or written; the UDM's token,
+    /// carrying the resource scope too, reads the key. Resources outside it still
+    /// need only the service scope.
+    ///
+    /// REVERT-VERIFIED: with `.with_oauth2_resource_scopes(..)` removed from
+    /// `udr_oauth2_listener`, the service-scope-only GET answers 200 with the key
+    /// and this test fails on its first assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_auth_subscription_is_served_only_with_its_resource_scope_1811() {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_AUTH_SUBSCRIPTION_MODIFY as MODIFY, NUDR_DR_AUTH_SUBSCRIPTION_READ as READ,
+        };
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _store = DbiTestStore::enable().await;
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = udr_oauth2_listener(NextgcoreSbiServerConfig::new(udr_addr));
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = SbiServer::on_listener(cfg, udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let bearer = |scope: &str| {
+            format!(
+                "Bearer {}",
+                stand_in::es256_access_token(&sk, stand_in::TEST_NRF_KID, "UDR", scope)
+            )
+        };
+        let service_only = bearer("nudr-dr");
+        let udm = bearer(&format!("nudr-dr {READ} {MODIFY}"));
+        let read_only = bearer(&format!("nudr-dr {READ}"));
+        let supi = "imsi-001010000018110";
+        let path = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+        let k = "465b5ce8b199b49faa5f0a2ee238a6bc";
+        let send = |req: SbiRequest, auth: &str| {
+            let req = req.with_header("authorization", auth.to_string());
+            let client = &client;
+            async move { client.send_request(req).await.expect("response") }
+        };
+        let put = |key: &str| {
+            SbiRequest::put(&path)
+                .with_json_body(&json!({
+                    "authenticationMethod": "5G_AKA",
+                    "encPermanentKey": key,
+                    "encOpcKey": "e8ed289deba952e4283b54e88e6183ca",
+                    "authenticationManagementField": "8000",
+                    "sequenceNumber": {"sqnScheme": "NON_TIME_BASED", "sqn": "000000000020"}
+                }))
+                .expect("json")
+        };
+
+        let provisioned = send(put(k), &udm).await;
+        let refused_get = send(SbiRequest::get(&path), &service_only).await;
+        let refused_put = send(put("00000000000000000000000000000000"), &service_only).await;
+        let patch = SbiRequest::patch(&path)
+            .with_json_body(
+                &json!([{"op": "replace", "path": "/sequenceNumber/sqn", "value": "000000000040"}]),
+            )
+            .expect("json");
+        let refused_patch = send(patch, &read_only).await;
+        let sqn_after_refusals = nextgcore_dbi::test_store::stored_sqn(supi);
+        let served = send(SbiRequest::get(&path), &udm).await;
+        let other = send(
+            SbiRequest::get(format!(
+                "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
+            )),
+            &service_only,
+        )
+        .await;
+        udr.stop().await.expect("stop");
+
+        let body = |r: &SbiResponse| -> serde_json::Value {
+            serde_json::from_str(r.http.content.as_deref().unwrap_or("{}")).unwrap_or_default()
+        };
+        let challenge = |r: &SbiResponse| {
+            r.http
+                .get_header("www-authenticate")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            refused_get.status, 403,
+            "a service-scope-only token must not read K: {:?}",
+            refused_get.http.content
+        );
+        assert_eq!(
+            challenge(&refused_get),
+            format!("Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\", scope=\"{READ}\"")
+        );
+        assert_eq!(
+            body(&refused_get)["status"],
+            403,
+            "TS 29.500 ProblemDetails"
+        );
+        assert!(
+            !refused_get
+                .http
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains(k),
+            "a refusal carries no key material"
+        );
+        assert_eq!(provisioned.status, 201, "{:?}", provisioned.http.content);
+        assert_eq!(refused_put.status, 403);
+        assert!(challenge(&refused_put).contains(&format!("scope=\"{MODIFY}\"")));
+        assert_eq!(refused_patch.status, 403, "a read scope does not modify");
+        assert!(challenge(&refused_patch).contains(&format!("scope=\"{MODIFY}\"")));
+        assert_eq!(
+            sqn_after_refusals,
+            Some(0x20),
+            "neither refused write reached the store"
+        );
+        assert_eq!(served.status, 200, "{:?}", served.http.content);
+        assert_eq!(
+            body(&served)["encPermanentKey"]
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some(k),
+            "the UDM's token reads the key the provisioning PUT stored"
+        );
+        assert_ne!(
+            other.status, 403,
+            "authentication-status needs only the service scope: {:?}",
+            other.http.content
+        );
     }
 
     #[test]
@@ -4748,6 +5477,67 @@ udr:
     /// amf-3gpp-access: strict-peer rejection, full registration round-trip,
     /// PATCH, DELETE, and DataChangeNotify delivery to a subs-to-notify
     /// subscriber over a real local listener.
+    /// #1814: a subscription receives only the UEs its `monitoredResourceUris`
+    /// name. UE A's subscription and a ueId-less one monitoring the bare suffix
+    /// `/pp-data` are both created, then UE B's pp-data and UE A's pp-data change.
+    /// UE A's subscription gets exactly UE A's change, and nothing reaches either
+    /// callback for UE B.
+    ///
+    /// REVERT-VERIFIED: with `uri_covers`'s raw suffix match restored, the
+    /// `/pp-data` subscription is notified of UE B's change. That notification
+    /// arrives first, at `/cb/suffix`, so the first assertion (`path == "/cb/a"`)
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_gets_only_the_ues_it_monitors_1814() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let ue_a = "imsi-001010000018141";
+        let ue_b = "imsi-001010000018142";
+        let pp = |ue: &str| format!("/nudr-dr/v2/subscription-data/{ue}/pp-data");
+        for (cb, monitored) in [("a", pp(ue_a)), ("suffix", "/pp-data".to_string())] {
+            let resp = client
+                .post_json(
+                    "/nudr-dr/v2/subscription-data/subs-to-notify",
+                    &json!({
+                        "callbackReference": format!("http://127.0.0.1:{cb_port}/cb/{cb}"),
+                        "monitoredResourceUris": [monitored]
+                    }),
+                )
+                .await
+                .expect("POST sub");
+            assert_eq!(resp.status, 201, "{cb}");
+        }
+
+        let doc = json!({"communicationCharacteristics": {"ppSubsRegTimer": {"subsRegTimer": 60}}});
+        for ue in [ue_b, ue_a] {
+            let resp = client.put_json(&pp(ue), &doc).await.expect("PUT pp-data");
+            assert!(
+                resp.status == 201 || resp.status == 204,
+                "{ue}: {}",
+                resp.status
+            );
+        }
+
+        let (path, notify) = recv_notification(&mut rx).await;
+        let mut others = Vec::new();
+        while let Ok(Some(n)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            others.push(n);
+        }
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+
+        assert_eq!(
+            path, "/cb/a",
+            "UE A's subscription is told of UE A's change"
+        );
+        assert_eq!(notify["ueId"], ue_a);
+        assert_eq!(notify["notifyItems"][0]["resourceId"], pp(ue_a));
+        assert!(
+            others.is_empty(),
+            "no other notification, UE B's change included: {others:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_amf3gpp_lifecycle_and_notify() {
         // #1666: the notification client follows the SBI profile, and this
@@ -7547,6 +8337,583 @@ udr:
     }
 
     // ========================================================================
+    // #1775: am-data provisioning changes reach the subscription-data subscriber.
+    // ========================================================================
+
+    /// A subscriber document with UE-AMBR `ul_mbps`/`dl_mbps` (unit 2 = Mbps).
+    fn ambr_document(
+        imsi: &str,
+        ul_mbps: i32,
+        dl_mbps: i32,
+    ) -> nextgcore_dbi::mongodb::bson::Document {
+        nextgcore_dbi::mongodb::bson::doc! {
+            "imsi": imsi,
+            "ambr": {
+                "uplink": { "value": ul_mbps, "unit": 2 },
+                "downlink": { "value": dl_mbps, "unit": 2 },
+            },
+        }
+    }
+
+    /// A notify listener answering every POST with `status`, sending what it
+    /// received into the channel.
+    async fn status_listener(
+        status: u16,
+    ) -> (SbiServer, u16, mpsc::UnboundedReceiver<serde_json::Value>) {
+        let (l, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), l);
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let body = req.http.content.clone().unwrap_or_default();
+                    let _ = tx.send(serde_json::from_str(&body).unwrap_or_default());
+                    SbiResponse::with_status(status)
+                }
+            })
+            .await
+            .expect("listener starts");
+        (server, addr.port(), rx)
+    }
+
+    /// Subscribe at the UDR for `supi`'s am-data, notifying `port`; the id.
+    async fn subscribe_am_data(client: &SbiClient, supi: &str, port: u16) -> String {
+        let body = json!({
+            "callbackReference":
+                format!("http://127.0.0.1:{port}/nudm-callback/v1/{supi}/udr-data-change/t"),
+            "monitoredResourceUris": [data_store::am_data_path(supi)],
+        });
+        let resp = client
+            .post_json("/nudr-dr/v2/subscription-data/subs-to-notify", &body)
+            .await
+            .expect("POST subs-to-notify");
+        assert_eq!(resp.status, 201);
+        json_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string()
+    }
+
+    /// The notifications that `pass` sent `rx`, without waiting for more.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<serde_json::Value>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            out.push(v);
+        }
+        out
+    }
+
+    /// #1775, TS 23.502 §4.5.1 / TS 29.505 §5.4.2.6: a provisioning change of a
+    /// watched UE's subscribed UE-AMBR and GPSI is told to the subscription-data
+    /// subscriber as a DataChangeNotify on the am-data resource, one ChangeItem per
+    /// changed member, the array replaced whole, each with its origValue. Told once:
+    /// the next pass, with nothing changed, sends nothing; and nothing is sent before
+    /// the change (the baseline is the am-data as it was at subscribe).
+    ///
+    /// REVERT-VERIFIED: with `am_data_watch_baseline` not called at subscribe the
+    /// first pass records the baseline and the change made before it is never told
+    /// (0 notifications); with the 2xx arm not advancing the state, the third pass
+    /// sends the change again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provisioned_am_data_change_is_told_once_member_by_member_1775() {
+        // Loopback plaintext peers; set and never reset (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let supi = "imsi-001019900017751";
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            ambr_document("001019900017751", 1, 2),
+        );
+        nextgcore_dbi::test_store::provision_subscriber(supi, &["4917751"]);
+        let (udm, port, mut rx) = status_listener(204).await;
+        let sub_id = subscribe_am_data(&client, supi, port).await;
+
+        // The operator provisions a new UE-AMBR and MSISDN.
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            ambr_document("001019900017751", 5, 10),
+        );
+        nextgcore_dbi::test_store::provision_subscriber(supi, &["4917759"]);
+        assert_eq!(am_data_watch_pass().await, 1, "the change is told");
+        let told = drain(&mut rx);
+        assert_eq!(told.len(), 1, "{told:?}");
+        let n = &told[0];
+        assert_eq!(n["ueId"], supi);
+        let item = &n["notifyItems"][0];
+        assert_eq!(item["resourceId"], data_store::am_data_path(supi));
+        assert_eq!(
+            item["changes"],
+            json!([
+                {"op": "REPLACE", "path": "/gpsis",
+                 "newValue": ["msisdn-4917759"], "origValue": ["msisdn-4917751"]},
+                {"op": "REPLACE", "path": "/subscribedUeAmbr",
+                 "newValue": {"uplink": "5 Mbps", "downlink": "10 Mbps"},
+                 "origValue": {"uplink": "1 Mbps", "downlink": "2 Mbps"}},
+            ]),
+            "one ChangeItem per changed member, arrays whole"
+        );
+
+        assert_eq!(am_data_watch_pass().await, 0, "told once");
+        assert!(drain(&mut rx).is_empty());
+
+        let resp = client
+            .delete(&format!(
+                "/nudr-dr/v2/subscription-data/subs-to-notify/{sub_id}"
+            ))
+            .await
+            .expect("DELETE");
+        assert_eq!(resp.status, 204);
+        am_data_watch_pass().await;
+        assert!(
+            data_store::store()
+                .doc_get(data_store::AM_DATA_NOTIFIED_COLLECTION, &sub_id)
+                .is_none(),
+            "a removed subscription's state goes with it"
+        );
+        udm.stop().await.expect("stop");
+        udr.stop().await.expect("stop");
+    }
+
+    /// #1775 (TS 29.503 Table 6.1.5.2-3 at the subscriber): a 400 is a refusal and
+    /// the same change is not resent, so a subscriber that keeps answering 400 is not
+    /// sent it in a loop; a 503 is resent, but not before its backoff has passed
+    /// (#1775 review MAJOR-2); a 404 says the subscription is gone, and it is removed
+    /// here.
+    ///
+    /// REVERT-VERIFIED: with the 4xx arm leaving the state, the second pass to the
+    /// 400 subscriber sends the change again; with the 404 arm not removing the
+    /// subscription, it is still stored after the pass; with the backoff not
+    /// checked, the 503 subscriber is sent to on the immediate next pass ("not
+    /// before its backoff").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_change_is_not_resent_and_a_gone_subscription_is_removed_1775() {
+        // Loopback plaintext peers; set and never reset (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let supi = "imsi-001019900017752";
+        let imsi = "001019900017752";
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let (refusing, refusing_port, mut refused) = status_listener(400).await;
+        let (busy, busy_port, mut busy_rx) = status_listener(503).await;
+        let (gone, gone_port, mut gone_rx) = status_listener(404).await;
+        let _refusing_sub = subscribe_am_data(&client, supi, refusing_port).await;
+        let busy_sub = subscribe_am_data(&client, supi, busy_port).await;
+        let gone_sub = subscribe_am_data(&client, supi, gone_port).await;
+
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 3, 4));
+        assert_eq!(am_data_watch_pass().await, 0, "none answered 2xx");
+        assert_eq!(drain(&mut refused).len(), 1);
+        assert_eq!(drain(&mut busy_rx).len(), 1);
+        assert_eq!(drain(&mut gone_rx).len(), 1);
+        assert!(
+            data_store::store().sub_get(&gone_sub).is_none(),
+            "a 404 removes the subscription"
+        );
+
+        let t0 = std::time::Instant::now();
+        let epoch = nextgcore_sbi::datetime::now_epoch_secs() as i64;
+        am_data_watch_pass_at(t0, epoch).await;
+        assert!(drain(&mut refused).is_empty(), "a refusal is not resent");
+        assert!(drain(&mut busy_rx).is_empty(), "not before its backoff");
+        am_data_watch_pass_at(t0 + AM_DATA_BACKOFF_MAX, epoch).await;
+        assert!(drain(&mut refused).is_empty(), "a refusal is not resent");
+        assert_eq!(
+            drain(&mut busy_rx).len(),
+            1,
+            "a 503 is resent once its backoff has passed"
+        );
+        assert!(
+            drain(&mut gone_rx).is_empty(),
+            "a removed subscription is not sent to"
+        );
+
+        for id in data_store::am_data_watchers()
+            .into_iter()
+            .filter(|(ue, _)| ue == supi)
+            .map(|(_, s)| s.id)
+        {
+            data_store::store().sub_remove(&id);
+        }
+        let _ = busy_sub;
+        for s in [refusing, busy, gone] {
+            s.stop().await.expect("stop");
+        }
+        udr.stop().await.expect("stop");
+    }
+
+    /// A TCP listener that accepts and never answers: a subscriber that is gone
+    /// without a 404 (a pod replaced, its address now silent). Its port.
+    async fn silent_listener() -> (tokio::task::JoinHandle<()>, u16) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = l.accept().await {
+                held.push(sock);
+            }
+        });
+        (task, port)
+    }
+
+    /// Remove every subscription watching `supi`'s am-data.
+    fn remove_watchers_of(supi: &str) {
+        for id in data_store::am_data_watchers()
+            .into_iter()
+            .filter(|(ue, _)| ue == supi)
+            .map(|(_, s)| s.id)
+        {
+            data_store::store().sub_remove(&id);
+        }
+    }
+
+    /// **#1775 review MAJOR-2**: subscribers that never answer do not stall the pass
+    /// for the others. Four silent subscribers and one live one watch a UE whose
+    /// am-data changed. The pass notifies them concurrently, so it takes about one
+    /// request timeout, not four, and the live one is told. The silent ones are then
+    /// backed off: the next pass skips them and is quick.
+    ///
+    /// REVERT-VERIFIED: with `AM_DATA_WATCH_CONCURRENCY` 1 (one notification at a
+    /// time, as before), the pass takes four timeouts ("concurrently"); with the
+    /// backoff not checked, the second pass waits on them again ("backed off").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silent_subscribers_do_not_stall_the_watch_1775() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let (supi, imsi) = ("imsi-001019900017754", "001019900017754");
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let mut silent = Vec::new();
+        for _ in 0..4 {
+            let (task, port) = silent_listener().await;
+            subscribe_am_data(&client, supi, port).await;
+            silent.push(task);
+        }
+        let (live, live_port, mut live_rx) = status_listener(204).await;
+        subscribe_am_data(&client, supi, live_port).await;
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 3, 4));
+
+        let t0 = std::time::Instant::now();
+        let epoch = nextgcore_sbi::datetime::now_epoch_secs() as i64;
+        assert_eq!(
+            am_data_watch_pass_at(t0, epoch).await,
+            1,
+            "the live one is told"
+        );
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "notified concurrently: one timeout, not four ({took:?})"
+        );
+        assert_eq!(drain(&mut live_rx).len(), 1);
+
+        let t1 = std::time::Instant::now();
+        assert_eq!(am_data_watch_pass_at(t1, epoch).await, 0);
+        assert!(
+            t1.elapsed() < Duration::from_secs(1),
+            "the silent ones are backed off ({:?})",
+            t1.elapsed()
+        );
+        remove_watchers_of(supi);
+        for t in silent {
+            t.abort();
+        }
+        live.stop().await.expect("stop");
+        udr.stop().await.expect("stop");
+    }
+
+    /// **#1775 review MAJOR-2**: a subscriber that has answered only 5xx (or not at
+    /// all) for `AM_DATA_DEAD_AFTER` is gone, and its subscription is removed, as on a
+    /// 404. Before it was retried every pass, forever.
+    ///
+    /// REVERT-VERIFIED: with the dead arm cut, the subscription is still stored after
+    /// an hour and a half of failures ("removed").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscriber_failing_for_an_hour_is_removed_1775() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let (supi, imsi) = ("imsi-001019900017755", "001019900017755");
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let (busy, busy_port, mut busy_rx) = status_listener(503).await;
+        let id = subscribe_am_data(&client, supi, busy_port).await;
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 3, 4));
+
+        let t0 = std::time::Instant::now();
+        let epoch = nextgcore_sbi::datetime::now_epoch_secs() as i64;
+        for k in 0..=6u32 {
+            am_data_watch_pass_at(t0 + AM_DATA_BACKOFF_MAX * 3 * k, epoch).await;
+        }
+        assert!(drain(&mut busy_rx).len() >= AM_DATA_DEAD_MIN_FAILURES as usize);
+        assert!(
+            data_store::store().sub_get(&id).is_none(),
+            "removed once it failed for an hour"
+        );
+        remove_watchers_of(supi);
+        busy.stop().await.expect("stop");
+        udr.stop().await.expect("stop");
+    }
+
+    /// **#1775 review MAJOR-2**, TS 29.504 §5.2.2.6.2: a suggested `expiry` is
+    /// confirmed in the 201, and once it passes the subscription is invalid: it is
+    /// removed and not told of a change. A suggested expiry that has passed already,
+    /// or is not a DateTime, is refused.
+    ///
+    /// REVERT-VERIFIED: with the expiry sweep cut from the pass, the expired
+    /// subscription is told of the change ("not told") and kept ("removed").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_subscription_is_removed_and_not_told_1775() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let (supi, imsi) = ("imsi-001019900017756", "001019900017756");
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let (udm, port, mut rx) = status_listener(204).await;
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let expiry = nextgcore_sbi::datetime::epoch_to_rfc3339(now + 60);
+        let body = |expiry: &str| {
+            json!({
+                "callbackReference": format!("http://127.0.0.1:{port}/cb/1776"),
+                "monitoredResourceUris": [data_store::am_data_path(supi)],
+                "expiry": expiry,
+            })
+        };
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &body(&expiry),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let v = json_of(&resp);
+        assert_eq!(v["expiry"], expiry, "confirmed as suggested");
+        let id = v["subscriptionId"].as_str().expect("id").to_string();
+        for bad in [
+            nextgcore_sbi::datetime::epoch_to_rfc3339(now - 1),
+            "soon".to_string(),
+        ] {
+            let resp = client
+                .post_json("/nudr-dr/v2/subscription-data/subs-to-notify", &body(&bad))
+                .await
+                .expect("POST");
+            assert_eq!(resp.status, 400, "{bad}");
+        }
+
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 3, 4));
+        am_data_watch_pass_at(std::time::Instant::now(), now as i64 + 61).await;
+        assert!(drain(&mut rx).is_empty(), "not told once expired");
+        assert!(data_store::store().sub_get(&id).is_none(), "removed");
+        remove_watchers_of(supi);
+        udm.stop().await.expect("stop");
+        udr.stop().await.expect("stop");
+    }
+
+    /// **#1836, TS 29.504 §5.2.2.6.2, the UDR peer of the UDM's leg refresh.** A
+    /// PATCH of `/expiry` extends the subscription's life: a pass after the first
+    /// expiry keeps it. A PATCH whose expiry has passed or cannot be read is refused
+    /// 400 and changes nothing, with a valid item beside it (validate before
+    /// mutating). Once the expiry passes, the subscription is gone: the refresh is
+    /// answered 404 (so the UDM subscribes again), also before a pass removed it.
+    ///
+    /// REVERT-VERIFIED: with `check_subscription_data_member` not checking `expiry`,
+    /// the past one is answered 204 ("a past expiry is refused"); with
+    /// `live_subscription_data_sub` not checking the expiry, the refresh of an
+    /// expired subscription is answered 204 ("an expired leg answers 404").
+    #[tokio::test]
+    async fn a_leg_refresh_extends_it_and_a_gone_leg_answers_404_1836() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let (supi, imsi) = ("imsi-001019900018361", "001019900018361");
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let at = |secs: u64| nextgcore_sbi::datetime::epoch_to_rfc3339(secs);
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &json!({
+                    "callbackReference": "http://127.0.0.1:9/cb/1836",
+                    "monitoredResourceUris": [data_store::am_data_path(supi)],
+                    "expiry": at(now + 60),
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let id = json_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let path = format!("/nudr-dr/v2/subscription-data/subs-to-notify/{id}");
+        let patch = |items: serde_json::Value| {
+            let mut req = SbiRequest::patch(&path);
+            req.http.content = Some(items.to_string());
+            req
+        };
+        let refresh = |secs: u64| json!([{"op": "replace", "path": "/expiry", "value": at(secs)}]);
+        let send = |req: SbiRequest| {
+            let client = &client;
+            async move { client.send_request(req).await.expect("answered").status }
+        };
+
+        assert_eq!(send(patch(refresh(now + 600))).await, 204, "refreshed");
+        am_data_watch_pass_at(std::time::Instant::now(), now as i64 + 61).await;
+        assert!(
+            data_store::store().sub_get(&id).is_some(),
+            "kept past its first expiry"
+        );
+
+        for bad in [
+            json!([
+                {"op": "replace", "path": "/callbackReference", "value": "http://127.0.0.1:9/x"},
+                {"op": "replace", "path": "/expiry", "value": at(now - 1)},
+            ]),
+            json!([{"op": "replace", "path": "/expiry", "value": "soon"}]),
+        ] {
+            assert_eq!(
+                send(patch(bad.clone())).await,
+                400,
+                "a past expiry is refused: {bad}"
+            );
+        }
+        let held = data_store::store().sub_get(&id).expect("held");
+        assert_eq!(held.body["expiry"], at(now + 600), "nothing applied");
+        assert_eq!(held.body["callbackReference"], "http://127.0.0.1:9/cb/1836");
+
+        // The expiry passes (set back, as time would), with no pass since.
+        let mut body = held.body;
+        body["expiry"] = json!(at(now - 5));
+        data_store::store().sub_set_body(&id, body, None);
+        assert_eq!(
+            send(patch(refresh(now + 900))).await,
+            404,
+            "an expired leg answers 404"
+        );
+        assert!(data_store::store().sub_get(&id).is_none(), "and is removed");
+        assert_eq!(send(patch(refresh(now + 900))).await, 404, "gone");
+        remove_watchers_of(supi);
+        udr.stop().await.expect("stop");
+    }
+
+    /// **#1836, UDR restart.** A leg's refreshed expiry and its am-data baseline are
+    /// in the UDR's state file: a UDR started on that file still holds the
+    /// subscription with the refreshed expiry, so the UDM's leg outlives the UDR
+    /// restart and its refreshes go on being answered.
+    ///
+    /// REVERT-VERIFIED: with `sub_set_body` not persisting, the reloaded
+    /// subscription has its first expiry ("the refreshed expiry").
+    #[test]
+    fn a_refreshed_leg_survives_a_udr_restart_1836() {
+        let path = std::env::temp_dir().join(format!(
+            "udr-1836-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let at = nextgcore_sbi::datetime::epoch_to_rfc3339;
+        let id = {
+            let ds = data_store::UdrDataStore::with_state_path(&path);
+            let sub = ds.sub_create(SubKind::SubscriptionData, "http://udm/cb", json!({}));
+            let body = json!({
+                "callbackReference": "http://udm/cb",
+                "monitoredResourceUris": ["/nudr-dr/v2/subscription-data/imsi-1/provisioned-data/am-data"],
+                "expiry": at(now + 60),
+                "subscriptionId": sub.id,
+            });
+            ds.sub_set_body(&sub.id, body.clone(), None);
+            ds.doc_put(
+                data_store::AM_DATA_NOTIFIED_COLLECTION,
+                &sub.id,
+                json!({"gpsis": ["1"]}),
+            );
+            let mut refreshed = body;
+            refreshed["expiry"] = json!(at(now + 900));
+            ds.sub_set_body(&sub.id, refreshed, None);
+            sub.id
+        };
+        let restarted = data_store::UdrDataStore::with_state_path(&path);
+        let sub = restarted
+            .sub_get(&id)
+            .expect("the leg survives the restart");
+        assert_eq!(sub.body["expiry"], at(now + 900), "the refreshed expiry");
+        assert_eq!(
+            restarted.doc_get(data_store::AM_DATA_NOTIFIED_COLLECTION, &id),
+            Some(json!({"gpsis": ["1"]})),
+            "and its baseline"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **#1775 review MAJOR-2**: one pass serves at most its bound of subscriptions,
+    /// round-robin from where the previous pass stopped, so a pass's cost is bounded
+    /// and every subscription is still served. Three subscriptions, two per pass:
+    /// the first pass serves a and b, the second starts with c; a backed-off one is
+    /// skipped; with room for all, every one is served and the cursor is cleared.
+    ///
+    /// REVERT-VERIFIED: with the cursor not kept (`next` always `None`), the second
+    /// pass serves a and b again ("the third, next pass").
+    #[test]
+    fn a_pass_is_bounded_and_round_robin_1775() {
+        let w: Vec<(String, data_store::StoredSub)> = ["a", "b", "c"]
+            .iter()
+            .map(|id| {
+                (
+                    format!("imsi-{id}"),
+                    data_store::StoredSub {
+                        id: id.to_string(),
+                        kind: SubKind::SubscriptionData,
+                        notify_uri: String::new(),
+                        body: serde_json::Value::Null,
+                    },
+                )
+            })
+            .collect();
+        let ids = |d: &[(String, data_store::StoredSub)]| -> Vec<String> {
+            d.iter().map(|(_, s)| s.id.clone()).collect()
+        };
+        let (first, cursor) = am_data_due(&w, None, 2, |_| false);
+        assert_eq!(ids(&first), ["a", "b"]);
+        let (second, cursor) = am_data_due(&w, cursor.as_deref(), 2, |_| false);
+        assert_eq!(ids(&second)[0], "c", "the third, next pass");
+        let (third, _) = am_data_due(&w, cursor.as_deref(), 2, |_| false);
+        assert_eq!(ids(&third), ["b", "c"]);
+        let (skip, _) = am_data_due(&w, None, 2, |id| id == "a");
+        assert_eq!(ids(&skip), ["b", "c"], "a backed-off one is skipped");
+        let (all, cursor) = am_data_due(&w, Some("b"), 10, |_| false);
+        assert_eq!(ids(&all), ["c", "a", "b"]);
+        assert_eq!(cursor, None, "every one served");
+    }
+
+    /// #1775: the ChangeItems between two am-data documents: ADD, REMOVE (with the
+    /// whole original array, TS 29.503 §5.2.2.5.2) and REPLACE, member by member, and
+    /// none for an unchanged member; a member name is escaped as an RFC 6901 token.
+    #[test]
+    fn am_data_changes_are_member_by_member_1775() {
+        let old = json!({"gpsis": ["msisdn-1"], "mpsPriority": true, "a/b": 1, "same": 2});
+        let new = json!({"mcsPriority": true, "mpsPriority": false, "a/b": 2, "same": 2});
+        assert_eq!(
+            data_store::am_data_changes(&old, &new),
+            json!([
+                {"op": "REPLACE", "path": "/a~1b", "newValue": 2, "origValue": 1},
+                {"op": "REMOVE", "path": "/gpsis", "origValue": ["msisdn-1"]},
+                {"op": "ADD", "path": "/mcsPriority", "newValue": true},
+                {"op": "REPLACE", "path": "/mpsPriority", "newValue": false, "origValue": true},
+            ])
+            .as_array()
+            .cloned()
+            .expect("array")
+        );
+    }
+
+    // ========================================================================
     // #1797: no key material in a DataChangeNotify.
     // ========================================================================
 
@@ -7849,5 +9216,51 @@ mod sbi_profile_tests_1795 {
             nextgcore_sbi::types::NfType::Udr,
             super::sbi_listener_config,
         );
+    }
+
+    /// #1811 x #1795: under production the token requirement comes from the
+    /// profile, and the K-read resource scope must come with it.
+    ///
+    /// REVERT-VERIFIED: with the resource-scope step removed from
+    /// `sbi_listener_config`, the production listener has none and this fails.
+    #[test]
+    fn production_keeps_the_auth_subscription_resource_scope_1795() {
+        use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+        let dir = std::env::temp_dir().join(format!("udrd-1795-rs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("udr.crt"),
+                key: file("udr.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let base = super::NextgcoreSbiServerConfig::new(addr);
+        let prod = super::sbi_listener_config(
+            base.clone(),
+            SbiProfile::Production,
+            &policy,
+            "https://127.0.0.10:7777",
+        )
+        .unwrap();
+        assert!(prod.require_oauth2);
+        assert!(
+            prod.oauth2_resource_scopes.is_some(),
+            "the K-read resource scope is enforced under production"
+        );
+        let dev =
+            super::sbi_listener_config(base, SbiProfile::Dev, &policy, "https://127.0.0.10:7777")
+                .unwrap();
+        assert!(dev.oauth2_resource_scopes.is_none(), "dev adds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1090,6 +1090,9 @@ fn handle_ue_policy_notify_callback(
 ///   change this AMF does not apply (DECISIONS 2026-11-18-030000), never a 204. The check, the changes and the
 ///   derived fields are one step under the store's lock, so a concurrent
 ///   re-subscription cannot interleave and nothing is left half applied.
+/// - An applied change of the UE-AMBR queues the UE for a UE Context Modification
+///   at NG-RAN (#1776, TS 23.502 §4.5.1), which the NGAP task sends if the UE is
+///   CM-CONNECTED.
 fn handle_sdm_notify_callback(
     supi: &str,
     token: Option<&str>,
@@ -1126,25 +1129,39 @@ fn handle_sdm_notify_callback(
             return None;
         }
         let current = crate::sdm_notify::current_am_data(&state.amf_ue);
-        // CM-CONNECTED as `ue_ng_connected` reads it, under the same lock.
-        let cm_connected = !state.is_cm_idle() && state.is_bound();
         Some(
-            crate::sdm_notify::applied_am_data(
-                supi,
-                &current,
-                state.sdm_subscription_id(),
-                &body,
-                cm_connected,
-            )
-            .map(|doc| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc)),
+            crate::sdm_notify::applied_am_data(supi, &current, state.sdm_subscription_id(), &body)
+                .map(|doc| {
+                    let before = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+                    crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc);
+                    before != (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink)
+                }),
         )
     });
+    // #1776, TS 23.502 §4.5.1: a changed UE-AMBR is the UE context at NG-RAN to
+    // modify. Queued for the NGAP task, which owns SCTP and reads the CM state at
+    // send time: a CM-CONNECTED UE's node gets a UE CONTEXT MODIFICATION REQUEST
+    // with the UE-AMBR then held; for a CM-IDLE UE nothing is sent, and its next
+    // Initial Context Setup carries it. Queued whatever the CM state now, so a UE
+    // that connects before the drain, on an Initial Context Setup built from what it
+    // held before this change, is still brought up to date. Only an applied change
+    // is queued, and a retry that changes nothing queues nothing.
+    if let Some(Some(Ok(true))) = outcome {
+        guard.ue_ambr_modification_add(ue.id);
+    }
     drop(guard);
     match outcome {
         None => context_not_found(supi),
         Some(None) => unknown_callback_token(supi, "SDM data change"),
-        Some(Some(Ok(()))) => {
-            log::info!("[{supi}] Nudm_SDM data change notification applied to the am-data");
+        Some(Some(Ok(ue_ambr_changed))) => {
+            log::info!(
+                "[{supi}] Nudm_SDM data change notification applied to the am-data{}",
+                if ue_ambr_changed {
+                    "; the UE-AMBR changed, queued for NG-RAN (UE Context Modification)"
+                } else {
+                    ""
+                }
+            );
             SbiResponse::no_content()
         }
         Some(Some(Err(refusal))) => {
@@ -1961,11 +1978,19 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     if sub.any_ue {
         subscription["anyUE"] = json!(true);
     }
+    // #1760: the reporting mode the AMF applies.
+    let trigger = if sub.one_time {
+        "ONE_TIME"
+    } else {
+        "CONTINUOUS"
+    };
     if let Some(expiry) = sub.expiry {
         subscription["options"] = json!({
-            "trigger": "CONTINUOUS",
+            "trigger": trigger,
             "expiry": system_time_to_rfc3339(expiry),
         });
+    } else if sub.one_time {
+        subscription["options"] = json!({ "trigger": trigger });
     }
     subscription
 }
@@ -2209,6 +2234,14 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         None => None,
     };
 
+    // #1760: the reporting mode (AmfEventMode.trigger, TS 29.518 §6.2.6.2.4). ONE_TIME
+    // is told once; CONTINUOUS and PERIODIC are reported as CONTINUOUS (periodic
+    // reporting is not implemented).
+    let one_time = subscription
+        .pointer("/options/trigger")
+        .and_then(Value::as_str)
+        == Some("ONE_TIME");
+
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let sub = EventSubscription {
         subscription_id: subscription_id.clone(),
@@ -2231,6 +2264,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        one_time,
+        first_location_pending: false,
         reporting_threshold,
         location_filters,
     };
@@ -2286,11 +2321,33 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     }
+    // #1760: a ONE_TIME subscription is told once, by whichever report comes first.
+    let mut reported = !report_list.is_empty();
     if let Some(first) = first_reach {
-        first.deliver_and_recheck(&sub);
+        if sub.one_time {
+            if let Some(report) = first.notify {
+                reported = true;
+                deliver_reachability_report(sub.clone(), report);
+            }
+        } else {
+            first.deliver_and_recheck(&sub);
+        }
     }
-    if let Some(report) = first_location {
-        deliver_location_report(sub.clone(), report);
+    match first_location {
+        FirstLocation::Notify(report) if !(sub.one_time && reported) => {
+            reported = true;
+            deliver_location_report(sub.clone(), report);
+        }
+        FirstLocation::Page(ue) if !(sub.one_time && reported) => {
+            page_for_first_location(&ue, &subscription_id);
+        }
+        _ => {}
+    }
+    if sub.one_time && reported {
+        if let Ok(guard) = ctx.read() {
+            guard.event_subscription_remove(&subscription_id);
+        }
+        log::info!("Event subscription {subscription_id} is ONE_TIME and was reported: removed");
     }
 
     log::info!(
@@ -2722,7 +2779,12 @@ fn fire_amf_event_matching(
         guard
             .event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
             .into_iter()
+            // #1760: a first LOCATION_REPORT waiting on a page is made by the page.
+            .filter(|s| !(s.first_location_pending && event_type == "LOCATION_REPORT"))
             .filter(|s| wants(&guard, s))
+            // #1760: a ONE_TIME subscription is told once: the fire point that claims
+            // it (removes it) is the one that reports.
+            .filter(|s| !s.one_time || guard.event_subscription_claim_one_time(&s.subscription_id))
             .collect()
     };
     if subs.is_empty() {
@@ -2927,51 +2989,84 @@ pub(crate) fn first_reachability_report(
     })
 }
 
+/// What a new subscription's first LOCATION_REPORT is (#1737, #1760).
+#[derive(Debug)]
+pub(crate) enum FirstLocation {
+    /// None to make here: no LOCATION_REPORT, no registered UE, or the immediateFlag
+    /// (whose report is already in the response's `reportList`).
+    None,
+    /// This notification, once the subscription is stored.
+    Notify(Value),
+    /// The UE is CM-IDLE over 3GPP access: it is paged first, and the page's outcome
+    /// makes the report ([`page_for_first_location`]).
+    Page(Box<AmfUe>),
+}
+
 /// #1737: the first LOCATION_REPORT of a new subscription for `supi`, TS 29.518
-/// §5.3.2.2.2 (`29518-k00.txt:5731-5737`): with the CONTINUOUS or PERIODIC mode and
+/// §5.3.2.2.2 (`29518-k00.txt:5731-5743`): with the CONTINUOUS or PERIODIC mode and
 /// no immediateFlag, *"the AMF shall send a first event notification to notify the
 /// current location of the UE after the subscription is created"*. The ONE_TIME
-/// mode without the immediateFlag gets the same notification (`:5719-5724`). This
-/// AMF does not read the mode (`options.trigger`), so every such subscription gets
-/// it.
+/// mode without the immediateFlag gets the same notification (`:5719-5724`).
 ///
-/// Returns the notification to send once the subscription is stored, or `None`
-/// with the immediateFlag, whose report is already in the response's `reportList`.
-/// Either way the location reported is recorded in `sub.reported_location`, so the
-/// next location evaluation measures this subscription's change from what it was
-/// told (see [`fire_location_change_report`]).
+/// For a CM-CONNECTED UE the notification is made now, with its location
+/// ([`FirstLocation::Notify`]), and that location is recorded in
+/// `sub.reported_location`, so the next location evaluation measures this
+/// subscription's change from what it was told (see [`fire_location_change_report`]).
+/// With the immediateFlag only the location is recorded.
+///
+/// #1760: the last known location is for a UE that *"does not respond to the
+/// paging"*, so a CM-IDLE UE that can be paged is paged first
+/// ([`FirstLocation::Page`], `sub.first_location_pending` set). A CM-IDLE UE that
+/// cannot be paged (its record has no registration area) gets the last known
+/// location now, with `ageOfLocationInformation` the minutes since it was acquired
+/// and at least 1.
 ///
 /// A UE that is not yet registered gets no first report here: its Registration
 /// Accept is where the AMF first reports its location, every dimension counting as
-/// changed (#1716). For a CM-IDLE UE the location is the last known one, with
-/// `ageOfLocationInformation` the minutes since it was acquired and at least 1, as
-/// the clause requires for a UE that does not answer paging. This AMF does not page
-/// the UE for it.
+/// changed (#1716).
 pub(crate) fn first_location_report(
     sub: &mut EventSubscription,
     immediate: bool,
     supi: Option<&str>,
-) -> Option<Value> {
+) -> FirstLocation {
     if !sub.event_types.iter().any(|t| t == "LOCATION_REPORT") {
-        return None;
+        return FirstLocation::None;
     }
-    let ue = supi.and_then(find_ue_by_context_id)?;
-    let record = amf_self()
+    let Some(ue) = supi.and_then(find_ue_by_context_id) else {
+        return FirstLocation::None;
+    };
+    let Some(record) = amf_self()
         .read()
         .ok()
         .and_then(|g| g.ue_store().get(ue.id))
-        .filter(|r| r.is_registered())?;
-    sub.reported_location = Some((
+        .filter(|r| r.is_registered())
+    else {
+        return FirstLocation::None;
+    };
+    let baseline = (
         ue.nr_tai.clone(),
         ue.nr_cgi.clone(),
         record.association_id(),
-    ));
+    );
     if immediate {
-        return None;
+        sub.reported_location = Some(baseline);
+        return FirstLocation::None;
     }
-    let mut location = nr_location_json(&ue);
-    if record.is_cm_idle() {
-        let minutes = location_acquired_at(&ue)
+    if record.is_cm_idle() && ue_pageable(&ue) {
+        sub.first_location_pending = true;
+        return FirstLocation::Page(Box::new(ue));
+    }
+    sub.reported_location = Some(baseline);
+    FirstLocation::Notify(location_report(&ue, record.is_cm_idle()))
+}
+
+/// A LOCATION_REPORT of `ue`'s location: the last known one when `last_known`, with
+/// `ageOfLocationInformation` the minutes since it was acquired and at least 1
+/// (TS 29.518 §5.3.2.2.2: "a value other than 0"), else the current one.
+fn location_report(ue: &AmfUe, last_known: bool) -> Value {
+    let mut location = nr_location_json(ue);
+    if last_known {
+        let minutes = location_acquired_at(ue)
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_secs() / 60)
             .unwrap_or(0)
@@ -2989,7 +3084,104 @@ pub(crate) fn first_location_report(
     if let Some(pei) = ue.pei.as_deref() {
         report["pei"] = json!(pei);
     }
-    Some(report)
+    report
+}
+
+/// #1760: page CM-IDLE `ue` for subscription `subscription_id`'s first
+/// LOCATION_REPORT. A page already running for the UE (for a downlink, or for
+/// another subscription) is joined rather than replaced, since it brings the UE back
+/// just the same. Otherwise a [`PagingContext::location_only`] page is started.
+///
+/// #1760 review: join-or-create is one operation under the paging-map write lock
+/// (`paging_join_or_add_location`), so a page another task queues between a check
+/// and an insert is never overwritten, and its N2 or failure-notify URI never lost.
+///
+/// [`PagingContext::location_only`]: crate::context::PagingContext::location_only
+pub(crate) fn page_for_first_location(ue: &AmfUe, subscription_id: &str) {
+    let page = crate::namf_handler::idle_ue_paging_context(
+        ue,
+        None,
+        None,
+        crate::namf_handler::PagedN2::Setup,
+        None,
+        None,
+    );
+    let joined = amf_self()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .paging_join_or_add_location(page, subscription_id);
+    if !joined {
+        crate::namf_handler::start_paging_nwdaf_hint(ue);
+    }
+    log::info!(
+        "[{}] LOCATION_REPORT {subscription_id}: the UE is CM-IDLE, paging it for its \
+         current location (TS 29.518 §5.3.2.2.2)",
+        ue.supi.as_deref().unwrap_or("?")
+    );
+}
+
+/// #1760: the page `paging` ended, and the first LOCATION_REPORTs waiting on it are
+/// made. `answered`: the UE answered it, at this location and on this NGAP
+/// association, and its current location is reported. `None`: it did not answer
+/// (T3513 ran out, or the UE was deregistered), and its last known location is
+/// reported with its age. A subscription gone meanwhile is skipped. A ONE_TIME one is
+/// removed with its report.
+pub(crate) fn first_locations_after_page(
+    paging: &crate::context::PagingContext,
+    answered: Option<(&AmfUe, u64)>,
+) {
+    if paging.location_report_subs.is_empty() {
+        return;
+    }
+    let (ue, association, last_known) = match answered {
+        Some((ue, association)) => (ue.clone(), association, false),
+        None => {
+            let Some(ue) = paging.supi.as_deref().and_then(find_ue_by_context_id) else {
+                // #1760 review: there is no UE to report the location of. Each
+                // waiting subscription still stops waiting, or the fire points would
+                // skip it for good; its next report is the UE's next registration
+                // (#1716).
+                if let Ok(g) = amf_self().read() {
+                    for id in &paging.location_report_subs {
+                        if g.event_subscription_abandon_first_location(id) {
+                            log::info!(
+                                "LOCATION_REPORT {id}: the page ended and its UE is gone; \
+                                 nothing is reported, and the subscription waits no longer"
+                            );
+                        }
+                    }
+                }
+                return;
+            };
+            let association = amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.ue_store().get(ue.id))
+                .map_or(0, |r| r.association_id());
+            (ue, association, true)
+        }
+    };
+    let told = (ue.nr_tai.clone(), ue.nr_cgi.clone(), association);
+    for id in &paging.location_report_subs {
+        let sub = amf_self()
+            .read()
+            .ok()
+            .and_then(|g| g.event_subscription_finish_first_location(id, told.clone()));
+        let Some(sub) = sub else {
+            continue;
+        };
+        log::info!(
+            "[{}] LOCATION_REPORT {id}: the page {}, its {} location is reported",
+            ue.supi.as_deref().unwrap_or("?"),
+            if last_known {
+                "was not answered"
+            } else {
+                "was answered"
+            },
+            if last_known { "last known" } else { "current" },
+        );
+        deliver_location_report(sub, location_report(&ue, last_known));
+    }
 }
 
 /// Send a LOCATION_REPORT notification `report` to `sub` (#1737).
@@ -4206,6 +4398,9 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: true,
+            // #1760: the mode travels with it (the echo carries `options.trigger`).
+            one_time: entry.pointer("/options/trigger").and_then(Value::as_str) == Some("ONE_TIME"),
+            first_location_pending: false,
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -5055,20 +5250,29 @@ fn try_positioning_relay(
     if !connected {
         // Paged. The downlinks are enqueued as usual, and the NGAP task holds them
         // while the UE is being paged, then delivers them once its Service Request
-        // has connected it. A page already running (for another transfer) is not
-        // replaced: it brings the UE back just the same. This differs on purpose from
-        // #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING for an SM transfer during a page:
-        // that rule protects the one SM N2 the paging context holds, and these
-        // downlinks are held by the NGAP task, not in the paging context, so they
-        // can ride a page in progress.
-        let paging = amf_self()
-            .read()
-            .ok()
-            .is_some_and(|g| g.paging_find(ue.id).is_some());
-        let location = if paging {
-            format!("/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages")
-        } else {
-            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // has connected it. A page already running (for another transfer, or
+        // location-only) is joined, not replaced: it brings the UE back just the
+        // same. This differs on purpose from #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING
+        // for an SM transfer during a page: that rule protects the one SM N2 the
+        // paging context holds, and these downlinks are held by the NGAP task, not in
+        // the paging context, so they can ride a page in progress. #1837: the join
+        // keeps this LMF's n1n2FailureTxfNotifURI on the page, so a page that fails
+        // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
+        // the paging-map lock, so a page another transfer queues meanwhile is joined,
+        // never overwritten.
+        // #1858: this transfer's own resource id, so its failure notification is
+        // its own even when another LMF transfer shares the callback URI. The same
+        // transfer retried gets the same id, and is recorded once.
+        let transfer_id = positioning_transfer_id(body, &downlinks);
+        let Some(location) =
+            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri, &transfer_id)
+        else {
+            log::info!(
+                "[{ue_context_id}] LCS: the page for the UE already carries {} other \
+                 transfers; 409",
+                crate::context::MAX_JOINED_TRANSFERS
+            );
+            return Some(paging_ongoing_error());
         };
         if let Ok(context) = amf_self().read() {
             for dl in downlinks {
@@ -5098,6 +5302,30 @@ fn try_positioning_relay(
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     })
+}
+
+/// #1858: the identity of a paged positioning transfer, the `{n1N2MessageId}` of
+/// the Location it is answered with (TS 29.518 §5.2.2.3.1) and of the
+/// n1n2MsgDataUri its failure notification names. Derived from the request itself
+/// (its JSON part and the LPP/NRPPa payloads), so a retry of the same transfer
+/// maps to the same resource and is recorded once, while two transfers with
+/// different content are two resources, even when they share one
+/// n1n2FailureTxfNotifURI.
+fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.to_string().hash(&mut h);
+    for dl in downlinks {
+        match &dl.kind {
+            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::NrppaToGnb {
+                routing_id,
+                nrppa_pdu,
+            } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
+            PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+        }
+    }
+    format!("lcs-{:016x}", h.finish())
 }
 
 /// UPDP (UE policy) downlink relay — Wave-6 E5 (TS 29.525 §4.2.2.2: the PCF
@@ -5156,17 +5384,18 @@ fn try_ue_policy_relay(
             return Some(ue_not_reachable_error());
         }
         // #749: paging is ongoing for another transfer; overwriting its context
-        // would lose that one, so this one is refused for the PCF to retry.
-        if crate::namf_handler::paging_ongoing(ue.id) {
-            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
-            return Some(paging_ongoing_error());
-        }
-        let location = crate::namf_handler::page_idle_ue_for_n1(
+        // would lose that one, so this one is refused for the PCF to retry. #1837:
+        // checked and queued as one step, so a transfer racing this one cannot slip
+        // in between.
+        let Some(location) = crate::namf_handler::page_idle_ue_for_n1(
             ue,
             updp_pdu,
             crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
             failure_uri,
-        );
+        ) else {
+            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
+            return Some(paging_ongoing_error());
+        };
         log::info!("[{ue_context_id}] UE policy: UE is CM-IDLE, paging it for the UPDP");
         let body = json!({ "cause": "ATTEMPTING_TO_REACH_UE" });
         return Some(match SbiResponse::with_status(202).with_json_body(&body) {
@@ -8227,31 +8456,44 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
         Err(resp) => return *resp,
     };
 
-    let mcast = crate::context::amf_mcast();
-    // Idempotent on the TMGI: a repeated ContextCreate returns the existing
-    // context rather than allocating a second one for the same session.
-    let session = match mcast.session_find_by_tmgi(&tmgi) {
-        Some(existing) => existing,
-        None => {
-            let Some(created) = mcast.session_create(tmgi.clone(), 1, None, Vec::new()) else {
+    // #1818: each ContextCreate gets a context of its own on the MBS session the
+    // TMGI names, so its ContextDelete releases only what it created. A repeat
+    // from the same MB-SMF (`mbsmfId`) for the same TMGI is a retry and gets the
+    // same context back rather than a second one.
+    let mbsmf_id = body.get("mbsmfId").and_then(Value::as_str);
+    let (context_ref, session) =
+        match crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id) {
+            Ok(created) => created,
+            // #1856: bounded, with the TS 29.500 cause for it.
+            Err(crate::ngap_mcast::BroadcastCreateRefused::Full) => {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    &format!(
+                        "this AMF holds {} broadcast MBS contexts",
+                        crate::ngap_mcast::MAX_BROADCAST_CONTEXTS
+                    ),
+                    Some("INSUFFICIENT_RESOURCES"),
+                );
+            }
+            Err(crate::ngap_mcast::BroadcastCreateRefused::Failed) => {
                 return send_error(
                     500,
                     "Internal Server Error",
                     "could not create the MBS session context",
                     None,
                 );
-            };
-            created
-        }
-    };
+            }
+        };
 
     log::info!(
-        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={}",
+        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={context_ref} session={}",
         tmgi.service_id_u32(),
         session.mbs_session_id,
     );
 
-    let context_ref = format!("{}", session.mbs_session_id);
+    // #1856: `<epoch>-<id>`, unique across restarts of this AMF.
+    let context_ref = crate::ngap_mcast::context_ref_string(context_ref);
     let response_body = json!({ "mbsContextRef": context_ref });
 
     // 201 with a Location header naming the created resource (TS 29.518 §6.5).
@@ -8273,16 +8515,22 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
 /// does not hold, which the MB-SMF treats as already gone, so a repeated delete is
 /// harmless. As ContextCreate drives no N2 Broadcast Session Setup in this tree, the
 /// delete drives no Broadcast Session Release either.
+///
+/// #1818: it removes the CONTEXT, and the MBS session under it only when no other
+/// broadcast context rides on it and a ContextCreate created it. It used to remove
+/// the session by its id outright, tearing down a TMGI-shared session another
+/// context or an NGAP multicast session still used.
 fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
-    let removed = context_ref
-        .parse::<u64>()
-        .ok()
-        .and_then(|id| crate::context::amf_mcast().session_remove(id));
-    match removed {
-        Some(session) => {
+    // #1856: a ref of another epoch (issued before a restart) is not found.
+    let released = crate::ngap_mcast::parse_context_ref(context_ref)
+        .and_then(|id| crate::context::amf_mcast().broadcast_context_delete(id));
+    match released {
+        Some(release) => {
             log::info!(
-                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x}",
-                session.tmgi.service_id_u32()
+                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x?} \
+                 session_removed={}",
+                release.tmgi.as_ref().map(Tmgi::service_id_u32),
+                release.session_removed
             );
             SbiResponse::with_status(204)
         }
@@ -8691,6 +8939,8 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            one_time: false,
+            first_location_pending: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -11265,8 +11515,8 @@ mod tests {
     async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000017481";
-        // CM-IDLE: a UE-AMBR change for a CM-CONNECTED UE is refused (see
-        // `a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748`).
+        // CM-IDLE (a CM-CONNECTED UE: see
+        // `a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776`).
         let _ue = setup_ue(supi, false, true);
         let body = am_data_change(
             supi,
@@ -11346,9 +11596,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_sdm_data_change_notification_applies_nothing_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017483";
-        // CM-IDLE, so the UE-AMBR change beside each refused one is applicable.
-        let _ue = setup_ue(supi, false, true);
+        // #1776: CM-CONNECTED, so the UE-AMBR change beside each refused one would be
+        // queued for a UE Context Modification were it applied.
+        let ue = setup_ue(supi, true, true);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
         let token = format!("sdm-{supi}");
         let kept = json!({
             "subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"},
@@ -11425,6 +11683,10 @@ mod tests {
             400
         );
         assert_eq!(sdm_view(supi), before, "nothing applied");
+        assert!(
+            !queued(),
+            "#1776: a refused notification queues no modification"
+        );
         // The S-NSSAIs unchanged: applied (the slices are compared, not the body).
         let same = am_data_change(
             supi,
@@ -11433,19 +11695,26 @@ mod tests {
         );
         assert_eq!(post_sdm_notify(supi, Some(&token), &same).await.status, 204);
         assert_eq!(sdm_view(supi).0, 9_000_000, "applied");
+        assert!(queued(), "#1776: and its UE-AMBR change queued");
+        amf_self()
+            .read()
+            .expect("ctx")
+            .ue_ambr_modification_remove_for(&[ue.id]);
     }
 
-    /// #1748 (R11 MAJOR-2, TS 23.502 §4.5.1): for a CM-CONNECTED UE, NG-RAN enforces
-    /// the UE-AMBR it was given, and this AMF does not send the UE Context
-    /// Modification that would move it, so a change of the subscribed UE-AMBR is
-    /// refused with 400 and nothing is applied, the GPSI change beside it included.
-    /// A change that leaves the UE-AMBR as it is is applied.
+    /// #1776 (lifts #1748 R11 MAJOR-2, TS 23.502 §4.5.1): a change of the subscribed
+    /// UE-AMBR for a CM-CONNECTED UE is applied and answered 204, with the GPSI
+    /// change beside it, and the UE is queued once for the NGAP task's UE Context
+    /// Modification. A change that leaves the UE-AMBR as it is (a GPSI-only change,
+    /// a retry of the same notification) queues nothing.
     ///
-    /// REVERT-VERIFIED: with `cm_connected` passed as `false` from the handler, the
-    /// refusal is a 204 and the UE-AMBR changes.
+    /// REVERT-VERIFIED: with the `ue_ambr_modification_add` call removed from the
+    /// handler, the "queued" assertion fails; with it made unconditional (any applied
+    /// change), the "a GPSI-only change" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748() {
+    async fn a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017488";
         let ue = setup_ue(supi, true, true);
         {
@@ -11460,8 +11729,29 @@ mod tests {
             });
         }
         assert!(ue_ng_connected(&ue), "CM-CONNECTED");
-        let before = sdm_view(supi);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
+        let dequeue = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_remove_for(&[ue.id])
+        };
+        dequeue();
         let token = format!("sdm-{supi}");
+        let gpsi_only = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917489"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
+            204
+        );
+        assert!(!queued(), "a GPSI-only change queues no modification");
         let body = am_data_change(
             supi,
             json!([
@@ -11471,18 +11761,15 @@ mod tests {
             ]),
         );
         let resp = post_sdm_notify(supi, Some(&token), &body).await;
-        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
-        assert_eq!(problem_cause(&resp), "UNSPECIFIED_MSG_FAILURE");
-        assert_eq!(sdm_view(supi), before, "nothing applied");
-        let gpsi_only = am_data_change(
-            supi,
-            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]}]),
-        );
-        assert_eq!(
-            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
-            204
-        );
-        assert_eq!(sdm_view(supi).2.as_deref(), Some("msisdn-4917488"));
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let (ul, dl, gpsi, _, _) = sdm_view(supi);
+        assert_eq!((ul, dl), (5_000_000, 10_000_000), "the new UE-AMBR is held");
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917488"));
+        assert!(queued(), "queued for the UE Context Modification");
+        dequeue();
+        // The UDM's retry of the same notification: 204, and nothing more to send.
+        assert_eq!(post_sdm_notify(supi, Some(&token), &body).await.status, 204);
+        assert!(!queued(), "a retry queues no second modification");
     }
 
     /// #1748: a notification is acted on only with the UE's current SDM subscription
@@ -12321,6 +12608,8 @@ mod tests {
     /// MB-SMF consumer got 404 RESOURCE_URI_STRUCTURE_NOT_FOUND here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mbs_n2_message_transfer_is_served_rather_than_404() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-comm/v1/n2-messages/transfer")
             .with_json_body(&mbs_tmgi_body("001", "01", "0000AB"))
             .expect("json")
@@ -12337,10 +12626,13 @@ mod tests {
         assert_eq!(body_json(&resp)["result"], json!("N2_NOT_SENT"));
     }
 
-    /// ContextCreate allocates a context, and a REPEAT for the same TMGI returns
-    /// the SAME ref rather than leaking a second session.
+    /// ContextCreate allocates a context, and a REPEAT for the same TMGI (from the
+    /// same MB-SMF: neither names an `mbsmfId`, #1818) returns the SAME ref rather
+    /// than leaking a second context.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mbs_context_create_is_idempotent_on_the_tmgi() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let body = mbs_tmgi_body("001", "01", "00CAFE");
         let post = || {
             SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
@@ -12369,6 +12661,8 @@ mod tests {
     /// 201 status alone cannot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_created_mbs_context_is_reachable_by_its_ngap_tmgi() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&mbs_tmgi_body("001", "01", "00BEEF"))
             .expect("json");
@@ -12385,11 +12679,58 @@ mod tests {
         );
     }
 
+    /// **#1856**: an `mbsContextRef` is `<epoch>-<id>`, the epoch this AMF
+    /// instance's own. A ref of another epoch (one an earlier run of this AMF
+    /// issued, whose counter restarted at 1) is 404 CONTEXT_NOT_FOUND and deletes
+    /// nothing, even when its number names a live context now.
+    ///
+    /// REVERT-VERIFIED: with `parse_context_ref` ignoring the epoch, the stale ref
+    /// deletes the live context ("a pre-restart ref is not found").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ref_from_before_a_restart_deletes_nothing_1856() {
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
+        let created = namf_request_handler(
+            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+                .with_json_body(&mbs_tmgi_body("001", "01", "001856"))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(created.status, 201);
+        let context_ref = body_json(&created)["mbsContextRef"]
+            .as_str()
+            .expect("mbsContextRef")
+            .to_string();
+        let (epoch, id) = context_ref.split_once('-').expect("<epoch>-<id>");
+        assert_eq!(epoch.len(), 8, "{context_ref}");
+        let stale_epoch = if epoch == "00000000" {
+            "00000001"
+        } else {
+            "00000000"
+        };
+        let stale = format!("{stale_epoch}-{id}");
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{stale}"
+        )))
+        .await;
+        assert_eq!(resp.status, 404, "a pre-restart ref is not found");
+        assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
+        let held = crate::ngap_mcast::parse_context_ref(&context_ref)
+            .and_then(|id| crate::context::amf_mcast().broadcast_context_find(id));
+        assert!(held.is_some(), "the live context is untouched");
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
+        )))
+        .await;
+        assert_eq!(resp.status, 204);
+    }
+
     /// #1758: ContextDelete removes the broadcast MBS context ContextCreate made,
     /// and a second delete (or an unknown reference) is 404 CONTEXT_NOT_FOUND, which
     /// the MB-SMF treats as gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_delete_removes_the_broadcast_mbs_context_1758() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&mbs_tmgi_body("001", "01", "001758"))
             .expect("json");
@@ -12399,14 +12740,18 @@ mod tests {
             .as_str()
             .expect("mbsContextRef")
             .to_string();
-        let id: u64 = context_ref.parse().expect("numeric ref");
-        assert!(crate::context::amf_mcast().session_find(id).is_some());
+        let id = crate::ngap_mcast::parse_context_ref(&context_ref).expect("this AMF's ref");
+        assert!(crate::context::amf_mcast()
+            .broadcast_context_find(id)
+            .is_some());
 
         let path = format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}");
         let deleted = namf_request_handler(SbiRequest::delete(&path)).await;
         assert_eq!(deleted.status, 204);
         assert!(
-            crate::context::amf_mcast().session_find(id).is_none(),
+            crate::context::amf_mcast()
+                .broadcast_context_find(id)
+                .is_none(),
             "the AMF holds no context after ContextDelete"
         );
         assert!(crate::context::amf_mcast()
@@ -12423,12 +12768,123 @@ mod tests {
         }
     }
 
+    /// POST a ContextCreate for `svc` (mcc 001, mnc 01), from `mbsmf_id` if given,
+    /// and return its `mbsContextRef`.
+    async fn create_mbs_context_1818(svc: &str, mbsmf_id: Option<&str>) -> String {
+        let mut body = mbs_tmgi_body("001", "01", svc);
+        if let Some(id) = mbsmf_id {
+            body["mbsmfId"] = json!(id);
+        }
+        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+            .with_json_body(&body)
+            .expect("json");
+        let created = namf_request_handler(req).await;
+        assert_eq!(created.status, 201);
+        body_json(&created)["mbsContextRef"]
+            .as_str()
+            .expect("mbsContextRef")
+            .to_string()
+    }
+
+    async fn delete_mbs_context_1818(context_ref: &str) -> u16 {
+        namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
+        )))
+        .await
+        .status
+    }
+
+    /// #1818: a ContextDelete does not remove an MBS session the NGAP multicast
+    /// path created and shares by TMGI. The broadcast context joins it, and its
+    /// delete releases the context only; the multicast session (and its gNB
+    /// state) is still held.
+    ///
+    /// REVERT-VERIFIED: with the `owned` check dropped from
+    /// `broadcast_context_delete`, the multicast session is removed and the
+    /// "multicast session survives" assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
+        let tmgi = Tmgi::new(0x181800, [0x00, 0xF1, 0x10]);
+        let mcast = crate::context::amf_mcast();
+        let multicast = mcast
+            .session_create(tmgi.clone(), 1, None, vec![1])
+            .expect("multicast session");
+        mcast.session_activate(
+            multicast.mbs_session_id,
+            crate::ngap_mcast::McastTransportInfo {
+                dl_teid: 0x1818,
+                transport_addr: std::net::Ipv4Addr::new(239, 0, 18, 18),
+            },
+            &[1818],
+        );
+
+        let context_ref = create_mbs_context_1818("181800", None).await;
+        let joined = mcast
+            .broadcast_context_find(
+                crate::ngap_mcast::parse_context_ref(&context_ref).expect("ref"),
+            )
+            .expect("the broadcast context is held");
+        assert_eq!(
+            joined.session_id, multicast.mbs_session_id,
+            "the broadcast context joins the multicast session sharing its TMGI"
+        );
+        assert_eq!(delete_mbs_context_1818(&context_ref).await, 204);
+
+        let kept = mcast
+            .session_find(multicast.mbs_session_id)
+            .expect("the multicast session survives the broadcast ContextDelete");
+        assert_eq!(kept.gnb_sessions.len(), 1, "with its gNB state");
+        assert_eq!(
+            mcast.session_find_by_tmgi(&tmgi).map(|s| s.mbs_session_id),
+            Some(multicast.mbs_session_id)
+        );
+        assert_eq!(delete_mbs_context_1818(&context_ref).await, 404);
+        mcast.session_remove(multicast.mbs_session_id);
+    }
+
+    /// #1818: two MB-SMFs' contexts on one TMGI share the session; the first
+    /// delete keeps it for the second, the last delete removes it. A repeat from
+    /// the same MB-SMF is a retry and gets its own context back.
+    ///
+    /// REVERT-VERIFIED: with the `shared` check dropped, the first delete removes
+    /// the session and the "kept for the other context" assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_broadcast_context_on_a_tmgi_removes_its_session_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
+        let tmgi = Tmgi::new(0x181801, [0x00, 0xF1, 0x10]);
+        let mcast = crate::context::amf_mcast();
+        let a = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
+        let a_again = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
+        assert_eq!(
+            a, a_again,
+            "a retry from the same MB-SMF is the same context"
+        );
+        let b = create_mbs_context_1818("181801", Some("mbsmf-b")).await;
+        assert_ne!(a, b, "another MB-SMF gets a context of its own");
+
+        assert_eq!(delete_mbs_context_1818(&a).await, 204);
+        assert!(
+            mcast.session_find_by_tmgi(&tmgi).is_some(),
+            "kept for the other context"
+        );
+        assert_eq!(delete_mbs_context_1818(&b).await, 204);
+        assert!(
+            mcast.session_find_by_tmgi(&tmgi).is_none(),
+            "the last context removes the session it created"
+        );
+    }
+
     /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is
     /// `anyOf [tmgi, ssm]`, but the AMF's NGAP `MBS-SessionID` carries a TMGI and
     /// no SSM-to-TMGI mapping is defined -- inventing one would drive the wrong
     /// session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ssm_only_mbs_session_id_is_refused_rather_than_mapped() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&json!({
                 "mbsSessionId": {
@@ -12446,6 +12902,8 @@ mod tests {
     /// The OpenAPI pins `pattern: '^[A-Fa-f0-9]{6}$'`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_malformed_mbs_service_id_is_a_400() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         for bad in ["ZZZZZZ", "ABC", "0000ABCD"] {
             let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
                 .with_json_body(&json!({
@@ -16806,6 +17264,8 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            one_time: false,
+            first_location_pending: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };

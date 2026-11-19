@@ -2484,6 +2484,9 @@ async fn a_queued_transfer_waits_for_a_paging_already_ongoing() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // #1693: this test adds pages to, or pumps, the process-global paging map.
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+    // #1837: the queued transfer's own page is built (and refused) under the lock,
+    // which reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_749_011u64, 64, "imsi-001010007490011");

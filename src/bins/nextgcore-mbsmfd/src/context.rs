@@ -135,6 +135,10 @@ pub struct AmfMbsContext {
     pub port: u16,
     pub nf_instance_id: Option<String>,
     pub context_ref: String,
+    /// #1854: the TMGI it was created for, so its delete takes the same
+    /// (AMF, TMGI) lane as a create for that TMGI ([`crate::lane`]). `None` when
+    /// unknown.
+    pub tmgi: Option<Tmgi>,
 }
 
 /// MBS Session Context (TS 23.247 5.3)
@@ -637,9 +641,24 @@ impl MbSmfContext {
         };
         let list = map.entry(id).or_default();
         if !list.contains(&context) {
-            list.push(context);
+            list.push(context.clone());
         }
+        drop(map);
+        drop(session_list);
+        // R24: the AMF hands a session reusing a released session's TMGI the same
+        // `mbsContextRef`, so a parked delete of it must not run.
+        crate::reconcile::unpark(&context);
         true
+    }
+
+    /// R24: whether a live session holds the AMF context `c` (same AMF, same
+    /// `mbsContextRef`).
+    pub fn amf_context_in_use(&self, c: &AmfMbsContext) -> bool {
+        self.amf_contexts.lock().is_ok_and(|m| {
+            m.values()
+                .flatten()
+                .any(|h| h.host == c.host && h.port == c.port && h.context_ref == c.context_ref)
+        })
     }
 
     /// #1758: take every AMF MBS context recorded for session `id`, for its release.

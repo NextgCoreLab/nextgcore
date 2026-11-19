@@ -4092,6 +4092,9 @@ mod tests {
     // -- lmfd-01: apiName routing (nlmf-loc dispatches; nlmf-location 404) ---
     #[tokio::test]
     async fn test_router_nlmf_loc_dispatches() {
+        // #1884: the fix it seeds is process state a sibling's `lmf_context_init`
+        // now clears, so it holds the lock between seeding and reading.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // A real measurement-derived fix must exist for a non-fabricating 200.
         seed_fix("imsi-001010000000099", 40.0);
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
@@ -5652,6 +5655,42 @@ lmf:
             detail.contains("lmf.positioning.cells"),
             "the detail must name the configuration to provision, not just say 'failed'; got \
              {detail}"
+        );
+    }
+
+    /// #1884: a test's context init forgets the UEs' last fixes. A fix cached
+    /// before the init (here, what the velocity test leaves for its SUPI) must not
+    /// answer a DetermineLocation made after it. That is the order that turned
+    /// `determine_location_with_no_reference_points_refuses_and_says_why`'s 500
+    /// into a 200 under `--shuffle`.
+    ///
+    /// REVERT-VERIFIED: without the `ue_locations` clear in `lmf_context_init`,
+    /// this fails "the fix cached before the init is gone".
+    #[tokio::test]
+    async fn a_test_s_context_init_forgets_the_cached_fixes_1884() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let supi = "imsi-001010000001884";
+        lmf_context_init(1024);
+        seed_fix_displaced(supi, 37.5000, -122.3, 1_000);
+        seed_fix_displaced(supi, 37.5010, -122.3, 1_010);
+        assert!(lmf_self().read().unwrap().ue_location_get(supi).is_some());
+
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .expect("context")
+            .clear_cell_registry_for_test();
+        assert!(
+            lmf_self().read().unwrap().ue_location_get(supi).is_none(),
+            "the fix cached before the init is gone"
+        );
+        let body = format!(r#"{{"supi":"{supi}","locationQoS":{{"hAccuracy":5.0}}}}"#);
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(&body, "application/json");
+        assert_eq!(
+            handle_determine_location(&req).await.status,
+            500,
+            "no reference points and no cache: the request is refused"
         );
     }
 
@@ -7330,7 +7369,13 @@ mod a8_event_notify_tests {
             .insert(path.to_string(), status);
     }
 
+    /// The H-GMLC sink is a loopback plaintext peer, and the notification client
+    /// follows the SBI profile (#1666), so every test that POSTs to it runs as a
+    /// dev deployment. Before #1884 only `test_post_event_notify_strict_peer_204`
+    /// set the override itself. The three periodic-LDR tests passed only when a
+    /// sibling had already set it, and alone each got no callback at all.
     async fn start_sink() -> (SbiServer, u16) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = port_addr.port();
         let cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
@@ -7907,6 +7952,9 @@ mod positioning_chain_strict_peer {
         use crate::nrppa_uplink::test_support::{ecid_report, nr_cgi, rsrp, splice_ie};
         use nextgcore_nrppa_gen::generated as gen;
 
+        // #1884: amfd's Namf consumer is a loopback plaintext peer, i.e. a dev
+        // deployment. Without the override it relied on a sibling having set it.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         lmf_context_init(1024);
@@ -9826,6 +9874,9 @@ mod callback_tokens_1518 {
     /// in flight after the abort and a fresh start is refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_subscribe_leaves_nothing_in_flight_1518() {
+        // #1884: the subscribe goes to a loopback plaintext AMF, i.e. a dev
+        // deployment. Without the override it relied on a sibling having set it.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         lmf_self()

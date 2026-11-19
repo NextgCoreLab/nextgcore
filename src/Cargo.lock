@@ -3425,6 +3425,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3446,6 +3447,7 @@ dependencies = [
  "nextgcore-dbi",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "nextgcore-udrd",
  "p256",
  "proptest",
  "serde",
@@ -3517,6 +3519,7 @@ dependencies = [
  "mongodb",
  "nextgcore-core",
  "nextgcore-dbi",
+ "nextgcore-sbi",
  "rustls 0.23.36",
  "rustls-pemfile 2.2.0",
  "serde",

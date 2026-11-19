@@ -67,6 +67,7 @@ use std::time::Duration;
 
 mod actuation; // #284: derivation + PCF actuation for stored TSC configurations
 mod context;
+mod reconcile; // #1817: PCF app-session Deletes that outlived their retry budget
 
 pub use context::*;
 
@@ -103,6 +104,17 @@ pub(crate) fn attach_oauth2(
         Some(oauth2) => client.with_oauth2(oauth2, target),
         None => client,
     }
+}
+
+/// #1817: what `/metrics` serves: the families every NF shares and the reconciler's.
+fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "tsctsf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    reconcile::render(&mut out);
+    out
 }
 
 /// #1754: spawn `fut` on its own task, so dropping the caller (a consumer that
@@ -418,6 +430,19 @@ async fn main() -> Result<()> {
         }
         Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
+
+    // #1817: retry the PCF app-session Deletes that outlived their retry budget.
+    let _reconciler = reconcile::spawn_reconciler();
+
+    // #1817: the Prometheus endpoint (the reconciler's gauge and counter beside the
+    // common families), on NEXTGCORE_METRICS_BIND (loopback by default) and
+    // TSCTSF_METRICS_PORT (9090). Non-fatal, like every NF's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "TSCTSF",
+        "TSCTSF_METRICS_PORT",
+        Arc::new(render_prometheus),
+    )
+    .await;
 
     log::info!("NextGCore TSCTSF ready (instance: {nf_instance_id})");
 
@@ -2311,6 +2336,100 @@ mod tests {
             actuation::set_for_test(false);
             reset_actuation(None);
             server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1817: a PCF that comes back AFTER the Delete's retry budget still gets the
+    /// Delete. Every fast retry is refused, the resource is parked with its
+    /// `appSessionId` kept, a reconcile pass that is still refused keeps it, and the
+    /// next pass delivers it.
+    ///
+    /// REVERT-VERIFIED: with `crate::reconcile::park(resource_id)` removed from the
+    /// retry task, nothing is parked and the "parked after the budget" wait times
+    /// out.
+    #[test]
+    fn a_pcf_back_after_the_retry_budget_still_gets_the_delete_1817() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let budget = actuation::DELETE_RETRY_DELAYS.len() + 1;
+            let refusals = vec![503u16; budget + 1];
+            let (server, port, pcf) = spawn_scripted_pcf(None, &refusals).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+            let before = reconcile::RECONCILED.get(&["deleted"]);
+
+            let created = tsctsf_sbi_request_handler(time_sync_create_1754()).await;
+            assert_eq!(created.status, 201);
+            let config_id = only_config_id();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            eventually("the Delete is parked after the budget", || {
+                reconcile::pending_count() == 1
+            })
+            .await;
+            assert_eq!(pcf.deletes(), budget);
+            assert_eq!(
+                actuation::app_session_for(&config_id).as_deref(),
+                Some("asc-1754")
+            );
+
+            assert_eq!(reconcile::reconcile_once().await, 0, "still refused");
+            assert_eq!(reconcile::pending_count(), 1, "kept, not dropped");
+
+            assert_eq!(reconcile::reconcile_once().await, 1, "the PCF accepts");
+            assert_eq!(pcf.deletes(), budget + 2);
+            assert_eq!(reconcile::pending_count(), 0);
+            assert!(actuation::app_session_for(&config_id).is_none());
+            assert_eq!(reconcile::RECONCILED.get(&["deleted"]), before + 1);
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// R24 (#1817 review): one pass sends for at most `MAX_PASS`. Against a
+    /// blackholed PCF the resources it does not reach are re-parked for the next.
+    ///
+    /// REVERT-VERIFIED: with the deadline check removed, the pass runs for every
+    /// resource's client timeout ("the pass is bounded").
+    #[test]
+    fn a_pass_against_a_blackholed_pcf_is_bounded_1817() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            // Accepts connections and never answers.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hole = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    held.push(s);
+                }
+            });
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            reset_actuation(Some(port));
+            for n in 0..6 {
+                let id = format!("hole-{n}");
+                actuation::record_app_session_for_test(&id, &format!("asc-{n}"));
+                reconcile::park(id);
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(reconcile::reconcile_once().await, 0);
+            assert!(
+                started.elapsed() < reconcile::MAX_PASS + Duration::from_secs(4),
+                "the pass is bounded: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(reconcile::pending_count(), 6, "every resource re-parked");
+            hole.abort();
+            reset_actuation(None);
         });
     }
 

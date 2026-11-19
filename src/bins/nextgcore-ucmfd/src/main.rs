@@ -35,6 +35,7 @@
 //!   with no format, so the encoding is still this UCMF's choice.
 
 mod context;
+mod owner_binding; // #1862: a subscription is cancelled by its creator only
 mod rac;
 mod racs_id;
 
@@ -767,7 +768,7 @@ fn handle(
             _ => (send_method_not_allowed(method, "subscriptions"), Vec::new()),
         },
         [UECM_API, "v1", "subscriptions", id] => match method {
-            "DELETE" => (unsubscribe(&mut write_state(ucmf), id), Vec::new()),
+            "DELETE" => (unsubscribe(&mut write_state(ucmf), id, request), Vec::new()),
             _ => (
                 send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
                 Vec::new(),
@@ -1155,7 +1156,12 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         },
     };
     let nf_id = json.get("nfId").and_then(Value::as_str).map(str::to_string);
-    let sub = match u.subscribe(nf_id, uri.to_string(), suggested, now) {
+    // #1862: bound to the identity this process verified, not the claimed nfId.
+    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    let sub = match u.subscribe_owned(nf_id, uri.to_string(), suggested, now, owner) {
         Ok(sub) => sub,
         // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
         Err(e) => {
@@ -1203,8 +1209,16 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         .unwrap_or_else(|e| send_internal_error(&format!("encoding CreatedSubscription: {e}")))
 }
 
-/// TS 29.673 §5.2.2.5 Unsubscribe.
-fn unsubscribe(u: &mut Ucmf, id: &str) -> SbiResponse {
+/// TS 29.673 §5.2.2.5 Unsubscribe, by the consumer that subscribed only
+/// (#1862): another NF gets 403 and the subscription stays.
+fn unsubscribe(u: &mut Ucmf, id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Some(sub) = u.subscription(id) {
+        if let Some(refused) =
+            owner_binding::refuse_non_owner(sub.owner.as_deref(), request, "Unsubscribe")
+        {
+            return refused;
+        }
+    }
     if u.unsubscribe(id) {
         SbiResponse::no_content()
     } else {
@@ -1701,7 +1715,11 @@ mod tests {
         let (r, _) = handle(&u, &sub, now());
         assert_eq!(r.status, 201);
         let location = r.http.get_header("Location").cloned().unwrap();
-        assert!(location.ends_with("/nucmf-uecm/v1/subscriptions/1"));
+        let id = location
+            .strip_prefix(&format!("{}/nucmf-uecm/v1/subscriptions/", api_root()))
+            .expect("Location names the subscription")
+            .to_string();
+        assert_eq!(id.len(), 32, "#1862: not a sequential id: {id}");
         assert_eq!(body(&r)["dicEntryId"], 0);
         assert!(body(&r)["confirmedExpires"].is_string());
 
@@ -1711,9 +1729,10 @@ mod tests {
         assert_eq!(notes[0].body["eventType"], "CREATION_OF_DICTIONARY_ENTRY");
         assert_eq!(notes[0].body["dicEntryId"], 1);
 
-        let (r, _) = handle(&u, &req("DELETE", "/nucmf-uecm/v1/subscriptions/1"), now());
+        let doc = format!("/nucmf-uecm/v1/subscriptions/{id}");
+        let (r, _) = handle(&u, &req("DELETE", &doc), now());
         assert_eq!(r.status, 204);
-        let (r, _) = handle(&u, &req("DELETE", "/nucmf-uecm/v1/subscriptions/1"), now());
+        let (r, _) = handle(&u, &req("DELETE", &doc), now());
         assert_eq!(
             (r.status, cause(&r)),
             (404, json!("SUBSCRIPTION_NOT_FOUND"))
@@ -1723,6 +1742,80 @@ mod tests {
             json!({"nfId": "a1"}),
         );
         assert_eq!(handle(&u, &bad, now()).0.status, 400);
+    }
+
+    const AMF_A_1862: &str = "aaaaaaaa-1862-4000-8000-00000000000a";
+    const AMF_B_1862: &str = "bbbbbbbb-1862-4000-8000-00000000000b";
+
+    fn as_nf_1862(mut r: SbiRequest, who: Option<&str>) -> SbiRequest {
+        r.oauth2_subject = who.map(str::to_string);
+        r
+    }
+
+    /// #1862, TS 29.673 §5.2.2.5 / TS 33.501 §13.4.1: a subscription is bound to
+    /// the verified identity that created it, not to its self-declared `nfId`.
+    /// Another NF, or an anonymous caller, gets 403 and the AMF keeps hearing
+    /// about dictionary changes; the owner unsubscribes.
+    #[test]
+    fn only_the_subscriber_unsubscribes_1862() {
+        let u = ucmf();
+        let sub = as_nf_1862(
+            with_json(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                // The nfId claims B's identity: it must not become the owner.
+                json!({"ucmfNotificationUri": "http://amf-a:7777/racs-notify", "nfId": AMF_B_1862}),
+            ),
+            Some(AMF_A_1862),
+        );
+        let (r, _) = handle(&u, &sub, now());
+        assert_eq!(r.status, 201);
+        let location = r.http.get_header("Location").cloned().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let doc = format!("/nucmf-uecm/v1/subscriptions/{id}");
+
+        for who in [Some(AMF_B_1862), None] {
+            let (r, _) = handle(&u, &as_nf_1862(req("DELETE", &doc), who), now());
+            assert_eq!(r.status, 403, "{who:?}");
+            assert!(
+                body(&r)["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("belongs to NF instance {AMF_A_1862}")),
+                "{who:?}: {}",
+                body(&r)
+            );
+        }
+        // Still subscribed: the next dictionary entry is notified to A.
+        let (_, notes) = handle(&u, &assign_request("35123456", &[1]), now());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].uris, ["http://amf-a:7777/racs-notify"]);
+
+        let (r, _) = handle(
+            &u,
+            &as_nf_1862(req("DELETE", &doc), Some(AMF_A_1862)),
+            now(),
+        );
+        assert_eq!(r.status, 204, "the subscriber unsubscribes");
+        let (_, notes) = handle(&u, &assign_request("35123457", &[2]), now());
+        assert!(notes.is_empty(), "and is no longer notified");
+    }
+
+    /// #1862: a caller whose token and certificate disagree subscribes nothing.
+    #[test]
+    fn disagreeing_identities_subscribe_nothing_1862() {
+        let u = ucmf();
+        let mut r = as_nf_1862(
+            with_json(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                json!({"ucmfNotificationUri": "http://amf-a:7777/racs-notify"}),
+            ),
+            Some(AMF_A_1862),
+        );
+        r.peer_cert_nf_instance_id = Some(AMF_B_1862.to_string());
+        let (r, _) = handle(&u, &r, now());
+        assert_eq!(r.status, 403);
+        let (_, notes) = handle(&u, &assign_request("35123456", &[1]), now());
+        assert!(notes.is_empty(), "no subscription was created");
     }
 
     const MAN: &str = "000007ed900000000abc";

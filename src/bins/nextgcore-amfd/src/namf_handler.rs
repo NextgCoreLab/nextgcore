@@ -332,16 +332,6 @@ pub enum NamfHandlerError {
 /// retried transfer goes to a CM-CONNECTED UE) or is still being paged.
 pub const PAGING_ONGOING_RETRY_AFTER_S: u64 = 2;
 
-/// Whether a paging procedure is ongoing for `amf_ue_ngap_id` (#749). The AMF
-/// keeps no ARP priority per paging, so every transfer counts as the same
-/// priority as the one being paged for.
-pub(crate) fn paging_ongoing(amf_ue_ngap_id: u64) -> bool {
-    amf_self()
-        .read()
-        .ok()
-        .is_some_and(|c| c.paging_find(amf_ue_ngap_id).is_some())
-}
-
 /// Namf handler result
 pub type NamfHandlerResult<T> = Result<T, NamfHandlerError>;
 
@@ -385,11 +375,9 @@ pub fn handle_n1_n2_message_transfer(
                 // (TS 23.501 §5.3.3.2.2), NOT the security flag, which a registered
                 // idle UE still has.
                 if cm_idle {
-                    if paging_ongoing(amf_ue.id) {
-                        return Err(NamfHandlerError::PagingOngoing);
-                    }
-                    cause = N1N2MessageTransferCause::AttemptingToReachUe;
-                    initiate_paging_for_idle_ue(
+                    // #1837: check-and-queue as one step (`AmfContext::paging_add`), so a
+                    // transfer racing this one cannot overwrite it, or be overwritten.
+                    if !initiate_paging_for_idle_ue(
                         amf_ue,
                         Some(sess),
                         req_data.n1_message.clone(),
@@ -397,7 +385,10 @@ pub fn handle_n1_n2_message_transfer(
                         PagedN2::Setup,
                         req_data.pdu_session_id,
                         req_data.n1n2_failure_txf_notif_uri.as_deref(),
-                    );
+                    ) {
+                        return Err(NamfHandlerError::PagingOngoing);
+                    }
+                    cause = N1N2MessageTransferCause::AttemptingToReachUe;
                 }
             }
             NgapIeType::PduResModReq => {
@@ -414,11 +405,9 @@ pub fn handle_n1_n2_message_transfer(
                     ));
                 }
                 if cm_idle {
-                    if paging_ongoing(amf_ue.id) {
-                        return Err(NamfHandlerError::PagingOngoing);
-                    }
-                    cause = N1N2MessageTransferCause::AttemptingToReachUe;
-                    initiate_paging_for_idle_ue(
+                    // #1837: check-and-queue as one step (`AmfContext::paging_add`), so a
+                    // transfer racing this one cannot overwrite it, or be overwritten.
+                    if !initiate_paging_for_idle_ue(
                         amf_ue,
                         Some(sess),
                         req_data.n1_message.clone(),
@@ -426,7 +415,10 @@ pub fn handle_n1_n2_message_transfer(
                         PagedN2::Modify,
                         req_data.pdu_session_id,
                         req_data.n1n2_failure_txf_notif_uri.as_deref(),
-                    );
+                    ) {
+                        return Err(NamfHandlerError::PagingOngoing);
+                    }
+                    cause = N1N2MessageTransferCause::AttemptingToReachUe;
                 }
             }
             NgapIeType::PduResRelCmd => {
@@ -435,11 +427,9 @@ pub fn handle_n1_n2_message_transfer(
                     if req_data.skip_ind {
                         cause = N1N2MessageTransferCause::N1MsgNotTransferred;
                     } else {
-                        if paging_ongoing(amf_ue.id) {
-                            return Err(NamfHandlerError::PagingOngoing);
-                        }
-                        cause = N1N2MessageTransferCause::AttemptingToReachUe;
-                        initiate_paging_for_idle_ue(
+                        // #1837: check-and-queue as one step (`AmfContext::paging_add`), so a
+                        // transfer racing this one cannot overwrite it, or be overwritten.
+                        if !initiate_paging_for_idle_ue(
                             amf_ue,
                             Some(sess),
                             req_data.n1_message.clone(),
@@ -447,7 +437,10 @@ pub fn handle_n1_n2_message_transfer(
                             PagedN2::Release,
                             req_data.pdu_session_id,
                             req_data.n1n2_failure_txf_notif_uri.as_deref(),
-                        );
+                        ) {
+                            return Err(NamfHandlerError::PagingOngoing);
+                        }
+                        cause = N1N2MessageTransferCause::AttemptingToReachUe;
                     }
                 } else {
                     log::debug!("Sending PDU session release command");
@@ -474,11 +467,9 @@ pub fn handle_n1_n2_message_transfer(
         if req_data.skip_ind {
             cause = N1N2MessageTransferCause::N1MsgNotTransferred;
         } else {
-            if paging_ongoing(amf_ue.id) {
-                return Err(NamfHandlerError::PagingOngoing);
-            }
-            cause = N1N2MessageTransferCause::AttemptingToReachUe;
-            initiate_paging_for_idle_ue(
+            // #1837: check-and-queue as one step (`AmfContext::paging_add`), so a
+            // transfer racing this one cannot overwrite it, or be overwritten.
+            if !initiate_paging_for_idle_ue(
                 amf_ue,
                 Some(sess),
                 req_data.n1_message.clone(),
@@ -486,7 +477,10 @@ pub fn handle_n1_n2_message_transfer(
                 PagedN2::Setup,
                 req_data.pdu_session_id,
                 req_data.n1n2_failure_txf_notif_uri.as_deref(),
-            );
+            ) {
+                return Err(NamfHandlerError::PagingOngoing);
+            }
+            cause = N1N2MessageTransferCause::AttemptingToReachUe;
         }
     }
 
@@ -740,6 +734,8 @@ pub fn handle_event_subscribe(
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        one_time: false,
+        first_location_pending: false,
         reporting_threshold: None,
         location_filters: subscription
             .location_filter_list
@@ -874,6 +870,22 @@ pub(crate) enum PagedN2 {
 /// Creates a PagingContext, stores it in the AMF context paging map,
 /// and marks the session paging as ongoing. The NGAP Paging message
 /// will be sent by the event loop timer when it processes paging entries.
+///
+/// #1837: returns `false`, and changes nothing (no page, no session paging state,
+/// no NWDAF query), when a page holding another transfer is already queued for the
+/// UE. The check and the insert are one step under the paging-map write lock
+/// ([`crate::context::AmfContext::paging_add`]), so of two transfers racing for one
+/// idle UE exactly one is queued and the other is refused (409
+/// HIGHER_PRIORITY_REQUEST_ONGOING, TS 23.502 §4.2.3.3 step 3b, which rejects a
+/// transfer of the same or a lower priority during a page; the AMF keeps no ARP
+/// priority per page, so every transfer counts as the same priority, #749).
+///
+/// #1760 review: a page started only for a LOCATION_REPORT subscription
+/// ([`PagingContext::location_only`]) holds no transfer and does not refuse one:
+/// TS 23.502 §4.2.3.3 pages the UE for the SMF's downlink data. The transfer takes
+/// that page over (keeping its waiting subscriptions and joined requesters), so the
+/// UE's answer both reactivates the session and is reported.
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn initiate_paging_for_idle_ue(
     amf_ue: &AmfUe,
@@ -883,7 +895,90 @@ pub(crate) fn initiate_paging_for_idle_ue(
     paged_n2: PagedN2,
     pdu_session_id: Option<u8>,
     failure_notify_uri: Option<&str>,
-) {
+) -> bool {
+    let paging_ctx = idle_ue_paging_context(
+        amf_ue,
+        pending_n1,
+        pending_n2,
+        paged_n2,
+        pdu_session_id,
+        failure_notify_uri,
+    );
+    queue_idle_ue_page(amf_ue, sess, paging_ctx, failure_notify_uri)
+}
+
+/// Queue `paging_ctx` for CM-IDLE `amf_ue` (see [`initiate_paging_for_idle_ue`]);
+/// `false`, with nothing changed, when a page holding a transfer is already queued.
+fn queue_idle_ue_page(
+    amf_ue: &AmfUe,
+    sess: Option<&mut AmfSess>,
+    paging_ctx: PagingContext,
+    failure_notify_uri: Option<&str>,
+) -> bool {
+    let (tmsi, tac, pdu_session_id) = (paging_ctx.tmsi, paging_ctx.tac, paging_ctx.pdu_session_id);
+
+    // Mark session as paging ongoing; keep the consumer's failure-notify
+    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
+    let location = paging_ctx.n1n2_msg_data_uri.clone();
+
+    // Store paging context in AMF global context. The NGAP server's paging pump
+    // (`NgapServer::process_paging`) sends the PAGING and runs T3513.
+    let queued = {
+        let ctx = amf_self();
+        let context = ctx.read().unwrap_or_else(|e| e.into_inner());
+        context.paging_add(paging_ctx)
+    };
+    if !queued {
+        return false;
+    }
+    start_paging_nwdaf_hint(amf_ue);
+    if let Some(sess) = sess {
+        sess.store_paging_info(&location, failure_notify_uri);
+    }
+
+    log::info!(
+        "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
+        amf_ue.supi.as_deref().unwrap_or("unknown"),
+        tmsi,
+        tac,
+        pdu_session_id
+    );
+    true
+}
+
+/// The SUPI to ask the NWDAF about for a page of `amf_ue`, under `nwdaf-mobility`
+/// (nextgsim#464, TS 23.501 §5.4.3.1); `None` otherwise.
+fn paging_nwdaf_supi(amf_ue: &AmfUe) -> Option<String> {
+    match (paging_strategy(), amf_ue.supi.as_deref()) {
+        (crate::context::PagingStrategy::NwdafMobility, Some(supi)) => Some(supi.to_string()),
+        _ => None,
+    }
+}
+
+/// nextgsim#464: start the NWDAF query for the page just queued for `amf_ue`. It
+/// starts once the context is queued, so its answer always finds it. When it does
+/// not start, the first PAGING is released now, to the registration area.
+pub(crate) fn start_paging_nwdaf_hint(amf_ue: &AmfUe) {
+    let Some(supi) = paging_nwdaf_supi(amf_ue) else {
+        return;
+    };
+    if !crate::nwdaf_mobility::spawn_hint(amf_ue.id, supi) {
+        if let Ok(context) = amf_self().read() {
+            context.paging_set_nwdaf_hint(amf_ue.id, None);
+        }
+    }
+}
+
+/// The paging context for CM-IDLE `amf_ue`, not yet queued (see
+/// [`initiate_paging_for_idle_ue`]).
+pub(crate) fn idle_ue_paging_context(
+    amf_ue: &AmfUe,
+    pending_n1: Option<Vec<u8>>,
+    pending_n2: Option<Vec<u8>>,
+    paged_n2: PagedN2,
+    pdu_session_id: Option<u8>,
+    failure_notify_uri: Option<&str>,
+) -> PagingContext {
     // Extract 5G-S-TMSI components from current GUTI
     let tmsi = amf_ue.current_guti.tmsi;
     let amf_set_id = amf_ue.current_guti.amf_set_id;
@@ -927,16 +1022,17 @@ pub(crate) fn initiate_paging_for_idle_ue(
         nwdaf_wait_until: None,
         nwdaf_predicted: None,
         nwdaf_last_cell: None,
+        location_report_subs: Vec::new(),
+        location_only: false,
+        joined_transfers: Vec::new(),
+        positioning_only: false,
     };
     let mut paging_ctx = paging_ctx;
     // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility`, the first PAGING
     // waits (bounded) for the NWDAF's UE mobility prediction. The query starts
-    // below, once the context is queued, so its answer always finds it.
-    let ask_nwdaf = match (paging_strategy(), amf_ue.supi.as_deref()) {
-        (crate::context::PagingStrategy::NwdafMobility, Some(supi)) => Some(supi.to_string()),
-        _ => None,
-    };
-    if ask_nwdaf.is_some() {
+    // once the context is queued (`start_paging_nwdaf_hint`), so its answer always
+    // finds it.
+    if paging_nwdaf_supi(amf_ue).is_some() {
         paging_ctx.nwdaf_wait_until =
             Some(std::time::Instant::now() + crate::nwdaf_mobility::HINT_TIMEOUT);
         // 0 is the never-learned default NCI (`namf_server::parse_ncgi`).
@@ -946,86 +1042,77 @@ pub(crate) fn initiate_paging_for_idle_ue(
         }
     }
 
-    // Mark session as paging ongoing; keep the consumer's failure-notify
-    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
-    let location = paging_ctx.n1n2_msg_data_uri.clone();
-
-    // Store paging context in AMF global context. The NGAP server's paging pump
-    // (`NgapServer::process_paging`) sends the PAGING and runs T3513.
-    let ctx = amf_self();
-    if let Ok(context) = ctx.read() {
-        context.paging_add(paging_ctx);
-    }
-    if let Some(supi) = ask_nwdaf {
-        if !crate::nwdaf_mobility::spawn_hint(amf_ue.id, supi) {
-            // Not started: release the first PAGING now, to the registration area.
-            if let Ok(context) = ctx.read() {
-                context.paging_set_nwdaf_hint(amf_ue.id, None);
-            }
-        }
-    }
-    if let Some(sess) = sess {
-        sess.store_paging_info(&location, failure_notify_uri);
-    }
-
-    log::info!(
-        "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
-        amf_ue.supi.as_deref().unwrap_or("unknown"),
-        tmsi,
-        tac,
-        pdu_session_id
-    );
+    paging_ctx
 }
 
 /// Page a CM-IDLE UE for an LMF's positioning transfer (#1087, TS 23.273: LPP to
 /// the UE, UE-associated NRPPa to its gNB). The page carries no N1 and no SM N2:
 /// the NGAP task holds the positioning payloads and delivers them once the UE is
-/// connected. Returns the transfer's `Location`, as [`page_idle_ue_for_n1`] does.
-pub fn page_idle_ue_for_positioning(amf_ue: &AmfUe, failure_notify_uri: Option<&str>) -> String {
-    initiate_paging_for_idle_ue(
-        amf_ue,
-        None,
-        None,
-        None,
-        PagedN2::Setup,
-        None,
-        failure_notify_uri,
-    );
-    format!(
-        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
-        amf_ue.supi.as_deref().unwrap_or("unknown")
-    )
+/// connected.
+///
+/// #1837: a page already queued for the UE (for another transfer, or location-only)
+/// is joined, not replaced, and the LMF's `failure_notify_uri` is kept on it, so a
+/// failed page notifies the LMF too. Join-or-start is one step under the paging-map
+/// write lock ([`crate::context::AmfContext::paging_join_or_add_transfer`]).
+/// Returns the transfer's own `Location`, `.../n1-n2-messages/{transfer_id}`
+/// (#1858), or `None` when the queued page can take no more requesters (nothing
+/// changed).
+pub fn page_idle_ue_for_positioning(
+    amf_ue: &AmfUe,
+    failure_notify_uri: Option<&str>,
+    transfer_id: &str,
+) -> Option<String> {
+    let mut paging_ctx =
+        idle_ue_paging_context(amf_ue, None, None, PagedN2::Setup, None, failure_notify_uri);
+    // #1858: the transfer's own resource (TS 29.518 §5.2.2.3.1: the Location
+    // ".../n1-n2-messages/{n1N2MessageId}"), which its failure notification names, so
+    // two LMF transfers sharing one callback URI are told apart.
+    paging_ctx.n1n2_msg_data_uri = format!("{}/{transfer_id}", paging_ctx.n1n2_msg_data_uri);
+    let location = paging_ctx.n1n2_msg_data_uri.clone();
+    let joined = {
+        let ctx = amf_self();
+        let context = ctx.read().unwrap_or_else(|e| e.into_inner());
+        context.paging_join_or_add_transfer(paging_ctx)
+    };
+    match joined {
+        crate::context::PagingJoin::Started => {
+            start_paging_nwdaf_hint(amf_ue);
+            log::info!(
+                "[{}] Paging initiated for a positioning transfer",
+                amf_ue.supi.as_deref().unwrap_or("unknown")
+            );
+        }
+        crate::context::PagingJoin::Joined => {}
+        crate::context::PagingJoin::Full => return None,
+    }
+    Some(location)
 }
 
 /// Page a CM-IDLE UE for an N1 message that belongs to no PDU session -- a
 /// UE-policy (UPDP) delivery from the PCF (#540, TS 23.502 §4.2.3.3 step 3a) --
 /// and keep it for delivery, in `container_type`, once the Service Request
-/// arrives. Returns the N1N2 transfer resource the 202 Location names.
+/// arrives. Returns the N1N2 transfer resource the 202 Location names, or `None`,
+/// with nothing changed, when a page holding another transfer is already queued
+/// (#749, #1837: checked and queued as one step).
 pub fn page_idle_ue_for_n1(
     amf_ue: &AmfUe,
     n1: Vec<u8>,
     container_type: u8,
     failure_notify_uri: Option<&str>,
-) -> String {
-    initiate_paging_for_idle_ue(
+) -> Option<String> {
+    let mut paging_ctx = idle_ue_paging_context(
         amf_ue,
-        None,
         Some(n1),
         None,
         PagedN2::Setup,
         None,
         failure_notify_uri,
     );
-    // The context was just queued with the default container type; set the one
-    // this N1 travels in.
-    let ctx = amf_self();
-    if let Ok(context) = ctx.read() {
-        context.paging_set_n1_container_type(amf_ue.id, container_type);
-    }
-    format!(
-        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
-        amf_ue.supi.as_deref().unwrap_or("unknown")
-    )
+    // #1837: the container type is set before the page is queued, not after: a
+    // later write could land on another transfer's page.
+    paging_ctx.pending_n1_container_type = container_type;
+    let location = paging_ctx.n1n2_msg_data_uri.clone();
+    queue_idle_ue_page(amf_ue, None, paging_ctx, failure_notify_uri).then_some(location)
 }
 
 /// Handle event unsubscribe (Namf_EventExposure_Unsubscribe)
@@ -1107,6 +1194,13 @@ mod tests {
     /// HIGHER_PRIORITY_REQUEST_ONGOING) instead of overwriting the paging
     /// context, so the first session's re-activation is not lost. Before #749 the
     /// second silently replaced the first.
+    ///
+    /// #1837: the refused transfer applies nothing: its session is not marked as
+    /// paging, and a refused UE-policy delivery changes nothing on the SM page.
+    /// REVERT-VERIFIED: with `queue_idle_ue_page` storing the session's paging info
+    /// before the refusal, "the refused transfer's session is not marked paging"
+    /// fails; with `page_idle_ue_for_n1` setting the container type on the queued
+    /// page after a refusal (as before #1837), "the SM page keeps its container type".
     #[test]
     fn a_second_transfer_while_paging_is_refused_and_keeps_the_first() {
         // #1588 review: this page reads the paging strategy.
@@ -1129,9 +1223,30 @@ mod tests {
             .expect("the first pages");
         assert_eq!(first.cause, N1N2MessageTransferCause::AttemptingToReachUe);
 
+        assert!(
+            psi2.paging.ongoing,
+            "the queued transfer's session is paging"
+        );
+
         let mut psi1 = create_test_sess();
         let second = handle_n1_n2_message_transfer(&ue, &mut psi1, None, true, &setup(1));
         assert_eq!(second.unwrap_err(), NamfHandlerError::PagingOngoing);
+        // #1837: the refused transfer applies nothing.
+        assert!(
+            !psi1.paging.ongoing && psi1.paging.n1n2_failure_txf_notif_uri.is_none(),
+            "the refused transfer's session is not marked paging"
+        );
+        // #1837: neither does a refused UE-policy delivery. Its container type,
+        // set on the page only once it is queued, does not land on the SM page.
+        assert_eq!(
+            page_idle_ue_for_n1(
+                &ue,
+                vec![0x01],
+                crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
+                Some("http://pcf/fail"),
+            ),
+            None
+        );
 
         let paged = amf_self()
             .read()
@@ -1140,6 +1255,15 @@ mod tests {
             .expect("paging for the first");
         assert_eq!(paged.pdu_session_id, Some(2), "the first transfer is kept");
         assert_eq!(paged.pending_n2, Some(vec![0x00, 2]));
+        assert_eq!(
+            paged.pending_n1_container_type,
+            crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
+            "the SM page keeps its container type"
+        );
+        assert!(
+            paged.joined_transfers.is_empty(),
+            "the PCF is not owed anything"
+        );
     }
 
     /// #518 / TS 23.502 §4.2.3.3 step 3a: an N1-only transfer to a CM-IDLE UE pages

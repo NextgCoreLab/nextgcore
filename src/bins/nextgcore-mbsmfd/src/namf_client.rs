@@ -454,8 +454,9 @@ mod tests {
     }
 
     fn amf_holds(context_ref: &str) -> bool {
-        nextgcore_amfd::context::amf_mcast()
-            .session_find(context_ref.parse().expect("numeric ref"))
+        // #1856: the ref is `<epoch>-<id>` and names the context, not the session.
+        nextgcore_amfd::ngap_mcast::parse_context_ref(context_ref)
+            .and_then(|id| nextgcore_amfd::context::amf_mcast().broadcast_context_find(id))
             .is_some()
     }
 
@@ -468,6 +469,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_released_session_deletes_its_context_at_the_real_amf_1758() {
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        // R24: after MBS_CONTEXT_LOCK, the order every holder of both takes them in.
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
         let tmgi = tmgi_1758([0x00, 0x17, 0x58]);
         let session = crate::mbsmf_self()
@@ -514,6 +517,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_context_created_after_its_release_is_deleted_1758() {
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        // R24: after MBS_CONTEXT_LOCK, the order every holder of both takes them in.
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
         let tmgi = tmgi_1758([0x01, 0x17, 0x58]);
         let ctx = crate::mbsmf_self();
@@ -594,6 +599,7 @@ mod tests {
             port: addr.port(),
             nf_instance_id: None,
             context_ref: "7".to_string(),
+            tmgi: None,
         };
         (server, context, deletes, arrived, release)
     }
@@ -615,6 +621,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_context_delete_is_retried_1758() {
         use std::sync::atomic::Ordering;
+        // R24: `release_amf_contexts` can park into the reconciler's set.
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         let (_server, context, deletes, _arrived, _release) =
             scripted_amf(false, &[500, 503]).await;
         assert!(!crate::release_amf_contexts(vec![context]).await);
@@ -622,6 +630,342 @@ mod tests {
             deletes.load(Ordering::SeqCst) == 3
         })
         .await;
+    }
+
+    /// #1817: an AMF that comes back AFTER the retry budget still gets the delete.
+    /// Every fast retry is refused, the record is parked, a reconcile pass that is
+    /// still refused keeps it, and the next pass delivers it.
+    ///
+    /// REVERT-VERIFIED: with `reconcile::park(failed)` removed from the retry task,
+    /// nothing is parked and the "parked after the budget" wait times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_amf_back_after_the_retry_budget_still_gets_the_delete_1817() {
+        use std::sync::atomic::Ordering;
+        let _g = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let budget = crate::AMF_RELEASE_RETRY_DELAYS.len() + 1;
+        // The first attempt, every retry, and one reconcile pass are refused.
+        let refusals = vec![503u16; budget + 1];
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &refusals).await;
+        let before = crate::reconcile::RECONCILED.get(&["deleted"]);
+        assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        eventually("the record is parked after the budget", || {
+            crate::reconcile::pending_count() == 1
+        })
+        .await;
+        assert_eq!(deletes.load(Ordering::SeqCst), budget);
+
+        assert_eq!(crate::reconcile::reconcile_once().await, 0, "still refused");
+        assert_eq!(crate::reconcile::pending_count(), 1, "kept, not dropped");
+
+        assert_eq!(
+            crate::reconcile::reconcile_once().await,
+            1,
+            "the AMF accepts"
+        );
+        assert_eq!(deletes.load(Ordering::SeqCst), budget + 2);
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert_eq!(crate::reconcile::RECONCILED.get(&["deleted"]), before + 1);
+    }
+
+    /// R24 (#1817 review): a parked ContextDelete is not sent for a context a live
+    /// session holds again. The AMF's ContextCreate is idempotent on the TMGI, so a
+    /// new session reusing a released one's TMGI is handed the same
+    /// `mbsContextRef`. Recording it unparks the delete; and a delete parked while
+    /// the context is held is dropped by the pass rather than sent.
+    ///
+    /// REVERT-VERIFIED: with the `unpark` call removed from `record_amf_context`,
+    /// "recording the reused context unparks its delete" fails; with the
+    /// in-use check removed from `delete_in_lane`, the AMF sees
+    /// the delete ("the live context is not deleted").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_delete_spares_a_context_a_live_session_reuses_1817() {
+        use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &[]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        let before = crate::reconcile::RECONCILED.get(&["reused"]);
+
+        // Session A was released while the AMF was down: its delete is parked.
+        crate::reconcile::park(vec![context.clone()]);
+        // Session B reuses the TMGI and gets the same context back.
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(
+                tmgi_1758([0x03, 0x18, 0x17]),
+                crate::MbsSessionType::Broadcast,
+            )
+            .expect("session");
+        assert!(ctx
+            .read()
+            .unwrap()
+            .record_amf_context(b.id, context.clone()));
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            0,
+            "recording the reused context unparks its delete"
+        );
+
+        // A delete parked while B holds it is dropped by the pass, not sent.
+        crate::reconcile::park(vec![context.clone()]);
+        let accepted = crate::reconcile::reconcile_once().await;
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            0,
+            "the live context is not deleted"
+        );
+        assert_eq!(accepted, 0);
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert_eq!(crate::reconcile::RECONCILED.get(&["reused"]), before + 2);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
+    }
+
+    /// R24: the fast retries of a refused ContextDelete stop once a live session
+    /// holds that context again, and nothing is parked for it.
+    ///
+    /// REVERT-VERIFIED: with the `amf_context_in_use` check removed from the retry
+    /// loop in `release_amf_contexts`, the retry deletes the live context ("no
+    /// retry deletes the reused context").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fast_retries_spare_a_context_a_live_session_reuses_1817() {
+        use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &[500]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(
+                tmgi_1758([0x04, 0x18, 0x17]),
+                crate::MbsSessionType::Broadcast,
+            )
+            .expect("session");
+        assert!(ctx
+            .read()
+            .unwrap()
+            .record_amf_context(b.id, context.clone()));
+        tokio::time::sleep(crate::AMF_RELEASE_RETRY_DELAYS[0] * 10).await;
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            1,
+            "no retry deletes the reused context"
+        );
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
+    }
+
+    /// R24: one pass sends for at most `MAX_PASS`. Against a blackholed AMF the
+    /// records it does not reach are re-parked, in order, for the next pass.
+    ///
+    /// REVERT-VERIFIED: with the deadline check removed, the pass runs for every
+    /// record's client timeout ("the pass is bounded").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_against_a_blackholed_amf_is_bounded_1817() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let parked: Vec<_> = (0..8)
+            .map(|n| crate::context::AmfMbsContext {
+                host: "127.0.0.1".to_string(),
+                port,
+                nf_instance_id: None,
+                context_ref: format!("hole-{n}"),
+                tmgi: None,
+            })
+            .collect();
+        crate::reconcile::park(parked);
+        let started = std::time::Instant::now();
+        assert_eq!(crate::reconcile::reconcile_once().await, 0);
+        assert!(
+            started.elapsed() < crate::reconcile::MAX_PASS + Duration::from_secs(4),
+            "the pass is bounded: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            8,
+            "every record re-parked"
+        );
+        crate::reconcile::clear_for_test();
+        hole.abort();
+    }
+
+    /// **#1854**: a ContextCreate for session B lands while session A's ContextDelete
+    /// for the same TMGI is in flight at the (real, TMGI-idempotent) AMF. B's create
+    /// waits for the delete in their (AMF, TMGI) lane, so the AMF hands it a FRESH
+    /// context rather than A's, and B's recorded context is live at the AMF
+    /// afterwards. No lane is left behind.
+    ///
+    /// REVERT-VERIFIED: with the create taking no lane, B is handed A's context,
+    /// the delete then removes it, and "B's context is live at the AMF" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_racing_a_delete_on_one_tmgi_gets_a_live_context_1854() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        // The real amfd handler, its ContextDelete held 400 ms on the way in.
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let a = arrived.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf_server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let a = a.clone();
+                async move {
+                    if req.header.method == "DELETE" {
+                        a.notify_one();
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    nextgcore_amfd::namf_request_handler(req).await
+                }
+            })
+            .await
+            .expect("AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let tmgi = tmgi_1758([0x05, 0x18, 0x54]);
+        let ctx = crate::mbsmf_self();
+        let session = |ctx: &std::sync::Arc<std::sync::RwLock<crate::MbSmfContext>>| {
+            ctx.read()
+                .unwrap()
+                .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+                .expect("session")
+        };
+        let a_session = session(&ctx);
+        let a_ref = crate::create_amf_mbs_context(a_session.id, tmgi.clone(), amf.clone())
+            .await
+            .expect("A's context");
+
+        // A is released; its ContextDelete is held at the AMF.
+        let a_id = format!("mbs-sess-{}", a_session.id);
+        let release = tokio::spawn(async move { crate::handle_mbs_session_release(&a_id).await });
+        arrived.notified().await;
+        // B, on the same TMGI, is created while that delete is in flight.
+        let b_session = session(&ctx);
+        let b_ref = crate::create_amf_mbs_context(b_session.id, tmgi.clone(), amf.clone())
+            .await
+            .expect("B's context");
+        release.await.expect("release");
+
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
+            .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
+        assert!(
+            live.is_some(),
+            "B's context is live at the AMF (A's was {a_ref}, B's is {b_ref})"
+        );
+        assert_eq!(
+            crate::lane::count_for_port(addr.port()),
+            0,
+            "no lane is left behind"
+        );
+        ctx.read().unwrap().take_amf_contexts(b_session.id);
+        ctx.read().unwrap().session_remove(b_session.id);
+    }
+
+    /// **#1854**, the other order: session B's ContextCreate on the TMGI takes the
+    /// lane first (the AMF holds it), and released session A's ContextDelete waits
+    /// behind it. B is handed A's context (the AMF is idempotent on the TMGI) and
+    /// records it, so A's delete, in the lane, sees B holding it and is not sent.
+    ///
+    /// REVERT-VERIFIED: with the in-use check removed from `delete_in_lane`, A's
+    /// delete removes B's live context ("B keeps the context A released").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_spares_the_context_a_later_session_holds_1854() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        // The real amfd handler; once armed, the next ContextCreate is held 400 ms.
+        let arm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let deletes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ar, a2, d2) = (arm.clone(), arrived.clone(), deletes.clone());
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf_server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let (ar, a2, d2) = (ar.clone(), a2.clone(), d2.clone());
+                async move {
+                    if req.header.method == "DELETE" {
+                        d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if req.header.method == "POST"
+                        && ar.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        a2.notify_one();
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    nextgcore_amfd::namf_request_handler(req).await
+                }
+            })
+            .await
+            .expect("AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let tmgi = tmgi_1758([0x06, 0x18, 0x54]);
+        let ctx = crate::mbsmf_self();
+        let a = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("A");
+        let a_ref = crate::create_amf_mbs_context(a.id, tmgi.clone(), amf.clone())
+            .await
+            .expect("A's context");
+        // A's release, up to its ContextDelete: removed here, contexts taken.
+        ctx.read().unwrap().session_remove(a.id);
+        let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+        // B's ContextCreate takes the lane first; the AMF holds it.
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("B");
+        arm.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (b_id, b_tmgi, b_amf) = (b.id, tmgi.clone(), amf.clone());
+        let create = tokio::spawn(crate::create_amf_mbs_context(b_id, b_tmgi, b_amf));
+        arrived.notified().await;
+        // A's delete now waits behind B's create in the lane.
+        let release = tokio::spawn(crate::release_amf_contexts(a_contexts));
+        let b_ref = create.await.expect("create").expect("B's context");
+        release.await.expect("release");
+        assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
+            .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
+        assert!(live.is_some(), "B keeps the context A released");
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
     }
 
     /// #1758 (check 3): a session release whose consumer disconnects while the AMF
@@ -633,6 +977,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_release_still_releases_the_amf_context_1758() {
         use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         let (_server, context, deletes, arrived, release) = scripted_amf(true, &[500]).await;
         crate::mbsmf_context_init(256);
         let ctx = crate::mbsmf_self();
