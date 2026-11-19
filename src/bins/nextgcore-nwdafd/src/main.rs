@@ -3120,13 +3120,24 @@ mod callback_oauth2_1421_tests {
         assert!(nrf_collector::callback_path().ends_with(&format!("/nf-status-notify/{token}")));
 
         let forged = uuid::Uuid::new_v4().simple().to_string();
-        for uri in [
-            format!("{base}/nnwdaf-callback/v1/nf-status-notify/{forged}"),
-            format!("{base}/nnwdaf-nfstatus-notify/v1/notify"),
-            format!("{base}/nnwdaf-callback/v1/nf-status-notify/{token}/"),
+        for (uri, refused) in [
+            (
+                format!("{base}/nnwdaf-callback/v1/nf-status-notify/{forged}"),
+                "HTTP 401",
+            ),
+            (
+                format!("{base}/nnwdaf-nfstatus-notify/v1/notify"),
+                "HTTP 401",
+            ),
+            // #1934: a trailing `/` is a malformed path, refused 400 by the SBI
+            // server before the callback exemption is consulted.
+            (
+                format!("{base}/nnwdaf-callback/v1/nf-status-notify/{token}/"),
+                "HTTP 400",
+            ),
         ] {
             match notify(uri.clone()).await {
-                NotifySendResult::Failed(why) => assert_eq!(why, "HTTP 401", "{uri}"),
+                NotifySendResult::Failed(why) => assert_eq!(why, refused, "{uri}"),
                 other => panic!("{uri}: {other:?}"),
             }
         }
