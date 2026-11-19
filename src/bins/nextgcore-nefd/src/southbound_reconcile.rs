@@ -34,7 +34,8 @@ pub const MAX_PASS: Duration = Duration::from_secs(30);
 pub const MAX_PASS: Duration = Duration::from_secs(2);
 
 /// `nef_southbound_unsubscribes_reconciled_total{result}`: parked unsubscribes the
-/// reconciler ended: `delivered` (2xx or 404) or `abandoned` (evicted at the bound).
+/// reconciler ended: `delivered` (2xx or 404), `abandoned` (evicted at the bound) or
+/// `expired` (parked longer than [`MAX_AGE`]).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "nef_southbound_unsubscribes_reconciled_total",
@@ -56,18 +57,41 @@ pub static PARKED: nextgcore_metrics::nf::CounterFamily = nextgcore_metrics::nf:
 /// through a handler or directly) holds `crate::context::NEF_CONTEXT_TEST_LOCK`,
 /// the lock beside the NEF's process-global state, which this set is part of
 /// (R27 #1947: a sibling test's park landed in another test's count, 1 run in 3).
-fn pending() -> &'static Mutex<VecDeque<SouthboundRef>> {
-    static PENDING: Mutex<VecDeque<SouthboundRef>> = Mutex::new(VecDeque::new());
+fn pending() -> &'static Mutex<VecDeque<Parked>> {
+    static PENDING: Mutex<VecDeque<Parked>> = Mutex::new(VecDeque::new());
     &PENDING
 }
 
-fn lock() -> std::sync::MutexGuard<'static, VecDeque<SouthboundRef>> {
+/// How long an unsubscribe stays parked before it is given up (`expired`): a
+/// producer that has not answered for a day is gone, not restarting.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// One parked unsubscribe, and when it was first parked.
+#[derive(Debug, Clone)]
+struct Parked {
+    southbound: SouthboundRef,
+    since: std::time::Instant,
+}
+
+fn lock() -> std::sync::MutexGuard<'static, VecDeque<Parked>> {
     pending().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn evict(set: &mut VecDeque<SouthboundRef>) {
+fn evict(set: &mut VecDeque<Parked>) {
     while set.len() > MAX_PENDING {
-        if let Some(old) = set.pop_front() {
+        // The oldest by park time, wherever rotation has put it.
+        let Some(oldest) = set
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.since)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        if let Some(Parked {
+            southbound: old, ..
+        }) = set.remove(oldest)
+        {
             log::error!(
                 "{} unsubscribe of {} abandoned: {MAX_PENDING} are already pending",
                 old.producer.as_str(),
@@ -81,7 +105,7 @@ fn evict(set: &mut VecDeque<SouthboundRef>) {
 /// Park an unsubscribe that failed. One already parked is not parked twice.
 pub fn park(southbound: SouthboundRef) {
     let mut set = lock();
-    if set.contains(&southbound) {
+    if set.iter().any(|p| p.southbound == southbound) {
         return;
     }
     log::warn!(
@@ -93,7 +117,10 @@ pub fn park(southbound: SouthboundRef) {
         SouthboundProducer::Amf => "amf",
         SouthboundProducer::Udm => "udm",
     }]);
-    set.push_back(southbound);
+    set.push_back(Parked {
+        southbound,
+        since: std::time::Instant::now(),
+    });
     evict(&mut set);
 }
 
@@ -105,7 +132,7 @@ pub fn pending_count() -> usize {
 /// The parked unsubscribes (tests).
 #[cfg(test)]
 pub fn parked() -> Vec<SouthboundRef> {
-    lock().iter().cloned().collect()
+    lock().iter().map(|p| p.southbound.clone()).collect()
 }
 
 /// Forget every parked unsubscribe (a test's own).
@@ -114,22 +141,45 @@ pub fn clear_for_test() {
     lock().clear();
 }
 
-/// One pass: retry the parked unsubscribes, oldest first, for at most
-/// [`MAX_PASS`], against the producer each subscription was made at (else the
-/// producer URI configured now, for one recorded before that was kept). Returns how
-/// many ended.
+/// One pass: retry the parked unsubscribes in turn order, for at most
+/// [`MAX_PASS`], at the producer each subscription was made at (else the producer
+/// URI configured now, for one recorded before that was kept). Returns how many
+/// ended.
+///
+/// No producer can starve the others (R30 #1954): once a DELETE to a producer fails
+/// in a pass, its other unsubscribes wait for the next pass instead of each costing
+/// a timeout, and a tried one goes to the BACK of the queue while one this pass did
+/// not reach keeps its place at the front. One parked longer than [`MAX_AGE`] is
+/// given up as `expired`.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<SouthboundRef> = lock().drain(..).collect();
+    let batch: Vec<Parked> = lock().drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut still = Vec::new();
-    for southbound in batch {
-        if tokio::time::Instant::now() >= deadline {
-            still.push(southbound);
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    let mut failing: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for parked in batch {
+        let southbound = &parked.southbound;
+        if parked.since.elapsed() > MAX_AGE {
+            log::error!(
+                "{} unsubscribe of {} expired after {MAX_AGE:?}",
+                southbound.producer.as_str(),
+                southbound.subscription_id
+            );
+            RECONCILED.inc(&["expired"]);
+            ended += 1;
             continue;
         }
-        let uri = crate::producer_uri(southbound.producer);
-        if crate::try_southbound_unsubscribe(uri, &southbound).await {
+        let uri = southbound
+            .producer_base
+            .clone()
+            .or_else(|| crate::producer_uri(southbound.producer));
+        let target = uri.clone().unwrap_or_default();
+        if tokio::time::Instant::now() >= deadline || failing.contains(&target) {
+            untried.push(parked);
+            continue;
+        }
+        if crate::try_southbound_unsubscribe(uri, southbound).await {
             log::info!(
                 "{} unsubscribe of {}: reconciled",
                 southbound.producer.as_str(),
@@ -138,13 +188,19 @@ pub async fn reconcile_once() -> usize {
             RECONCILED.inc(&["delivered"]);
             ended += 1;
         } else {
-            still.push(southbound);
+            failing.insert(target);
+            failed.push(parked);
         }
     }
     let mut set = lock();
-    for southbound in still.into_iter().rev() {
-        if !set.contains(&southbound) {
-            set.push_front(southbound);
+    for parked in untried.into_iter().rev() {
+        if !set.iter().any(|p| p.southbound == parked.southbound) {
+            set.push_front(parked);
+        }
+    }
+    for parked in failed {
+        if !set.iter().any(|p| p.southbound == parked.southbound) {
+            set.push_back(parked);
         }
     }
     evict(&mut set);

@@ -3642,6 +3642,59 @@ mod tests {
         reset_context();
     }
 
+    /// #1877 (R30 #1954): a parked unsubscribe toward a blackholed producer does
+    /// not starve one toward a healthy producer behind it. The one tried and failed
+    /// goes to the back, the untried keeps its turn, so the healthy one is sent on
+    /// the next pass.
+    ///
+    /// REVERT-VERIFIED: with every entry re-parked at the front in order, as before,
+    /// this fails: the healthy producer's DELETE is never sent.
+    #[test]
+    fn a_blackholed_producer_does_not_starve_a_healthy_one_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hole = blackhole.local_addr().unwrap();
+            let held = tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((c, _)) = blackhole.accept().await {
+                    conns.push(c);
+                }
+            });
+            let (amf, amf_uri, seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            let at = |base: String, id: &str| SouthboundRef {
+                producer: SouthboundProducer::Amf,
+                subscription_id: id.to_string(),
+                delete_path: format!("/namf-evts/v1/subscriptions/{id}"),
+                producer_base: Some(base),
+            };
+            southbound_reconcile::park(at(format!("http://{hole}"), "dead-1877"));
+            southbound_reconcile::park(at(amf_uri.clone(), "s-1877"));
+
+            southbound_reconcile::reconcile_once().await;
+            southbound_reconcile::reconcile_once().await;
+            let delivered = deletes_1877(&seen);
+            let dead_parked = southbound_reconcile::parked()
+                .iter()
+                .any(|r| r.subscription_id == "dead-1877");
+            held.abort();
+            amf.stop().await.ok();
+            assert_eq!(delivered, 1, "the healthy producer's DELETE is sent");
+            assert!(dead_parked, "the blackholed one stays parked");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
     /// #1877: an AF delete whose AMF unsubscribe fails is parked and retried until
     /// the AMF takes it; the record is gone at once.
     ///
