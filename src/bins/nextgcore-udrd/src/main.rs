@@ -6463,6 +6463,43 @@ udr:
         listener.stop().await.expect("listener stops");
     }
 
+    /// #1939 item 1: an identifier carrying a percent-encoded `/` (TS 29.519
+    /// `{appId}` is a free-form string) passes the SBI server's path check and
+    /// reaches the router as ONE segment: the PFD document is created under it,
+    /// read back under it, and the bare prefix is a different (absent) one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_encoded_slash_in_an_app_id_is_one_segment_1939() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, listener, _cb_port, _rx) = start_udr_and_listener().await;
+        let pfd = json!({
+            "applicationId": "vendor/app",
+            "pfds": [{"pfdId": "pfd-1", "flowDescriptions": ["permit out ip from any to any"]}]
+        });
+        let created = client
+            .put_json("/nudr-dr/v2/application-data/pfds/vendor%2Fapp", &pfd)
+            .await
+            .expect("PUT");
+        let read = client
+            .get("/nudr-dr/v2/application-data/pfds/vendor%2Fapp")
+            .await
+            .expect("GET");
+        let prefix = client
+            .get("/nudr-dr/v2/application-data/pfds/vendor")
+            .await
+            .expect("GET prefix");
+        udr.stop().await.expect("stop");
+        listener.stop().await.expect("stop");
+        assert_eq!(created.status, 201, "{:?}", created.http.content);
+        assert_eq!(read.status, 200, "{:?}", read.http.content);
+        assert!(read
+            .http
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("vendor/app"));
+        assert_eq!(prefix.status, 404);
+    }
+
     /// application-data: pfds + influenceData lifecycle, query filters, and
     /// TrafficInfluDataNotif delivery.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

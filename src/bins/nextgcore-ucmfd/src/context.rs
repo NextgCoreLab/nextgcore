@@ -153,6 +153,59 @@ pub struct Subscription {
     pub owner: Option<String>,
 }
 
+/// Operator policy for Nucmf_Provisioning (#1939, `ucmf.provisioning`).
+///
+/// Both members default to "no restriction beyond #1916" (the NEF / AF consumer
+/// rule and the creator binding), so an unconfigured UCMF behaves as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProvisioningPolicy {
+    /// #1939 item 5, TS 29.675 §4.1.3.2: an AF provisions directly only as a
+    /// TRUSTED AF; an untrusted one goes through the NEF. When `Some`, a caller
+    /// whose verified certificate names AF must be one of these NF Instance IDs.
+    /// When `None`, an AF that reached this SBI (which production fronts with
+    /// mTLS and NRF tokens, so it is inside the operator's domain, TS 23.501
+    /// §6.2.10) is taken as trusted.
+    pub trusted_afs: Option<Vec<String>>,
+    /// #1939 item 3: the TS 23.003 §29.2 Vendor IDs each consumer (NF Instance
+    /// ID) may provision manufacturer-assigned IDs under, so a NEF / AF cannot
+    /// squat another manufacturer's RACS IDs first-come. Empty: no restriction.
+    /// When not empty, a consumer it does not name may provision none.
+    pub vendor_ids: BTreeMap<String, Vec<u32>>,
+}
+
+impl ProvisioningPolicy {
+    /// Whether `consumer` (a verified NF Instance ID, if any) may provision the
+    /// manufacturer-assigned RACS ID `racs_key`. A key that is not a valid
+    /// manufacturer-assigned ID is not judged here: provisioning reports it.
+    pub fn may_provision(&self, consumer: Option<&str>, racs_key: &str) -> bool {
+        if self.vendor_ids.is_empty() {
+            return true;
+        }
+        let Ok(RacsId::ManufacturerAssigned { vendor_id, .. }) = RacsId::from_digit_str(racs_key)
+        else {
+            return true;
+        };
+        let Some(consumer) = consumer else {
+            return false;
+        };
+        self.vendor_ids
+            .iter()
+            .find(|(id, _)| id.trim().eq_ignore_ascii_case(consumer.trim()))
+            .is_some_and(|(_, vendors)| vendors.contains(&vendor_id))
+    }
+
+    /// Whether an AF-typed caller with NF Instance ID `af` is trusted (item 5).
+    pub fn trusts_af(&self, af: Option<&str>) -> bool {
+        match (&self.trusted_afs, af) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(list), Some(af)) => list
+                .iter()
+                .any(|t| t.trim().eq_ignore_ascii_case(af.trim())),
+        }
+    }
+}
+
 /// An "Individual UE radio capability provisioning" (TS 29.675 §5.2.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provisioning {
@@ -392,6 +445,8 @@ impl Default for Limits {
 }
 
 pub struct Ucmf {
+    /// #1939: who may provision what (Nucmf_Provisioning).
+    provisioning_policy: ProvisioningPolicy,
     version_id: u8,
     mode: ModeOfOperation,
     next_entry_id: u32,
@@ -514,6 +569,7 @@ impl Persister {
 impl Ucmf {
     pub fn new(version_id: u8, mode: ModeOfOperation) -> Self {
         Self {
+            provisioning_policy: ProvisioningPolicy::default(),
             version_id,
             mode,
             next_entry_id: 1,
@@ -553,6 +609,15 @@ impl Ucmf {
     /// Set the capacity limits (configuration, #786).
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// #1939: who may provision what (from `ucmf.provisioning`).
+    pub fn set_provisioning_policy(&mut self, policy: ProvisioningPolicy) {
+        self.provisioning_policy = policy;
+    }
+
+    pub fn provisioning_policy(&self) -> &ProvisioningPolicy {
+        &self.provisioning_policy
     }
 
     pub fn subscription_count(&self) -> usize {

@@ -171,7 +171,11 @@ jobs:
         # has to be a feature (it binds a privileged port), so it gets an
         # explicit build+test here instead. Add a line per gated feature;
         # 6G and research features go in the research-features job instead.
-        run: cd src && cargo test -p nextgcore-easdfd --features dns-udp
+        # #1939: nextgcore-sbi's `http3` transport carries the same path check as
+        # the HTTP/2 server, so its tests run here rather than only compile.
+        run: |
+          cd src && cargo test -p nextgcore-easdfd --features dns-udp
+          cargo test -p nextgcore-sbi --features http3 --lib http3
 
       - name: cargo test (kernel SCTP)
         # Deployments that face an independent RAN run amfd with `kernel-sctp`
