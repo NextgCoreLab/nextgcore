@@ -38532,6 +38532,9 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
+            max_reports: None,
+            reports_made: std::collections::HashMap::new(),
             one_time: false,
             first_location_pending: false,
             reporting_threshold: None,
@@ -39033,6 +39036,904 @@ mod tests {
         );
         sink.stop().await.expect("sink stop");
         store.remove(id);
+    }
+
+    /// #1819: a LOCATION_REPORT subscription with `options` `trigger` and, when
+    /// given, `repPeriod`, plus an `expiry` when given. Returns the sink, its
+    /// receiver and the subscribe response.
+    async fn periodic_location_subscription(
+        supi: &str,
+        tag: &str,
+        options: serde_json::Value,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        mpsc::Receiver<String>,
+        nextgcore_sbi::SbiResponse,
+    ) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({
+                    "subscription": {
+                        "eventList": [{ "type": "LOCATION_REPORT" }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
+                        "notifyCorrelationId": format!("corr-{tag}"),
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                        "options": options,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        (sink, rx, resp)
+    }
+
+    /// A CM-CONNECTED registered UE `supi` at TAC 0x1819, cell 0x1_8191, stored as
+    /// `id`.
+    fn store_connected_ue_1819(id: u64, supi: &str) {
+        let mut stored = idle_registered_ue(id);
+        stored.cm_idle = false;
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x1819;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0001_8191;
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        guard.ue_store().insert(id, stored);
+    }
+
+    /// **#1819**, TS 29.518 §5.3.2.2.2 (`29518-k00.txt:5731-5737`) and Table
+    /// 6.2.6.2.6-1: a PERIODIC LOCATION_REPORT subscription is told the UE's
+    /// location at the subscription and then every `repPeriod`, with nothing
+    /// changing in between. Its unsubscribe stops the timer at once, and no report
+    /// follows.
+    ///
+    /// REVERT-VERIFIED: with the `spawn_periodic_reports` call in
+    /// `handle_event_subscription_create` removed, only the first report arrives
+    /// ("a periodic LOCATION_REPORT with no location change"); with the
+    /// `cancel_periodic_location_reports` call removed from the unsubscribe, the
+    /// timer still runs ("the unsubscribe stops the timer").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_location_subscription_is_told_every_period_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_101u64, "imsi-001010001819101");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-periodic",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(v["subscription"]["options"]["trigger"], "PERIODIC", "{v}");
+        assert_eq!(v["subscription"]["options"]["repPeriod"], 1, "{v}");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+
+        let (got, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!(got, supi);
+        assert_eq!((tac.as_str(), nci.as_str()), ("1819", "000018191"));
+        let started = std::time::Instant::now();
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a periodic LOCATION_REPORT with no location change")
+            .expect("channel closed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "on the period, not at once"
+        );
+        let report: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            report["reportList"][0]["location"]["nrLocation"]["ncgi"]["nrCellId"], "000018191",
+            "{report}"
+        );
+
+        let deleted = crate::namf_server::namf_request_handler(nextgcore_sbi::SbiRequest::delete(
+            format!("/namf-evts/v1/subscriptions/{sub_id}"),
+        ))
+        .await;
+        assert_eq!(deleted.status, 204);
+        assert!(
+            !crate::namf_server::periodic_location_timer_running(&sub_id),
+            "the unsubscribe stops the timer"
+        );
+        while rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+                .await
+                .is_err(),
+            "no report after the unsubscribe"
+        );
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819**: a location change is reported to a CONTINUOUS subscription (the
+    /// positive control) and not to a PERIODIC one, which is told on its period
+    /// only. And a PERIODIC subscription's timer stops at its expiry.
+    ///
+    /// REVERT-VERIFIED: with the `rep_period` gate removed from
+    /// `fire_location_change_report`, the PERIODIC subscriber is told the change
+    /// ("a PERIODIC subscription is not told a change"); with the expiry arm removed
+    /// from the timer, it still runs ("the timer stops at the expiry").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_location_subscription_is_not_told_changes_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_201u64, "imsi-001010001819201");
+        store_connected_ue_1819(id, supi);
+        let expiry = crate::namf_server::system_time_to_rfc3339(
+            std::time::SystemTime::now() + Duration::from_secs(2),
+        );
+        let (psink, mut prx, presp) = periodic_location_subscription(
+            supi,
+            "1819-p",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 60, "expiry": expiry }),
+        )
+        .await;
+        assert_eq!(presp.status, 201);
+        let pv: serde_json::Value =
+            serde_json::from_str(presp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let p_id = pv["subscriptionId"].as_str().expect("id").to_string();
+        let (csink, mut crx, cresp) = periodic_location_subscription(
+            supi,
+            "1819-c",
+            serde_json::json!({ "trigger": "CONTINUOUS" }),
+        )
+        .await;
+        assert_eq!(cresp.status, 201);
+        let _c = crate::namf_server::EventSubscriptionGuard::of(&cresp);
+        let _p = crate::namf_server::EventSubscriptionGuard::of(&presp);
+        // Both first reports.
+        next_location_report(&mut prx).await;
+        next_location_report(&mut crx).await;
+
+        // The UE moves to TAC 0x181A.
+        let ue = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            let mut ue = guard.amf_ue_find_by_supi(supi).expect("ue");
+            ue.nr_tai.tac = 0x181A;
+            guard.amf_ue_update(&ue);
+            ue
+        };
+        let now = (ue.nr_tai.clone(), ue.nr_cgi.clone(), 1);
+        crate::namf_server::fire_location_change_report(
+            &ue,
+            crate::context::LocationChange {
+                tai: true,
+                cell: false,
+                ran_node: false,
+            },
+            &now,
+        );
+        let (_, tac, _) = next_location_report(&mut crx).await;
+        assert_eq!(tac, "181A", "the CONTINUOUS subscriber is told the change");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), prx.recv())
+                .await
+                .is_err(),
+            "a PERIODIC subscription is not told a change"
+        );
+
+        assert!(crate::namf_server::periodic_location_timer_running(&p_id));
+        let mut stopped = false;
+        for _ in 0..40 {
+            if !crate::namf_server::periodic_location_timer_running(&p_id) {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(stopped, "the timer stops at the expiry");
+        psink.stop().await.expect("sink stop");
+        csink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819 with #1760**: while a PERIODIC subscription's first LOCATION_REPORT
+    /// waits on a page (`first_location_pending`), its period reports nothing; once
+    /// the first report is made the period reports again (the positive control).
+    ///
+    /// REVERT-VERIFIED: with the `first_location_pending` skip removed from the
+    /// timer, a periodic report arrives while the first one is pending ("no periodic
+    /// report while the first waits on a page").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_report_waits_for_a_paged_first_report_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_401u64, "imsi-001010001819401");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-pending",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+        next_location_report(&mut rx).await;
+        // As the subscribe path stores a subscription whose first report waits on a
+        // page (`event_subscription_update` keeps the stored flag, so it is re-added).
+        let told = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            let mut sub = guard.event_subscription_remove(&sub_id).expect("stored");
+            sub.first_location_pending = true;
+            assert!(guard.event_subscription_add(sub));
+            let ue = guard.amf_ue_find_by_supi(supi).expect("ue");
+            (ue.nr_tai.clone(), ue.nr_cgi.clone(), 1)
+        };
+        while rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1600), rx.recv())
+                .await
+                .is_err(),
+            "no periodic report while the first waits on a page"
+        );
+        // The page's outcome makes the first report: the period resumes.
+        assert!(crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_finish_first_location(&sub_id, told)
+            .is_some());
+        next_location_report(&mut rx).await;
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// #1832: a subscription for `events` about `supi` (or any UE when `None`),
+    /// with `options`. Returns the sink, its receiver, the response and its id.
+    async fn subscription_1832(
+        supi: Option<&str>,
+        tag: &str,
+        events: serde_json::Value,
+        options: serde_json::Value,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        mpsc::Receiver<String>,
+        nextgcore_sbi::SbiResponse,
+        String,
+    ) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let mut subscription = serde_json::json!({
+            "eventList": events,
+            "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
+            "notifyCorrelationId": format!("corr-{tag}"),
+            "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "options": options,
+        });
+        match supi {
+            Some(s) => subscription["supi"] = serde_json::json!(s),
+            None => subscription["anyUE"] = serde_json::json!(true),
+        }
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": subscription }))
+                .expect("json"),
+        )
+        .await;
+        let id =
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap_or("{}"))
+                .ok()
+                .and_then(|v| v["subscriptionId"].as_str().map(str::to_string))
+                .unwrap_or_default();
+        (sink, rx, resp, id)
+    }
+
+    fn sub_stored_1832(id: &str) -> bool {
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(id)
+            .is_some()
+    }
+
+    fn move_ue_1832(supi: &str, tac: u32) -> crate::context::AmfUe {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        let mut ue = guard.amf_ue_find_by_supi(supi).expect("ue");
+        ue.nr_tai.tac = tac;
+        guard.amf_ue_update(&ue);
+        let now = (ue.nr_tai.clone(), ue.nr_cgi.clone(), 1);
+        drop(guard);
+        crate::namf_server::fire_location_change_report(
+            &ue,
+            crate::context::LocationChange {
+                tai: true,
+                cell: false,
+                ran_node: false,
+            },
+            &now,
+        );
+        ue
+    }
+
+    /// **#1832**, TS 29.518 Table 6.2.6.2.6-1 / AmfEventTrigger CONTINUOUS: with
+    /// `maxReports` 2, the first LOCATION_REPORT and one change are reported, the
+    /// subscription then ends (it is removed), and a further change is not reported.
+    /// The echo carries `maxReports`.
+    ///
+    /// REVERT-VERIFIED: with `event_subscription_claim_report` always granting,
+    /// "the subscription ended on its maxReports" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_continuous_subscription_ends_on_its_max_reports_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_101u64, "imsi-001010001832101");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp, sub_id) = subscription_1832(
+            Some(supi),
+            "1832-cont",
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+            serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 2 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(v["subscription"]["options"]["maxReports"], 2, "{v}");
+        next_location_report(&mut rx).await;
+        move_ue_1832(supi, 0x1833);
+        let (_, tac, _) = next_location_report(&mut rx).await;
+        assert_eq!(tac, "1833");
+        let mut ended = false;
+        for _ in 0..50 {
+            if !sub_stored_1832(&sub_id) {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ended, "the subscription ended on its maxReports");
+        move_ue_1832(supi, 0x1834);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "no third report"
+        );
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1832**: a PERIODIC CONNECTIVITY_STATE_REPORT is reported on its period
+    /// with nothing changing, and a change is not reported to it in between. With
+    /// `maxReports` 2 it ends after two, and its timer stops.
+    ///
+    /// REVERT-VERIFIED: with the periodic timer reporting LOCATION_REPORT only, "a
+    /// periodic CONNECTIVITY_STATE_REPORT" fails; with the PERIODIC filter removed
+    /// from `event_subscriptions_matching_ue`, "a change is not reported to a
+    /// PERIODIC subscription" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_connectivity_report_is_made_on_its_period_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_201u64, "imsi-001010001832201");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp, sub_id) = subscription_1832(
+            Some(supi),
+            "1832-periodic-cm",
+            serde_json::json!([{ "type": "CONNECTIVITY_STATE_REPORT" }]),
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1, "maxReports": 2 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let body = tokio::time::timeout(Duration::from_millis(2500), rx.recv())
+            .await
+            .expect("a periodic CONNECTIVITY_STATE_REPORT")
+            .expect("channel");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["type"], "CONNECTIVITY_STATE_REPORT",
+            "{v}"
+        );
+        // Just after a tick: a change now is not reported (the next tick is ~1 s out).
+        let ue = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .amf_ue_find_by_supi(supi)
+            .expect("ue");
+        crate::namf_server::fire_connectivity_state_report(&ue, false);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "a change is not reported to a PERIODIC subscription"
+        );
+        // The second periodic report is its last.
+        tokio::time::timeout(Duration::from_millis(2500), rx.recv())
+            .await
+            .expect("the second periodic report")
+            .expect("channel");
+        let mut stopped = false;
+        for _ in 0..40 {
+            if !sub_stored_1832(&sub_id)
+                && !crate::namf_server::periodic_location_timer_running(&sub_id)
+            {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(stopped, "ended on its maxReports, and the timer stopped");
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1832, R27**: a PERIODIC subscription to an event with no state for a
+    /// period to report (LOSS_OF_CONNECTIVITY: an occurrence) is notified when the
+    /// event occurs, and runs no timer.
+    ///
+    /// REVERT-VERIFIED: with the matcher skipping every PERIODIC subscription, "a
+    /// PERIODIC LOSS_OF_CONNECTIVITY subscriber is told the loss" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_stateless_event_is_reported_when_it_occurs_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_501u64, "imsi-001010001832501");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp, sub_id) = subscription_1832(
+            Some(supi),
+            "1832-loss",
+            serde_json::json!([{ "type": "LOSS_OF_CONNECTIVITY" }]),
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        assert!(!crate::namf_server::periodic_location_timer_running(
+            &sub_id
+        ));
+        let ue = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .amf_ue_find_by_supi(supi)
+            .expect("ue");
+        crate::namf_server::fire_loss_of_connectivity(&ue, "UE_DETACHED");
+        let body = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("a PERIODIC LOSS_OF_CONNECTIVITY subscriber is told the loss")
+            .expect("channel");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["reportList"][0]["type"], "LOSS_OF_CONNECTIVITY", "{v}");
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1832, R27**: an any-UE PERIODIC CONNECTIVITY_STATE_REPORT reports each
+    /// registered UE on its period (the tick resolves the UEs, as for location).
+    ///
+    /// REVERT-VERIFIED: with the tick passing the subscription's own SUPI (none
+    /// here), "an any-UE PERIODIC subscription reports its UEs" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_any_ue_periodic_state_report_covers_its_ues_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_601u64, "imsi-001010001832601");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp, _sub_id) = subscription_1832(
+            None,
+            "1832-any-cm",
+            serde_json::json!([{ "type": "CONNECTIVITY_STATE_REPORT" }]),
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let body = tokio::time::timeout(Duration::from_millis(2500), rx.recv())
+            .await
+            .expect("an any-UE PERIODIC subscription reports its UEs")
+            .expect("channel");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let supis: Vec<&str> = v["reportList"]
+            .as_array()
+            .expect("reportList")
+            .iter()
+            .filter_map(|r| r["supi"].as_str())
+            .collect();
+        assert!(supis.contains(&supi), "{v}");
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1832, R27**: at the count map's bound, a NEW (event, UE) is refused
+    /// rather than a count evicted, so no UE's count restarts.
+    ///
+    /// REVERT-VERIFIED: with an arbitrary count evicted at the bound, the new UE's
+    /// claim is granted ("a new UE at the bound is refused").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_reports_counts_are_not_evicted_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (sink, _rx, resp, sub_id) = subscription_1832(
+            None,
+            "1832-bound",
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+            serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        use crate::context::ReportClaim;
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().expect("ctx lock");
+            for n in 0..crate::context::MAX_REPORTED_REACHABILITY {
+                assert_eq!(
+                    guard.event_subscription_claim_report(
+                        &sub_id,
+                        Some(1),
+                        "LOCATION_REPORT",
+                        &format!("imsi-b{n}")
+                    ),
+                    ReportClaim::Granted { ended: false }
+                );
+            }
+            assert_eq!(
+                guard.event_subscription_claim_report(
+                    &sub_id,
+                    Some(1),
+                    "LOCATION_REPORT",
+                    "imsi-new"
+                ),
+                ReportClaim::Refused,
+                "a new UE at the bound is refused"
+            );
+            assert_eq!(
+                guard.event_subscription_claim_report(
+                    &sub_id,
+                    Some(1),
+                    "LOCATION_REPORT",
+                    "imsi-b0"
+                ),
+                ReportClaim::Refused,
+                "and a counted UE keeps its count"
+            );
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1832**: maxReports applies to each member UE of an any-UE subscription
+    /// (Table 6.2.6.2.6-1), and such a subscription is not ended by one UE's
+    /// maximum.
+    ///
+    /// REVERT-VERIFIED: with the count keyed by event only, the second UE's claim
+    /// is refused ("each UE has its own maximum").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_reports_counts_per_member_ue_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (sink, _rx, resp, sub_id) = subscription_1832(
+            None,
+            "1832-any",
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+            serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        use crate::context::ReportClaim;
+        let claim = |ue: &str| {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx lock")
+                .event_subscription_claim_report(&sub_id, Some(1), "LOCATION_REPORT", ue)
+        };
+        assert_eq!(claim("imsi-a"), ReportClaim::Granted { ended: false });
+        assert_eq!(
+            claim("imsi-b"),
+            ReportClaim::Granted { ended: false },
+            "each UE has its own maximum"
+        );
+        assert_eq!(claim("imsi-a"), ReportClaim::Refused);
+        assert!(sub_stored_1832(&sub_id), "an any-UE subscription goes on");
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1832**, Table 6.2.6.2.6-1: a transferred subscription's
+    /// `options.maxReports` is the REMAINING number of reports, and an event that
+    /// made its maximum is left out; a maxReports of 0 is refused 400.
+    ///
+    /// REVERT-VERIFIED: with the transfer carrying the plain echo, the remaining
+    /// count is 3 not 2 ("the remaining number of reports").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transferred_subscription_carries_its_remaining_reports_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_401u64, "imsi-001010001832401");
+        store_connected_ue_1819(id, supi);
+        let (sink, _rx, resp, sub_id) = subscription_1832(
+            Some(supi),
+            "1832-xfer",
+            serde_json::json!([
+                { "type": "LOCATION_REPORT" },
+                { "type": "REGISTRATION_STATE_REPORT" }
+            ]),
+            serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 3 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let ctx = crate::context::amf_self();
+        let (sub, ue) = {
+            let guard = ctx.read().expect("ctx lock");
+            for _ in 0..3 {
+                guard.event_subscription_claim_report(
+                    &sub_id,
+                    Some(3),
+                    "REGISTRATION_STATE_REPORT",
+                    supi,
+                );
+            }
+            let mut sub = guard.event_subscription_find(&sub_id).expect("stored");
+            // The first LOCATION_REPORT may or may not have been counted yet; pin it.
+            sub.reports_made
+                .insert(("LOCATION_REPORT".to_string(), supi.to_string()), 1);
+            (sub, guard.amf_ue_find_by_supi(supi).expect("ue"))
+        };
+        let out = crate::namf_server::subscription_transfer_json(&sub, &ue);
+        assert_eq!(
+            out["options"]["maxReports"], 2,
+            "the remaining number of reports: {out}"
+        );
+        let events: Vec<&str> = out["eventList"]
+            .as_array()
+            .expect("eventList")
+            .iter()
+            .filter_map(|e| e["type"].as_str())
+            .collect();
+        assert_eq!(
+            events,
+            ["LOCATION_REPORT"],
+            "the exhausted event is left out"
+        );
+        sink.stop().await.expect("sink stop");
+
+        let (sink, _rx, bad, _) = subscription_1832(
+            Some(supi),
+            "1832-bad",
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+            serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 0 }),
+        )
+        .await;
+        assert_eq!(bad.status, 400);
+        sink.stop().await.expect("sink stop");
+        ctx.read().expect("ctx lock").ue_store().remove(id);
+    }
+
+    /// **#1819, R27**: a PERIODIC timer outlives an expiry that was extended
+    /// before it came: at the expiry it re-reads the subscription instead of
+    /// stopping. (The extension here is a store update, a path that does not
+    /// respawn the timer; PATCH respawns it as well.)
+    ///
+    /// REVERT-VERIFIED: with the expiry arm `break`ing, "the timer survives an
+    /// extended expiry" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_timer_survives_an_extended_expiry_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_501u64, "imsi-001010001819501");
+        store_connected_ue_1819(id, supi);
+        let expiry = crate::namf_server::system_time_to_rfc3339(
+            std::time::SystemTime::now() + Duration::from_secs(1),
+        );
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-extend",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 2, "expiry": expiry }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+        next_location_report(&mut rx).await;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            let mut sub = guard.event_subscription_find(&sub_id).expect("stored");
+            sub.expiry = Some(std::time::SystemTime::now() + Duration::from_secs(60));
+            assert!(guard.event_subscription_update(sub));
+        }
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(
+            crate::namf_server::periodic_location_timer_running(&sub_id),
+            "the timer survives an extended expiry"
+        );
+        next_location_report(&mut rx).await;
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819, R27**: a PATCH of `eventList` drives the PERIODIC timer. Without
+    /// LOCATION_REPORT the timer stops and reports no location; with it again, the
+    /// timer runs and reports.
+    ///
+    /// REVERT-VERIFIED (#1819): without the cancel/spawn after the modify, "a PATCH
+    /// that removes LOCATION_REPORT stops the timer" failed. #1832: PERIODIC covers
+    /// every event, so the timer now reports the patched event; each tick re-reads
+    /// `event_types`, so it follows the PATCH even without the respawn. With the
+    /// non-location events left out of the tick, "the patched event on its period"
+    /// fails. (The tick's own
+    /// `event_types` check is a second guard for a store update that does not go
+    /// through the modify handler; a PATCH cannot reach it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_patched_event_list_drives_the_periodic_timer_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_601u64, "imsi-001010001819601");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-patch",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+        next_location_report(&mut rx).await;
+        let patch = |events: serde_json::Value| {
+            nextgcore_sbi::SbiRequest::patch(format!("/namf-evts/v1/subscriptions/{sub_id}"))
+                .with_json_body(&serde_json::json!([
+                    { "op": "replace", "path": "/subscription/eventList", "value": events }
+                ]))
+                .expect("json")
+        };
+        let resp = crate::namf_server::namf_request_handler(patch(
+            serde_json::json!([{ "type": "REGISTRATION_STATE_REPORT" }]),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        // #1832: PERIODIC now covers every event, so the respawned timer reports
+        // the REGISTRATION_STATE_REPORT, and no location.
+        assert!(crate::namf_server::periodic_location_timer_running(&sub_id));
+        while rx.try_recv().is_ok() {}
+        let body = tokio::time::timeout(Duration::from_millis(2500), rx.recv())
+            .await
+            .expect("the patched event on its period")
+            .expect("channel");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let types: Vec<&str> = v["reportList"]
+            .as_array()
+            .expect("reportList")
+            .iter()
+            .filter_map(|r| r["type"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            ["REGISTRATION_STATE_REPORT"],
+            "no location after LOCATION_REPORT is removed"
+        );
+        let resp = crate::namf_server::namf_request_handler(patch(
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        assert!(crate::namf_server::periodic_location_timer_running(&sub_id));
+        next_location_report(&mut rx).await;
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819**: PERIODIC without `repPeriod` (Table 6.2.6.2.6-1: "shall be present
+    /// if the trigger is set to PERIODIC") is refused 400 MANDATORY_IE_MISSING, and a
+    /// zero period MANDATORY_IE_INCORRECT; nothing is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_subscription_needs_a_rep_period_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let before = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_count();
+        for (options, cause) in [
+            (
+                serde_json::json!({ "trigger": "PERIODIC" }),
+                "MANDATORY_IE_MISSING",
+            ),
+            (
+                serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 0 }),
+                "MANDATORY_IE_INCORRECT",
+            ),
+        ] {
+            let (sink, _rx, resp) =
+                periodic_location_subscription("imsi-001010001819301", "1819-bad", options).await;
+            assert_eq!(resp.status, 400);
+            let v: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+            assert_eq!(v["cause"], cause, "{v}");
+            sink.stop().await.expect("sink stop");
+        }
+        assert_eq!(
+            crate::context::amf_self()
+                .read()
+                .expect("ctx lock")
+                .event_subscription_count(),
+            before
+        );
     }
 
     /// **#1737, #1760**: the first report is the subscription's own baseline, and for
@@ -39660,6 +40561,9 @@ mod tests {
                     taken_over: false,
                     one_time: false,
                     first_location_pending: true,
+                    rep_period: None,
+                    max_reports: None,
+                    reports_made: std::collections::HashMap::new(),
                     reporting_threshold: None,
                     location_filters: Vec::new(),
                 })
@@ -40823,6 +41727,9 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
+            max_reports: None,
+            reports_made: std::collections::HashMap::new(),
             one_time: false,
             first_location_pending: false,
             reporting_threshold: None,
@@ -45701,6 +46608,9 @@ mod tests {
                 reported_connectivity: std::collections::HashMap::new(),
                 reported_location: None,
                 taken_over: false,
+                rep_period: None,
+                max_reports: None,
+                reports_made: std::collections::HashMap::new(),
                 one_time: false,
                 first_location_pending: false,
                 reporting_threshold: None,
@@ -45835,6 +46745,9 @@ mod tests {
                 reported_connectivity: std::collections::HashMap::new(),
                 reported_location: None,
                 taken_over: false,
+                rep_period: None,
+                max_reports: None,
+                reports_made: std::collections::HashMap::new(),
                 one_time: false,
                 first_location_pending: false,
                 reporting_threshold: None,
