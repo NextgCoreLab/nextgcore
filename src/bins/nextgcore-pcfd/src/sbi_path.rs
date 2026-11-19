@@ -2622,7 +2622,8 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
         .delete(&path)
         .await
         .map_err(|e| format!("nbsf-management delete failed: {e}"))?;
-    Ok(resp.status == 204 || resp.status == 200)
+    // #1877: 404, the BSF does not hold it, is the state wanted.
+    Ok(resp.status == 204 || resp.status == 200 || resp.status == 404)
 }
 
 // --- Wave-6 E4: UE-policy (URSP) delivery via Namf_Communication N1N2 ---
@@ -3210,12 +3211,28 @@ pub fn pcf_sess_register_bsf_binding(sess_id: u64) {
                 match pcf_register_bsf_binding(&binding).await {
                     Ok(Some(id)) => {
                         log::info!("PCF binding registered with BSF (id={id}) for {sm_policy_id}");
-                        if let Ok(ctx) = crate::context::pcf_self().read() {
-                            if let Some(mut sess) = ctx.sess_find_by_sm_policy_id(&sm_policy_id) {
-                                sess.binding
-                                    .store(&format!("/nbsf-management/v1/pcfBindings/{id}"), &id);
-                                ctx.sess_update(&sess);
-                            }
+                        // #1877: stored on THIS session, by id: the sess list lock that
+                        // `sess_update` and `sess_remove` both take orders it against a
+                        // delete. A delete first (the 201 landed after the policy was
+                        // gone, or it was replaced) leaves nothing to store it on, and the
+                        // binding is deregistered rather than left stale at the BSF.
+                        let stored = crate::context::pcf_self().read().is_ok_and(|ctx| {
+                            ctx.sess_find_by_id(sess_id)
+                                .filter(|s| s.sm_policy_id == sm_policy_id)
+                                .is_some_and(|mut sess| {
+                                    sess.binding.store(
+                                        &format!("/nbsf-management/v1/pcfBindings/{id}"),
+                                        &id,
+                                    );
+                                    ctx.sess_update(&sess)
+                                })
+                        });
+                        if !stored {
+                            log::info!(
+                                "PCF binding {id}: SM policy {sm_policy_id} went while it was \
+                                 registered; deregistering it"
+                            );
+                            pcf_sess_deregister_bsf_binding(id);
                         }
                     }
                     Ok(None) => log::debug!("No BSF reachable; PCF binding not registered"),
@@ -3283,17 +3300,24 @@ pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(binding_id.clone());
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            match pcf_deregister_bsf_binding(&binding_id).await {
-                Ok(true) => log::info!("PCF binding {binding_id} deregistered from BSF"),
-                Ok(false) => {
-                    log::debug!("No BSF reachable; binding {binding_id} not deregistered")
-                }
-                Err(e) => log::warn!("BSF binding deregistration failed: {e}"),
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        crate::bsf_reconcile::park(&binding_id);
+        return;
+    };
+    handle.spawn(async move {
+        match pcf_deregister_bsf_binding(&binding_id).await {
+            Ok(true) => log::info!("PCF binding {binding_id} deregistered from BSF"),
+            // #1877: retried until the BSF takes it, rather than left there.
+            Ok(false) => {
+                log::warn!("No BSF reachable; binding {binding_id} parked for the reconciler");
+                crate::bsf_reconcile::park(&binding_id);
             }
-        });
-    }
+            Err(e) => {
+                log::warn!("BSF binding deregistration failed: {e}; parked");
+                crate::bsf_reconcile::park(&binding_id);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -3940,6 +3964,172 @@ mod tests {
 #[cfg(test)]
 mod tests_api_root {
     use super::{build_pcf_binding_body_with, pcf_api_root_for, pcf_self_info_for, PcfSelfInfo};
+    use super::{
+        pcf_self_info_set, pcf_sess_deregister_bsf_binding, pcf_sess_register_bsf_binding,
+    };
+
+    type Seen1877 = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// One SBI peer playing the NRF (it answers BSF discovery with itself) and the
+    /// BSF: a binding POST answered 201 after `post_delay`, a DELETE with `delete`.
+    async fn nrf_and_bsf_1877(
+        post_delay: std::time::Duration,
+        delete: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    ) -> (nextgcore_sbi::server::SbiServer, u16, Seen1877) {
+        use std::sync::atomic::Ordering;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Seen1877 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let own = port.clone();
+        let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = sink.clone();
+                let port = own.load(Ordering::SeqCst);
+                let delete = delete.load(Ordering::SeqCst);
+                async move {
+                    use nextgcore_sbi::message::SbiResponse;
+                    let (method, uri) = (req.header.method.clone(), req.header.uri.clone());
+                    sink.lock().unwrap().push((method.clone(), uri.clone()));
+                    if uri.contains("/nnrf-disc/") {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "validityPeriod": 3600,
+                                "nfInstances": [{
+                                    "nfInstanceId": "bsf-1877",
+                                    "nfType": "BSF",
+                                    "nfStatus": "REGISTERED",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "nfServices": [{
+                                        "serviceInstanceId": "s1",
+                                        "serviceName": "nbsf-management",
+                                        "scheme": "http",
+                                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                    }]
+                                }]
+                            }))
+                            .unwrap();
+                    }
+                    if method == "DELETE" {
+                        return SbiResponse::with_status(delete);
+                    }
+                    tokio::time::sleep(post_delay).await;
+                    SbiResponse::with_status(201)
+                        .with_header("Location", "/nbsf-management/v1/pcfBindings/b-1877")
+                        .with_json_body(&serde_json::json!({ "supi": "imsi-1" }))
+                        .unwrap()
+                }
+            },
+        )
+        .await;
+        port.store(addr.port(), Ordering::SeqCst);
+        (srv, addr.port(), seen)
+    }
+
+    fn binding_deletes_1877(seen: &Seen1877) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, u)| m == "DELETE" && u.ends_with("/pcfBindings/b-1877"))
+            .count()
+    }
+
+    /// #1877: a BSF binding whose 201 lands after its SM policy was deleted is
+    /// deregistered, not left at the BSF pointing at a session that is gone (the
+    /// delete found no binding id to deregister, because none was stored yet).
+    ///
+    /// REVERT-VERIFIED: with the late 201 discarded as before, this fails: the BSF
+    /// never sees the DELETE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the PCF context guard, held across the test
+    async fn a_binding_that_lands_after_its_policy_went_is_deregistered_1877() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let (srv, port, seen) = nrf_and_bsf_1877(
+            std::time::Duration::from_millis(300),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204)),
+        )
+        .await;
+        let _nrf = crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        let _ = pcf_self_info_set(PcfSelfInfo {
+            sbi_addr: "127.0.0.1".into(),
+            sbi_port: 7777,
+            fqdn: None,
+            nf_instance_id: "pcf-1877".into(),
+        });
+        let sess_id = {
+            let ctx = crate::context::pcf_self();
+            let guard = ctx.read().unwrap();
+            let ue = guard.ue_sm_add("imsi-001010000018773").expect("ue");
+            guard.sess_add(ue.id, 5).expect("sess").id
+        };
+
+        pcf_sess_register_bsf_binding(sess_id);
+        // The policy is deleted while the BSF is still answering the binding POST.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, u)| m == "POST" && u.contains("pcfBindings"))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "never registered");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let removed = crate::context::pcf_self()
+            .read()
+            .unwrap()
+            .sess_remove_with_apps(sess_id);
+        assert!(
+            removed.is_some_and(|(s, _)| s.binding.id.is_none()),
+            "no id to deregister yet"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while binding_deletes_1877(&seen) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let deleted = binding_deletes_1877(&seen);
+        srv.stop().await.ok();
+
+        assert_eq!(deleted, 1, "the late binding is deregistered at the BSF");
+    }
+
+    /// #1877: a BSF deregistration that fails is parked and retried until the BSF
+    /// takes it.
+    ///
+    /// REVERT-VERIFIED: with a failed deregistration not parked, this fails:
+    /// nothing is parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the PCF context guard, held across the test
+    async fn a_failed_bsf_deregistration_is_reconciled_1877() {
+        use std::sync::atomic::Ordering;
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::bsf_reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let (srv, port, seen) = nrf_and_bsf_1877(std::time::Duration::ZERO, status.clone()).await;
+        let _nrf = crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{port}")).await;
+
+        pcf_sess_deregister_bsf_binding("b-1877".to_string());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::bsf_reconcile::is_parked("b-1877") && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let parked = crate::bsf_reconcile::is_parked("b-1877");
+        status.store(204, Ordering::SeqCst);
+        crate::bsf_reconcile::reconcile_once().await;
+        let parked_after = crate::bsf_reconcile::is_parked("b-1877");
+        let tries = binding_deletes_1877(&seen);
+        crate::bsf_reconcile::clear_for_test();
+        srv.stop().await.ok();
+
+        assert!(parked, "the failed deregistration is parked");
+        assert!(!parked_after, "and delivered once the BSF answers");
+        assert_eq!(tries, 2, "failed once, then delivered");
+    }
 
     /// #1322 (#1321 review): no self identity, no BSF binding, logged once.
     #[test]

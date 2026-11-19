@@ -15,6 +15,7 @@
 #[cfg(feature = "demo-d441a-congestion-loop")]
 pub mod ambr_override;
 pub mod app;
+pub mod bsf_reconcile; // #1877: failed BSF binding deregistrations, retried until delivered
 /// nextgsim#465: the User Data Congestion Session-AMBR controller (demo-only).
 #[cfg(feature = "demo-d441a-congestion-loop")]
 pub mod congestion_loop;

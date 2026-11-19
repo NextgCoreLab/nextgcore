@@ -719,6 +719,8 @@ pub async fn run() -> Result<()> {
         .start(pcf_sbi_request_handler)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+    // #1877: BSF binding deregistrations that failed are retried until delivered.
+    drop(crate::bsf_reconcile::spawn_reconciler());
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
