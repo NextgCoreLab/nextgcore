@@ -1090,6 +1090,9 @@ fn handle_ue_policy_notify_callback(
 ///   change this AMF does not apply (DECISIONS 2026-11-18-030000), never a 204. The check, the changes and the
 ///   derived fields are one step under the store's lock, so a concurrent
 ///   re-subscription cannot interleave and nothing is left half applied.
+/// - An applied change of the UE-AMBR queues the UE for a UE Context Modification
+///   at NG-RAN (#1776, TS 23.502 §4.5.1), which the NGAP task sends if the UE is
+///   CM-CONNECTED.
 fn handle_sdm_notify_callback(
     supi: &str,
     token: Option<&str>,
@@ -1126,25 +1129,39 @@ fn handle_sdm_notify_callback(
             return None;
         }
         let current = crate::sdm_notify::current_am_data(&state.amf_ue);
-        // CM-CONNECTED as `ue_ng_connected` reads it, under the same lock.
-        let cm_connected = !state.is_cm_idle() && state.is_bound();
         Some(
-            crate::sdm_notify::applied_am_data(
-                supi,
-                &current,
-                state.sdm_subscription_id(),
-                &body,
-                cm_connected,
-            )
-            .map(|doc| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc)),
+            crate::sdm_notify::applied_am_data(supi, &current, state.sdm_subscription_id(), &body)
+                .map(|doc| {
+                    let before = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+                    crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc);
+                    before != (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink)
+                }),
         )
     });
+    // #1776, TS 23.502 §4.5.1: a changed UE-AMBR is the UE context at NG-RAN to
+    // modify. Queued for the NGAP task, which owns SCTP and reads the CM state at
+    // send time: a CM-CONNECTED UE's node gets a UE CONTEXT MODIFICATION REQUEST
+    // with the UE-AMBR then held; for a CM-IDLE UE nothing is sent, and its next
+    // Initial Context Setup carries it. Queued whatever the CM state now, so a UE
+    // that connects before the drain, on an Initial Context Setup built from what it
+    // held before this change, is still brought up to date. Only an applied change
+    // is queued, and a retry that changes nothing queues nothing.
+    if let Some(Some(Ok(true))) = outcome {
+        guard.ue_ambr_modification_add(ue.id);
+    }
     drop(guard);
     match outcome {
         None => context_not_found(supi),
         Some(None) => unknown_callback_token(supi, "SDM data change"),
-        Some(Some(Ok(()))) => {
-            log::info!("[{supi}] Nudm_SDM data change notification applied to the am-data");
+        Some(Some(Ok(ue_ambr_changed))) => {
+            log::info!(
+                "[{supi}] Nudm_SDM data change notification applied to the am-data{}",
+                if ue_ambr_changed {
+                    "; the UE-AMBR changed, queued for NG-RAN (UE Context Modification)"
+                } else {
+                    ""
+                }
+            );
             SbiResponse::no_content()
         }
         Some(Some(Err(refusal))) => {
@@ -5233,20 +5250,29 @@ fn try_positioning_relay(
     if !connected {
         // Paged. The downlinks are enqueued as usual, and the NGAP task holds them
         // while the UE is being paged, then delivers them once its Service Request
-        // has connected it. A page already running (for another transfer) is not
-        // replaced: it brings the UE back just the same. This differs on purpose from
-        // #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING for an SM transfer during a page:
-        // that rule protects the one SM N2 the paging context holds, and these
-        // downlinks are held by the NGAP task, not in the paging context, so they
-        // can ride a page in progress.
-        let paging = amf_self()
-            .read()
-            .ok()
-            .is_some_and(|g| g.paging_find(ue.id).is_some());
-        let location = if paging {
-            format!("/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages")
-        } else {
-            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // has connected it. A page already running (for another transfer, or
+        // location-only) is joined, not replaced: it brings the UE back just the
+        // same. This differs on purpose from #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING
+        // for an SM transfer during a page: that rule protects the one SM N2 the
+        // paging context holds, and these downlinks are held by the NGAP task, not in
+        // the paging context, so they can ride a page in progress. #1837: the join
+        // keeps this LMF's n1n2FailureTxfNotifURI on the page, so a page that fails
+        // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
+        // the paging-map lock, so a page another transfer queues meanwhile is joined,
+        // never overwritten.
+        // #1858: this transfer's own resource id, so its failure notification is
+        // its own even when another LMF transfer shares the callback URI. The same
+        // transfer retried gets the same id, and is recorded once.
+        let transfer_id = positioning_transfer_id(body, &downlinks);
+        let Some(location) =
+            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri, &transfer_id)
+        else {
+            log::info!(
+                "[{ue_context_id}] LCS: the page for the UE already carries {} other \
+                 transfers; 409",
+                crate::context::MAX_JOINED_TRANSFERS
+            );
+            return Some(paging_ongoing_error());
         };
         if let Ok(context) = amf_self().read() {
             for dl in downlinks {
@@ -5276,6 +5302,30 @@ fn try_positioning_relay(
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     })
+}
+
+/// #1858: the identity of a paged positioning transfer, the `{n1N2MessageId}` of
+/// the Location it is answered with (TS 29.518 §5.2.2.3.1) and of the
+/// n1n2MsgDataUri its failure notification names. Derived from the request itself
+/// (its JSON part and the LPP/NRPPa payloads), so a retry of the same transfer
+/// maps to the same resource and is recorded once, while two transfers with
+/// different content are two resources, even when they share one
+/// n1n2FailureTxfNotifURI.
+fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.to_string().hash(&mut h);
+    for dl in downlinks {
+        match &dl.kind {
+            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::NrppaToGnb {
+                routing_id,
+                nrppa_pdu,
+            } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
+            PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+        }
+    }
+    format!("lcs-{:016x}", h.finish())
 }
 
 /// UPDP (UE policy) downlink relay — Wave-6 E5 (TS 29.525 §4.2.2.2: the PCF
@@ -5334,17 +5384,18 @@ fn try_ue_policy_relay(
             return Some(ue_not_reachable_error());
         }
         // #749: paging is ongoing for another transfer; overwriting its context
-        // would lose that one, so this one is refused for the PCF to retry.
-        if crate::namf_handler::paging_ongoing(ue.id) {
-            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
-            return Some(paging_ongoing_error());
-        }
-        let location = crate::namf_handler::page_idle_ue_for_n1(
+        // would lose that one, so this one is refused for the PCF to retry. #1837:
+        // checked and queued as one step, so a transfer racing this one cannot slip
+        // in between.
+        let Some(location) = crate::namf_handler::page_idle_ue_for_n1(
             ue,
             updp_pdu,
             crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
             failure_uri,
-        );
+        ) else {
+            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
+            return Some(paging_ongoing_error());
+        };
         log::info!("[{ue_context_id}] UE policy: UE is CM-IDLE, paging it for the UPDP");
         let body = json!({ "cause": "ATTEMPTING_TO_REACH_UE" });
         return Some(match SbiResponse::with_status(202).with_json_body(&body) {
@@ -8410,16 +8461,30 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
     // from the same MB-SMF (`mbsmfId`) for the same TMGI is a retry and gets the
     // same context back rather than a second one.
     let mbsmf_id = body.get("mbsmfId").and_then(Value::as_str);
-    let Some((context_ref, session)) =
-        crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id)
-    else {
-        return send_error(
-            500,
-            "Internal Server Error",
-            "could not create the MBS session context",
-            None,
-        );
-    };
+    let (context_ref, session) =
+        match crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id) {
+            Ok(created) => created,
+            // #1856: bounded, with the TS 29.500 cause for it.
+            Err(crate::ngap_mcast::BroadcastCreateRefused::Full) => {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    &format!(
+                        "this AMF holds {} broadcast MBS contexts",
+                        crate::ngap_mcast::MAX_BROADCAST_CONTEXTS
+                    ),
+                    Some("INSUFFICIENT_RESOURCES"),
+                );
+            }
+            Err(crate::ngap_mcast::BroadcastCreateRefused::Failed) => {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    "could not create the MBS session context",
+                    None,
+                );
+            }
+        };
 
     log::info!(
         "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={context_ref} session={}",
@@ -8427,7 +8492,8 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
         session.mbs_session_id,
     );
 
-    let context_ref = format!("{context_ref}");
+    // #1856: `<epoch>-<id>`, unique across restarts of this AMF.
+    let context_ref = crate::ngap_mcast::context_ref_string(context_ref);
     let response_body = json!({ "mbsContextRef": context_ref });
 
     // 201 with a Location header naming the created resource (TS 29.518 §6.5).
@@ -8455,9 +8521,8 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
 /// the session by its id outright, tearing down a TMGI-shared session another
 /// context or an NGAP multicast session still used.
 fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
-    let released = context_ref
-        .parse::<u64>()
-        .ok()
+    // #1856: a ref of another epoch (issued before a restart) is not found.
+    let released = crate::ngap_mcast::parse_context_ref(context_ref)
         .and_then(|id| crate::context::amf_mcast().broadcast_context_delete(id));
     match released {
         Some(release) => {
@@ -11450,8 +11515,8 @@ mod tests {
     async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000017481";
-        // CM-IDLE: a UE-AMBR change for a CM-CONNECTED UE is refused (see
-        // `a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748`).
+        // CM-IDLE (a CM-CONNECTED UE: see
+        // `a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776`).
         let _ue = setup_ue(supi, false, true);
         let body = am_data_change(
             supi,
@@ -11531,9 +11596,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_sdm_data_change_notification_applies_nothing_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017483";
-        // CM-IDLE, so the UE-AMBR change beside each refused one is applicable.
-        let _ue = setup_ue(supi, false, true);
+        // #1776: CM-CONNECTED, so the UE-AMBR change beside each refused one would be
+        // queued for a UE Context Modification were it applied.
+        let ue = setup_ue(supi, true, true);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
         let token = format!("sdm-{supi}");
         let kept = json!({
             "subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"},
@@ -11610,6 +11683,10 @@ mod tests {
             400
         );
         assert_eq!(sdm_view(supi), before, "nothing applied");
+        assert!(
+            !queued(),
+            "#1776: a refused notification queues no modification"
+        );
         // The S-NSSAIs unchanged: applied (the slices are compared, not the body).
         let same = am_data_change(
             supi,
@@ -11618,19 +11695,26 @@ mod tests {
         );
         assert_eq!(post_sdm_notify(supi, Some(&token), &same).await.status, 204);
         assert_eq!(sdm_view(supi).0, 9_000_000, "applied");
+        assert!(queued(), "#1776: and its UE-AMBR change queued");
+        amf_self()
+            .read()
+            .expect("ctx")
+            .ue_ambr_modification_remove_for(&[ue.id]);
     }
 
-    /// #1748 (R11 MAJOR-2, TS 23.502 §4.5.1): for a CM-CONNECTED UE, NG-RAN enforces
-    /// the UE-AMBR it was given, and this AMF does not send the UE Context
-    /// Modification that would move it, so a change of the subscribed UE-AMBR is
-    /// refused with 400 and nothing is applied, the GPSI change beside it included.
-    /// A change that leaves the UE-AMBR as it is is applied.
+    /// #1776 (lifts #1748 R11 MAJOR-2, TS 23.502 §4.5.1): a change of the subscribed
+    /// UE-AMBR for a CM-CONNECTED UE is applied and answered 204, with the GPSI
+    /// change beside it, and the UE is queued once for the NGAP task's UE Context
+    /// Modification. A change that leaves the UE-AMBR as it is (a GPSI-only change,
+    /// a retry of the same notification) queues nothing.
     ///
-    /// REVERT-VERIFIED: with `cm_connected` passed as `false` from the handler, the
-    /// refusal is a 204 and the UE-AMBR changes.
+    /// REVERT-VERIFIED: with the `ue_ambr_modification_add` call removed from the
+    /// handler, the "queued" assertion fails; with it made unconditional (any applied
+    /// change), the "a GPSI-only change" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748() {
+    async fn a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017488";
         let ue = setup_ue(supi, true, true);
         {
@@ -11645,8 +11729,29 @@ mod tests {
             });
         }
         assert!(ue_ng_connected(&ue), "CM-CONNECTED");
-        let before = sdm_view(supi);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
+        let dequeue = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_remove_for(&[ue.id])
+        };
+        dequeue();
         let token = format!("sdm-{supi}");
+        let gpsi_only = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917489"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
+            204
+        );
+        assert!(!queued(), "a GPSI-only change queues no modification");
         let body = am_data_change(
             supi,
             json!([
@@ -11656,18 +11761,15 @@ mod tests {
             ]),
         );
         let resp = post_sdm_notify(supi, Some(&token), &body).await;
-        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
-        assert_eq!(problem_cause(&resp), "UNSPECIFIED_MSG_FAILURE");
-        assert_eq!(sdm_view(supi), before, "nothing applied");
-        let gpsi_only = am_data_change(
-            supi,
-            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]}]),
-        );
-        assert_eq!(
-            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
-            204
-        );
-        assert_eq!(sdm_view(supi).2.as_deref(), Some("msisdn-4917488"));
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let (ul, dl, gpsi, _, _) = sdm_view(supi);
+        assert_eq!((ul, dl), (5_000_000, 10_000_000), "the new UE-AMBR is held");
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917488"));
+        assert!(queued(), "queued for the UE Context Modification");
+        dequeue();
+        // The UDM's retry of the same notification: 204, and nothing more to send.
+        assert_eq!(post_sdm_notify(supi, Some(&token), &body).await.status, 204);
+        assert!(!queued(), "a retry queues no second modification");
     }
 
     /// #1748: a notification is acted on only with the UE's current SDM subscription
@@ -12577,6 +12679,51 @@ mod tests {
         );
     }
 
+    /// **#1856**: an `mbsContextRef` is `<epoch>-<id>`, the epoch this AMF
+    /// instance's own. A ref of another epoch (one an earlier run of this AMF
+    /// issued, whose counter restarted at 1) is 404 CONTEXT_NOT_FOUND and deletes
+    /// nothing, even when its number names a live context now.
+    ///
+    /// REVERT-VERIFIED: with `parse_context_ref` ignoring the epoch, the stale ref
+    /// deletes the live context ("a pre-restart ref is not found").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ref_from_before_a_restart_deletes_nothing_1856() {
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
+        let created = namf_request_handler(
+            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+                .with_json_body(&mbs_tmgi_body("001", "01", "001856"))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(created.status, 201);
+        let context_ref = body_json(&created)["mbsContextRef"]
+            .as_str()
+            .expect("mbsContextRef")
+            .to_string();
+        let (epoch, id) = context_ref.split_once('-').expect("<epoch>-<id>");
+        assert_eq!(epoch.len(), 8, "{context_ref}");
+        let stale_epoch = if epoch == "00000000" {
+            "00000001"
+        } else {
+            "00000000"
+        };
+        let stale = format!("{stale_epoch}-{id}");
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{stale}"
+        )))
+        .await;
+        assert_eq!(resp.status, 404, "a pre-restart ref is not found");
+        assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
+        let held = crate::ngap_mcast::parse_context_ref(&context_ref)
+            .and_then(|id| crate::context::amf_mcast().broadcast_context_find(id));
+        assert!(held.is_some(), "the live context is untouched");
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
+        )))
+        .await;
+        assert_eq!(resp.status, 204);
+    }
+
     /// #1758: ContextDelete removes the broadcast MBS context ContextCreate made,
     /// and a second delete (or an unknown reference) is 404 CONTEXT_NOT_FOUND, which
     /// the MB-SMF treats as gone.
@@ -12593,7 +12740,7 @@ mod tests {
             .as_str()
             .expect("mbsContextRef")
             .to_string();
-        let id: u64 = context_ref.parse().expect("numeric ref");
+        let id = crate::ngap_mcast::parse_context_ref(&context_ref).expect("this AMF's ref");
         assert!(crate::context::amf_mcast()
             .broadcast_context_find(id)
             .is_some());
@@ -12657,6 +12804,8 @@ mod tests {
     /// "multicast session survives" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let tmgi = Tmgi::new(0x181800, [0x00, 0xF1, 0x10]);
         let mcast = crate::context::amf_mcast();
         let multicast = mcast
@@ -12673,7 +12822,9 @@ mod tests {
 
         let context_ref = create_mbs_context_1818("181800", None).await;
         let joined = mcast
-            .broadcast_context_find(context_ref.parse().expect("numeric ref"))
+            .broadcast_context_find(
+                crate::ngap_mcast::parse_context_ref(&context_ref).expect("ref"),
+            )
             .expect("the broadcast context is held");
         assert_eq!(
             joined.session_id, multicast.mbs_session_id,
@@ -12701,6 +12852,8 @@ mod tests {
     /// the session and the "kept for the other context" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_last_broadcast_context_on_a_tmgi_removes_its_session_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let tmgi = Tmgi::new(0x181801, [0x00, 0xF1, 0x10]);
         let mcast = crate::context::amf_mcast();
         let a = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
