@@ -251,6 +251,16 @@ fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
 }
 
+tokio::task_local! {
+    /// #2003 review MAJOR: the sequence number of the UpdateSMContext this task
+    /// is serving, so the AMF change it records names its writer
+    /// ([`context::PolicyBinding::serving_amf_writer`]).
+    static CURRENT_SM_CONTEXT_UPDATE: u64;
+}
+
+/// #2003: sequence numbers for [`CURRENT_SM_CONTEXT_UPDATE`]; 0 is never handed out.
+static SM_CONTEXT_UPDATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[cfg(test)]
 tokio::task_local! {
     /// #1648 tests: the OAuth2 client [`oauth2_client`] returns inside
@@ -6162,6 +6172,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                     ambr_dl_bps: decision.sess_ambr_dl_bps,
                     sm_context_status_uri: sm_context_status_uri.clone(),
                     serving_amf: None,
+                    serving_amf_writer: 0,
                     fsm: fsm.clone(),
                     easdf_dns_context_id: easdf_dns_context_id.clone(),
                     easdf_reported_eas: Vec::new(),
@@ -6862,6 +6873,8 @@ fn record_serving_amf(sm_context_ref: &str, serving_nf_id: &str, status_uri: &st
     if let Ok(mut bindings) = ctx.policy_bindings.write() {
         if let Some(b) = bindings.get_mut(sm_context_ref) {
             b.sm_context_status_uri = Some(status_uri.to_string());
+            // #2003: this update is now the binding's last AMF-change writer.
+            b.serving_amf_writer = CURRENT_SM_CONTEXT_UPDATE.try_with(|seq| *seq).unwrap_or(0);
             // #1860: a bound context follows the AMF change. The router admitted
             // this request only if `serving_nf_id` is the caller's own verified
             // identity (`refuse_sm_context_caller`), so the new owner proved it.
@@ -7542,14 +7555,50 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     // validated, so a request answered 4xx/5xx would still have moved the owner
     // and rebound the status URI. Whatever this request recorded is put back when
     // it fails, so a rejected request applies nothing.
-    let before = ServingAmfState::read(sm_context_ref);
-    let resp = handle_sm_context_update_inner(sm_context_ref, request).await;
-    if resp.status >= 400 {
-        if let Some(before) = before {
-            before.restore_if_rebound_by(sm_context_ref, request);
-        }
+    //
+    // #1931: and when the request is CANCELLED mid-update (the AMF's stream is
+    // reset, a timeout drops this future while it awaits N4), the same restore
+    // runs from the guard's `Drop`, so a dropped AMF change leaves the owner
+    // where it was. Only an answered success disarms it.
+    let writer = SM_CONTEXT_UPDATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut rollback = AmfChangeRollback {
+        sm_context_ref,
+        request,
+        writer,
+        before: ServingAmfState::read(sm_context_ref),
+    };
+    let resp = CURRENT_SM_CONTEXT_UPDATE
+        .scope(
+            writer,
+            handle_sm_context_update_inner(sm_context_ref, request),
+        )
+        .await;
+    if resp.status < 400 {
+        rollback.before = None;
     }
     resp
+}
+
+/// Restores the serving-AMF state an UpdateSMContext recorded unless the update
+/// answered success (#1899 review M1 for a failure, #1931 for a cancellation).
+/// Its `Drop` runs on both: the normal end of `handle_sm_context_update` and the
+/// drop of its future mid-await. `restore_if_rebound_by` is synchronous and
+/// compare-and-restore, so a later request's change is never undone.
+struct AmfChangeRollback<'a> {
+    sm_context_ref: &'a str,
+    request: &'a SbiRequest,
+    /// This update's sequence number (#2003): only its own write is undone.
+    writer: u64,
+    /// `None` once disarmed (or when the context had no binding to restore).
+    before: Option<ServingAmfState>,
+}
+
+impl Drop for AmfChangeRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(before) = self.before.take() {
+            before.restore_if_rebound_by(self.sm_context_ref, self.request, self.writer);
+        }
+    }
 }
 
 /// The serving-AMF state an AMF change rewrites (#1899 review M1): the bound
@@ -7578,7 +7627,7 @@ impl ServingAmfState {
 
     /// Put `self` back if `request` was an AMF change and the context still holds
     /// exactly what it recorded. A later change by another request is left alone.
-    fn restore_if_rebound_by(self, sm_context_ref: &str, request: &SbiRequest) {
+    fn restore_if_rebound_by(self, sm_context_ref: &str, request: &SbiRequest, writer: u64) {
         let Some(body) = request
             .http
             .content
@@ -7593,22 +7642,25 @@ impl ServingAmfState {
         ) else {
             return;
         };
+        // #2003 review minor 1: recover a poisoned lock rather than skip the
+        // restore. A panic mid-update is exactly when the restore matters.
         let handle = smf_self();
-        let Ok(ctx) = handle.read() else {
-            return;
-        };
+        let ctx = handle.read().unwrap_or_else(|e| e.into_inner());
         let mut restored = false;
-        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+        {
+            let mut bindings = ctx
+                .policy_bindings
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(b) = bindings.get_mut(sm_context_ref) {
-                let ours = b.sm_context_status_uri.as_deref() == Some(status_uri)
-                    && (b.serving_amf == self.serving_amf
-                        || b.serving_amf.as_deref() == Some(serving));
-                if ours
-                    && (b.sm_context_status_uri != self.binding_status_uri
-                        || b.serving_amf != self.serving_amf)
-                {
+                // #2003 review MAJOR: ours only while this update is still the
+                // last AMF-change writer. A value comparison took a later update
+                // that wrote the SAME servingNfId and URI (an AMF's retry) for
+                // this one's write, and undid it.
+                if writer != 0 && b.serving_amf_writer == writer {
                     b.sm_context_status_uri = self.binding_status_uri.clone();
                     b.serving_amf = self.serving_amf.clone();
+                    b.serving_amf_writer = 0;
                     restored = true;
                 }
             }
@@ -19207,6 +19259,7 @@ mod tests {
                         // N1N2MessageTransfer is attempted.
                         sm_context_status_uri: None,
                         serving_amf: None,
+                        serving_amf_writer: 0,
                         fsm: gsm_sm::GsmFsm::new(0),
                         // #114: no EASDF DNS context by default, so the release
                         // path has nothing to delete.
@@ -28700,6 +28753,140 @@ mod tests {
                 .await
                 .status,
             200
+        );
+    }
+
+    /// #1931: an AMF change whose UpdateSMContext is CANCELLED mid-update (its
+    /// future dropped while it waits on N4, as when the AMF resets the stream)
+    /// moves nothing either. B names itself and deactivates the user plane; the
+    /// UPF is slow, the request is dropped before the answer, and the context is
+    /// still A's with A's status URI, managed by A and refused to B.
+    #[tokio::test]
+    async fn a_cancelled_amf_change_moves_nothing_1931() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000001931", 5, Some(AMF_A_1860)).await;
+        let uri_before = lookup_policy_binding(&reference)
+            .expect("bound")
+            .sm_context_status_uri;
+        upf.clear_seen();
+        upf.delay_modifications(2_000);
+
+        let update = smf_sbi_request_handler(sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({
+                "servingNfId": AMF_B_1860,
+                "smContextStatusUri": "http://amf-b.example/nsmf-callback/status",
+                "upCnxState": "DEACTIVATED",
+            }),
+            Some(AMF_B_1860),
+        ));
+        let dropped = tokio::time::timeout(Duration::from_millis(300), update).await;
+        assert!(
+            dropped.is_err(),
+            "the update must still be on N4 when it is dropped"
+        );
+        assert!(
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST),
+            "the drop came mid-update, after the AMF change was recorded: {:?}",
+            upf.seen()
+        );
+        upf.delay_modifications(0);
+
+        let binding = lookup_policy_binding(&reference).expect("bound");
+        assert_eq!(
+            binding.serving_amf.as_deref(),
+            Some(AMF_A_1860),
+            "a cancelled AMF change must not move the owner"
+        );
+        assert_eq!(binding.sm_context_status_uri, uri_before);
+        let retrieve = |who| sm_op_1860(&reference, "retrieve", serde_json::json!({}), who);
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_B_1860)))
+                .await
+                .status,
+            403
+        );
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_A_1860)))
+                .await
+                .status,
+            200
+        );
+    }
+
+    /// #2003 review MAJOR (R30's probe): a stalled update's rollback never undoes a
+    /// LATER update that wrote the same values. B's AMF change with a UP change
+    /// stalls on N4; B's retry of the AMF change alone succeeds and B owns the
+    /// context; the stalled original is then dropped. B is still the owner.
+    #[tokio::test]
+    async fn a_dropped_update_never_undoes_a_later_identical_one_2003() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000002003", 5, Some(AMF_A_1860)).await;
+        let status_b = "http://amf-b.example/nsmf-callback/status";
+        upf.clear_seen();
+        upf.delay_modifications(2_000);
+
+        let slow = sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({
+                "servingNfId": AMF_B_1860,
+                "smContextStatusUri": status_b,
+                "upCnxState": "DEACTIVATED",
+            }),
+            Some(AMF_B_1860),
+        );
+        let stalled = tokio::spawn(smf_sbi_request_handler(slow));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!stalled.is_finished(), "R1 must still be on N4");
+
+        let retry = smf_sbi_request_handler(sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({ "servingNfId": AMF_B_1860, "smContextStatusUri": status_b }),
+            Some(AMF_B_1860),
+        ))
+        .await;
+        assert_eq!(retry.status, 204, "{:?}", retry.http.content);
+        assert_eq!(
+            lookup_policy_binding(&reference)
+                .unwrap()
+                .serving_amf
+                .as_deref(),
+            Some(AMF_B_1860)
+        );
+
+        stalled.abort();
+        let _ = stalled.await;
+        upf.delay_modifications(0);
+
+        let binding = lookup_policy_binding(&reference).expect("bound");
+        assert_eq!(
+            binding.serving_amf.as_deref(),
+            Some(AMF_B_1860),
+            "the stalled update's rollback undid B's later AMF change"
+        );
+        assert_eq!(binding.sm_context_status_uri.as_deref(), Some(status_b));
+        let retrieve = |who| sm_op_1860(&reference, "retrieve", serde_json::json!({}), who);
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_B_1860)))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_A_1860)))
+                .await
+                .status,
+            403
         );
     }
 
