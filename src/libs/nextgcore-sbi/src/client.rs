@@ -208,6 +208,21 @@ impl ConnectTarget {
     }
 }
 
+/// A host the client is about to dial OTHER than the one it was built for: a
+/// 307/308 redirect's target or an overload alternate (#1915). Handed to the
+/// caller's [`SbiTargetPolicy`] before any byte is sent there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SbiTarget {
+    pub scheme: UriScheme,
+    pub host: String,
+    pub port: u16,
+}
+
+/// A caller's rule for which [`SbiTarget`]s this client may reach (#1915).
+/// `Err` carries the reason; the target is then never dialled, so neither the
+/// request nor its `Authorization` reach it.
+pub type SbiTargetPolicy = Arc<dyn Fn(&SbiTarget) -> Result<(), String> + Send + Sync>;
+
 /// SBI Client configuration
 #[derive(Debug, Clone)]
 pub struct SbiClientConfig {
@@ -380,6 +395,12 @@ pub struct SbiClient {
     /// keyed by producer, echoed back as `3gpp-Sbi-Routing-Binding` on later
     /// requests to the same producer (TS 29.500 §6.12.2).
     bindings: Arc<StdMutex<HashMap<String, String>>>,
+    /// #1915: the caller's rule for redirect and alternate targets, checked
+    /// after the built-in no-downgrade rule. `None`: that rule alone.
+    target_policy: Option<SbiTargetPolicy>,
+    /// #1915: whether a 307/308 is followed at all (after the checks). `false`
+    /// hands every redirect back to the caller verbatim.
+    follow_redirects: bool,
 }
 
 impl SbiClient {
@@ -399,6 +420,46 @@ impl SbiClient {
             overload: Arc::new(OverloadRegistry::new()),
             alternates: Arc::new(Vec::new()),
             bindings: Arc::new(StdMutex::new(HashMap::new())),
+            target_policy: None,
+            follow_redirects: true,
+        }
+    }
+
+    /// Check every redirect and alternate target against `policy` before it is
+    /// dialled (#1915, TS 29.500 §6.10.9: a consumer applies its own security
+    /// policy to the target a redirect names). A target the policy refuses is
+    /// never contacted: a redirect to it fails the request, an alternate is
+    /// skipped. Applies after the built-in rule that `https` never redirects to
+    /// `http`.
+    pub fn with_target_policy(mut self, policy: SbiTargetPolicy) -> Self {
+        self.target_policy = Some(policy);
+        self
+    }
+
+    /// Never follow a 307/308: hand it back to the caller verbatim (#1915).
+    pub fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
+    }
+
+    /// Whether this client may dial `target`, a host other than the configured
+    /// one (#1915). Built-in: a client configured for `https` never moves to
+    /// `http` (no downgrade, so no bearer or SUPI in cleartext). Then the
+    /// caller's [`SbiTargetPolicy`], if any.
+    fn check_target(&self, target: &ConnectTarget) -> Result<(), String> {
+        if self.config.scheme == UriScheme::Https && target.scheme != UriScheme::Https {
+            return Err(format!(
+                "{} would downgrade an https client to cleartext",
+                target.base_uri()
+            ));
+        }
+        match &self.target_policy {
+            Some(policy) => policy(&SbiTarget {
+                scheme: target.scheme,
+                host: target.host.clone(),
+                port: target.port,
+            }),
+            None => Ok(()),
         }
     }
 
@@ -1099,6 +1160,8 @@ impl SbiClient {
     fn first_healthy_alternate(&self, now: Instant) -> Option<ConnectTarget> {
         self.alternates
             .iter()
+            // #1915: an alternate the target policy refuses is never chosen.
+            .filter(|alt| self.check_target(alt).is_ok())
             .find(|alt| {
                 self.overload
                     .effective_oci(&alt.base_uri(), now)
@@ -1322,9 +1385,23 @@ impl SbiClient {
             let response = self.send_once(&request, target.as_ref()).await?;
 
             // sbi-04: follow a 307/308 redirect when a budget remains.
-            if matches!(response.status, 307 | 308) {
+            if self.follow_redirects && matches!(response.status, 307 | 308) {
                 match next_redirect(&response)? {
                     Some((new_uri, new_target)) => {
+                        // #1915: the redirect target is checked before anything
+                        // is sent there. Refused, it is never dialled, so the
+                        // request and its Authorization stay here.
+                        if let Err(reason) = self.check_target(&new_target) {
+                            log::warn!(
+                                "refusing {} redirect to {}: {reason}",
+                                response.status,
+                                new_target.base_uri()
+                            );
+                            return Err(SbiError::ClientError(format!(
+                                "redirect to {} refused: {reason}",
+                                new_target.base_uri()
+                            )));
+                        }
                         if redirects_left == 0 {
                             return Err(SbiError::ClientError(
                                 "redirect loop: exceeded maximum redirects".into(),
@@ -4191,5 +4268,135 @@ mod tests {
         let ended = watch.records();
         assert!(ended.is_empty(), "no connection to {peer} ended: {ended:?}");
         server.stop().await.expect("stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #1915: redirect and alternate targets are checked before any dial
+    // ------------------------------------------------------------------
+
+    fn only_host(host: &'static str) -> SbiTargetPolicy {
+        Arc::new(move |t: &SbiTarget| {
+            if t.host == host {
+                Ok(())
+            } else {
+                Err(format!("{} is not {host}", t.host))
+            }
+        })
+    }
+
+    /// #1915: a redirect to a host the caller's policy refuses is never dialled,
+    /// so the request and its Authorization never reach it; the request fails
+    /// naming the refusal. The same redirect with a policy admitting the host is
+    /// followed, so the zero is the policy's.
+    #[tokio::test]
+    async fn a_redirect_the_target_policy_refuses_is_never_dialled_1915() {
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let final_addr = serve_echo_method_body(final_count.clone()).await;
+        let redir_count = Arc::new(AtomicUsize::new(0));
+        // `localhost` reaches the same listener as 127.0.0.1, so following it
+        // would be observable on `final_count`.
+        let redir = serve_fixed(
+            307,
+            vec![(
+                "Location".to_string(),
+                format!("http://localhost:{}/redirected", final_addr.port()),
+            )],
+            "redirecting",
+            redir_count.clone(),
+        )
+        .await;
+        let request = || {
+            SbiRequest::post("/nudm-uecm/v1/imsi-1/registrations")
+                .with_header("Authorization", "Bearer must-not-leave")
+                .with_body("payload", "text/plain")
+        };
+
+        let refusing = SbiClient::with_host_port("127.0.0.1", redir.port())
+            .with_target_policy(only_host("127.0.0.1"));
+        let err = refusing.send_request(request()).await.unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(
+            final_count.load(Ordering::SeqCst),
+            0,
+            "the refused target is never dialled"
+        );
+
+        let admitting = SbiClient::with_host_port("127.0.0.1", redir.port())
+            .with_target_policy(only_host("localhost"));
+        let response = admitting.send_request(request()).await.expect("followed");
+        assert_eq!(response.status, 200);
+        assert_eq!(final_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// #1915: an https client never follows a redirect to http (no downgrade),
+    /// with or without a caller policy; https stays admissible.
+    #[test]
+    fn an_https_client_never_redirects_to_cleartext_1915() {
+        let client = SbiClient::new(SbiClientConfig::new("udm.example", 443).with_https());
+        let to = |scheme| ConnectTarget {
+            scheme,
+            host: "udm2.example".to_string(),
+            port: 8443,
+        };
+        let err = client.check_target(&to(UriScheme::Http)).unwrap_err();
+        assert!(err.contains("downgrade"), "{err}");
+        assert!(client.check_target(&to(UriScheme::Https)).is_ok());
+        let with_policy = client.with_target_policy(Arc::new(|_: &SbiTarget| Ok(())));
+        assert!(with_policy.check_target(&to(UriScheme::Http)).is_err());
+    }
+
+    /// #1915: `without_redirects` hands the 307 back verbatim and dials nothing.
+    #[tokio::test]
+    async fn without_redirects_a_307_is_returned_not_followed_1915() {
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let final_addr = serve_echo_method_body(final_count.clone()).await;
+        let redir = serve_fixed(
+            307,
+            vec![(
+                "Location".to_string(),
+                format!("http://{final_addr}/redirected"),
+            )],
+            "redirecting",
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", redir.port()).without_redirects();
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await
+            .expect("a 307 is a response");
+        assert_eq!(response.status, 307);
+        assert_eq!(final_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// #1915: the OCI alternate path runs the same check, so an alternate the
+    /// policy refuses is never chosen and never dialled.
+    #[tokio::test]
+    async fn an_alternate_the_target_policy_refuses_is_never_dialled_1915() {
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let primary = serve_fixed(
+            503,
+            vec![oci_header(60)],
+            "overloaded",
+            primary_hits.clone(),
+        )
+        .await;
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let alternate = serve_fixed(200, vec![], "served", alt_hits.clone()).await;
+        let client = SbiClient::with_host_port("127.0.0.1", primary.port())
+            .with_alternate_targets([("localhost", alternate.port())])
+            .with_target_policy(only_host("127.0.0.1"));
+
+        let _ = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await;
+        let _ = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await;
+        assert_eq!(
+            alt_hits.load(Ordering::SeqCst),
+            0,
+            "a refused alternate is never dialled"
+        );
     }
 }
