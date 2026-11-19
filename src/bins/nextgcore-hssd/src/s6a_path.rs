@@ -1586,13 +1586,21 @@ pub async fn hss_s6a_run_server(
     addr: std::net::SocketAddr,
     config: nextgcore_diameter::config::DiameterConfig,
 ) -> Result<(), String> {
-    use nextgcore_diameter::transport::DiameterListener;
+    let listener = hss_s6a_bind(addr).await?;
+    hss_s6a_serve(listener, config).await
+}
 
-    let listener = DiameterListener::bind(addr)
+/// Bind the HSS S6a Diameter listener (#2088: the caller reports a failure through
+/// `listener_bind_failed` before serving, so it is fatal at start-up under the
+/// production profile, as for every listener but N26).
+pub async fn hss_s6a_bind(
+    addr: std::net::SocketAddr,
+) -> Result<nextgcore_diameter::transport::DiameterListener, String> {
+    let listener = nextgcore_diameter::transport::DiameterListener::bind(addr)
         .await
         .map_err(|e| format!("S6a listener bind failed: {e}"))?;
     log::info!("HSS S6a Diameter server listening on {addr}");
-    hss_s6a_serve(listener, config).await
+    Ok(listener)
 }
 
 /// Serve S6a on an already-bound listener (see [`hss_s6a_run_server`]).

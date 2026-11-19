@@ -67,25 +67,57 @@ fn a_taken_metrics_port_is_tolerated_under_dev_2056() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("SURVIVED-2056"));
 }
 
-/// The lines (0-based) of the listener call sites in `prod`: `serve_metrics(` from
-/// `nes_energy`, or a bare `serve_metrics(` call.
+/// The calls that bind a listener in an NF (#2088, R30 on #2073: not only metrics).
+/// Metrics, NES and SLA (`serve_metrics`); TCP; SCTP (`SctpServer` matches the kernel
+/// one too, and the NGAP, S1AP and SBc-AP servers that wrap them); Diameter, and the
+/// two NF wrappers whose callers decide what a failure means (pcrfd Gx/Rx, hssd S6a).
+/// UDP sockets (GTP-C, GTP-U, PFCP, N26) are not listed: they are not in #2056's
+/// scope, and N26 is its documented exception.
+const LISTENER_BINDS: &[&str] = &[
+    "nes_energy::serve_metrics(",
+    " serve_metrics(",
+    "TcpListener::bind(",
+    "SctpServer::bind(",
+    "NgapTransport::bind(",
+    "S1apServer::bind(",
+    "SbcapServer::bind(",
+    "DiameterListener::bind(",
+    "pcrf_fd_listen(",
+    "hss_s6a_bind(",
+    "hss_s6a_run_server(",
+];
+
+/// The lines (0-based) of the listener call sites in `prod`: any [`LISTENER_BINDS`]
+/// call, not a function's own definition, nor a comment.
 fn listener_sites(prod: &[&str]) -> Vec<usize> {
     prod.iter()
         .enumerate()
-        .filter(|(_, l)| l.contains("nes_energy::serve_metrics(") || l.contains(" serve_metrics("))
+        .filter(|(_, l)| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+                && !l.contains("fn ")
+                && LISTENER_BINDS.iter().any(|call| l.contains(call))
+        })
         .map(|(i, _)| i)
         .collect()
 }
+
+/// How many lines a call site's statement may run to its `?`.
+const PROPAGATE_WINDOW: usize = 10;
 
 /// How far after its call site a listener's bind-failure arm may call the handler.
 /// The furthest today is mmed's, 24 lines.
 const HANDLER_WINDOW: usize = 30;
 
-/// #2073 (R31 on #2063): the listener call sites in `prod` whose OWN bind failure does
-/// not reach `listener_bind_failed(`. Each site needs a call to the handler after it,
-/// within [`HANDLER_WINDOW`] lines and before the next site, so a second, unwired
-/// listener in a file whose first one is wired is still found. #2056 checked each file,
-/// so any one call anywhere in the file covered every listener in it.
+/// #2073 (R31 on #2063): the listener call sites in `prod` whose OWN bind failure is not
+/// fatal under production. A site is wired when either:
+/// - its statement propagates the error with `?` within [`PROPAGATE_WINDOW`] lines
+///   (start-up fails, under every profile); or
+/// - it calls `listener_bind_failed(` after it, within [`HANDLER_WINDOW`] lines.
+///
+/// Both must come before the next site, so a second, unwired listener in a file whose
+/// first one is wired is still found. #2056 checked each file, so any one handler call
+/// anywhere in the file covered every listener in it.
 fn unwired_listener_sites(prod: &[&str]) -> Vec<usize> {
     let sites = listener_sites(prod);
     sites
@@ -94,9 +126,14 @@ fn unwired_listener_sites(prod: &[&str]) -> Vec<usize> {
         .filter(|(n, &site)| {
             let next = sites.get(n + 1).copied().unwrap_or(prod.len());
             let end = next.min(site + HANDLER_WINDOW).min(prod.len());
-            !prod[site..end]
+            let handled = prod[site..end]
                 .iter()
-                .any(|l| l.contains("listener_bind_failed("))
+                .any(|l| l.contains("listener_bind_failed("));
+            let statement_end = next.min(site + PROPAGATE_WINDOW).min(prod.len());
+            let propagated = prod[site..statement_end]
+                .iter()
+                .any(|l| l.contains("?;") || l.trim_end().ends_with('?'));
+            !(handled || propagated)
         })
         .map(|(_, &site)| site)
         .collect()
@@ -131,6 +168,24 @@ fn the_listener_guard_checks_each_call_site_2073() {
     );
     // The unwired one first: the wired one's handler, after it, does not cover it.
     assert_eq!(check(&[&unwired, &wired]), (2, vec![0]));
+
+    // #2088: TCP, SCTP and Diameter binds are sites too. One whose error is
+    // propagated with `?` is wired; an unwired Diameter bind is found.
+    let propagated = [
+        "    let listener = tokio::net::TcpListener::bind(addr)",
+        "        .await",
+        "        .context(\"bind failed\")?;",
+    ];
+    let unwired_diameter =
+        ["    let _l = nextgcore_diameter::transport::DiameterListener::bind(addr).await;"];
+    let definition = ["pub async fn hss_s6a_bind("];
+    assert_eq!(check(&[&propagated]), (1, vec![]));
+    assert_eq!(check(&[&propagated, &unwired_diameter]), (2, vec![3]));
+    assert_eq!(
+        check(&[&definition]),
+        (0, vec![]),
+        "a definition is not a call"
+    );
 }
 
 /// #2056: every NF that binds a metrics (or NES/SLA) listener itself, outside its
@@ -164,6 +219,12 @@ fn every_nf_listener_bind_failure_goes_through_the_shared_handler_2056() {
     let mut missing = Vec::new();
     {
         for f in files {
+            // #2088: a whole-file test module (`#[cfg(test)] mod x;`), by the tree's
+            // naming: `*tests.rs`, or anything under a `tests/` directory.
+            let name = f.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.ends_with("tests.rs") || f.components().any(|c| c.as_os_str() == "tests") {
+                continue;
+            }
             let text = std::fs::read_to_string(&f).unwrap_or_default();
             // Production code only: what precedes the file's first inline test
             // module (`#[cfg(test)]` then `mod <name> {`); a lone `#[cfg(test)]` item
@@ -172,8 +233,11 @@ fn every_nf_listener_bind_failure_goes_through_the_shared_handler_2056() {
             let end = lines
                 .windows(2)
                 .position(|w| {
+                    let t = w[1].trim_start();
                     w[0].trim() == "#[cfg(test)]"
-                        && w[1].trim_start().starts_with("mod ")
+                        && ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+                            .iter()
+                            .any(|m| t.starts_with(m))
                         && w[1].trim_end().ends_with('{')
                 })
                 .unwrap_or(lines.len());
@@ -191,7 +255,8 @@ fn every_nf_listener_bind_failure_goes_through_the_shared_handler_2056() {
     );
     assert!(
         missing.is_empty(),
-        "these NFs bind a listener without the #2056 handler: {missing:?}"
+        "these NFs bind a listener whose failure is neither propagated nor sent through the \
+         #2056 handler: {missing:?}"
     );
 }
 
