@@ -531,7 +531,7 @@ async fn ausf_sbi_route(request: SbiRequest) -> SbiResponse {
         ("nausf-auth", "ue-authentications", "DELETE") if parts.len() >= 4 => {
             // Delete Authentication Context
             let auth_ctx_id = parts[3];
-            handle_auth_context_delete(auth_ctx_id).await
+            handle_auth_context_delete(auth_ctx_id, &request).await
         }
 
         // Nausf_SoRProtection / Nausf_UPUProtection custom operations
@@ -756,6 +756,11 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
 
     // Set serving network name
     ausf_ue.serving_network_name = Some(serving_network_name.to_string());
+    // #1872: every authentication is a new resource with its own unguessable
+    // authCtxId (stored, and the previous one retired, by `ue_update` below),
+    // bound to the verified identity of the NF that started it.
+    ausf_ue.ctx_id = crate::context::new_auth_ctx_id();
+    ausf_ue.owner = caller_identity(request);
 
     // Send request to UDM to get authentication vector
     // Build UDM NUDM-UEAU request
@@ -965,6 +970,48 @@ fn send_problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(status))
 }
 
+/// #1872: the verified identity of the NF calling: the `sub` of the access
+/// token this AUSF verified (the consumer, also through an SCP, TS 33.501
+/// §13.4.1.2), else the NF Instance ID of the client certificate it verified.
+/// `None` when it verified neither.
+fn caller_identity(request: &SbiRequest) -> Option<String> {
+    let verified = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    verified(&request.oauth2_subject).or_else(|| verified(&request.peer_cert_nf_instance_id))
+}
+
+/// #1872: refuse a caller that is not the NF that started `ue`'s current
+/// authentication. A context bound to an identity is acted on only by a caller
+/// proving that identity (compared case-insensitively, as NF Instance IDs are
+/// UUIDs); `403`, with nothing verified, reported to the UDM or zeroized. An
+/// unbound context (its creator proved no identity) binds nothing. `Some` is
+/// the refusal to send.
+fn refuse_foreign_caller(ue: &crate::context::AusfUe, request: &SbiRequest) -> Option<SbiResponse> {
+    let owner = ue.owner.as_deref()?;
+    let caller = caller_identity(request);
+    if caller
+        .as_deref()
+        .is_some_and(|c| c.eq_ignore_ascii_case(owner))
+    {
+        return None;
+    }
+    log::debug!(
+        "authCtxId {} refused: started by NF {owner}, called by {}",
+        ue.ctx_id,
+        caller.as_deref().unwrap_or("an unverified caller")
+    );
+    Some(nextgcore_sbi::server::send_error(
+        403,
+        "Forbidden",
+        "the authentication context was started by another NF",
+        None,
+    ))
+}
+
 pub async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("5G-AKA Confirmation: auth_ctx_id={auth_ctx_id}");
 
@@ -1014,6 +1061,11 @@ pub async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest)
             return send_not_found("Authentication context not found", None);
         }
     };
+    // #1872: only the NF that started this authentication may act on it,
+    // checked before anything is verified, reported or changed.
+    if let Some(refused) = refuse_foreign_caller(&ausf_ue, request) {
+        return refused;
+    }
 
     // ausfd-03: null/absent resStar → 200 AUTHENTICATION_FAILURE (no kseaf, no supi)
     // TS 29.509 §6.1.6.2.8: both kseaf and supi are conditional on authentication success.
@@ -1188,6 +1240,11 @@ pub async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiR
             return send_not_found("Authentication context not found", None);
         }
     };
+    // #1872: only the NF that started this authentication may act on it,
+    // checked before anything is verified, reported or changed.
+    if let Some(refused) = refuse_foreign_caller(&ausf_ue, request) {
+        return refused;
+    }
 
     // Decode EAP payload (base64)
     let eap_bytes = match nextgcore_crypt::base64::decode(eap_payload) {
@@ -1467,7 +1524,7 @@ pub async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiR
     }
 }
 
-pub async fn handle_auth_context_delete(auth_ctx_id: &str) -> SbiResponse {
+pub async fn handle_auth_context_delete(auth_ctx_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("Auth Context Delete: auth_ctx_id={auth_ctx_id}");
 
     // ausfd-08: TS 29.509 DELETE ue-authentications/{authCtxId} and TS 33.501
@@ -1484,14 +1541,21 @@ pub async fn handle_auth_context_delete(auth_ctx_id: &str) -> SbiResponse {
 
     let ue_id = {
         if let Ok(context) = ctx.read() {
-            context.ue_find_by_ctx_id(auth_ctx_id).map(|ue| ue.id)
+            context.ue_find_by_ctx_id(auth_ctx_id)
         } else {
             None
         }
     };
 
     let ue_id = match ue_id {
-        Some(id) => id,
+        Some(ue) => {
+            // #1872: only the NF that started this authentication may delete
+            // it, checked before anything is removed or zeroized.
+            if let Some(refused) = refuse_foreign_caller(&ue, request) {
+                return refused;
+            }
+            ue.id
+        }
         None => {
             return send_not_found("Authentication context not found", None);
         }
@@ -3189,7 +3253,7 @@ mod tests {
             .is_some());
 
         // DELETE -> 204 and context removed.
-        let resp = handle_auth_context_delete(&ctx_id).await;
+        let resp = handle_auth_context_delete(&ctx_id, &SbiRequest::default()).await;
         assert_eq!(resp.status, 204, "first DELETE must return 204");
         assert!(
             ausf_self()
@@ -3201,7 +3265,7 @@ mod tests {
         );
 
         // Second DELETE -> 404.
-        let resp = handle_auth_context_delete(&ctx_id).await;
+        let resp = handle_auth_context_delete(&ctx_id, &SbiRequest::default()).await;
         assert_eq!(resp.status, 404, "second DELETE must return 404");
     }
 
@@ -3307,7 +3371,7 @@ mod tests {
                 .nth(4)
                 .expect("authCtxId in href")
                 .to_string();
-            let resp = handle_auth_context_delete(&ctx_id).await;
+            let resp = handle_auth_context_delete(&ctx_id, &SbiRequest::default()).await;
             assert_eq!(resp.status, 204, "DELETE must succeed");
             assert!(
                 ausf_self().read().unwrap().ue_find_by_supi(supi).is_none(),
@@ -3329,6 +3393,199 @@ mod tests {
             assert_eq!(guard.anchor_next_sor_counter(supi), Ok(0x0001));
             assert_eq!(guard.anchor_next_sor_counter(supi), Ok(0x0002));
             assert_eq!(guard.anchor_next_upu_counter(supi), Ok(0x0001));
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    // ====================================================================
+    // #1872: authCtxId is an unguessable, restart-unique UUID, and each
+    // authentication context is bound to the NF that started it.
+    // ====================================================================
+
+    const AMF_A_1872: &str = "18720000-0000-4000-8000-00000000000a";
+    const AMF_B_1872: &str = "18720000-0000-4000-8000-00000000000b";
+
+    fn as_nf_1872(mut req: SbiRequest, token_sub: Option<&str>, cert: Option<&str>) -> SbiRequest {
+        req.oauth2_subject = token_sub.map(str::to_string);
+        req.peer_cert_nf_instance_id = cert.map(str::to_string);
+        req
+    }
+
+    /// Start a 5G-AKA through the production handler as `caller`; returns the
+    /// authCtxId from the Location header and the RAND.
+    async fn authenticate_1872(supi: &str, caller: SbiRequest) -> (String, [u8; 16]) {
+        let req = caller.with_body(
+            serde_json::json!({"supiOrSuci": supi, "servingNetworkName": TEST_SNN}).to_string(),
+            "application/json",
+        );
+        let resp = handle_ue_authentication(&req).await;
+        assert_eq!(resp.status, 201, "authenticate: {:?}", resp.http.content);
+        let location = resp.http.get_header("location").expect("Location").clone();
+        let ctx_id = location.rsplit('/').next().expect("authCtxId").to_string();
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+        let rand_bytes = crate::nudm_handler::hex_to_bytes(
+            body.pointer("/5gAuthData/rand")
+                .and_then(|v| v.as_str())
+                .expect("rand"),
+        );
+        let mut rand = [0u8; 16];
+        rand.copy_from_slice(&rand_bytes);
+        (ctx_id, rand)
+    }
+
+    fn confirm_req_1872(rand: &[u8; 16], caller: SbiRequest) -> SbiRequest {
+        let (res, ck, ik, _ak, _akstar) =
+            nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, rand).unwrap();
+        let res_star =
+            nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, rand, &res);
+        caller.with_body(
+            serde_json::json!({"resStar": crate::nudm_handler::bytes_to_hex(&res_star)})
+                .to_string(),
+            "application/json",
+        )
+    }
+
+    /// The pool index the old authCtxId was, and a UUID per context instead.
+    ///
+    /// REVERT-VERIFIED: with `new_auth_ctx_id` returning a counter, the UUID
+    /// parse fails.
+    #[test]
+    fn auth_ctx_ids_are_random_uuids_1872() {
+        let mut ctx = crate::context::AusfContext::new();
+        ctx.init(8);
+        let a = ctx.ue_add("suci-0-001-01-0000-0-0-1872000001").unwrap();
+        let b = ctx.ue_add("suci-0-001-01-0000-0-0-1872000002").unwrap();
+        for ue in [&a, &b] {
+            let parsed = uuid::Uuid::parse_str(&ue.ctx_id).expect("authCtxId is a UUID");
+            assert_eq!(
+                parsed.get_version_num(),
+                4,
+                "random (v4), not derived from state"
+            );
+        }
+        assert_ne!(a.ctx_id, b.ctx_id);
+        assert!(ctx.ue_find_by_ctx_id(&a.ctx_id).is_some());
+        // The pool index is not an authCtxId any more.
+        assert!(ctx.ue_find_by_ctx_id(&a.id.to_string()).is_none());
+        assert!(ctx.ue_find_by_ctx_id("1").is_none());
+    }
+
+    /// The whole flow through the production handlers against a mock UDM:
+    /// - a re-authentication gets a new authCtxId and retires the old one;
+    /// - another AMF's confirmation or DELETE is refused 403 with nothing
+    ///   applied (no result, no KSEAF, no anchor, context still there);
+    /// - the creating AMF confirms and deletes, also through an SCP whose
+    ///   certificate is not its own (the token `sub` is the identity).
+    ///
+    /// REVERT-VERIFIED: with `refuse_foreign_caller` returning `None`, AMF B's
+    /// confirmation succeeds and the first 403 assertion fails; with
+    /// `ausf_ue.ctx_id` no longer re-minted per authentication, the second
+    /// authentication reuses the first authCtxId and its assertion fails; with
+    /// the owner not recorded, AMF B is admitted.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn an_auth_context_answers_only_the_amf_that_started_it_1872() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_addr.port()))),
+                udm_listener,
+            );
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_addr.port().to_string());
+
+            let supi = "imsi-001010000001872";
+            let amf_a = || as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), None);
+            let amf_b = || as_nf_1872(SbiRequest::default(), Some(AMF_B_1872), None);
+
+            let (first, _) = authenticate_1872(supi, amf_a()).await;
+            let (ctx_id, rand) = authenticate_1872(supi, amf_a()).await;
+            assert_ne!(first, ctx_id, "a new authentication is a new resource");
+            let stale = handle_5g_aka_confirmation(&first, &confirm_req_1872(&rand, amf_a())).await;
+            assert_eq!(stale.status, 404, "the retired authCtxId finds nothing");
+            let ue = ausf_self()
+                .read()
+                .unwrap()
+                .ue_find_by_ctx_id(&ctx_id)
+                .expect("ctx");
+            assert_eq!(
+                ue.owner.as_deref(),
+                Some(AMF_A_1872),
+                "bound to its creator"
+            );
+
+            // Another AMF: refused, nothing applied.
+            for (req, what) in [
+                (amf_b(), "another AMF's token"),
+                (
+                    as_nf_1872(SbiRequest::default(), None, Some(AMF_B_1872)),
+                    "another AMF's cert",
+                ),
+                (SbiRequest::default(), "an unverified caller"),
+            ] {
+                let r = handle_5g_aka_confirmation(&ctx_id, &confirm_req_1872(&rand, req)).await;
+                assert_eq!(r.status, 403, "{what} confirmation: {:?}", r.http.content);
+                let ue = ausf_self()
+                    .read()
+                    .unwrap()
+                    .ue_find_by_ctx_id(&ctx_id)
+                    .expect(what);
+                assert_eq!(ue.kseaf, [0u8; 32], "{what}: no KSEAF derived");
+                assert!(
+                    ausf_self()
+                        .read()
+                        .unwrap()
+                        .anchor_lookup_kausf(supi)
+                        .is_none(),
+                    "{what}: no anchor stored"
+                );
+            }
+            let eap = amf_b().with_body(r#"{"eapPayload":"AQ=="}"#, "application/json");
+            let r = handle_eap_session(&ctx_id, &eap).await;
+            assert_eq!(
+                r.status, 403,
+                "another AMF's EAP session: {:?}",
+                r.http.content
+            );
+            let r = handle_auth_context_delete(&ctx_id, &amf_b()).await;
+            assert_eq!(r.status, 403, "another AMF's DELETE");
+            assert!(ausf_self()
+                .read()
+                .unwrap()
+                .ue_find_by_ctx_id(&ctx_id)
+                .is_some());
+
+            // The creator, through an SCP: the certificate is the SCP's, the
+            // token sub is AMF A's.
+            let via_scp = as_nf_1872(
+                SbiRequest::default(),
+                Some(AMF_A_1872),
+                Some("18720000-0000-4000-8000-0000000005c9"),
+            );
+            let r = handle_5g_aka_confirmation(&ctx_id, &confirm_req_1872(&rand, via_scp)).await;
+            assert_eq!(r.status, 200, "the creator confirms: {:?}", r.http.content);
+            let conf: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(conf["authResult"], "AUTHENTICATION_SUCCESS");
+            let upper = as_nf_1872(
+                SbiRequest::default(),
+                Some(&AMF_A_1872.to_uppercase()),
+                None,
+            );
+            let r = handle_auth_context_delete(&ctx_id, &upper).await;
+            assert_eq!(
+                r.status, 204,
+                "the creator deletes (UUIDs compare case-insensitively)"
+            );
         })
         .await
         .expect("test timed out");

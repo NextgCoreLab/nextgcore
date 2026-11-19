@@ -146,6 +146,11 @@ pub struct Subscription {
     pub nf_id: Option<String>,
     pub notification_uri: String,
     pub expires: Option<DateTime<Utc>>,
+    /// #1862: the verified NF Instance ID of the consumer that subscribed, the
+    /// only one that may unsubscribe (TS 29.673 §5.2.2.5, TS 33.501 §13.4.1).
+    /// Never the self-declared `nfId`. `None` when it subscribed with no verified
+    /// identity (`dev`) or was restored from a state file written before #1862.
+    pub owner: Option<String>,
 }
 
 /// An "Individual UE radio capability provisioning" (TS 29.675 §5.2.2).
@@ -452,6 +457,7 @@ impl SnapshotSource {
                 "nfId": s.nf_id,
                 "uri": s.notification_uri,
                 "expires": s.expires.map(|t| t.to_rfc3339()),
+                "owner": s.owner,
             })).collect::<Vec<_>>(),
             "provisionings": self.provisionings.iter().map(|p| json!({
                 "id": p.id,
@@ -758,12 +764,25 @@ impl Ucmf {
 
     /// TS 29.673 §5.2.2.4: create a subscription, granting an expiry no later
     /// than both the consumer's hint and this UCMF's maximum lifetime.
+    #[cfg(test)]
     pub fn subscribe(
         &mut self,
         nf_id: Option<String>,
         notification_uri: String,
         suggested: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
+    ) -> Result<Subscription, SubscribeError> {
+        self.subscribe_owned(nf_id, notification_uri, suggested, now, None)
+    }
+
+    /// TS 29.673 §5.2.2.4, bound to `owner` (#1862).
+    pub fn subscribe_owned(
+        &mut self,
+        nf_id: Option<String>,
+        notification_uri: String,
+        suggested: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        owner: Option<String>,
     ) -> Result<Subscription, SubscribeError> {
         self.purge_expired(now);
         if self.subscriptions.len() >= self.limits.max_subscriptions {
@@ -816,10 +835,13 @@ impl Ucmf {
             _ => ceiling,
         };
         let sub = Subscription {
-            id: seq.to_string(),
+            // #1862: 128 random bits, so one consumer's ID says nothing about
+            // another's. `seq` still drives the expiry spread and the reservation.
+            id: crate::owner_binding::unguessable_id(),
             nf_id,
             notification_uri,
             expires: Some(expires),
+            owner,
         };
         self.subscriptions.insert(sub.id.clone(), sub.clone());
         self.persist();
@@ -1332,6 +1354,7 @@ impl Ucmf {
                         .and_then(Value::as_str)
                         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
                         .map(|t| t.with_timezone(&Utc)),
+                    owner: s.get("owner").and_then(Value::as_str).map(str::to_string),
                 },
             );
         }
@@ -1456,6 +1479,41 @@ fn merge_patch(target: &mut Value, patch: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1862: a subscription's verified owner survives a restart, and one written
+    /// before #1862 restores ownerless.
+    #[test]
+    fn the_subscription_owner_is_persisted_1862() {
+        let owner = "aaaaaaaa-1862-4000-8000-00000000000a";
+        let now = Utc::now();
+        let mut u = Ucmf::new(0x05, ModeOfOperation::B);
+        let sub = u
+            .subscribe_owned(
+                None,
+                "http://amf-a/cb".into(),
+                None,
+                now,
+                Some(owner.into()),
+            )
+            .expect("subscribe");
+        let doc = u.snapshot();
+        let mut restored = Ucmf::new(0x05, ModeOfOperation::B);
+        restored.restore(&doc);
+        assert_eq!(
+            restored
+                .subscription(&sub.id)
+                .and_then(|s| s.owner.clone())
+                .as_deref(),
+            Some(owner)
+        );
+        let mut old = doc;
+        for s in old["subscriptions"].as_array_mut().unwrap() {
+            s.as_object_mut().unwrap().remove("owner");
+        }
+        let mut restored = Ucmf::new(0x05, ModeOfOperation::B);
+        restored.restore(&old);
+        assert_eq!(restored.subscription(&sub.id).unwrap().owner, None);
+    }
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z")
@@ -1882,7 +1940,9 @@ mod tests {
         let a = u
             .subscribe(None, "http://amf/n".into(), None, now())
             .unwrap();
-        assert_eq!(a.id, (u64::MAX - 1).to_string());
+        // #1862: the id is random; the counter still drives the expiry spread and
+        // the reservation, and still refuses at its top.
+        assert_eq!(a.id.len(), 32, "{}", a.id);
         let ceiling = now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
         assert!(a.expires.unwrap() <= ceiling);
         // At the top the counter refuses rather than hand out an ID again.
