@@ -153,18 +153,19 @@ fn now_epoch_secs() -> u64 {
 /// microseconds since the epoch. IDs used to restart at 1, so after a restart a
 /// stale PINE still holding `pe-2` heartbeated, or relayed through, whichever
 /// element the new process numbered 2 (TS 23.542 §8.8: the PIN server
-/// identifies an element by the identifier it assigned). Seeding from the
-/// clock keeps IDs increasing across restarts (so "lowest id" still means
-/// "registered first", PIND-07) without persisting a counter: a restart
-/// happens more than a microsecond after the last allocation of the previous
-/// process, and allocations run far slower than one per microsecond.
+/// identifies an element by the identifier it assigned).
+///
+/// #1953 (R32 on #1950): the seed is random, not the wall clock. A clock
+/// stepped backwards could re-issue the previous process's IDs, and a
+/// clock-derived ID tells a prober roughly what IDs exist. 40 random bits:
+/// two process lifetimes overlap only if one's run of IDs reaches the other's,
+/// with odds about (n + m) / 2^40 per restart, and the sequence still
+/// increases within a process (PIND-07 "lowest id").
 fn boot_id_base() -> usize {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as usize)
-        .unwrap_or(1)
-        .max(1)
+    let r = uuid::Uuid::new_v4();
+    let b = r.as_bytes();
+    let v = b[..5].iter().fold(0u64, |acc, &x| acc << 8 | u64::from(x));
+    (v as usize).max(1)
 }
 
 /// Extract the numeric sequence from a `prefix-N` id for "lowest-id" ordering
@@ -953,6 +954,28 @@ impl PinContext {
     }
 
     /// Get a PIN element by ID
+    /// [`Self::element_find`] for `caller`, authorised as heartbeat and relay
+    /// are (#1953): the element itself, the PIN owner or a PEMC of its PIN.
+    pub fn element_find_for(
+        &self,
+        element_id: &str,
+        caller: Option<&str>,
+    ) -> Result<PinElement, PinContextError> {
+        let pins = self
+            .pin_networks
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        let elements = self
+            .elements
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        authorize_element_caller(&pins, &elements, None, element_id, caller)?;
+        elements
+            .get(element_id)
+            .cloned()
+            .ok_or(PinContextError::NotFound)
+    }
+
     pub fn element_find(&self, element_id: &str) -> Option<PinElement> {
         self.elements.read().ok()?.get(element_id).cloned()
     }
@@ -1776,12 +1799,22 @@ mod tests {
             (&before.2, &after.2),
         ] {
             assert_ne!(a, b, "an ID is reused after a restart");
-            assert!(
-                id_seq(a) < id_seq(b),
-                "{a} vs {b}: IDs must keep increasing"
-            );
         }
         assert_ne!(before.0, "pin-1");
+        // #1953: within one process they still increase (PIND-07).
+        assert!(id_seq(&before.0) < id_seq(&before.1) && id_seq(&before.1) < id_seq(&before.2));
+    }
+
+    /// #1953 (R32 on #1950): the seed is random, so it does not follow the
+    /// clock: two contexts made in the same microsecond still differ.
+    /// REVERT-VERIFIED: with the wall-clock seed restored, back-to-back
+    /// contexts collide often enough that the 64-pair loop fails.
+    #[test]
+    fn the_id_seed_is_random_not_the_clock_1953() {
+        let seeds: std::collections::HashSet<usize> = (0..64)
+            .map(|_| PinContext::new().next_id.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(seeds.len(), 64, "seeds repeated: not random");
     }
 
     /// #1873: a heartbeat names its PIN and comes from the element itself or
