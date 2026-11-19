@@ -20,6 +20,9 @@
 //! - otherwise it must be on [`ALLOWED`] with its reason, and an allowlist entry
 //!   that matches nothing fails the test.
 //!
+//! In a [`FULL_COVERAGE_CRATES`] crate (#1992) every manage arm is judged,
+//! whatever resource it names.
+//!
 //! Test code is removed by brace matching (every `#[cfg(test)]` item, wherever
 //! it sits in the file), so a route placed after a test module is still judged.
 
@@ -28,6 +31,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Owner checks that are not `owner_binding`, per crate, with why.
+/// Crates where EVERY PATCH/PUT/DELETE route arm must reach an owner check,
+/// not only subscription-named ones (#1992, R32 on #1988): their policy
+/// associations, contexts and app sessions are bound to their creator too.
+const FULL_COVERAGE_CRATES: &[&str] = &["nextgcore-pcfd"];
+
 const OWN_CHECKS: &[(&str, &str, &str)] = &[
     (
         "nextgcore-nrfd",
@@ -50,6 +58,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "nextgcore-bsfd",
         "/metrics.rs:",
         "a metric label table, not a route",
+    ),
+    (
+        "nextgcore-pcfd",
+        "/metrics.rs:",
+        "a metric label table, not a route (judged under FULL_COVERAGE_CRATES, #1992)",
     ),
     (
         "nextgcore-nssfd",
@@ -284,9 +297,14 @@ fn calls(body_code: &str, name: &str) -> bool {
     false
 }
 
+/// The owner checks, matched with their call parenthesis (#1992) so a
+/// differently named function such as `refuse_non_owner_off(` is not mistaken
+/// for one.
 const CHECKS: &[&str] = &[
-    "owner_binding::refuse_non_owner",
-    "owner_binding::non_owner_refusal",
+    "owner_binding::refuse_non_owner(",
+    "owner_binding::refuse_non_owner_with(",
+    "owner_binding::non_owner_refusal(",
+    "owner_binding::non_owner_refusal_with(",
 ];
 
 /// The names of the functions in a crate that reach an owner check.
@@ -333,6 +351,12 @@ const METHODS: &[&str] = &["\"PATCH\"", "\"PUT\"", "\"DELETE\""];
 
 /// Every PATCH/PUT/DELETE match arm on a subscription resource in one file.
 fn subscription_arms(text: &str, code: &str) -> Vec<Arm> {
+    manage_arms(text, code, false)
+}
+
+/// Every PATCH/PUT/DELETE match arm in one file: on a subscription resource
+/// only, or on any resource when `full` ([`FULL_COVERAGE_CRATES`]).
+fn manage_arms(text: &str, code: &str, full: bool) -> Vec<Arm> {
     let lines: Vec<&str> = text.lines().collect();
     let code_lines: Vec<&str> = code.lines().collect();
     let indent = |s: &str| s.len() - s.trim_start().len();
@@ -379,7 +403,7 @@ fn subscription_arms(text: &str, code: &str) -> Vec<Arm> {
             .map(|j| lines[j].to_string())
             .unwrap_or_default();
         let context = format!("{enclosing}\n{pattern}");
-        if !names_subscription(&context) {
+        if !full && !names_subscription(&context) {
             continue;
         }
         // The arm's body: a block, or the expression up to the arm's `,`.
@@ -420,6 +444,11 @@ fn subscription_arms(text: &str, code: &str) -> Vec<Arm> {
 
 /// The unchecked subscription arms in one crate, as (`file:line`, arm).
 fn unchecked(files: &[(String, String)], own: &[&str]) -> Vec<(String, String)> {
+    unchecked_in(files, own, false)
+}
+
+/// [`unchecked`], judging every manage arm when `full`.
+fn unchecked_in(files: &[(String, String)], own: &[&str], full: bool) -> Vec<(String, String)> {
     let prod: Vec<(String, String, String)> = files
         .iter()
         .map(|(name, text)| {
@@ -432,7 +461,7 @@ fn unchecked(files: &[(String, String)], own: &[&str]) -> Vec<(String, String)> 
     let checking = checking_functions(&fns, own);
     let mut out = Vec::new();
     for (name, text, code) in &prod {
-        for arm in subscription_arms(text, code) {
+        for arm in manage_arms(text, code, full) {
             let ok = CHECKS.iter().chain(own).any(|m| arm.body.contains(m))
                 || checking.iter().any(|f| calls(&arm.body_code, f));
             if !ok {
@@ -540,6 +569,30 @@ fn the_detector_judges_every_subscription_route_arm() {
     assert!(one(s).is_empty(), "{:?}", one(s));
 }
 
+/// #1992: in a [`FULL_COVERAGE_CRATES`] crate a manage route on any resource
+/// must check its caller; elsewhere only subscription routes are judged.
+/// REVERT-VERIFIED: with `full` ignored in `manage_arms`, the listed crate's
+/// unchecked context DELETE is not caught.
+#[test]
+fn a_full_coverage_crate_judges_every_manage_route_1992() {
+    let src = r#"
+        fn r(m: &str) -> S {
+            match (res, m) {
+                ("policies", "DELETE") => drop_it(),
+                ("subscriptions", "DELETE") => del(),
+                _ => nf(),
+            }
+        }
+        fn del() -> S { owner_binding::refuse_non_owner(o, r, "x").unwrap_or_else(ok) }
+    "#;
+    let files = [("x.rs".to_string(), src.to_string())];
+    assert_eq!(unchecked_in(&files, &[], true).len(), 1, "listed crate");
+    assert!(
+        unchecked_in(&files, &[], false).is_empty(),
+        "unlisted crate"
+    );
+}
+
 #[test]
 fn every_subscription_route_checks_its_caller() {
     let bins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bins");
@@ -578,14 +631,15 @@ fn every_subscription_route_checks_its_caller() {
             .filter(|(c, _, _)| *c == name)
             .map(|(_, m, _)| *m)
             .collect();
-        for (at, arm) in unchecked(&files, &own) {
+        let full = FULL_COVERAGE_CRATES.contains(&name.as_str());
+        for (at, arm) in unchecked_in(&files, &own, full) {
             let seen = format!("{at} {arm}");
             match ALLOWED
                 .iter()
                 .position(|(c, needle, _)| *c == name && seen.contains(needle))
             {
                 Some(k) => *allowed_hits.entry(k).or_default() += 1,
-                None => problems.push(format!("{at}: unchecked subscription route: {arm}")),
+                None => problems.push(format!("{at}: unchecked manage route: {arm}")),
             }
         }
     }
