@@ -98,6 +98,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udmd/src/app.rs` (the binary'
 | `--tls-key` | path | unset | Same placeholder-only caveat as `--tls`. |
 | `--max-ue` | usize | `1024` | UE context pool capacity (also the denominator of the NRF load gauge). |
 | `--max-sess` | usize | `4096` | Session context pool capacity. |
+| `--state-file` | path | `NEXTGCORE_UDM_STATE_FILE`, else unset | The durable state file (#1836): SDM subscriptions, the UDR am-data subscriptions and the am-data changes waiting for an AMF. Unset (or empty) is memory-only, and udmd logs `no UDM state file`. A file that cannot be read fails the start rather than be overwritten. See "Durable state" below. |
 
 ## Behavior notes
 
@@ -108,6 +109,31 @@ From the clap `Args` struct in `src/bins/nextgcore-udmd/src/app.rs` (the binary'
 - **SQN replay protection gates AV issuance.** After Milenage AV generation the SQN is advanced per TS 33.102 Annex C.3.2 (per code comment) and PATCHed to the UDR. A UDR 5xx or transport failure makes the UDM **refuse to issue the AV** (503) to prevent SQN replay; other non-success statuses (e.g. 404 in the matched sim) degrade with a warning and the AV is issued anyway.
 - **SoR/UPU acks are MAC-verified, single-use.** When an am-data response carried a protected SoR/UPU payload, the expected XMAC-I_UE is pinned; the UE's ack MAC is compared constant-time and a match yields 204 *and clears the pin* (a replayed ack is rejected). Mismatch or missing MAC → 400 (`SOR_MAC_FAILURE`/`UPU_MAC_FAILURE`/`MANDATORY_IE_MISSING`); a MAC with nothing outstanding → 400 `UNEXPECTED_MESSAGE`. A plain ack with nothing outstanding stays 204 (backward-compatible with the matched sim, which never sends acks, per code comment). `ueNotReachable: true` is recorded without a MAC check.
 - **Environment variables** read by this binary: `NEXTGCORE_SBI_OAUTH2_REQUIRE` (`1`/`true`/`TRUE`/`yes` = on; checked *before* and overriding the YAML `sbi.oauth2.require`), `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP tracing endpoint, default `http://jaeger:4317`), `NEXTGCORE_SBI_PROFILE` (see [Configuration Overview](./overview.md)), and the peer fallbacks `UDR_SBI_ADDR`/`UDR_SBI_PORT`, `AUSF_SBI_ADDR`/`AUSF_SBI_PORT` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` (the AMF that receives UECM deregistration notifications and Namf calls when none is cached) used only when NRF discovery yields no instance.
+
+## Durable state (#1836, #1885)
+
+With `--state-file` or `NEXTGCORE_UDM_STATE_FILE`, udmd writes its SDM
+subscriptions, its am-data subscriptions at the UDR and the queued am-data
+changes to that file before it answers, and restores them before its listener
+opens. The file is one udmd instance's: give each instance its own file, and
+never two processes one file.
+
+Every shipped deployment except compose leaves it off:
+
+| Deployment | How to turn it on | Volume |
+|---|---|---|
+| Docker compose | on by default | named volume `udm_state` at `/var/lib/nextgcore` |
+| Helm chart | `udm.durableState.enabled=true` | `type: pvc` (default; a ReadWriteOnce claim) or `type: emptyDir`. The render fails for `udm.replicas > 1` or a ReadWriteMany claim. |
+| k8s/ (kustomize) | component `k8s/components/udm-durable-state` (claim) or `k8s/components/udm-durable-state-emptydir` | at `/var/lib/nextgcore`, file `udm-state.json` |
+| EKS (`deploy-eks.sh`) | `UDM_DURABLE_STATE=pvc` (gp3) or `emptydir`. `auto` (the default) keeps the live mode. | as k8s/ |
+
+An emptyDir survives a container restart, not a pod delete or reschedule: a new
+pod starts with no state. A claim survives both. The claim modes run one replica
+with strategy `Recreate`, so a rollout stops the old pod before the new one
+mounts the claim. A pod delete or node drain can still overlap the two on one
+node for the termination grace period, and `ReadWriteOncePod` closes that where
+the CSI driver supports it. Details: `deploy/eks/README.md` ("UDM durable
+state") and `deploy/helm/nextgcore/README.md`.
 
 ## Metrics endpoint (#1334)
 
