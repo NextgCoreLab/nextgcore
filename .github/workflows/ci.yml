@@ -388,6 +388,7 @@ jobs:
           node webui/server/lib/session-key.check.js
           node webui/server/lib/bind-address.check.js
           node webui/server/lib/insecure-dev.check.js
+          node webui/server/lib/mongoose-debug.check.js
 
   helm:
     # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits
