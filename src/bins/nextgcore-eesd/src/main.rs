@@ -321,13 +321,31 @@ fn sbi_listener_config(
     policy: &nextgcore_sbi::security::SbiSecurityPolicy,
     nrf_uri: &str,
 ) -> nextgcore_sbi::SbiResult<NextgcoreSbiServerConfig> {
-    nextgcore_sbi::security::apply_sbi_security_policy(
+    let mut config = nextgcore_sbi::security::apply_sbi_security_policy(
         config,
         profile,
         &policy.server_tls_only(),
         nextgcore_sbi::types::NfType::Ees,
         nrf_uri,
-    )
+    )?;
+    // #2050: under production a client certificate is verified when one is
+    // presented, against the policy's CA, and none is demanded: EECs and EASes
+    // hold none, while an EES calling the ECS role presents its own. The
+    // verified identity is what the ECS routes accept as a caller.
+    if profile.is_production() {
+        let ca = policy.tls_paths.ca_cert.clone();
+        if !std::path::Path::new(&ca).is_file() {
+            return Err(nextgcore_sbi::SbiError::TlsError(format!(
+                "SBI production profile requires a TLS client CA certificate at {ca}, which \
+                 does not exist: the EES verifies the client certificate an EES presents to \
+                 its ECS role (#2050)"
+            )));
+        }
+        config.verify_client = true;
+        config.verify_client_cacert = Some(ca);
+        config.verify_client_optional = true;
+    }
+    Ok(config)
 }
 
 #[tokio::main]
@@ -3835,10 +3853,17 @@ mod tests {
                 "easIds": ["eas-router"],
             },
         });
+        // #2050: an EES with a verified client certificate.
+        let as_ees = |mut r: SbiRequest| {
+            r.peer_cert_nf_instance_id = Some("20500000-0000-4000-8000-0000000000e5".into());
+            r
+        };
         let request = || {
-            SbiRequest::post("/eecs-eesregistration/v1/registrations")
-                .with_json_body(&body)
-                .expect("serialize")
+            as_ees(
+                SbiRequest::post("/eecs-eesregistration/v1/registrations")
+                    .with_json_body(&body)
+                    .expect("serialize"),
+            )
         };
 
         // OFF: the path is a 404, exactly as before #107.
@@ -3864,11 +3889,11 @@ mod tests {
         assert!(location.starts_with("/eecs-eesregistration/v1/registrations/"));
 
         // And the refresh, also through the router.
-        let refresh = block_on(ees_sbi_request_handler(
+        let refresh = block_on(ees_sbi_request_handler(as_ees(
             SbiRequest::put(&location)
                 .with_json_body(&body)
                 .expect("serialize"),
-        ));
+        )));
         assert!(
             (200..300).contains(&refresh.status),
             "the PUT refresh must be 2xx through the router, got {}",
@@ -3876,15 +3901,112 @@ mod tests {
         );
 
         // Discovery finds it, which is the point of registering at all.
-        let discovered = block_on(ees_sbi_request_handler(
+        let discovered = block_on(ees_sbi_request_handler(as_ees(
             SbiRequest::post("/eecs-targeteesdiscovery/v1/target-ees-discovery")
                 .with_json_body(&serde_json::json!({ "easId": "eas-router" }))
                 .expect("serialize"),
-        ));
+        )));
         assert_eq!(discovered.status, 200);
         let found: serde_json::Value =
             serde_json::from_str(discovered.http.content.as_deref().expect("body")).expect("json");
         assert_eq!(found["eesProfiles"][0]["eesId"], "ees-router.example.com");
+
+        ecs_role::set_for_test(false);
+        ecs_role::clear_registry_for_test();
+    }
+
+    /// #2050: every ECS route needs a verified caller. Under the production
+    /// profile: a direct EES with a verified client certificate is served; a
+    /// caller with an access token for the ECS API's scope is served and its
+    /// `sub` recorded; a token for another API is refused 403; an anonymous
+    /// caller is refused 401 and nothing is stored.
+    ///
+    /// REVERT-VERIFIED: with `require_verified_caller` admitting every
+    /// request, the anonymous registration is 201 and the first anonymous
+    /// assertion fails.
+    #[test]
+    fn the_ecs_routes_need_a_verified_caller_2050() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ecs_role::clear_registry_for_test();
+        ecs_role::set_for_test(true);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let body = serde_json::json!({
+            "eesProf": {
+                "eesId": "ees-2050.example.com",
+                "endPt": {"uri": "http://10.0.0.9:7814"},
+                "easIds": ["eas-2050"],
+            },
+        });
+        let register = || {
+            SbiRequest::post("/eecs-eesregistration/v1/registrations")
+                .with_json_body(&body)
+                .expect("serialize")
+        };
+        let count = || ecs_role::registered_eess().len();
+
+        // Anonymous: refused, nothing stored, on every ECS API.
+        let before = count();
+        let r = block_on(ees_sbi_request_handler(register()));
+        assert_eq!(
+            r.status, 401,
+            "anonymous registration: {:?}",
+            r.http.content
+        );
+        assert_eq!(count(), before, "nothing stored");
+        for (path, b) in [
+            (
+                "/eecs-serviceprovisioning/v1/provisioning-requests",
+                serde_json::json!({"eecId": "e"}),
+            ),
+            (
+                "/eecs-targeteesdiscovery/v1/target-ees-discovery",
+                serde_json::json!({"easId": "x"}),
+            ),
+        ] {
+            let r = block_on(ees_sbi_request_handler(
+                SbiRequest::post(path).with_json_body(&b).unwrap(),
+            ));
+            assert_eq!(r.status, 401, "anonymous {path}");
+        }
+
+        // Direct (mTLS): a verified client certificate.
+        let mut direct = register();
+        direct.peer_cert_nf_instance_id = Some("20500000-0000-4000-8000-0000000000e5".into());
+        assert_eq!(
+            block_on(ees_sbi_request_handler(direct)).status,
+            201,
+            "direct EES"
+        );
+
+        // Token: valid for the ECS API's scope.
+        let token = register().with_header(
+            "Authorization",
+            bearer_sub(
+                &sk,
+                "k1",
+                ecs_role::SCOPE_EES_REGISTRATION,
+                "ees-token-2050",
+            ),
+        );
+        assert_eq!(
+            block_on(ees_sbi_request_handler(token)).status,
+            201,
+            "token EES"
+        );
+
+        // A token for another API is not a credential for this one.
+        let wrong = register().with_header(
+            "Authorization",
+            bearer_sub(&sk, "k1", auth::SCOPE_EASREGISTRATION, "ees-token-2050"),
+        );
+        assert_eq!(
+            block_on(ees_sbi_request_handler(wrong)).status,
+            403,
+            "wrong scope"
+        );
 
         ecs_role::set_for_test(false);
         ecs_role::clear_registry_for_test();
@@ -3903,11 +4025,13 @@ mod tests {
         // No JWKS configured at all: an `eees-*` route fails closed with 401 here.
         auth::clear_auth_jwks();
 
-        let resp = block_on(ees_sbi_request_handler(
-            SbiRequest::post("/eecs-serviceprovisioning/v1/provisioning-requests")
-                .with_json_body(&serde_json::json!({ "eecId": "eec-1" }))
-                .expect("serialize"),
-        ));
+        // #2050: a verified client certificate is the caller's identity, so
+        // no token (and no JWKS) is needed.
+        let mut with_cert = SbiRequest::post("/eecs-serviceprovisioning/v1/provisioning-requests")
+            .with_json_body(&serde_json::json!({ "eecId": "eec-1" }))
+            .expect("serialize");
+        with_cert.peer_cert_nf_instance_id = Some("20500000-0000-4000-8000-0000000000e1".into());
+        let resp = block_on(ees_sbi_request_handler(with_cert));
         assert_eq!(
             resp.status, 200,
             "EDGE-4 provisioning must not be gated on an EES service scope"
@@ -7158,8 +7282,8 @@ mod sbi_profile_tests_1795 {
             tls_paths: TlsPaths {
                 cert: file("ees.crt"),
                 key: file("ees.key"),
-                // No CA on disk either: a TLS-only server verifies no client (#1848).
-                ca_cert: dir.join("absent-ca.crt").display().to_string(),
+                // #2050: the CA an EES's client certificate is verified against.
+                ca_cert: file("ca.crt"),
                 client_cert: None,
                 client_key: None,
             },
@@ -7177,10 +7301,35 @@ mod sbi_profile_tests_1795 {
         .expect("production applies");
         assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
         assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+        // #2050: a presented client certificate is verified (an EES calling
+        // the ECS role), but none is demanded (an EEC holds none).
         assert!(
-            !prod.verify_client,
+            prod.verify_client,
+            "a presented client certificate is verified"
+        );
+        assert!(
+            prod.verify_client_optional,
             "an EEC presents no operator certificate"
         );
+        assert_eq!(
+            prod.verify_client_cacert.as_deref(),
+            Some(policy.tls_paths.ca_cert.as_str())
+        );
+        let no_ca = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                ca_cert: dir.join("absent-ca.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = sbi_listener_config(
+            NextgcoreSbiServerConfig::new(addr),
+            SbiProfile::Production,
+            &no_ca,
+            nrf,
+        )
+        .expect_err("a missing CA is named, not ignored");
+        assert!(err.to_string().contains("absent-ca.crt"), "{err}");
         assert!(
             !prod.require_oauth2,
             "the per-operation gate, not the server, checks EEC/EAS tokens"

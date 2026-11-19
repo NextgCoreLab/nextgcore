@@ -375,11 +375,59 @@ pub fn handle_target_ees_discovery(request: &SbiRequest) -> SbiResponse {
 /// Returning `None` rather than a 404 keeps the caller's own fallback in charge, so
 /// with the role disabled these paths answer exactly what they answered before
 /// #107 — which is what makes the default safe rather than merely quiet.
+/// The OAuth2 scope of each ECS API: its API name (TS 29.558 §8, TS 29.500
+/// §6.7.3, the service-name scope every API carries).
+pub const SCOPE_EES_REGISTRATION: &str = "eecs-eesregistration";
+pub const SCOPE_SERVICE_PROVISIONING: &str = "eecs-serviceprovisioning";
+pub const SCOPE_TARGET_EES_DISCOVERY: &str = "eecs-targeteesdiscovery";
+
+/// #2050: an ECS route needs a verified caller identity (TS 33.558 §6.2,
+/// TS 33.501 §13.1), either:
+/// - a client certificate this EES verified (mTLS: under the production
+///   profile the listener verifies one when presented, and the EES-side ECS
+///   client presents its own through the shared profile-following client), or
+/// - an access token valid for the route's API `scope`, through the same
+///   per-operation gate every `eees-*` route runs, whose `sub` is recorded.
+///
+/// A token that is presented is always verified, even with a certificate, so
+/// a bad token is never ignored. `Some` is the refusal to send (401 for no or
+/// a bad credential, 403 for a token without the scope); nothing has run yet.
+fn require_verified_caller(request: &mut SbiRequest, scope: &str) -> Option<SbiResponse> {
+    if request.http.get_header("authorization").is_some() {
+        return crate::auth::authorize(request, scope);
+    }
+    let has_cert = request
+        .peer_cert_nf_instance_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if has_cert {
+        return None;
+    }
+    Some(nextgcore_sbi::server::send_unauthorized(
+        &format!(
+            "the ECS {scope} API needs a verified caller: a client certificate or an access \
+             token for {scope}"
+        ),
+        Some("UNAUTHORIZED"),
+    ))
+}
+
 pub fn route(parts: &[&str], request: &SbiRequest) -> Option<SbiResponse> {
     if !enabled() {
         return None;
     }
     let method = request.header.method.as_str();
+    let scope = match parts.first() {
+        Some(&"eecs-eesregistration") => SCOPE_EES_REGISTRATION,
+        Some(&"eecs-serviceprovisioning") => SCOPE_SERVICE_PROVISIONING,
+        Some(&"eecs-targeteesdiscovery") => SCOPE_TARGET_EES_DISCOVERY,
+        _ => return None,
+    };
+    let mut verified = request.clone();
+    if let Some(refused) = require_verified_caller(&mut verified, scope) {
+        return Some(refused);
+    }
+    let request = &verified;
     match parts {
         ["eecs-eesregistration", "v1", "registrations"] => Some(match method {
             "POST" => handle_registration_create(request),
@@ -407,6 +455,9 @@ pub fn route(parts: &[&str], request: &SbiRequest) -> Option<SbiResponse> {
 mod tests {
     use super::*;
     use crate::types::EndPoint;
+
+    /// #2050: the verified EES the route-level tests act as.
+    const TEST_EES_2050: &str = "20500000-0000-4000-8000-0000000000e5";
 
     fn post(path: &str, body: serde_json::Value) -> SbiRequest {
         SbiRequest::post(path)
@@ -673,7 +724,9 @@ mod tests {
                 route(&path, &post(&path.join("/"), serde_json::json!({}))).is_some(),
                 "{path:?} must be routed with the role on"
             );
-            let get = SbiRequest::get(path.join("/"));
+            let mut get = SbiRequest::get(path.join("/"));
+            // #2050: a verified caller, so the method check is what answers.
+            get.peer_cert_nf_instance_id = Some(TEST_EES_2050.into());
             let resp = route(&path, &get).expect("routed");
             assert_eq!(
                 resp.status, 405,
