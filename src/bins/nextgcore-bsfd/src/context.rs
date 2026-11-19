@@ -675,6 +675,10 @@ pub struct BsfSubscription {
     /// The received document, echoed on replace so the resource is what the
     /// consumer sent.
     pub raw: serde_json::Value,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed
+    /// (`nextgcore_sbi::owner_binding`), the only one that may replace or
+    /// remove it. `None` when it subscribed with no verified identity (`dev`).
+    pub owner: Option<String>,
 }
 
 impl BsfSubscription {
@@ -2032,6 +2036,7 @@ mod tests {
             events: vec!["PCF_UE_BINDING_REGISTRATION".to_string()],
             expiry: expiry.map(String::from),
             raw: serde_json::json!({}),
+            owner: None,
         }
     }
 

@@ -807,7 +807,9 @@ fn owner_for_new_subscription_in(
     operation: &str,
     production: bool,
 ) -> Result<Option<String>, Box<SbiResponse>> {
-    match nextgcore_udrd::owner_binding::owner_for_new_resource(request, operation)? {
+    // #1865: the shared helper with this function's explicit policy, so the
+    // `_in` tests do not depend on the process-wide profile.
+    match nextgcore_udrd::owner_binding::owner_for_new_resource_with(request, operation, false)? {
         None if production => {
             let why = "the requester has no verified identity (no access token subject and no \
                        client certificate NF Instance ID); under the production SBI profile \
@@ -840,7 +842,7 @@ fn subscription_caller_refusal_in(
                 .to_string(),
         );
     }
-    nextgcore_udrd::owner_binding::non_owner_refusal(owner, request)
+    nextgcore_udrd::owner_binding::non_owner_refusal_with(owner, request, production)
 }
 
 /// [`subscription_caller_refusal`] as the `403` to send.
@@ -5166,8 +5168,8 @@ mod tests {
     fn every_subscription_site_uses_the_production_wrappers_1903() {
         let src = include_str!("main.rs");
         for direct in [
-            "nextgcore_udrd::owner_binding::owner_for_new_resource(",
-            "nextgcore_udrd::owner_binding::non_owner_refusal(",
+            "nextgcore_udrd::owner_binding::owner_for_new_resource_with(",
+            "nextgcore_udrd::owner_binding::non_owner_refusal_with(",
         ] {
             assert_eq!(
                 src.matches(direct).count(),

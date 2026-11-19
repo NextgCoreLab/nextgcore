@@ -35,7 +35,7 @@
 //!   with no format, so the encoding is still this UCMF's choice.
 
 mod context;
-mod owner_binding; // #1862: a subscription is cancelled by its creator only
+use nextgcore_sbi::owner_binding; // #1862, on the shared #1865 helper
 mod rac;
 mod racs_id;
 
@@ -1739,7 +1739,10 @@ mod tests {
         let (r, _) = handle(
             &u,
             &with_json(
-                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                as_nf_1862(
+                    req("POST", "/nucmf-uecm/v1/subscriptions"),
+                    Some(AMF_A_1862),
+                ),
                 json!({"ucmfNotificationUri": "http://amf:7777/racs-notify"}),
             ),
             now(),
@@ -1833,7 +1836,10 @@ mod tests {
     fn subscribe_notify_unsubscribe_over_the_api() {
         let u = ucmf();
         let sub = with_json(
-            req("POST", "/nucmf-uecm/v1/subscriptions"),
+            as_nf_1862(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                Some(AMF_A_1862),
+            ),
             json!({"ucmfNotificationUri": "http://amf:7777/racs-notify", "nfId": "a1"}),
         );
         let (r, _) = handle(&u, &sub, now());
@@ -1854,15 +1860,26 @@ mod tests {
         assert_eq!(notes[0].body["dicEntryId"], 1);
 
         let doc = format!("/nucmf-uecm/v1/subscriptions/{id}");
-        let (r, _) = handle(&u, &req("DELETE", &doc), now());
+        let (r, _) = handle(
+            &u,
+            &as_nf_1862(req("DELETE", &doc), Some(AMF_A_1862)),
+            now(),
+        );
         assert_eq!(r.status, 204);
-        let (r, _) = handle(&u, &req("DELETE", &doc), now());
+        let (r, _) = handle(
+            &u,
+            &as_nf_1862(req("DELETE", &doc), Some(AMF_A_1862)),
+            now(),
+        );
         assert_eq!(
             (r.status, cause(&r)),
             (404, json!("SUBSCRIPTION_NOT_FOUND"))
         );
         let bad = with_json(
-            req("POST", "/nucmf-uecm/v1/subscriptions"),
+            as_nf_1862(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                Some(AMF_A_1862),
+            ),
             json!({"nfId": "a1"}),
         );
         assert_eq!(handle(&u, &bad, now()).0.status, 400);
@@ -2509,7 +2526,10 @@ mod tests {
         );
         let sub = || {
             with_json(
-                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                as_nf_1862(
+                    req("POST", "/nucmf-uecm/v1/subscriptions"),
+                    Some(AMF_A_1862),
+                ),
                 json!({"ucmfNotificationUri": "http://amf:7777/racs-notify"}),
             )
         };

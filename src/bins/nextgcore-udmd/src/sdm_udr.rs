@@ -291,6 +291,30 @@ struct SavedSdmSubscription {
     #[serde(default)]
     callback_reference: Option<String>,
     monitored_resource_uris: Vec<String>,
+    /// #1865 (R32 on #1936 M1): the verified consumer that created it, so it is
+    /// still that consumer's after a restart. Absent in a record written before
+    /// #1865; see [`restored_owner`].
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// The owner a restored SDM subscription is bound to (#1865, R32 on #1936 M1).
+///
+/// A record written since #1865 carries its verified creator. One written
+/// before has none, and under production an ownerless subscription is frozen:
+/// its AMF would get 403 on Unsubscribe forever and nothing caps its lifetime.
+/// Such a record is bound to the `nfInstanceId` it was created with (mandatory
+/// in `SdmSubscription`, TS 29.503 §6.1.6.2.3): the one subscriber it names,
+/// which is the AMF that will next unsubscribe, proving that NF instance.
+/// Adopting the first verified caller instead would hand the subscription to
+/// any NF that learned its ID before its own AMF came back.
+fn restored_owner(saved: &SavedSdmSubscription) -> Option<String> {
+    saved.owner.clone().or_else(|| {
+        saved
+            .nf_instance_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+    })
 }
 
 /// The state as restored: #1836's snapshot document, and what a replay of the
@@ -329,6 +353,7 @@ fn saved(s: UdmSdmSubscription) -> SavedSdmSubscription {
         nf_instance_id: s.nf_instance_id,
         callback_reference: s.callback_reference,
         monitored_resource_uris: s.monitored_resource_uris,
+        owner: s.owner,
     }
 }
 
@@ -530,6 +555,7 @@ pub async fn init_state(path: Option<std::path::PathBuf>) -> Result<usize, Strin
         let ctx = udm_self();
         if let Ok(context) = ctx.read() {
             for s in snap.sdm_subscriptions {
+                let owner = restored_owner(&s);
                 let mut sub = UdmSdmSubscription::for_supi(
                     s.supi,
                     s.nf_instance_id,
@@ -537,6 +563,7 @@ pub async fn init_state(path: Option<std::path::PathBuf>) -> Result<usize, Strin
                     s.monitored_resource_uris,
                 );
                 sub.id = s.id;
+                sub.owner = owner;
                 if !context.sdm_subscription_insert(sub) {
                     log::error!("state file: SDM subscription over the cap, not restored");
                 }
@@ -1550,6 +1577,46 @@ pub(crate) fn leg_token(supi: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1865 (R32 on #1936 M1): a restored SDM subscription keeps its verified
+    /// creator; one written before #1865 is bound to the nfInstanceId it names,
+    /// never left ownerless (frozen under production).
+    /// REVERT-VERIFIED: with `restored_owner` returning `saved.owner` alone the
+    /// legacy record restores ownerless and the second assertion fails.
+    #[test]
+    fn a_restored_sdm_subscription_is_still_bound_1865() {
+        let record = |owner: Option<&str>, nf: Option<&str>| SavedSdmSubscription {
+            id: "s-1865".into(),
+            supi: "imsi-001010000001865".into(),
+            nf_instance_id: nf.map(str::to_string),
+            callback_reference: Some("http://amf/cb".into()),
+            monitored_resource_uris: vec![],
+            owner: owner.map(str::to_string),
+        };
+        let amf = "aaaaaaaa-1865-4000-8000-0000000000a1";
+        assert_eq!(
+            restored_owner(&record(Some(amf), Some("declared"))).as_deref(),
+            Some(amf)
+        );
+        assert_eq!(
+            restored_owner(&record(None, Some(amf))).as_deref(),
+            Some(amf)
+        );
+        assert_eq!(restored_owner(&record(None, Some(" "))), None);
+        // A pre-#1865 file has no `owner` member at all.
+        let legacy: SavedSdmSubscription = serde_json::from_value(serde_json::json!({
+            "id": "s-old", "supi": "imsi-1", "nfInstanceId": amf,
+            "monitoredResourceUris": []
+        }))
+        .unwrap();
+        assert_eq!(legacy.owner, None);
+        assert_eq!(restored_owner(&legacy).as_deref(), Some(amf));
+        // And a written record carries it.
+        let mut sub =
+            crate::context::UdmSdmSubscription::for_supi("imsi-1", Some(amf.into()), None, vec![]);
+        sub.owner = Some(amf.into());
+        assert_eq!(saved(sub).owner.as_deref(), Some(amf));
+    }
     use crate::ee_amf::set_notify_base;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use std::sync::Arc;
@@ -1634,7 +1701,8 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = crate::app::handle_sdm_subscribe(supi, &req).await;
+        let resp =
+            crate::app::handle_sdm_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
         assert_eq!(resp.status, 201);
         wait_idle().await;
         serde_json::from_str::<Value>(resp.http.content.as_deref().expect("body")).expect("json")
@@ -1797,9 +1865,13 @@ mod tests {
         assert_eq!(ue.gpsi.as_deref(), Some("msisdn-4917759"), "the new GPSI");
 
         assert_eq!(
-            crate::app::handle_sdm_unsubscribe(supi, &sdm_id)
-                .await
-                .status,
+            crate::app::handle_sdm_unsubscribe(
+                supi,
+                &sdm_id,
+                &crate::app::as_test_consumer(&SbiRequest::default())
+            )
+            .await
+            .status,
             204
         );
         wait_idle().await;
@@ -1883,9 +1955,13 @@ mod tests {
         );
 
         assert_eq!(
-            crate::app::handle_sdm_unsubscribe(supi, &refusing_id)
-                .await
-                .status,
+            crate::app::handle_sdm_unsubscribe(
+                supi,
+                &refusing_id,
+                &crate::app::as_test_consumer(&SbiRequest::default())
+            )
+            .await
+            .status,
             204
         );
         wait_idle().await;
@@ -2323,6 +2399,20 @@ mod tests {
             .map(|s| s.id)
             .collect();
         assert_eq!(held, vec![sdm_id]);
+        // #1865 (R32 on #1936 M1): still its creator's after the restart.
+        // REVERT-VERIFIED: with `saved()` dropping the owner this is `[None]`
+        // (the restore then binds the declared nfInstanceId instead).
+        let owners: Vec<Option<String>> = udm_self()
+            .read()
+            .expect("ctx")
+            .sdm_subscriptions_for_supi(supi)
+            .into_iter()
+            .map(|s| s.owner)
+            .collect();
+        assert_eq!(
+            owners,
+            vec![Some(crate::app::TEST_CONSUMER_1865.to_string())]
+        );
         let second = udr_notify(supi, &udm_callback, &gpsis(2), &gpsis(3));
         assert_eq!(
             nextgcore_udrd::data_store::deliver_notification(&udm_callback, &second).await,
@@ -2794,7 +2884,12 @@ mod tests {
         let id = sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/u").await;
         let token = leg_token(supi).expect("leg");
         break_it(&dir);
-        let resp = crate::app::handle_sdm_unsubscribe(supi, &id).await;
+        let resp = crate::app::handle_sdm_unsubscribe(
+            supi,
+            &id,
+            &crate::app::as_test_consumer(&SbiRequest::default()),
+        )
+        .await;
         assert_eq!(
             (
                 resp.status,
@@ -2881,6 +2976,8 @@ mod tests {
             // Nothing listens there: the queued change stays queued.
             callback_reference: Some("http://127.0.0.1:9/cb/sdm-notify/m".to_string()),
             monitored_resource_uris: vec![format!("/nudm-sdm/v2/{supi}/am-data")],
+            // A #1836 snapshot predates #1865: no owner.
+            owner: None,
         };
         let token = "0123456789abcdef0123456789a18961";
         let snapshot = Snapshot {

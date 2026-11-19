@@ -946,6 +946,11 @@ pub struct NonUeN2InfoSubscription {
     pub an_type_list: Vec<String>,
     /// `supportedFeatures`, echoed in the 201 body when the consumer sent it.
     pub supported_features: Option<String>,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Never the self-declared `nfId`. `None` when it was
+    /// created with no verified identity (the `dev` profile) or internally.
+    pub owner: Option<String>,
 }
 
 /// A PWS transfer that asked to be told what the RAN answered (#399, TS 29.518
@@ -990,6 +995,11 @@ pub struct UeN1N2InfoSubscription {
     /// LCS correlation identifier supplied by the consumer, echoed back in
     /// notifications (TS 29.572 CorrelationID)
     pub lcs_correlation_id: Option<String>,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Never the self-declared `nfId`. `None` when it was
+    /// created with no verified identity (the `dev` profile) or internally.
+    pub owner: Option<String>,
 }
 
 /// Fallback LCS correlation captured from an incoming
@@ -1138,6 +1148,11 @@ impl EventArea {
 pub struct EventSubscription {
     /// Subscription ID (assigned by AMF, returned in Location header)
     pub subscription_id: String,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Never the self-declared `nfId`. `None` when it was
+    /// created with no verified identity (the `dev` profile) or internally.
+    pub owner: Option<String>,
     /// Event notification URI (mandatory `eventNotifyUri`)
     pub notify_uri: String,
     /// Notify correlation ID (mandatory `notifyCorrelationId`)
@@ -1442,6 +1457,11 @@ pub struct AmfStatusSubscription {
     /// §5.2.2.5.1.3 round-trips byte-identically. The AMF does not reinterpret a
     /// `Guami` it only has to echo.
     pub guami_list: Vec<serde_json::Value>,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Never the self-declared `nfId`. `None` when it was
+    /// created with no verified identity (the `dev` profile) or internally.
+    pub owner: Option<String>,
 }
 
 impl AmfContext {
@@ -7728,6 +7748,7 @@ mod tests {
         assert!(ctx.n1n2_subscription_add(
             supi,
             UeN1N2InfoSubscription {
+                owner: None,
                 subscription_id: "sub-lpp".to_string(),
                 n1_message_class: Some("LPP".to_string()),
                 n1_notify_callback_uri: Some("http://lmf:7777/nlmf-loc/v1/notify/n1".to_string()),
@@ -7739,6 +7760,7 @@ mod tests {
         assert!(ctx.n1n2_subscription_add(
             supi,
             UeN1N2InfoSubscription {
+                owner: None,
                 subscription_id: "sub-nrppa".to_string(),
                 n1_message_class: None,
                 n1_notify_callback_uri: None,
@@ -7751,6 +7773,7 @@ mod tests {
         assert!(!ctx.n1n2_subscription_add(
             supi,
             UeN1N2InfoSubscription {
+                owner: None,
                 subscription_id: "sub-lpp".to_string(),
                 n1_message_class: Some("LPP".to_string()),
                 n1_notify_callback_uri: Some("http://other/cb".to_string()),
@@ -7808,6 +7831,7 @@ mod tests {
         assert!(ctx.n1n2_subscription_add(
             supi,
             UeN1N2InfoSubscription {
+                owner: None,
                 subscription_id: "sub-1".to_string(),
                 n1_message_class: Some("LPP".to_string()),
                 n1_notify_callback_uri: Some("http://lmf:7777/cb".to_string()),

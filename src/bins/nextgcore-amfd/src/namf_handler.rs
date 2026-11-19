@@ -703,6 +703,7 @@ pub fn handle_event_subscribe(
     // Generate subscription ID and persist in the AMF context
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let stored = crate::context::EventSubscription {
+        owner: None,
         subscription_id: subscription_id.clone(),
         notify_uri: callback_uri.to_string(),
         notify_correlation_id: subscription_id.clone(),

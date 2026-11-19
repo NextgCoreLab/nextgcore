@@ -12,6 +12,7 @@ use clap::Parser;
 use nextgcore_sbi::constants::content_type::APPLICATION_NGAP;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as NextgcoreSbiServerConfig,
@@ -494,7 +495,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ["nmbsmf-mbssession", "v1", "mbs-sessions", "contexts", "subscriptions", sub_id] => {
             match method {
                 "PATCH" => handle_ctx_status_subscribe_mod(sub_id, &request).await,
-                "DELETE" => handle_ctx_status_unsubscribe(sub_id).await,
+                "DELETE" => handle_ctx_status_unsubscribe(sub_id, &request).await,
                 _ => send_method_not_allowed(method, "mbs-sessions/contexts/subscriptions/{id}"),
             }
         }
@@ -506,7 +507,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["nmbsmf-mbssession", "v1", "mbs-sessions", "subscriptions", sub_id] => match method {
             "PATCH" => handle_status_subscribe_mod(sub_id, &request).await,
-            "DELETE" => handle_status_unsubscribe(sub_id).await,
+            "DELETE" => handle_status_unsubscribe(sub_id, &request).await,
             _ => send_method_not_allowed(method, "mbs-sessions/subscriptions/{id}"),
         },
         // Per-session document: GET / PATCH / DELETE. Must come after all
@@ -2544,9 +2545,34 @@ async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
 // mbsmfd-05: Status / ContextStatus Subscribe / Unsubscribe / Notify handlers
 // ---------------------------------------------------------------------------
 
+/// #1865: `404` for an unknown subscription (checked first), `403` for a caller
+/// that is not the one that subscribed (TS 33.501 §13.4.1), else `None`.
+/// `owner` is the store's lookup: `None` = no such subscription.
+fn refuse_sub_non_owner(
+    owner: Option<Option<String>>,
+    sub_id: &str,
+    kind: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let Some(owner) = owner else {
+        return Some(send_not_found(
+            &format!("{kind} subscription {sub_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        ));
+    };
+    owner_binding::refuse_non_owner(owner.as_deref(), request, operation)
+}
+
 /// StatusSubscribe — POST `/mbs-sessions/subscriptions` → 201 + Location
 /// (TS 29.532 §5.3.2.6). Body: StatusSubscribeReqData{subscription:MbsSessionSubscription}.
 async fn handle_status_subscribe(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the verified identity of the subscriber, decided before
+    // the body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "StatusSubscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -2579,6 +2605,7 @@ async fn handle_status_subscribe(request: &SbiRequest) -> SbiResponse {
                 .collect(),
             mbs_session_id: document.get("mbsSessionId").cloned(),
             document,
+            owner,
         }
     };
     let ctx = mbsmf_self();
@@ -2603,6 +2630,16 @@ async fn handle_status_subscribe(request: &SbiRequest) -> SbiResponse {
 /// (TS 29.532 §5.3.2.6, operationId StatusSubscribeMod).
 /// Body: application/json-patch+json (array of PatchItem). Returns modified bare subscription.
 async fn handle_status_subscribe_mod(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the subscriber may modify, checked before the body is read.
+    let owner = mbsmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.status_sub_owner(sub_id));
+    if let Some(refused) =
+        refuse_sub_non_owner(owner, sub_id, "Status", request, "StatusSubscribeMod")
+    {
+        return refused;
+    }
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -2637,8 +2674,15 @@ async fn handle_status_subscribe_mod(sub_id: &str, request: &SbiRequest) -> SbiR
 
 /// StatusUnsubscribe — DELETE `/mbs-sessions/subscriptions/{id}` → 204
 /// (TS 29.532 §5.3.2.7).
-async fn handle_status_unsubscribe(sub_id: &str) -> SbiResponse {
+async fn handle_status_unsubscribe(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = mbsmf_self();
+    // #1865: only the subscriber may unsubscribe, checked before the removal.
+    let owner = ctx.read().ok().and_then(|c| c.status_sub_owner(sub_id));
+    if let Some(refused) =
+        refuse_sub_non_owner(owner, sub_id, "Status", request, "StatusUnsubscribe")
+    {
+        return refused;
+    }
     let removed = ctx
         .read()
         .ok()
@@ -2658,6 +2702,12 @@ async fn handle_status_unsubscribe(sub_id: &str) -> SbiResponse {
 /// ContextStatusSubscribe — POST `/mbs-sessions/contexts/subscriptions` → 201
 /// (TS 29.532 §5.3.2.9). Body: ContextStatusSubscribeReqData{subscription:ContextStatusSubscription}.
 async fn handle_ctx_status_subscribe(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the verified identity of the subscriber, decided before
+    // the body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "ContextStatusSubscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -2691,6 +2741,7 @@ async fn handle_ctx_status_subscribe(request: &SbiRequest) -> SbiResponse {
                 .collect(),
             mbs_session_id: Some(session_id_val),
             document,
+            owner,
         }
     };
     let ctx = mbsmf_self();
@@ -2715,6 +2766,20 @@ async fn handle_ctx_status_subscribe(request: &SbiRequest) -> SbiResponse {
 /// (TS 29.532 §5.3.2.9, operationId ContextStatusSubscribeMod).
 /// Body: application/json-patch+json. Returns modified bare subscription.
 async fn handle_ctx_status_subscribe_mod(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1865: only the subscriber may modify, checked before the body is read.
+    let owner = mbsmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.ctx_sub_owner(sub_id));
+    if let Some(refused) = refuse_sub_non_owner(
+        owner,
+        sub_id,
+        "ContextStatus",
+        request,
+        "ContextStatusSubscribeMod",
+    ) {
+        return refused;
+    }
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -2749,8 +2814,19 @@ async fn handle_ctx_status_subscribe_mod(sub_id: &str, request: &SbiRequest) -> 
 
 /// ContextStatusUnsubscribe — DELETE `/mbs-sessions/contexts/subscriptions/{id}` → 204
 /// (TS 29.532 §5.3.2.10).
-async fn handle_ctx_status_unsubscribe(sub_id: &str) -> SbiResponse {
+async fn handle_ctx_status_unsubscribe(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let ctx = mbsmf_self();
+    // #1865: only the subscriber may unsubscribe, checked before the removal.
+    let owner = ctx.read().ok().and_then(|c| c.ctx_sub_owner(sub_id));
+    if let Some(refused) = refuse_sub_non_owner(
+        owner,
+        sub_id,
+        "ContextStatus",
+        request,
+        "ContextStatusUnsubscribe",
+    ) {
+        return refused;
+    }
     let removed = ctx
         .read()
         .ok()
@@ -4489,14 +4565,25 @@ mod tests {
 
     // ---- mbsmfd-05: subscription router integration tests ----
 
+    /// #1865: the verified subscriber of the router tests below, so they pass
+    /// under both SBI profiles (production refuses an anonymous subscribe).
+    const TEST_NF_1865: &str = "aaaaaaaa-1865-4000-8000-0000000000a1";
+
+    fn as_nf(mut r: SbiRequest) -> SbiRequest {
+        r.oauth2_subject = Some(TEST_NF_1865.to_string());
+        r
+    }
+
     // Subscribe → 201 + Location; unsubscribe → 204; double-delete → 404.
     #[tokio::test]
     async fn test_router_status_subscribe_and_unsubscribe() {
         mbsmf_context_init(256);
         let body = r#"{"subscription":{"eventList":[{"eventType":"BROADCAST_DELIVERY_STATUS"}],"notifyUri":"http://nef:9000/notify"}}"#;
         let rsp = mbsmf_sbi_request_handler(
-            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
-                .with_body(body, "application/json"),
+            as_nf(SbiRequest::post(
+                "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions",
+            ))
+            .with_body(body, "application/json"),
         )
         .await;
         assert_eq!(rsp.status, 201, "Status subscribe → 201");
@@ -4505,16 +4592,16 @@ mod tests {
         let sub_id = loc.unwrap().rsplit('/').next().unwrap().to_string();
 
         // Unsubscribe the subscription we just created → 204.
-        let del = mbsmf_sbi_request_handler(SbiRequest::delete(format!(
+        let del = mbsmf_sbi_request_handler(as_nf(SbiRequest::delete(format!(
             "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/{sub_id}"
-        )))
+        ))))
         .await;
         assert_eq!(del.status, 204, "Status unsubscribe → 204");
 
         // Second delete → 404 (already removed).
-        let del2 = mbsmf_sbi_request_handler(SbiRequest::delete(format!(
+        let del2 = mbsmf_sbi_request_handler(as_nf(SbiRequest::delete(format!(
             "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/{sub_id}"
-        )))
+        ))))
         .await;
         assert_eq!(del2.status, 404, "Second delete → 404");
     }
@@ -4525,8 +4612,10 @@ mod tests {
         mbsmf_context_init(256);
         let create_body = r#"{"subscription":{"eventList":[{"eventType":"BROADCAST_DELIVERY_STATUS"}],"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-orig"}}"#;
         let rsp = mbsmf_sbi_request_handler(
-            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
-                .with_body(create_body, "application/json"),
+            as_nf(SbiRequest::post(
+                "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions",
+            ))
+            .with_body(create_body, "application/json"),
         )
         .await;
         assert_eq!(rsp.status, 201);
@@ -4537,9 +4626,9 @@ mod tests {
         let patch_body =
             r#"[{"op":"replace","path":"/notifyCorrelationId","value":"corr-updated"}]"#;
         let upd = mbsmf_sbi_request_handler(
-            SbiRequest::patch(format!(
+            as_nf(SbiRequest::patch(format!(
                 "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/{sub_id}"
-            ))
+            )))
             .with_body(patch_body, "application/json-patch+json"),
         )
         .await;
@@ -4550,9 +4639,9 @@ mod tests {
 
         // PATCH on a random unknown ID → 404.
         let miss = mbsmf_sbi_request_handler(
-            SbiRequest::patch(
+            as_nf(SbiRequest::patch(
                 "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/00000000-0000-0000-0000-000000000000",
-            )
+            ))
             .with_body(patch_body, "application/json-patch+json"),
         )
         .await;
@@ -4565,8 +4654,10 @@ mod tests {
         mbsmf_context_init(256);
         let body = r#"{"subscription":{"nfcInstanceId":"smf-1","mbsSessionId":{"tmgi":{"mbsServiceId":"010203","plmnId":{"mcc":"001","mnc":"01"}}},"eventList":[{"eventType":"SESSION_RELEASE"}],"notifyUri":"http://smf:8080/ctx-notify"}}"#;
         let rsp = mbsmf_sbi_request_handler(
-            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions")
-                .with_body(body, "application/json"),
+            as_nf(SbiRequest::post(
+                "/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions",
+            ))
+            .with_body(body, "application/json"),
         )
         .await;
         assert_eq!(rsp.status, 201, "ContextStatus subscribe → 201");
@@ -4579,9 +4670,9 @@ mod tests {
         );
         let sub_id = loc.unwrap().rsplit('/').next().unwrap().to_string();
 
-        let del = mbsmf_sbi_request_handler(SbiRequest::delete(format!(
+        let del = mbsmf_sbi_request_handler(as_nf(SbiRequest::delete(format!(
             "/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions/{sub_id}"
-        )))
+        ))))
         .await;
         assert_eq!(del.status, 204, "ContextStatus unsubscribe → 204");
     }
@@ -4826,8 +4917,10 @@ mod tests {
             r#"{{"subscription":{{"eventList":[{{"eventType":"SESSION_RELEASE"}}],"notifyUri":"http://127.0.0.1:1/notify","notifyCorrelationId":"rel-corr-{session_id}"}}}}"#
         );
         let sub_rsp = mbsmf_sbi_request_handler(
-            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
-                .with_body(sub_body, "application/json"),
+            as_nf(SbiRequest::post(
+                "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions",
+            ))
+            .with_body(sub_body, "application/json"),
         )
         .await;
         assert_eq!(sub_rsp.status, 201);
@@ -4843,9 +4936,9 @@ mod tests {
         mbsmf_context_init(256);
 
         // POST with no body → 400.
-        let no_body = mbsmf_sbi_request_handler(SbiRequest::post(
+        let no_body = mbsmf_sbi_request_handler(as_nf(SbiRequest::post(
             "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions",
-        ))
+        )))
         .await;
         assert_eq!(no_body.status, 400);
 
@@ -5239,6 +5332,171 @@ mod tmgi_session_owner_tests_1863 {
             .unwrap()
             .session_find_by_id(pool_id)
             .is_none());
+    }
+}
+
+/// #1865: a Status or ContextStatus subscription is modified or cancelled only
+/// by the consumer that created it (TS 33.501 §13.4.1). Every request goes
+/// through `mbsmf_sbi_request_handler`, so the routing that hands the caller to
+/// each handler is covered as well as the check.
+#[cfg(test)]
+mod subscription_owner_tests_1865 {
+    use super::*;
+
+    const OWNER: &str = "aaaaaaaa-1865-4000-8000-0000000000b1";
+    const OTHER: &str = "bbbbbbbb-1865-4000-8000-0000000000b2";
+
+    fn with_identity(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
+        r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        r.oauth2_subject = token.map(str::to_string);
+        r
+    }
+
+    /// The callers that must not manage OWNER's subscription: a foreign
+    /// certificate, a foreign token, no identity at all, and OWNER's
+    /// certificate with a foreign token.
+    fn intruders() -> [(Option<&'static str>, Option<&'static str>); 4] {
+        [
+            (Some(OTHER), None),
+            (None, Some(OTHER)),
+            (None, None),
+            (Some(OWNER), Some(OTHER)),
+        ]
+    }
+
+    struct Kind {
+        collection: &'static str,
+        body: String,
+        owner_of: fn(&str) -> Option<Option<String>>,
+    }
+
+    fn status_kind(tag: &str) -> Kind {
+        Kind {
+            collection: "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions",
+            body: format!(
+                r#"{{"subscription":{{"eventList":[{{"eventType":"BROADCAST_DELIVERY_STATUS"}}],"notifyUri":"http://nef/{tag}","notifyCorrelationId":"orig"}}}}"#
+            ),
+            owner_of: |id| mbsmf_self().read().unwrap().status_sub_owner(id),
+        }
+    }
+
+    fn ctx_kind(tag: &str) -> Kind {
+        Kind {
+            collection: "/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions",
+            body: format!(
+                r#"{{"subscription":{{"nfcInstanceId":"smf-1","mbsSessionId":{{"tmgi":{{"mbsServiceId":"010203","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"eventList":[{{"eventType":"SESSION_RELEASE"}}],"notifyUri":"http://smf/{tag}","notifyCorrelationId":"orig"}}}}"#
+            ),
+            owner_of: |id| mbsmf_self().read().unwrap().ctx_sub_owner(id),
+        }
+    }
+
+    async fn create(kind: &Kind, cert: Option<&str>, token: Option<&str>) -> SbiResponse {
+        mbsmf_sbi_request_handler(with_identity(
+            SbiRequest::post(kind.collection).with_body(&kind.body, "application/json"),
+            cert,
+            token,
+        ))
+        .await
+    }
+
+    fn patch(kind: &Kind, id: &str, value: &str) -> SbiRequest {
+        SbiRequest::patch(format!("{}/{id}", kind.collection)).with_body(
+            format!(r#"[{{"op":"replace","path":"/notifyCorrelationId","value":"{value}"}}]"#),
+            "application/json-patch+json",
+        )
+    }
+
+    /// REVERT-VERIFIED: with the owner dropped at create (`owner: None` in the
+    /// SubEntry) the bound-owner assertion fails; with `refuse_sub_non_owner`
+    /// short-circuited to the 404 arm only, every intruder PATCH and DELETE
+    /// gets 200/204 and the 403 assertions fail; with the PATCH check removed
+    /// alone, or the DELETE check removed alone, the matching assertion fails.
+    async fn only_the_subscriber_manages(kind: Kind) {
+        mbsmf_context_init(256);
+        let rsp = create(&kind, Some(OWNER), None).await;
+        assert_eq!(rsp.status, 201, "{:?}", rsp.http.content);
+        let loc = rsp.http.get_header("location").cloned().unwrap();
+        let id = loc.rsplit('/').next().unwrap().to_string();
+        assert_eq!((kind.owner_of)(&id), Some(Some(OWNER.to_string())));
+
+        for (cert, token) in intruders() {
+            let r = mbsmf_sbi_request_handler(with_identity(
+                patch(&kind, &id, "hijacked"),
+                cert,
+                token,
+            ))
+            .await;
+            assert_eq!(r.status, 403, "PATCH by cert={cert:?} token={token:?}");
+            let r = mbsmf_sbi_request_handler(with_identity(
+                SbiRequest::delete(format!("{}/{id}", kind.collection)),
+                cert,
+                token,
+            ))
+            .await;
+            assert_eq!(r.status, 403, "DELETE by cert={cert:?} token={token:?}");
+            assert!((kind.owner_of)(&id).is_some(), "still stored");
+        }
+
+        // The owner, by token this time: the refused PATCHes changed nothing.
+        let r =
+            mbsmf_sbi_request_handler(with_identity(patch(&kind, &id, "owner"), None, Some(OWNER)))
+                .await;
+        assert_eq!(r.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["notifyCorrelationId"], "owner");
+        let r = mbsmf_sbi_request_handler(with_identity(
+            SbiRequest::delete(format!("{}/{id}", kind.collection)),
+            Some(&OWNER.to_uppercase()),
+            None,
+        ))
+        .await;
+        assert_eq!(r.status, 204);
+        assert_eq!((kind.owner_of)(&id), None);
+
+        // Unknown stays 404, for anyone.
+        let r = mbsmf_sbi_request_handler(with_identity(
+            SbiRequest::delete(format!("{}/{id}", kind.collection)),
+            Some(OTHER),
+            None,
+        ))
+        .await;
+        assert_eq!(r.status, 404);
+    }
+
+    #[tokio::test]
+    async fn only_the_subscriber_manages_a_status_subscription_1865() {
+        only_the_subscriber_manages(status_kind("own-status-1865")).await;
+    }
+
+    #[tokio::test]
+    async fn only_the_subscriber_manages_a_context_status_subscription_1865() {
+        only_the_subscriber_manages(ctx_kind("own-ctx-1865")).await;
+    }
+
+    /// REVERT-VERIFIED: with the create-side `owner_for_new_resource` replaced
+    /// by `Ok(None)`, the mismatched subscribe gets 201 and is stored.
+    #[tokio::test]
+    async fn a_subscriber_whose_identities_disagree_stores_nothing_1865() {
+        mbsmf_context_init(256);
+        for (kind, event) in [
+            (
+                status_kind("mixed-status-1865"),
+                "BROADCAST_DELIVERY_STATUS",
+            ),
+            (ctx_kind("mixed-ctx-1865"), "SESSION_RELEASE"),
+        ] {
+            let rsp = create(&kind, Some(OWNER), Some(OTHER)).await;
+            assert_eq!(rsp.status, 403);
+            let c = mbsmf_self();
+            let c = c.read().unwrap();
+            let stored = c
+                .status_subs_matching(event, &None)
+                .into_iter()
+                .chain(c.ctx_subs_matching(event, &None))
+                .any(|e| e.notify_uri.contains("mixed-"));
+            assert!(!stored, "nothing stored for a refused subscribe");
+        }
     }
 }
 

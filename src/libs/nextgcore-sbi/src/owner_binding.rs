@@ -21,6 +21,15 @@
 //!    ([`SbiRequest::oauth2_subject`], TS 29.510 `AccessTokenClaims.sub`, the
 //!    consumer's NF Instance ID), which survives an SCP hop (TS 33.501 §13.3).
 //!
+//! A relay is recognised only by the RFC 9310 NFTypes extension of its
+//! certificate. An SCP certificate without one counts as the consumer, so it
+//! disagrees with the consumer's token and the request is refused: this fails
+//! closed (R32 on #1936).
+//!
+//! A binding is to one NF instance. There is no NF-set or AMF-set awareness
+//! (TS 29.500 §6.5, TS 23.501 §5.21): a set member that takes over another's
+//! resources gets 403 until the resource is re-created (#1937).
+//!
 //! When both are present they must name the same NF instance. A caller whose
 //! certificate and token disagree is refused at create (nothing is stored) and
 //! at every later operation.
