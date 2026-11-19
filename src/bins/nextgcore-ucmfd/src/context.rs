@@ -1369,18 +1369,20 @@ impl Ucmf {
             ) else {
                 continue;
             };
+            let owner = s.get("owner").and_then(Value::as_str).map(str::to_string);
+            let expires = s
+                .get("expires")
+                .and_then(Value::as_str)
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Utc));
             self.subscriptions.insert(
                 sid.to_string(),
                 Subscription {
                     id: sid.to_string(),
                     nf_id: s.get("nfId").and_then(Value::as_str).map(str::to_string),
                     notification_uri: uri.to_string(),
-                    expires: s
-                        .get("expires")
-                        .and_then(Value::as_str)
-                        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t.with_timezone(&Utc)),
-                    owner: s.get("owner").and_then(Value::as_str).map(str::to_string),
+                    expires: restored_expiry(expires, owner.is_none(), Utc::now()),
+                    owner,
                 },
             );
         }
@@ -1411,6 +1413,25 @@ impl Ucmf {
             );
         }
     }
+}
+
+/// #1937: the expiry a restored subscription keeps. An ownerless one (written
+/// before #1862) is frozen under the production profile, so nobody can
+/// unsubscribe it; it must not outlive the UCMF's own maximum either. It is
+/// capped at [`MAX_SUBSCRIPTION_LIFETIME_SECS`] from the restart, whatever
+/// (or however absent) its stored expiry, after which it lapses and its
+/// consumer re-subscribes, bound. An owned subscription keeps its expiry: its
+/// owner can still manage it.
+fn restored_expiry(
+    stored: Option<DateTime<Utc>>,
+    ownerless: bool,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if !ownerless {
+        return stored;
+    }
+    let cap = now + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
+    Some(stored.map_or(cap, |t| t.min(cap)))
 }
 
 /// The authority (`host[:port]`) of a notification URI.
@@ -1540,6 +1561,42 @@ mod tests {
         let mut restored = Ucmf::new(0x05, ModeOfOperation::B);
         restored.restore(&old);
         assert_eq!(restored.subscription(&sub.id).unwrap().owner, None);
+    }
+
+    /// #1937: a restored ownerless subscription lapses within the UCMF's
+    /// maximum lifetime of the restart, whether its stored expiry was far away
+    /// or absent; an owned one keeps its stored expiry.
+    ///
+    /// REVERT-VERIFIED: with `restored_expiry` returning `stored` unchanged,
+    /// the ownerless 30-day subscription keeps its expiry and the first
+    /// assertion fails.
+    #[test]
+    fn a_restored_ownerless_subscription_lapses_within_the_maximum_1937() {
+        let far = Utc::now() + ChronoDuration::days(30);
+        let doc = serde_json::json!({
+            "subscriptions": [
+                {"id": "ownerless-far", "uri": "http://amf/cb", "expires": far.to_rfc3339()},
+                {"id": "ownerless-none", "uri": "http://amf/cb"},
+                {"id": "owned-far", "uri": "http://amf/cb", "expires": far.to_rfc3339(),
+                 "owner": "aaaaaaaa-1937-4000-8000-00000000000a"},
+            ]
+        });
+        let mut u = Ucmf::new(0x05, ModeOfOperation::B);
+        let before = Utc::now();
+        u.restore(&doc);
+        let limit = Utc::now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
+        for id in ["ownerless-far", "ownerless-none"] {
+            let expires = u.subscription(id).unwrap().expires.expect("an expiry");
+            assert!(
+                expires <= limit && expires > before,
+                "{id}: lapses within the maximum ({expires})"
+            );
+        }
+        let owned = u.subscription("owned-far").unwrap().expires.unwrap();
+        assert!(
+            (owned - far).num_seconds().abs() <= 1,
+            "an owned subscription keeps its stored expiry"
+        );
     }
 
     /// #1916: a provisioning's verified owner survives a restart and a replace,
