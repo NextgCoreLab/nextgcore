@@ -422,6 +422,10 @@ jobs:
           # parses it and checks nrfd admits the AMF's guamiList.
           grep -q 'nf_set_id: set001.region02.amfset.5gc.mnc070.mcc999' "$RUNNER_TEMP/prod.yaml" \
             || { echo "no derived nf_set_allowlist entry for the AMF (#2052)"; exit 1; }
+          # The NSSF's dev-only OAuth2 opt-out is not rendered under production.
+          if grep -q 'require: false' "$RUNNER_TEMP/prod.yaml"; then
+            echo "production profile renders an oauth2 opt-out (#2052)"; exit 1
+          fi
       - name: helm template refuses an nrf.nfSetAllowlist without the chart's AMF (#2052)
         run: |
           refuse() {
