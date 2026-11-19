@@ -1823,6 +1823,16 @@ fn complete_ue_detach(ctx: &MmeContext, pending: crate::gtp_path::PendingDetach)
             }
         }
     }
+    // #1911: the S1 release is marked BEFORE the UE context goes, so no reader
+    // sees a detached UE whose S1 connection is not being released. The detach
+    // completes on the GTP thread; in the other order a reader on another thread
+    // (and a test polling for the removal) saw `ue_ctx_rel_action` still `Invalid`
+    // between the two steps. The command itself still follows the removal, so its
+    // UE CONTEXT RELEASE COMPLETE never finds the context still attached and
+    // takes the UE for ECM-IDLE.
+    if let Some(enb_ue) = &enb_ue {
+        mark_ue_context_release(ctx, enb_ue.id, nas_cause::DETACH);
+    }
     // Also drops whatever Delete Session records of this detach remain.
     ctx.mme_ue_remove(pending.mme_ue_id);
     if let Some(enb_ue) = enb_ue {
@@ -1927,11 +1937,7 @@ pub(crate) fn release_ue_context(ctx: &MmeContext, enb_ue: &EnbUe) {
 /// caller holds an `mme_ue_pool` guard: no path holds `enb_ue_pool` while
 /// waiting on `mme_ue_pool`.
 pub(crate) fn release_ue_context_with_cause(ctx: &MmeContext, enb_ue: &EnbUe, cause: i64) {
-    if let Some(stored) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue.id) {
-        stored.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
-        stored.relcause.group = S1apCauseGroup::Nas;
-        stored.relcause.cause = cause;
-    }
+    mark_ue_context_release(ctx, enb_ue.id, cause);
 
     match s1ap_build::build_ue_context_release_command(
         Some(enb_ue.enb_ue_s1ap_id),
@@ -1943,6 +1949,17 @@ pub(crate) fn release_ue_context_with_cause(ctx: &MmeContext, enb_ue: &EnbUe, ca
             s1ap_path::s1ap_send_pdu(enb_ue.enb_id, pdu);
         }
         Err(e) => log::error!("Failed to build UE Context Release Command: {e}"),
+    }
+}
+
+/// Record on the S1 connection that its release removes the UE context, with
+/// the S1AP NAS `cause`, without sending anything. Idempotent. Takes only the
+/// `enb_ue_pool` lock, briefly.
+fn mark_ue_context_release(ctx: &MmeContext, enb_ue_id: u64, cause: i64) {
+    if let Some(stored) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
+        stored.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
+        stored.relcause.group = S1apCauseGroup::Nas;
+        stored.relcause.cause = cause;
     }
 }
 
