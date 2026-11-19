@@ -159,6 +159,20 @@ struct Args {
     /// `production` SBI profile (#1848).
     #[arg(long)]
     allow_insecure_no_tls: bool,
+
+    /// A target NF inside this PLMN that a reconstructed N32-f request may be
+    /// forwarded to under the production SBI profile, besides hosts under the
+    /// serving PLMNs' 5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org domains (#1870):
+    /// `host`, `host:port`, `[v6]:port`, or `.domain` for every host under it.
+    /// Repeatable. Every target must also be https.
+    #[arg(long = "n32f-target-allow")]
+    n32f_target_allow: Vec<String>,
+
+    /// The SBI port a home-domain host, a bare `--n32f-target-allow` host or a
+    /// `.domain` entry is admitted on (#1870). Repeatable; default 443. A
+    /// `host:port` entry names its own port.
+    #[arg(long = "n32f-target-port")]
+    n32f_target_port: Vec<u16>,
 }
 
 /// #1848: the SEPP's lab/test flags weaken N32 below what TS 33.501 requires,
@@ -201,8 +215,8 @@ fn refuse_lab_flags_under_production(
 }
 
 /// #1848: the client TLS every peer SEPP is dialled with. Under the
-/// `production` SBI profile, with any `--peer-sepp`:
-/// - each peer apiRoot must be `https`: N32-c is mutually authenticated TLS
+/// `production` SBI profile:
+/// - each `--peer-sepp` apiRoot must be `https`: N32-c is mutually authenticated TLS
 ///   between the SEPPs (TS 33.501 §13.1, §13.2.2.2), so an `http` peer is a
 ///   startup error rather than a cleartext N32;
 /// - the SEPP presents its own client certificate, `--n32-client-cert` /
@@ -213,14 +227,16 @@ fn refuse_lab_flags_under_production(
 /// - each of those files must exist, named when one does not.
 ///
 /// `Ok(Some)` is the TLS to dial with (whatever `--tls` says, which governs the
-/// listener). `Ok(None)` under `dev` or with no peer: as before.
+/// listener). `Ok(None)` under `dev`: as before. #1870: this applies with no
+/// `--peer-sepp` too, because a receiving SEPP dials its peers for the N32-f
+/// error report, and that call uses the same TLS (`set_n32_client_tls`).
 fn n32_peer_client_tls(
     profile: nextgcore_sbi::security::SbiProfile,
     peers: &[String],
     given: &n32_server::N32TlsConfig,
     defaults: &nextgcore_sbi::security::TlsPaths,
 ) -> Result<Option<n32_server::N32TlsConfig>, String> {
-    if !profile.is_production() || peers.is_empty() {
+    if !profile.is_production() {
         return Ok(None);
     }
     for peer in peers {
@@ -429,6 +445,54 @@ async fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     let peer_tls_opt = peer_tls.as_ref().or(n32_tls_opt);
+    // #1870 (R26 on #1881): the n32f-error report and the SBI-side forward dial
+    // the peer SEPP with the same TLS as the N32-c handshake: under production
+    // this SEPP's own certificate and a configured CA (#1881's
+    // `n32_peer_client_tls`, which now applies whether or not a --peer-sepp is
+    // given, because a receiving SEPP dials its peers too), else the --tls flags.
+    n32_server::set_n32_client_tls(peer_tls_opt.cloned());
+
+    // #1870: where a peer-supplied N32-f target may point, and over what.
+    let home_domains: Vec<String> = sepp_self()
+        .read()
+        .map(|c| {
+            c.serving_plmn_ids
+                .iter()
+                .map(n32_server::home_network_domain)
+                .collect()
+        })
+        .unwrap_or_default();
+    let forward_policy = n32_server::N32fForwardPolicy::new(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        home_domains,
+        args.n32f_target_allow.clone(),
+    )
+    .with_allowed_ports(args.n32f_target_port.clone());
+    forward_policy
+        .check_files()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if forward_policy.profile.is_production() {
+        log::info!(
+            "N32-f forwarding: production SBI profile, https targets only, under {:?} or in \
+             --n32f-target-allow {:?}; CA={} client certificate={}",
+            forward_policy.home_domains,
+            forward_policy.allowed_targets,
+            forward_policy.tls.ca_cert,
+            forward_policy.tls.client_cert.as_deref().unwrap_or("NONE"),
+        );
+        if forward_policy.home_domains.is_empty() && forward_policy.allowed_targets.is_empty() {
+            log::warn!(
+                "N32-f forwarding: no --serving-plmn and no --n32f-target-allow, so every \
+                 reconstructed N32-f request will be refused"
+            );
+        }
+    } else {
+        log::warn!(
+            "N32-f forwarding: dev SBI profile, any peer-supplied target is dialled over its \
+             own scheme"
+        );
+    }
+    n32_server::set_n32f_forward_policy(forward_policy);
 
     // Start the consumer-facing SBI server (C8): home-PLMN NFs send outbound
     // roaming requests here; the handler runs the forwarding pipeline through
@@ -640,6 +704,25 @@ mod lab_flag_tests_1848 {
             client_key: Some(file("profile-client.key")),
         };
         (dir, paths)
+    }
+
+    /// #1870: with no `--peer-sepp` (a receiving SEPP), production still
+    /// yields the SEPP's own client certificate and the profile CA, which the
+    /// n32f-error report and the SBI-side forward are dialled with.
+    #[test]
+    fn production_peer_tls_applies_without_a_configured_peer_1870() {
+        let (dir, paths) = files();
+        let tls = n32_peer_client_tls(SbiProfile::Production, &[], &Default::default(), &paths)
+            .expect("files exist")
+            .expect("production always has peer TLS");
+        assert_eq!(tls.client_cert, paths.client_cert);
+        assert_eq!(tls.ca_cert.as_deref(), Some(paths.ca_cert.as_str()));
+        assert!(
+            n32_peer_client_tls(SbiProfile::Dev, &[], &Default::default(), &paths)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// REVERT-VERIFIED: with the scheme check removed, an `http` peer is

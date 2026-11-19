@@ -217,6 +217,12 @@ pub struct NssfSubscription {
     pub accepted_events: Vec<String>,
     pub amf_id: Option<String>,
     pub amf_set_id: Option<String>,
+    /// #1909: the verified NF Instance ID of the consumer that created the
+    /// subscription (`nextgcore_sbi::owner_binding`), the only one that may
+    /// modify or remove it. Persisted; a snapshot written before #1909 restores
+    /// it `None`, which the production profile freezes until the NSSF-assigned
+    /// expiry sweeps it.
+    pub owner: Option<String>,
 }
 
 impl NssfSubscription {
@@ -277,6 +283,9 @@ impl NssfSubscription {
         if let Some(ref a) = self.amf_set_id {
             obj.insert("amfSetId".into(), serde_json::json!(a));
         }
+        if let Some(ref o) = self.owner {
+            obj.insert("owner".into(), serde_json::json!(o));
+        }
         v
     }
 
@@ -300,6 +309,7 @@ impl NssfSubscription {
             accepted_events: Vec::new(),
             amf_id: str_at("amfId"),
             amf_set_id: str_at("amfSetId"),
+            owner: str_at("owner"),
         })
     }
 }
@@ -1330,6 +1340,36 @@ mod tests {
         );
     }
 
+    /// #1909: the subscription's verified owner survives a restart, and a
+    /// snapshot written before #1909 restores it ownerless.
+    /// REVERT-VERIFIED: with `owner` dropped from `to_persist_json` the first
+    /// assertion fails.
+    #[test]
+    fn the_subscription_owner_is_persisted_1909() {
+        let sub = NssfSubscription {
+            subscription_id: "sub-1909".to_string(),
+            nf_nssai_availability_uri: "http://127.0.0.1:9/cb".to_string(),
+            tai_list: Vec::new(),
+            event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
+            expiry: None,
+            accepted_events: Vec::new(),
+            amf_id: None,
+            amf_set_id: None,
+            owner: Some("aaaaaaaa-1909-4000-8000-0000000000a1".to_string()),
+        };
+        let doc = sub.to_persist_json();
+        assert_eq!(
+            NssfSubscription::from_persist_json(&doc).and_then(|s| s.owner),
+            sub.owner
+        );
+        let mut old = doc;
+        old.as_object_mut().unwrap().remove("owner");
+        assert_eq!(
+            NssfSubscription::from_persist_json(&old).unwrap().owner,
+            None
+        );
+    }
+
     #[test]
     fn test_subscription_store() {
         let mut ctx = NssfContext::new();
@@ -1348,6 +1388,7 @@ mod tests {
             accepted_events: Vec::new(),
             amf_id: None,
             amf_set_id: None,
+            owner: None,
         };
         ctx.subscription_add(sub);
         assert_eq!(ctx.subscription_count(), 1);
@@ -1408,6 +1449,7 @@ mod tests {
                 accepted_events: Vec::new(),
                 amf_id: Some("amf-1".to_string()),
                 amf_set_id: None,
+                owner: None,
             });
             ctx.set_nssai_availability(
                 "amf-1",
@@ -1461,6 +1503,7 @@ mod tests {
                 accepted_events: Vec::new(),
                 amf_id: None,
                 amf_set_id: None,
+                owner: None,
             });
             assert!(ctx.subscription_remove("sub-x"));
         }
@@ -1488,6 +1531,7 @@ mod tests {
             accepted_events: Vec::new(),
             amf_id: None,
             amf_set_id: None,
+            owner: None,
         });
         ctx.persist(); // no-op without a path
         assert!(ctx.state_path.is_none());

@@ -825,9 +825,9 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["nnwdaf-eventssubscription", "v1", "subscriptions", subscription_id] => match method {
-            "GET" => handle_subscription_get(subscription_id).await,
+            "GET" => handle_subscription_get(subscription_id, &request).await,
             "PUT" => handle_subscription_update(subscription_id, &request).await,
-            "DELETE" => handle_subscription_delete(subscription_id).await,
+            "DELETE" => handle_subscription_delete(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
@@ -855,7 +855,7 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["nnwdaf-mlmodelprovision", "v1", "subscriptions", subscription_id] => match method {
             "PUT" => handle_ml_prov_subscription_update(subscription_id, &request).await,
-            "DELETE" => handle_ml_prov_subscription_delete(subscription_id).await,
+            "DELETE" => handle_ml_prov_subscription_delete(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
@@ -2116,12 +2116,14 @@ mod tests {
     #[tokio::test]
     async fn test_routing_mlmodelprovision_subscriptions_post_routed() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
-        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+        let mut req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
             .with_json_body(&serde_json::json!({
                 "notifUri": "http://anlf.local/cb",
                 "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
             }))
             .expect("valid JSON body");
+        // #1865: a verified consumer, so the create passes under either profile.
+        req.oauth2_subject = Some("c0c0c0c0-1865-4000-8000-0000000000c0".into());
         let resp = nwdaf_sbi_request_handler(req).await;
         assert_eq!(
             resp.status, 201,

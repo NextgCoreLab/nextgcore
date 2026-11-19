@@ -179,6 +179,26 @@ pub enum UpdateError {
 }
 
 /// EES Context - main context structure.
+/// #1865: the EES resource families a consumer creates and then manages, each
+/// bound to its creator (`EesContext::owners`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Owned {
+    /// `eees-easregistration` registrations (EDGE-3).
+    EasRegistration,
+    /// `eees-eecregistration` registrations (EDGE-1).
+    EecRegistration,
+    /// `eees-easdiscovery` subscriptions.
+    DiscoverySubscription,
+    /// `eees-appclientinformation` subscriptions.
+    AcInfoSubscription,
+    /// `eees-acrmgntevent` subscriptions.
+    AcrMgntSubscription,
+    /// `eees-acrevents` subscriptions.
+    AcrEventsSubscription,
+    /// `eees-eel-acr` ACT status subscriptions.
+    ActStatusSubscription,
+}
+
 pub struct EesContext {
     /// Stored EAS registrations, keyed by the server-minted `registrationId`.
     registrations: RwLock<HashMap<String, EasRegistration>>,
@@ -215,6 +235,13 @@ pub struct EesContext {
     /// `ACTStatusSubsc` body carries no id member, so the key lives only here and
     /// in the `Location` header.
     act_status_subscriptions: RwLock<HashMap<String, ACTStatusSubsc>>,
+    /// #1865: the verified consumer that created each resource above, the only
+    /// one that may modify or delete it (`nextgcore_sbi::owner_binding`). Kept
+    /// beside the stores rather than in the resource bodies, which are the
+    /// spec wire types (`PartialEq`, serialised as is). One entry per LIVE
+    /// owned resource: every removal path forgets it, so it is bounded by the
+    /// stores' own caps. A resource with no entry is ownerless.
+    owners: RwLock<HashMap<(Owned, String), String>>,
     /// Maximum registrations (applied per resource family).
     max_eas: usize,
     /// Context initialized flag.
@@ -235,6 +262,7 @@ impl EesContext {
             acrevents_subscriptions: RwLock::new(HashMap::new()),
             eec_contexts: RwLock::new(HashMap::new()),
             act_status_subscriptions: RwLock::new(HashMap::new()),
+            owners: RwLock::new(HashMap::new()),
             max_eas: 0,
             initialized: AtomicBool::new(false),
         }
@@ -286,12 +314,73 @@ impl EesContext {
         if let Ok(mut subs) = self.act_status_subscriptions.write() {
             subs.clear();
         }
+        if let Ok(mut owners) = self.owners.write() {
+            owners.clear();
+        }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("EES context finalized");
     }
 
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::SeqCst)
+    }
+
+    /// #1865: record the verified consumer that created `kind`/`id`. `None`
+    /// (no verified identity) records nothing: the resource is ownerless.
+    pub fn set_owner(&self, kind: Owned, id: &str, owner: Option<String>) {
+        if let (Some(owner), Ok(mut owners)) = (owner, self.owners.write()) {
+            owners.insert((kind, id.to_string()), owner);
+        }
+    }
+
+    /// #1865: the verified consumer that created `kind`/`id`, if any.
+    pub fn owner_of(&self, kind: Owned, id: &str) -> Option<String> {
+        self.owners
+            .read()
+            .ok()?
+            .get(&(kind, id.to_string()))
+            .cloned()
+    }
+
+    /// #1865 tests: how many `kind` resources are stored.
+    #[cfg(test)]
+    pub fn resource_count(&self, kind: Owned) -> usize {
+        fn len<T>(m: &RwLock<HashMap<String, T>>) -> usize {
+            m.read().map(|m| m.len()).unwrap_or(0)
+        }
+        match kind {
+            Owned::EasRegistration => len(&self.registrations),
+            Owned::EecRegistration => len(&self.eec_registrations),
+            Owned::DiscoverySubscription => len(&self.disc_subscriptions),
+            Owned::AcInfoSubscription => len(&self.app_client_infos),
+            Owned::AcrMgntSubscription => len(&self.acr_mgnt_subscriptions),
+            Owned::AcrEventsSubscription => len(&self.acrevents_subscriptions),
+            Owned::ActStatusSubscription => len(&self.act_status_subscriptions),
+        }
+    }
+
+    /// #1865 tests: the stored `kind`/`id` as JSON, to prove a refusal changed
+    /// nothing.
+    #[cfg(test)]
+    pub fn resource_snapshot(&self, kind: Owned, id: &str) -> Option<serde_json::Value> {
+        fn json<T: serde::Serialize>(v: Option<T>) -> Option<serde_json::Value> {
+            v.and_then(|v| serde_json::to_value(v).ok())
+        }
+        match kind {
+            Owned::EasRegistration => json(self.eas_find(id)),
+            Owned::EecRegistration => json(self.eec_find(id)),
+            Owned::DiscoverySubscription => json(self.disc_sub_find(id)),
+            Owned::AcInfoSubscription => json(self.acinfo_find(id)),
+            Owned::AcrMgntSubscription => json(self.acrmgnt_sub_find(id)),
+            Owned::AcrEventsSubscription => json(self.acrevents_find(id)),
+            Owned::ActStatusSubscription => json(self.act_status_sub_find(id)),
+        }
+    }
+
+    fn forget_owner(&self, kind: Owned, id: &str) {
+        if let Ok(mut owners) = self.owners.write() {
+            owners.remove(&(kind, id.to_string()));
+        }
     }
 
     /// Register an Edge Application Server.
@@ -335,6 +424,7 @@ impl EesContext {
                 index.remove(&removed.eas_prof.eas_id);
             }
         }
+        self.forget_owner(Owned::EasRegistration, registration_id);
         log::info!("EAS deregistered: registrationId={registration_id}");
         Some(removed)
     }
@@ -557,6 +647,7 @@ impl EesContext {
     pub fn eec_deregister(&self, registration_id: &str) -> Option<EecRegistration> {
         let removed = self.eec_registrations.write().ok()?.remove(registration_id);
         if removed.is_some() {
+            self.forget_owner(Owned::EecRegistration, registration_id);
             log::info!("EEC deregistered: registrationId={registration_id}");
         }
         removed
@@ -641,10 +732,15 @@ impl EesContext {
     }
 
     pub fn disc_sub_delete(&self, subscription_id: &str) -> Option<EasDiscoverySubscription> {
-        self.disc_subscriptions
+        let removed = self
+            .disc_subscriptions
             .write()
             .ok()?
-            .remove(subscription_id)
+            .remove(subscription_id);
+        if removed.is_some() {
+            self.forget_owner(Owned::DiscoverySubscription, subscription_id);
+        }
+        removed
     }
 
     pub fn disc_sub_update(
@@ -728,6 +824,7 @@ impl EesContext {
                 .collect();
             for id in expired {
                 if let Some(r) = regs.remove(&id) {
+                    self.forget_owner(Owned::EasRegistration, &id);
                     if let Some(ids) = index.get_mut(&r.eas_prof.eas_id) {
                         ids.retain(|x| x != &id);
                         if ids.is_empty() {
@@ -747,6 +844,7 @@ impl EesContext {
                 .collect();
             for id in expired {
                 eecs.remove(&id);
+                self.forget_owner(Owned::EecRegistration, &id);
                 removed += 1;
             }
         }
@@ -760,6 +858,7 @@ impl EesContext {
                 .collect();
             for id in expired {
                 subs.remove(&id);
+                self.forget_owner(Owned::AcrEventsSubscription, &id);
                 removed += 1;
             }
         }
@@ -1022,6 +1121,7 @@ impl EesContext {
     pub fn acinfo_delete(&self, subscription_id: &str) -> Option<ACInfoSubscription> {
         let removed = self.app_client_infos.write().ok()?.remove(subscription_id);
         if removed.is_some() {
+            self.forget_owner(Owned::AcInfoSubscription, subscription_id);
             log::info!("ACInfoSubscription deleted: subscriptionId={subscription_id}");
         }
         removed
@@ -1122,6 +1222,7 @@ impl EesContext {
             .ok()?
             .remove(subscription_id);
         if removed.is_some() {
+            self.forget_owner(Owned::AcrEventsSubscription, subscription_id);
             log::info!("ACREventsSubscription deleted: subscriptionId={subscription_id}");
         }
         removed
@@ -1377,6 +1478,7 @@ impl EesContext {
             .ok()?
             .remove(subscription_id);
         if removed.is_some() {
+            self.forget_owner(Owned::AcrMgntSubscription, subscription_id);
             log::info!(
                 "ACR management event subscription deleted: subscriptionId={subscription_id}"
             );

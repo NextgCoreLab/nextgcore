@@ -116,7 +116,7 @@ async fn a_connected_ues_lpp_and_nrppa_are_relayed() {
     let (ue, ran, supi) = (7_108_701u64, 87, "imsi-001010010870001");
     live_ue(&mut server, ue, ran, supi);
 
-    let resp = crate::namf_request_handler(positioning_transfer(supi)).await;
+    let resp = crate::namf_server::test_namf_request_handler(positioning_transfer(supi)).await;
     assert_eq!(resp.status, 200, "{}", cause_of(&resp));
     assert_eq!(cause_of(&resp), "N1_N2_TRANSFER_INITIATED");
     server.process_positioning_downlinks().await;
@@ -135,7 +135,7 @@ async fn a_connected_ue_is_reachable_for_namf_mt() {
         nextgcore_sbi::SbiRequest::post(format!("/namf-mt/v1/ue-contexts/{supi}/ue-reachind"))
             .with_json_body(&serde_json::json!({ "reachability": "REACHABLE" }))
             .expect("json");
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", cause_of(&resp));
     server.forget_ue(ue);
 }
@@ -155,7 +155,7 @@ async fn a_cm_idle_ues_positioning_transfer_pages_it_and_waits() {
     let (ue, ran, supi) = (7_108_703u64, 89, "imsi-001010010870003");
     idle_ue(&mut server, ue, ran, supi);
 
-    let resp = crate::namf_request_handler(positioning_transfer(supi)).await;
+    let resp = crate::namf_server::test_namf_request_handler(positioning_transfer(supi)).await;
     assert_eq!(resp.status, 202, "{}", cause_of(&resp));
     assert_eq!(cause_of(&resp), "ATTEMPTING_TO_REACH_UE");
     let paged = crate::context::amf_self()
@@ -195,7 +195,7 @@ async fn an_unpageable_idle_ue_is_not_reachable() {
     let (ue, ran, supi) = (7_108_704u64, 90, "imsi-001010010870004");
     idle_ue(&mut server, ue, ran, supi);
     server.ue_auth_state.with_mut(ue, |s| s.registered = false);
-    let resp = crate::namf_request_handler(positioning_transfer(supi)).await;
+    let resp = crate::namf_server::test_namf_request_handler(positioning_transfer(supi)).await;
     // An unregistered UE may not be resolvable by SUPI at all (404); either way it
     // is never relayed to.
     assert!(
@@ -216,7 +216,7 @@ async fn a_downlink_for_a_ue_that_went_idle_is_not_sent_to_its_old_connection() 
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_108_705u64, 91, "imsi-001010010870005");
     live_ue(&mut server, ue, ran, supi);
-    let resp = crate::namf_request_handler(positioning_transfer(supi)).await;
+    let resp = crate::namf_server::test_namf_request_handler(positioning_transfer(supi)).await;
     assert_eq!(resp.status, 200);
     // The AN release lands before the pump runs.
     server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
@@ -256,7 +256,7 @@ async fn a_connected_ues_immediate_reports_say_reachable_and_connected() {
             }
         }))
         .expect("json");
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 201, "{}", json_of(&resp));
     let body = json_of(&resp);
     let reports = body["reportList"].as_array().cloned().unwrap_or_default();
@@ -284,13 +284,13 @@ async fn a_connected_ues_location_and_domain_selection_info_say_it_is_attached()
         .with_mut(ue, |s| s.amf_ue.ue_location_timestamp = 1_700_000_000);
 
     let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     assert_eq!(json_of(&resp)["ratType"], "NR");
 
     let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
         .with_param("info-class", "TADS");
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     assert!(
         json_of(&resp).get("lastActTime").is_some(),
@@ -321,7 +321,7 @@ async fn an_unhandled_n1_class_for_a_connected_ue_is_not_refused_unreachable() {
                 "application/vnd.3gpp.sms",
                 bytes::Bytes::from_static(&[0x01]),
             ));
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     server.forget_ue(ue);
 }
@@ -345,7 +345,7 @@ async fn an_unbound_ue_context_is_not_connected() {
         .ue_auth_state
         .insert(ue, UeNasContext::published(amf_ue, 0, 0));
 
-    let resp = crate::namf_request_handler(positioning_transfer(supi)).await;
+    let resp = crate::namf_server::test_namf_request_handler(positioning_transfer(supi)).await;
     assert_eq!(resp.status, 504, "{}", cause_of(&resp));
     server.process_positioning_downlinks().await;
     assert!(
@@ -435,7 +435,7 @@ async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acq
     );
 
     let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     let body = json_of(&resp);
     assert_eq!(
@@ -455,7 +455,7 @@ async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acq
 
     let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
         .with_param("info-class", "TADS");
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     assert_eq!(rfc3339_secs(&json_of(&resp)["lastActTime"]), stamp);
 
@@ -471,7 +471,7 @@ async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acq
             }
         }))
         .expect("json");
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 201, "{}", json_of(&resp));
     let body = json_of(&resp);
     let report = body["reportList"]
@@ -498,7 +498,7 @@ async fn an_unstamped_location_omits_its_timestamp() {
     live_ue(&mut server, ue, ran, supi);
 
     let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     let body = json_of(&resp);
     assert!(body["location"]["nrLocation"].is_object(), "{body}");
@@ -512,7 +512,7 @@ async fn an_unstamped_location_omits_its_timestamp() {
 
     let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
         .with_param("info-class", "TADS");
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert!(
         json_of(&resp).get("lastActTime").is_none(),
         "{}",
@@ -540,7 +540,7 @@ async fn a_corrupt_location_stamp_is_omitted_and_never_panics() {
             .with_mut(ue, |s| s.amf_ue.ue_location_timestamp = corrupt);
 
         let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
-        let resp = crate::namf_request_handler(req).await;
+        let resp = crate::namf_server::test_namf_request_handler(req).await;
         assert_eq!(resp.status, 200, "{corrupt}: {}", json_of(&resp));
         let body = json_of(&resp);
         assert!(
@@ -553,7 +553,7 @@ async fn a_corrupt_location_stamp_is_omitted_and_never_panics() {
 
         let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
             .with_param("info-class", "TADS");
-        let resp = crate::namf_request_handler(req).await;
+        let resp = crate::namf_server::test_namf_request_handler(req).await;
         assert_eq!(resp.status, 200, "{corrupt}");
         assert!(json_of(&resp).get("lastActTime").is_none(), "{corrupt}");
 
@@ -568,7 +568,7 @@ async fn a_corrupt_location_stamp_is_omitted_and_never_panics() {
                 }
             }))
             .expect("json");
-        let resp = crate::namf_request_handler(req).await;
+        let resp = crate::namf_server::test_namf_request_handler(req).await;
         assert_eq!(resp.status, 201, "{corrupt}: {}", json_of(&resp));
         let body = json_of(&resp);
         let report = body["reportList"]
@@ -591,7 +591,7 @@ async fn a_corrupt_location_stamp_is_omitted_and_never_panics() {
 async fn delete_subscription(answer: &serde_json::Value) {
     let id = answer["subscriptionId"].as_str().expect("subscriptionId");
     let req = nextgcore_sbi::SbiRequest::delete(format!("/namf-evts/v1/subscriptions/{id}"));
-    let resp = crate::namf_request_handler(req).await;
+    let resp = crate::namf_server::test_namf_request_handler(req).await;
     assert_eq!(resp.status, 204, "{}", json_of(&resp));
 }
 
@@ -661,8 +661,11 @@ async fn a_positioning_transfer_joining_a_location_page_is_told_it_failed_1837()
     let lmf = format!("http://127.0.0.1:{port}/lmf-fail-1837");
     let mut locations = Vec::new();
     for _ in 0..2 {
-        let resp =
-            crate::namf_request_handler(positioning_transfer_notifying(supi, Some(&lmf))).await;
+        let resp = crate::namf_server::test_namf_request_handler(positioning_transfer_notifying(
+            supi,
+            Some(&lmf),
+        ))
+        .await;
         assert_eq!(resp.status, 202, "{}", cause_of(&resp));
         assert_eq!(cause_of(&resp), "ATTEMPTING_TO_REACH_UE");
         locations.push(
@@ -743,7 +746,11 @@ async fn a_failed_page_notifies_every_transfer_it_holds_at_its_own_uri_1837() {
         .paging_add(sm_page));
 
     let lmf = format!("http://127.0.0.1:{lmf_port}/lmf-fail-1837");
-    let resp = crate::namf_request_handler(positioning_transfer_notifying(supi, Some(&lmf))).await;
+    let resp = crate::namf_server::test_namf_request_handler(positioning_transfer_notifying(
+        supi,
+        Some(&lmf),
+    ))
+    .await;
     assert_eq!(resp.status, 202, "{}", cause_of(&resp));
     let lmf_location = resp
         .http

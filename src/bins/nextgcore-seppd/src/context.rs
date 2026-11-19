@@ -597,8 +597,9 @@ pub fn sepp_self() -> Arc<RwLock<SeppContext>> {
 
 /// Initialize the global SEPP context
 /// Serializes every test that touches this crate's process-global state: the SEPP
-/// context (`sender`, the peer/node list), the N32-c TLS exporter-secret store, and
-/// the `allow_insecure_no_tls` flag.
+/// context (`sender`, the peer/node list), the N32-c TLS exporter-secret store, the
+/// `allow_insecure_no_tls` flag, and the telescopic-FQDN mapping store
+/// (`telescopic::MAPPINGS`, #1870).
 ///
 /// ONE lock for all of it, across modules, on purpose. #100 first added a
 /// per-module lock in `n32c_handler` and another in `n32_server`, and they still

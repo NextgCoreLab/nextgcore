@@ -2528,7 +2528,11 @@ mod tests {
                 json!({ "pdn": { "eventType": "PDN_CONNECTIVITY_STATUS" } }),
             ),
         ] {
-            let resp = crate::app::handle_ee_subscribe(supi, &subscribe(uri, configs)).await;
+            let resp = crate::app::handle_ee_subscribe(
+                supi,
+                &crate::app::as_test_consumer(&subscribe(uri, configs)),
+            )
+            .await;
             assert_eq!(resp.status, 201);
             let body: Value =
                 serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
@@ -2614,7 +2618,7 @@ mod tests {
             .to_string(),
         );
         assert_eq!(
-            crate::app::handle_ee_modify(supi, &ids[0], &req)
+            crate::app::handle_ee_modify(supi, &ids[0], &crate::app::as_test_consumer(&req))
                 .await
                 .status,
             204
@@ -2666,7 +2670,9 @@ mod tests {
             .to_string(),
         );
         assert_eq!(
-            crate::app::handle_ee_subscribe(supi, &req).await.status,
+            crate::app::handle_ee_subscribe(supi, &crate::app::as_test_consumer(&req))
+                .await
+                .status,
             400
         );
 
@@ -2677,7 +2683,7 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = crate::app::handle_ee_subscribe(supi, &req).await;
+        let resp = crate::app::handle_ee_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
         assert_eq!(resp.status, 201);
         let body: Value =
             serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
@@ -2715,7 +2721,9 @@ mod tests {
                 "/nudm-ee/v1/{supi}/ee-subscriptions/{id}"
             ));
             patch.http.content = Some(ops.to_string());
-            let resp = crate::app::handle_ee_modify(supi, &id, &patch).await;
+            let resp =
+                crate::app::handle_ee_modify(supi, &id, &crate::app::as_test_consumer(&patch))
+                    .await;
             assert_eq!(resp.status, 400, "{label}");
             assert!(
                 resp.http
