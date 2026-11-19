@@ -401,8 +401,15 @@ fn udr_oauth2_listener(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerCo
     // a UDM (UDR_RESOURCE_SCOPES). The server refuses a token without it, 403
     // insufficient_scope, before the router runs, so a refused request reads
     // nothing.
+    //
+    // #1964: nrfd pins a resource-scoped token's `aud` to the UDR instances it
+    // evaluated the scope over, so this UDR accepts its own instance ID too.
     config
         .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr)
+        .with_expected_audience_instance(
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udr)
+                .to_string(),
+        )
         .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
 }
 
@@ -5536,6 +5543,55 @@ mod tests {
     /// REVERT-VERIFIED: with `.with_oauth2_resource_scopes(..)` removed from
     /// `udr_oauth2_listener`, the service-scope-only GET answers 200 with the key
     /// and this test fails on its first assertion.
+    /// **#1964.** nrfd pins a resource-scoped token's `aud` to the UDR instances
+    /// it evaluated the scope over. The real listener accepts a token whose
+    /// `aud` is THIS UDR's instance ID, so the UDM's K read keeps working, and
+    /// refuses one pinned to another UDR.
+    ///
+    /// REVERT-VERIFIED: with `.with_expected_audience_instance(..)` removed from
+    /// `udr_oauth2_listener`, the own-instance token is refused and the first
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_pinned_to_this_udr_is_accepted_1964() {
+        use nextgcore_sbi::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_READ as READ;
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _store = DbiTestStore::enable().await;
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = udr_oauth2_listener(NextgcoreSbiServerConfig::new(udr_addr));
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = SbiServer::on_listener(cfg, udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let own = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udr);
+        let path = "/nudr-dr/v2/subscription-data/imsi-001010000019640/authentication-data/\
+                    authentication-subscription";
+        let get = |aud: &str| {
+            let token = stand_in::es256_access_token(
+                &sk,
+                stand_in::TEST_NRF_KID,
+                aud,
+                &format!("nudr-dr {READ}"),
+            );
+            let req = SbiRequest::get(path).with_header("authorization", format!("Bearer {token}"));
+            let client = &client;
+            async move { client.send_request(req).await.expect("response").status }
+        };
+        let mine = get(own).await;
+        assert!(
+            mine != 401 && mine != 403,
+            "a token pinned to this UDR passes the gate (got {mine})"
+        );
+        let elsewhere = get("19640000-0000-4000-8000-0000000000ff").await;
+        assert!(
+            elsewhere == 401 || elsewhere == 403,
+            "a token pinned to another UDR is refused (got {elsewhere})"
+        );
+        udr.stop().await.ok();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_auth_subscription_is_served_only_with_its_resource_scope_1811() {
         use nextgcore_sbi::resource_scope::{
