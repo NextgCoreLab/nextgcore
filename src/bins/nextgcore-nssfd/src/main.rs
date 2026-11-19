@@ -875,7 +875,10 @@ async fn nssf_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = method.as_str();
     let uri = request.header.uri.clone();
 
-    log::debug!("NSSF SBI request: {method} {uri}");
+    log::debug!(
+        "NSSF SBI request: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(&uri);
@@ -962,7 +965,10 @@ async fn nssf_sbi_route(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown NSSF request: {method} {uri}");
+            log::warn!(
+                "Unknown NSSF request: {method} {uri}",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+            );
             problem_details(
                 404,
                 "Not Found",

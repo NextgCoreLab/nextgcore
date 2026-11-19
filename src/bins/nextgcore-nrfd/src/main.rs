@@ -2249,7 +2249,10 @@ async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("NRF SBI request: {method} {uri}");
+    log::debug!(
+        "NRF SBI request: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -2352,7 +2355,10 @@ async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
         ("nnrf-oauth2", "jwks", "GET") => handle_jwks(),
 
         _ => {
-            log::warn!("Unknown NRF request: {method} {uri}");
+            log::warn!(
+                "Unknown NRF request: {method} {uri}",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_method_not_allowed(method, uri)
         }
     };
