@@ -5517,7 +5517,10 @@ async fn a_connected_update_whose_mac_fails_has_its_session_ies_ignored() {
 async fn a_later_update_without_session_ies_clears_earlier_ones() {
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
-    let (ue, ran) = (7_759_701u64, 67);
+    // #2008: an id of its own. `a_connected_update_whose_mac_fails_has_its_session_ies_ignored`
+    // used 7_759_701 too, and the UE store is process-global: run together, that
+    // test's insert and `forget_ue` replaced or removed this UE mid-update.
+    let (ue, ran) = (7_759_901u64, 69);
     registered_ue_with_guti(&mut server, ue, ran);
     hold_session(&mut server, ue, 1, "stale-759-1", port);
     server.ue_auth_state.with_mut(ue, |s| {
@@ -5551,11 +5554,8 @@ async fn a_later_update_without_session_ies_clears_earlier_ones() {
     let accept = registration_accept_of(nas_pdu);
     assert_eq!(accept.pdu_session_status, None);
     assert_eq!(accept.pdu_session_reactivation_result, None);
-    let ctx = crate::context::amf_self();
-    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-    if let Some(sess) = guard.sess_find_by_psi(ue, 1) {
-        guard.sess_remove(sess.id);
-    }
+    // #2008: the UE leaves the process-global store, and its session with it.
+    server.forget_ue(ue);
 }
 
 /// #826 review M2 (#778): a connected mobility update re-activates PSI 1 with
@@ -5573,7 +5573,9 @@ async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
     let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
-    let (ue, ran, supi) = (7_759_301u64, 63, "imsi-001010007590301");
+    // #2008: not 7_759_301, which the CM-IDLE update test above uses in the same
+    // process-global UE store.
+    let (ue, ran, supi) = (7_759_801u64, 63, "imsi-001010007590801");
     registered_ue_with_guti(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
     hold_session(&mut server, ue, 1, "reg759-nodup-1", port);

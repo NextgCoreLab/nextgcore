@@ -911,7 +911,6 @@ mod tests {
         let mut server = server_with_area_gnbs().await;
         let t = tmgi(0x01_7966);
         let mcast = crate::context::amf_mcast();
-        let before = mcast.broadcast_count();
 
         let create = start_create(create_request("017966", &uri, json!({}))).await;
         server.process_mbs_broadcast().await;
@@ -949,7 +948,13 @@ mod tests {
         let notes = wait_notifies(&seen, 2).await;
         assert_eq!(notes.len(), 2, "the last gNB's loss releases the context");
         assert_eq!(notes[1].0["releasedInd"], true);
-        assert_eq!(mcast.broadcast_count(), before, "released, not stuck");
+        // #2008: this test's own context, not the global count. A context a failed
+        // sibling left behind was released here too (its gNBs are this server's
+        // association ids), so the count fell below the one read at the start.
+        assert!(
+            mcast.broadcast_refs_of(&t).is_empty(),
+            "released, not stuck"
+        );
         assert!(take_sent_ngap(&mut server).is_empty());
     }
 
@@ -986,8 +991,15 @@ mod tests {
             crate::context::amf_mcast().broadcast_rescan();
             server.process_mbs_broadcast().await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let notes = seen.lock().unwrap().clone();
+        // #2008: wait for the notification to arrive rather than for a fixed 100 ms:
+        // it is its own spawned POST, which a loaded host did not deliver in time.
+        // Then the full `wait_notifies` window for a second one, which the latch
+        // must stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let notes = wait_notifies(&seen, 2).await;
         assert_eq!(notes.len(), 1, "one incompletion notification");
         assert_eq!(
             notes[0].0["operationStatus"],

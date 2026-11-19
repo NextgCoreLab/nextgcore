@@ -1485,7 +1485,7 @@ impl AmfContext {
             full_name: NetworkName::default(),
             amf_name: None,
             relative_capacity: 255,
-            amf_ue_ngap_id_generator: AtomicU64::new(1),
+            amf_ue_ngap_id_generator: AtomicU64::new(FIRST_AMF_UE_NGAP_ID),
             gnb_list: RwLock::new(HashMap::new()),
             amf_ue_list: RwLock::new(HashMap::new()),
             ran_ue_list: RwLock::new(HashMap::new()),
@@ -3556,6 +3556,21 @@ impl AmfContext {
         self.event_subscriptions
             .read()
             .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Tests (#2008): how many stored subscriptions notify a URI containing
+    /// `notify_uri_part`. The store is process-global, so a test counting every
+    /// subscription also counts the ones its siblings create and delete meanwhile.
+    #[cfg(test)]
+    pub(crate) fn event_subscription_count_notifying(&self, notify_uri_part: &str) -> usize {
+        self.event_subscriptions
+            .read()
+            .map(|m| {
+                m.values()
+                    .filter(|s| s.notify_uri.contains(notify_uri_part))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -6567,6 +6582,21 @@ pub fn amf_mcast() -> Arc<crate::ngap_mcast::NgapMcastContext> {
         .clone()
 }
 
+/// The first AMF UE NGAP ID the allocator hands out.
+#[cfg(not(test))]
+const FIRST_AMF_UE_NGAP_ID: u64 = 1;
+
+/// Tests (#2008): the UE store is process-global, and tests key their UEs by
+/// literal AMF UE NGAP IDs (1 for the 5GS-to-EPS tests, up to 1_794_000_488).
+/// Allocated from 1, the id the allocator handed one test (`setup_ue`, an Initial UE
+/// Message) could be the literal another test inserts at the same moment, and one
+/// would replace the other's UE. `test_n1n2_subscription_missing_pair_400` resolves
+/// its UE by SUPI over this store, so it would then get 404 where it expects 400.
+/// Allocated ids start above every literal, so the two ranges cannot meet. Still within u32 and within
+/// the AMF UE NGAP ID range (0..2^40-1, TS 38.413 §9.3.3.1).
+#[cfg(test)]
+const FIRST_AMF_UE_NGAP_ID: u64 = 2_000_000_000;
+
 /// Initialize the global AMF context
 pub fn amf_context_init(max_gnb: usize, max_ue: usize, max_sess: usize) {
     let ctx = amf_self();
@@ -6923,6 +6953,22 @@ mod tests {
         assert!(!ctx.is_initialized());
         assert_eq!(ctx.gnb_count(), 0);
         assert_eq!(ctx.amf_ue_count(), 0);
+    }
+
+    /// #2008: in a test build the allocator's ids start above every literal AMF UE
+    /// NGAP ID a test keys a UE by, so an allocated UE and a literal one never share
+    /// a key in the process-global UE store.
+    ///
+    /// REVERT-VERIFIED: with the test start back at 1, this fails.
+    #[test]
+    fn allocated_ue_ids_start_above_every_literal_test_id_2008() {
+        let ctx = AmfContext::new();
+        let first = ctx.next_amf_ue_ngap_id();
+        assert!(
+            first > 1_794_000_488,
+            "allocated id {first} is in the range tests use as literal UE ids"
+        );
+        assert!(first < (1 << 40), "an AMF UE NGAP ID (TS 38.413 §9.3.3.1)");
     }
 
     #[test]

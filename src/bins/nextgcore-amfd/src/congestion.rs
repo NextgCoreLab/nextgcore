@@ -44,25 +44,62 @@ pub(crate) static CONGESTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 
 /// Serialise on [`CONGESTION_TEST_LOCK`] and hand the caller a known-clean posture.
 #[cfg(test)]
-pub(crate) async fn congestion_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn congestion_test_guard() -> CongestionTestGuard {
     reset_congestion_posture(CONGESTION_TEST_LOCK.lock().await)
 }
 
 /// [`congestion_test_guard`] for a synchronous `#[test]` (outside any runtime).
 #[cfg(test)]
-pub(crate) fn congestion_test_guard_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) fn congestion_test_guard_blocking() -> CongestionTestGuard {
     reset_congestion_posture(CONGESTION_TEST_LOCK.blocking_lock())
 }
 
 #[cfg(test)]
-fn reset_congestion_posture(
-    guard: tokio::sync::MutexGuard<'static, ()>,
-) -> tokio::sync::MutexGuard<'static, ()> {
+thread_local! {
+    /// #2008: whether this thread holds [`CONGESTION_TEST_LOCK`] through a
+    /// [`CongestionTestGuard`]. Only such a thread sees the posture a test set.
+    static OWNS_POSTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests (#2008): the posture is process-global, but its readers are every
+/// registration handler, in hundreds of tests that never take the lock. While one
+/// test forced congestion (or set `AMF_NAS_CONGESTION_THRESHOLD=10`, which every
+/// suite's leftover UEs exceed), a sibling's Registration Update was refused with
+/// 5GMM #22 instead of accepted. So in a test build the posture is seen only on the
+/// thread that holds this guard, which is the test's own: a `#[tokio::test]` body
+/// runs on the thread that calls `block_on`, and so do the handlers it awaits.
+/// Every other thread sees the shipped default (not congested).
+#[cfg(test)]
+pub(crate) struct CongestionTestGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for CongestionTestGuard {
+    fn drop(&mut self) {
+        OWNS_POSTURE.with(|o| o.set(false));
+    }
+}
+
+/// Tests (#2008): whether this thread may see the configured posture.
+#[cfg(test)]
+fn sees_posture() -> bool {
+    OWNS_POSTURE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn sees_posture() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn reset_congestion_posture(guard: tokio::sync::MutexGuard<'static, ()>) -> CongestionTestGuard {
     set_forced(false);
     std::env::remove_var("AMF_NAS_CONGESTION");
     std::env::remove_var("AMF_NAS_CONGESTION_THRESHOLD");
     std::env::remove_var("AMF_T3346_SECS");
-    guard
+    OWNS_POSTURE.with(|o| o.set(true));
+    CongestionTestGuard { _lock: guard }
 }
 
 /// Default T3346 when congestion is active and `AMF_T3346_SECS` is unset.
@@ -81,6 +118,9 @@ pub fn set_forced(active: bool) -> bool {
 
 /// Whether an operator has forced the posture on.
 pub fn is_forced() -> bool {
+    if !sees_posture() {
+        return false;
+    }
     FORCED.load(Ordering::SeqCst) || env_flag("AMF_NAS_CONGESTION")
 }
 
@@ -88,6 +128,9 @@ pub fn is_forced() -> bool {
 ///
 /// `None` when unset or 0 — congestion by occupancy is off, which is the shipped default.
 pub fn occupancy_threshold() -> Option<usize> {
+    if !sees_posture() {
+        return None;
+    }
     match std::env::var("AMF_NAS_CONGESTION_THRESHOLD") {
         Ok(raw) => match raw.trim().parse::<usize>() {
             Ok(0) => None,
@@ -181,6 +224,32 @@ mod tests {
         assert!(is_active(0), "a declaration does not need a UE count");
         set_forced(previous);
         assert!(!is_active(0));
+    }
+
+    /// #2008: a posture a test sets is seen by that test's thread only. Before, a
+    /// sibling's registration handler on another thread read the forced posture (or
+    /// the threshold of 10, which a suite's leftover UEs always exceed) and refused a
+    /// Registration Update with 5GMM #22: the 4-byte Reject behind
+    /// `a_later_update_without_session_ies_clears_earlier_ones` and its neighbours.
+    ///
+    /// REVERT-VERIFIED: with `sees_posture` true on every thread, the sibling thread
+    /// is congested.
+    #[test]
+    fn a_tests_posture_is_not_seen_by_its_siblings_2008() {
+        let _g = guard();
+        let previous = set_forced(true);
+        std::env::set_var("AMF_NAS_CONGESTION_THRESHOLD", "10");
+        assert!(is_active(0), "the test that forced it is congested");
+        let sibling = std::thread::spawn(|| (is_forced(), is_active(1_000_000)))
+            .join()
+            .expect("sibling");
+        assert_eq!(
+            sibling,
+            (false, false),
+            "a sibling test's thread sees the shipped default"
+        );
+        std::env::remove_var("AMF_NAS_CONGESTION_THRESHOLD");
+        set_forced(previous);
     }
 
     #[test]
