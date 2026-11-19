@@ -1900,17 +1900,23 @@ async fn main() -> Result<()> {
     // NF-type rule does NOT follow it: a forwarded identity carries no NF types,
     // so every registration would be refused (documented in nrf.md).
     policy.require_subscriber_identity = verification || policy.trust_forwarded_client_cert;
-    policy.require_registrant_nf_types = verification;
-    if !verification {
+    // #1979: with XFCC `Cert=` parsed, a declared terminator's forwarded
+    // registrants carry NF types too, so the rule follows it as well. A
+    // terminator that forwards no `Cert=` proves no type, and its registrants
+    // are refused: configure it to forward the certificate.
+    policy.require_registrant_nf_types = verification || policy.trust_forwarded_client_cert;
+    if !policy.require_registrant_nf_types {
+        // #1979: both rules follow a declared terminator, so here neither is on.
         log::warn!(
-            "nrfd-1926: dev SBI profile and no TLS client-certificate verification: a \
-             registrant may register as any NF type{}",
-            if policy.require_subscriber_identity {
-                " (NFStatusSubscribe still needs a verified identity: a TLS terminator is \
-                 declared, #1952)"
-            } else {
-                ", and NFStatusSubscribe needs no verified identity"
-            }
+            "nrfd-1926: dev SBI profile, no TLS client-certificate verification and no \
+             declared TLS terminator: a registrant may register as any NF type, and \
+             NFStatusSubscribe needs no verified identity"
+        );
+    } else if !verification {
+        log::info!(
+            "nrfd-1979: a TLS terminator is declared (trust_forwarded_client_cert): \
+             forwarded registrants are bound to the NF types of the certificate it forwards \
+             in XFCC Cert=; one that forwards no Cert= is refused"
         );
     }
     if policy.require_subscriber_identity {
@@ -2546,7 +2552,7 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         "NFRegister",
         nf_instance_id,
         &nf_profile.nf_type,
-        registrant_nf_types_required(),
+        registrant_nf_types_required(nrf_policy()),
     ) {
         return refused;
     }
@@ -2691,7 +2697,7 @@ async fn handle_nf_deregister(nf_instance_id: &str, request: &SbiRequest) -> Sbi
             "NFDeregister",
             nf_instance_id,
             &p.nf_type,
-            registrant_nf_types_required(),
+            registrant_nf_types_required(nrf_policy()),
         )
     }) {
         return refused;
@@ -2950,7 +2956,7 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         "NFUpdate",
         nf_instance_id,
         &updated.nf_type,
-        registrant_nf_types_required(),
+        registrant_nf_types_required(nrf_policy()),
     ) {
         return refused;
     }
@@ -4760,6 +4766,37 @@ const XFCC_HEADER: &str = "x-forwarded-client-cert";
 /// would let an attacker smuggle a fake `URI=` inside a quoted `Subject` DN.
 /// Returns the (unquoted) `URI=` value of the leaf entry, or None when absent.
 fn parse_xfcc_first_entry_uri(header: &str) -> Option<String> {
+    parse_xfcc_first_entry_element(header, "uri")
+}
+
+/// #1979: the RFC 9310 NFTypes of the leaf certificate a trusted terminator
+/// forwarded in XFCC `Cert=` (Envoy `forward_client_cert_details` with
+/// `set_current_client_cert_details.cert: true`): the URL-encoded PEM of the
+/// client certificate it verified. Empty when the element is absent or does not
+/// decode, so a terminator that forwards no certificate proves no NF type.
+fn parse_xfcc_first_entry_cert_nf_types(header: &str) -> Vec<String> {
+    use base64::Engine;
+    let Some(encoded) = parse_xfcc_first_entry_element(header, "cert") else {
+        return Vec::new();
+    };
+    let pem = nextgcore_sbi::uri_encode::decode_query_value(&encoded);
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("-----END CERTIFICATE-----"))
+        .collect();
+    match base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) {
+        Ok(der) if !der.is_empty() => nextgcore_sbi::peer_cert::nf_types_from_der(&der),
+        _ => Vec::new(),
+    }
+}
+
+/// The (unquoted) value of element `key` (case-insensitive) of the FIRST cert
+/// entry of an Envoy XFCC header, or None when absent or empty. Quote-aware, as
+/// [`parse_xfcc_first_entry_uri`] describes.
+fn parse_xfcc_first_entry_element(header: &str, key: &str) -> Option<String> {
     // 1) Take the first cert entry (up to the first UNQUOTED comma).
     let mut in_quotes = false;
     let mut entry_end = header.len();
@@ -4791,10 +4828,10 @@ fn parse_xfcc_first_entry_uri(header: &str) -> Option<String> {
     }
     pairs.push(&entry[start..]);
 
-    // 3) Find the URI element (case-insensitive key) and unquote its value.
+    // 3) Find the element (case-insensitive key) and unquote its value.
     for pair in pairs {
         if let Some((k, v)) = pair.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("uri") {
+            if k.trim().eq_ignore_ascii_case(key) {
                 let v = v.trim();
                 let v = v
                     .strip_prefix('"')
@@ -4927,9 +4964,15 @@ impl RegistrantIdentity {
         // A forwarded identity came through a terminator: the certificate of the
         // connection is the terminator's, and its NF types describe it, not the
         // registrant.
+        // #1979: the registrant's own NF types are those of the certificate the
+        // trusted terminator forwarded in XFCC `Cert=`, if it forwarded one.
         let forwarded = !direct && instance_ids.iter().any(|(s, _)| s.starts_with("forwarded"));
         let nf_types = if forwarded {
-            Vec::new()
+            request
+                .http
+                .get_header(XFCC_HEADER)
+                .map(|x| parse_xfcc_first_entry_cert_nf_types(x))
+                .unwrap_or_default()
         } else {
             request.peer_cert_nf_types.clone()
         };
@@ -5022,13 +5065,14 @@ impl RegistrantIdentity {
             }
             nextgcore_nrfd::metrics::observe_unverified_nf_management();
             let why = if self.forwarded {
-                "its identity was forwarded by a TLS terminator, whose certificate names                  the terminator's NF types, not the requester's"
+                "its identity was forwarded by a TLS terminator without the requester's \
+                 certificate (XFCC Cert=), so no NF type of the requester is known"
             } else {
                 "its client certificate names no NF type (RFC 9310 NFTypes)"
             };
             log::debug!("{operation} for NF instance {nf_instance_id} as {nf_type} refused: {why}");
             return Some(invalid_client(&format!(
-                "{operation}: nfType {nf_type:?} cannot be verified: {why} (TS 33.310                  §6.1.3c.3)"
+                "{operation}: nfType {nf_type:?} cannot be verified: {why} (TS 33.310 §6.1.3c.3)"
             )));
         }
         if self
@@ -5053,12 +5097,13 @@ impl RegistrantIdentity {
 
 /// #1917: [`NrfPolicy::require_registrant_nf_types`], which tests of the dev
 /// behaviour turn off for their own task only.
-fn registrant_nf_types_required() -> bool {
+fn registrant_nf_types_required(policy: &NrfPolicy) -> bool {
     #[cfg(test)]
     if let Ok(required) = registrant_nf_type_tests_1917::REQUIRED.try_with(|r| *r) {
         return required;
     }
-    nrf_policy().require_registrant_nf_types
+    // #1979: the policy the caller decides under, not the process-global one.
+    policy.require_registrant_nf_types
 }
 
 /// #1809: [`NrfPolicy::require_subscriber_identity`], which tests of the dev
@@ -5512,6 +5557,7 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
 /// `Err` is the reason appended to the `invalid_client` description.
 fn unregistered_nrf_api_consumer(
     request: &SbiRequest,
+    policy: &NrfPolicy,
     authentication: &ClientAuthentication,
     nf_type: &str,
     target_nf_type: &str,
@@ -5560,10 +5606,22 @@ fn unregistered_nrf_api_consumer(
     // NRF would then trust. Only a client certificate THIS NRF verified, naming
     // the type in its NFTypes, proves it; a certificate naming none, a forwarded
     // identity and a CCA do not.
-    if registrant_nf_types_required() {
+    if registrant_nf_types_required(policy) {
+        // #1979: a trusted forwarded identity proves the NF types of the
+        // certificate the terminator forwarded (XFCC `Cert=`).
+        let forwarded_types = (!direct && policy.trust_forwarded_client_cert)
+            .then(|| request.http.get_header(XFCC_HEADER))
+            .flatten()
+            .map(|x| parse_xfcc_first_entry_cert_nf_types(x))
+            .unwrap_or_default();
         let verified = authentication.via_transport
-            && direct
-            && cert_types.iter().any(|t| t.eq_ignore_ascii_case(nf_type));
+            && if direct {
+                cert_types.iter().any(|t| t.eq_ignore_ascii_case(nf_type))
+            } else {
+                forwarded_types
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(nf_type))
+            };
         if !verified {
             return Err(format!(
                 ", and nfType {nf_type:?} cannot be verified: no client certificate this NRF \
@@ -5679,6 +5737,7 @@ async fn handle_access_token_request_with_policy(
         Some(consumer) => consumer,
         None => match unregistered_nrf_api_consumer(
             request,
+            policy,
             &authentication,
             &nf_type,
             &target_nf_type,
@@ -12577,6 +12636,137 @@ mod registrant_binding_tests_1611 {
         )
     }
 
+    /// An Envoy-style XFCC header for a terminator that verified a client
+    /// certificate naming `uri` and `nf_types`, with (`with_cert`) or without
+    /// its URL-encoded PEM in `Cert=` (#1979).
+    fn xfcc_1979(tag: &str, uri: &str, nf_types: &[&str], with_cert: bool) -> String {
+        let (_, _, _, cert, _) = pki(tag, Some(uri), Some(nf_types));
+        let pem = std::fs::read_to_string(cert).expect("client pem");
+        if with_cert {
+            format!(
+                "By=spiffe://nrf;Hash=00;Cert=\"{}\";URI={uri}",
+                nextgcore_sbi::uri_encode::encode_query_value(&pem)
+            )
+        } else {
+            format!("By=spiffe://nrf;Hash=00;URI={uri}")
+        }
+    }
+
+    /// **#1979.** A trusted terminator's XFCC `Cert=` carries the requester's
+    /// certificate, so its RFC 9310 NFTypes bind the forwarded registrant as a
+    /// direct certificate's do. Without `Cert=`, or with one that does not
+    /// decode, no type is known, and where types are required it is refused.
+    ///
+    /// REVERT-VERIFIED: with `RegistrantIdentity::of` back to no types for a
+    /// forwarded identity, `nf_types` is empty and the first assertion fails.
+    #[test]
+    fn a_forwarded_certificate_s_nf_types_bind_the_registrant_1979() {
+        let id = "19790000-0000-4000-8000-0000000000a1";
+        let uri = format!("urn:uuid:{id}");
+        let trusting = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let forwarded = |xfcc: &str| {
+            let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"));
+            req.peer_cert_nf_types = vec!["SCP".into()]; // the terminator's own
+            req.http.set_header(XFCC_HEADER, xfcc.to_string());
+            RegistrantIdentity::of(&req, &trusting)
+        };
+
+        let with = forwarded(&xfcc_1979("xfcc-1979a", &uri, &["AMF"], true));
+        assert_eq!(with.nf_types, vec!["AMF".to_string()], "from XFCC Cert=");
+        assert!(with.forwarded);
+        assert!(with.bind_nf_type("NFRegister", id, "AMF", true).is_none());
+        let refused = with
+            .bind_nf_type("NFRegister", id, "AUSF", true)
+            .expect("an AMF certificate cannot register an AUSF");
+        assert_eq!(refused.status, 400);
+
+        let without = forwarded(&xfcc_1979("xfcc-1979b", &uri, &["AMF"], false));
+        assert!(without.nf_types.is_empty(), "no Cert=, no type");
+        assert!(without
+            .bind_nf_type("NFRegister", id, "AMF", true)
+            .expect("refused where types are required")
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("XFCC Cert="));
+
+        let garbage = forwarded(&format!("By=x;Cert=\"not-a-pem\";URI={uri}"));
+        assert!(
+            garbage.nf_types.is_empty(),
+            "an undecodable Cert= proves nothing"
+        );
+    }
+
+    /// **#1979.** The bootstrap token (#1952) for an unregistered NF behind a
+    /// trusted terminator: the type in the forwarded certificate (XFCC `Cert=`)
+    /// proves the requested `nfType`, so an AMF gets its nnrf token as AMF and
+    /// not as AUSF.
+    ///
+    /// REVERT-VERIFIED: with the forwarded branch of the token check removed,
+    /// the AMF request is refused and the first assertion fails.
+    #[tokio::test]
+    async fn a_forwarded_certificate_s_type_proves_the_bootstrap_token_1979() {
+        use super::registrant_nf_type_tests_1917::REQUIRED;
+        let _self_entry = self_entry_test_lock().lock().await;
+        let id = "19790000-0000-4000-8000-0000000000b2";
+        let xfcc = xfcc_1979("xfcc-1979c", &format!("urn:uuid:{id}"), &["AMF"], true);
+        let policy = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let ask = |nf_type: &str| {
+            let mut r = SbiRequest::post("/oauth2/token");
+            r.http.set_content(
+                json!({
+                    "grant_type": "client_credentials", "nfInstanceId": id, "nfType": nf_type,
+                    "targetNfType": "NRF", "scope": "nnrf-disc",
+                })
+                .to_string(),
+            );
+            r.peer_cert_nf_types = vec!["SCP".into()]; // the terminator's own
+            r.http.set_header(XFCC_HEADER, xfcc.clone());
+            r
+        };
+        let as_amf = REQUIRED
+            .scope(
+                true,
+                handle_access_token_request_with_policy(&ask("AMF"), &policy),
+            )
+            .await;
+        assert_eq!(as_amf.status, 200, "{:?}", as_amf.http.content);
+        let as_ausf = REQUIRED
+            .scope(
+                true,
+                handle_access_token_request_with_policy(&ask("AUSF"), &policy),
+            )
+            .await;
+        assert_eq!(as_ausf.status, 400, "{:?}", as_ausf.http.content);
+    }
+
+    /// **#1979 (2).** `registrant_nf_types_required` reads the policy it is
+    /// given, not the process-global one: a policy that does not require
+    /// types answers no even though the global (default) policy does.
+    ///
+    /// REVERT-VERIFIED: with the function reading `nrf_policy()` again, the
+    /// first assertion fails.
+    #[test]
+    fn the_nf_type_rule_reads_the_policy_it_is_given_1979() {
+        let off = NrfPolicy {
+            require_registrant_nf_types: false,
+            ..NrfPolicy::default()
+        };
+        assert!(
+            nrf_policy().require_registrant_nf_types,
+            "control: the global requires them"
+        );
+        assert!(!registrant_nf_types_required(&off));
+        assert!(registrant_nf_types_required(&NrfPolicy::default()));
+    }
+
     /// The real NRF handler behind a mutual-TLS listener, and a client that
     /// presents a certificate with `client_uri` / `nf_types`.
     async fn mtls_nrf(
@@ -15544,7 +15734,7 @@ mod verification_required_tests_1926 {
         assert!(tls_at < at, "the listener's TLS is resolved first");
         for policy in [
             "policy.require_subscriber_identity = verification || policy.trust_forwarded_client_cert;",
-            "policy.require_registrant_nf_types = verification;",
+            "policy.require_registrant_nf_types = verification || policy.trust_forwarded_client_cert;",
         ] {
             assert!(main[at..].contains(policy), "{policy}");
         }
