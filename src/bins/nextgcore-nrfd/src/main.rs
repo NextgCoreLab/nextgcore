@@ -2456,6 +2456,20 @@ fn registration_notification_event(is_new: bool) -> NotificationEventType {
 }
 
 /// Handle NF Register request
+/// R32 on #1957: 400 with `invalidParams` for a profile whose range patterns
+/// are over this NRF's caps (TS 29.500 §5.2.7.2), before anything is stored.
+fn refuse_range_patterns(profile: &serde_json::Value) -> Option<SbiResponse> {
+    let (param, reason) = nextgcore_nrfd::nnrf_handler::range_pattern_violation(profile)?;
+    let body = serde_json::json!({
+        "title": "Bad Request",
+        "status": 400,
+        "detail": reason,
+        "cause": "INVALID_MSG_FORMAT",
+        "invalidParams": [{ "param": param, "reason": reason }],
+    });
+    Some(SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json"))
+}
+
 async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
     // #1633: the registry key (TS 29.510 §5.2.2.2.2: upper-case UUIDs are handled as
     // lower-case).
@@ -2488,6 +2502,9 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
+    if let Some(refused) = refuse_range_patterns(&profile) {
+        return refused;
+    }
     // Mandatory attribute validation (TS 29.510 Table 6.1.6.2.2-1:
     // nfInstanceId, nfType, nfStatus) -> 400 ProblemDetails.
     let nf_profile = match NfProfile::from_json(&profile) {
@@ -2887,6 +2904,16 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         }
     }
 
+    // A patch that adds or changes range patterns is held to the caps. One that
+    // leaves them as they were (a heartbeat of a profile restored from before
+    // the caps) is not refused for them; discovery excludes that profile.
+    if nextgcore_nrfd::nnrf_handler::range_pattern_violation(&doc)
+        != nextgcore_nrfd::nnrf_handler::range_pattern_violation(&pre_patch_doc)
+    {
+        if let Some(refused) = refuse_range_patterns(&doc) {
+            return refused;
+        }
+    }
     // The patched document must still be a valid NFProfile with the same
     // identity (nfInstanceId is read-only for the resource).
     let mut updated = match NfProfile::from_json(&doc) {
@@ -6371,6 +6398,60 @@ mod tests {
     const AUTH_SUBS_READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
     const AUTH_SUBS_MODIFY: &str = "nudr-dr:subscription-data:authentication-subscription:modify";
 
+    /// #1918: the AUSF profile ausfd registers (`build_nf_profile`, pinned by
+    /// ausfd's `the_profile_grants_the_deregister_scope_to_the_udm_only_1918`).
+    /// The two must stay in step: this is the NRF half of that exchange.
+    fn ausf_with_deregister_scope() -> NfProfile {
+        auth_producer(
+            "AUSF",
+            serde_json::json!([{
+                "serviceInstanceId": "ausf-auth",
+                "serviceName": "nausf-auth",
+                "allowedNfTypes": ["AMF", "UDM", "SCP"],
+                "allowedOperationsPerNfType": {
+                    "AMF": ["nausf-auth"],
+                    "UDM": ["nausf-auth", nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS],
+                    "SCP": ["nausf-auth"]
+                }
+            }]),
+            Some(serde_json::json!(["AMF", "UDM", "SCP"])),
+        )
+    }
+
+    /// #1918: the NRF grants the UDM the AUSF's Deregister resource scope with
+    /// the service scope, and an AMF only the service scope, so a token carrying
+    /// `nausf-auth:ue-authentications` proves a UDM even through an SCP.
+    #[test]
+    fn the_deregister_scope_is_granted_to_the_udm_only_1918() {
+        let ausf = ausf_with_deregister_scope();
+        let requested: Vec<String> = vec![
+            "nausf-auth".into(),
+            nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS.into(),
+        ];
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the UDM is authorized");
+        assert_eq!(udm, requested, "the UDM gets both scopes");
+        let amf = authorize_access_token(
+            &auth_consumer("AMF"),
+            "AMF",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the AMF keeps its service scope");
+        assert_eq!(amf, vec!["nausf-auth".to_string()]);
+    }
+
     /// #1811: only the UDM is granted the AuthenticationSubscription scope.
     /// A PCF or NEF asking for it gets the service scope alone (RFC 6749 §3.3
     /// lets the server narrow the request), so its token cannot read K at the
@@ -8003,6 +8084,58 @@ mod tests {
         // The supervision timer is armed at 2x the negotiated value.
         let hb = negotiate_heartbeat(None, 10, 1, 3600);
         assert_eq!((hb as u64) * 2, 20);
+    }
+
+    /// R32 on #1957 M1: a profile declaring more range patterns than the cap
+    /// is refused 400 with `invalidParams` and nothing is stored; at the cap it
+    /// registers. REVERT-VERIFIED: with the `refuse_range_patterns` call removed
+    /// from NFRegister, the over-cap profile answers 201.
+    #[tokio::test]
+    async fn a_profile_over_the_range_pattern_cap_is_refused_1879() {
+        use serde_json::json;
+        let profile = |id: &str, n: usize| {
+            let ranges: Vec<serde_json::Value> = (0..n)
+                .map(|k| json!({ "pattern": format!("imsi-00101{k:04}[0-9]+") }))
+                .collect();
+            json!({
+                "nfInstanceId": id, "nfType": "UDM", "nfStatus": "REGISTERED",
+                "udmInfo": { "supiRanges": ranges },
+            })
+        };
+        let register = |id: &'static str, body: serde_json::Value| async move {
+            let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"));
+            req.http.set_content(body.to_string());
+            req.peer_cert_nf_instance_id = Some(id.into());
+            req.peer_cert_nf_types = vec!["UDM".into()];
+            handle_nf_register(id, &req).await
+        };
+        let over = "aaaaaaaa-1879-4000-8000-000000000065";
+        let resp = register(
+            over,
+            profile(
+                over,
+                nextgcore_nrfd::nnrf_handler::MAX_RANGE_PATTERNS_PER_PROFILE + 1,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["invalidParams"][0]["param"],
+            "/udmInfo/supiRanges/64/pattern"
+        );
+        assert!(nf_manager().get(over).is_none(), "nothing stored");
+        let at = "aaaaaaaa-1879-4000-8000-000000000064";
+        let resp = register(
+            at,
+            profile(
+                at,
+                nextgcore_nrfd::nnrf_handler::MAX_RANGE_PATTERNS_PER_PROFILE,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
     }
 
     #[tokio::test]
