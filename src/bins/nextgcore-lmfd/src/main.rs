@@ -10215,13 +10215,15 @@ mod callback_tokens_1518 {
         amf.server.stop().await.ok();
     }
 
-    /// #1518 (R8 M2): a subscribe whose task is cancelled mid-create (its
-    /// DetermineLocation consumer disconnected) abandons its in-flight entry, so
-    /// the key can be subscribed again and the entry holds no cap slot. Both the
-    /// UE and the non-UE paths.
+    /// #1518 (R8 M2): a subscribe whose caller is cancelled mid-create (its
+    /// DetermineLocation consumer disconnected) does not hold its in-flight entry
+    /// for ever. #1877: the create now finishes on its own task, so against an AMF
+    /// that never answers the entry is abandoned when the create's own bounded
+    /// request gives up (not at the cancel), and then the key can be subscribed
+    /// again. Both the UE and the non-UE paths.
     ///
     /// REVERT-VERIFIED: with `InFlightCreate`'s drop not abandoning, the key stays
-    /// in flight after the abort and a fresh start is refused.
+    /// in flight after the create gives up and a fresh start is refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_subscribe_leaves_nothing_in_flight_1518() {
         // #1884: the subscribe goes to a loopback plaintext AMF, i.e. a dev
@@ -10253,6 +10255,15 @@ mod callback_tokens_1518 {
 
         // By key: other modules' tests share the store without this lock.
         let held = |key: &str| lmf_self().read().unwrap().amf_subscription_holds(key);
+        // The create's own bound (client connect 2 s + request 3 s), with margin.
+        let gave_up = |key: String| async move {
+            for _ in 0..80 {
+                if !lmf_self().read().unwrap().amf_subscription_holds(&key) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
         let in_flight = |key: String| async move {
             for _ in 0..100 {
                 if lmf_self().read().unwrap().amf_subscription_holds(&key) {
@@ -10271,7 +10282,11 @@ mod callback_tokens_1518 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!held(&amf.subscription_key(ue)), "abandoned on cancel");
+        gave_up(amf.subscription_key(ue)).await;
+        assert!(
+            !held(&amf.subscription_key(ue)),
+            "abandoned once the create gives up"
+        );
         assert!(
             lmf_self()
                 .read()
@@ -10293,7 +10308,11 @@ mod callback_tokens_1518 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!held(&amf.non_ue_subscription_key()), "abandoned on cancel");
+        gave_up(amf.non_ue_subscription_key()).await;
+        assert!(
+            !held(&amf.non_ue_subscription_key()),
+            "abandoned once the create gives up"
+        );
 
         hold.abort();
         lmf_context_final();
