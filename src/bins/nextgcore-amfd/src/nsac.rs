@@ -196,37 +196,9 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
 /// The longest a failing peer is left alone between attempts.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 
-type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
-
-/// Per peer: when it may next be tried, and the current backoff.
-fn backoff() -> &'static Mutex<Backoff> {
-    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
-        std::sync::LazyLock::new(Default::default);
-    &BACKOFF
-}
-
-fn backing_off(peer: &str) -> bool {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(peer)
-        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
-}
-
-fn note_failure(peer: &str) {
-    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    let wait = map
-        .get(peer)
-        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
-    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
-}
-
-fn note_success(peer: &str) {
-    backoff()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(peer);
-}
+/// Per peer: its backoff (#1994: the shared one), guarded like the parked set.
+static BACKOFF: nextgcore_core::backoff::PeerBackoff =
+    nextgcore_core::backoff::PeerBackoff::new(BACKOFF_BASE, BACKOFF_MAX);
 
 /// The peer a DECREASE goes to: the NSACF that granted the admission.
 fn peer_of(a: &Admission) -> String {
@@ -568,18 +540,27 @@ async fn send(a: &Admission) -> Outcome {
 }
 
 fn evict(set: &mut VecDeque<Parked>) {
-    while set.len() > MAX_PENDING {
-        if let Some(Parked { a: old, .. }) = set.pop_front() {
-            log::error!(
-                "[{}] NSACF DECREASE for SST={} SD={:?} abandoned: {MAX_PENDING} are already \
-                 pending; the UE stays counted at the NSACF",
-                old.supi,
-                old.snssai.sst,
-                old.snssai.sd
-            );
-            RECONCILED.inc(&["abandoned"]);
-        }
+    // #1994: the oldest by park time, wherever rotation has put it (it popped the
+    // front, which rotation makes the next to be tried, not the oldest).
+    for Parked { a: old, .. } in
+        nextgcore_core::backoff::evict_oldest(set, MAX_PENDING, |p| p.since)
+    {
+        log::error!(
+            "[{}] NSACF DECREASE for SST={} SD={:?} abandoned: {MAX_PENDING} are already \
+             pending; the UE stays counted at the NSACF",
+            old.supi,
+            old.snssai.sst,
+            old.snssai.sd
+        );
+        RECONCILED.inc(&["abandoned"]);
     }
+}
+
+/// #1994: forget the backoff of an NSACF with nothing left parked, so one that
+/// never comes back does not stay in the map for good.
+fn prune_backoff(set: &VecDeque<Parked>) {
+    let live: std::collections::HashSet<String> = set.iter().map(|p| peer_of(&p.a)).collect();
+    BACKOFF.retain(|peer| live.contains(peer));
 }
 
 /// Park a DECREASE that failed. One already parked is not parked twice.
@@ -640,7 +621,7 @@ pub async fn reconcile_once() -> usize {
             continue;
         }
         let peer = peer_of(a);
-        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
             untried.push(p);
             continue;
         }
@@ -649,12 +630,12 @@ pub async fn reconcile_once() -> usize {
             Outcome::Accepted => "delivered",
             Outcome::Refused => "refused",
             Outcome::Failed => {
-                note_failure(&peer);
+                BACKOFF.note_failure(&peer);
                 failed.push(p);
                 continue;
             }
         };
-        note_success(&peer);
+        BACKOFF.note_success(&peer);
         log::info!(
             "[{}] parked NSACF DECREASE for SST={} SD={:?}: {result}",
             a.supi,
@@ -676,6 +657,7 @@ pub async fn reconcile_once() -> usize {
         }
     }
     evict(&mut set);
+    prune_backoff(&set);
     ended
 }
 
@@ -726,7 +708,7 @@ pub fn render(out: &mut String) {
 pub fn clear_for_test() {
     lock(admissions()).clear();
     lock(pending()).clear();
-    lock(backoff()).clear();
+    BACKOFF.clear();
     let mut ops = lock(ops());
     ops.in_flight.clear();
     ops.admitting.clear();
@@ -1286,5 +1268,69 @@ pub(crate) mod tests {
         assert_eq!(held.len(), MAX_PENDING);
         assert_eq!(held[0].supi, "imsi-bound-1", "the oldest went");
         assert_eq!(RECONCILED.get(&["abandoned"]) - before, 1);
+    }
+
+    fn parked_decrease_1994(n: usize, port: u16) -> Admission {
+        Admission {
+            supi: format!("imsi-1994-{n}"),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(1),
+            nf_id: "amf-1994".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        }
+    }
+
+    /// #1994: eviction takes the oldest wherever rotation has put it. A failed
+    /// DECREASE goes to the back, so the front is the next to be tried, not the
+    /// oldest.
+    ///
+    /// REVERT-VERIFIED: with `evict` popping the front, as before, this fails:
+    /// the younger front entry is evicted and the oldest kept.
+    #[tokio::test]
+    async fn eviction_takes_the_oldest_after_rotation_1994() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        for n in 0..MAX_PENDING {
+            park(parked_decrease_1994(n, 1));
+        }
+        // A pass tried the oldest and it failed: it is at the back now.
+        {
+            let mut set = lock(pending());
+            let oldest = set.pop_front().expect("parked");
+            set.push_back(oldest);
+        }
+        park(parked_decrease_1994(MAX_PENDING, 1));
+        let held: Vec<String> = parked().into_iter().map(|a| a.supi).collect();
+        clear_for_test();
+
+        assert_eq!(held.len(), MAX_PENDING);
+        assert!(
+            !held.contains(&"imsi-1994-0".to_string()),
+            "the oldest went"
+        );
+        assert!(held.contains(&"imsi-1994-1".to_string()), "not the front");
+    }
+
+    /// #1994: a pass forgets the backoff of an NSACF with nothing parked, and
+    /// keeps that of one still holding parked DECREASEs.
+    ///
+    /// REVERT-VERIFIED: with `prune_backoff` a no-op, this fails: the NSACF with
+    /// nothing parked keeps its backoff.
+    #[tokio::test]
+    async fn an_nsacf_with_nothing_parked_is_pruned_1994() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (gone, kept) = ("127.0.0.1:19941", "127.0.0.1:19942");
+        BACKOFF.note_failure(gone);
+        BACKOFF.note_failure(kept);
+        // Backing off, so not contacted: it stays parked.
+        park(parked_decrease_1994(0, 19942));
+        reconcile_once().await;
+        let after = (BACKOFF.current(gone), BACKOFF.current(kept));
+        clear_for_test();
+
+        assert_eq!(after.0, None, "nothing parked: pruned");
+        assert_eq!(after.1, Some(BACKOFF_BASE), "still parked: kept");
     }
 }
