@@ -222,6 +222,30 @@ const DEFAULT_SERVER_CERT: &str = "/etc/nextgcore/tls/server.crt";
 const DEFAULT_SERVER_KEY: &str = "/etc/nextgcore/tls/server.key";
 const DEFAULT_CLIENT_CA: &str = "/etc/nextgcore/tls/ca.crt";
 
+/// #1795: the NRF's listener under the SBI security profile. Under
+/// `production` it must serve TLS (TS 33.501 §13.1.0): with none configured
+/// this is a startup error, where it used to be a warning over a cleartext
+/// listener every production NF then failed to reach. The TLS itself stays the
+/// NRF's own (`nrf.sbi.server[0].tls`, its environment or `--tls`): the NRF is
+/// the token issuer and the root its peers bootstrap from, so a client
+/// certificate stays optional (#1617 step 2) and its token gate stays
+/// `nrf.sbi.oauth2.require_server`. Under `dev` cleartext is still allowed.
+fn check_listener_profile(
+    profile: nextgcore_sbi::security::SbiProfile,
+    server_tls: Option<&NrfServerTls>,
+) -> anyhow::Result<()> {
+    if profile.is_production() && server_tls.is_none() {
+        anyhow::bail!(
+            "the SBI profile is production but the NRF has no TLS configured, and it does not \
+             serve cleartext under production (TS 33.501 §13.1.0). Enable TLS \
+             (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls), or select \
+             {}=dev explicitly",
+            nextgcore_sbi::security::SBI_PROFILE_ENV
+        );
+    }
+    Ok(())
+}
+
 /// The TLS command-line flags.
 #[derive(Debug, Default, Clone)]
 struct TlsFlags {
@@ -1699,6 +1723,11 @@ async fn main() -> Result<()> {
             .and_then(|v| v.first())
             .and_then(|s| s.tls.as_ref()),
     )?;
+    // #1795: under the production SBI profile the NRF never serves cleartext.
+    check_listener_profile(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        server_tls.as_ref(),
+    )?;
     if let Some(tls) = &server_tls {
         tls.check_files()?;
     } else {
@@ -1709,13 +1738,7 @@ async fn main() -> Result<()> {
             "the NRF serves cleartext h2c: no NF can present a client certificate, so every \
              NFRegister / NFUpdate / NFDeregister is refused 400 INVALID_CLIENT (#1617). \
              Enable TLS (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls) \
-             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh).{}",
-            if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
-                " The SBI profile is production too: every NF on it dials its NRF over https \
-                 and cannot reach this one."
-            } else {
-                ""
-            }
+             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh)."
         );
     }
 
@@ -14390,5 +14413,33 @@ mod subscription_owner_tests_1809 {
         assert_eq!(r.status, 404);
         let r = nrf_sbi_request_handler(patch("no-such-1809", Some(OTHER), None)).await;
         assert_eq!(r.status, 404);
+    }
+}
+
+/// #1795: the NRF's listener follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::*;
+    use nextgcore_sbi::security::SbiProfile;
+
+    /// REVERT-VERIFIED: with the production arm of `check_listener_profile`
+    /// removed, a cleartext NRF is admitted under production and this fails.
+    #[test]
+    fn the_nrf_never_serves_cleartext_under_production_1795() {
+        let err = check_listener_profile(SbiProfile::Production, None)
+            .expect_err("a cleartext NRF is refused under production");
+        assert!(
+            err.to_string().contains("does not serve cleartext"),
+            "{err}"
+        );
+        let tls = NrfServerTls {
+            cert: "/c".into(),
+            key: "/k".into(),
+            ca: "/ca".into(),
+            client_auth: ClientAuth::Optional,
+        };
+        check_listener_profile(SbiProfile::Production, Some(&tls))
+            .expect("the NRF's own TLS is admitted under production");
+        check_listener_profile(SbiProfile::Dev, None).expect("dev keeps its cleartext NRF");
     }
 }

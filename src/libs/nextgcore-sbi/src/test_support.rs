@@ -17,12 +17,14 @@ use crate::server::{SbiServer, SbiServerConfig};
 /// keys, so never in a production build.
 #[cfg(any(test, feature = "test-support"))]
 mod dev_pki;
+mod listener_profile;
 mod nf_process;
 /// Token-minting OAuth2 stand-ins: never in a production build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod oauth2;
 #[cfg(any(test, feature = "test-support"))]
 pub use dev_pki::DevPki;
+pub use listener_profile::assert_listener_follows_sbi_profile;
 pub use nf_process::{claim_port, free_port_on, spawn_port, NfProcess, NfSpawn, ADDR_IN_USE};
 
 /// Every port this module has handed out in this process, by either route.

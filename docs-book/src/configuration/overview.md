@@ -77,7 +77,7 @@ Common sub-blocks seen in the Docker configs:
 | `SMF_PFCP_ADDR/PORT`, `UPF_PFCP_ADDR/PORT` | PFCP endpoints | SMF/UPF |
 | `AMF_NAS_SECURITY=nextgcore` | Forces the strict NAS-security path, overriding `nas.use_nextgcore_security` in YAML | amfd `lib.rs` |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Forces OAuth2 enforcement on the SBI server regardless of YAML | amfd `lib.rs` |
-| `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm. **Defaults to `production`** (mutually-authenticated TLS + a required OAuth2 access token). `dev`/`development`/`insecure`/`local`/`test` opt out to cleartext h2c; **any other value, including a typo, stays `production`** so a mistake cannot silently downgrade security | `nextgcore-sbi` `security.rs` |
+| `NEXTGCORE_SBI_PROFILE` | SBI security profile for every SBI NF (#1795). **Defaults to `production`** (mutually-authenticated TLS + a required OAuth2 access token). `dev`/`development`/`insecure`/`local`/`test` opt out to cleartext h2c; **any other value, including a typo, stays `production`** so a mistake cannot silently downgrade security | `nextgcore-sbi` `security.rs` |
 | `NEXTGCORE_SBI_TLS_CERT` / `_KEY` / `_CA` | Override the production profile's **server** certificate paths (defaults under `/etc/nextgcore/tls/`), so the certs can be mounted wherever the deployment puts them | `nextgcore-sbi` `security.rs` |
 | `NEXTGCORE_SBI_TLS_CLIENT_CERT` / `_CLIENT_KEY` | Override the certificate this NF **presents when it dials a peer**. Under mTLS an NF is both server and client, and a deployment may mount the two roles' material separately | `nextgcore-sbi` `security.rs` |
 | NRF URI `https://…` | How every NF reaches **its NRF** (#1617): NFRegister / NFUpdate / NFDeregister, heartbeats, discovery, subscriptions, the access-token and JWKS requests. An `https://` NRF URI (or the `production` profile) dials TLS with the NRF client TLS below, whatever the profile says about other peers; an `http://` NRF URI under `dev` stays h2c. The NRF binds registration to the presented certificate's `urn:uuid:` URI SAN and RFC 9310 NFTypes | `nextgcore-sbi` `nrf_tls.rs` |
@@ -140,11 +140,23 @@ registrations.
 
 ### SBI security profile (issue #63)
 
-`amf`, `smf`, `ausf` and `udm` resolve `NEXTGCORE_SBI_PROFILE` at startup. Under
-`production`:
+Every NF that serves SBI resolves `NEXTGCORE_SBI_PROFILE` at startup (#1795;
+before it, only `amf`, `smf`, `ausf`, `udm` and `easdf`). Under `production`:
 
-* their **listener** serves SBI over mutually-authenticated TLS and requires an
-  OAuth2 access token whose audience is their own NF type;
+* its **listener** serves SBI over mutually-authenticated TLS and requires an
+  OAuth2 access token whose audience is its own NF type, whatever its own
+  `--tls` flag or config `tls` block says (the profile's certificate wins).
+  Under `dev` the NF's own `--tls` still applies. The exceptions, each by
+  what its callers can present:
+  * `scp` and `sepp` verify the client certificate but require no token of
+    their own: a proxied or roaming request carries the token for the
+    producer, which checks it (TS 33.501 §13.4.1.2). The SEPP's N32 listener
+    refuses to start without `--tls` (N32-c is TLS, TS 33.501 §13.2.1);
+  * `ees` and `pin` serve TLS without demanding a client certificate or a
+    token at the listener: their callers are UEs and application servers
+    (TS 23.558, TS 23.542). The EES's per-operation gate checks tokens;
+  * `nrf` serves its own TLS (`nrf.sbi.server[0].tls`) with a client
+    certificate optional (#1617), and refuses to start without TLS;
 * their **outbound peer calls** use `https`, presenting this NF's client
   certificate and verifying the peer against the configured CA;
 * they **refuse to start** when any certificate named above is missing —
@@ -153,8 +165,7 @@ registrations.
 
 The outbound half also covers the shared peer-client cache in
 `nextgcore-sbi`'s global context, so **peripheral NFs that resolve peers through
-it follow the profile too**. Their own listeners are still configured by their
-individual `--tls` flags rather than by this profile.
+it follow the profile too**.
 
 **Every NF presents tokens under `production`** (#1665). `bsf`, `dccf`, `lmf`,
 `mbsmf`, `nsacf`, `nssf`, `nwdaf`, `pcf`, `tsctsf`, `ucmf` and `udr` install their
