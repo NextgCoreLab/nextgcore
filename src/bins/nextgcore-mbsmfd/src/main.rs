@@ -1190,20 +1190,62 @@ async fn create_amf_mbs_context(
         notify_token: token.commit(),
         tmgi: Some(tmgi),
     };
+    // #2068: from the 201 on, the AMF holds this context. Until a session's
+    // record or a finished release accounts for it, dropping this create parks
+    // its ContextDelete for the reconciler, so an abort cannot leave the context
+    // at the AMF recorded nowhere.
+    let created = CreatedAmfContext::new(record.clone());
     let recorded = mbsmf_self()
         .read()
         .map(|c| c.record_amf_context(session_id, record.clone()))
         .unwrap_or(false);
     drop(lane);
     if recorded {
+        created.settle();
         return Some(context_ref);
     }
     log::warn!(
         "MBS session {session_id} was released while its ContextCreate was in flight; \
          deleting the AMF context {context_ref}"
     );
+    // #2068: an abort during this delete parks it (the guard); once it returns,
+    // the context is deleted, or its retries own it (and then the reconciler).
     release_amf_contexts(vec![record]).await;
+    created.settle();
     None
+}
+
+/// #2068: an AMF context a ContextCreate was answered with (201), not yet
+/// accounted for by a session's record or by a finished release. Dropped
+/// unsettled -- the create's task aborted between the 201 and either -- it parks
+/// the context's ContextDelete with [`reconcile`], which delivers it (or drops
+/// it, if a live session holds the context again by then).
+struct CreatedAmfContext(Option<AmfMbsContext>);
+
+impl CreatedAmfContext {
+    fn new(context: AmfMbsContext) -> Self {
+        Self(Some(context))
+    }
+
+    /// A record or a finished release accounts for the context now.
+    fn settle(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CreatedAmfContext {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            log::warn!(
+                "MBS: the ContextCreate that made AMF {}:{} MBS context {} was dropped \
+                 before the context was recorded or released; parking its ContextDelete",
+                c.host,
+                c.port,
+                c.context_ref
+            );
+            reconcile::park(vec![c]);
+        }
+    }
 }
 
 /// #1817: what `/metrics` serves: the families every NF shares and the reconciler's.
