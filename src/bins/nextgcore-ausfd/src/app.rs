@@ -1082,10 +1082,14 @@ fn refuse_foreign_caller(ue: &crate::context::AusfUe, request: &SbiRequest) -> O
 /// #1907: who may Deregister a SUPI (TS 29.509 §5.2.2.3): "the NF Service
 /// Consumer (e.g. UDM)" clearing a stale security context. A caller with a
 /// verified identity must be the NF that started the UE's current
-/// authentication, or present a client certificate whose RFC 9310 NFTypes
-/// name the UDM. Any other AMF is refused, so it cannot purge another UE's
-/// KAUSF. A caller with no verified identity is refused (#1928). `Some` is the
-/// refusal to send, before anything is removed.
+/// authentication, present a client certificate whose RFC 9310 NFTypes name the
+/// UDM, or (#1918) present an access token this AUSF verified whose scope
+/// carries `nausf-auth:ue-authentications`. The NRF grants that scope to the
+/// UDM only ([`AUSF_RESOURCE_SCOPES`]), so it proves a UDM that reached this
+/// AUSF through an SCP, whose certificate is the SCP's. Any other AMF is
+/// refused, so it cannot purge another UE's KAUSF. A caller with no verified
+/// identity is refused (#1928). `Some` is the refusal to send, before anything
+/// is removed.
 fn refuse_deregister(
     ue: Option<&crate::context::AusfUe>,
     request: &SbiRequest,
@@ -1106,7 +1110,13 @@ fn refuse_deregister(
         .iter()
         .any(|ty| ty.eq_ignore_ascii_case("UDM"));
     let is_owner = owner.is_some_and(|o| o.eq_ignore_ascii_case(&caller));
-    if is_udm || is_owner {
+    // #1918: the verified token's scope, not a claim the request makes.
+    let has_scope = request.oauth2_scope.as_deref().is_some_and(|scope| {
+        scope
+            .split_whitespace()
+            .any(|s| s == nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS)
+    });
+    if is_udm || is_owner || has_scope {
         return None;
     }
     log::debug!("Deregister refused: NF {caller} is neither the UDM nor the context's owner");
@@ -2059,10 +2069,12 @@ async fn send_udm_auth_result(
 /// instance) and [`build_nf_profile`] (the NFProfile PUT to the NRF), so the two
 /// cannot drift.
 const AUSF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
-    // TS 29.509 Nausf_UEAuthentication, consumed by the AMF.
+    // TS 29.509 Nausf_UEAuthentication, consumed by the AMF, and by the UDM
+    // for Deregister (§5.2.2.3, #1918): without it here the NRF grants a UDM
+    // no `nausf-auth` token at all.
     (
         nextgcore_sbi::types::SbiServiceType::NausfAuth,
-        &["AMF", "SCP"],
+        &["AMF", "UDM", "SCP"],
     ),
     // TS 29.509 Nausf_SoRProtection. Wave-6 F-03: the UDM discovers the AUSF
     // holding the latest K_AUSF BY SERVICE NAME (TS 33.501 §6.14.2.1 step 8), so
@@ -2077,6 +2089,47 @@ const AUSF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
         &["UDM", "SCP"],
     ),
 ];
+
+/// #1918: the resource-level scopes of an AUSF service, and the ONE NF type each
+/// is registered for in `allowedOperationsPerNfType` (TS 29.510 Table
+/// 6.1.6.2.3-1 NOTE 11), so the NRF grants it to that type only. The UDM
+/// Deregisters (TS 29.509 §5.2.2.3) and, reaching the AUSF through an SCP,
+/// presents the SCP's certificate, so its type is proven by the NRF's grant of
+/// this scope instead ([`refuse_deregister`]). Spelling: the vendored OpenAPI's
+/// (`nextgcore_sbi::resource_scope`).
+const AUSF_RESOURCE_SCOPES: &[(&str, &str, &str)] = &[(
+    "nausf-auth",
+    nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS,
+    "UDM",
+)];
+
+/// The `allowedOperationsPerNfType` of AUSF service `name`, or `None` when the
+/// service has no resource-level scope (#1918), as udrd builds its own (#1811).
+///
+/// NOTE 11: once the map is present it must name EVERY NF type allowed the
+/// service, with all its scopes, the service-level one included: a type left
+/// out is barred from the whole service. So each of `allowed` gets the
+/// service-level scope, and only the type [`AUSF_RESOURCE_SCOPES`] names gets a
+/// resource scope.
+fn ausf_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::Value> {
+    if !AUSF_RESOURCE_SCOPES.iter().any(|(svc, _, _)| *svc == name) {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = allowed
+        .iter()
+        .map(|nf_type| {
+            let mut scopes = vec![name.to_string()];
+            scopes.extend(
+                AUSF_RESOURCE_SCOPES
+                    .iter()
+                    .filter(|(svc, _, t)| *svc == name && t == nf_type)
+                    .map(|(_, scope, _)| scope.to_string()),
+            );
+            (nf_type.to_string(), serde_json::json!(scopes))
+        })
+        .collect();
+    Some(serde_json::Value::Object(map))
+}
 
 /// Build this AUSF's typed self NF instance from [`AUSF_SERVICES`].
 fn build_ausf_nf_instance(
@@ -2116,7 +2169,7 @@ fn build_nf_profile(
         .iter()
         .map(|(service_type, allowed)| {
             let name = service_type.to_name();
-            serde_json::json!({
+            let mut service = serde_json::json!({
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
@@ -2127,7 +2180,11 @@ fn build_nf_profile(
                     "port": sbi_port
                 }],
                 "allowedNfTypes": allowed,
-            })
+            });
+            if let Some(ops) = ausf_allowed_operations(name, allowed) {
+                service["allowedOperationsPerNfType"] = ops;
+            }
+            service
         })
         .collect();
 
@@ -3880,6 +3937,116 @@ mod tests {
         let r = handle_ue_authentication_deregister(&deregister(udm)).await;
         assert_eq!(r.status, 204, "{:?}", r.http.content);
         assert!(!held());
+    }
+
+    /// **#1918.** A UDM reaching this AUSF through an SCP presents the SCP's
+    /// certificate and a token naming itself. Its Deregister is admitted when
+    /// that verified token carries `nausf-auth:ue-authentications`, which the NRF
+    /// grants the UDM only (TS 29.509 OpenAPI `security`, TS 29.510 NOTE 11), and
+    /// refused without it, context intact.
+    ///
+    /// REVERT-VERIFIED: with `has_scope` dropped from `refuse_deregister`, the
+    /// scoped Deregister is 403 and the second assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn a_udm_via_the_scp_deregisters_on_its_resource_scope_1918() {
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+        ausf_context_init(128);
+        let supi = "imsi-001010000001918";
+        let ctx = ausf_self();
+        {
+            let guard = ctx.read().unwrap();
+            let mut ue = guard.ue_add("suci-0-001-01-0000-0-0-1918000001").unwrap();
+            ue.supi = Some(supi.into());
+            ue.owner = Some(AMF_A_1872.into());
+            assert!(guard.ue_begin_authentication(&ue));
+            guard.ue_set_supi(ue.id, supi);
+        }
+        let held = || ausf_self().read().unwrap().ue_find_by_supi(supi).is_some();
+        let via_scp = |scope: &str| {
+            let mut req = as_nf_1872(
+                SbiRequest::default(),
+                Some("19180000-0000-4000-8000-0000000000d1"),
+                Some("19180000-0000-4000-8000-0000000000c1"),
+            );
+            req.peer_cert_nf_types = vec!["SCP".into()];
+            req.oauth2_scope = Some(scope.to_string());
+            req.with_body(
+                serde_json::json!({ "supi": supi }).to_string(),
+                "application/json",
+            )
+        };
+
+        let r = handle_ue_authentication_deregister(&via_scp("nausf-auth")).await;
+        assert_eq!(
+            r.status, 403,
+            "the service scope alone: {:?}",
+            r.http.content
+        );
+        assert!(held(), "refused, the context is intact");
+
+        let r = handle_ue_authentication_deregister(&via_scp(
+            "nausf-auth nausf-auth:ue-authentications",
+        ))
+        .await;
+        assert_eq!(
+            r.status, 204,
+            "the UDM's resource scope: {:?}",
+            r.http.content
+        );
+        assert!(!held(), "the stale context is cleared");
+    }
+
+    /// **#1918.** The AUSF registers the Deregister resource scope for the UDM
+    /// (TS 29.510 Table 6.1.6.2.3-1 NOTE 11): `nausf-auth` admits the UDM, and
+    /// its `allowedOperationsPerNfType` names every allowed type with the
+    /// service scope, the UDM alone with the resource scope too. The other
+    /// services carry no map.
+    ///
+    /// REVERT-VERIFIED: with the map not attached in `build_nf_profile`, the
+    /// first map assertion fails; with UDM dropped from `AUSF_SERVICES`, the
+    /// allowedNfTypes assertion fails.
+    #[test]
+    fn the_profile_grants_the_deregister_scope_to_the_udm_only_1918() {
+        let profile = build_nf_profile(
+            "ausf-1918",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let auth = services
+            .iter()
+            .find(|s| s["serviceName"] == "nausf-auth")
+            .expect("nausf-auth");
+        let allowed: Vec<&str> = auth["allowedNfTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(allowed.contains(&"UDM"), "{allowed:?}");
+        let ops = &auth["allowedOperationsPerNfType"];
+        assert_eq!(
+            ops["UDM"],
+            serde_json::json!(["nausf-auth", "nausf-auth:ue-authentications"])
+        );
+        for t in ["AMF", "SCP"] {
+            assert_eq!(ops[t], serde_json::json!(["nausf-auth"]), "{t}");
+        }
+        assert_eq!(
+            ops.as_object().map(|m| m.len()),
+            Some(allowed.len()),
+            "NOTE 11: every allowed type is in the map, or it is barred"
+        );
+        for svc in services.iter().filter(|s| s["serviceName"] != "nausf-auth") {
+            assert!(
+                svc.get("allowedOperationsPerNfType").is_none(),
+                "{}",
+                svc["serviceName"]
+            );
+        }
     }
 
     // ====================================================================

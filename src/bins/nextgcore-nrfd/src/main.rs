@@ -188,6 +188,21 @@ struct SbiServerTlsYaml {
     min_version: Option<String>,
 }
 
+/// #1926 (DECISION 2026-11-19): whether the NRF requires verified callers, for
+/// [`NrfPolicy::require_subscriber_identity`] (#1809) and
+/// [`NrfPolicy::require_registrant_nf_types`] (#1917). Yes under the production
+/// profile, and whenever the listener serves TLS: [`NrfServerTls::apply`] then
+/// verifies every presented client certificate against its CA, so the NRF CAN
+/// verify its callers, and the profile is only a deployment label. k8s and helm
+/// run the NRF on the dev profile (#1897) with TLS, so this is what keeps the
+/// refusals on there.
+fn verification_required(
+    profile: nextgcore_sbi::security::SbiProfile,
+    server_tls: Option<&NrfServerTls>,
+) -> bool {
+    profile.is_production() || server_tls.is_some()
+}
+
 /// Whether the NRF's listener demands a client certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientAuth {
@@ -1871,15 +1886,21 @@ async fn main() -> Result<()> {
     // against this allowlist, and a heartbeating NF never re-registers, so the
     // claim is enforced here, before the policy is published.
     enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());
-    // #1809: subscriptions are bound to a verified identity under production.
-    policy.require_subscriber_identity =
-        nextgcore_sbi::security::SbiProfile::resolve().is_production();
-    // #1917: and NF management to the NF type the caller's certificate names.
-    policy.require_registrant_nf_types =
-        nextgcore_sbi::security::SbiProfile::resolve().is_production();
-    if !policy.require_registrant_nf_types {
+    // #1809 / #1917, and #1926 (DECISION 2026-11-19): subscriptions are bound to
+    // a verified identity, and NF management to the NF type the caller's
+    // certificate names, wherever the NRF can verify callers: under the
+    // production profile, or whenever its listener verifies client certificates.
+    let verification = verification_required(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        server_tls.as_ref(),
+    );
+    policy.require_subscriber_identity = verification;
+    policy.require_registrant_nf_types = verification;
+    if !verification {
         log::warn!(
-            "nrfd-1917: dev SBI profile: a registrant whose certificate names no NF type              (RFC 9310 NFTypes), or whose identity was forwarded by a terminator, may              register as any NF type"
+            "nrfd-1926: dev SBI profile and no TLS client-certificate verification: \
+             NFStatusSubscribe needs no verified identity, and a registrant may register as \
+             any NF type"
         );
     }
     if policy.require_subscriber_identity {
@@ -2435,6 +2456,20 @@ fn registration_notification_event(is_new: bool) -> NotificationEventType {
 }
 
 /// Handle NF Register request
+/// R32 on #1957: 400 with `invalidParams` for a profile whose range patterns
+/// are over this NRF's caps (TS 29.500 §5.2.7.2), before anything is stored.
+fn refuse_range_patterns(profile: &serde_json::Value) -> Option<SbiResponse> {
+    let (param, reason) = nextgcore_nrfd::nnrf_handler::range_pattern_violation(profile)?;
+    let body = serde_json::json!({
+        "title": "Bad Request",
+        "status": 400,
+        "detail": reason,
+        "cause": "INVALID_MSG_FORMAT",
+        "invalidParams": [{ "param": param, "reason": reason }],
+    });
+    Some(SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json"))
+}
+
 async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
     // #1633: the registry key (TS 29.510 §5.2.2.2.2: upper-case UUIDs are handled as
     // lower-case).
@@ -2467,6 +2502,9 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
+    if let Some(refused) = refuse_range_patterns(&profile) {
+        return refused;
+    }
     // Mandatory attribute validation (TS 29.510 Table 6.1.6.2.2-1:
     // nfInstanceId, nfType, nfStatus) -> 400 ProblemDetails.
     let nf_profile = match NfProfile::from_json(&profile) {
@@ -2866,6 +2904,16 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         }
     }
 
+    // A patch that adds or changes range patterns is held to the caps. One that
+    // leaves them as they were (a heartbeat of a profile restored from before
+    // the caps) is not refused for them; discovery excludes that profile.
+    if nextgcore_nrfd::nnrf_handler::range_pattern_violation(&doc)
+        != nextgcore_nrfd::nnrf_handler::range_pattern_violation(&pre_patch_doc)
+    {
+        if let Some(refused) = refuse_range_patterns(&doc) {
+            return refused;
+        }
+    }
     // The patched document must still be a valid NFProfile with the same
     // identity (nfInstanceId is read-only for the resource).
     let mut updated = match NfProfile::from_json(&doc) {
@@ -6350,6 +6398,60 @@ mod tests {
     const AUTH_SUBS_READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
     const AUTH_SUBS_MODIFY: &str = "nudr-dr:subscription-data:authentication-subscription:modify";
 
+    /// #1918: the AUSF profile ausfd registers (`build_nf_profile`, pinned by
+    /// ausfd's `the_profile_grants_the_deregister_scope_to_the_udm_only_1918`).
+    /// The two must stay in step: this is the NRF half of that exchange.
+    fn ausf_with_deregister_scope() -> NfProfile {
+        auth_producer(
+            "AUSF",
+            serde_json::json!([{
+                "serviceInstanceId": "ausf-auth",
+                "serviceName": "nausf-auth",
+                "allowedNfTypes": ["AMF", "UDM", "SCP"],
+                "allowedOperationsPerNfType": {
+                    "AMF": ["nausf-auth"],
+                    "UDM": ["nausf-auth", nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS],
+                    "SCP": ["nausf-auth"]
+                }
+            }]),
+            Some(serde_json::json!(["AMF", "UDM", "SCP"])),
+        )
+    }
+
+    /// #1918: the NRF grants the UDM the AUSF's Deregister resource scope with
+    /// the service scope, and an AMF only the service scope, so a token carrying
+    /// `nausf-auth:ue-authentications` proves a UDM even through an SCP.
+    #[test]
+    fn the_deregister_scope_is_granted_to_the_udm_only_1918() {
+        let ausf = ausf_with_deregister_scope();
+        let requested: Vec<String> = vec![
+            "nausf-auth".into(),
+            nextgcore_sbi::resource_scope::NAUSF_AUTH_UE_AUTHENTICATIONS.into(),
+        ];
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the UDM is authorized");
+        assert_eq!(udm, requested, "the UDM gets both scopes");
+        let amf = authorize_access_token(
+            &auth_consumer("AMF"),
+            "AMF",
+            "AUSF",
+            &requested,
+            std::slice::from_ref(&ausf),
+            &[],
+            &[],
+        )
+        .expect("the AMF keeps its service scope");
+        assert_eq!(amf, vec!["nausf-auth".to_string()]);
+    }
+
     /// #1811: only the UDM is granted the AuthenticationSubscription scope.
     /// A PCF or NEF asking for it gets the service scope alone (RFC 6749 §3.3
     /// lets the server narrow the request), so its token cannot read K at the
@@ -7982,6 +8084,58 @@ mod tests {
         // The supervision timer is armed at 2x the negotiated value.
         let hb = negotiate_heartbeat(None, 10, 1, 3600);
         assert_eq!((hb as u64) * 2, 20);
+    }
+
+    /// R32 on #1957 M1: a profile declaring more range patterns than the cap
+    /// is refused 400 with `invalidParams` and nothing is stored; at the cap it
+    /// registers. REVERT-VERIFIED: with the `refuse_range_patterns` call removed
+    /// from NFRegister, the over-cap profile answers 201.
+    #[tokio::test]
+    async fn a_profile_over_the_range_pattern_cap_is_refused_1879() {
+        use serde_json::json;
+        let profile = |id: &str, n: usize| {
+            let ranges: Vec<serde_json::Value> = (0..n)
+                .map(|k| json!({ "pattern": format!("imsi-00101{k:04}[0-9]+") }))
+                .collect();
+            json!({
+                "nfInstanceId": id, "nfType": "UDM", "nfStatus": "REGISTERED",
+                "udmInfo": { "supiRanges": ranges },
+            })
+        };
+        let register = |id: &'static str, body: serde_json::Value| async move {
+            let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"));
+            req.http.set_content(body.to_string());
+            req.peer_cert_nf_instance_id = Some(id.into());
+            req.peer_cert_nf_types = vec!["UDM".into()];
+            handle_nf_register(id, &req).await
+        };
+        let over = "aaaaaaaa-1879-4000-8000-000000000065";
+        let resp = register(
+            over,
+            profile(
+                over,
+                nextgcore_nrfd::nnrf_handler::MAX_RANGE_PATTERNS_PER_PROFILE + 1,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["invalidParams"][0]["param"],
+            "/udmInfo/supiRanges/64/pattern"
+        );
+        assert!(nf_manager().get(over).is_none(), "nothing stored");
+        let at = "aaaaaaaa-1879-4000-8000-000000000064";
+        let resp = register(
+            at,
+            profile(
+                at,
+                nextgcore_nrfd::nnrf_handler::MAX_RANGE_PATTERNS_PER_PROFILE,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
     }
 
     #[tokio::test]
@@ -15171,5 +15325,135 @@ mod registrant_nf_type_tests_1917 {
             .scope(false, handle_nf_deregister(id, &delete))
             .await;
         assert_eq!(r.status, 204, "dev NFDeregister: {:?}", r.http.content);
+    }
+}
+
+/// #1926 (DECISION 2026-11-19): the NRF requires verified callers wherever it can
+/// verify them, not only under the production profile.
+#[cfg(test)]
+mod verification_required_tests_1926 {
+    use super::*;
+    use nextgcore_sbi::security::SbiProfile;
+
+    fn tls() -> NrfServerTls {
+        NrfServerTls {
+            cert: "nrf.crt".into(),
+            key: "nrf.key".into(),
+            ca: "ca.crt".into(),
+            client_auth: ClientAuth::Optional,
+        }
+    }
+
+    /// The decision as a table: production, or a listener that verifies client
+    /// certificates. Optional client auth counts: a presented certificate is
+    /// verified, so a caller can be.
+    ///
+    /// REVERT-VERIFIED: with `|| server_tls.is_some()` dropped, the dev-with-TLS
+    /// row fails.
+    #[test]
+    fn verified_callers_are_required_wherever_the_nrf_can_verify_them_1926() {
+        assert!(
+            !verification_required(SbiProfile::Dev, None),
+            "dev, cleartext"
+        );
+        assert!(
+            verification_required(SbiProfile::Dev, Some(&tls())),
+            "dev, TLS"
+        );
+        assert!(verification_required(SbiProfile::Production, None));
+        let required = NrfServerTls {
+            client_auth: ClientAuth::Required,
+            ..tls()
+        };
+        assert!(verification_required(SbiProfile::Dev, Some(&required)));
+    }
+
+    /// Every shipped stack's NRF serves TLS, so under the dev profile those
+    /// stacks have the refusals on: the docker compose nrf.yaml, the k8s
+    /// ConfigMap and the Helm chart as rendered (CI sets NEXTGCORE_HELM_REQUIRED,
+    /// so the Helm leg is never skipped there). A dev NRF without TLS keeps them
+    /// off.
+    #[test]
+    fn every_shipped_stack_requires_verified_callers_under_dev_1926() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut stacks: Vec<(String, String)> = vec![(
+            "docker nrf.yaml".into(),
+            std::fs::read_to_string(root.join("docker/rust/configs/5gc/nrf.yaml")).unwrap(),
+        )];
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        stacks.push((
+            "k8s ConfigMap nrf.yaml".into(),
+            cm["data"]["nrf.yaml"]
+                .as_str()
+                .expect("nrf.yaml")
+                .to_string(),
+        ));
+        if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "nrf.yaml") {
+            stacks.push(("Helm nrf.yaml".into(), text));
+        }
+        let flags = TlsFlags {
+            tls: false,
+            cert: None,
+            key: None,
+            mtls: false,
+            ca: None,
+        };
+        for (name, text) in &stacks {
+            let yaml: NrfYaml =
+                serde_yaml::from_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let server_tls = resolve_server_tls(
+                &flags,
+                |_| None,
+                yaml.nrf
+                    .as_ref()
+                    .and_then(|n| n.sbi.as_ref())
+                    .and_then(|s| s.server.as_ref())
+                    .and_then(|v| v.first())
+                    .and_then(|s| s.tls.as_ref()),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                verification_required(SbiProfile::Dev, server_tls.as_ref()),
+                "{name}: the NRF verifies client certificates, so it requires verified callers"
+            );
+        }
+        // A dev NRF with TLS turned off by the environment: unchanged, off.
+        let off = resolve_server_tls(
+            &flags,
+            |v| (v == NRF_SERVER_TLS_ENV).then(|| "false".to_string()),
+            None,
+        )
+        .unwrap();
+        assert!(!verification_required(SbiProfile::Dev, off.as_ref()));
+    }
+
+    /// `main` sets BOTH policies from [`verification_required`], after the
+    /// listener's TLS is resolved and before the policy is published.
+    ///
+    /// REVERT-VERIFIED: with either assignment back on the profile alone, this
+    /// fails.
+    #[test]
+    fn main_sets_both_policies_from_the_listener_s_verification_1926() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main
+            .find("\n    NRF_POLICY.set(policy).ok();\n")
+            .expect("the policy is published")];
+        let tls_at = main
+            .find("let server_tls = resolve_server_tls(")
+            .expect("TLS");
+        let at = main
+            .find("let verification = verification_required(")
+            .expect("verification_required is called");
+        assert!(tls_at < at, "the listener's TLS is resolved first");
+        for policy in [
+            "policy.require_subscriber_identity = verification;",
+            "policy.require_registrant_nf_types = verification;",
+        ] {
+            assert!(main[at..].contains(policy), "{policy}");
+        }
     }
 }

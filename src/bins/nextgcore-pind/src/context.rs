@@ -149,6 +149,24 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// #1873: the first ID sequence number of this process: the boot time in
+/// microseconds since the epoch. IDs used to restart at 1, so after a restart a
+/// stale PINE still holding `pe-2` heartbeated, or relayed through, whichever
+/// element the new process numbered 2 (TS 23.542 §8.8: the PIN server
+/// identifies an element by the identifier it assigned). Seeding from the
+/// clock keeps IDs increasing across restarts (so "lowest id" still means
+/// "registered first", PIND-07) without persisting a counter: a restart
+/// happens more than a microsecond after the last allocation of the previous
+/// process, and allocations run far slower than one per microsecond.
+fn boot_id_base() -> usize {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as usize)
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Extract the numeric sequence from a `prefix-N` id for "lowest-id" ordering
 /// (PIND-07 take-over picks the lowest-id backup). A non-numeric / malformed id
 /// sorts last (`u64::MAX`) so it never silently wins a take-over.
@@ -279,8 +297,8 @@ impl PinContextError {
     pub fn detail(&self) -> &'static str {
         match self {
             PinContextError::PemcRequiresOwner => {
-                "Registering a PEMC (management) element requires the caller \
-                 to be the PIN owner or an already-registered PEMC of this PIN"
+                "The caller must be the PIN owner or an already-registered PEMC \
+                 of this PIN (or, for a heartbeat or relay path, the element itself)"
             }
             PinContextError::RelayOnlyForPegc => {
                 "A relay path may only be set on a PEGC (gateway) element"
@@ -318,6 +336,37 @@ fn caller_is_owner_or_pemc(
             .map(|e| e.role == PinElementRole::Pemc && e.host_supi.as_deref() == Some(caller))
             .unwrap_or(false)
     })
+}
+
+/// #1873: `caller` may act on `element_id` as the element itself (its hosting
+/// UE's SUPI) or as the owner or a PEMC of its PIN. With `pin_id`, the element
+/// must also belong to that PIN. `NotFound` for an unknown element, one outside
+/// `pin_id`, or one whose PIN is gone; `PemcRequiresOwner` for anyone else,
+/// including an anonymous caller.
+fn authorize_element_caller(
+    pins: &HashMap<String, PersonalIotNetwork>,
+    elements: &HashMap<String, PinElement>,
+    pin_id: Option<&str>,
+    element_id: &str,
+    caller: Option<&str>,
+) -> Result<(), PinContextError> {
+    let element = elements.get(element_id).ok_or(PinContextError::NotFound)?;
+    if pin_id.is_some_and(|p| p != element.pin_id) {
+        return Err(PinContextError::NotFound);
+    }
+    let pin = pins.get(&element.pin_id).ok_or(PinContextError::NotFound)?;
+    let caller = caller.unwrap_or("");
+    let is_self = !caller.is_empty() && element.host_supi.as_deref() == Some(caller);
+    if is_self || caller_is_owner_or_pemc(pin, caller, elements) {
+        Ok(())
+    } else {
+        log::debug!(
+            "PIN element {element_id}: caller {caller:?} is neither the element nor the \
+             owner/PEMC of PIN {}",
+            element.pin_id
+        );
+        Err(PinContextError::PemcRequiresOwner)
+    }
 }
 
 /// Pick the lowest-id member of `pin` whose granted role equals `role`,
@@ -381,7 +430,7 @@ impl PinContext {
             pin_networks: RwLock::new(HashMap::new()),
             elements: RwLock::new(HashMap::new()),
             owner_index: RwLock::new(HashMap::new()),
-            next_id: AtomicUsize::new(1),
+            next_id: AtomicUsize::new(boot_id_base()),
             max_pins: 0,
             default_pin_lifetime_secs: DEFAULT_PIN_LIFETIME_SECS,
             default_heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
@@ -811,11 +860,26 @@ impl PinContext {
 
     /// Reset an element's keep-alive timestamp (PIND-09). Accepts a heartbeat
     /// from the PINE/PEMC/PEGC and slides its liveness deadline forward.
-    pub fn element_heartbeat(&self, element_id: &str) -> Result<(), PinContextError> {
+    ///
+    /// #1873: the element must belong to `pin_id` (the `{pinId}` path segment,
+    /// else `NotFound`), and the caller must be the element itself (its hosting
+    /// UE), the PIN owner or a PEMC of the PIN (else `PemcRequiresOwner`), so a
+    /// stale or foreign PINE cannot keep another owner's element alive.
+    pub fn element_heartbeat(
+        &self,
+        pin_id: &str,
+        element_id: &str,
+        caller_supi: Option<&str>,
+    ) -> Result<(), PinContextError> {
+        let pins = self
+            .pin_networks
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
         let mut elements = self
             .elements
             .write()
             .map_err(|_| PinContextError::NotFound)?;
+        authorize_element_caller(&pins, &elements, Some(pin_id), element_id, caller_supi)?;
         match elements.get_mut(element_id) {
             Some(e) => {
                 e.last_heartbeat = now_epoch_secs();
@@ -940,12 +1004,21 @@ impl PinContext {
     ///   - `Ok(())` on success.
     ///   - `Err(PinContextError::NotFound)` when the element does not exist.
     ///   - `Err(PinContextError::RelayOnlyForPegc)` when the element is not a PEGC.
+    ///
+    /// #1873: only the PEGC itself (its hosting UE), the PIN owner or a PEMC of
+    /// its PIN may set the relay path (else `PemcRequiresOwner`), checked before
+    /// anything changes.
     pub fn element_set_relay(
         &self,
         element_id: &str,
         relay_path: Vec<String>,
+        caller_supi: Option<&str>,
     ) -> Result<(), PinContextError> {
+        let Ok(pins) = self.pin_networks.read() else {
+            return Err(PinContextError::NotFound);
+        };
         if let Ok(mut elements) = self.elements.write() {
+            authorize_element_caller(&pins, &elements, None, element_id, caller_supi)?;
             match elements.get_mut(element_id) {
                 None => Err(PinContextError::NotFound),
                 Some(element) => {
@@ -1500,7 +1573,8 @@ mod tests {
             let mut elements = ctx.elements.write().unwrap();
             elements.get_mut(&elem.element_id).unwrap().last_heartbeat = 0;
         }
-        ctx.element_heartbeat(&elem.element_id).unwrap();
+        ctx.element_heartbeat(&pin.pin_id, &elem.element_id, Some("imsi-owner-001"))
+            .unwrap();
         let refreshed = ctx.element_find(&elem.element_id).unwrap();
         assert!(
             refreshed.last_heartbeat > 0,
@@ -1634,7 +1708,11 @@ mod tests {
             )
             .unwrap();
 
-        let result = ctx.element_set_relay(&gw.element_id, vec!["pe-upstream".to_string()]);
+        let result = ctx.element_set_relay(
+            &gw.element_id,
+            vec!["pe-upstream".to_string()],
+            Some("imsi-001010000000001"),
+        );
         assert!(result.is_ok(), "relay on PEGC should succeed");
 
         let found = ctx.element_find(&gw.element_id).unwrap();
@@ -1657,7 +1735,11 @@ mod tests {
             )
             .unwrap();
 
-        let result = ctx.element_set_relay(&elem.element_id, vec!["pe-gw".to_string()]);
+        let result = ctx.element_set_relay(
+            &elem.element_id,
+            vec!["pe-gw".to_string()],
+            Some("imsi-001010000000001"),
+        );
         assert_eq!(
             result.unwrap_err(),
             PinContextError::RelayOnlyForPegc,
@@ -1665,10 +1747,141 @@ mod tests {
         );
     }
 
+    /// #1873: IDs do not restart at 1, so a restart cannot hand a stale PINE's
+    /// `pe-2` to another owner's element; and they still increase, so "lowest
+    /// id" (PIND-07 take-over) keeps meaning "registered first".
+    /// REVERT-VERIFIED: with `next_id` seeded at 1 again the two contexts (two
+    /// process lifetimes) mint the same IDs and the disjointness assertion fails.
+    #[test]
+    fn ids_are_unique_across_a_restart_and_still_increase_1873() {
+        let mint = || {
+            let mut ctx = PinContext::new();
+            ctx.init(8);
+            let pin = ctx.pin_create("Home", "imsi-owner-1873").unwrap();
+            let pe = ctx
+                .element_register(
+                    &pin.pin_id,
+                    reg(PinElementType::Element, vec![], None),
+                    None,
+                )
+                .unwrap();
+            (pin.pin_id, pe.element_id, pe.pin_client_id)
+        };
+        let before = mint();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let after = mint(); // a later process
+        for (a, b) in [
+            (&before.0, &after.0),
+            (&before.1, &after.1),
+            (&before.2, &after.2),
+        ] {
+            assert_ne!(a, b, "an ID is reused after a restart");
+            assert!(
+                id_seq(a) < id_seq(b),
+                "{a} vs {b}: IDs must keep increasing"
+            );
+        }
+        assert_ne!(before.0, "pin-1");
+    }
+
+    /// #1873: a heartbeat names its PIN and comes from the element itself or
+    /// the PIN's owner/PEMC; a foreign or anonymous caller, or the right caller
+    /// under the wrong PIN, keeps nothing alive.
+    /// REVERT-VERIFIED: with `authorize_element_caller` returning `Ok(())` the
+    /// foreign, anonymous and wrong-PIN heartbeats refresh the element; with
+    /// only the `pin_id` comparison dropped, the wrong-PIN one does.
+    #[test]
+    fn a_heartbeat_is_bound_to_its_pin_and_its_caller_1873() {
+        let mut ctx = PinContext::new();
+        ctx.init(8);
+        let mine = ctx.pin_create("Home", "imsi-owner-a-1873").unwrap();
+        let theirs = ctx.pin_create("Home", "imsi-owner-b-1873").unwrap();
+        let pe = ctx
+            .element_register(
+                &mine.pin_id,
+                reg(PinElementType::Element, vec![], None)
+                    .with_host_supi(Some("imsi-pine-1873".into())),
+                None,
+            )
+            .unwrap();
+        let stale = |ctx: &PinContext| {
+            ctx.elements
+                .write()
+                .unwrap()
+                .get_mut(&pe.element_id)
+                .unwrap()
+                .last_heartbeat = 0;
+        };
+        let alive = |ctx: &PinContext| ctx.element_find(&pe.element_id).unwrap().last_heartbeat > 0;
+        stale(&ctx);
+        for caller in [Some("imsi-owner-b-1873"), None, Some("")] {
+            assert_eq!(
+                ctx.element_heartbeat(&mine.pin_id, &pe.element_id, caller),
+                Err(PinContextError::PemcRequiresOwner),
+                "{caller:?}"
+            );
+        }
+        assert_eq!(
+            ctx.element_heartbeat(&theirs.pin_id, &pe.element_id, Some("imsi-pine-1873")),
+            Err(PinContextError::NotFound),
+            "the {{pinId}} path segment is honoured"
+        );
+        assert!(!alive(&ctx), "nothing refreshed it");
+        // The element itself and the owner both may.
+        ctx.element_heartbeat(&mine.pin_id, &pe.element_id, Some("imsi-pine-1873"))
+            .unwrap();
+        assert!(alive(&ctx));
+        stale(&ctx);
+        ctx.element_heartbeat(&mine.pin_id, &pe.element_id, Some("imsi-owner-a-1873"))
+            .unwrap();
+        assert!(alive(&ctx));
+    }
+
+    /// #1873: only the PEGC itself or its PIN's owner/PEMC sets its relay path.
+    /// REVERT-VERIFIED: with the `authorize_element_caller` call removed from
+    /// `element_set_relay` the foreign caller's relay path is stored.
+    #[test]
+    fn a_relay_path_is_set_by_the_owner_or_the_pegc_only_1873() {
+        let mut ctx = PinContext::new();
+        ctx.init(8);
+        let pin = ctx.pin_create("Home", "imsi-owner-r-1873").unwrap();
+        let gw = ctx
+            .element_register(
+                &pin.pin_id,
+                reg(PinElementType::Gateway, vec!["relay".into()], None)
+                    .with_host_supi(Some("imsi-gw-1873".into())),
+                Some("imsi-owner-r-1873"),
+            )
+            .unwrap();
+        for caller in [Some("imsi-other-1873"), None] {
+            assert_eq!(
+                ctx.element_set_relay(&gw.element_id, vec!["pe-evil".into()], caller),
+                Err(PinContextError::PemcRequiresOwner)
+            );
+        }
+        assert!(ctx
+            .element_find(&gw.element_id)
+            .unwrap()
+            .relay_path
+            .is_empty());
+        ctx.element_set_relay(&gw.element_id, vec!["pe-up".into()], Some("imsi-gw-1873"))
+            .unwrap();
+        ctx.element_set_relay(
+            &gw.element_id,
+            vec!["pe-up2".into()],
+            Some("imsi-owner-r-1873"),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.element_find(&gw.element_id).unwrap().relay_path,
+            vec!["pe-up2".to_string()]
+        );
+    }
+
     #[test]
     fn test_relay_set_on_nonexistent_element() {
         let ctx = PinContext::new();
-        let result = ctx.element_set_relay("nonexistent-id", vec![]);
+        let result = ctx.element_set_relay("nonexistent-id", vec![], Some("imsi-x"));
         assert_eq!(result.unwrap_err(), PinContextError::NotFound);
     }
 
@@ -1729,7 +1942,11 @@ mod tests {
             .unwrap();
 
         assert!(ctx
-            .element_set_relay(&elem.element_id, vec!["pe-gw".to_string()])
+            .element_set_relay(
+                &elem.element_id,
+                vec!["pe-gw".to_string()],
+                Some("imsi-001010000000001")
+            )
             .is_ok());
         let found = ctx.element_find(&elem.element_id).unwrap();
         assert_eq!(found.relay_path, vec!["pe-gw".to_string()]);

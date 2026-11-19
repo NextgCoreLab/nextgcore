@@ -39,6 +39,14 @@ pub const NUDR_DR_AUTH_SUBSCRIPTION_READ: &str =
 pub const NUDR_DR_AUTH_SUBSCRIPTION_MODIFY: &str =
     "nudr-dr:subscription-data:authentication-subscription:modify";
 
+/// TS 29.509 (`TS29509_Nausf_UEAuthentication.yaml`, the `security` of
+/// `/ue-authentications/deregister`): the resource-level scope of the
+/// Deregister service operation (§5.2.2.3), which "the NF Service Consumer (e.g.
+/// UDM)" invokes (#1918). The AUSF ADMITS it rather than requiring it, so it is
+/// not in [`required_resource_scope`]: the OpenAPI lists `nausf-auth` alone as
+/// well.
+pub const NAUSF_AUTH_UE_AUTHENTICATIONS: &str = "nausf-auth:ue-authentications";
+
 /// TS 29.536 Table 6.1.9-1: "Access (from a primary NSACF) to update the
 /// network slice local configuration" of a distributed NSACF (#1892).
 pub const NNSACF_NSAC_LOCAL_CONFIGS_UPDATE: &str = "nnsacf-nsac:local-configs-update";
