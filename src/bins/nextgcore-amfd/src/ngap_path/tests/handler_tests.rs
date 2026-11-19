@@ -6688,3 +6688,51 @@ async fn an_initial_emergency_request_uses_the_emergency_dnn_and_slice_2041() {
         assert_eq!(create["sNssai"]["sd"], "002041");
     }
 }
+
+/// **#2058.** An "existing emergency PDU session" request for the PSI whose routing
+/// context is the UE's emergency PDU session goes to that routing context's SMF, not
+/// to a fresh selection (TS 24.501 §5.4.5.2.5 a) vii)), still on the emergency DNN and
+/// S-NSSAI. Two SMFs: the session's owner, and the one selection resolves to.
+///
+/// REVERT-VERIFIED: with `emergency_session_smf` returning `None` (a fresh selection, as
+/// #2051 had it), this fails: the selected SMF gets the create and the owner none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_existing_emergency_session_request_goes_to_its_own_smf_2058() {
+    let (_owner, owner_port, owner_seen) = create_body_recording_smf_2041().await;
+    let (_selected, selected_port, selected_seen) = create_body_recording_smf_2041().await;
+    let _env = super::SmfEnvGuard::acquire(selected_port).await;
+    let mut server = capturing_ngap_server().await;
+    let emergency_dnn = server.emergency.emergency_dnn().to_string();
+    for (ue, ran, authenticated) in [(7_205_801u64, 261u32, false), (7_205_802, 262, true)] {
+        emergency_registered_ue_2041(&mut server, ue, ran, authenticated);
+        // The emergency PDU session PSI 5, held at the owner SMF.
+        assert!(server.emergency.assign_emergency_pdu_session(ue, 5));
+        server
+            .sm_context_smfs
+            .insert((ue, 5), ("127.0.0.1".to_string(), owner_port));
+        let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+        server
+            .handle_uplink_nas_transport(
+                ASSOC,
+                &uplink_nas_transport(ue, ran, &ul_nas_transport_2041(&request, 4, None, None, 0)),
+            )
+            .await
+            .expect("handled");
+        settle_establishments(&mut server).await;
+        server.sbi_offload.settle().await;
+        server.forget_ue(ue);
+    }
+    let owner_creates = owner_seen.lock().expect("seen").clone();
+    assert!(
+        selected_seen.lock().expect("seen").is_empty(),
+        "no SMF is selected afresh: {:?}",
+        selected_seen.lock().expect("seen")
+    );
+    assert_eq!(owner_creates.len(), 2, "both go to the session's SMF");
+    for create in &owner_creates {
+        assert_eq!(create["requestType"], "EXISTING_EMERGENCY_PDU_SESSION");
+        assert_eq!(create["pduSessionId"], 5);
+        assert_eq!(create["dnn"], emergency_dnn.as_str());
+    }
+}
