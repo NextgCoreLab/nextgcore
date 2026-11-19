@@ -428,7 +428,9 @@ impl OAuthVerifier {
         // claims, and refused only after it, so the refusal order is unchanged:
         // token, audience, service scope, then resource scope.
         let resource_refusal = match (&claims, resource_scope) {
-            (Ok(c), Some(scope)) if crate::oauth::check_token_scope(&c.scope, scope).is_err() => {
+            // #2079: with the yaml's alternatives (`subscription-data` grants
+            // `registrations:write`).
+            (Ok(c), Some(scope)) if !crate::resource_scope::token_grants(&c.scope, scope) => {
                 Some(BearerRefusal::InsufficientScope {
                     scope: scope.to_string(),
                     detail: format!(
@@ -3075,6 +3077,48 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == "nudr-dr"),
+            "{err:?}"
+        );
+    }
+
+    /// #2079: the gate honours the TS 29.505 yaml's alternatives. An
+    /// NF-registration write needs `registrations:write`, and a token carrying
+    /// `nudr-dr:subscription-data` instead passes too; a service-scope-only
+    /// token is refused naming `registrations:write`.
+    ///
+    /// REVERT-VERIFIED: with the gate back on `check_token_scope` (no
+    /// alternatives), the `subscription-data` token is refused and the
+    /// `alternative` assertion fails.
+    #[tokio::test]
+    async fn subscription_data_satisfies_a_registration_write_2079() {
+        use crate::resource_scope::{
+            NUDR_DR_REGISTRATIONS_WRITE as WRITE, NUDR_DR_SUBSCRIPTION_DATA as DATA,
+        };
+        let verifier_for = |jwks: serde_json::Value| OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks),
+            expected_audience: None,
+            expected_audience_instance: None,
+            callback_exemptions: Vec::new(),
+            resource_scopes: Some(crate::resource_scope::required_resource_scope),
+        };
+        let check = |scope: String| async move {
+            let (token, jwks) = token_jwks_with_scope("UDR", &scope);
+            let header = format!("Bearer {token}");
+            verifier_for(jwks)
+                .authorize(Some(&header), Some("nudr-dr"), Some(WRITE))
+                .await
+        };
+        assert!(
+            check(format!("nudr-dr {WRITE}")).await.is_ok(),
+            "registrations:write"
+        );
+        assert!(
+            check(format!("nudr-dr {DATA}")).await.is_ok(),
+            "alternative: subscription-data grants a registration write"
+        );
+        let err = check("nudr-dr".to_string()).await.unwrap_err();
+        assert!(
+            matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == WRITE),
             "{err:?}"
         );
     }
