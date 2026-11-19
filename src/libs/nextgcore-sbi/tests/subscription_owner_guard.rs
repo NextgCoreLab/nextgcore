@@ -7,7 +7,7 @@
 //! each NF. This test reads the daemon sources and fails when a crate routes a
 //! DELETE on a subscription resource without both halves of the binding: an
 //! owner recorded at create (`owner_for_new_resource`) and the caller checked
-//! before any side effect (`refuse_non_owner`). A new subscription route in a
+//! before any side effect (`refuse_non_owner` or `non_owner_refusal`). A new subscription route in a
 //! crate that never used the helper fails here, not in review.
 //!
 //! The detector is deliberately coarse (a crate, not a route): the per-NF
@@ -30,14 +30,6 @@ const EXEMPT: &[(&str, &str)] = &[
         "nextgcore-nefd",
         "#110: northbound AF subscriptions are bound to the authenticated SCS/AS \
          (authenticated_client_id), and the AF is not an NF with an NF Instance ID",
-    ),
-    (
-        "nextgcore-udrd",
-        "#1861: per-resource ownership in progress; moves onto owner_binding",
-    ),
-    (
-        "nextgcore-ucmfd",
-        "#1862: per-resource ownership in progress; moves onto owner_binding",
     ),
 ];
 
@@ -123,9 +115,10 @@ fn every_nf_serving_subscriptions_binds_them_to_their_creator() {
         let binds_at_create = code
             .iter()
             .any(|c| c.contains("owner_binding::owner_for_new_resource"));
-        let checks_the_caller = code
-            .iter()
-            .any(|c| c.contains("owner_binding::refuse_non_owner"));
+        let checks_the_caller = code.iter().any(|c| {
+            c.contains("owner_binding::refuse_non_owner")
+                || c.contains("owner_binding::non_owner_refusal")
+        });
         match (
             EXEMPT.iter().find(|(n, _)| *n == name),
             binds_at_create && checks_the_caller,
@@ -156,6 +149,8 @@ fn every_nf_serving_subscriptions_binds_them_to_their_creator() {
         "nextgcore-mbsmfd",
         "nextgcore-nsacfd",
         "nextgcore-eesd",
+        "nextgcore-udrd",
+        "nextgcore-ucmfd",
         "nextgcore-dccfd",
         "nextgcore-nssfd",
     ] {

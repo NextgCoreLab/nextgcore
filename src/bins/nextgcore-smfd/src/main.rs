@@ -54,7 +54,7 @@ mod n4_build;
 mod n4_handler;
 mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod n6_delay; // #1502: N6 delay measurement, provisioned over N4 association (TS 29.244 §5.33.8)
-mod owner_binding; // #1860: SM contexts bound to the verified serving AMF
+use nextgcore_sbi::owner_binding; // #1860, on the shared #1865 helper
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
