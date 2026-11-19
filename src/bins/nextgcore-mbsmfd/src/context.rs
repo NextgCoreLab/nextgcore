@@ -168,6 +168,32 @@ fn context_key(c: &AmfMbsContext) -> ContextKey {
     (c.host.clone(), c.port, c.context_ref.clone())
 }
 
+/// #2015: the deterministic seam of the held-snapshot race: a hook the next
+/// mint on this thread runs at the point where it has decided which contexts
+/// live sessions hold and is about to reclaim, so a test can try to land a
+/// `record_amf_context` exactly there. Thread-local, so no other test sees it.
+#[cfg(test)]
+mod mint_seam {
+    use super::MbSmfContext;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce(&MbSmfContext)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub fn set(hook: impl FnOnce(&MbSmfContext) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub fn fire(ctx: &MbSmfContext) {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook(ctx);
+        }
+    }
+}
+
 /// #1796/#1930: one live notify token: the session holding it and the AMF
 /// context it names (`None` until the ContextCreate answered).
 #[derive(Debug, Clone)]
@@ -176,6 +202,34 @@ struct NotifyToken {
     context: Option<ContextKey>,
     /// #1985: mint order, so the cap reclaims the oldest released context first.
     seq: u64,
+    /// #2015: the AMF answered this context's ContextDelete with a 204, so the
+    /// token is only in its #1796 grace: the one kind of token the mint cap may
+    /// reclaim ([`MbSmfContext::mark_amf_context_released`]).
+    released: bool,
+}
+
+/// #2015: what a notify token is, for the mint cap: held by a live session or a
+/// create in flight (`Live`), its context released by the AMF's 204 and in its
+/// grace (`Released`), or its context's delete still pending -- in flight,
+/// retried or parked -- so the context still exists at the AMF (`Pending`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    Live,
+    Released,
+    Pending,
+}
+
+fn token_class(t: &NotifyToken, held: &HashSet<ContextKey>) -> TokenClass {
+    match &t.context {
+        None => TokenClass::Live,
+        Some(k) if held.contains(k) => TokenClass::Live,
+        Some(_) if t.released => TokenClass::Released,
+        Some(_) => TokenClass::Pending,
+    }
+}
+
+fn held_contexts(contexts: &HashMap<u64, Vec<AmfMbsContext>>) -> HashSet<ContextKey> {
+    contexts.values().flatten().map(context_key).collect()
 }
 
 /// #1985: the mint order of [`NotifyToken::seq`].
@@ -183,10 +237,25 @@ static NOTIFY_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// #1796: the most AMF ContextStatusNotify tokens held at once. One is minted per
 /// ContextCreate and forgotten when its context is released; past the cap a
-/// ContextCreate is not sent. #1985: at the cap a mint first reclaims the tokens
-/// of the oldest context no live session holds (one whose delete is parked or in
-/// its grace), so released contexts never starve a live session's create.
+/// ContextCreate is not sent.
+///
+/// #2015: the cap counts the tokens of live sessions, of creates in flight and of
+/// contexts the AMF released (204, in their grace). At the cap a mint reclaims
+/// the oldest released context's tokens, and refuses when there is none (live
+/// sessions fill the cap, as before #1985). It never takes the token of a
+/// context whose delete is pending: that context still exists at the AMF, and a
+/// session that is handed it again is notified on that token (#1985).
 pub const MAX_AMF_NOTIFY_TOKENS: usize = 4096;
+
+/// #2015: the most tokens of contexts whose ContextDelete is pending (in flight,
+/// retried or parked), on top of [`MAX_AMF_NOTIFY_TOKENS`], so they never count
+/// against a live session's create. Normally the parked set's own ends bound
+/// them (`reconcile::MAX_PENDING` eviction, the reconciler's 204/404, `MAX_AGE`,
+/// `releasedInd`); a context reused many times holds one token per reuse,
+/// though, so this is the hard bound: a mint that would pass it forgets the
+/// tokens of the oldest pending context first. The map never holds more than
+/// `MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS`.
+pub const MAX_PENDING_NOTIFY_TOKENS: usize = crate::reconcile::MAX_PENDING;
 
 /// MBS Session Context (TS 23.247 5.3)
 #[derive(Debug, Clone)]
@@ -818,30 +887,30 @@ impl MbSmfContext {
     }
 
     /// #1796: a fresh ContextStatusNotify token for session `id`, or `None` at
-    /// [`MAX_AMF_NOTIFY_TOKENS`].
+    /// [`MAX_AMF_NOTIFY_TOKENS`] when no released context's tokens can be
+    /// reclaimed (#2015).
+    ///
+    /// #2015: which contexts live sessions hold and the reclaim are decided in
+    /// ONE critical section, `amf_contexts` then `amf_notify_tokens` (the order
+    /// [`Self::record_amf_context`] takes them in), so a record cannot land
+    /// between the two and lose the token it was just handed. Callers may hold
+    /// the global context's read guard; nothing here takes the pending set.
     pub fn mint_amf_notify_token(&self, id: u64) -> Option<String> {
+        let contexts = self.amf_contexts.lock().ok()?;
         let mut tokens = self.amf_notify_tokens.lock().ok()?;
         if tokens.len() >= MAX_AMF_NOTIFY_TOKENS {
-            // #1985: the contexts live sessions hold, for the reclaim. Lock order:
-            // `amf_contexts` before `amf_notify_tokens`, so the map is re-taken.
-            drop(tokens);
-            let held: HashSet<ContextKey> = self
-                .amf_contexts
-                .lock()
-                .ok()?
-                .values()
-                .flatten()
-                .map(context_key)
-                .collect();
-            tokens = self.amf_notify_tokens.lock().ok()?;
-            if tokens.len() >= MAX_AMF_NOTIFY_TOKENS && !Self::reclaim_released(&mut tokens, &held)
-            {
+            let held = held_contexts(&contexts);
+            #[cfg(test)]
+            mint_seam::fire(self);
+            if !Self::make_room(&mut tokens, &held) {
                 log::warn!(
-                    "MBS: {MAX_AMF_NOTIFY_TOKENS} AMF notification tokens held; none minted"
+                    "MBS: {MAX_AMF_NOTIFY_TOKENS} AMF notification tokens held by live \
+                     sessions; none minted"
                 );
                 return None;
             }
         }
+        drop(contexts);
         let token = uuid::Uuid::new_v4().simple().to_string();
         tokens.insert(
             token.clone(),
@@ -849,23 +918,47 @@ impl MbSmfContext {
                 session_id: id,
                 context: None,
                 seq: NOTIFY_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed),
+                released: false,
             },
         );
         Some(token)
     }
 
-    /// #1985: forget every token of the oldest context that no live session holds
-    /// (`held`): its delete is parked or in its grace, so only a session that
-    /// re-records it could still need them. A token of a create still in flight
-    /// names no context and is never reclaimed. Returns whether any was.
-    fn reclaim_released(
+    /// #2015: room for one more token, or false (nothing changed). Live and
+    /// released tokens are capped at [`MAX_AMF_NOTIFY_TOKENS`]: at the cap the
+    /// oldest released context's tokens are reclaimed, and with none the mint is
+    /// refused rather than take a pending context's. Pending tokens are capped
+    /// separately at [`MAX_PENDING_NOTIFY_TOKENS`]: past it the oldest pending
+    /// context's tokens go, so they never starve a live create.
+    fn make_room(tokens: &mut HashMap<String, NotifyToken>, held: &HashSet<ContextKey>) -> bool {
+        let counted = tokens
+            .values()
+            .filter(|t| token_class(t, held) != TokenClass::Pending)
+            .count();
+        if counted >= MAX_AMF_NOTIFY_TOKENS
+            && !Self::forget_oldest(tokens, held, TokenClass::Released)
+        {
+            return false;
+        }
+        if tokens.len() >= MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS {
+            Self::forget_oldest(tokens, held, TokenClass::Pending);
+        }
+        true
+    }
+
+    /// #1985/#2015: forget every token of the context with the oldest token of
+    /// `class` (`Released` or `Pending`; a `Live` one is never taken). Returns
+    /// whether there was one.
+    fn forget_oldest(
         tokens: &mut HashMap<String, NotifyToken>,
         held: &HashSet<ContextKey>,
+        class: TokenClass,
     ) -> bool {
+        debug_assert!(class != TokenClass::Live);
         let Some(key) = tokens
             .values()
+            .filter(|t| token_class(t, held) == class)
             .filter_map(|t| t.context.as_ref().map(|k| (t.seq, k)))
-            .filter(|(_, k)| !held.contains(*k))
             .min_by_key(|(seq, _)| *seq)
             .map(|(_, k)| k.clone())
         else {
@@ -873,15 +966,41 @@ impl MbSmfContext {
         };
         let before = tokens.len();
         tokens.retain(|_, t| t.context.as_ref() != Some(&key));
+        let what = if class == TokenClass::Released {
+            "released"
+        } else {
+            "pending (its delete is not done; a session handed it again is not notified)"
+        };
         log::warn!(
-            "MBS: {MAX_AMF_NOTIFY_TOKENS} AMF notification tokens held; reclaimed {} of the \
-             released AMF {}:{} MBS context {}",
+            "MBS: AMF notification tokens at their cap; forgot {} of the {what} AMF {}:{} \
+             MBS context {}",
             before - tokens.len(),
             key.0,
             key.1,
             key.2
         );
         true
+    }
+
+    /// #2015: the AMF answered `c`'s ContextDelete with a 204: its tokens are in
+    /// their #1796 grace only, so the mint cap may reclaim them.
+    pub fn mark_amf_context_released(&self, c: &AmfMbsContext) {
+        let key = context_key(c);
+        if let Ok(mut tokens) = self.amf_notify_tokens.lock() {
+            for (t, v) in tokens.iter_mut() {
+                if *t == c.notify_token || v.context.as_ref() == Some(&key) {
+                    v.released = true;
+                }
+            }
+        }
+    }
+
+    /// #2015: whether `token`'s context is marked released (a 204), for tests.
+    #[cfg(test)]
+    pub fn amf_notify_token_released(&self, token: &str) -> bool {
+        self.amf_notify_tokens
+            .lock()
+            .is_ok_and(|t| t.get(token).is_some_and(|v| v.released))
     }
 
     /// #1796: the session a live ContextStatusNotify token belongs to (#1930: the
@@ -899,6 +1018,29 @@ impl MbSmfContext {
     /// them. Returns how many were forgotten.
     pub fn forget_amf_context_tokens(&self, c: &AmfMbsContext) -> usize {
         let key = context_key(c);
+        let Ok(mut tokens) = self.amf_notify_tokens.lock() else {
+            return 0;
+        };
+        let before = tokens.len();
+        tokens.retain(|t, v| *t != c.notify_token && v.context.as_ref() != Some(&key));
+        before - tokens.len()
+    }
+
+    /// #2015: forget `c`'s context's tokens as [`Self::forget_amf_context_tokens`]
+    /// does, unless a live session holds that context: for a delete given up on
+    /// (evicted or expired), whose context a session may have re-recorded since
+    /// the delete left the pending set. The check and the forget are one critical
+    /// section, `amf_contexts` then `amf_notify_tokens` (as in
+    /// [`Self::record_amf_context`]), so a record cannot land between them.
+    /// Returns how many were forgotten.
+    pub fn forget_unheld_context_tokens(&self, c: &AmfMbsContext) -> usize {
+        let key = context_key(c);
+        let Ok(contexts) = self.amf_contexts.lock() else {
+            return 0;
+        };
+        if contexts.values().flatten().any(|h| context_key(h) == key) {
+            return 0;
+        }
         let Ok(mut tokens) = self.amf_notify_tokens.lock() else {
             return 0;
         };
@@ -992,6 +1134,8 @@ impl MbSmfContext {
             for t in tokens.values_mut() {
                 if t.context.as_ref() == Some(&key) {
                     t.session_id = id;
+                    // #2015: held again, so no longer released.
+                    t.released = false;
                 }
             }
         }
@@ -1841,68 +1985,103 @@ mod tests {
         }
     }
 
-    /// **#1985** bound: a parked delete keeps its context's notify tokens, so at
-    /// [`MAX_AMF_NOTIFY_TOKENS`] a mint reclaims the tokens of the OLDEST context
-    /// no live session holds, rather than refusing a live session's create. A
-    /// context a live session holds is never reclaimed, and nor is a create in
-    /// flight (its token names no context yet): a map full of those still refuses.
-    /// A private context, so the full map cannot starve another test's mint.
-    ///
-    /// REVERT-VERIFIED: with `reclaim_released` returning false, "a live create is
-    /// not starved by released contexts" fails; with the `held` filter removed,
-    /// "the held context's token is kept" fails.
-    #[test]
-    fn the_token_cap_reclaims_the_oldest_released_context_1985() {
-        let mut ctx = MbSmfContext::new();
-        ctx.init(8);
-        let record = |n: usize, token: String| AmfMbsContext {
+    /// #2015 fixture: an AMF context record of `n`, with `token`.
+    fn cap_record_2015(n: usize, token: String) -> AmfMbsContext {
+        AmfMbsContext {
             host: "127.0.0.1".to_string(),
             port: 9,
             nf_instance_id: None,
-            context_ref: format!("cap-1985-{n}"),
+            context_ref: format!("cap-2015-{n}"),
             notify_token: token,
             tmgi: None,
-        };
-        let released = ctx
-            .session_add(make_tmgi(0x51), MbsSessionType::Broadcast)
+        }
+    }
+
+    /// #2015 fixture: `n` contexts a released session left with their deletes
+    /// pending (recorded, then taken by the release), refs `from..from + n`.
+    fn pending_contexts_2015(ctx: &MbSmfContext, tmgi: u8, from: usize, n: usize) -> Vec<String> {
+        let s = ctx
+            .session_add(make_tmgi(tmgi), MbsSessionType::Broadcast)
             .expect("released");
-        let tokens: Vec<String> = (0..MAX_AMF_NOTIFY_TOKENS)
-            .map(|n| {
-                let t = ctx.mint_amf_notify_token(released.id).expect("minted");
-                assert!(ctx.record_amf_context(released.id, record(n, t.clone())));
+        let tokens = (from..from + n)
+            .map(|k| {
+                let t = ctx.mint_amf_notify_token(s.id).expect("minted");
+                assert!(ctx.record_amf_context(s.id, cap_record_2015(k, t.clone())));
                 t
             })
             .collect();
-        // The session is released; every delete is parked (none ran).
-        ctx.take_amf_contexts(released.id);
-        ctx.session_remove(released.id);
-        // A live session re-records context 0, the oldest: its token is held.
+        ctx.take_amf_contexts(s.id);
+        ctx.session_remove(s.id);
+        tokens
+    }
+
+    /// **#2015** (item 1): at [`MAX_AMF_NOTIFY_TOKENS`] a mint reclaims only the
+    /// tokens of a context the AMF released (204, in its grace), never those of a
+    /// context whose delete is pending -- the AMF still holds that context and a
+    /// session handed it again is notified on them (#1985). With no released
+    /// context the mint is refused, as before #1985, and the refusal applies
+    /// nothing; a retried mint is refused the same way. Pending tokens do not
+    /// count against the cap, so they never starve a live create. A private
+    /// context, so the full map cannot starve another test's mint.
+    ///
+    /// REVERT-VERIFIED: with `make_room` reclaiming any context no live session
+    /// holds (the #1985 rule), "refused rather than take a parked context's
+    /// token" fails; with pending tokens counted against the cap, "a live create is not
+    /// starved by parked tokens" fails.
+    #[test]
+    fn the_token_cap_never_reclaims_a_parked_contexts_token_2015() {
+        let mut ctx = MbSmfContext::new();
+        ctx.init(8);
+        // 4096 contexts whose deletes are parked; the AMF then answers 204 for
+        // context 0, so only its token is in a grace.
+        let parked = pending_contexts_2015(&ctx, 0x51, 0, MAX_PENDING_NOTIFY_TOKENS);
+        ctx.mark_amf_context_released(&cap_record_2015(0, parked[0].clone()));
         let live = ctx
             .session_add(make_tmgi(0x52), MbsSessionType::Broadcast)
             .expect("live");
-        assert!(ctx.record_amf_context(live.id, record(0, tokens[0].clone())));
-        assert_eq!(ctx.amf_notify_token_count(), MAX_AMF_NOTIFY_TOKENS);
+        // Live tokens up to the cap (one released token counts too).
+        for _ in 0..MAX_AMF_NOTIFY_TOKENS - 1 {
+            assert!(
+                ctx.mint_amf_notify_token(live.id).is_some(),
+                "a live create is not starved by parked tokens"
+            );
+        }
+        let full = ctx.amf_notify_token_count();
+        // The cap: 4095 live + 1 released; 4095 more parked beside it.
+        assert_eq!(full, MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS - 1);
 
         assert!(
             ctx.mint_amf_notify_token(live.id).is_some(),
-            "a live create is not starved by released contexts"
-        );
-        assert_eq!(
-            ctx.amf_notify_session(&tokens[0]),
-            Some(live.id),
-            "the held context's token is kept"
+            "the released context's token makes room"
         );
         assert!(
-            ctx.amf_notify_session(&tokens[1]).is_none(),
-            "the oldest released context's token is reclaimed"
+            ctx.amf_notify_session(&parked[0]).is_none(),
+            "the released context's token is reclaimed"
         );
         assert!(
-            ctx.amf_notify_session(&tokens[2]).is_some(),
-            "only that one"
+            parked[1..]
+                .iter()
+                .all(|t| ctx.amf_notify_session(t).is_some()),
+            "a parked context's token is never reclaimed"
         );
-        assert_eq!(ctx.amf_notify_token_count(), MAX_AMF_NOTIFY_TOKENS);
 
-        // Control: creates in flight are never reclaimed.
+        // No released context left: refused, and nothing changes -- twice.
+        for attempt in 0..2 {
+            assert!(
+                ctx.mint_amf_notify_token(live.id).is_none(),
+                "refused rather than take a parked context's token ({attempt})"
+            );
+            assert_eq!(
+                ctx.amf_notify_token_count(),
+                full,
+                "a refused mint applies nothing"
+            );
+            assert!(parked[1..]
+                .iter()
+                .all(|t| ctx.amf_notify_session(t).is_some()));
+        }
+
+        // Control: creates in flight are never reclaimed either.
         let inflight = MbSmfContext::new();
         for _ in 0..MAX_AMF_NOTIFY_TOKENS {
             inflight.mint_amf_notify_token(1).expect("minted");
@@ -1910,6 +2089,107 @@ mod tests {
         assert!(
             inflight.mint_amf_notify_token(1).is_none(),
             "a create in flight keeps its token"
+        );
+    }
+
+    /// **#2015** (item 1, the hard bound): pending tokens can outgrow the parked
+    /// set (a context reused n times holds n tokens), so past
+    /// [`MAX_PENDING_NOTIFY_TOKENS`] a mint forgets the oldest pending context's
+    /// tokens rather than refuse a live create; the map never passes both caps.
+    ///
+    /// REVERT-VERIFIED: with the `Pending` forget removed from `make_room`, the
+    /// map grows past "never more than both caps"; with the `held` arm removed
+    /// from `token_class`, "a held context's token is kept" fails.
+    #[test]
+    fn past_the_pending_bound_a_mint_forgets_the_oldest_parked_context_2015() {
+        let mut ctx = MbSmfContext::new();
+        ctx.init(8);
+        let a = pending_contexts_2015(&ctx, 0x53, 0, MAX_AMF_NOTIFY_TOKENS);
+        let b = pending_contexts_2015(&ctx, 0x54, MAX_AMF_NOTIFY_TOKENS, MAX_AMF_NOTIFY_TOKENS);
+        let live = ctx
+            .session_add(make_tmgi(0x55), MbsSessionType::Broadcast)
+            .expect("live");
+        // The live session is handed the oldest parked context again: held.
+        assert!(ctx.record_amf_context(live.id, cap_record_2015(0, a[0].clone())));
+        assert!(
+            ctx.mint_amf_notify_token(live.id).is_some(),
+            "a live create is not starved by parked tokens"
+        );
+        assert_eq!(
+            ctx.amf_notify_token_count(),
+            MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS,
+            "never more than both caps"
+        );
+        assert_eq!(
+            ctx.amf_notify_session(&a[0]),
+            Some(live.id),
+            "a held context's token is kept"
+        );
+        assert!(
+            ctx.amf_notify_session(&a[1]).is_none(),
+            "the oldest pending goes"
+        );
+        assert!(ctx.amf_notify_session(&a[2]).is_some(), "only that one");
+        assert!(ctx.amf_notify_session(&b[0]).is_some());
+    }
+
+    /// **#2015** (item 2): the held snapshot and the reclaim are one critical
+    /// section with `record_amf_context`. Session B's create was answered with
+    /// the oldest pending context K and B records it exactly where a mint at the
+    /// bound has decided what live sessions hold and is about to forget K (the
+    /// `mint_seam`): the record cannot land there, it lands after the mint, and
+    /// B keeps the token it was just handed. Deterministic: the seam records only
+    /// if `amf_contexts` is free at that point.
+    ///
+    /// REVERT-VERIFIED: with `mint_amf_notify_token` dropping `amf_contexts` after
+    /// the snapshot (the #1985 code), the record lands in the window, K's tokens
+    /// -- B's own among them -- are forgotten, and "B keeps the token it was just
+    /// handed" fails.
+    #[test]
+    fn a_record_racing_the_mint_keeps_its_token_2015() {
+        let mut ctx = MbSmfContext::new();
+        ctx.init(8);
+        // One under both caps, from two released sessions (each held up to the cap).
+        let parked = pending_contexts_2015(&ctx, 0x56, 0, MAX_AMF_NOTIFY_TOKENS);
+        pending_contexts_2015(
+            &ctx,
+            0x59,
+            MAX_AMF_NOTIFY_TOKENS,
+            MAX_PENDING_NOTIFY_TOKENS - 1,
+        );
+        let b = ctx
+            .session_add(make_tmgi(0x57), MbsSessionType::Broadcast)
+            .expect("B");
+        let tb = ctx.mint_amf_notify_token(b.id).expect("B's token");
+        assert_eq!(
+            ctx.amf_notify_token_count(),
+            MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS
+        );
+        let k = cap_record_2015(0, tb.clone());
+        let landed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (l, rec, bid) = (landed.clone(), k.clone(), b.id);
+        mint_seam::set(move |ctx| {
+            let free = ctx.amf_contexts.try_lock().is_ok();
+            if free {
+                assert!(ctx.record_amf_context(bid, rec));
+                l.set(true);
+            }
+        });
+        let c = ctx
+            .session_add(make_tmgi(0x58), MbsSessionType::Broadcast)
+            .expect("C");
+        assert!(ctx.mint_amf_notify_token(c.id).is_some(), "C's token");
+        if !landed.get() {
+            assert!(ctx.record_amf_context(b.id, k));
+        }
+        assert_eq!(
+            ctx.amf_notify_session(&tb),
+            Some(b.id),
+            "B keeps the token it was just handed"
+        );
+        assert!(
+            ctx.amf_notify_session(&parked[0]).is_none(),
+            "K was pending at the mint, so its old token went"
         );
     }
 

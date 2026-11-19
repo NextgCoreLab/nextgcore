@@ -172,11 +172,33 @@ pub fn park(contexts: Vec<AmfMbsContext>) {
 /// tokens go (the bound on the tokens parked deletes keep). Called with the
 /// pending set unlocked: forgetting reads the global context, and
 /// `record_amf_context` takes the pending set under that read (`unpark`).
+///
+/// #2015: not when a live session holds the context: one that re-recorded it
+/// after the record left the pending set (drained by a pass, or popped by the
+/// eviction) found nothing to unpark, and the tokens are its own now. The check
+/// and the forget are atomic with `record_amf_context`.
 fn forget_abandoned(abandoned: &[AmfMbsContext]) {
+    #[cfg(test)]
+    if !abandoned.is_empty() {
+        if let Some(hook) = BEFORE_FORGET_SEAM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook();
+        }
+    }
     for c in abandoned {
-        crate::forget_amf_notify_token(c);
+        crate::forget_abandoned_amf_notify_token(c);
     }
 }
+
+/// #2015: the deterministic seam of the abandon/re-record race: run once by the
+/// next [`forget_abandoned`] with something to forget, after the records left
+/// the pending set and before their tokens are forgotten. Set only under
+/// [`PENDING_TEST_LOCK`].
+#[cfg(test)]
+pub static BEFORE_FORGET_SEAM: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 /// How many ContextDeletes are parked: the
 /// `nextgcore_mbsmf_amf_context_deletes_pending` gauge.
@@ -510,6 +532,56 @@ mod tests {
         assert_eq!(delivered, 1, "the healthy AMF gets its delete");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(left.len(), 3, "the blackholed ones stay parked: {left:?}");
+    }
+
+    /// **#2015** (#1961's order, untested until now): after a pass, a record that
+    /// was tried and failed sits BEHIND both a record the pass did not reach (its
+    /// AMF was backing off) and a record parked while the pass ran -- so a
+    /// failing AMF's deletes are not retried first on every pass. The stand-in
+    /// AMF parks the new record when F1's delete reaches it, then refuses it.
+    ///
+    /// REVERT-VERIFIED: with `Repark::drop` pushing the failed records to the
+    /// FRONT, "a failed delete goes behind the untried and the newly parked"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_delete_goes_behind_untried_and_newly_parked_ones_2015() {
+        let _g = PENDING_TEST_LOCK.lock().await;
+        clear_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Parked during the pass (another session's release).
+                    park(vec![ctx(20153)]);
+                    nextgcore_sbi::message::SbiResponse::with_status(503)
+                }
+            },
+        )
+        .await;
+        park(vec![ctx_at(addr.port(), 20151), ctx_at(addr.port(), 20152)]);
+        reconcile_once().await;
+        let order: Vec<String> = pending()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.ctx.context_ref.clone())
+            .collect();
+        clear_for_test();
+        srv.stop().await.ok();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "F1 tried, F2 skipped for the backoff"
+        );
+        assert_eq!(
+            order,
+            ["20152", "20153", "20151"],
+            "a failed delete goes behind the untried and the newly parked"
+        );
     }
 
     /// #1961: a record parked longer than [`MAX_AGE`] ends as `expired`, not by

@@ -1265,7 +1265,9 @@ fn release_retries(mut failed: Vec<AmfMbsContext>) {
         // #1985: its notify tokens are kept: the context still exists at the AMF,
         // and a session that reuses it is notified on them. They go with the
         // context's end: the reconciler's 204 (after the grace) or 404, a
-        // `releasedInd`, the reconciler's eviction, or the token cap's reclaim.
+        // `releasedInd`, the reconciler's eviction or expiry, or (#2015) the
+        // pending-token bound; never the token cap's reclaim, which takes only
+        // contexts the AMF released.
         reconcile::park(failed);
     });
 }
@@ -1287,6 +1289,10 @@ fn retire_amf_notify_token(c: &AmfMbsContext, outcome: namf_client::ContextDelet
         forget_amf_notify_token(c);
         return;
     }
+    // #2015: in its grace only, so the token cap may reclaim it.
+    if let Ok(ctx) = mbsmf_self().read() {
+        ctx.mark_amf_context_released(c);
+    }
     let c = c.clone();
     // Detached: the forget must outlive the release that scheduled it.
     drop(spawn_detached(async move {
@@ -1301,6 +1307,16 @@ fn retire_amf_notify_token(c: &AmfMbsContext, outcome: namf_client::ContextDelet
 fn forget_amf_notify_token(c: &AmfMbsContext) {
     if let Ok(ctx) = mbsmf_self().read() {
         ctx.forget_amf_context_tokens(c);
+    }
+}
+
+/// #2015: a delete given up on (evicted at `reconcile::MAX_PENDING` or expired
+/// after `reconcile::MAX_AGE`): its context's tokens go, unless a live session
+/// re-recorded that context after the delete left the pending set -- the tokens
+/// are that session's then.
+fn forget_abandoned_amf_notify_token(c: &AmfMbsContext) {
+    if let Ok(ctx) = mbsmf_self().read() {
+        ctx.forget_unheld_context_tokens(c);
     }
 }
 
