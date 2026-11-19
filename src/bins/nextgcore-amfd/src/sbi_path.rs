@@ -862,6 +862,11 @@ pub fn amf_sbi_send_request(_nf_instance_id: &str, _xact: &SbiXact) -> SbiResult
 
 /// Discover NF endpoint for the given service type using SbiContext cache + env var fallback
 fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // #1974: the AUSF endpoint is process-global; see `test_support::AUSF_ENV_LOCK`.
+    #[cfg(test)]
+    if matches!(service_type, SbiServiceType::NausfAuth) {
+        crate::test_support::assert_ausf_env_lock_held();
+    }
     // Map AMF SbiServiceType to nextgcore_sbi SbiServiceType and env var names
     let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
@@ -2398,6 +2403,11 @@ pub async fn call_ausf_5g_aka_confirm(
 /// Unlike `resolve_nf_endpoint`, this is safe to call from async context
 /// (no `Handle::block_on`).
 pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // #1974: the AUSF endpoint is process-global; see `test_support::AUSF_ENV_LOCK`.
+    #[cfg(test)]
+    if matches!(service_type, SbiServiceType::NausfAuth) {
+        crate::test_support::assert_ausf_env_lock_held();
+    }
     let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
             nextgcore_sbi::types::SbiServiceType::NausfAuth,
@@ -4523,7 +4533,17 @@ pub async fn call_nsacf_ue_decrease(
     access_type: &str,
 ) -> crate::nsac::Outcome {
     use crate::nsac::Outcome;
-    let client = peer_client(nextgcore_sbi::types::NfType::Nsacf, nsacf_host, nsacf_port);
+    // #1945: bounded by the NSAC module's own timeouts, which an INCREASE's wait
+    // for this DECREASE covers, not by the SBI client's 30 s default.
+    let client = crate::attach_oauth2(
+        SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(nsacf_host, nsacf_port)
+                .with_max_response_body(max_response_body_for(nextgcore_sbi::types::NfType::Nsacf))
+                .with_connect_timeout(crate::nsac::DECREASE_CONNECT_TIMEOUT)
+                .with_request_timeout(crate::nsac::DECREASE_REQUEST_TIMEOUT),
+        ),
+        nextgcore_sbi::types::NfType::Nsacf,
+    );
     let mut snssai = serde_json::json!({ "sst": snssai_sst });
     if let Some(sd) = snssai_sd {
         snssai["sd"] = serde_json::Value::String(format!("{sd:06X}"));

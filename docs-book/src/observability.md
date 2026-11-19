@@ -101,6 +101,7 @@ Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so
 | `amf_nsac_ue_decreases_pending` | gauge | | Nnsacf_NSAC_NumOfUEsUpdate DECREASEs that failed, parked for the reconciler (#1876) |
 | `amf_nsac_ue_decreases_total` | counter | `result` (`accepted`, `refused`, `failed`: parked, `superseded`: not sent, the UE is admitted again or being admitted) | DECREASEs sent on deregistration, S-NSSAI removal or a denied registration's rollback |
 | `amf_nsac_ue_decreases_reconciled_total` | counter | `result` (`delivered`, `superseded`, `refused`, `abandoned`) | parked DECREASEs the reconciler ended |
+| `amf_nsac_ue_recounts_total` | counter | | INCREASEs re-sent because a DECREASE of the same UE and S-NSSAI may have landed after a re-registration's INCREASE (the INCREASE stopped waiting for it, #1945) |
 
 The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (`fivegs_amffunction_*`, `ran_ue`, `amf_session`, `gnb`) are not served: nothing increments them.
 

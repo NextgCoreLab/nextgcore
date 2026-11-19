@@ -24008,6 +24008,8 @@ mod tests {
         reconcile::reconcile_once().await;
         let parked_while_down = parked_1875(is_ours);
         status.store(204, Ordering::SeqCst);
+        // #1961: the NSACF that failed is backing off; the next pass is after it.
+        tokio::time::sleep(reconcile::BACKOFF_BASE + std::time::Duration::from_millis(50)).await;
         reconcile::reconcile_once().await;
         let parked_after = parked_1875(is_ours);
         let decreases = sent_1875(&seen, |_, u, b| {
