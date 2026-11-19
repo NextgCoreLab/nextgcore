@@ -265,23 +265,34 @@ pub fn take(supi: &str, access_type: &str, keep: &[SNssai]) -> Vec<Admission> {
 /// What [`admit_registration`] decided.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Admitted {
-    /// The last answer's admission (`AmfUe::slice_admission_granted`).
+    /// Whether any S-NSSAI was admitted (`AmfUe::slice_admission_granted`).
     pub granted: bool,
-    /// The S-NSSAI the NSACF denied, if one was: the registration is rejected.
-    pub denied: Option<SNssai>,
+    /// #1942: the S-NSSAIs the NSACF denied (maximum number of UEs reached), or
+    /// whose admission could not be performed. They are rejected, the rest of the
+    /// registration goes on (TS 23.502 §4.2.11.2, TS 24.501 §5.5.1.2.4); only when
+    /// every one is rejected is the registration.
+    pub rejected: Vec<SNssai>,
 }
 
-/// Count a registering UE in at the NSACF on each S-NSSAI of `allowed`, in order,
-/// stopping at the first denial (TS 23.502 §4.2.11.2, TS 29.536 §5.2.2.2).
+impl Admitted {
+    /// Every S-NSSAI of `allowed` was rejected: the registration is.
+    pub fn all_rejected(&self, allowed: &[SNssai]) -> bool {
+        allowed.iter().all(|s| self.rejected.contains(s))
+    }
+}
+
+/// Count a registering UE in at the NSACF on each S-NSSAI of `allowed`, in order
+/// (TS 23.502 §4.2.11.2, TS 29.536 §5.2.2.2). #1942: a denial rejects that
+/// S-NSSAI only; the others are still asked for.
 ///
 /// #1876:
 /// - each count the NSACF took is [`record`]ed, so a deregistration undoes it;
 /// - an INCREASE that got no answer at all is reconciled with a precautionary
 ///   DECREASE, not parked (a DECREASE of a UE the NSACF does not hold is a no-op);
-/// - on a denial the UE is rejected, so EVERY admission it holds on this access is
-///   counted out again, the ones this request took included (they used to stay);
-/// - otherwise an S-NSSAI it held and no longer has in `allowed` is counted out
-///   ("removed from the Allowed NSSAI").
+/// - when every S-NSSAI is rejected the UE is, so EVERY admission it holds on this
+///   access is counted out again;
+/// - otherwise an S-NSSAI it held and no longer has in its Allowed NSSAI (`allowed`
+///   less the rejected ones) is counted out ("removed from the Allowed NSSAI").
 pub async fn admit_registration(
     supi: &str,
     access_type: &str,
@@ -291,7 +302,7 @@ pub async fn admit_registration(
     nf_id: &str,
 ) -> Admitted {
     let mut granted = false;
-    let mut denied = None;
+    let mut rejected = Vec::new();
     let mut unanswered = Vec::new();
     for snssai in allowed {
         let admission = Admission {
@@ -347,15 +358,14 @@ pub async fn admit_registration(
         spawn_decreases(owed);
         match answer {
             Ok(res) => {
-                granted = res.admitted;
+                granted |= res.admitted;
                 if res.counted {
                     record(admission);
                 } else if res.unanswered {
                     unanswered.push(admission);
                 }
                 if !res.admitted {
-                    denied = Some(snssai.clone());
-                    break;
+                    rejected.push(snssai.clone());
                 }
             }
             Err(e) => {
@@ -365,9 +375,7 @@ pub async fn admit_registration(
                     "[{supi}] NSACF UE admission query failed for SST={}: {e}",
                     snssai.sst
                 );
-                granted = false;
-                denied = Some(snssai.clone());
-                break;
+                rejected.push(snssai.clone());
             }
         }
     }
@@ -379,13 +387,13 @@ pub async fn admit_registration(
             let _ = decrease_once(a).await;
         });
     }
-    let gone = if denied.is_some() {
-        take(supi, access_type, &[])
-    } else {
-        take(supi, access_type, allowed)
-    };
-    spawn_decreases(gone);
-    Admitted { granted, denied }
+    let kept: Vec<SNssai> = allowed
+        .iter()
+        .filter(|s| !rejected.contains(s))
+        .cloned()
+        .collect();
+    spawn_decreases(take(supi, access_type, &kept));
+    Admitted { granted, rejected }
 }
 
 /// How a DECREASE ended.
@@ -715,42 +723,81 @@ pub(crate) mod tests {
         get()
     }
 
-    /// #1876: a registration denied on its second S-NSSAI counts the UE out of the
-    /// first again: the UE is rejected, so it holds no slice.
+    /// #1942: a registration denied on its second S-NSSAI rejects that S-NSSAI
+    /// only: the first stays admitted and counted, and the NSACF is asked about the
+    /// third as well (TS 23.502 §4.2.11.2).
     ///
-    /// REVERT-VERIFIED: with the denial taking nothing back, this fails: no
-    /// DECREASE for SST 1, which stays counted.
+    /// REVERT-VERIFIED: with the loop stopping at the first denial again, this
+    /// fails: SST 3 is never asked for.
     #[tokio::test]
-    async fn a_denied_later_snssai_counts_the_earlier_grant_out_1876() {
+    async fn a_denied_snssai_is_rejected_and_the_others_kept_1942() {
         let _g = NSAC_TEST_LOCK.lock().await;
         clear_for_test();
         let (srv, port, seen) = nsacf(&[2], Arc::new(AtomicU16::new(204))).await;
-        let supi = "imsi-001010000018761";
+        let supi = "imsi-001010000019421";
+        let allowed = [snssai(1), snssai(2), snssai(3)];
 
-        let out = admit_registration(
+        let out =
+            admit_registration(supi, "3GPP_ACCESS", &allowed, "127.0.0.1", port, "amf-1942").await;
+        let decreased = decreases(&seen, 0).await;
+        let asked: Vec<u8> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(f, _)| f == "INCREASE")
+            .map(|(_, s)| *s)
+            .collect();
+        let held = (
+            is_admitted(supi, "3GPP_ACCESS", &snssai(1)),
+            is_admitted(supi, "3GPP_ACCESS", &snssai(3)),
+        );
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(out.rejected, vec![snssai(2)], "only SST 2 is rejected");
+        assert!(!out.all_rejected(&allowed));
+        assert_eq!(asked, vec![1, 2, 3], "every S-NSSAI is asked for");
+        assert_eq!(held, (true, true), "SST 1 and 3 stay admitted");
+        assert!(
+            decreased.is_empty(),
+            "nothing is counted out: {decreased:?}"
+        );
+    }
+
+    /// #1876, #1942: a registration whose every S-NSSAI is rejected is rejected, so
+    /// whatever the UE was admitted to before is counted out.
+    ///
+    /// REVERT-VERIFIED: with nothing taken back when all are rejected, this fails:
+    /// no DECREASE for the earlier SST 3.
+    #[tokio::test]
+    async fn every_snssai_rejected_counts_the_ue_out_1876() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, seen) = nsacf(&[1, 2], Arc::new(AtomicU16::new(204))).await;
+        let supi = "imsi-001010000018761";
+        admit_registration(
             supi,
             "3GPP_ACCESS",
-            &[snssai(1), snssai(2)],
+            &[snssai(3)],
             "127.0.0.1",
             port,
             "amf-1876",
         )
         .await;
+        let allowed = [snssai(1), snssai(2)];
+
+        let out =
+            admit_registration(supi, "3GPP_ACCESS", &allowed, "127.0.0.1", port, "amf-1876").await;
         let decreased = decreases(&seen, 1).await;
-        let held = is_admitted(supi, "3GPP_ACCESS", &snssai(1));
+        let held = is_admitted(supi, "3GPP_ACCESS", &snssai(3));
         clear_for_test();
         srv.stop().await.ok();
 
-        assert_eq!(out.denied, Some(snssai(2)));
-        assert_eq!(decreased, vec![1], "SST 1 counted out again, and only it");
-        assert!(!held, "and no admission is held");
+        assert!(out.all_rejected(&allowed));
+        assert_eq!(decreased, vec![3], "the earlier SST 3 is counted out");
+        assert!(!held);
     }
 
-    /// #1876: a re-registration whose Allowed NSSAI drops an S-NSSAI counts the UE
-    /// out of it, and keeps the one still allowed.
-    ///
-    /// REVERT-VERIFIED: with `admit_registration` taking nothing back on success,
-    /// this fails: no DECREASE for SST 2.
     #[tokio::test]
     async fn an_snssai_removed_from_the_allowed_nssai_is_counted_out_1876() {
         let _g = NSAC_TEST_LOCK.lock().await;
@@ -806,7 +853,10 @@ pub(crate) mod tests {
         let parked_now = pending_count();
         clear_for_test();
 
-        assert!(out.granted && out.denied.is_none(), "degrade-open admits");
+        assert!(
+            out.granted && out.rejected.is_empty(),
+            "degrade-open admits"
+        );
         assert!(!held, "but counted nothing to undo");
         assert_eq!(
             parked_now, 0,
@@ -1037,7 +1087,7 @@ pub(crate) mod tests {
         clear_for_test();
         srv.stop().await.ok();
 
-        assert!(out.denied.is_none());
+        assert!(out.rejected.is_empty());
         assert_eq!(
             order,
             ["DECREASE-applied", "INCREASE-applied"],
@@ -1084,7 +1134,7 @@ pub(crate) mod tests {
             Outcome::Superseded,
             "not sent while the INCREASE is out"
         );
-        assert_eq!(out.denied, Some(snssai(1)));
+        assert_eq!(out.rejected, vec![snssai(1)]);
         assert_eq!(
             order,
             ["INCREASE-applied", "DECREASE-applied"],

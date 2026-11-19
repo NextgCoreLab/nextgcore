@@ -589,7 +589,13 @@ pub fn build_registration_accept_for_sessions(
             equivalent_plmns: None,
             tai_list,
             allowed_nssai,
-            rejected_nssai: None,
+            // #1942: the S-NSSAIs NSAC rejected.
+            rejected_nssai: (!amf_ue.rejected_nssai.is_empty()).then(|| {
+                encode_rejected_nssai_value(
+                    &amf_ue.rejected_nssai,
+                    REJECTED_NSSAI_CAUSE_NOT_IN_REGISTRATION_AREA,
+                )
+            }),
             network_feature_support,
             pdu_session_status: pdu_session_status.map(|psi| PduSessionStatus { length: 2, psi }),
             pdu_session_reactivation_result: reactivation_result,
@@ -665,6 +671,34 @@ pub fn encode_tai_list(tai: &crate::context::Tai5gs) -> Vec<u8> {
     data
 }
 
+/// Rejected S-NSSAI cause "S-NSSAI not available in the current registration area"
+/// (TS 24.501 Table 9.11.3.46.1, bits 4-1 = 0001), the cause §5.5.1.2.4 gives a UE
+/// that does not support extended rejected NSSAI for a slice whose maximum number of
+/// UEs is reached (#1942).
+pub const REJECTED_NSSAI_CAUSE_NOT_IN_REGISTRATION_AREA: u8 = 1;
+
+/// Encode a Rejected NSSAI IE value (TS 24.501 §9.11.3.46): per rejected S-NSSAI,
+/// one octet of (length of the S-NSSAI << 4 | cause), then SST and an optional SD.
+pub fn encode_rejected_nssai_value(snssais: &[crate::context::SNssai], cause: u8) -> Vec<u8> {
+    let mut data = Vec::new();
+    for snssai in snssais {
+        match snssai.sd {
+            Some(sd) => {
+                data.push((4 << 4) | (cause & 0x0F));
+                data.push(snssai.sst);
+                data.push((sd >> 16) as u8);
+                data.push((sd >> 8) as u8);
+                data.push(sd as u8);
+            }
+            None => {
+                data.push((1 << 4) | (cause & 0x0F));
+                data.push(snssai.sst);
+            }
+        }
+    }
+    data
+}
+
 /// Encode an NSSAI IE value (list of S-NSSAIs) per TS 24.501 Section 9.11.3.37
 pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
     let mut data = Vec::new();
@@ -694,6 +728,26 @@ pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
 /// `drift_registration_reject_through_nextgcore_nas` and `golden_registration_reject`.
 pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
     build_registration_reject_with_backoff(gmm_cause, None)
+}
+
+/// #1942: a Registration Reject carrying the Rejected NSSAI (IEI 0x69, TS 24.501
+/// §8.2.9.6), each S-NSSAI with cause "not available in the current registration
+/// area", as §5.5.1.2.5 requires with #62.
+pub fn build_registration_reject_with_rejected_nssai(
+    gmm_cause: GmmCause,
+    rejected: &[crate::context::SNssai],
+) -> Vec<u8> {
+    let msg =
+        nextgcore_msg::FiveGmmMessage::RegistrationReject(nextgcore_msg::RegistrationReject {
+            gmm_cause: gmm_cause as u8,
+            t3346_value: None,
+            t3502_value: None,
+            eap_message: None,
+            rejected_nssai: (!rejected.is_empty()).then(|| {
+                encode_rejected_nssai_value(rejected, REJECTED_NSSAI_CAUSE_NOT_IN_REGISTRATION_AREA)
+            }),
+        });
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build a Registration Reject carrying an optional T3346 back-off
@@ -1736,6 +1790,57 @@ mod tests {
         expected.extend_from_slice(&[0x5e, 0x01, 0xA9]);
 
         assert_eq!(build_registration_accept(&ue), Some(expected));
+    }
+
+    /// #1942: an S-NSSAI NSAC rejected goes in the Registration Accept's Rejected
+    /// NSSAI (IEI 0x11, TS 24.501 §8.2.7.6 / §9.11.3.46) with cause 1 "not available
+    /// in the current registration area", after the Allowed NSSAI.
+    ///
+    /// REVERT-VERIFIED: with `rejected_nssai: None` in the accept again, this fails:
+    /// the IE is missing.
+    #[test]
+    fn golden_registration_accept_carries_the_rejected_nssai_1942() {
+        let mut ue = create_test_amf_ue();
+        ue.access_type = 1;
+        ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            tac: 0x010203,
+        };
+        ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ue.rejected_nssai = vec![crate::context::SNssai {
+            sst: 2,
+            sd: Some(0x0a0b0c),
+        }];
+        let accept = build_registration_accept(&ue).expect("accept");
+        // Rejected S-NSSAI: (length 4 << 4 | cause 1), SST 2, SD 0a0b0c.
+        let ie = [0x11, 0x05, 0x41, 0x02, 0x0a, 0x0b, 0x0c];
+        let at = accept.windows(ie.len()).position(|w| w == ie);
+        assert!(at.is_some(), "the Rejected NSSAI IE: {accept:02x?}");
+        let allowed = accept
+            .windows(2)
+            .position(|w| w == [0x15, 0x02])
+            .expect("allowed");
+        assert!(
+            allowed < at.unwrap(),
+            "after the Allowed NSSAI (§8.2.7 order)"
+        );
+        assert_eq!(
+            encode_rejected_nssai_value(&[crate::context::SNssai { sst: 3, sd: None }], 1),
+            vec![0x11, 0x03],
+            "SST only: length 1"
+        );
+    }
+
+    /// #1942: a #62 Registration Reject carries the Rejected NSSAI (IEI 0x69).
+    #[test]
+    fn golden_registration_reject_with_rejected_nssai_1942() {
+        assert_eq!(
+            build_registration_reject_with_rejected_nssai(
+                GmmCause::NoNetworkSlicesAvailable,
+                &[crate::context::SNssai { sst: 1, sd: None }],
+            ),
+            vec![0x7e, 0x00, 0x44, 62, 0x69, 0x02, 0x11, 0x01]
+        );
     }
 
     #[test]

@@ -236,6 +236,16 @@ authenticated. GPSI resolution needs the UDM's `id-translation-result`, which
 this repo's `udmd` serves from the UDR's identity data (it answered `501` before
 #85 was fixed); a GPSI the UDR has no mapping for is still refused with `404`.
 
+### Request paths every SBI server refuses (#1934, #1939)
+
+Before routing, before the callback exemption and before any OAuth2 or resource-scope check, every nextgcore-sbi server answers `400 INVALID_MSG_FORMAT` to a request path that has:
+- an empty segment (`//` anywhere, a leading `//`, a trailing `/`), or
+- a dot segment (`.` or `..`, also percent-encoded as `%2e`).
+
+This is so a router and a per-path check can never disagree on which resource a path names (#1934: `//` once skipped a resource scope).
+
+A percent-encoded `/` (`%2F`) or `\` (`%5C`) inside a segment is accepted. A resource URI variable that is a free-form string (TS 29.519 `{appId}`, TS 29.122 `{scsAsId}`, `{afId}`) may carry one. No router or per-path check in this tree decodes a path before splitting it, so an encoded separator is one segment to all of them. A router that decodes must do so per segment, after splitting. The HTTP/3 prototype transport applies the same check.
+
 ## Common parameters and code defaults
 
 | Parameter | Default (from code) | Where defined |

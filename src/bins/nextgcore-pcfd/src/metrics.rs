@@ -122,6 +122,8 @@ pub fn render_prometheus() -> String {
         nrf_client: true,
     });
     render_pcf_families(&mut out, &census());
+    // #1877: the BSF deregistration reconciler.
+    crate::bsf_reconcile::render(&mut out);
     out
 }
 

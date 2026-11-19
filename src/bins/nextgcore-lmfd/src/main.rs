@@ -9956,6 +9956,8 @@ mod callback_tokens_1518 {
         seen: Arc<Mutex<Vec<(String, String)>>>,
         subscribe_status: Arc<std::sync::atomic::AtomicU16>,
         transfer_status: Arc<std::sync::atomic::AtomicU16>,
+        /// #1877: how long a subscribe is held before it is answered (ms).
+        subscribe_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     async fn stand_in_amf() -> StandInAmf {
@@ -9963,25 +9965,34 @@ mod callback_tokens_1518 {
         let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let subscribe_status = Arc::new(std::sync::atomic::AtomicU16::new(201));
         let transfer_status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let subscribe_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
-        let (s, sub, tr) = (
+        let (s, sub, tr, delay) = (
             seen.clone(),
             subscribe_status.clone(),
             transfer_status.clone(),
+            subscribe_delay_ms.clone(),
         );
         server
             .start(move |req: SbiRequest| {
-                let (s, sub, tr) = (s.clone(), sub.clone(), tr.clone());
+                let (s, sub, tr, delay) = (s.clone(), sub.clone(), tr.clone(), delay.clone());
                 async move {
                     let uri = req.header.uri.clone();
-                    let mut seen = s.lock().unwrap();
-                    seen.push((uri.clone(), req.http.content.clone().unwrap_or_default()));
+                    let n = {
+                        let mut seen = s.lock().unwrap();
+                        seen.push((uri.clone(), req.http.content.clone().unwrap_or_default()));
+                        seen.len()
+                    };
                     if uri.ends_with("/subscriptions") {
+                        let held = delay.load(Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(held)).await;
                         let status = sub.load(Ordering::SeqCst);
                         SbiResponse::with_status(status)
                             .with_json_body(&serde_json::json!({
-                                "n1n2NotifySubscriptionId": format!("s{}", seen.len()),
+                                "n1n2NotifySubscriptionId": format!("s{n}"),
+                                // #1877: and the non-UE NRPPa answer's member.
+                                "n2NotifySubscriptionId": format!("s{n}"),
                             }))
                             .unwrap()
                     } else {
@@ -10001,6 +10012,7 @@ mod callback_tokens_1518 {
             seen,
             subscribe_status,
             transfer_status,
+            subscribe_delay_ms,
         }
     }
 
@@ -10032,6 +10044,109 @@ mod callback_tokens_1518 {
             404 => false,
             other => panic!("unexpected {other}"),
         }
+    }
+
+    /// #1877: a DetermineLocation whose consumer went away while the AMF was making
+    /// the N1N2 subscription leaves it recorded, its token admitted, not orphaned at
+    /// the AMF: the create and its commit run on their own task.
+    ///
+    /// REVERT-VERIFIED: with the create awaited inline again, this fails: the entry
+    /// is abandoned and the AMF's subscription is recorded nowhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscribe_cancelled_mid_create_is_still_recorded_1877() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+        let ue = "imsi-001010000018774";
+        let amf = stand_in_amf().await;
+        amf.subscribe_delay_ms.store(300, Ordering::SeqCst);
+        {
+            let mut ensure = Box::pin(namf_client::ensure_n1n2_subscription(&amf.amf, ue));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while amf.subscribed_n1_tokens().is_empty() {
+                assert!(tokio::time::Instant::now() < deadline, "never subscribed");
+                if tokio::time::timeout(std::time::Duration::from_millis(5), &mut ensure)
+                    .await
+                    .is_ok()
+                {
+                    panic!("finished before the AMF answered");
+                }
+            }
+            // Dropped here: the consumer went away.
+        }
+        let key = amf.amf.subscription_key(ue);
+        let recorded = || lmf_self().read().unwrap().amf_subscription_get(&key);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorded().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let id = recorded();
+        let token = amf.subscribed_n1_tokens()[0].clone();
+        let still_admitted = admitted(&token).await;
+        amf.server.stop().await.ok();
+
+        assert_eq!(
+            id.as_deref(),
+            Some("s1"),
+            "the AMF's subscription is recorded"
+        );
+        assert!(still_admitted, "and its token admitted");
+    }
+
+    /// #1877: the same for the non-UE NRPPa subscription (TS 29.518 §5.2.2.4.2):
+    /// its create, dropped by a caller that went away, is still recorded.
+    ///
+    /// REVERT-VERIFIED: with this create awaited inline again, this fails: the entry
+    /// is abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_subscribe_cancelled_mid_create_is_still_recorded_1877() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+        let amf = stand_in_amf().await;
+        amf.subscribe_delay_ms.store(300, Ordering::SeqCst);
+        let subscribed = || {
+            amf.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(uri, _)| uri.ends_with("/subscriptions"))
+        };
+        {
+            let mut ensure = Box::pin(namf_client::ensure_non_ue_nrppa_subscription(
+                &amf.amf, "lmf-1877",
+            ));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !subscribed() {
+                assert!(tokio::time::Instant::now() < deadline, "never subscribed");
+                if tokio::time::timeout(std::time::Duration::from_millis(5), &mut ensure)
+                    .await
+                    .is_ok()
+                {
+                    panic!("finished before the AMF answered");
+                }
+            }
+        }
+        let key = amf.amf.non_ue_subscription_key();
+        let recorded = || lmf_self().read().unwrap().amf_subscription_get(&key);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorded().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let id = recorded();
+        amf.server.stop().await.ok();
+
+        assert_eq!(
+            id.as_deref(),
+            Some("s1"),
+            "the AMF's subscription is recorded"
+        );
     }
 
     /// #1518, restarts of both peers. The subscription is made once and reused;
@@ -10100,13 +10215,15 @@ mod callback_tokens_1518 {
         amf.server.stop().await.ok();
     }
 
-    /// #1518 (R8 M2): a subscribe whose task is cancelled mid-create (its
-    /// DetermineLocation consumer disconnected) abandons its in-flight entry, so
-    /// the key can be subscribed again and the entry holds no cap slot. Both the
-    /// UE and the non-UE paths.
+    /// #1518 (R8 M2): a subscribe whose caller is cancelled mid-create (its
+    /// DetermineLocation consumer disconnected) does not hold its in-flight entry
+    /// for ever. #1877: the create now finishes on its own task, so against an AMF
+    /// that never answers the entry is abandoned when the create's own bounded
+    /// request gives up (not at the cancel), and then the key can be subscribed
+    /// again. Both the UE and the non-UE paths.
     ///
     /// REVERT-VERIFIED: with `InFlightCreate`'s drop not abandoning, the key stays
-    /// in flight after the abort and a fresh start is refused.
+    /// in flight after the create gives up and a fresh start is refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_subscribe_leaves_nothing_in_flight_1518() {
         // #1884: the subscribe goes to a loopback plaintext AMF, i.e. a dev
@@ -10138,6 +10255,15 @@ mod callback_tokens_1518 {
 
         // By key: other modules' tests share the store without this lock.
         let held = |key: &str| lmf_self().read().unwrap().amf_subscription_holds(key);
+        // The create's own bound (client connect 2 s + request 3 s), with margin.
+        let gave_up = |key: String| async move {
+            for _ in 0..80 {
+                if !lmf_self().read().unwrap().amf_subscription_holds(&key) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
         let in_flight = |key: String| async move {
             for _ in 0..100 {
                 if lmf_self().read().unwrap().amf_subscription_holds(&key) {
@@ -10156,7 +10282,11 @@ mod callback_tokens_1518 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!held(&amf.subscription_key(ue)), "abandoned on cancel");
+        gave_up(amf.subscription_key(ue)).await;
+        assert!(
+            !held(&amf.subscription_key(ue)),
+            "abandoned once the create gives up"
+        );
         assert!(
             lmf_self()
                 .read()
@@ -10178,7 +10308,11 @@ mod callback_tokens_1518 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!held(&amf.non_ue_subscription_key()), "abandoned on cancel");
+        gave_up(amf.non_ue_subscription_key()).await;
+        assert!(
+            !held(&amf.non_ue_subscription_key()),
+            "abandoned once the create gives up"
+        );
 
         hold.abort();
         lmf_context_final();

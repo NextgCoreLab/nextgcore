@@ -531,6 +531,9 @@ pub struct RegistrationReject {
     pub t3502_value: Option<GprsTimer2>,
     /// EAP message
     pub eap_message: Option<EapMessage>,
+    /// Rejected NSSAI (TS 24.501 §8.2.9.6 / §9.11.3.46, IEI 0x69): the IE value,
+    /// rejected S-NSSAIs each with its cause.
+    pub rejected_nssai: Option<Vec<u8>>,
 }
 
 impl RegistrationReject {
@@ -548,6 +551,12 @@ impl RegistrationReject {
         if let Some(ref eap) = self.eap_message {
             buf.put_u8(0x78);
             eap.encode(buf);
+        }
+        if let Some(ref rejected_nssai) = self.rejected_nssai {
+            // Rejected NSSAI: TLV, IEI 0x69 (§8.2.9.1, after the EAP message).
+            buf.put_u8(0x69);
+            buf.put_u8(rejected_nssai.len() as u8);
+            buf.put_slice(rejected_nssai);
         }
     }
 
@@ -582,6 +591,10 @@ impl RegistrationReject {
                         &mut msg.eap_message,
                         optional_tlv_e(buf, EapMessage::decode)?,
                     );
+                }
+                0x69 => {
+                    buf.skip(1)?;
+                    set_first(&mut msg.rejected_nssai, Some(opaque_tlv(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }

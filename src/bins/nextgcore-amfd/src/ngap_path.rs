@@ -6884,19 +6884,29 @@ impl NgapServer {
             )
             .await;
             state.amf_ue.slice_admission_granted = admitted.granted;
-            if let Some(denied) = admitted.denied {
+            // #1942, TS 23.502 §4.2.11.2 / TS 24.501 §5.5.1.2.4: an S-NSSAI whose
+            // maximum number of UEs is reached is rejected, and the registration goes
+            // on with the others. This AMF does not offer the Extended rejected NSSAI
+            // (it does not read the UE's ER-NSSAI bit), so the cause is the one §5.5.1.2.4
+            // gives a UE without it: "S-NSSAI not available in the current registration
+            // area", in the Rejected NSSAI IE. It used to reject the whole registration
+            // on the first denial.
+            if let Some(reject) = apply_nsac_outcome(&mut state.amf_ue, &admitted) {
                 log::warn!(
-                    "[{supi}] Slice admission denied by NSACF (SST={}, SD={:?}); rejecting registration",
-                    denied.sst,
-                    denied.sd
-                );
-                let reject = gmm_build::build_registration_reject(
-                    GmmCause::InsufficientResourcesForSpecificSlice,
+                    "[{supi}] NSACF admitted no S-NSSAI of the Allowed NSSAI; rejecting the \
+                     registration with 5GMM #62"
                 );
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
                 return Ok(());
+            }
+            if !admitted.rejected.is_empty() {
+                log::warn!(
+                    "[{supi}] NSACF denied {:?}; they are rejected and the registration goes on \
+                     with the rest of the Allowed NSSAI",
+                    admitted.rejected
+                );
             }
         }
 
@@ -21695,6 +21705,28 @@ impl NgapServer {
 /// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
 /// UDM therefore saw a "new AMF" and sent the restarted AMF a
 /// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
+/// #1942: apply NSAC's answer to a registering UE. The rejected S-NSSAIs leave the
+/// Allowed NSSAI and are recorded as the Rejected NSSAI the Registration Accept
+/// carries. When none is left, the Registration Reject to send: 5GMM #62 "No network
+/// slices available", with every S-NSSAI asked for in its Rejected NSSAI (TS 24.501
+/// §5.5.1.2.5).
+fn apply_nsac_outcome(
+    amf_ue: &mut crate::context::AmfUe,
+    admitted: &crate::nsac::Admitted,
+) -> Option<Vec<u8>> {
+    amf_ue.rejected_nssai = admitted.rejected.clone();
+    if admitted.all_rejected(&amf_ue.allowed_nssai) {
+        return Some(gmm_build::build_registration_reject_with_rejected_nssai(
+            GmmCause::NoNetworkSlicesAvailable,
+            &admitted.rejected,
+        ));
+    }
+    amf_ue
+        .allowed_nssai
+        .retain(|s| !admitted.rejected.contains(s));
+    None
+}
+
 /// The TS 29.571 AccessType an NSAC request names for an `AmfUe::access_type`.
 fn nsac_access_type(access_type: u8) -> &'static str {
     if access_type == 0 || access_type == 1 {
@@ -43702,6 +43734,36 @@ mod tests {
             "with the NAS state gone too, which is the pre-#361 behaviour this setting \
              preserves for a deployment whose regulation forbids the feature"
         );
+    }
+
+    /// #1942: NSAC's answer applied to a registering UE. A rejected S-NSSAI leaves
+    /// the Allowed NSSAI and is carried as the Rejected NSSAI, the registration
+    /// goes on; with every S-NSSAI rejected it is refused with #62.
+    ///
+    /// REVERT-VERIFIED: with any rejection refusing the registration again, this
+    /// fails: the partial case answers a reject.
+    #[test]
+    fn a_rejected_snssai_leaves_the_allowed_nssai_and_the_rest_goes_on_1942() {
+        let s = |sst| SNssai { sst, sd: None };
+        let mut ue = UeNasContext::new(7_194_201, 1, 1, false).amf_ue;
+        ue.allowed_nssai = vec![s(1), s(2)];
+        let partial = crate::nsac::Admitted {
+            granted: true,
+            rejected: vec![s(2)],
+        };
+        assert_eq!(apply_nsac_outcome(&mut ue, &partial), None, "goes on");
+        assert_eq!(ue.allowed_nssai, vec![s(1)]);
+        assert_eq!(ue.rejected_nssai, vec![s(2)]);
+
+        let mut ue = UeNasContext::new(7_194_202, 1, 1, false).amf_ue;
+        ue.allowed_nssai = vec![s(1), s(2)];
+        let none = crate::nsac::Admitted {
+            granted: false,
+            rejected: vec![s(1), s(2)],
+        };
+        let reject = apply_nsac_outcome(&mut ue, &none).expect("refused");
+        assert_eq!(reject[3], 62, "5GMM #62 No network slices available");
+        assert_eq!(&reject[4..6], &[0x69, 0x04], "with the Rejected NSSAI");
     }
 
     /// #1876: every deregistration counts the UE out at the NSACF on each S-NSSAI it
