@@ -411,6 +411,35 @@ jobs:
         run: helm lint deploy/helm/nextgcore --set global.siteId=ci
       - name: helm template renders
         run: helm template t deploy/helm/nextgcore --set global.siteId=ci > /dev/null
+      - name: helm lint and template, production profile (#2052)
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/nextgcore --set global.siteId=ci --set global.sbiProfile=production
+          helm template t deploy/helm/nextgcore --set global.siteId=ci \
+            --set global.sbiProfile=production > "$RUNNER_TEMP/prod.yaml"
+          # The derived nrf.nf_set_allowlist entry for the chart's AMF. The
+          # nrfd test the_helm_chart_provisions_its_amf_for_its_amf_set_2052
+          # parses it and checks nrfd admits the AMF's guamiList.
+          grep -q 'nf_set_id: set001.region02.amfset.5gc.mnc070.mcc999' "$RUNNER_TEMP/prod.yaml" \
+            || { echo "no derived nf_set_allowlist entry for the AMF (#2052)"; exit 1; }
+          # The NSSF's dev-only OAuth2 opt-out is not rendered under production.
+          if grep -q 'require: false' "$RUNNER_TEMP/prod.yaml"; then
+            echo "production profile renders an oauth2 opt-out (#2052)"; exit 1
+          fi
+      - name: helm template refuses an nrf.nfSetAllowlist without the chart's AMF (#2052)
+        run: |
+          refuse() {
+            local want="$1"; shift
+            if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci "$@" 2>&1); then
+              echo "rendered with $*; it must fail (#2052)"; exit 1
+            fi
+            echo "$out" | grep -q "$want" || { echo "failed for another reason: $out"; exit 1; }
+          }
+          refuse 'admits no AMF' --set-json 'nrf.nfSetAllowlist=[]'
+          refuse 'admits no AMF' \
+            --set-json 'nrf.nfSetAllowlist=[{"nf_set_id":"set002.region02.amfset.5gc.mnc070.mcc999"}]'
+          refuse 'nf_set_id must be a non-empty' --set-json 'nrf.nfSetAllowlist=[{"nf_types":["AMF"]}]'
+          refuse 'an AMF Set ID is an integer 0-1023' --set amf.config.amfId.set=1024
       - name: helm template refuses amf.replicas=2
         run: |
           if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci \
