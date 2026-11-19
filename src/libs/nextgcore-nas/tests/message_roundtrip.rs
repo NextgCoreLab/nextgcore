@@ -526,6 +526,8 @@ fn gmm_registration_reject() {
         t3346_value: Some(GprsTimer2::new(10)),
         t3502_value: Some(GprsTimer2::new(12)),
         eap_message: Some(EapMessage::new(vec![0x04, 0x01, 0x00, 0x04])),
+        // #1942: the Rejected NSSAI, SST 1 and SST 2 + SD, cause 1.
+        rejected_nssai: Some(vec![0x11, 0x01, 0x41, 0x02, 0x01, 0x02, 0x03]),
     }));
 }
 
