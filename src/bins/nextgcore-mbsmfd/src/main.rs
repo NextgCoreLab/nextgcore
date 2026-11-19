@@ -1111,6 +1111,36 @@ fn requested_snssai(body: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({ "sst": 1 }))
 }
 
+/// #2062: a ContextStatusNotify token minted for a ContextCreate, forgotten when
+/// dropped unless [`Self::commit`]ted to the context's record: a create that
+/// fails, or is dropped at any await, leaves no Live token behind.
+struct MintedNotifyToken(Option<String>);
+
+impl MintedNotifyToken {
+    fn new(token: String) -> Self {
+        Self(Some(token))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_deref().unwrap_or_default()
+    }
+
+    /// Hand the token to the record that now owns it; nothing is forgotten.
+    fn commit(mut self) -> String {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for MintedNotifyToken {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            if let Ok(c) = mbsmf_self().read() {
+                c.forget_amf_notify_token(&token);
+            }
+        }
+    }
+}
+
 /// #1758: Namf_MBSBroadcast ContextCreate on `amf` for session `session_id`, and
 /// its record, so the session's release can delete it. When the session was
 /// released while the create was in flight (the release found nothing to delete),
@@ -1119,7 +1149,7 @@ fn requested_snssai(body: &str) -> serde_json::Value {
 ///
 /// #1796: the request carries a `notifyUri` ending in a token minted here, so the
 /// AMF's ContextStatusNotify for this context is admitted; a create that did not
-/// produce a context forgets it.
+/// produce a context forgets it (#2062: as does one dropped mid-flight).
 async fn create_amf_mbs_context(
     session_id: u64,
     tmgi: Tmgi,
@@ -1137,28 +1167,27 @@ async fn create_amf_mbs_context(
         };
         (base, guard.mint_amf_notify_token(session_id)?)
     };
-    let forget = |token: &str| {
-        if let Ok(c) = mbsmf_self().read() {
-            c.forget_amf_notify_token(token);
-        }
-    };
+    // #2062: the token is Live until the create commits it to a record, and the
+    // mint cap never reclaims a Live token; so a create dropped mid-flight (its
+    // task aborted, the runtime shut down, a caller's timeout) must forget it, or
+    // enough of them wedge the cap and every later create is refused.
+    let token = MintedNotifyToken::new(token);
     // #1854: the create and its record run in the (AMF, TMGI) lane, so a delete of
     // the context a released session held on the same TMGI is either done before
     // this create (which then gets a fresh context) or sees this record and is
     // dropped. The AMF's ContextCreate is idempotent on the TMGI, so without the
     // lane this create could be handed a context an in-flight delete then removes.
     let lane = lane::enter(&amf.host, amf.port, Some(&tmgi)).await;
-    let Some(context_ref) = namf_client::context_create(&amf, &tmgi, &leg, &base, &token).await
-    else {
-        forget(&token);
-        return None;
-    };
+    // #2062: a create that fails drops `token`, which forgets it.
+    let context_ref = namf_client::context_create(&amf, &tmgi, &leg, &base, token.as_str()).await?;
     let record = AmfMbsContext {
         host: amf.host,
         port: amf.port,
         nf_instance_id: amf.nf_instance_id,
         context_ref: context_ref.clone(),
-        notify_token: token,
+        // #2062: the record owns the token from here: recorded, the session's
+        // release forgets it; not recorded, the delete below does.
+        notify_token: token.commit(),
         tmgi: Some(tmgi),
     };
     let recorded = mbsmf_self()
