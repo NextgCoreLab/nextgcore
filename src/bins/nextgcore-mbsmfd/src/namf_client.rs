@@ -1024,6 +1024,44 @@ mod tests {
         ctx.read().unwrap().session_remove(b.id);
     }
 
+    /// **#2075**: a `release_retries` task aborted while the AMF holds one of its
+    /// ContextDeletes parks every delete it had not delivered -- the one in
+    /// flight and the ones behind it -- with the reconciler, instead of losing
+    /// them. Deterministic: the stand-in AMF holds the first retry, and the task
+    /// is aborted there.
+    ///
+    /// REVERT-VERIFIED: with `UndeliveredDeletes` parking nothing on drop, the
+    /// abort leaves nothing parked and "the aborted retries park both deletes"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_release_retries_park_their_deletes_2075() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let (_server, context, _deletes, arrived, _release) = scripted_amf(true, &[]).await;
+        crate::mbsmf_context_init(256);
+        let second = crate::context::AmfMbsContext {
+            context_ref: "8".to_string(),
+            ..context.clone()
+        };
+        let retries = crate::release_retries(vec![context, second]);
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("the first retry reaches the AMF");
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            0,
+            "nothing is parked while the retries run"
+        );
+        retries.abort();
+        assert!(retries.await.expect_err("aborted").is_cancelled());
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            2,
+            "the aborted retries park both deletes"
+        );
+        crate::reconcile::clear_for_test();
+    }
+
     /// R24: one pass sends for at most `MAX_PASS`. Against a blackholed AMF the
     /// records it does not reach are re-parked, in order, for the next pass.
     ///
