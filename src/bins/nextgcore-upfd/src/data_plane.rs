@@ -8199,6 +8199,15 @@ mod tests {
     /// that alternates the PERIO harvest with `take_urr_reports` (what a query or a
     /// Remove URR does); every byte recorded is in exactly one report or still on the
     /// URR. With the old non-resetting read for TERMR/IMMER this double-counted.
+    ///
+    /// #1902: the race is forced, not left to the scheduler. The recorder used to
+    /// record 100 000 packets back to back, so a harvester thread starved for those
+    /// few milliseconds (a loaded `cargo test --workspace`) took only 2-3 reports and
+    /// failed the "raced" precondition, although every byte was still counted once.
+    /// It now records in `CHUNKS` chunks and, after each, waits for one full
+    /// harvester pass that STARTED after the chunk ended, so at least `CHUNKS`
+    /// reports carry bytes however the threads are scheduled. The harvester never
+    /// waits, so on a multi-core host it still races every chunk's packets.
     #[test]
     fn query_and_final_reports_racing_the_harvest_count_every_byte_once() {
         let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
@@ -8217,52 +8226,91 @@ mod tests {
         urr.set_reporting(None, None, None, None, Some(1));
         session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
 
-        const PACKETS: u64 = 100_000;
+        // 20 000 packets: the interleaving is forced now, not bought with volume.
+        const CHUNKS: u64 = 20;
+        const PER_CHUNK: u64 = 1_000;
+        // Harvester passes completed (#1902).
+        let passes = Arc::new(AtomicU64::new(0));
+        // Only turns a hang into a failure; nothing in the race is timed.
+        let deadline = std::time::Duration::from_secs(120);
         let recorder = {
-            let urr = Arc::clone(&urr);
+            let (urr, passes) = (Arc::clone(&urr), Arc::clone(&passes));
             on_thread("recorder-821", move || {
-                (0..PACKETS)
-                    .map(|i| {
-                        let b = 40 + (i % 1400);
-                        urr.record(b, i % 2 == 0);
-                        b
-                    })
-                    .sum::<u64>()
+                let (mut sent, mut packets) = (0u64, 0u64);
+                for _ in 0..CHUNKS {
+                    for _ in 0..PER_CHUNK {
+                        let b = 40 + (packets % 1400);
+                        urr.record(b, packets.is_multiple_of(2));
+                        sent += b;
+                        packets += 1;
+                    }
+                    // +2: the pass in flight at this load may have begun before the
+                    // chunk's last packet; the one after it did not. Yielding, not
+                    // spinning on the URR, so a starved harvester gets the CPU. A hung
+                    // harvester fails the `recv_timeout` below.
+                    let seen = passes.load(Ordering::SeqCst);
+                    while passes.load(Ordering::SeqCst) < seen + 2 {
+                        std::thread::yield_now();
+                    }
+                }
+                (sent, packets)
             })
         };
         let done = Arc::new(AtomicBool::new(false));
         let harvester = {
-            let (dp, urr, done) = (Arc::clone(&dp), Arc::clone(&urr), Arc::clone(&done));
+            let (dp, urr, done, passes) = (
+                Arc::clone(&dp),
+                Arc::clone(&urr),
+                Arc::clone(&done),
+                Arc::clone(&passes),
+            );
             on_thread("harvester-821", move || {
                 let mut reports = Vec::new();
                 let mut pass = 0u64;
                 loop {
                     let last = done.load(Ordering::SeqCst);
-                    if pass.is_multiple_of(2) {
+                    let taken = if pass.is_multiple_of(2) {
                         urr.backdate_period(std::time::Duration::from_secs(5));
-                        reports.extend(dp.collect_urr_reports());
+                        dp.collect_urr_reports()
                     } else {
-                        reports.extend(dp.take_urr_reports(0x821, None));
-                    }
+                        dp.take_urr_reports(0x821, None)
+                    };
+                    // A take of nothing still returns an (empty) entry; keeping only
+                    // the ones that carried usage bounds the Vec while a starved
+                    // recorder idles. Empty entries add nothing to the sums.
+                    reports.extend(taken.into_iter().filter(|r| r.total_pkts > 0));
                     pass += 1;
+                    passes.store(pass, Ordering::SeqCst);
                     if last {
                         break reports;
                     }
+                    std::thread::yield_now();
                 }
             })
         };
-        let deadline = std::time::Duration::from_secs(30);
-        let sent = recorder.recv_timeout(deadline).expect("recorder finishes");
+        let (sent, packets) = recorder.recv_timeout(deadline).expect("recorder finishes");
         done.store(true, Ordering::SeqCst);
         let reports = harvester
             .recv_timeout(deadline)
             .expect("harvester finishes");
-        assert!(reports.len() > 10, "raced: {}", reports.len());
+        // Every chunk's bytes are taken by a pass that starts after the chunk ends
+        // and before the next chunk begins, so at least CHUNKS reports carry bytes.
+        let carrying = reports.len() as u64;
+        assert!(
+            carrying >= CHUNKS,
+            "raced: {carrying} reports carried bytes"
+        );
         let reported: u64 = reports.iter().map(|r| r.total_bytes).sum();
         assert_eq!(
             reported + urr.usage().total_bytes(),
             sent,
             "every byte exactly once"
+        );
+        let reported_pkts: u64 = reports.iter().map(|r| r.total_pkts).sum();
+        assert_eq!(
+            reported_pkts + urr.usage().total_pkts(),
+            packets,
+            "every packet exactly once"
         );
     }
 
