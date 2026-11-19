@@ -1773,14 +1773,26 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
             );
         }
         let periodic = periodic_reporting_from_input(&input);
-        if let Ok(c) = lmf_self().read() {
-            c.register_ldr(LdrContext {
+        // #2077: the LDR belongs to its verified creator, and an existing one
+        // is replaced only by its owner, so no other NF can re-point a UE's
+        // deferred location at its own hgmlcCallBackURI.
+        let owner = match owner_binding::owner_for_new_resource(request, "DetermineLocation") {
+            Ok(owner) => owner,
+            Err(refused) => return *refused,
+        };
+        if let Some(refused) = register_owned_ldr(
+            LdrContext {
                 ldr_reference: ldr_ref.to_string(),
                 ldr_type: ldr_type.to_string(),
                 hgmlc_callback_uri: input.hgmlc_call_back_uri.clone(),
                 supi: input.supi.clone(),
                 periodic_event_info: periodic,
-            });
+                owner,
+            },
+            request,
+            "DetermineLocation",
+        ) {
+            return refused;
         }
         // A8: only PERIODIC + periodicEventInfo + a reachable H-GMLC callback +
         // a target SUPI drives the trigger scheduler. The area- and motion-event
@@ -2506,6 +2518,160 @@ fn encode_location_response(
 // lmfd#0: custom Nlmf_Location operation handlers (TS 29.572 §6.1.4).
 // ---------------------------------------------------------------------------
 
+/// #2077: register `ldr` unless an LDR with its reference exists and belongs to
+/// another NF instance than the caller's verified one (or, under production,
+/// to nobody). `Some` is the `403` to send; nothing changed.
+fn register_owned_ldr(
+    ldr: LdrContext,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let reference = ldr.ldr_reference.clone();
+    let result = match lmf_self().read() {
+        Ok(c) => c.register_ldr_unless(ldr, |owner| {
+            owner_binding::refuse_non_owner(owner, request, operation)
+        }),
+        Err(_) => Err(None),
+    };
+    match result {
+        Ok(()) => None,
+        Err(Some(refused)) => {
+            log::debug!("{operation} of LDR [{reference}] refused: not its owner");
+            Some(refused)
+        }
+        Err(None) => Some(problem(
+            500,
+            nlmf::cause::UNSPECIFIED,
+            "the LDR store is unavailable",
+        )),
+    }
+}
+
+/// #2077 (CONVENTIONS: the caller's NF type is verified, never assumed): why
+/// the requester is not shown to be an AMF, or `None` when it is. Call it once
+/// `owner_binding::verified_consumer_id` named the caller.
+///
+/// - The consumer's own client certificate (not a relay's) naming NF types
+///   (RFC 9310, TS 33.310 §6.1.3c) must name AMF.
+/// - Otherwise -- a token alone, a token through an SCP or SEPP, or a
+///   certificate without NF types plus a token -- the NRF must list the token's
+///   verified subject as an AMF (NFDiscovery with `target-nf-instance-id`),
+///   failing closed. An access token names no NF type of its consumer (TS
+///   29.510 `AccessTokenClaims`).
+/// - A certificate without NF types and no token is refused: it cannot be told
+///   apart from a relay's.
+async fn verified_amf_refusal(request: &SbiRequest) -> Option<String> {
+    let types = &request.peer_cert_nf_types;
+    let relay = types.iter().any(|t| {
+        owner_binding::RELAY_NF_TYPES
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(t))
+    });
+    let cert = request
+        .peer_cert_nf_instance_id
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty());
+    if cert && !relay && !types.is_empty() {
+        return (!types.iter().any(|t| t.eq_ignore_ascii_case("AMF")))
+            .then(|| format!("the requester's certificate names {types:?}, not AMF"));
+    }
+    let Some(sub) = request
+        .oauth2_subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Some(
+            "the requester's certificate names no NF types and it sent no access token, \
+             so it cannot be shown to be an AMF"
+                .to_string(),
+        );
+    };
+    if nrf_lists_amf(sub).await {
+        None
+    } else {
+        Some(format!("the NRF does not list {sub} as an AMF"))
+    }
+}
+
+/// #2077: whether the NRF lists NF instance `id` as an AMF; `false` with no NRF
+/// or no answer (fail closed).
+async fn nrf_lists_amf(id: &str) -> bool {
+    #[cfg(test)]
+    if listed_amfs_2077::listed(id) {
+        return true;
+    }
+    let Some(nrf_uri) = nextgcore_sbi::context::global_context().get_nrf_uri().await else {
+        log::warn!("no NRF to show that {id} is an AMF; refusing its AMF-only request");
+        return false;
+    };
+    nrf_at_lists_amf(&nrf_uri, id).await
+}
+
+/// #2077: NFDiscovery at `nrf_uri` of AMF instance `id` (TS 29.510
+/// `target-nf-instance-id`): `true` only for a 200 listing `id` with `nfType`
+/// AMF.
+async fn nrf_at_lists_amf(nrf_uri: &str, id: &str) -> bool {
+    // #1617: the NRF client TLS for an https NRF URI or the production profile.
+    let Some(config) = nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(nrf_uri) else {
+        return false;
+    };
+    let client = nextgcore_sbi::client::SbiClient::new(
+        config
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    let mut request = SbiRequest::get("/nnrf-disc/v1/nf-instances");
+    request.http.set_param("target-nf-type", "AMF");
+    request.http.set_param("requester-nf-type", "LMF");
+    request.http.set_param("target-nf-instance-id", id);
+    let resp = match client.send_request(request).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!("NRF discovery of AMF {id} failed: {e}; refusing its AMF-only request");
+            return false;
+        }
+    };
+    if resp.status != 200 {
+        log::warn!(
+            "NRF discovery of AMF {id} returned {}; refusing its AMF-only request",
+            resp.status
+        );
+        return false;
+    }
+    resp.http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .and_then(|b| b["nfInstances"].as_array().cloned())
+        .is_some_and(|list| {
+            list.iter().any(|i| {
+                i["nfInstanceId"]
+                    .as_str()
+                    .is_some_and(|n| owner_binding::same_nf_instance_id(n, id))
+                    && i["nfType"].as_str() == Some("AMF")
+            })
+        })
+}
+
+/// #2077: the AMF instances tests have the NRF list. Only ever added to, with
+/// ids unique to each test, so concurrent tests cannot collide.
+#[cfg(test)]
+pub(crate) mod listed_amfs_2077 {
+    use std::sync::Mutex;
+
+    static LISTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn list(id: &str) {
+        LISTED.lock().unwrap().push(id.to_ascii_lowercase());
+    }
+
+    pub(crate) fn listed(id: &str) -> bool {
+        let id = id.trim().to_ascii_lowercase();
+        LISTED.lock().unwrap().contains(&id)
+    }
+}
+
 /// POST /nlmf-loc/v1/cancel-location (TS 29.572 §6.1.4.3).
 ///
 /// Cancels an active deferred/periodic/triggered LDR session identified by
@@ -2532,9 +2698,16 @@ async fn handle_cancel_location(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
+    // #2077: only the LDR's owner cancels it, checked under the removal's lock.
     let removed = match lmf_self().read() {
-        Ok(c) => c.cancel_ldr(&data.ldr_reference),
-        Err(_) => false,
+        Ok(c) => c.cancel_ldr_unless(&data.ldr_reference, |owner| {
+            owner_binding::refuse_non_owner(owner, request, "CancelLocation")
+        }),
+        Err(_) => Ok(false),
+    };
+    let removed = match removed {
+        Ok(removed) => removed,
+        Err(refused) => return refused,
     };
     if removed {
         SbiResponse::no_content()
@@ -2603,14 +2776,40 @@ async fn handle_location_context_transfer(request: &SbiRequest) -> SbiResponse {
     let periodic = periodic_reporting_from_event_content(&data.event_report_message.event_content);
     let is_periodic = data.ldr_type.eq_ignore_ascii_case("PERIODIC");
 
-    if let Ok(c) = lmf_self().read() {
-        c.register_ldr(LdrContext {
+    // #2077: an LDR context arrives from an AMF (TS 29.572 §5.2.2.5, TS 23.273
+    // §6.3.1), so the caller must be shown to be one -- otherwise any NF could
+    // transfer in an LDR for any SUPI with its own hgmlcCallBackURI -- and it
+    // replaces an existing LDR only if it owns it. Checked before anything is
+    // stored or armed.
+    let owner = match owner_binding::owner_for_new_resource(request, "LocationContextTransfer") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    if owner.is_some() {
+        if let Some(why) = verified_amf_refusal(request).await {
+            log::debug!(
+                "LocationContextTransfer [{}] refused: {why}",
+                data.ldr_reference
+            );
+            return nextgcore_sbi::server::send_forbidden(
+                &format!("LocationContextTransfer: {why}"),
+                None,
+            );
+        }
+    }
+    if let Some(refused) = register_owned_ldr(
+        LdrContext {
             ldr_reference: data.ldr_reference.clone(),
             ldr_type: data.ldr_type.clone(),
             hgmlc_callback_uri: Some(data.hgmlc_call_back_uri.clone()),
             supi: data.supi.clone(),
             periodic_event_info: periodic,
-        });
+            owner,
+        },
+        request,
+        "LocationContextTransfer",
+    ) {
+        return refused;
     }
 
     match (is_periodic, periodic, data.supi.as_deref()) {
@@ -4910,6 +5109,7 @@ mod tests {
             hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
             supi: None,
             periodic_event_info: None,
+            owner: None,
         });
 
         // First cancel -> 204.
@@ -4926,6 +5126,248 @@ mod tests {
         assert_eq!(resp2.status, 403);
         let v = body_json(&resp2);
         assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
+    }
+
+    // -- #2077: an LDR is bound to its verified owner -------------------------
+
+    fn transfer_2077(reference: &str, callback: &str) -> SbiRequest {
+        let body = serde_json::json!({
+            "amfId": "amf-01",
+            "ldrType": "UE_AVAILABLE",
+            "hgmlcCallBackURI": callback,
+            "ldrReference": reference,
+            "supi": "imsi-001010000002077",
+            "eventReportMessage": { "eventClass": "SUPPLEMENTARY_SERVICES", "eventContent": {} }
+        });
+        SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body.to_string(), "application/json")
+    }
+
+    fn cancel_2077(reference: &str) -> SbiRequest {
+        let body =
+            serde_json::json!({ "hgmlcCallBackURI": "http://gmlc/cb", "ldrReference": reference });
+        SbiRequest::post("/nlmf-loc/v1/cancel-location")
+            .with_body(body.to_string(), "application/json")
+    }
+
+    /// **#2077**: an LDR transferred in by an AMF is that AMF's. Every other
+    /// caller -- another AMF's token or certificate, an anonymous one, and one
+    /// whose certificate and token disagree -- is refused 403 when it transfers
+    /// the same `ldrReference` with its own `hgmlcCallBackURI` (the location
+    /// redirect) and when it cancels it, and nothing changes. The owner then
+    /// cancels it.
+    ///
+    /// REVERT-VERIFIED: with `register_owned_ldr`'s owner check removed, the
+    /// foreign transfer is answered 204 and "refused: transfer by foreign token"
+    /// fails; with `cancel_ldr_unless`'s check removed, "refused: cancel by
+    /// foreign certificate" fails.
+    #[tokio::test]
+    async fn an_ldr_is_replaced_and_cancelled_only_by_its_owner_2077() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        // Both are AMFs, so what refuses the stranger is the owner check.
+        listed_amfs_2077::list(OWNER_1865);
+        listed_amfs_2077::list(OTHER_1865);
+        let reference = "cc2077";
+        let resp = handle_location_context_transfer(&owned_1865(transfer_2077(
+            reference,
+            "http://gmlc/owner",
+        )))
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let ldr = lmf_self()
+            .read()
+            .unwrap()
+            .ldr_find(reference)
+            .expect("registered");
+        assert_eq!(ldr.owner.as_deref(), Some(OWNER_1865));
+
+        for (who, req) in strangers_1865(|| transfer_2077(reference, "http://evil/cb")) {
+            let resp = handle_location_context_transfer(&req).await;
+            assert_eq!(resp.status, 403, "refused: transfer by {who}");
+            let ldr = lmf_self()
+                .read()
+                .unwrap()
+                .ldr_find(reference)
+                .expect("kept");
+            assert_eq!(
+                ldr.hgmlc_callback_uri.as_deref(),
+                Some("http://gmlc/owner"),
+                "{who}"
+            );
+            assert_eq!(ldr.owner.as_deref(), Some(OWNER_1865), "{who}");
+        }
+        for (who, req) in strangers_1865(|| cancel_2077(reference)) {
+            let resp = handle_cancel_location(&req).await;
+            assert_eq!(resp.status, 403, "refused: cancel by {who}");
+            assert!(
+                lmf_self().read().unwrap().ldr_find(reference).is_some(),
+                "{who}: still registered"
+            );
+        }
+        assert_eq!(
+            handle_cancel_location(&owned_1865(cancel_2077(reference)))
+                .await
+                .status,
+            204
+        );
+        assert!(lmf_self().read().unwrap().ldr_find(reference).is_none());
+    }
+
+    /// **#2077**: a LocationContextTransfer comes from an AMF (TS 29.572
+    /// §5.2.2.5), and the caller must be shown to be one (CONVENTIONS: the
+    /// verified NF type). Refused, with nothing registered: a token the NRF does
+    /// not list as an AMF's, that token through an SCP, a certificate without NF
+    /// types and no token (even for a listed AMF), and a GMLC certificate.
+    /// Admitted: a certificate naming AMF, an SCP with a listed AMF's token, and
+    /// a listed AMF's token alone.
+    ///
+    /// REVERT-VERIFIED: with the `verified_amf_refusal` call removed, the
+    /// unlisted token's transfer is answered 204 and "refused: token only" fails.
+    #[tokio::test]
+    async fn a_location_context_transfer_needs_a_verified_amf_2077() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        const DIRECT: &str = "dddddddd-2077-4000-8000-00000000000d";
+        const VIA_SCP: &str = "eeeeeeee-2077-4000-8000-00000000000e";
+        const TOKEN: &str = "ffffffff-2077-4000-8000-00000000000f";
+        const NOT_AMF: &str = "99999999-2077-4000-8000-000000000009";
+        const SCP: &str = "55555555-2077-4000-8000-000000000005";
+        for id in [DIRECT, VIA_SCP, TOKEN] {
+            listed_amfs_2077::list(id);
+        }
+        let with = |reference: &str, cert: Option<(&str, &[&str])>, token: Option<&str>| {
+            let mut req = transfer_2077(reference, "http://gmlc/cb");
+            if let Some((id, types)) = cert {
+                req.peer_cert_nf_instance_id = Some(id.to_string());
+                req.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            }
+            req.oauth2_subject = token.map(str::to_string);
+            req
+        };
+        for (what, req, expect) in [
+            (
+                "token only",
+                with("x2077-1", None, Some(NOT_AMF)),
+                "does not list",
+            ),
+            (
+                "SCP",
+                with("x2077-2", Some((SCP, &["SCP"])), Some(NOT_AMF)),
+                "does not list",
+            ),
+            (
+                "typeless",
+                with("x2077-3", Some((DIRECT, &[])), None),
+                "names no NF types",
+            ),
+            (
+                "GMLC",
+                with("x2077-4", Some((NOT_AMF, &["GMLC"])), None),
+                "not AMF",
+            ),
+        ] {
+            let resp = handle_location_context_transfer(&req).await;
+            assert_eq!(resp.status, 403, "refused: {what}");
+            let detail = body_json(&resp)["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(detail.contains(expect), "{what}: {detail}");
+        }
+        for r in ["x2077-1", "x2077-2", "x2077-3", "x2077-4"] {
+            assert!(
+                lmf_self().read().unwrap().ldr_find(r).is_none(),
+                "{r} not registered"
+            );
+        }
+        for (what, req, reference, owner) in [
+            (
+                "direct",
+                with("y2077-1", Some((DIRECT, &["AMF"])), None),
+                "y2077-1",
+                DIRECT,
+            ),
+            (
+                "SCP",
+                with("y2077-2", Some((SCP, &["SCP"])), Some(VIA_SCP)),
+                "y2077-2",
+                VIA_SCP,
+            ),
+            (
+                "token only",
+                with("y2077-3", None, Some(TOKEN)),
+                "y2077-3",
+                TOKEN,
+            ),
+        ] {
+            let resp = handle_location_context_transfer(&req).await;
+            assert_eq!(
+                resp.status, 204,
+                "admitted: {what}: {:?}",
+                resp.http.content
+            );
+            let ldr = lmf_self()
+                .read()
+                .unwrap()
+                .ldr_find(reference)
+                .expect("registered");
+            assert_eq!(ldr.owner.as_deref(), Some(owner), "{what}");
+        }
+    }
+
+    /// **#2077**: the NRF lookup behind a token's NF type passes only a 200
+    /// listing the instance with `nfType` AMF; another type, an unknown
+    /// instance, an error and an NRF that does not answer all refuse.
+    ///
+    /// REVERT-VERIFIED: with the `nfType` check dropped, "a GMLC is not an AMF"
+    /// fails.
+    #[tokio::test]
+    async fn the_nrf_lookup_of_an_amf_fails_closed_2077() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        const AMF: &str = "aaaaaaaa-2077-4000-8000-0000000000a1";
+        const GMLC: &str = "bbbbbbbb-2077-4000-8000-0000000000b1";
+        const ERR: &str = "cccccccc-2077-4000-8000-0000000000c1";
+        let (_nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|req: SbiRequest| async move {
+                let id = req
+                    .http
+                    .params
+                    .get("target-nf-instance-id")
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(
+                    req.http.params.get("target-nf-type").map(String::as_str),
+                    Some("AMF")
+                );
+                if id == ERR {
+                    return SbiResponse::with_status(500);
+                }
+                let listed = match id.as_str() {
+                    AMF => vec![serde_json::json!({ "nfInstanceId": AMF, "nfType": "AMF" })],
+                    GMLC => vec![serde_json::json!({ "nfInstanceId": GMLC, "nfType": "GMLC" })],
+                    _ => vec![],
+                };
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({ "nfInstances": listed }))
+                    .expect("json")
+            })
+            .await;
+        let nrf = format!("http://127.0.0.1:{}", addr.port());
+        assert!(nrf_at_lists_amf(&nrf, AMF).await, "a listed AMF is an AMF");
+        assert!(!nrf_at_lists_amf(&nrf, GMLC).await, "a GMLC is not an AMF");
+        assert!(
+            !nrf_at_lists_amf(&nrf, "dddddddd-2077-4000-8000-0000000000d1").await,
+            "an unknown instance is not an AMF"
+        );
+        assert!(!nrf_at_lists_amf(&nrf, ERR).await, "an NRF error refuses");
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        assert!(
+            !nrf_at_lists_amf(&format!("http://127.0.0.1:{dead_port}"), AMF).await,
+            "an NRF that does not answer refuses"
+        );
     }
 
     // -- lmfd#0: up-subscriptions 201 + unsubscribe 204 ----------------------
