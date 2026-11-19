@@ -646,6 +646,8 @@ pub async fn run() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
     // #1836: audit the restored UDR legs now, then refresh them periodically.
     crate::sdm_udr::spawn_leg_refresh();
+    // #1877: AMF unsubscribes that failed are retried until delivered.
+    drop(crate::ee_amf::spawn_unsubscribe_reconciler());
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -2733,9 +2735,13 @@ pub async fn handle_ee_unsubscribe(ue_identity: &str, subscription_id: &str) -> 
             .as_ref()
             .and_then(|c| c.ee_subscription_remove(subscription_id))
     };
-    // #1440: and the subscription this UDM held at the AMF for it.
+    // #1440: and the subscription this UDM held at the AMF for it. #1877: on its
+    // own task, so a request dropped mid-release (the consumer went away) cannot
+    // leave the AMF reporting for a subscription the UDM no longer holds; the
+    // record is already gone, so nothing else would release it.
     if let Some(sub) = removed {
-        crate::ee_amf::release(&sub).await;
+        let task = tokio::spawn(async move { crate::ee_amf::release(&sub).await });
+        let _ = task.await;
     }
     SbiResponse::with_status(204)
 }

@@ -338,11 +338,22 @@ async fn amf_subscribe(amf_base: &str, body: &Value) -> Result<String, String> {
     )
 }
 
-/// DELETE an AMF subscription (TS 29.518 §5.3.2.3). Best-effort: a gone AMF or an
-/// already-deleted subscription leaves nothing to clean up.
+/// DELETE an AMF subscription (TS 29.518 §5.3.2.3). One that fails is parked
+/// for the reconciler and retried until the AMF takes it (#1877): it used to be
+/// tried once and only logged, so an AMF that was down for a moment kept
+/// reporting to the UDM for a subscription nobody holds.
 async fn amf_unsubscribe(subscription_uri: &str) {
+    if !try_amf_unsubscribe(subscription_uri).await {
+        park_unsubscribe(subscription_uri);
+    }
+}
+
+/// One DELETE of an AMF subscription: whether the AMF answered 2xx, or 404 (it
+/// does not hold the subscription, the state wanted). A URI that is not one
+/// cannot be retried and counts as done.
+async fn try_amf_unsubscribe(subscription_uri: &str) -> bool {
     let Some((host, port, path)) = split_uri(subscription_uri) else {
-        return;
+        return true;
     };
     // The URI can be one the AMF supplied (SUBSCRIPTION_ID_CHANGE), so it does
     // not go through the tokened-client cache (#1659 review m2).
@@ -353,13 +364,157 @@ async fn amf_unsubscribe(subscription_uri: &str) {
     )
     .await
     {
-        Ok(Ok(resp)) => log::info!(
-            "Namf_EventExposure_Unsubscribe {subscription_uri}: status={}",
-            resp.status
-        ),
-        Ok(Err(e)) => log::warn!("Namf_EventExposure_Unsubscribe {subscription_uri} failed: {e}"),
-        Err(_) => log::warn!("Namf_EventExposure_Unsubscribe {subscription_uri} timed out"),
+        Ok(Ok(resp)) => {
+            log::info!(
+                "Namf_EventExposure_Unsubscribe {subscription_uri}: status={}",
+                resp.status
+            );
+            resp.is_success() || resp.status == 404
+        }
+        Ok(Err(e)) => {
+            log::warn!("Namf_EventExposure_Unsubscribe {subscription_uri} failed: {e}");
+            false
+        }
+        Err(_) => {
+            log::warn!("Namf_EventExposure_Unsubscribe {subscription_uri} timed out");
+            false
+        }
     }
+}
+
+// ---- #1877: the reconciler for AMF unsubscribes that failed ----
+
+/// AMF unsubscribes parked before the oldest is abandoned.
+pub const MAX_PENDING_UNSUBSCRIBES: usize = 4096;
+
+/// How often a parked AMF unsubscribe is retried.
+#[cfg(not(test))]
+pub const UNSUBSCRIBE_RECONCILE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+pub const UNSUBSCRIBE_RECONCILE_PERIOD: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The longest one pass sends for.
+const UNSUBSCRIBE_MAX_PASS: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `udm_ee_amf_unsubscribes_reconciled_total{result}`: parked AMF unsubscribes
+/// the reconciler ended, `delivered` (2xx or 404) or `abandoned` (evicted).
+pub static UNSUBSCRIBES_RECONCILED: nextgcore_metrics::nf::CounterFamily =
+    nextgcore_metrics::nf::CounterFamily::new(
+        "udm_ee_amf_unsubscribes_reconciled_total",
+        "Namf_EventExposure unsubscribes that failed and were parked, by how the reconciler \
+         ended them",
+        &["result"],
+    );
+
+/// The parked AMF subscription URIs, oldest first.
+///
+/// Tests that read or write it hold [`UNSUBSCRIBES_TEST_LOCK`], declared beside it.
+fn parked_unsubscribes() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static PARKED: std::sync::Mutex<std::collections::VecDeque<String>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    &PARKED
+}
+
+/// Serialises the tests that touch [`parked_unsubscribes`].
+#[cfg(test)]
+pub static UNSUBSCRIBES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn lock_parked() -> std::sync::MutexGuard<'static, std::collections::VecDeque<String>> {
+    parked_unsubscribes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn evict_unsubscribes(set: &mut std::collections::VecDeque<String>) {
+    while set.len() > MAX_PENDING_UNSUBSCRIBES {
+        if let Some(old) = set.pop_front() {
+            log::error!(
+                "Namf_EventExposure_Unsubscribe {old} abandoned: \
+                 {MAX_PENDING_UNSUBSCRIBES} are already pending"
+            );
+            UNSUBSCRIBES_RECONCILED.inc(&["abandoned"]);
+        }
+    }
+}
+
+/// Park an AMF unsubscribe that failed. One already parked is not added twice.
+fn park_unsubscribe(subscription_uri: &str) {
+    let mut set = lock_parked();
+    if set.iter().any(|u| u == subscription_uri) {
+        return;
+    }
+    log::warn!(
+        "Namf_EventExposure_Unsubscribe {subscription_uri} parked; retried every \
+         {UNSUBSCRIBE_RECONCILE_PERIOD:?}"
+    );
+    set.push_back(subscription_uri.to_string());
+    evict_unsubscribes(&mut set);
+}
+
+/// How many AMF unsubscribes are parked.
+pub fn parked_unsubscribe_count() -> usize {
+    lock_parked().len()
+}
+
+/// Forget every parked AMF unsubscribe (tests).
+#[cfg(test)]
+pub fn clear_parked_unsubscribes_for_test() {
+    lock_parked().clear();
+}
+
+/// One reconcile pass over the parked AMF unsubscribes, oldest first, for at most
+/// [`UNSUBSCRIBE_MAX_PASS`]. Returns how many ended.
+pub async fn reconcile_unsubscribes_once() -> usize {
+    let batch: Vec<String> = lock_parked().drain(..).collect();
+    let deadline = tokio::time::Instant::now() + UNSUBSCRIBE_MAX_PASS;
+    let mut ended = 0;
+    let mut still = Vec::new();
+    for uri in batch {
+        if tokio::time::Instant::now() >= deadline || !try_amf_unsubscribe(&uri).await {
+            still.push(uri);
+            continue;
+        }
+        UNSUBSCRIBES_RECONCILED.inc(&["delivered"]);
+        ended += 1;
+    }
+    let mut set = lock_parked();
+    for uri in still.into_iter().rev() {
+        if !set.contains(&uri) {
+            set.push_front(uri);
+        }
+    }
+    evict_unsubscribes(&mut set);
+    ended
+}
+
+/// Run [`reconcile_unsubscribes_once`] every [`UNSUBSCRIBE_RECONCILE_PERIOD`].
+pub fn spawn_unsubscribe_reconciler() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        let mut timer = tokio::time::interval(UNSUBSCRIBE_RECONCILE_PERIOD);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            reconcile_unsubscribes_once().await;
+        }
+    })
+}
+
+/// The reconciler's families, for `/metrics`.
+pub fn render_unsubscribe_reconciler(out: &mut String) {
+    use std::fmt::Write as _;
+    nextgcore_metrics::nf::write_header(
+        out,
+        "udm_ee_amf_unsubscribes_pending",
+        "gauge",
+        "Namf_EventExposure unsubscribes parked for the reconciler",
+    );
+    let _ = writeln!(
+        out,
+        "udm_ee_amf_unsubscribes_pending {}",
+        parked_unsubscribe_count()
+    );
+    UNSUBSCRIBES_RECONCILED.render(out);
 }
 
 /// Store `leg` on subscription `id` if it still exists; `false` when it is gone.
@@ -1072,6 +1227,79 @@ mod tests {
             "released at the AMF"
         );
         clear(supi);
+    }
+
+    /// #1877: an EE unsubscribe dropped while its AMF release waits for a reconcile
+    /// in flight still releases the AMF subscription: the release runs on its own
+    /// task, and the record it would otherwise be found by is already gone.
+    ///
+    /// REVERT-VERIFIED: with `ee_amf::release` awaited inline again, this fails:
+    /// the AMF keeps the subscription.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM/AMF state
+    async fn an_unsubscribe_dropped_mid_release_still_releases_at_the_amf_1877() {
+        let supi = "imsi-001010000018771";
+        let _guard = setup(supi);
+        let (_amf, _amf_base) = real_amf("amf-18771").await;
+        let client = mock_udr();
+        let id = ee_subscribe(supi, "http://nef.example.org/notify", loc()).await;
+        assert_eq!(register(supi, "amf-18771", &client).await, 201);
+        let leg = leg_of(&id).expect("forwarded on registration");
+        assert!(amf_subscription(&leg.subscription_uri).is_some());
+
+        // A reconcile of this subscription holds its leg lock.
+        let lock = leg_lock(&id);
+        let held = lock.lock().await;
+        {
+            let mut unsubscribe = Box::pin(crate::app::handle_ee_unsubscribe(supi, &id));
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut unsubscribe).await;
+            // Dropped here, unanswered: the consumer went away.
+        }
+        drop(held);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while amf_subscription(&leg.subscription_uri).is_some()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let kept = amf_subscription(&leg.subscription_uri).is_some();
+        clear(supi);
+
+        assert!(stored(&id).is_none(), "the record is gone");
+        assert!(!kept, "and so is the AMF subscription");
+    }
+
+    /// #1877: an AMF unsubscribe that fails is parked and retried until the AMF
+    /// takes it.
+    ///
+    /// REVERT-VERIFIED: with `amf_unsubscribe` not parking a failure, this fails:
+    /// nothing is parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_amf_unsubscribe_is_reconciled_1877() {
+        let _parked = UNSUBSCRIBES_TEST_LOCK.lock().await;
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let answer = status.clone();
+        let (_amf, addr, seen) =
+            recorder(move |_| SbiResponse::with_status(answer.load(Ordering::SeqCst))).await;
+        let uri = format!(
+            "http://127.0.0.1:{}/namf-evts/v1/subscriptions/s-18772",
+            addr.port()
+        );
+
+        amf_unsubscribe(&uri).await;
+        let parked_after_failure = parked_unsubscribe_count();
+        status.store(204, Ordering::SeqCst);
+        reconcile_unsubscribes_once().await;
+        let parked_after = parked_unsubscribe_count();
+        let tries = seen.lock().unwrap().len();
+        clear_parked_unsubscribes_for_test();
+
+        assert_eq!(parked_after_failure, 1, "the failed unsubscribe is parked");
+        assert_eq!(parked_after, 0, "and delivered once the AMF answers");
+        assert_eq!(tries, 2);
     }
 
     /// **#1449 review 2.** A PATCH of `callbackReference` re-subscribes at the AMF
