@@ -10970,6 +10970,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_replacement_notifies_profile_changed_over_the_wire() {
         use serde_json::json;
+        // #1869: the subscriber is a loopback h2c callback, which only the dev
+        // profile dials. Set and left set (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use std::sync::Mutex as StdMutex;
 
         // A deliberately unique nfType: `nf_manager()` is process-global and
