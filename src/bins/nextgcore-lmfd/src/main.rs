@@ -9120,11 +9120,15 @@ mod positioning_chain_strict_peer {
             .unwrap()
             .amf_subscription_begin(&amf_peer.non_ue_subscription_key(), &amf_peer, None)
             .expect("no subscription yet");
-        let sub = namf_client::build_non_ue_nrppa_subscription_request(
+        let mut sub = namf_client::build_non_ue_nrppa_subscription_request(
             "lmf-807",
             "http://127.0.0.1:7816",
             &start.n2_token,
         );
+        // #1865: amfd binds the subscription to a verified LMF; without one the
+        // production profile refuses it, so this would depend on a sibling test
+        // having selected dev.
+        sub.oauth2_subject = Some("lmf-807".into());
         let resp = nextgcore_amfd::namf_request_handler(sub).await;
         assert_eq!(resp.status, 201, "{:?}", resp.http.content);
 

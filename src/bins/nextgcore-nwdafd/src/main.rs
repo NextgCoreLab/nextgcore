@@ -2053,12 +2053,14 @@ mod tests {
     #[tokio::test]
     async fn test_routing_mlmodelprovision_subscriptions_post_routed() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
-        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+        let mut req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
             .with_json_body(&serde_json::json!({
                 "notifUri": "http://anlf.local/cb",
                 "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
             }))
             .expect("valid JSON body");
+        // #1865: a verified consumer, so the create passes under either profile.
+        req.oauth2_subject = Some("c0c0c0c0-1865-4000-8000-0000000000c0".into());
         let resp = nwdaf_sbi_request_handler(req).await;
         assert_eq!(
             resp.status, 201,

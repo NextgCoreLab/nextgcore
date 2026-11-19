@@ -5679,11 +5679,14 @@ mod tests {
             "callbackReference": "http://consumer.example.com/ee",
             "monitoringConfigurations": { "1": { "eventType": "LOSS_OF_CONNECTIVITY" } },
         });
-        let sub = crate::context::UdmEeSubscription::for_ue(
+        let mut sub = crate::context::UdmEeSubscription::for_ue(
             ue,
             "http://consumer.example.com/ee",
             original.to_string(),
         );
+        // #1865: owned by the consumer the PATCHes below come from, so the test
+        // does not depend on a sibling having selected the dev profile.
+        sub.owner = Some(TEST_CONSUMER_1865.to_string());
         let sub_id = sub.id.clone();
         {
             let ctx = udm_self();
