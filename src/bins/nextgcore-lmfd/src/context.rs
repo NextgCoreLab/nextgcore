@@ -600,15 +600,27 @@ pub struct LmfContext {
     /// deleting a subscription that never existed was told it succeeded, and a
     /// subscribed consumer's state was unretrievable. Fabricated success in both
     /// directions.
-    up_subscriptions: RwLock<HashMap<String, crate::nlmf::UpSubscription>>,
+    /// #1865: each with the verified NF Instance ID of the consumer that
+    /// created it, the only one that may delete it (`None` under `dev` with no
+    /// verified identity).
+    up_subscriptions: RwLock<HashMap<String, (crate::nlmf::UpSubscription, Option<String>)>>,
     /// UP-location configurations (`configure-up`, TS 29.572 §6.1.4.7), keyed by
     /// the UE identity the configuration is for (`supi`, else `gpsi`) — #104.
     /// Previously validated and discarded.
     up_configs: RwLock<HashMap<String, crate::nlmf::UpConfig>>,
     /// `Nlmf_DataExposure` subscriptions (TS 29.572 §5.4), keyed by the
     /// LMF-minted `subscriptionId` (#104). The whole service was absent before.
-    exposure_subscriptions:
-        RwLock<HashMap<String, crate::broadcast_exposure::LmfDataExposureSubscription>>,
+    /// #1865: each with its creator's verified NF Instance ID, as
+    /// [`Self::up_subscriptions`].
+    exposure_subscriptions: RwLock<
+        HashMap<
+            String,
+            (
+                crate::broadcast_exposure::LmfDataExposureSubscription,
+                Option<String>,
+            ),
+        >,
+    >,
     /// NRPPa exchanges awaiting their answer, keyed by `(procedure code,
     /// NRPPATransactionID)` (#807). The uplink notify hands a matching
     /// SUCCESSFUL/UNSUCCESSFUL OUTCOME to the waiter instead of the E-CID path.
@@ -744,23 +756,46 @@ impl LmfContext {
 
     // ---- #104: UP-location subscriptions and configurations ------------------
 
-    /// Store a UP-location subscription under a freshly minted id; returns the id.
-    pub fn up_subscription_insert(&self, sub: crate::nlmf::UpSubscription) -> Option<String> {
+    /// Store a UP-location subscription, bound to `owner` (#1865), under a
+    /// freshly minted id; returns the id.
+    pub fn up_subscription_insert(
+        &self,
+        sub: crate::nlmf::UpSubscription,
+        owner: Option<String>,
+    ) -> Option<String> {
         let mut subs = self.up_subscriptions.write().ok()?;
         let id = uuid::Uuid::new_v4().to_string();
-        subs.insert(id.clone(), sub);
+        subs.insert(id.clone(), (sub, owner));
         Some(id)
     }
 
     /// The stored subscription for `id`, if any.
     pub fn up_subscription_find(&self, id: &str) -> Option<crate::nlmf::UpSubscription> {
-        self.up_subscriptions.read().ok()?.get(id).cloned()
+        self.up_subscriptions
+            .read()
+            .ok()?
+            .get(id)
+            .map(|(s, _)| s.clone())
+    }
+
+    /// #1865: the owner of UP-location subscription `id`: `None` when the id
+    /// is unknown, `Some(None)` when it is ownerless.
+    pub fn up_subscription_owner(&self, id: &str) -> Option<Option<String>> {
+        self.up_subscriptions
+            .read()
+            .ok()?
+            .get(id)
+            .map(|(_, o)| o.clone())
     }
 
     /// Remove a UP-location subscription. `None` when the id is unknown, which is
     /// what lets `up-unsubscribe` answer 404 instead of a fabricated 204.
     pub fn up_subscription_remove(&self, id: &str) -> Option<crate::nlmf::UpSubscription> {
-        self.up_subscriptions.write().ok()?.remove(id)
+        self.up_subscriptions
+            .write()
+            .ok()?
+            .remove(id)
+            .map(|(s, _)| s)
     }
 
     pub fn up_subscription_count(&self) -> usize {
@@ -782,14 +817,16 @@ impl LmfContext {
 
     // ---- #104: Nlmf_DataExposure subscriptions -------------------------------
 
-    /// Store a data-exposure subscription under a freshly minted id.
+    /// Store a data-exposure subscription, bound to `owner` (#1865), under a
+    /// freshly minted id.
     pub fn exposure_subscription_insert(
         &self,
         sub: crate::broadcast_exposure::LmfDataExposureSubscription,
+        owner: Option<String>,
     ) -> Option<String> {
         let mut subs = self.exposure_subscriptions.write().ok()?;
         let id = uuid::Uuid::new_v4().to_string();
-        subs.insert(id.clone(), sub);
+        subs.insert(id.clone(), (sub, owner));
         Some(id)
     }
 
@@ -797,7 +834,21 @@ impl LmfContext {
         &self,
         id: &str,
     ) -> Option<crate::broadcast_exposure::LmfDataExposureSubscription> {
-        self.exposure_subscriptions.read().ok()?.get(id).cloned()
+        self.exposure_subscriptions
+            .read()
+            .ok()?
+            .get(id)
+            .map(|(s, _)| s.clone())
+    }
+
+    /// #1865: the owner of data-exposure subscription `id`: `None` when the id
+    /// is unknown, `Some(None)` when it is ownerless.
+    pub fn exposure_subscription_owner(&self, id: &str) -> Option<Option<String>> {
+        self.exposure_subscriptions
+            .read()
+            .ok()?
+            .get(id)
+            .map(|(_, o)| o.clone())
     }
 
     /// Replace an existing subscription (the PATCH result). `false` when the id is
@@ -810,18 +861,31 @@ impl LmfContext {
         let Ok(mut subs) = self.exposure_subscriptions.write() else {
             return false;
         };
-        if !subs.contains_key(id) {
+        // The replacement keeps the subscription's owner (#1865).
+        let Some(entry) = subs.get_mut(id) else {
             return false;
-        }
-        subs.insert(id.to_string(), sub);
+        };
+        entry.0 = sub;
         true
+    }
+
+    #[cfg(test)]
+    pub fn exposure_subscription_count(&self) -> usize {
+        self.exposure_subscriptions
+            .read()
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     pub fn exposure_subscription_remove(
         &self,
         id: &str,
     ) -> Option<crate::broadcast_exposure::LmfDataExposureSubscription> {
-        self.exposure_subscriptions.write().ok()?.remove(id)
+        self.exposure_subscriptions
+            .write()
+            .ok()?
+            .remove(id)
+            .map(|(s, _)| s)
     }
 
     /// Is a real positioning measurement source wired (#104)?
