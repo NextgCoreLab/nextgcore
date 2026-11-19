@@ -51,6 +51,19 @@ dbg2('subscribers', 'updateOne', { imsi: '1' },
 assert.ok(!more[0].includes(K) && !more[0].includes(OPC), `leaked: ${more[0]}`);
 assert.ok(more[0].includes('"10"'), `the BigInt is shown, not thrown: ${more[0]}`);
 
+// #2006: an own toJSON cannot hand JSON.stringify K, nor can a prototype's.
+const viaToJson = [];
+const dbg3 = mongooseDebug({ NODE_ENV: 'development', NEXTGCORE_SBI_PROFILE: 'dev' }, (l) =>
+  viaToJson.push(l));
+dbg3('subscribers', 'insertOne', { security: { toJSON() { return { k: K }; } } });
+dbg3('subscribers', 'insertOne', { security: { toJSON() { return K; } } });
+class Wrapped { constructor() { this.imsi = '1'; } toJSON() { return { imsi: '1', opc: OPC }; } }
+dbg3('subscribers', 'insertOne', { doc: Object.assign(Object.create(Wrapped.prototype), { imsi: '1' }) });
+dbg3('subscribers', 'insertOne', { doc: new Wrapped() });
+for (const l of viaToJson) {
+  assert.ok(!l.includes(K) && !l.includes(OPC), `toJSON leaked: ${l}`);
+}
+
 // #1983: DEBUG never enables mquery/mongoose query logging.
 assert.strictEqual(sanitizeDebugEnv({}), undefined);
 for (const raw of ['mquery', '*', 'mquery*,express:*', 'mongoose:*']) {
