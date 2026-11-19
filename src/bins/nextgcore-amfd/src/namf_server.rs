@@ -10812,6 +10812,8 @@ mod tests {
         setup_ue(supi, true, true);
         let mut create = n1n2_subscription_request(supi, &n1n2_subscription_body("o1865"));
         create.peer_cert_nf_instance_id = Some(owner.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        create.peer_cert_nf_types = vec!["SMF".into()];
         let resp = namf_request_handler(create).await;
         assert_eq!(resp.status, 201);
         let sub_id = body_json(&resp)["n1n2NotifySubscriptionId"]
@@ -10829,10 +10831,14 @@ mod tests {
         assert_eq!(held(), Some(Some(owner.to_string())));
         let mut foreign_cert = SbiRequest::delete(uri.clone());
         foreign_cert.peer_cert_nf_instance_id = Some(other.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        foreign_cert.peer_cert_nf_types = vec!["SMF".into()];
         let mut foreign_token = SbiRequest::delete(uri.clone());
         foreign_token.oauth2_subject = Some(other.into());
         let mut mixed = SbiRequest::delete(uri.clone());
         mixed.peer_cert_nf_instance_id = Some(owner.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["SMF".into()];
         mixed.oauth2_subject = Some(other.into());
         for req in [foreign_cert, foreign_token, mixed] {
             assert_eq!(namf_request_handler(req).await.status, 403);
@@ -18607,6 +18613,8 @@ mod subscription_owner_tests_1865 {
 
     fn as_cert(mut r: SbiRequest, id: &str) -> SbiRequest {
         r.peer_cert_nf_instance_id = Some(id.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        r.peer_cert_nf_types = vec!["SMF".into()];
         r
     }
     fn as_token(mut r: SbiRequest, id: &str) -> SbiRequest {

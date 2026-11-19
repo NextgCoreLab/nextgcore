@@ -5087,6 +5087,11 @@ mod tests {
         const OTHER: &str = "0e0e0e0e-1937-4000-8000-0000000000cf";
         let as_caller = |mut r: SbiRequest, cert: Option<&str>, token: Option<&str>| {
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: a consumer's certificate names its NF type (RFC 9310); an
+                // untyped one is no identity under the production profile.
+                r.peer_cert_nf_types = vec!["PCF".into()];
+            }
             r.oauth2_subject = token.map(str::to_string);
             r
         };
@@ -5280,6 +5285,11 @@ mod tests {
         };
         let as_caller = |mut r: SbiRequest, cert: Option<&str>, token: Option<&str>| {
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: a consumer's certificate names its NF type (RFC 9310); an
+                // untyped one is no identity under the production profile.
+                r.peer_cert_nf_types = vec!["PCF".into()];
+            }
             r.oauth2_subject = token.map(str::to_string);
             r
         };
@@ -5427,6 +5437,11 @@ mod tests {
             let body = (method == "PUT").then(|| doc("http://127.0.0.1:9/hijacked"));
             let mut r = request(method, &location, body);
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: a consumer's certificate names its NF type (RFC 9310); an
+                // untyped one is no identity under the production profile.
+                r.peer_cert_nf_types = vec!["PCF".into()];
+            }
             r.oauth2_subject = token.map(str::to_string);
             r
         };
@@ -5476,6 +5491,8 @@ mod tests {
             Some(doc("http://127.0.0.1:9/mixed")),
         );
         mixed.peer_cert_nf_instance_id = Some(OWNER.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["PCF".into()];
         mixed.oauth2_subject = Some(OTHER.into());
         assert_eq!(bsf_sbi_request_handler(mixed).await.status, 403);
         assert!(
