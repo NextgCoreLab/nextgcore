@@ -11177,16 +11177,18 @@ impl NgapServer {
                 // data network, with the wrong UPF, policy, charging and slice --
                 // and silently, because the session established.
                 //
-                // #2041, TS 24.501 §5.4.5.2.5 a) v): for an "initial emergency request" the AMF
-                // "shall use the emergency DNN from the AMF emergency configuration data as the
-                // DNN", whatever the UE named (it names none, §6.4.1.2), and the configured
-                // emergency S-NSSAI (`spawn_establishment_attempt`). A UE registered for
-                // emergency services reaches here only with an emergency request type (the
-                // fence above), so its session is on the emergency DNN by construction: the
-                // #361 5GSM #29 refusal of another DNN, a 5GSM message the AMF built itself,
-                // is superseded by the fence's #90.
+                // #2041, TS 24.501 §5.4.5.2.5 a) v), vii) and viii): for an emergency request
+                // ("initial emergency request" or "existing emergency PDU session") the AMF
+                // sends the DNN and the S-NSSAI of its emergency configuration data, whatever
+                // the UE named (it names none, §6.4.1.2): this DNN here, the S-NSSAI in
+                // `spawn_establishment_attempt`. A UE registered for emergency services reaches
+                // here only with one of those request types (the fence above), so its session
+                // is on the emergency DNN and S-NSSAI by construction: the #361 5GSM #29
+                // refusal of another DNN, a 5GSM message the AMF built itself, is superseded.
+                // R32 on #2051: type 4 forwarded the UE's DNN and S-NSSAI, so an
+                // emergency-registered UE could still reach "internet" through it.
                 let emergency_dnn = self.emergency.emergency_dnn().to_string();
-                let dnn = if request_type == Some(REQUEST_TYPE_INITIAL_EMERGENCY_REQUEST) {
+                let dnn = if is_emergency_request_type(request_type) {
                     Some(emergency_dnn.as_str())
                 } else {
                     dnn_override
@@ -12807,10 +12809,11 @@ impl NgapServer {
         state: &UeNasContext,
     ) {
         let psi = p.sm_pdu[1];
-        // #2041, TS 24.501 §5.4.5.2.5 a) v): an "initial emergency request" goes out on the
-        // S-NSSAI of the AMF's emergency configuration data. An unauthenticated emergency UE
-        // has no Allowed NSSAI, so this was SST 1 regardless of `amf.emergency.s_nssai`.
-        let (sst, sd) = if p.request_type == Some(REQUEST_TYPE_INITIAL_EMERGENCY_REQUEST) {
+        // #2041, TS 24.501 §5.4.5.2.5 a) v), vii), viii): an emergency request ("initial
+        // emergency request" or "existing emergency PDU session") goes out on the S-NSSAI of
+        // the AMF's emergency configuration data. An unauthenticated emergency UE has no
+        // Allowed NSSAI, so this was SST 1 regardless of `amf.emergency.s_nssai`.
+        let (sst, sd) = if is_emergency_request_type(p.request_type) {
             let emergency = crate::context::amf_self()
                 .read()
                 .map(|c| c.emergency_s_nssai())

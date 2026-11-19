@@ -6605,14 +6605,17 @@ async fn an_emergency_registered_ue_gets_a_normal_establishment_sent_back_2041()
     );
 }
 
-/// **#2041.** An "initial emergency request" goes to the SMF on the emergency DNN and
-/// the emergency S-NSSAI of the AMF's emergency configuration data, whatever the UE
-/// named (TS 24.501 §5.4.5.2.5 a) v)), for an unauthenticated UE (no Allowed NSSAI)
-/// and an authenticated one (an Allowed NSSAI of another slice) alike.
+/// **#2041.** An emergency request, "initial emergency request" (3) or "existing
+/// emergency PDU session" (4), goes to the SMF on the emergency DNN and the emergency
+/// S-NSSAI of the AMF's emergency configuration data, whatever the UE named (TS 24.501
+/// §5.4.5.2.5 a) v), vii), viii)), for an unauthenticated UE (no Allowed NSSAI) and an
+/// authenticated one (an Allowed NSSAI of another slice) alike. R32's probe on #2051: a
+/// type 4 naming "internet" and SST 1, with no emergency session, was forwarded as asked.
 ///
 /// REVERT-VERIFIED: with the S-NSSAI taken from the Allowed NSSAI again, this fails:
 /// the unauthenticated UE's create names SST 1 and the authenticated one's SST 2; with
-/// the UE's DNN forwarded again, the create names "internet".
+/// the UE's DNN forwarded again, the create names "internet"; with only type 3 forced
+/// (as #2051 first had it), the type-4 creates name "internet".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_initial_emergency_request_uses_the_emergency_dnn_and_slice_2041() {
@@ -6638,7 +6641,12 @@ async fn an_initial_emergency_request_uses_the_emergency_dnn_and_slice_2041() {
         }))
     };
     let emergency_dnn = server.emergency.emergency_dnn().to_string();
-    for (ue, ran, authenticated) in [(7_204_111u64, 251u32, false), (7_204_112, 252, true)] {
+    for (ue, ran, authenticated, request_type) in [
+        (7_204_111u64, 251u32, false, 3u8),
+        (7_204_112, 252, true, 3),
+        (7_204_113, 253, false, 4),
+        (7_204_114, 254, true, 4),
+    ] {
         emergency_registered_ue_2041(&mut server, ue, ran, authenticated);
         let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
         server
@@ -6647,7 +6655,7 @@ async fn an_initial_emergency_request_uses_the_emergency_dnn_and_slice_2041() {
                 &uplink_nas_transport(
                     ue,
                     ran,
-                    &ul_nas_transport_2041(&request, 3, Some(1), Some("internet"), 0),
+                    &ul_nas_transport_2041(&request, request_type, Some(1), Some("internet"), 0),
                 ),
             )
             .await
@@ -6657,9 +6665,21 @@ async fn an_initial_emergency_request_uses_the_emergency_dnn_and_slice_2041() {
         server.forget_ue(ue);
     }
     let creates = seen.lock().expect("seen").clone();
-    assert_eq!(creates.len(), 2, "both are forwarded: {creates:?}");
+    assert_eq!(creates.len(), 4, "all are forwarded: {creates:?}");
+    let types: Vec<&str> = creates
+        .iter()
+        .map(|c| c["requestType"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "INITIAL_EMERGENCY_REQUEST",
+            "INITIAL_EMERGENCY_REQUEST",
+            "EXISTING_EMERGENCY_PDU_SESSION",
+            "EXISTING_EMERGENCY_PDU_SESSION"
+        ]
+    );
     for create in &creates {
-        assert_eq!(create["requestType"], "INITIAL_EMERGENCY_REQUEST");
         assert_eq!(create["dnn"], emergency_dnn.as_str(), "the emergency DNN");
         assert_eq!(
             create["sNssai"]["sst"], 4,
