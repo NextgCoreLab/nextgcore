@@ -1162,7 +1162,11 @@ impl Ucmf {
         match loaded {
             Ok(Loaded::Absent) => Ok(false),
             Ok(Loaded::Snapshot(doc)) => {
-                self.restore(&doc);
+                // #1937 (R32 on #1975): a cap applied at restore is written back
+                // at once, or every restart would grant another 24 h.
+                if self.restore(&doc) {
+                    self.persist();
+                }
                 Ok(true)
             }
             Err(e) => Err(e.to_string()),
@@ -1295,7 +1299,11 @@ impl Ucmf {
         }
     }
 
-    fn restore(&mut self, doc: &Value) {
+    /// Install the snapshot `doc`. `true` when restoring changed a record
+    /// relative to `doc` (a capped ownerless expiry, #1937), so the caller must
+    /// write the state back.
+    fn restore(&mut self, doc: &Value) -> bool {
+        let mut changed = false;
         let u64_of = |k: &str| doc.get(k).and_then(Value::as_u64);
         if let Some(v) = u64_of("versionId") {
             self.version_id = v as u8;
@@ -1381,7 +1389,11 @@ impl Ucmf {
                     id: sid.to_string(),
                     nf_id: s.get("nfId").and_then(Value::as_str).map(str::to_string),
                     notification_uri: uri.to_string(),
-                    expires: restored_expiry(expires, owner.is_none(), Utc::now()),
+                    expires: {
+                        let capped = restored_expiry(expires, owner.is_none(), Utc::now());
+                        changed |= capped != expires;
+                        capped
+                    },
                     owner,
                 },
             );
@@ -1412,6 +1424,7 @@ impl Ucmf {
                 },
             );
         }
+        changed
     }
 }
 
@@ -1561,6 +1574,47 @@ mod tests {
         let mut restored = Ucmf::new(0x05, ModeOfOperation::B);
         restored.restore(&old);
         assert_eq!(restored.subscription(&sub.id).unwrap().owner, None);
+    }
+
+    /// R32 on #1975: the cap is written back when it is applied, so a second
+    /// restart does not grant another 24 h: the expiry after two restarts is
+    /// no later than after the first.
+    ///
+    /// REVERT-VERIFIED: with `attach_store` not persisting after a capping
+    /// restore, the second restart re-caps from its own clock and the expiry
+    /// moves later, failing the assertion.
+    #[test]
+    fn a_capped_expiry_does_not_move_later_on_each_restart_1937() {
+        let path = std::env::temp_dir().join(format!(
+            "ucmfd-1937-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let far = Utc::now() + ChronoDuration::days(30);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "subscriptions": [
+                    {"id": "ownerless-far", "uri": "http://amf/cb", "expires": far.to_rfc3339()}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let restart = || {
+            let mut u = Ucmf::new(0x05, ModeOfOperation::B);
+            assert_eq!(u.attach_store(Some(path.clone())), Ok(true));
+            u.subscription("ownerless-far").unwrap().expires.unwrap()
+        };
+        let first = restart();
+        assert!(first < far, "capped at the first restart");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = restart();
+        assert!(
+            second <= first,
+            "a second restart must not extend it ({first} -> {second})"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// #1937: a restored ownerless subscription lapses within the UCMF's
