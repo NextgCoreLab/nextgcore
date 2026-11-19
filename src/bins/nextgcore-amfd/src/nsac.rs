@@ -31,7 +31,7 @@
 
 use crate::context::SNssai;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Records parked before the oldest is abandoned.
@@ -84,6 +84,56 @@ fn admissions() -> &'static Mutex<HashMap<Key, Admission>> {
     &ADMISSIONS
 }
 
+/// R27 #1940: the DECREASEs on the wire and the INCREASEs being decided, per key.
+/// Read and written only with [`admissions`] locked first, so a DECREASE's check
+/// ("is the key admitted, or being admitted?") and its registration as in flight
+/// are one step against an INCREASE's registration and its look for one in flight.
+#[derive(Default)]
+struct Ops {
+    /// DECREASEs registered before their check and still on the wire.
+    in_flight: HashMap<Key, Vec<Arc<Flight>>>,
+    /// INCREASEs being decided, each with the DECREASEs it superseded: they are
+    /// owed again if this INCREASE does not end up counting the UE.
+    admitting: HashMap<Key, Vec<Admission>>,
+}
+
+/// One DECREASE on the wire, which an INCREASE for its key waits for.
+#[derive(Default)]
+struct Flight {
+    done: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl Flight {
+    fn finish(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self, until: tokio::time::Instant) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.done.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            if tokio::time::timeout_at(until, notified).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn ops() -> &'static Mutex<Ops> {
+    static OPS: std::sync::LazyLock<Mutex<Ops>> = std::sync::LazyLock::new(Default::default);
+    &OPS
+}
+
+/// The longest an INCREASE waits for a DECREASE of its key on the wire: the SBI
+/// client's request timeout bounds the DECREASE, with room to spare.
+const DECREASE_WAIT: Duration = Duration::from_secs(10);
+
 /// The parked DECREASEs, oldest first.
 fn pending() -> &'static Mutex<VecDeque<Admission>> {
     static PENDING: Mutex<VecDeque<Admission>> = Mutex::new(VecDeque::new());
@@ -100,7 +150,7 @@ pub static DECREASES: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "amf_nsac_ue_decreases_total",
         "Nnsacf_NSAC_NumOfUEsUpdate DECREASEs sent on deregistration, S-NSSAI removal or a \
-         denied registration's rollback, by outcome (accepted, refused, failed = parked)",
+         denied registration's rollback, by outcome (accepted, refused, failed = parked, superseded = admitted again)",
         &["result"],
     );
 
@@ -184,7 +234,23 @@ pub async fn admit_registration(
             nsacf_host: nsacf_host.to_string(),
             nsacf_port,
         };
-        match crate::sbi_path::call_nsacf_ue_admission(
+        // R27 #1940: registered as being admitted BEFORE looking for a DECREASE of
+        // the key on the wire, under the admissions lock a DECREASE checks under. A
+        // DECREASE that registered first is waited for (so it lands before this
+        // INCREASE); one that checks after sees this one and is superseded, its
+        // count handed to this INCREASE.
+        let key = key_of(supi, access_type, snssai);
+        let flights = {
+            let _admitted = lock(admissions());
+            let mut ops = lock(ops());
+            ops.admitting.entry(key.clone()).or_default();
+            ops.in_flight.get(&key).cloned().unwrap_or_default()
+        };
+        let until = tokio::time::Instant::now() + DECREASE_WAIT;
+        for f in flights {
+            f.wait(until).await;
+        }
+        let answer = crate::sbi_path::call_nsacf_ue_admission(
             nsacf_host,
             nsacf_port,
             nf_id,
@@ -194,8 +260,24 @@ pub async fn admit_registration(
             access_type,
             true,
         )
-        .await
-        {
+        .await;
+        // The DECREASEs superseded while this INCREASE was out: still owed unless
+        // this INCREASE counts the UE at the same NSACF (it counts a UE once).
+        let inherited = {
+            let _admitted = lock(admissions());
+            lock(ops()).admitting.remove(&key).unwrap_or_default()
+        };
+        let counted_here = matches!(&answer, Ok(res) if res.counted);
+        let owed: Vec<Admission> = inherited
+            .into_iter()
+            .filter(|old| {
+                !(counted_here
+                    && old.nsacf_host == admission.nsacf_host
+                    && old.nsacf_port == admission.nsacf_port)
+            })
+            .collect();
+        spawn_decreases(owed);
+        match answer {
             Ok(res) => {
                 granted = res.admitted;
                 if res.counted {
@@ -222,8 +304,11 @@ pub async fn admit_registration(
         }
     }
     for a in unanswered {
+        // R27 #1940: through the same check-and-send as every DECREASE, so a next
+        // registration's INCREASE neither overtakes it nor is counted out by it.
+        // Not parked: it reconciles an INCREASE that may never have landed.
         tokio::spawn(async move {
-            let _ = send(&a).await;
+            let _ = decrease_once(a).await;
         });
     }
     let gone = if denied.is_some() {
@@ -244,6 +329,45 @@ pub enum Outcome {
     Refused,
     /// No answer, a 5xx, or a refused token: worth retrying.
     Failed,
+    /// Not sent: the key is admitted again, or being admitted (its INCREASE takes
+    /// the count over, and owes this DECREASE back if it does not count the UE).
+    Superseded,
+}
+
+/// R27 #1940: one DECREASE, its check and its send atomic against an INCREASE for
+/// the same key. Registered as in flight under the admissions lock, in the same
+/// step as the check, and finished when the NSACF answers; nothing is parked.
+async fn decrease_once(a: Admission) -> Outcome {
+    let key = key_of(&a.supi, &a.access_type, &a.snssai);
+    let flight = {
+        let admitted = lock(admissions());
+        let mut ops = lock(ops());
+        if admitted.contains_key(&key) {
+            return Outcome::Superseded;
+        }
+        if let Some(owed) = ops.admitting.get_mut(&key) {
+            owed.push(a);
+            return Outcome::Superseded;
+        }
+        let flight = Arc::new(Flight::default());
+        ops.in_flight
+            .entry(key.clone())
+            .or_default()
+            .push(flight.clone());
+        flight
+    };
+    let outcome = send(&a).await;
+    {
+        let mut ops = lock(ops());
+        if let Some(list) = ops.in_flight.get_mut(&key) {
+            list.retain(|f| !Arc::ptr_eq(f, &flight));
+            if list.is_empty() {
+                ops.in_flight.remove(&key);
+            }
+        }
+    }
+    flight.finish();
+    outcome
 }
 
 /// Count `admissions` out, off the caller's path; a failure is parked.
@@ -267,14 +391,12 @@ pub fn spawn_decreases(admissions: Vec<Admission>) {
 /// One DECREASE now, parked on failure. Not sent when the slice has been admitted
 /// for the UE again meanwhile (it would count the live registration out).
 pub async fn decrease_now(a: Admission) -> Outcome {
-    if is_admitted(&a.supi, &a.access_type, &a.snssai) {
-        return Outcome::Accepted;
-    }
-    let outcome = send(&a).await;
+    let outcome = decrease_once(a.clone()).await;
     let label = match outcome {
         Outcome::Accepted => "accepted",
         Outcome::Refused => "refused",
         Outcome::Failed => "failed",
+        Outcome::Superseded => "superseded",
     };
     DECREASES.inc(&[label]);
     if outcome == Outcome::Failed {
@@ -351,16 +473,13 @@ pub async fn reconcile_once() -> usize {
             still.push(a);
             continue;
         }
-        let result = if is_admitted(&a.supi, &a.access_type, &a.snssai) {
-            "superseded"
-        } else {
-            match send(&a).await {
-                Outcome::Accepted => "delivered",
-                Outcome::Refused => "refused",
-                Outcome::Failed => {
-                    still.push(a);
-                    continue;
-                }
+        let result = match decrease_once(a.clone()).await {
+            Outcome::Superseded => "superseded",
+            Outcome::Accepted => "delivered",
+            Outcome::Refused => "refused",
+            Outcome::Failed => {
+                still.push(a);
+                continue;
             }
         };
         log::info!(
@@ -421,6 +540,9 @@ pub fn render(out: &mut String) {
 pub fn clear_for_test() {
     lock(admissions()).clear();
     lock(pending()).clear();
+    let mut ops = lock(ops());
+    ops.in_flight.clear();
+    ops.admitting.clear();
 }
 
 #[cfg(test)]
@@ -640,6 +762,159 @@ pub(crate) mod tests {
             "two failures, then one delivered; none for `back`"
         );
         assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+    }
+
+    /// A stand-in NSACF that APPLIES each request `delay` after it arrives, then
+    /// records "<FLAG>-applied". An INCREASE for an SST in `deny` is refused 403.
+    async fn slow_nsacf(
+        increase_delay: Duration,
+        decrease_delay: Duration,
+        deny: &'static [u8],
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let sink = applied.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let body: serde_json::Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    let op = &body["ueACRequestInfo"][0]["acuOperationList"][0];
+                    let flag = op["updateFlag"].as_str().unwrap_or_default().to_string();
+                    let sst = op["snssai"]["sst"].as_u64().unwrap_or(0) as u8;
+                    let increase = flag == "INCREASE";
+                    tokio::time::sleep(if increase {
+                        increase_delay
+                    } else {
+                        decrease_delay
+                    })
+                    .await;
+                    sink.lock().unwrap().push(format!("{flag}-applied"));
+                    if increase && deny.contains(&sst) {
+                        return SbiResponse::with_status(403)
+                            .with_json_body(&serde_json::json!({ "status": 403 }))
+                            .unwrap();
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        (srv, addr.port(), applied)
+    }
+
+    fn admission_at(supi: &str, sst: u8, port: u16) -> Admission {
+        Admission {
+            supi: supi.to_string(),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(sst),
+            nf_id: "amf-1940".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        }
+    }
+
+    async fn applied_n(applied: &Arc<Mutex<Vec<String>>>, n: usize) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while applied.lock().unwrap().len() < n && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        applied.lock().unwrap().clone()
+    }
+
+    /// R27 #1940: a de-registration's DECREASE that the NSACF applies late, and a
+    /// re-registration 30 ms after it. The INCREASE waits for the DECREASE on the
+    /// wire, so the NSACF applies DECREASE then INCREASE and the UE stays counted.
+    ///
+    /// REVERT-VERIFIED: with the INCREASE not waiting for a DECREASE in flight,
+    /// this fails: INCREASE-applied, DECREASE-applied (R27's probe, 3 of 3).
+    #[tokio::test]
+    async fn a_reregistration_waits_for_the_deregistrations_decrease_1940() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, applied) =
+            slow_nsacf(Duration::ZERO, Duration::from_millis(300), &[]).await;
+        let supi = "imsi-001010000019401";
+        record(admission_at(supi, 1, port));
+
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            port,
+            "amf-1940",
+        )
+        .await;
+        let order = applied_n(&applied, 2).await;
+        let held = is_admitted(supi, "3GPP_ACCESS", &snssai(1));
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert!(out.denied.is_none());
+        assert_eq!(
+            order,
+            ["DECREASE-applied", "INCREASE-applied"],
+            "the DECREASE lands first"
+        );
+        assert!(held, "and the re-registered UE is counted");
+    }
+
+    /// R27 #1940: a DECREASE that finds an INCREASE for its key being decided is
+    /// not sent while it is out; the INCREASE takes it over. Here the INCREASE is
+    /// denied, so it did not count the UE, and the DECREASE it took over is sent
+    /// after it.
+    ///
+    /// REVERT-VERIFIED: with the DECREASE ignoring an INCREASE being decided, this
+    /// fails: the DECREASE is applied before the INCREASE.
+    #[tokio::test]
+    async fn a_decrease_during_an_increase_is_taken_over_1940() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, applied) =
+            slow_nsacf(Duration::from_millis(300), Duration::ZERO, &[1]).await;
+        let supi = "imsi-001010000019402";
+
+        let registering = tokio::spawn(async move {
+            admit_registration(
+                supi,
+                "3GPP_ACCESS",
+                &[snssai(1)],
+                "127.0.0.1",
+                port,
+                "amf-1940",
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let during = decrease_now(admission_at(supi, 1, port)).await;
+        let out = registering.await.unwrap();
+        let order = applied_n(&applied, 2).await;
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(
+            during,
+            Outcome::Superseded,
+            "not sent while the INCREASE is out"
+        );
+        assert_eq!(out.denied, Some(snssai(1)));
+        assert_eq!(
+            order,
+            ["INCREASE-applied", "DECREASE-applied"],
+            "sent after it"
+        );
     }
 
     /// #1876: bounded. Parking past [`MAX_PENDING`] evicts the oldest.
