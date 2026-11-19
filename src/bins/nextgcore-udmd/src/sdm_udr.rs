@@ -2247,9 +2247,18 @@ mod tests {
     }
 
     /// A UDM crash: every worker stops, and everything in memory is gone.
+    ///
+    /// Under [`STATE_LOCK`], as a real crash cannot land between a change and its
+    /// write (#1896 R30): `clear_legs` takes no lock of its own, so a worker that
+    /// had passed its generation check could otherwise persist its SUPI's queue
+    /// from the emptied maps, as a delete, and the "restarted" UDM would find it
+    /// gone (`a_1836_snapshot_is_migrated_to_the_log_1896`, 4 in 6 parallel runs).
     async fn crash() {
-        clear_legs();
-        udm_self().read().expect("ctx").ue_remove_all();
+        {
+            let _held = STATE_LOCK.lock().await;
+            clear_legs();
+            udm_self().read().expect("ctx").ue_remove_all();
+        }
         wait_idle().await;
     }
 

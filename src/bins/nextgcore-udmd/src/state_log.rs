@@ -15,13 +15,24 @@
 //!
 //! # Torn and corrupt
 //!
-//! A crash during an append can leave the last line without its newline: that
-//! write was never acknowledged (the fsync comes before the answer), so on load
-//! it is cut off and logged ([`Opened::torn`]). Any complete line whose checksum
-//! or JSON does not hold is corruption: the open fails, the file is left as it
-//! is, and the UDM does not start (as `nextgcore_core::state_store` does for a
-//! snapshot). An append that failed part-way is cut off before the next append
-//! ([`StateLog::append`]), so it cannot run into the next line.
+//! A crash during an append can leave the last line without its newline, or (on a
+//! filesystem that exposes an unwritten extent after a crash in the final
+//! `fdatasync`) as NUL bytes ending in a newline. Either way that write was never
+//! acknowledged (the fsync comes before the answer), so on load such a last line is
+//! cut off and logged ([`Opened::Log`]'s `torn`). Only those two shapes are taken as
+//! torn (#1896 R30): a last line that has content and fails its checksum may be an
+//! acknowledged record that is corrupt, and cutting it would drop an acknowledged
+//! write silently. So it, like any damaged line before it, is corruption: the open
+//! fails, the file is left as it is, and the UDM does not start (as
+//! `nextgcore_core::state_store` does for a snapshot). An append that failed
+//! part-way is cut off before the next append ([`StateLog::append`]), so it cannot
+//! run into the next line.
+//!
+//! fsync failure: when `fdatasync` fails, the line is cut back (best effort) and
+//! the caller answers 500/503 and undoes the change in memory. If the cut fails
+//! too, the line may still reach the disk, and the change would then come back at
+//! the next start although it was refused: the usual fsync-failure ambiguity, not
+//! resolved here.
 //!
 //! # Bounds
 //!
@@ -143,6 +154,10 @@ impl StateLog {
         } else {
             bytes[..whole - 1].split(|b| *b == b'\n').collect()
         };
+        let count = lines.len();
+        // The end of the last line that parsed: what a damaged last line is cut to.
+        let mut good_end = 0usize;
+        let mut torn_last = false;
         for (n, raw) in lines.into_iter().enumerate() {
             let parsed = std::str::from_utf8(raw)
                 .ok()
@@ -152,7 +167,22 @@ impl StateLog {
                 })
                 .and_then(|(_, json)| serde_json::from_str::<Value>(json).ok());
             match parsed {
-                Some(Value::Array(line_ops)) => ops.extend(line_ops),
+                Some(Value::Array(line_ops)) => {
+                    ops.extend(line_ops);
+                    good_end += raw.len() + 1;
+                }
+                // A last line of NUL bytes only: an unwritten extent, so a write
+                // that never completed (see the module doc). Any other damage,
+                // last line or not, fails below.
+                _ if n + 1 == count && raw.iter().all(|b| *b == 0) => {
+                    log::error!(
+                        "state log {} last line ({} bytes) is all NUL bytes: taken as a write \
+                         that never completed and cut off",
+                        path.display(),
+                        raw.len() + 1
+                    );
+                    torn_last = true;
+                }
                 _ => {
                     return Err(format!(
                         "state log {} line {} is damaged; refusing to start over it",
@@ -162,6 +192,7 @@ impl StateLog {
                 }
             }
         }
+        let whole = if torn_last { good_end } else { whole };
         let torn = bytes.len() - whole;
         if torn > 0 {
             log::warn!(
@@ -557,5 +588,54 @@ mod tests {
             );
         }
         assert!(load_10k < 10_000.0, "10k loads in {load_10k:.0} ms");
+    }
+
+    /// **#1896 (R30 minor).** A last line of NUL bytes ending in its newline, as an
+    /// unwritten extent after a crash in the final fsync leaves it, is cut off like a
+    /// torn tail: the open succeeds with the lines before it, the file is truncated
+    /// to them, and appending goes on cleanly. A last line that has content and fails
+    /// its checksum is NOT cut: it may be an acknowledged record that is corrupt, so
+    /// the open fails and the file is left as it is.
+    ///
+    /// REVERT-VERIFIED: with an all-NUL last line failing the open as any other, the
+    /// UDM does not start ("a NUL last line is cut off"); with any damaged last line
+    /// cut, the corrupt one opens ("a corrupt last line still fails").
+    #[test]
+    fn a_zero_filled_last_line_is_cut_off_1896() {
+        let path = temp_path("zeroed");
+        let (mut log, _) = StateLog::open(&path).expect("new");
+        log.append(&[put("a", json!(1))]).expect("a");
+        let keep = std::fs::metadata(&path).expect("meta").len();
+        log.append(&[put("b", json!(2))]).expect("b");
+        let mut bytes = std::fs::read(&path).expect("read");
+        let end = bytes.len() - 1;
+        for b in &mut bytes[keep as usize..end] {
+            *b = 0;
+        }
+        std::fs::write(&path, &bytes).expect("write");
+
+        let (mut log, opened) = StateLog::open(&path).expect("a NUL last line is cut off");
+        let Opened::Log { ops, torn } = opened else {
+            panic!("log")
+        };
+        assert_eq!(ops, vec![put("a", json!(1))]);
+        assert_eq!(torn as u64, bytes.len() as u64 - keep);
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            keep,
+            "truncated"
+        );
+        log.append(&[put("c", json!(3))]).expect("c");
+        assert_eq!(ops_of(&path), vec![put("a", json!(1)), put("c", json!(3))]);
+
+        // The last line now has content: one byte of its JSON changes.
+        let mut bytes = std::fs::read(&path).expect("read");
+        let last = bytes.len() - 2;
+        bytes[last] = if bytes[last] == b']' { b'}' } else { b']' };
+        std::fs::write(&path, &bytes).expect("write");
+        let err = StateLog::open(&path).expect_err("a corrupt last line still fails");
+        assert!(err.contains("line 2"), "{err}");
+        assert_eq!(std::fs::read(&path).expect("read"), bytes, "left as it is");
+        let _ = std::fs::remove_file(&path);
     }
 }
