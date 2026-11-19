@@ -506,6 +506,12 @@ pub enum SessCreateError {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PcfSess {
     pub id: u64,
+    /// #1991: the verified NF Instance ID of the SMF that created this SM
+    /// policy (`nextgcore_sbi::owner_binding`), one of the callers that may ask
+    /// for its P-CSCF restoration. `None` when created with no verified
+    /// identity (`dev`) or restored from a state file written before #1991.
+    #[serde(default)]
+    pub owner: Option<String>,
     pub sm_policy_id: String,
     pub binding: PcfBinding,
     /// PDU Session Identity
@@ -662,6 +668,7 @@ impl PcfSess {
     pub fn new(id: u64, pcf_ue_sm_id: u64, psi: u8) -> Self {
         Self {
             id,
+            owner: None,
             sm_policy_id: Uuid::new_v4().to_string(),
             binding: PcfBinding::default(),
             psi,
@@ -1206,6 +1213,10 @@ impl UavPolicyAuthorization {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PcfApp {
     pub id: u64,
+    /// #1991: the verified identity of the AF/NEF that created this app
+    /// session, which may ask for P-CSCF restoration of its PDU session.
+    #[serde(default)]
+    pub owner: Option<String>,
     pub app_session_id: String,
     pub notif_uri: Option<String>,
     /// Parent session ID
@@ -1226,6 +1237,7 @@ impl PcfApp {
     pub fn new(id: u64, sess_id: u64) -> Self {
         Self {
             id,
+            owner: None,
             app_session_id: Uuid::new_v4().to_string(),
             notif_uri: None,
             sess_id,
