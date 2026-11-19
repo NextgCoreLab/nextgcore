@@ -34,4 +34,30 @@ assert.strictEqual(out.split(REDACTED).length - 1, 5, `every key field redacted:
 const doc = { security: { k: K } };
 assert.strictEqual(redact(doc).security.k, REDACTED);
 assert.strictEqual(doc.security.k, K);
+// #1983: index-suffixed and positional paths, off-schema names, BigInt.
+const { sanitizeDebugEnv, isKeyField } = require('./mongoose-debug');
+for (const k of ['security.k.0', 'security.opc.$', 'security.k.$[]', 'ki', 'permanentKeyValue',
+  'encPermanentKey', 'OPcKey', 'clientSecret']) {
+  assert.ok(isKeyField(k), `${k} is key material`);
+}
+for (const k of ['security.amf', 'security.sqn', 'imsi', 'key_id', 'kind']) {
+  assert.ok(!isKeyField(k), `${k} is not key material`);
+}
+const more = [];
+const dbg2 = mongooseDebug({ NODE_ENV: 'development', NEXTGCORE_SBI_PROFILE: 'dev' }, (l) =>
+  more.push(l));
+dbg2('subscribers', 'updateOne', { imsi: '1' },
+  { $set: { 'security.k.0': K, ki: K, permanentKeyValue: OPC, 'security.sqn': 10n } });
+assert.ok(!more[0].includes(K) && !more[0].includes(OPC), `leaked: ${more[0]}`);
+assert.ok(more[0].includes('"10"'), `the BigInt is shown, not thrown: ${more[0]}`);
+
+// #1983: DEBUG never enables mquery/mongoose query logging.
+assert.strictEqual(sanitizeDebugEnv({}), undefined);
+for (const raw of ['mquery', '*', 'mquery*,express:*', 'mongoose:*']) {
+  const out = sanitizeDebugEnv({ DEBUG: raw });
+  assert.ok(/-mquery\*/.test(out) && /-mongoose\*/.test(out), `${raw} -> ${out}`);
+  assert.ok(!out.split(',').some((ns) => /^(mquery|mongoose)/.test(ns)), `${raw} -> ${out}`);
+}
+assert.ok(sanitizeDebugEnv({ DEBUG: 'express:*' }).startsWith('express:*,'));
+
 console.log('mongoose-debug: ok');

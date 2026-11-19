@@ -2098,9 +2098,56 @@ mod shipped_artefact_guards {
     #[test]
     fn mongoose_debug_goes_through_the_redacting_helper_1970() {
         let server = read_code("webui/server/index.js");
+        // #1983: any spelling of turning debug on, in any server file, must hand
+        // mongoose the redacting logger and nothing else.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../webui/server");
+        let mut files = vec![root.join("index.js")];
+        for dir in ["models", "lib", "routes", "bin"] {
+            if let Ok(rd) = std::fs::read_dir(root.join(dir)) {
+                files.extend(
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "js")),
+                );
+            }
+        }
+        for file in &files {
+            // Comment lines may quote the old call (the helper's own doc does).
+            let text: String = std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with('*') || t.starts_with("/*"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (at, _) in text.match_indices("set(") {
+                let args: String = text[at + 4..]
+                    .chars()
+                    .take_while(|c| *c != ')')
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                let names_debug = ["'debug'", "\"debug\"", "`debug`"]
+                    .iter()
+                    .any(|q| args.starts_with(&format!("{q},")));
+                assert!(
+                    !names_debug || args.ends_with(",mongooseDebug"),
+                    "{}: mongoose debug must be the redacting helper's value, got set({args})",
+                    file.display()
+                );
+            }
+        }
+        // And `DEBUG` (mquery's raw query log) is sanitised before mongoose loads.
+        let sanitized = server
+            .find("sanitizeDebugEnv(process.env)")
+            .expect("DEBUG sanitised");
+        let mongoose = server
+            .find("require('mongoose')")
+            .expect("mongoose required");
         assert!(
-            !server.contains("mongoose.set('debug', true)"),
-            "index.js must not enable raw mongoose debug logging"
+            sanitized < mongoose,
+            "DEBUG must be sanitised before mongoose is required"
         );
         assert!(
             server.contains("require('./lib/mongoose-debug').mongooseDebug(process.env)"),
