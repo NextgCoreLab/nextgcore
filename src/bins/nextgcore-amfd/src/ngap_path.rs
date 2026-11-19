@@ -3561,9 +3561,11 @@ impl NgapServer {
             log::error!("Failed to build NG Reset Acknowledge");
         }
 
-        for call in smf_work {
-            self.offload_ng_reset_smf_call(call);
-        }
+        let superseded: Vec<(u64, u8)> = smf_work
+            .into_iter()
+            .filter_map(|call| self.offload_ng_reset_smf_call(call))
+            .collect();
+        self.resolve_superseded_join_parts(&superseded).await;
 
         Ok(())
     }
@@ -3670,9 +3672,11 @@ impl NgapServer {
              {} SMF update(s) to follow)",
             smf_work.len()
         );
-        for call in smf_work {
-            self.offload_ng_reset_smf_call(call);
-        }
+        let superseded: Vec<(u64, u8)> = smf_work
+            .into_iter()
+            .filter_map(|call| self.offload_ng_reset_smf_call(call))
+            .collect();
+        self.resolve_superseded_join_parts(&superseded).await;
     }
 
     /// Parse NG Setup Request (fallback when ASN.1 parsing fails)
@@ -14692,7 +14696,10 @@ impl NgapServer {
     /// runs in order, a newer reset supersedes a queued older one, and a later activation
     /// is queued behind it, dropping it first if it has not started (`spawn_join_activation`). A release for an aborted
     /// de-registration is independent work: the UE is already forgotten.
-    fn offload_ng_reset_smf_call(&mut self, call: NgResetSmfCall) {
+    /// Returns the key whose not-yet-started work the call superseded (#1924):
+    /// that work delivers no outcome, so a join waiting on it is resolved by the
+    /// caller ([`Self::resolve_superseded_join_parts`]).
+    fn offload_ng_reset_smf_call(&mut self, call: NgResetSmfCall) -> Option<(u64, u8)> {
         match call {
             NgResetSmfCall::Deactivate {
                 amf_ue_ngap_id,
@@ -14705,7 +14712,7 @@ impl NgapServer {
                 // A second reset before the first one's call ran: one is enough. Only
                 // non-durable work is dropped: a queued handover CANCELLED or COMPLETED
                 // for the session is durable and still runs first (#978 review, m6).
-                self.sbi_offload.supersede_key(key);
+                let superseded = self.sbi_offload.supersede_key(key);
                 self.sbi_offload.spawn_keyed_moot(key, move || async move {
                     match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
                         .await
@@ -14720,6 +14727,7 @@ impl NgapServer {
                     }
                     None
                 });
+                superseded.then_some(key)
             }
             NgResetSmfCall::Release {
                 amf_ue_ngap_id,
@@ -14727,18 +14735,55 @@ impl NgapServer {
                 sm_ref,
                 host,
                 port,
-            } => self.sbi_offload.spawn(async move {
-                match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
-                    Ok(()) => log::info!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by \
+            } => {
+                self.sbi_offload.spawn(async move {
+                    match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
+                        Ok(()) => log::info!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by \
                          NG Reset)"
-                    ),
-                    Err(e) => log::warn!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
-                    ),
-                }
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
+                        ),
+                    }
+                    None
+                });
                 None
-            }),
+            }
+        }
+    }
+
+    /// #1924: an NG Reset (or an association loss handled as one) superseded the
+    /// not-yet-started work for these `(UE, PSI)` keys, so their outcomes will never
+    /// arrive. A join waiting on one of them stops waiting for it, as its deadline
+    /// would have it, and a join left waiting for nothing is finished now rather than
+    /// at [`SMF_JOIN_MAX_WAIT`]. Under load the Service Request's activations could
+    /// still be waiting for a permit when the reset superseded them; the join then
+    /// lingered until its deadline (#1924's flake: "both answers came in").
+    async fn resolve_superseded_join_parts(&mut self, superseded: &[(u64, u8)]) {
+        if superseded.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        for (id, j) in self.smf_joins.iter_mut() {
+            for (ue, psi) in superseded {
+                if j.amf_ue_ngap_id == *ue && j.waiting.remove(psi) {
+                    log::info!(
+                        "UE {ue}: PDU session {psi}'s SMF exchange was superseded by an NG \
+                         release; its join stops waiting for it"
+                    );
+                }
+            }
+            if j.waiting.is_empty() {
+                done.push(*id);
+            }
+        }
+        for id in done {
+            if let Some(j) = self.smf_joins.remove(&id) {
+                if let Err(e) = self.finish_smf_join(j).await {
+                    log::warn!("SMF join not finished: {e}");
+                }
+            }
         }
     }
 
