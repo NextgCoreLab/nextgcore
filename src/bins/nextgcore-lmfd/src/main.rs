@@ -24,6 +24,7 @@ use std::time::Duration;
 // lmfd-05/06: codec decode glue — NRPPa APER → CellMeasurement, LPP UPER →
 // CellMeasurement.  Exposes the two inbound binary-report route helpers used
 // by `handle_nrppa_binary_report` and `handle_lpp_binary_report` below.
+mod amf_unsubscribe; // #2085: the reconciler for failed AMF unsubscribes
 mod broadcast_exposure; // #104: Nlmf_Broadcast + Nlmf_DataExposure
 mod codec_glue;
 mod context;
@@ -481,6 +482,9 @@ async fn main() -> Result<()> {
         Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
+    // #2085: failed AMF unsubscribes are retried until the AMF answers.
+    let _unsubscribe_reconciler = amf_unsubscribe::spawn_reconciler();
+
     log::info!("NextGCore LMF ready (instance: {nf_instance_id})");
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -494,6 +498,18 @@ async fn main() -> Result<()> {
     // waiting out its supervision timer. Stopping the server first would
     // open the bad window: not serving, but still advertised.
     nextgcore_sbi::heartbeat::deregister_self().await;
+    // #2085: unsubscribe at the AMFs before the context is cleared. amfd's
+    // non-UE N2 subscriptions never expire, so each one left here would outlive
+    // this LMF, one per AMF per restart.
+    let held = lmf_self()
+        .read()
+        .map(|c| c.amf_subscriptions_take_created())
+        .unwrap_or_default();
+    if !held.is_empty() {
+        let n = held.len();
+        let done = amf_unsubscribe::unsubscribe_all(held, SHUTDOWN_UNSUBSCRIBE_BUDGET).await;
+        log::info!("Unsubscribed {done} of {n} AMF subscription(s) at shutdown");
+    }
     sbi_server
         .stop()
         .await
@@ -503,6 +519,9 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/// #2085: how long shutdown waits for the AMFs to answer its unsubscribes.
+const SHUTDOWN_UNSUBSCRIBE_BUDGET: Duration = Duration::from_secs(3);
 
 /// LMF SBI request handler
 async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {

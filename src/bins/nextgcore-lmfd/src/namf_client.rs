@@ -358,7 +358,7 @@ pub async fn discover_amf(preferred_amf_id: Option<&str>) -> Option<DiscoveredAm
 
 /// Bounded-timeout SBI client for a discovered AMF (connect 2s, request 3s —
 /// strictly inside the DetermineLocation wait budget).
-fn client_for(amf: &DiscoveredAmf) -> SbiClient {
+pub(crate) fn client_for(amf: &DiscoveredAmf) -> SbiClient {
     // Attach an NRF-issued Bearer token when OAuth2 enforcement is on (Wave-6
     // H8 Phase A); no-op otherwise so the matched-sim default path is unchanged.
     crate::attach_oauth2(
@@ -426,19 +426,10 @@ async fn create_n1n2_subscription(
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
-            let sub_id = resp
-                .http
-                .content
-                .as_deref()
-                .and_then(|b| serde_json::from_str::<Value>(b).ok())
-                .and_then(|v| {
-                    v.get("n1n2NotifySubscriptionId")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                });
+            let sub_id = created_subscription_id(&resp, "n1n2NotifySubscriptionId");
             if sub_id.is_none() {
                 log::warn!(
-                    "A2: N1N2 subscription 201 without n1n2NotifySubscriptionId (not cached)"
+                    "A2: N1N2 subscription 201 without n1n2NotifySubscriptionId or Location (not cached)"
                 );
             }
             sub_id
@@ -529,22 +520,37 @@ fn spawn_unsubscribe(sub: crate::context::AmfSubscription) {
 
 /// DELETE subscription `id` (a UE's N1N2 one when `ue_context_id` is given, else
 /// the non-UE one) at `amf`, best-effort and in the background.
+///
+/// #2085: a DELETE that fails is parked with [`crate::amf_unsubscribe`] and
+/// retried until the AMF answers, instead of only being logged: the local entry
+/// is already gone, so nothing else would ever ask the AMF again.
 fn spawn_unsubscribe_id(amf: &DiscoveredAmf, ue_context_id: Option<&str>, id: &str) {
-    let path = match ue_context_id {
-        Some(ue) => format!("/namf-comm/v1/ue-contexts/{ue}/n1-n2-messages/subscriptions/{id}"),
-        None => format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{id}"),
-    };
-    let amf = amf.clone();
-    let id = id.to_string();
-    tokio::spawn(async move {
-        match client_for(&amf)
-            .send_request(SbiRequest::delete(path))
-            .await
-        {
-            Ok(resp) => log::debug!("A2: unsubscribe of {id} returned {}", resp.status),
-            Err(e) => log::warn!("A2: unsubscribe of {id} failed: {e}"),
-        }
-    });
+    crate::amf_unsubscribe::spawn_unsubscribe(
+        amf,
+        crate::amf_unsubscribe::subscription_path(ue_context_id, id),
+    );
+}
+
+/// #2085: the AMF's id for a subscription it answered 201 to: `field` of the
+/// body, else the last segment of the `Location` header (TS 29.518: the created
+/// resource's URI, `.../subscriptions/{subscriptionId}`). A 201 whose id was
+/// only in `Location` used to be left unrecorded, and so never unsubscribed.
+fn created_subscription_id(
+    resp: &nextgcore_sbi::message::SbiResponse,
+    field: &str,
+) -> Option<String> {
+    resp.http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<Value>(b).ok())
+        .and_then(|v| v.get(field).and_then(Value::as_str).map(String::from))
+        .or_else(|| {
+            resp.http
+                .get_header("Location")
+                .and_then(|l| l.trim_end_matches('/').rsplit('/').next())
+                .filter(|id| !id.is_empty())
+                .map(String::from)
+        })
 }
 
 /// POST the multipart N1N2MessageTransfer to the serving AMF
@@ -732,18 +738,9 @@ async fn create_non_ue_nrppa_subscription(
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
-            let id = resp
-                .http
-                .content
-                .as_deref()
-                .and_then(|b| serde_json::from_str::<Value>(b).ok())
-                .and_then(|v| {
-                    v.get("n2NotifySubscriptionId")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                });
+            let id = created_subscription_id(&resp, "n2NotifySubscriptionId");
             if id.is_none() {
-                log::warn!("Multi-RTT: NonUeN2InfoSubscribe 201 without n2NotifySubscriptionId");
+                log::warn!("Multi-RTT: NonUeN2InfoSubscribe 201 without n2NotifySubscriptionId or Location");
             }
             id
         }
@@ -1060,6 +1057,64 @@ mod tests {
             nf_instance_id: None,
         };
         (server, amf)
+    }
+
+    /// **#2085**: a 201 whose subscription id is only in `Location` (TS 29.518:
+    /// the created resource's URI) is recorded under that id, so it is
+    /// unsubscribed later; and shutdown takes every created subscription, with
+    /// its resource path at the AMF, for `amf_unsubscribe::unsubscribe_all`.
+    ///
+    /// REVERT-VERIFIED: with the `Location` fallback removed from
+    /// `created_subscription_id`, "recorded under the id in Location" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_201_with_only_a_location_is_recorded_and_unsubscribed_at_shutdown_2085() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_server, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            |_req: nextgcore_sbi::message::SbiRequest| async move {
+                let mut resp = nextgcore_sbi::message::SbiResponse::with_status(201);
+                resp.http.set_header(
+                    "Location",
+                    "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/loc-2085",
+                );
+                resp
+            },
+        )
+        .await;
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            scheme: "http".to_string(),
+            nf_instance_id: None,
+        };
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:1");
+        ensure_non_ue_nrppa_subscription(&amf, "lmf-2085").await;
+        let key = amf.non_ue_subscription_key();
+        let mut recorded = None;
+        for _ in 0..200 {
+            recorded = lmf_self().read().unwrap().amf_subscription_get(&key);
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            recorded.as_deref(),
+            Some("loc-2085"),
+            "recorded under the id in Location"
+        );
+        let taken = lmf_self().read().unwrap().amf_subscriptions_take_created();
+        assert!(
+            taken.contains(&(
+                amf.clone(),
+                "/namf-comm/v1/non-ue-n2-messages/subscriptions/loc-2085".to_string()
+            )),
+            "{taken:?}"
+        );
+        assert!(!lmf_self().read().unwrap().amf_subscription_holds(&key));
     }
 
     /// #1087, TS 29.518 §5.2.2.3.1: 202 ATTEMPTING_TO_REACH_UE (the UE is CM-IDLE

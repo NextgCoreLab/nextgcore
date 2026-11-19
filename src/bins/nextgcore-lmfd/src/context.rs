@@ -1940,6 +1940,33 @@ impl LmfContext {
             .is_ok_and(|s| s.contains_key(key))
     }
 
+    /// #2085: forget every created AMF subscription and return each one's AMF
+    /// and resource path, so shutdown can unsubscribe them. Entries still in
+    /// flight are left alone (their create commits or abandons them).
+    pub fn amf_subscriptions_take_created(
+        &self,
+    ) -> Vec<(crate::namf_client::DiscoveredAmf, String)> {
+        let Ok(mut subs) = self.amf_subscriptions.write() else {
+            return Vec::new();
+        };
+        let created: Vec<String> = subs
+            .iter()
+            .filter(|(_, s)| s.subscription_id.is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        created
+            .into_iter()
+            .filter_map(|k| subs.remove(&k))
+            .filter_map(|s| {
+                let id = s.subscription_id?;
+                Some((
+                    s.amf,
+                    crate::amf_unsubscribe::subscription_path(s.ue_context_id.as_deref(), &id),
+                ))
+            })
+            .collect()
+    }
+
     /// Number of held AMF subscriptions, created or in flight.
     pub fn amf_subscription_count(&self) -> usize {
         self.amf_subscriptions.read().map(|s| s.len()).unwrap_or(0)
