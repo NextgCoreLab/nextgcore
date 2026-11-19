@@ -4735,12 +4735,154 @@ fn spawn_abandoned_create_release(sm_context_ref: String) {
     };
     RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
     handle.spawn(async move {
+        // Its own N4 session and SM policy association, by reference.
         release_user_plane(&sm_context_ref).await;
         if let Some(Some(binding)) = take_sm_context(&sm_context_ref) {
-            spawn_release_side_effects_with(&sm_context_ref, binding, true);
+            qos_mon::forget(&sm_context_ref);
+            // R27 #1890: the AMF's retry for the same (SUPI, PSI) is the normal
+            // follow-up to the timeout that abandoned this create, so a newer
+            // session may hold the pair by now. In flight FIRST, then the check, so
+            // a create that registers after the check finds this entry and
+            // supersedes or waits for it (`await_release_in_flight_on`), and one
+            // that registered before it is seen by the check.
+            let in_flight =
+                ReleaseInFlight::begin_with(&binding.supi, binding.psi, nsac_release_of(&binding));
+            let newer = newer_session_for(
+                &binding.supi,
+                binding.psi,
+                ABANDONED_RELEASE_WAITS_FOR_CREATE,
+            )
+            .await;
+            let announce = match newer {
+                NewerSession::None => true,
+                held => {
+                    // The newer session wins (TS 29.502 §5.2.2.2.1: a create for a
+                    // PSI the SMF holds replaces the old session). Its UECM
+                    // registration replaced this one's record, so no deregistration;
+                    // on the same S-NSSAI the NSACF counts both under one entry (UE,
+                    // PSI, S-NSSAI), so no DECREASE; and no PDU_SES_REL, which would
+                    // follow its PDU_SES_EST.
+                    log::info!(
+                        "[{}] PSI {}: a newer session holds the pair; the abandoned create \
+                         releases only its own N4 session, SM policy, address and DNS \
+                         context",
+                        binding.supi,
+                        binding.psi
+                    );
+                    in_flight.entry.supersede();
+                    if held.shares_slice_with(&binding) {
+                        in_flight
+                            .entry
+                            .supersede_nsac((binding.sst, binding.sd.as_deref()));
+                    }
+                    false
+                }
+            };
+            tokio::join!(
+                release_nsac_admission(&binding, Some(&in_flight.entry)),
+                release_udm_cleanup(&binding, Some(&in_flight.entry)),
+            );
+            drop(in_flight);
+            if let Ok(_permit) = release_side_effect_permits().clone().acquire_owned().await {
+                release_side_effects(&sm_context_ref, &binding, announce).await;
+            }
         }
         RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
     });
+}
+
+/// How long an abandoned create's release waits for a newer create of the same
+/// (SUPI, PSI) to settle, to learn its S-NSSAI (R27 #1890).
+const ABANDONED_RELEASE_WAITS_FOR_CREATE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What holds a (SUPI, PSI) besides the session being rolled back (R27 #1890).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NewerSession {
+    /// Nothing: the rollback may remove the pair's records.
+    None,
+    /// An established session on this S-NSSAI (SST, SD).
+    Established(u8, Option<String>),
+    /// A create still in flight (registered, no binding yet): its S-NSSAI is not
+    /// known, so it is treated as sharing every one.
+    Creating,
+}
+
+impl NewerSession {
+    /// Whether the NSACF counts this and `binding`'s session under one entry.
+    fn shares_slice_with(&self, binding: &context::PolicyBinding) -> bool {
+        match self {
+            NewerSession::None => false,
+            NewerSession::Established(sst, sd) => {
+                same_snssai((*sst, sd.as_deref()), (binding.sst, binding.sd.as_deref()))
+            }
+            NewerSession::Creating => true,
+        }
+    }
+}
+
+/// The session holding (SUPI, PSI) now, waiting at most `wait` for one still being
+/// created to settle. Call it after the rolled-back session's own context is gone.
+async fn newer_session_for(supi: &str, psi: u8, wait: std::time::Duration) -> NewerSession {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let now = {
+            let handle = smf_self();
+            let Ok(ctx) = handle.read() else {
+                return NewerSession::Creating;
+            };
+            let bound = ctx.policy_bindings.read().ok().and_then(|m| {
+                m.values()
+                    .find(|b| b.supi == supi && b.psi == psi)
+                    .map(|b| NewerSession::Established(b.sst, b.sd.clone()))
+            });
+            bound.unwrap_or_else(|| {
+                let registered = ctx
+                    .ue_find_by_supi(supi)
+                    .and_then(|ue| ctx.sess_find_by_psi(ue.id, psi))
+                    .is_some();
+                if registered {
+                    NewerSession::Creating
+                } else {
+                    NewerSession::None
+                }
+            })
+        };
+        if now != NewerSession::Creating || tokio::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// R27 #1890: a failed create's NSACF DECREASE, unless a newer session for the same
+/// (SUPI, PSI) on the same S-NSSAI holds the NSACF entry it would remove. Call it
+/// after `rollback()` removed this create's own context.
+#[allow(clippy::too_many_arguments)]
+async fn rollback_create_nsac(
+    admitted: bool,
+    nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
+    if admitted {
+        let held = match newer_session_for(supi, psi, std::time::Duration::ZERO).await {
+            NewerSession::None => false,
+            NewerSession::Established(s, d) => same_snssai((s, d.as_deref()), (sst, sd)),
+            NewerSession::Creating => true,
+        };
+        if held {
+            log::info!(
+                "[{supi}] PSI {psi}: a newer session holds the NSACF entry; the failed \
+                 create sends no DECREASE"
+            );
+            return true;
+        }
+    }
+    rollback_nsac_as(admitted, nf_id, nsacf, plmn, supi, psi, sst, sd).await
 }
 
 impl CreateHandoff {
@@ -4798,6 +4940,14 @@ impl Drop for CreateAbandonGuard {
 /// one received is released ([`spawn_abandoned_create_release`]): the AMF holds no
 /// `smContextRef` for it, so nothing else ever would. Same shape as #894's
 /// [`eps_to_5gs::handle_create`] and #1755's dccfd create.
+///
+/// R27 #1890: which create wins. The AMF's usual answer to the timeout that
+/// abandons a create is to retry it, for the same SUPI and PSI. The retry wins (TS
+/// 29.502 §5.2.2.2.1: a create for a PSI the SMF holds replaces the old session): the
+/// abandoned create, whether it then fails or reaches its 201, releases only what is
+/// its own (N4 session, SM policy, address, SDM subscription, DNS context) and
+/// leaves the pair's NSACF entry, UECM registration and event state to the newer
+/// session ([`newer_session_for`]).
 async fn establish_detached(request: SbiRequest, req_body: serde_json::Value) -> SbiResponse {
     let handoff = std::sync::Arc::new(std::sync::Mutex::new(CreateHandoff::Pending));
     let mut guard = CreateAbandonGuard {
@@ -5482,7 +5632,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                     fsm_dispatch_policy_response(&mut fsm, status);
                     rollback();
                     spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
-                    rollback_nsac_as(
+                    rollback_create_nsac(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
                         nsac_nsacf.as_ref(),
@@ -5509,7 +5659,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                     fsm.transition_to(gsm_sm::GsmState::Exception);
                     rollback();
                     spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
-                    rollback_nsac_as(
+                    rollback_create_nsac(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
                         nsac_nsacf.as_ref(),
@@ -5673,7 +5823,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                 }
                 rollback();
                 spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
-                rollback_nsac_as(
+                rollback_create_nsac(
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
                     nsac_nsacf.as_ref(),
@@ -9212,6 +9362,15 @@ fn spawn_create_udm_rollback(supi: &str, psi: u8, sdm_subscription_id: Option<St
     let in_flight = ReleaseInFlight::begin(&binding.supi, binding.psi);
     RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(async move {
+        // R27 #1890: in flight first, then the check (see
+        // `spawn_abandoned_create_release`). A newer session for the pair registered
+        // at the UDM after this create, so its record is the one a deregistration
+        // would delete; this create's own SDM subscription still goes.
+        if newer_session_for(&binding.supi, binding.psi, std::time::Duration::ZERO).await
+            != NewerSession::None
+        {
+            in_flight.entry.supersede();
+        }
         release_udm_cleanup(&binding, Some(&in_flight.entry)).await;
         drop(in_flight);
         RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
@@ -22950,6 +23109,163 @@ mod tests {
     #[tokio::test]
     async fn a_create_whose_201_is_never_read_is_released_1874() {
         cancelled_create_1874(None, "imsi-001010000018747", 9).await;
+    }
+
+    /// R27 #1890: create A is abandoned at PFCP (the AMF timed out) and the AMF's
+    /// retry, create B for the same SUPI and PSI, succeeds before A's 201 lands. A's
+    /// release then removes only what is A's own. It sends no NSACF DECREASE (the
+    /// NSACF counts both under one entry, so it would count B out), no UECM
+    /// deregistration (B's registration replaced the record), and no PDU_SES_REL
+    /// (which would follow B's PDU_SES_EST). A's address is still freed.
+    ///
+    /// REVERT-VERIFIED: with `newer_session_for` answering `None` in the abandoned
+    /// release, this fails: nsac INC, INC, DEC, a UECM DELETE, and a PDU_SES_REL.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_abandoned_create_spares_the_retry_that_replaced_it_1890() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _g = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        // Nothing held at the SBI peers; the UPF answers establishments 300 ms late.
+        let (peers, seen) = create_peers_1874(CreateStage1874::Pfcp).await;
+        upf.delay_establishments(300);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = events.clone();
+        let (consumer, consumer_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(req.http.content.clone().unwrap_or_default());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let supi = "imsi-001010000018901";
+        let psi = 10;
+        let subscribed = smf_sbi_request_handler(events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body(
+                &format!("http://127.0.0.1:{}/nsmf-events", consumer_addr.port()),
+                Some(supi),
+            )),
+        ))
+        .await;
+        assert_eq!(subscribed.status, 201);
+        let request = || {
+            create_request(
+                supi,
+                psi,
+                &n1(
+                    psi,
+                    1,
+                    gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                    &[0x91, 0x00],
+                ),
+            )
+        };
+        let addresses = smf_self().read().unwrap().ipv4_pool.active_count();
+
+        // A: dropped while its PFCP establishment is out.
+        {
+            let a = request();
+            let mut create = Box::pin(handle_sm_context_create(&a));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !upf
+                .seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A never reached PFCP"
+                );
+                if tokio::time::timeout(std::time::Duration::from_millis(5), &mut create)
+                    .await
+                    .is_ok()
+                {
+                    panic!("A answered before PFCP");
+                }
+            }
+        }
+        // B: the AMF's retry.
+        let b = handle_sm_context_create(&request()).await;
+        // A's 201 lands and its release runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while smf_self().read().unwrap().ipv4_pool.active_count() != addresses + 1
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        side_effects_settled().await;
+        let log = seen.lock().unwrap().clone();
+        let nsac: Vec<&str> = log
+            .iter()
+            .filter(|(_, u, _)| u.contains("/nnsacf-nsac/"))
+            .map(|(_, _, b)| if b.contains("DECREASE") { "DEC" } else { "INC" })
+            .collect();
+        let uecm: Vec<&str> = log
+            .iter()
+            .filter(|(_, u, _)| u.contains(supi) && u.contains("/smf-registrations/"))
+            .map(|(m, _, _)| m.as_str())
+            .collect();
+        let b_bound = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, bd)| bd.supi == supi)
+            .map(|(r, _)| r.clone())
+            .collect::<Vec<_>>();
+        let addresses_now = smf_self().read().unwrap().ipv4_pool.active_count();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let released_events = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.contains("PDU_SES_REL"))
+            .count();
+        for r in &b_bound {
+            let _ = release_sm_context_locally(r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        std::env::remove_var("PCF_URI");
+        stop_udm_leg();
+        easdf::set_for_test(None);
+        upf.delay_establishments(0);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peers.stop()).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), consumer.stop()).await;
+
+        assert_eq!(b.status, 201, "B, the retry, is established");
+        assert_eq!(b_bound.len(), 1, "and is the one session left for the pair");
+        assert_eq!(
+            addresses_now,
+            addresses + 1,
+            "A's address is freed, B's held"
+        );
+        assert_eq!(
+            nsac,
+            vec!["INC", "INC"],
+            "A sends no DECREASE that would count B out"
+        );
+        assert_eq!(
+            uecm,
+            vec!["PUT", "PUT"],
+            "nor a UECM DELETE of B's registration"
+        );
+        assert_eq!(
+            released_events, 0,
+            "nor a PDU_SES_REL after B's PDU_SES_EST"
+        );
     }
 
     /// #1072 review M3: a DECREASE the NSACF refuses is logged and counted.
