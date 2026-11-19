@@ -101,6 +101,9 @@ pub struct PcfUeBinding {
     // PcfForUeBinding (:1390-1420) does not define them, so emitting them here
     // polluted the resource representation.
     pub management_features: u64,
+    /// #1937: the verified identity of the PCF that registered it
+    /// (`nextgcore_sbi::owner_binding`); only it may update or delete it.
+    pub owner: Option<String>,
 }
 
 /// PCF for MBS binding (TS 29.521 §4.2.2.4, pcf-mbs-bindings resource).
@@ -120,6 +123,9 @@ pub struct PcfMbsBinding {
     pub bind_level: Option<String>,
     pub recovery_time: Option<String>,
     pub management_features: u64,
+    /// #1937: the verified identity of the PCF that registered it
+    /// (`nextgcore_sbi::owner_binding`); only it may update or delete it.
+    pub owner: Option<String>,
 }
 
 /// Canonical comparison key for a TS 29.571 `MbsSessionId`.
@@ -931,7 +937,28 @@ impl BsfContext {
 
     /// Remove session
     pub fn sess_remove(&self, id: u64) -> Option<BsfSess> {
-        let mut sess_list = self.sess_list.write().ok()?;
+        self.sess_remove_checked(id, |_| Ok::<(), ()>(()))
+            .ok()
+            .flatten()
+    }
+
+    /// #1937 (R32 on #1959): remove session `id` only if `check` admits the
+    /// session stored under it AT REMOVAL TIME. The check and the removal run
+    /// under one `sess_list` write lock, so a pool id freed and reused by
+    /// another PCF's binding in between cannot be removed on the strength of
+    /// a check made against the old one. `Ok(None)`: nothing stored under `id`.
+    pub fn sess_remove_checked<E>(
+        &self,
+        id: u64,
+        check: impl FnOnce(&BsfSess) -> Result<(), E>,
+    ) -> Result<Option<BsfSess>, E> {
+        let Ok(mut sess_list) = self.sess_list.write() else {
+            return Ok(None);
+        };
+        match sess_list.get(&id) {
+            Some(current) => check(current)?,
+            None => return Ok(None),
+        }
 
         if let Some(sess) = sess_list.remove(&id) {
             // Remove from IPv4 hash
@@ -949,9 +976,9 @@ impl BsfContext {
                 hash.remove(mac);
             }
             log::debug!("BSF session removed (id={id})");
-            return Some(sess);
+            return Ok(Some(sess));
         }
-        None
+        Ok(None)
     }
 
     /// Remove all sessions
@@ -1102,6 +1129,12 @@ impl BsfContext {
     pub fn sess_update(&self, sess: &BsfSess) -> bool {
         if let Ok(mut sess_list) = self.sess_list.write() {
             if let Some(existing) = sess_list.get_mut(&sess.id) {
+                // #1937: a pool id freed and reused by another PCF's binding
+                // while this update ran is not overwritten with the old one.
+                // A fresh register sets the owner of an ownerless record.
+                if existing.owner.is_some() && existing.owner != sess.owner {
+                    return false;
+                }
                 *existing = sess.clone();
                 return true;
             }
@@ -1284,6 +1317,23 @@ impl BsfContext {
         self.ue_binding_list.write().ok()?.remove(id)
     }
 
+    /// #1937: remove binding `id` only if `check` admits it, under one
+    /// write lock. `Ok(None)`: no such binding.
+    pub fn ue_binding_remove_checked<E>(
+        &self,
+        id: &str,
+        check: impl FnOnce(&PcfUeBinding) -> Result<(), E>,
+    ) -> Result<Option<PcfUeBinding>, E> {
+        let Ok(mut list) = self.ue_binding_list.write() else {
+            return Ok(None);
+        };
+        match list.get(id) {
+            Some(current) => check(current)?,
+            None => return Ok(None),
+        }
+        Ok(list.remove(id))
+    }
+
     pub fn ue_binding_update(&self, binding: &PcfUeBinding) -> bool {
         if let Ok(mut list) = self.ue_binding_list.write() {
             if let Some(existing) = list.get_mut(&binding.binding_id) {
@@ -1332,6 +1382,23 @@ impl BsfContext {
 
     pub fn mbs_binding_remove(&self, id: &str) -> Option<PcfMbsBinding> {
         self.mbs_binding_list.write().ok()?.remove(id)
+    }
+
+    /// #1937: remove binding `id` only if `check` admits it, under one
+    /// write lock. `Ok(None)`: no such binding.
+    pub fn mbs_binding_remove_checked<E>(
+        &self,
+        id: &str,
+        check: impl FnOnce(&PcfMbsBinding) -> Result<(), E>,
+    ) -> Result<Option<PcfMbsBinding>, E> {
+        let Ok(mut list) = self.mbs_binding_list.write() else {
+            return Ok(None);
+        };
+        match list.get(id) {
+            Some(current) => check(current)?,
+            None => return Ok(None),
+        }
+        Ok(list.remove(id))
     }
 
     pub fn mbs_binding_update(&self, binding: &PcfMbsBinding) -> bool {
@@ -2531,6 +2598,7 @@ mod tests {
             bind_level: None,
             recovery_time: None,
             management_features: 0x1,
+            owner: None,
         };
         ctx.ue_binding_add(b.clone());
 
@@ -2592,6 +2660,7 @@ mod tests {
             bind_level: None,
             recovery_time: None,
             management_features: 0x1,
+            owner: None,
         };
         ctx.mbs_binding_add(b1.clone());
 
@@ -2613,6 +2682,7 @@ mod tests {
             bind_level: None,
             recovery_time: None,
             management_features: 0x1,
+            owner: None,
         };
         ctx.mbs_binding_add(b2);
         assert_eq!(ctx.mbs_binding_find_by_mbs_session_id(&id_abc).len(), 2);
