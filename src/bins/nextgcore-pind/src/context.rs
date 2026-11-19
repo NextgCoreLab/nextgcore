@@ -494,9 +494,53 @@ impl PinContext {
         self.initialized.load(Ordering::SeqCst)
     }
 
+    /// `prefix-<random>-<seq>`. #1953 (R32 on #1967 M1): the 64 random bits
+    /// make every ID unguessable on its own, so creating one PIN no longer
+    /// reveals its neighbours' IDs. The trailing sequence number keeps PIND-07's
+    /// "lowest id = registered first" (`id_seq` reads the last segment).
     fn alloc_id(&self, prefix: &str) -> String {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        format!("{prefix}-{id}")
+        let r = uuid::Uuid::new_v4();
+        let b = r.as_bytes();
+        let random = b[..8].iter().fold(String::new(), |mut acc, x| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{x:02x}");
+            acc
+        });
+        format!("{prefix}-{random}-{id}")
+    }
+
+    /// #1953 (R32 on #1967 M1): whether `caller` may read PIN `pin_id` (its
+    /// owner and membership) or discover its elements: the owner, a PEMC of
+    /// the PIN, or the host of one of its member elements (TS 23.542 §8.5:
+    /// PIN information is for the PIN's own clients). `NotFound` for an
+    /// unknown PIN, `PemcRequiresOwner` for anyone else, anonymous included.
+    pub fn authorize_pin_reader(
+        &self,
+        pin_id: &str,
+        caller: Option<&str>,
+    ) -> Result<(), PinContextError> {
+        let pins = self
+            .pin_networks
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        let elements = self
+            .elements
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
+        let pin = pins.get(pin_id).ok_or(PinContextError::NotFound)?;
+        let caller = caller.unwrap_or("");
+        let member = !caller.is_empty()
+            && pin.member_ids.iter().any(|id| {
+                elements
+                    .get(id)
+                    .is_some_and(|e| e.host_supi.as_deref() == Some(caller))
+            });
+        if member || caller_is_owner_or_pemc(pin, caller, &elements) {
+            Ok(())
+        } else {
+            Err(PinContextError::PemcRequiresOwner)
+        }
     }
 
     /// Select a PEGC candidate among the owner's registered elements
@@ -1803,6 +1847,23 @@ mod tests {
         assert_ne!(before.0, "pin-1");
         // #1953: within one process they still increase (PIND-07).
         assert!(id_seq(&before.0) < id_seq(&before.1) && id_seq(&before.1) < id_seq(&before.2));
+    }
+
+    /// #1953 (R32 on #1967 M1): one ID says nothing about the next: each
+    /// carries its own 64 random bits, while the trailing sequence still orders
+    /// them. REVERT-VERIFIED: with `alloc_id` back to `prefix-<seq>`, the
+    /// random-part assertions fail.
+    #[test]
+    fn ids_are_unguessable_one_by_one_1953() {
+        let mut ctx = PinContext::new();
+        ctx.init(8);
+        let a = ctx.pin_create("Home", "imsi-a-1953").unwrap().pin_id;
+        let b = ctx.pin_create("Home", "imsi-b-1953").unwrap().pin_id;
+        let random = |id: &str| id.split('-').nth(1).unwrap_or("").to_string();
+        assert_eq!(random(&a).len(), 16, "{a}");
+        assert!(random(&a).chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(random(&a), random(&b), "{a} {b}");
+        assert_eq!(id_seq(&b), id_seq(&a) + 1, "the order is kept: {a} {b}");
     }
 
     /// #1953 (R32 on #1950): the seed is random, so it does not follow the

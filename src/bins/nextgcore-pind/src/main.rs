@@ -395,11 +395,14 @@ fn extract_caller_supi(
     trust_token: bool,
     trust_header: bool,
 ) -> Option<String> {
-    // 1. Verified JWT sub claim (highest priority).
-    if trust_token {
-        if let Some(sub) = caller_supi_from_token(request) {
-            return Some(sub);
-        }
+    // 1. The token subject the SBI server verified (highest priority).
+    // #1953 (R32 on #1967): honoured whenever present. Only the server sets it,
+    // after verifying the token, so `--require-oauth2` (`trust_token`) no
+    // longer has to be on for it; without it a production deployment was
+    // anonymous and every create refused.
+    let _ = trust_token;
+    if let Some(sub) = caller_supi_from_token(request) {
+        return Some(sub);
     }
     // 2/3. Bespoke / consumer-info headers — only when explicitly trusted.
     if trust_header {
@@ -476,7 +479,7 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "pins"),
         },
         ["pinapp", "v1", "pins", pin_id] => match method {
-            "GET" => handle_pin_get(pin_id).await,
+            "GET" => handle_pin_get(pin_id, &request).await,
             "DELETE" => handle_pin_delete(pin_id, &request).await,
             _ => send_method_not_allowed(method, "pins/{id}"),
         },
@@ -641,7 +644,22 @@ async fn handle_pin_list() -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_pin_get(pin_id: &str) -> SbiResponse {
+async fn handle_pin_get(pin_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1953 (R32 on #1967 M1): only the PIN's owner, a PEMC or a member.
+    let refused = pin_self()
+        .read()
+        .map_err(|_| PinContextError::NotFound)
+        .and_then(|c| c.authorize_pin_reader(pin_id, caller_supi(request).as_deref()));
+    match refused {
+        Ok(()) => {}
+        Err(PinContextError::PemcRequiresOwner) => {
+            return send_pin_forbidden(
+                &PinContextError::PemcRequiresOwner,
+                "urn:nextgcore:pin:read-authorization-failed",
+            )
+        }
+        Err(_) => return send_not_found(&format!("PIN {pin_id} not found"), Some("PIN_NOT_FOUND")),
+    }
     let ctx = pin_self();
     let pin = if let Ok(context) = ctx.read() {
         context.pin_find(pin_id)
@@ -843,6 +861,21 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
 }
 
 async fn handle_element_discover(pin_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1953 (R32 on #1967 M1): only the PIN's owner, a PEMC or a member.
+    let refused = pin_self()
+        .read()
+        .map_err(|_| PinContextError::NotFound)
+        .and_then(|c| c.authorize_pin_reader(pin_id, caller_supi(request).as_deref()));
+    match refused {
+        Ok(()) => {}
+        Err(PinContextError::PemcRequiresOwner) => {
+            return send_pin_forbidden(
+                &PinContextError::PemcRequiresOwner,
+                "urn:nextgcore:pin:read-authorization-failed",
+            )
+        }
+        Err(_) => return send_not_found(&format!("PIN {pin_id} not found"), Some("PIN_NOT_FOUND")),
+    }
     let uri = &request.header.uri;
     let capability = uri
         .split("capability=")
@@ -1438,6 +1471,67 @@ mod tests {
         let ctx = pin_self();
         let guard = ctx.read().expect("ctx read");
         guard.pin_create("Home", owner).expect("seed pin").pin_id
+    }
+
+    /// #1953 (R32 on #1967 M1): a PIN (with its owner's SUPI) and its element
+    /// list (with addresses and ports) are read only by the owner, a PEMC or a
+    /// member's host; a stranger or anonymous caller gets 403 on both.
+    /// REVERT-VERIFIED: with the `authorize_pin_reader` guard removed from
+    /// either handler, the stranger's request on it answers 200.
+    #[test]
+    fn a_pin_and_its_elements_are_read_by_its_own_clients_only_1953() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-owner-r1953");
+        let reg = register_request(
+            &pin_id,
+            "imsi-member-r1953",
+            full_registration(serde_json::json!({})),
+        );
+        assert_eq!(block_on(handle_element_register(&pin_id, &reg)).status, 201);
+        let read = |path: String, who: Option<&str>| {
+            let mut r = SbiRequest::get(path);
+            if let Some(w) = who {
+                r = r.with_header("x-caller-supi", w);
+            }
+            block_on(pin_sbi_request_handler(r)).status
+        };
+        let pin_path = format!("/pinapp/v1/pins/{pin_id}");
+        let list_path = format!("/pinapp/v1/pins/{pin_id}/elements");
+        for path in [&pin_path, &list_path] {
+            assert_eq!(
+                read(path.clone(), Some("imsi-stranger-r1953")),
+                403,
+                "{path}"
+            );
+            assert_eq!(read(path.clone(), None), 403, "{path}");
+            assert_eq!(read(path.clone(), Some("imsi-owner-r1953")), 200, "{path}");
+            assert_eq!(read(path.clone(), Some("imsi-member-r1953")), 200, "{path}");
+        }
+        assert_eq!(
+            read(
+                "/pinapp/v1/pins/pin-absent".into(),
+                Some("imsi-owner-r1953")
+            ),
+            404
+        );
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+    }
+
+    /// #1953 (R32 on #1967): the verified token subject is the caller whether
+    /// or not `--require-oauth2` is set (only the SBI server sets it).
+    /// REVERT-VERIFIED: with the subject gated on `trust_token` again, the
+    /// untrusted-flag case is `None`.
+    #[test]
+    fn the_verified_subject_is_the_caller_without_the_flag_1953() {
+        let mut request = SbiRequest::post("/pinapp/v1/pins");
+        request.oauth2_subject = Some("imsi-verified-1953".into());
+        assert_eq!(
+            extract_caller_supi(&request, false, false).as_deref(),
+            Some("imsi-verified-1953")
+        );
     }
 
     fn full_registration(extra: serde_json::Value) -> serde_json::Value {
