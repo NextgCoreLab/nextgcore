@@ -913,6 +913,38 @@ fn refuse_unallowed_nf_sets(
     ))
 }
 
+/// #2035: refuse an NFRegister or NFUpdate of an AMF whose `amfInfo.guamiList`
+/// adds a GUAMI another AMF, outside its AMF Set, already lists. A GUAMI
+/// identifies one AMF (TS 23.003 §2.10.1), shared only within an AMF Set; an
+/// AMF listing another's would be believed to serve it (pcfd's AMF-relocation
+/// check, #2013). `backupInfoAmfFailure` / `backupInfoAmfRemoval` are not
+/// checked: there an AMF names the GUAMIs it backs up. 403, nothing stored.
+fn refuse_guami_of_another_set(
+    operation: &str,
+    nf_instance_id: &str,
+    nf_type: &str,
+    doc: &serde_json::Value,
+    added: &[&serde_json::Value],
+) -> Option<SbiResponse> {
+    if !nf_type.eq_ignore_ascii_case("AMF") || added.is_empty() {
+        return None;
+    }
+    let others = nf_manager().list();
+    let (guami, holder) =
+        nextgcore_nrfd::sbi_path::guami_listed_by_another_set(nf_instance_id, doc, added, &others)?;
+    log::warn!(
+        "{operation} for AMF {nf_instance_id} refused: its guamiList has {guami}, which AMF          {holder} of another AMF Set already lists"
+    );
+    Some(send_error(
+        403,
+        "Forbidden",
+        &format!(
+            "{operation}: AMF {nf_instance_id:?} may not list GUAMI {guami}: another AMF              outside its AMF Set lists it (TS 23.003 §2.10.1)"
+        ),
+        None,
+    ))
+}
+
 /// The CCA trusted keys one source configures, keyed canonically (#1633).
 ///
 /// Since #1657 an NF's UUID in either case is one key. Two entries that spell
@@ -2598,6 +2630,16 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
     ) {
         return refused;
     }
+    // #2035: and lists no GUAMI an AMF of another AMF Set lists.
+    if let Some(refused) = refuse_guami_of_another_set(
+        "NFRegister",
+        nf_instance_id,
+        &nf_profile.nf_type,
+        &profile,
+        &nextgcore_nrfd::sbi_path::guami_list_of(&profile),
+    ) {
+        return refused;
+    }
 
     // nrfd-03: negotiate the heartBeatTimer the NRF will enforce and stamp it
     // onto the stored AND returned profile (TS 29.510 Table 6.1.6.2.2-1: the
@@ -3015,6 +3057,31 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     if let Some(refused) =
         refuse_unallowed_nf_sets("NFUpdate", nf_instance_id, &updated.nf_type, added)
     {
+        return refused;
+    }
+    // #2035: nor add a GUAMI an AMF of another AMF Set lists. As for the sets,
+    // only the GUAMIs it adds (all of them when the patch re-types it, or
+    // changes its AMF Set), so a heartbeat of a profile restored from before
+    // the check is not refused.
+    let reset = retyped
+        || pre_patch_doc.pointer("/amfInfo/amfSetId") != doc.pointer("/amfInfo/amfSetId")
+        || pre_patch_doc.pointer("/amfInfo/amfRegionId") != doc.pointer("/amfInfo/amfRegionId");
+    let held_guamis = if reset {
+        Vec::new()
+    } else {
+        nextgcore_nrfd::sbi_path::guami_list_of(&pre_patch_doc)
+    };
+    let added_guamis: Vec<&serde_json::Value> = nextgcore_nrfd::sbi_path::guami_list_of(&doc)
+        .into_iter()
+        .filter(|g| !held_guamis.contains(g))
+        .collect();
+    if let Some(refused) = refuse_guami_of_another_set(
+        "NFUpdate",
+        nf_instance_id,
+        &updated.nf_type,
+        &doc,
+        &added_guamis,
+    ) {
         return refused;
     }
 
@@ -15077,6 +15144,111 @@ mod nrf_api_tokens_tests_1667 {
 
 /// #1719: the registrant's `nfSetIdList` under `nrf.nf_set_allowlist`, through
 /// the real NFRegister and NFUpdate handlers.
+#[cfg(test)]
+mod tests_guami_uniqueness_2035 {
+    use super::*;
+    use serde_json::json;
+
+    fn guami(amf_id: &str) -> serde_json::Value {
+        json!({ "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id })
+    }
+
+    async fn put_amf(id: &str, set: Option<&str>, guamis: &[&str], backup: &[&str]) -> SbiResponse {
+        let mut amf_info = json!({
+            "amfRegionId": "20",
+            "guamiList": guamis.iter().map(|g| guami(g)).collect::<Vec<_>>(),
+        });
+        if let Some(set) = set {
+            amf_info["amfSetId"] = json!(set);
+        }
+        if !backup.is_empty() {
+            amf_info["backupInfoAmfFailure"] =
+                json!(backup.iter().map(|g| guami(g)).collect::<Vec<_>>());
+        }
+        let body = json!({
+            "nfInstanceId": id, "nfType": "AMF", "nfStatus": "REGISTERED",
+            "heartBeatTimer": 10, "ipv4Addresses": ["10.20.35.1"], "amfInfo": amf_info,
+        });
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"))
+            .with_body(body.to_string(), "application/json");
+        req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = vec!["AMF".to_string()];
+        handle_nf_register(id, &req).await
+    }
+
+    async fn patch(id: &str, ops: serde_json::Value) -> SbiResponse {
+        let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}"))
+            .with_body(ops.to_string(), "application/json-patch+json");
+        req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = vec!["AMF".to_string()];
+        handle_nf_update(id, &req).await
+    }
+
+    fn listed(id: &str) -> Vec<String> {
+        nf_manager()
+            .get(id)
+            .map(|p| {
+                nextgcore_nrfd::sbi_path::guami_list_of(&p.to_json())
+                    .iter()
+                    .filter_map(|g| g.get("amfId").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #2035: a GUAMI identifies one AMF (TS 23.003 §2.10.1) and only an AMF Set
+    /// shares it, so an AMF may not register, or patch in, a GUAMI that an AMF
+    /// of another AMF Set (or naming none) already lists: 403, nothing stored.
+    /// An AMF of the same set may list it, an AMF of another set may name it in
+    /// `backupInfoAmfFailure`, and a heartbeat patch of a held profile passes.
+    ///
+    /// REVERT-VERIFIED: with `refuse_guami_of_another_set` returning `None`, the
+    /// other set's registration is 201; with the patch's added GUAMIs left
+    /// empty, the patch adding the GUAMI is 200.
+    #[tokio::test]
+    async fn a_guami_is_listed_only_within_one_amf_set_2035() {
+        let a = "20350a0a-0000-4000-8000-00000000000a";
+        let b = "20350b0b-0000-4000-8000-00000000000b";
+        let c = "20350c0c-0000-4000-8000-00000000000c";
+        let d = "20350d0d-0000-4000-8000-00000000000d";
+        let e = "20350e0e-0000-4000-8000-00000000000e";
+        let g = "2035a1";
+        let resp = put_amf(a, Some("001"), &[g], &[]).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        // Another set: refused, nothing stored.
+        let resp = put_amf(b, Some("002"), &[g, "2035b1"], &[]).await;
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        assert!(nf_manager().get(b).is_none());
+        // No set named: refused too.
+        let resp = put_amf(e, None, &[g], &[]).await;
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        // The same set (case aside): admitted.
+        let resp = put_amf(c, Some("001"), &[&g.to_ascii_uppercase()], &[]).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        // Another set backing it up: admitted.
+        let resp = put_amf(d, Some("002"), &["2035d1"], &[g]).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        // ...but not patching it into its own guamiList.
+        let resp = patch(
+            d,
+            json!([{ "op": "add", "path": "/amfInfo/guamiList/-", "value": guami(g) }]),
+        )
+        .await;
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        assert_eq!(listed(d), vec!["2035d1".to_string()]);
+        // A heartbeat of a held profile passes.
+        let resp = patch(
+            a,
+            json!([{ "op": "replace", "path": "/nfStatus", "value": "REGISTERED" }]),
+        )
+        .await;
+        assert!(matches!(resp.status, 200 | 204), "{:?}", resp.http.content);
+        for id in [a, c, d] {
+            let _ = nf_manager().deregister(id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_nf_set_ids_1719 {
     use super::*;

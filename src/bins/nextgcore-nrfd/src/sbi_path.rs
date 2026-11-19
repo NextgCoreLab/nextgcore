@@ -1184,6 +1184,61 @@ fn plmn_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 }
 
 /// GUAMI equality (TS 29.571 `Guami`: plmnId + amfId).
+/// #2035: the `amfInfo.guamiList` entries of an NF profile document. The
+/// `backupInfoAmfFailure` / `backupInfoAmfRemoval` lists are other members and
+/// are not included: an AMF lists another's GUAMI there to back it up.
+pub fn guami_list_of(doc: &serde_json::Value) -> Vec<&serde_json::Value> {
+    doc.pointer("/amfInfo/guamiList")
+        .and_then(|v| v.as_array())
+        .map(|l| l.iter().collect())
+        .unwrap_or_default()
+}
+
+/// #2035: the AMF Set (`amfRegionId`, `amfSetId`) an AMF profile document
+/// names, lowercased; `None` when either is missing.
+fn amf_set_of(doc: &serde_json::Value) -> Option<(String, String)> {
+    let member = |k: &str| {
+        doc.pointer(&format!("/amfInfo/{k}"))
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    Some((member("amfRegionId")?, member("amfSetId")?))
+}
+
+/// #2035: the first of `guamis` that an AMF other than `nf_instance_id`, in a
+/// different AMF Set, already lists in its `amfInfo.guamiList`, with that
+/// AMF's NF instance ID. A GUAMI identifies one AMF (TS 23.003 §2.10.1); only
+/// the AMFs of one set share one (TS 23.501 §5.21.2). An AMF naming no set is
+/// in a set of its own. `doc` is the registrant's profile document.
+pub fn guami_listed_by_another_set<'a>(
+    nf_instance_id: &str,
+    doc: &serde_json::Value,
+    guamis: &[&'a serde_json::Value],
+    others: &[NfProfile],
+) -> Option<(&'a serde_json::Value, String)> {
+    let own_set = amf_set_of(doc);
+    let own_id = crate::nnrf_handler::canonical_nf_instance_id(nf_instance_id);
+    for g in guamis {
+        for other in others {
+            if !other.nf_type.eq_ignore_ascii_case("AMF")
+                || crate::nnrf_handler::canonical_nf_instance_id(&other.nf_instance_id) == own_id
+            {
+                continue;
+            }
+            let same_set = own_set.is_some() && amf_set_of(&other.attributes) == own_set;
+            if !same_set
+                && guami_list_of(&other.attributes)
+                    .iter()
+                    .any(|h| guami_eq(g, h))
+            {
+                return Some((g, other.nf_instance_id.clone()));
+            }
+        }
+    }
+    None
+}
+
 fn guami_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     fn amf_id(v: &serde_json::Value) -> &str {
         v.get("amfId").and_then(|x| x.as_str()).unwrap_or_default()

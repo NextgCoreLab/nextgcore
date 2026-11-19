@@ -1805,6 +1805,12 @@ async fn owner_or_amf_relocation(
             .iter()
             .any(|r| r.eq_ignore_ascii_case(t))
     });
+    // #2035: a relocation comes from an AMF of this PLMN (TS 29.507 §4.2.3.2),
+    // whose profile this NRF holds; one relayed by a SEPP is from another
+    // PLMN and is refused outright.
+    if types.iter().any(|t| t.eq_ignore_ascii_case("SEPP")) {
+        return Err(refused);
+    }
     // Not through a relay: the caller's own certificate must name AMF. A token
     // with no certificate has no NFTypes, so it is refused here too.
     if !via_relay && !types.iter().any(|t| t.eq_ignore_ascii_case("AMF")) {
@@ -12839,6 +12845,11 @@ mod tests {
     /// direct-certificate NFTypes check dropped (no NFTypes accepted), the
     /// no-NFTypes certificate and the token-only caller do; with the `guami`
     /// requirement dropped, the guami-less AM update does.
+    /// #2035: the new AMF's token relayed by a SEPP is refused, and so is the new
+    /// AMF while an AMF of another AMF Set lists the GUAMI too; an AMF of its
+    /// own set listing it is no conflict. REVERT-VERIFIED: without the SEPP
+    /// refusal the SEPP-relayed takeover succeeds; with the one-set check always
+    /// passing, the takeover during the conflict does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn a_new_amf_relocating_an_association_takes_it_over_1992() {
@@ -12851,34 +12862,35 @@ mod tests {
         const OTHER_AMF: &str = "bbbbbbbb-1992-4000-8000-0000000000b2";
         const SMF: &str = "cccccccc-1992-4000-8000-0000000000c3";
         const SCP: &str = "dddddddd-1992-4000-8000-0000000000d4";
-        // A stand-in NRF: NEW_AMF serves GUAMI 020041, OTHER_AMF 020099, and SMF
-        // is an SMF.
+        const SEPP: &str = "ffffffff-2035-4000-8000-0000000000f6";
+        const PEER_AMF: &str = "aaaaaaaa-2035-4000-8000-0000000000a7";
+        const IMPOSTOR_AMF: &str = "abababab-2035-4000-8000-0000000000a8";
+        // A stand-in NRF answering every AMF discovery with all of them: NEW_AMF
+        // and PEER_AMF of AMF Set 20/001 serve GUAMI 020041, OTHER_AMF (set
+        // 20/003) 020099, and SMF is an SMF. #2035: while IMPOSTOR is set, an AMF
+        // of set 20/002 lists 020041 too.
+        static IMPOSTOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let nrf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
-        nrf.start(|req: SbiRequest| async move {
-            let uri = req
-                .http
-                .get_param("target-nf-instance-id")
-                .cloned()
-                .unwrap_or_default();
-            let profile = |id: &str, ty: &str, amf_id: &str| {
+        nrf.start(|_req: SbiRequest| async move {
+            let profile = |id: &str, ty: &str, set: &str, amf_id: &str| {
                 serde_json::json!({
                     "nfInstanceId": id, "nfType": ty, "nfStatus": "REGISTERED",
-                    "amfInfo": { "guamiList": [
+                    "amfInfo": { "amfRegionId": "20", "amfSetId": set, "guamiList": [
                         { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id }
                     ]},
                 })
             };
-            let instances = if uri.contains(NEW_AMF) {
-                vec![profile(NEW_AMF, "AMF", "020041")]
-            } else if uri.contains(OTHER_AMF) {
-                vec![profile(OTHER_AMF, "AMF", "020099")]
-            } else if uri.contains(SMF) {
-                vec![profile(SMF, "SMF", "020041")]
-            } else {
-                vec![]
-            };
+            let mut instances = vec![
+                profile(NEW_AMF, "AMF", "001", "020041"),
+                profile(PEER_AMF, "AMF", "001", "020041"),
+                profile(OTHER_AMF, "AMF", "003", "020099"),
+                profile(SMF, "SMF", "001", "020041"),
+            ];
+            if IMPOSTOR.load(std::sync::atomic::Ordering::SeqCst) {
+                instances.push(profile(IMPOSTOR_AMF, "AMF", "002", "020041"));
+            }
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({ "nfInstances": instances }))
                 .unwrap_or_else(|_| SbiResponse::with_status(500))
@@ -13007,6 +13019,15 @@ mod tests {
                 ),
             ),
             (
+                "#2035: the new AMF's token relayed by a SEPP",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SEPP),
+                    &["SEPP"],
+                    Some(NEW_AMF),
+                ),
+            ),
+            (
                 "anonymous",
                 as_caller(
                     make_request("POST", &update, Some(am_reloc())),
@@ -13021,7 +13042,25 @@ mod tests {
             assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
             assert_eq!(owner_of_am().as_deref(), Some(TEST_CONSUMER_1865), "{who}");
         }
-        // The new AMF, directly with its AMF certificate, relocates it.
+        // #2035: while an AMF of another set lists the GUAMI too, nobody's claim
+        // to it is believed.
+        IMPOSTOR.store(true, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &update, Some(am_reloc())),
+            Some(NEW_AMF),
+            &["AMF"],
+            None,
+        ))
+        .await;
+        IMPOSTOR.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            resp.status, 403,
+            "GUAMI listed by two AMF Sets: {:?}",
+            resp.http.content
+        );
+        assert_eq!(owner_of_am().as_deref(), Some(TEST_CONSUMER_1865));
+        // The new AMF, directly with its AMF certificate, relocates it (its set
+        // peer listing the GUAMI too is no conflict).
         let resp = pcf_sbi_request_handler(as_caller(
             make_request("POST", &update, Some(am_reloc())),
             Some(NEW_AMF),
