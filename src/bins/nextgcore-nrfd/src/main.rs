@@ -4895,40 +4895,51 @@ fn parse_xfcc_single_entry(header: &str) -> Option<std::collections::HashMap<Str
 /// #2000: ANY URI SAN of the certificate counts, not only the one chosen as its
 /// NF Instance ID (`urn:uuid:` first), so a terminator allowlisted by its SPIFFE
 /// ID is recognised even when its certificate also carries a `urn:uuid:` SAN.
-/// A `urn:uuid:` UUID compares case-insensitively (RFC 4122 §3), with or
-/// without the prefix on either side; any other SAN compares exactly.
+///
+/// #2012: an entry and a SAN compare case-insensitively only when BOTH are a
+/// UUID ([`as_uuid`]: RFC 4122 text, with or without `urn:uuid:`), as UUIDs
+/// compare (RFC 4122 §3). Anything else compares exactly, as written: a SAN
+/// that merely starts with `urn:uuid:` no longer matches a non-UUID entry
+/// whatever its case.
 fn from_trusted_terminator(request: &SbiRequest, policy: &NrfPolicy) -> bool {
     if !policy.trust_forwarded_client_cert || !request.peer_cert_present {
         return false;
     }
-    let strip = |s: &str| -> (bool, String) {
-        let s = s.trim();
-        match s.get(..9) {
-            Some(p) if p.eq_ignore_ascii_case("urn:uuid:") => (true, s[9..].trim().to_string()),
-            _ => (false, s.to_string()),
-        }
-    };
     // The certificate's URI SANs, and the NF Instance ID chosen from them (the
     // only one a request built without a handshake carries).
-    let sans: Vec<(bool, String)> = request
+    let sans: Vec<&str> = request
         .peer_cert_uri_sans
         .iter()
         .map(String::as_str)
         .chain(request.peer_cert_nf_instance_id.as_deref())
-        .map(strip)
-        .filter(|(_, v)| !v.is_empty())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
         .collect();
     policy.trusted_xfcc_terminators.iter().any(|t| {
-        let (t_urn, t) = strip(t);
+        let t = t.trim();
         !t.is_empty()
-            && sans.iter().any(|(s_urn, s)| {
-                if t_urn || *s_urn {
-                    s.eq_ignore_ascii_case(&t)
-                } else {
-                    *s == t
-                }
+            && sans.iter().any(|s| match (as_uuid(t), as_uuid(s)) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => *s == t,
             })
     })
+}
+
+/// #2012: the UUID `v` names, when it is one: RFC 4122 text (8-4-4-4-12 hex
+/// digits), bare or after a case-insensitive `urn:uuid:` (RFC 4122 §3).
+fn as_uuid(v: &str) -> Option<&str> {
+    let v = v.trim();
+    let id = match v.get(..9) {
+        Some(p) if p.eq_ignore_ascii_case("urn:uuid:") => &v[9..],
+        _ => v,
+    };
+    let b = id.as_bytes();
+    (b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        }))
+    .then_some(id)
 }
 
 /// Whether the connection's verified certificate identifies the caller
@@ -13310,6 +13321,64 @@ mod registrant_binding_tests_1611 {
         );
         let other = peer(&["spiffe://cluster.local/ns/5gc/sa/other"]);
         assert!(!from_trusted_terminator(&other, &listing(TEST_TERMINATOR)));
+    }
+
+    /// **#2012.** Case is ignored only between two UUIDs. A SAN that merely
+    /// starts with `urn:uuid:` (a non-UUID after it) matches a non-UUID entry
+    /// only as written, exactly; between UUIDs the prefix and case still do
+    /// not matter.
+    ///
+    /// REVERT-VERIFIED: with the #2000 rule back (case-insensitive whenever
+    /// either side has the `urn:uuid:` prefix), the case-different non-UUID
+    /// entries match and the first assertion fails.
+    #[test]
+    fn only_two_uuids_compare_case_insensitively_2012() {
+        let peer = |san: &str| {
+            let mut r = SbiRequest::post("/x");
+            r.peer_cert_present = true;
+            r.peer_cert_uri_sans = vec![san.to_string()];
+            r
+        };
+        let listing = |entry: &str| NrfPolicy {
+            trust_forwarded_client_cert: true,
+            trusted_xfcc_terminators: vec![entry.to_string()],
+            ..NrfPolicy::default()
+        };
+        let odd = peer("urn:uuid:Envoy-Terminator");
+        for entry in [
+            "urn:uuid:envoy-terminator",
+            "envoy-terminator",
+            "Envoy-Terminator",
+        ] {
+            assert!(
+                !from_trusted_terminator(&odd, &listing(entry)),
+                "a non-UUID {entry:?} is matched exactly only"
+            );
+        }
+        assert!(from_trusted_terminator(
+            &odd,
+            &listing("urn:uuid:Envoy-Terminator")
+        ));
+        let uuid = peer("urn:uuid:20120000-0000-4000-8000-0000000000AB");
+        for entry in [
+            "urn:uuid:20120000-0000-4000-8000-0000000000ab",
+            "URN:UUID:20120000-0000-4000-8000-0000000000AB",
+            "20120000-0000-4000-8000-0000000000ab",
+        ] {
+            assert!(from_trusted_terminator(&uuid, &listing(entry)), "{entry:?}");
+        }
+        assert_eq!(
+            as_uuid("urn:uuid:20120000-0000-4000-8000-0000000000AB"),
+            Some("20120000-0000-4000-8000-0000000000AB")
+        );
+        for not in [
+            "urn:uuid:envoy",
+            "20120000-0000-4000-8000-0000000000a",
+            "20120000x0000-4000-8000-0000000000ab",
+            "spiffe://x",
+        ] {
+            assert_eq!(as_uuid(not), None, "{not:?}");
+        }
     }
 
     /// **#2000.** A terminator's connection without XFCC is (None, []): the

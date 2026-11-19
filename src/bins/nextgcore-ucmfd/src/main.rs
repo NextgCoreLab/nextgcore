@@ -1540,11 +1540,80 @@ where
     }
 }
 
+/// #1998: how long an NRF answer about whether a caller is a NEF is reused.
+const NEF_LOOKUP_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// #1998: at most this many cached answers; a full cache drops the expired
+/// ones, then everything, rather than grow.
+const NEF_LOOKUP_CACHE_MAX: usize = 1024;
+
+/// #1998: verified NF Instance ID (lowercase) -> (it is a NEF, when learnt).
+/// Positive and negative answers both; a failed lookup is never cached (it
+/// fails closed, and the next request asks again). As ausfd's
+/// `CALLER_TYPE_CACHE` (#1964).
+static NEF_LOOKUP_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
+/// #2025: the one test lock for [`NEF_LOOKUP_CACHE`], declared beside it. Every
+/// test that reads or writes the cache holds it, so tests run in parallel
+/// cannot see each other's answers (or a `clear()` when it fills up).
+#[cfg(test)]
+pub(crate) static NEF_LOOKUP_CACHE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+fn nef_lookup_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
+    NEF_LOOKUP_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Whether NF instance `id` is a NEF, per its NRF profile, reusing an answer
+/// for [`NEF_LOOKUP_TTL`] (#1998: every provisioning request by a relayed or
+/// token-identified NEF used to cost one NRF query). Keyed by the caller's
+/// VERIFIED identity, which is all `provisioner_refusal` passes; an `Err` from
+/// `lookup` is returned and not cached, so it keeps failing closed.
+async fn cached_nef_lookup<F, Fut>(id: String, lookup: F) -> Result<bool, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    let key = id.to_ascii_lowercase();
+    if let Some((is_nef, at)) = nef_lookup_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        if at.elapsed() < NEF_LOOKUP_TTL {
+            return Ok(is_nef);
+        }
+    }
+    let is_nef = lookup(id).await?;
+    let mut cache = nef_lookup_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= NEF_LOOKUP_CACHE_MAX {
+        cache.retain(|_, (_, at)| at.elapsed() < NEF_LOOKUP_TTL);
+        if cache.len() >= NEF_LOOKUP_CACHE_MAX {
+            cache.clear();
+        }
+    }
+    cache.insert(key, (is_nef, std::time::Instant::now()));
+    Ok(is_nef)
+}
+
+/// Whether NF instance `id` is a NEF, per its NRF profile, cached
+/// ([`cached_nef_lookup`], #1998).
+async fn caller_is_nef(id: String) -> Result<bool, String> {
+    cached_nef_lookup(id, nrf_says_nef).await
+}
+
 /// Whether NF instance `id` is a NEF, per its NRF profile (#1989 review M1; the
 /// pattern of ausfd's `caller_is`, #1964). Yes only when the NFDiscovery result
 /// names `id` itself as a NEF, so an NRF that ignores the instance filter cannot
 /// vouch for it. `Err` (no NRF, no answer, an unparsable one) fails closed.
-async fn caller_is_nef(id: String) -> Result<bool, String> {
+///
+/// The discovery names `requester-nf-type=UCMF`, so the NRF also applies the
+/// NEF profile's `allowedNfTypes` (TS 29.510 §6.1.6.2.2 NFProfile): a NEF whose profile
+/// does not allow the UCMF is not returned, and is refused here (#1998).
+async fn nrf_says_nef(id: String) -> Result<bool, String> {
     let sbi_ctx = global_context();
     let nrf_uri = sbi_ctx
         .get_nrf_uri()
@@ -3225,5 +3294,114 @@ mod sbi_profile_tests_1795 {
             nextgcore_sbi::types::NfType::Ucmf,
             super::sbi_listener_config,
         );
+    }
+}
+
+/// #1998: the NRF answer about a caller being a NEF is reused for its TTL.
+#[cfg(test)]
+mod nef_lookup_cache_tests_1998 {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// **#2025.** Every test fn in this file that touches the NEF lookup cache
+    /// (`cached_nef_lookup(`, `caller_is_nef(`, `nef_lookup_cache()`) holds
+    /// [`NEF_LOOKUP_CACHE_TEST_LOCK`]: a test that does not can race another
+    /// one's entries, as R30's probe raced the #1998 test.
+    ///
+    /// REVERT-VERIFIED: with the lock taken out of the #1998 test, this fails
+    /// naming it.
+    #[test]
+    fn every_test_touching_the_nef_lookup_cache_holds_its_lock_2025() {
+        let src = include_str!("main.rs");
+        let tests = &src[src.find("#[cfg(test)]\nmod ").expect("test modules")..];
+        let touches = ["cached_nef_lookup(", "caller_is_nef(", "nef_lookup_cache()"];
+        let mut unlocked = Vec::new();
+        let mut checked = 0;
+        for chunk in tests
+            .split("\n    async fn ")
+            .chain(tests.split("\n    fn "))
+            .skip(1)
+        {
+            let name: String = chunk.chars().take_while(|c| *c != '(').collect();
+            // The fn body: up to the next item at this indentation.
+            let body = chunk.split("\n    }\n").next().unwrap_or(chunk);
+            if name.contains("_2025") || !touches.iter().any(|t| body.contains(t)) {
+                continue;
+            }
+            checked += 1;
+            if !body.contains("NEF_LOOKUP_CACHE_TEST_LOCK.lock()") {
+                unlocked.push(name);
+            }
+        }
+        assert!(checked >= 1, "the scan finds the #1998 test");
+        assert!(
+            unlocked.is_empty(),
+            "tests touching the cache without its lock: {unlocked:?}"
+        );
+    }
+
+    /// **#1998.** A second provisioning request by the same verified NEF costs
+    /// no NRF query; a refusal is reused too; a failed lookup is not cached (it
+    /// keeps failing closed and the next request asks again); an expired answer
+    /// is asked again; and the key is the verified ID, case-insensitively.
+    ///
+    /// REVERT-VERIFIED: with `cached_nef_lookup` never reading the cache, the
+    /// second call queries again and the first assertion on the count fails;
+    /// with a failed lookup cached as `false`, the second failure is `Ok`.
+    #[tokio::test]
+    async fn the_nef_lookup_is_cached_by_verified_id_and_fails_closed_1998() {
+        let _cache = NEF_LOOKUP_CACHE_TEST_LOCK.lock().await;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counting = |answer: Result<bool, String>| {
+            let asked = asked.clone();
+            move |_id: String| {
+                asked.fetch_add(1, SeqCst);
+                async move { answer }
+            }
+        };
+        let nef = "19980000-0000-4000-8000-00000000000A".to_string();
+        assert_eq!(
+            cached_nef_lookup(nef.clone(), counting(Ok(true))).await,
+            Ok(true)
+        );
+        assert_eq!(
+            cached_nef_lookup(nef.to_ascii_lowercase(), counting(Ok(false))).await,
+            Ok(true),
+            "reused, whatever the lookup would say now"
+        );
+        assert_eq!(asked.load(SeqCst), 1, "one NRF query for two requests");
+
+        let not_nef = "19980000-0000-4000-8000-00000000000b".to_string();
+        assert_eq!(
+            cached_nef_lookup(not_nef.clone(), counting(Ok(false))).await,
+            Ok(false)
+        );
+        assert_eq!(
+            cached_nef_lookup(not_nef, counting(Ok(true))).await,
+            Ok(false)
+        );
+        assert_eq!(asked.load(SeqCst), 2, "a refusal is reused too");
+
+        let unknown = "19980000-0000-4000-8000-00000000000c".to_string();
+        assert!(
+            cached_nef_lookup(unknown.clone(), counting(Err("NRF down".into())))
+                .await
+                .is_err()
+        );
+        assert!(cached_nef_lookup(unknown, counting(Err("NRF down".into())))
+            .await
+            .is_err());
+        assert_eq!(asked.load(SeqCst), 4, "a failure is never cached");
+
+        // Expired: asked again, and the new answer replaces the old.
+        nef_lookup_cache()
+            .lock()
+            .unwrap()
+            .get_mut(&nef.to_ascii_lowercase())
+            .expect("cached")
+            .1 = std::time::Instant::now() - NEF_LOOKUP_TTL;
+        assert_eq!(cached_nef_lookup(nef, counting(Ok(false))).await, Ok(false));
+        assert_eq!(asked.load(SeqCst), 5, "an expired answer is asked again");
     }
 }

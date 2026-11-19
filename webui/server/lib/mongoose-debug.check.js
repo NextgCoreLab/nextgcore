@@ -73,4 +73,21 @@ for (const raw of ['mquery', '*', 'mquery*,express:*', 'mongoose:*']) {
 }
 assert.ok(sanitizeDebugEnv({ DEBUG: 'express:*' }).startsWith('express:*,'));
 
+// #2021: an account's password hash and salt are redacted too, at any depth and
+// in a dotted path; a name that merely contains them is not.
+const HASH = 'f1e2d3c4b5a6978877665544332211ffeeddccbbaa99887766554433221100aa';
+const SALT = '9a8b7c6d5e4f3a2b1c0d';
+const accounts = [];
+const dbg4 = mongooseDebug({ NODE_ENV: 'development', NEXTGCORE_SBI_PROFILE: 'dev' }, (l) =>
+  accounts.push(l));
+dbg4('accounts', 'insertOne', { username: 'admin', hash: HASH, salt: SALT });
+dbg4('accounts', 'updateOne', { username: 'admin' }, { $set: { 'auth.hash': HASH, 'auth.Salt': SALT } });
+for (const l of accounts) {
+  assert.ok(!l.includes(HASH) && !l.includes(SALT), `password material logged: ${l}`);
+}
+assert.ok(accounts[0].includes('admin'), 'the username is still shown');
+for (const k of ['hashAlgorithm', 'saltRounds', 'hashtag']) {
+  assert.ok(!isKeyField(k), `${k} is not key material`);
+}
+
 console.log('mongoose-debug: ok');

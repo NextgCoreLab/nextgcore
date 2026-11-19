@@ -1085,6 +1085,12 @@ fn with_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServer
 pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
+    // #1992: a restored ownerless record past its lapse is gone before this
+    // request is routed, so managing it answers 404, not 403 (O(1) until one
+    // can lapse).
+    if let Ok(context) = pcf_self().read() {
+        context.sweep_lapsed_ownerless(crate::context::unix_now_secs());
+    }
 
     log::debug!(
         "PCF SBI request: {method} {}",
@@ -1752,6 +1758,69 @@ pub async fn handle_am_policy_delete(pol_asso_id: &str, request: &SbiRequest) ->
     }
 }
 
+/// #1992 (R32 on #1988, R30 on #2013): the caller check for an AM/UE policy
+/// association update, admitting AMF relocation (TS 29.507 §4.2.3.2, TS
+/// 29.525 §4.2.3.2: the new AMF updates the Notification URI and the GUAMI).
+///
+/// `Ok(None)`: the caller is the owner. `Ok(Some(new))`: a relocation, and
+/// `new` (the caller's verified NF Instance ID) becomes the owner. It is
+/// admitted only when all of these hold, and refused 403 otherwise, with
+/// nothing changed:
+/// - the body carries `notificationUri` and a `guami` (for UE policies too);
+/// - the caller proved an identity, over a certificate: directly, with that
+///   certificate's own NFTypes naming AMF (no NFTypes is refused), or through
+///   an SCP/SEPP certificate with the verified token `sub` as the identity. A
+///   token with no certificate is refused;
+/// - the NRF holds an AMF profile for that identity whose `guamiList` includes
+///   the claimed GUAMI ([`sbi_path::amf_serves_guami`]). Behind an SCP this is
+///   what types the caller. The check fails closed.
+async fn owner_or_amf_relocation(
+    owner: Option<&str>,
+    request: &SbiRequest,
+    body: &serde_json::Value,
+    operation: &str,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(owner, request, operation)
+    else {
+        return Ok(None);
+    };
+    let refused = Box::new(refused);
+    if body
+        .get("notificationUri")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return Err(refused);
+    }
+    let Some(guami) = body.get("guami").and_then(ue_policy::AmfGuami::from_json) else {
+        return Err(refused);
+    };
+    let caller = match nextgcore_sbi::owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        _ => return Err(refused),
+    };
+    let types = &request.peer_cert_nf_types;
+    let via_relay = types.iter().any(|t| {
+        nextgcore_sbi::owner_binding::RELAY_NF_TYPES
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(t))
+    });
+    // Not through a relay: the caller's own certificate must name AMF. A token
+    // with no certificate has no NFTypes, so it is refused here too.
+    if !via_relay && !types.iter().any(|t| t.eq_ignore_ascii_case("AMF")) {
+        return Err(refused);
+    }
+    if !sbi_path::amf_serves_guami(&caller, &guami).await {
+        log::debug!(
+            "{operation}: relocation refused: the NRF has no AMF profile for {caller} serving \
+             the claimed GUAMI"
+        );
+        return Err(refused);
+    }
+    log::info!("{operation}: AMF relocation, the association now belongs to {caller}");
+    Ok(Some(caller))
+}
+
 pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("AM Policy Update: {pol_asso_id}");
 
@@ -1779,13 +1848,18 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         );
     };
     // #1937: only the NF that created it, before anything is read or changed.
-    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+    // #1992: or a new AMF relocating it (TS 29.507 §4.2.3.2).
+    let relocated_to = match owner_or_amf_relocation(
         ue_am.owner.as_deref(),
         request,
+        &update_data,
         "Npcf_AMPolicyControl_Update",
-    ) {
-        return refused;
-    }
+    )
+    .await
+    {
+        Ok(new) => new,
+        Err(refused) => return *refused,
+    };
 
     // TS 29.507 §4.2.3.1: apply the PolicyAssociationUpdateRequest, then
     // re-evaluate. Before #89 the body was deserialised into `_update_data` and
@@ -1793,6 +1867,9 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // GUAMI or ask for different triggers and the PCF would keep using the old
     // ones while answering 200.
     let mut updated = ue_am.clone();
+    if let Some(new) = relocated_to {
+        updated.owner = Some(new);
+    }
     let mut changed = Vec::new();
 
     if let Some(uri) = update_data.get("notificationUri").and_then(|v| v.as_str()) {
@@ -2814,13 +2891,21 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         );
     };
     // #1937: only the NF that created it, before anything is read or changed.
-    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+    // #1992: or a new AMF relocating it (TS 29.525 §4.2.3.2: the Notification
+    // URI only).
+    // The new owner is recorded once the update is applied, so a request
+    // refused below changes nothing.
+    let relocated_to = match owner_or_amf_relocation(
         existing.owner.as_deref(),
         request,
+        &data,
         "Npcf_UEPolicyControl_Update",
-    ) {
-        return refused;
-    }
+    )
+    .await
+    {
+        Ok(new) => new,
+        Err(refused) => return *refused,
+    };
     let supi = existing.supi.clone();
 
     // `notificationUri` (§5.6.2.4): where subsequent notifications go. Applied first
@@ -2927,6 +3012,9 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // unconditionally rather than only on a "significant" change: §4.2.4 does not
     // define significance, and a consumer that can be told less than every update is
     // a consumer that has to poll.
+    if let Some(new) = relocated_to {
+        ue_policy::ue_policy_set_owner(pol_asso_id, Some(new));
+    }
     let notified = sbi_path::pcf_send_ue_policy_update_notify(pol_asso_id);
     if !notified {
         log::warn!(
@@ -5449,7 +5537,16 @@ struct BindingKeys<'a> {
 ///   reported domain, so an SMF that never sends `ipDomain` is not refused.
 ///
 /// `Err` names why nothing can match (a SUPI with no SM association here).
-fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
+///
+/// #2016 (R31): only sessions `visible` admits are candidates, and they are
+/// filtered BEFORE the `ipDomain` narrowing, which looks at the candidates as
+/// a set: narrowed over every tenant's sessions, another tenant's session in
+/// the asked domain would flip the caller's own (domain-less) match away, an
+/// oracle for other tenants' domains.
+fn binding_candidates(
+    keys: &BindingKeys,
+    visible: impl Fn(&PcfSess) -> bool,
+) -> Result<Vec<PcfSess>, String> {
     let ctx = pcf_self();
     let Ok(context) = ctx.read() else {
         return Err("the PCF context is unavailable".to_string());
@@ -5457,7 +5554,7 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
     let ue_sm_id = match keys.supi {
         Some(supi) => match context.ue_sm_find_by_supi(supi) {
             Some(ue_sm) => Some(ue_sm.id),
-            None => return Err(format!("no SM policy association for supi {supi}")),
+            None => return Err(format!("{NO_SM_ASSOCIATION_FOR_SUPI} {supi}")),
         },
         None => None,
     };
@@ -5480,6 +5577,14 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
             })
     });
     drop(context);
+    let found = candidates.len();
+    candidates.retain(|sess| visible(sess));
+    if candidates.len() < found {
+        log::debug!(
+            "PDU session binding: {} of {found} matching session(s) not the caller's",
+            found - candidates.len()
+        );
+    }
     if let (BindingAddress::V4(_), Some(domain)) = (keys.address, keys.ip_domain) {
         if candidates
             .iter()
@@ -5493,9 +5598,28 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
     Ok(candidates)
 }
 
+/// #1583: why [`binding_candidates`] found nothing for a SUPI it does not know.
+const NO_SM_ASSOCIATION_FOR_SUPI: &str = "no SM policy association for supi";
+
 /// #1583: exactly one session for `keys`, else why not (none, or several).
 fn bind_one_session(keys: &BindingKeys) -> Result<PcfSess, String> {
-    let mut candidates = binding_candidates(keys)?;
+    bind_one_visible_session(keys, |_| true)
+}
+
+/// #2016: exactly one session for `keys` among those `visible` admits, else
+/// why not. A session `visible` rejects is treated as absent, and so is an
+/// unknown SUPI's: the answer (and the detail sent back) for a session the
+/// caller may not see is the one for no session at all, so a caller cannot
+/// probe which sessions exist. Several visible sessions remain an ambiguity.
+fn bind_one_visible_session(
+    keys: &BindingKeys,
+    visible: impl Fn(&PcfSess) -> bool,
+) -> Result<PcfSess, String> {
+    let mut candidates = match binding_candidates(keys, visible) {
+        Ok(found) => found,
+        Err(why) if why.starts_with(NO_SM_ASSOCIATION_FOR_SUPI) => Vec::new(),
+        Err(why) => return Err(why),
+    };
     let asked = format!(
         "address={:?} ipDomain={:?} sliceInfo={:?} supi={:?} dnn={:?}",
         keys.address, keys.ip_domain, keys.slice, keys.supi, keys.dnn
@@ -5519,8 +5643,14 @@ fn bind_one_session(keys: &BindingKeys) -> Result<PcfSess, String> {
 ///
 /// No session, or more than one, is a failure to identify it: `Err` holds the
 /// `500 PDU_SESSION_NOT_AVAILABLE`, or a `400` for a request that names nothing.
+///
+/// #2016: only sessions `may_restore` admits (the caller's, see
+/// [`refuse_pcscf_restoration_caller`]) are identified, so a session the
+/// caller may not restore is answered exactly as no session is: the same
+/// `500 PDU_SESSION_NOT_AVAILABLE`, with the same detail.
 fn identify_pcscf_restoration_session(
     body: &serde_json::Value,
+    may_restore: impl Fn(&PcfSess) -> bool,
 ) -> Result<PcfSess, Box<SbiResponse>> {
     let text = |key: &str| {
         body.get(key)
@@ -5569,13 +5699,16 @@ fn identify_pcscf_restoration_session(
             )))
         }
     };
-    bind_one_session(&BindingKeys {
-        address,
-        ip_domain,
-        slice,
-        supi,
-        dnn,
-    })
+    bind_one_visible_session(
+        &BindingKeys {
+            address,
+            ip_domain,
+            slice,
+            supi,
+            dnn,
+        },
+        may_restore,
+    )
     .map_err(|why| Box::new(pcscf_restoration_session_not_available(&why)))
 }
 
@@ -5630,16 +5763,23 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         Ok(v) => v,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
-    let sess = match identify_pcscf_restoration_session(&body) {
+    // A certificate and a token naming different NFs prove no identity at all;
+    // that is known without looking any session up, so it can be said (403).
+    if let Err(why) = nextgcore_sbi::owner_binding::verified_consumer_id(request) {
+        log::debug!("P-CSCF Restoration refused: {why}");
+        return nextgcore_sbi::server::send_forbidden(&why, None);
+    }
+    // #1991: only the SMF that owns the SM policy, or an AF/NEF that owns an app
+    // session on this PDU session, may restore it (TS 29.514 §4.2.2.27, TS
+    // 29.512 §4.2.3.18), refused before any notify is sent. #2016: by
+    // identifying only such sessions, so another caller's session answers as no
+    // session does (500 PDU_SESSION_NOT_AVAILABLE), never a revealing 403.
+    let sess = match identify_pcscf_restoration_session(&body, |sess| {
+        refuse_pcscf_restoration_caller(sess, request).is_none()
+    }) {
         Ok(sess) => sess,
         Err(resp) => return *resp,
     };
-    // #1991: only the SMF that owns the SM policy, or an AF/NEF that owns an app
-    // session on this PDU session, may restore it (TS 29.514 §4.2.2.27, TS
-    // 29.512 §4.2.3.18), refused before any notify is sent.
-    if let Some(refused) = refuse_pcscf_restoration_caller(&sess, request) {
-        return refused;
-    }
     let address = format!(
         "ipv4={:?} ipv6={:?} dnn={:?}",
         sess.ipv4addr_string, sess.ipv6prefix_string, sess.dnn
@@ -12084,7 +12224,7 @@ mod tests {
     /// #1527: what `handle_pcscf_restoration` identifies for `body`: `Ok(smPolicyId)`,
     /// or `Err((status, cause))`.
     fn pcscf_identify_1527(body: serde_json::Value) -> Result<String, (u16, String)> {
-        identify_pcscf_restoration_session(&body)
+        identify_pcscf_restoration_session(&body, |_| true)
             .map(|sess| sess.sm_policy_id)
             .map_err(|resp| {
                 let cause = resp
@@ -12682,6 +12822,262 @@ mod tests {
             "notifId": notif_id,
             "eventSubs": events,
         })
+    }
+
+    /// #1992 (R32 on #1988, R30 on #2013): a new AMF relocating an AM or UE
+    /// policy association (TS 29.507 §4.2.3.2, TS 29.525 §4.2.3.2: the update
+    /// carries the Notification URI and the GUAMI) takes it over only if the NRF
+    /// holds an AMF profile for the caller's verified identity whose `guamiList`
+    /// includes that GUAMI. A direct certificate must also name AMF in its own
+    /// NFTypes; a token with no certificate is refused. Everyone else gets 403
+    /// and changes nothing: an SMF-typed certificate, a certificate with no
+    /// NFTypes, no `guami` (for UE policies too), a token with no certificate, an
+    /// AMF claiming a GUAMI it does not serve, an AMF the NRF does not know, a
+    /// non-AMF behind the SCP, and an anonymous caller.
+    /// REVERT-VERIFIED: with the NRF check (`amf_serves_guami`) always true, the
+    /// AMF claiming a GUAMI it does not serve takes it over; with the
+    /// direct-certificate NFTypes check dropped (no NFTypes accepted), the
+    /// no-NFTypes certificate and the token-only caller do; with the `guami`
+    /// requirement dropped, the guami-less AM update does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_new_amf_relocating_an_association_takes_it_over_1992() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        const NEW_AMF: &str = "aaaaaaaa-1992-4000-8000-0000000000a2";
+        const OTHER_AMF: &str = "bbbbbbbb-1992-4000-8000-0000000000b2";
+        const SMF: &str = "cccccccc-1992-4000-8000-0000000000c3";
+        const SCP: &str = "dddddddd-1992-4000-8000-0000000000d4";
+        // A stand-in NRF: NEW_AMF serves GUAMI 020041, OTHER_AMF 020099, and SMF
+        // is an SMF.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        nrf.start(|req: SbiRequest| async move {
+            let uri = req
+                .http
+                .get_param("target-nf-instance-id")
+                .cloned()
+                .unwrap_or_default();
+            let profile = |id: &str, ty: &str, amf_id: &str| {
+                serde_json::json!({
+                    "nfInstanceId": id, "nfType": ty, "nfStatus": "REGISTERED",
+                    "amfInfo": { "guamiList": [
+                        { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id }
+                    ]},
+                })
+            };
+            let instances = if uri.contains(NEW_AMF) {
+                vec![profile(NEW_AMF, "AMF", "020041")]
+            } else if uri.contains(OTHER_AMF) {
+                vec![profile(OTHER_AMF, "AMF", "020099")]
+            } else if uri.contains(SMF) {
+                vec![profile(SMF, "SMF", "020041")]
+            } else {
+                vec![]
+            };
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({ "nfInstances": instances }))
+                .unwrap_or_else(|_| SbiResponse::with_status(500))
+        })
+        .await
+        .expect("stand-in NRF starts");
+        let _nrf_guard =
+            crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{}", addr.port())).await;
+
+        let location_of = |resp: &SbiResponse| {
+            let loc = resp
+                .http
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                .map(|(_, v)| v.clone())
+                .expect("Location");
+            loc.find("/npcf-")
+                .map(|i| loc[i..].to_string())
+                .expect("a PCF path")
+        };
+        // (certificate id, certificate NFTypes, token sub)
+        let as_caller =
+            |mut r: SbiRequest, cert: Option<&str>, types: &[&str], token: Option<&str>| {
+                r.peer_cert_nf_instance_id = cert.map(str::to_string);
+                r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+                r.oauth2_subject = token.map(str::to_string);
+                r
+            };
+        let guami = |amf_id: &str| serde_json::json!({ "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id });
+        let relocation = |kind: &str, g: Option<serde_json::Value>| {
+            let mut b = serde_json::json!({
+                "notificationUri": format!("http://127.0.0.1:9/namf-callback/v1/{kind}/new-1992"),
+            });
+            if let Some(g) = g {
+                b["guami"] = g;
+            }
+            b
+        };
+
+        // The AM policy is created by TEST_CONSUMER_1865 (the old AMF).
+        let am = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000001992",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/old-1992",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(am.status, 201, "{:?}", am.http.content);
+        let am_path = location_of(&am);
+        let update = format!("{am_path}/update");
+        let am_id = am_path.rsplit('/').next().unwrap().to_string();
+        let owner_of_am = || {
+            pcf_self()
+                .read()
+                .unwrap()
+                .ue_am_find_by_association_id(&am_id)
+                .and_then(|a| a.owner)
+        };
+        let am_reloc = || relocation("am-policy", Some(guami("020041")));
+        let refused: Vec<(&str, SbiRequest)> = vec![
+            (
+                "SMF-typed certificate",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SMF),
+                    &["SMF"],
+                    None,
+                ),
+            ),
+            (
+                "certificate with no NFTypes",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(NEW_AMF),
+                    &[],
+                    None,
+                ),
+            ),
+            (
+                "no guami",
+                as_caller(
+                    make_request("POST", &update, Some(relocation("am-policy", None))),
+                    Some(NEW_AMF),
+                    &["AMF"],
+                    None,
+                ),
+            ),
+            (
+                "a token with no certificate",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    None,
+                    &[],
+                    Some(NEW_AMF),
+                ),
+            ),
+            (
+                "an AMF claiming a GUAMI it does not serve",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SCP),
+                    &["SCP"],
+                    Some(OTHER_AMF),
+                ),
+            ),
+            (
+                "an AMF the NRF does not know",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some("eeeeeeee-1992-4000-8000-0000000000e5"),
+                    &["AMF"],
+                    None,
+                ),
+            ),
+            (
+                "a non-AMF behind the SCP",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    Some(SCP),
+                    &["SCP"],
+                    Some(SMF),
+                ),
+            ),
+            (
+                "anonymous",
+                as_caller(
+                    make_request("POST", &update, Some(am_reloc())),
+                    None,
+                    &[],
+                    None,
+                ),
+            ),
+        ];
+        for (who, req) in refused {
+            let resp = pcf_sbi_request_handler(req).await;
+            assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
+            assert_eq!(owner_of_am().as_deref(), Some(TEST_CONSUMER_1865), "{who}");
+        }
+        // The new AMF, directly with its AMF certificate, relocates it.
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &update, Some(am_reloc())),
+            Some(NEW_AMF),
+            &["AMF"],
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(owner_of_am().as_deref(), Some(NEW_AMF));
+        let resp = pcf_sbi_request_handler(make_request("GET", &am_path, None)).await;
+        assert_eq!(resp.status, 403, "the old AMF no longer owns it");
+
+        // A UE policy association needs the GUAMI too, and the same check.
+        let ue = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/old-1992",
+                "supi": "imsi-001010000011992",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(ue.status, 201, "{:?}", ue.http.content);
+        let ue_path = location_of(&ue);
+        let ue_id = ue_path.rsplit('/').next().unwrap().to_string();
+        let ue_update = format!("{ue_path}/update");
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &ue_update, Some(relocation("ue-policy", None))),
+            Some(SCP),
+            &["SCP"],
+            Some(NEW_AMF),
+        ))
+        .await;
+        assert_eq!(resp.status, 403, "UE: no guami");
+        // Behind an SCP, the new AMF's token: the NRF check is what admits it.
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request(
+                "POST",
+                &ue_update,
+                Some(relocation("ue-policy", Some(guami("020041")))),
+            ),
+            Some(SCP),
+            &["SCP"],
+            Some(NEW_AMF),
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(
+            ue_policy::ue_policy_find(&ue_id)
+                .and_then(|a| a.owner)
+                .as_deref(),
+            Some(NEW_AMF)
+        );
+        drop(_nrf_guard);
+        nrf.stop().await.ok();
     }
 
     /// #1937: AM, UE and SM policy associations and AF app sessions (and an
@@ -14609,11 +15005,14 @@ mod tests {
 
     /// #1991: P-CSCF restoration is asked only by the SMF that owns the SM
     /// policy or an AF/NEF that owns an app session on the PDU session; a
-    /// foreign NF, a mismatched certificate/token pair or an anonymous caller
-    /// gets 403 and no notify reaches the SMF.
-    /// REVERT-VERIFIED: with the `refuse_pcscf_restoration_caller` call removed,
-    /// the foreign caller answers 204 and a notify is sent; with the app-owner
-    /// arm dropped, the AF's restoration is refused 403.
+    /// foreign NF or an anonymous caller is answered as for no session (#2016:
+    /// 500 PDU_SESSION_NOT_AVAILABLE, byte for byte the unknown-IP answer), a
+    /// mismatched certificate/token pair 403, and no notify reaches the SMF.
+    /// REVERT-VERIFIED: with the visibility filter (`refuse_pcscf_restoration_caller`
+    /// in `identify_pcscf_restoration_session`) removed, the foreign caller
+    /// answers 204 and a notify is sent; with the app-owner arm dropped, the
+    /// AF's restoration is refused. #2016: with the 403 path back after
+    /// identification, the foreign answer differs from the unknown-IP one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn pcscf_restoration_is_asked_by_the_sessions_smf_or_af_only_1991() {
@@ -14660,15 +15059,42 @@ mod tests {
                 token,
             )
         };
+        // #2016: what no session at all gets, for the same request shape.
+        let unknown = pcf_sbi_request_handler(as_nf(
+            make_request(
+                "POST",
+                "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                Some(serde_json::json!({ "ueIpv4": "10.45.19.92" })),
+            ),
+            None,
+            Some(OTHER),
+        ))
+        .await;
+        assert_eq!(unknown.status, 500);
+        // The body with the asked address left out (it differs by request).
+        let without_ip = |resp: &SbiResponse| {
+            let body = resp.http.content.as_deref().unwrap_or_default();
+            match (body.find("address="), body.find(" ipDomain=")) {
+                (Some(a), Some(b)) if a < b => format!("{}{}", &body[..a], &body[b..]),
+                _ => body.to_string(),
+            }
+        };
         for (who, cert, token) in [
             ("foreign token", None, Some(OTHER)),
             ("foreign certificate", Some(OTHER), None),
-            ("mismatched pair", Some(SMF), Some(OTHER)),
             ("anonymous", None, None),
         ] {
             let resp = pcf_sbi_request_handler(restore(cert, token)).await;
-            assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
+            assert_eq!(
+                (resp.status, without_ip(&resp)),
+                (500, without_ip(&unknown)),
+                "{who}: answered exactly as an unknown UE IP is"
+            );
         }
+        // A certificate/token pair that disagree proves no identity: said up
+        // front, whatever the session.
+        let resp = pcf_sbi_request_handler(restore(Some(SMF), Some(OTHER))).await;
+        assert_eq!(resp.status, 403, "mismatched pair: {:?}", resp.http.content);
         assert!(
             drain_notifications(&peers, 1).await.is_empty(),
             "a refused restoration sends nothing"
@@ -14703,6 +15129,158 @@ mod tests {
                 .await
                 .status,
             204
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #2016: identification is among the caller's own sessions. A private
+    /// IPv4 shared by two SMFs' sessions resolves to the asking SMF's (it was
+    /// an ambiguity 500, or a 403 that confirmed the other one existed), and
+    /// two sessions of the SAME caller on that address remain the real
+    /// ambiguity: 500 PDU_SESSION_NOT_AVAILABLE naming two sessions.
+    ///
+    /// REVERT-VERIFIED: with identification over every session again
+    /// (`|_| true` in `handle_pcscf_restoration`), SMF A's request is a 500
+    /// for two matching sessions and the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_identifies_among_the_callers_sessions_2016() {
+        const SMF_A: &str = "aaaaaaaa-2016-4000-8000-0000000000a1";
+        const SMF_B: &str = "bbbbbbbb-2016-4000-8000-0000000000b2";
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ipv4 = "10.45.20.16";
+        let as_smf = |mut r: SbiRequest, smf: &str| {
+            r.oauth2_subject = Some(smf.to_string());
+            r
+        };
+        let create = |supi: &str, psi: u8| {
+            let mut body = full_create_body(supi, psi);
+            let obj = body.as_object_mut().unwrap();
+            obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+            obj.insert(
+                "notificationUri".to_string(),
+                serde_json::json!(format!(
+                    "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                    peers.smf_port
+                )),
+            );
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+        };
+        for (supi, psi, smf) in [
+            ("imsi-001010000002016", 1, SMF_A),
+            ("imsi-001010000002017", 2, SMF_B),
+        ] {
+            let resp = pcf_sbi_request_handler(as_smf(create(supi, psi), smf)).await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        }
+        let restore = |smf: &str| {
+            as_smf(
+                make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4 })),
+                ),
+                smf,
+            )
+        };
+        let resp = pcf_sbi_request_handler(restore(SMF_A)).await;
+        assert_eq!(
+            resp.status, 204,
+            "SMF A's own session: {:?}",
+            resp.http.content
+        );
+        assert_eq!(await_notifications(&peers, 1).await.len(), 1);
+
+        // A second session of SMF A's on the same address: now it is ambiguous.
+        let resp = pcf_sbi_request_handler(as_smf(create("imsi-001010000002018", 3), SMF_A)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let resp = pcf_sbi_request_handler(restore(SMF_A)).await;
+        assert_eq!(resp.status, 500);
+        assert!(
+            resp.http
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("2 PDU sessions match")
+                    && c.contains("PDU_SESSION_NOT_AVAILABLE")),
+            "{:?}",
+            resp.http.content
+        );
+        // SMF B still has exactly one there.
+        assert_eq!(pcf_sbi_request_handler(restore(SMF_B)).await.status, 204);
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #2016 (R31 M): the `ipDomain` narrowing runs over the caller's sessions
+    /// only. SMF A restores its domain-less session with `ipDomain=dom-secret`
+    /// (the fallback to the session with no reported domain); SMF B then holds
+    /// a session on the same IPv4 IN dom-secret. A's answer must not change:
+    /// narrowed over every tenant, B's session would flip it to 500, telling A
+    /// that someone has a session in that domain.
+    ///
+    /// REVERT-VERIFIED: with the visibility filter after the narrowing again,
+    /// A's second restoration is a 500 and the assertion on it fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn another_tenants_ip_domain_does_not_change_the_answer_2016() {
+        const SMF_A: &str = "aaaaaaaa-2016-4000-8000-0000000000d1";
+        const SMF_B: &str = "bbbbbbbb-2016-4000-8000-0000000000d2";
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ipv4 = "10.45.20.26";
+        let as_smf = |mut r: SbiRequest, smf: &str| {
+            r.oauth2_subject = Some(smf.to_string());
+            r
+        };
+        let create = |supi: &str, psi: u8, domain: Option<&str>| {
+            let mut body = full_create_body(supi, psi);
+            let obj = body.as_object_mut().unwrap();
+            obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+            if let Some(d) = domain {
+                obj.insert("ipDomain".to_string(), serde_json::json!(d));
+            }
+            obj.insert(
+                "notificationUri".to_string(),
+                serde_json::json!(format!(
+                    "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                    peers.smf_port
+                )),
+            );
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+        };
+        let restore = || {
+            as_smf(
+                make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4, "ipDomain": "dom-secret" })),
+                ),
+                SMF_A,
+            )
+        };
+        let resp =
+            pcf_sbi_request_handler(as_smf(create("imsi-001010000002026", 1, None), SMF_A)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(pcf_sbi_request_handler(restore()).await.status, 204);
+        let resp = pcf_sbi_request_handler(as_smf(
+            create("imsi-001010000002027", 2, Some("dom-secret")),
+            SMF_B,
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let resp = pcf_sbi_request_handler(restore()).await;
+        assert_eq!(
+            resp.status, 204,
+            "another SMF's session in the asked domain changes nothing: {:?}",
+            resp.http.content
         );
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
