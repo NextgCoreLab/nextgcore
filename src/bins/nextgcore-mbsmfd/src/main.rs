@@ -5210,7 +5210,6 @@ mod subscription_owner_tests_1865 {
         }
     }
 }
-||||||| 034b3fe2
 
 /// #1795: the listener `main` builds follows the SBI security profile.
 #[cfg(test)]

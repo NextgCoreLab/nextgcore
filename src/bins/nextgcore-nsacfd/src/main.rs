@@ -5641,7 +5641,6 @@ mod subscription_owner_tests_1865 {
         assert_eq!(before, after, "nothing stored for a refused subscribe");
     }
 }
-||||||| 034b3fe2
 
 /// #1795: the listener `main` builds follows the SBI security profile.
 #[cfg(test)]

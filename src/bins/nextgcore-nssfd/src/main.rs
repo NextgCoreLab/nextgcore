@@ -7767,7 +7767,6 @@ mod subscription_owner_tests_1909 {
         assert_eq!(owner_of(), None);
     }
 }
-||||||| 034b3fe2
 
 /// #1795: the listener `main` builds follows the SBI security profile.
 #[cfg(test)]
