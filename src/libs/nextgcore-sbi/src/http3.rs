@@ -260,6 +260,7 @@ where
         // HTTP/2 server fills them from mTLS and `OAuth2Verifier::authorize`.
         peer_cert_nf_instance_id: None,
         peer_cert_nf_types: Vec::new(),
+        peer_cert_present: false,
         oauth2_subject: None,
         oauth2_scope: None,
     };
