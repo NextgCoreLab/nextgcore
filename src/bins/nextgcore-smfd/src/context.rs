@@ -1200,7 +1200,12 @@ pub struct SmfSess {
     pub sm_context_ref: Option<String>,
     /// SM Context Status URI
     pub sm_context_status_uri: Option<String>,
-    /// PDU Session Reference
+    /// PDU Session Reference: the `pduSessionRef` an H-SMF / SMF minted for this
+    /// session on the `pdu-sessions` service (TS 29.502 §5.2.2.7), so set only on
+    /// the V-SMF / I-SMF side of a home-routed or I-SMF session. This SMF has no
+    /// such split, so nothing sets it (#1891): it used to be the bare session index
+    /// on every session, which made every session look home-routed and handed a
+    /// sequential reference to a service with no caller binding.
     pub pdu_session_ref: Option<String>,
     /// PDU Session Resource URI
     pub pdu_session_resource_uri: Option<String>,
@@ -1666,6 +1671,14 @@ pub struct PolicyBinding {
     pub ambr_dl_bps: u64,
     /// SM context status URI provided by the AMF (TS 29.502)
     pub sm_context_status_uri: Option<String>,
+    /// #1860: the verified NF Instance ID of the serving AMF, the one consumer
+    /// allowed to modify, release or retrieve this SM context (TS 29.502
+    /// §5.2.2.3-§5.2.2.5, TS 33.501 §13.4.1). Recorded from the creating AMF's
+    /// access token / client certificate, never from the body, and moved only by
+    /// an AMF change the new AMF itself proves (`servingNfId` = its own verified
+    /// identity). `None` for a context created with no verified identity (the
+    /// `dev` profile) or restored from a snapshot written before #1860.
+    pub serving_amf: Option<String>,
     /// GSM (5G session management) FSM for this session
     pub fsm: crate::gsm_sm::GsmFsm,
     /// EASDF DNS-context id for this session, when one was created (#114,
@@ -1932,6 +1945,7 @@ impl PolicyBinding {
             ambr_ul_bps: 0,
             ambr_dl_bps: 0,
             sm_context_status_uri: None,
+            serving_amf: None,
             fsm: crate::gsm_sm::GsmFsm::new(0),
             easdf_dns_context_id: None,
             mapped_eps_bearer_id: None,
@@ -1994,14 +2008,34 @@ pub const FIVE_G_CP_SEID_BASE: u64 = 1 << 48;
 /// SEID and the UPF's Session Reports for one were applied to the other. It also
 /// overlapped the EPC SEIDs from `n4_seid_generator`.
 pub fn derive_cp_n4_seid(sm_context_ref: &str) -> u64 {
-    let index = sm_context_ref.parse::<u64>().unwrap_or(0);
+    let index = sm_context_ref_index(sm_context_ref).map_or(0, u64::from);
     FIVE_G_CP_SEID_BASE | (index & (FIVE_G_CP_SEID_BASE - 1))
 }
 
 /// The derivation snapshot version 1 used: the SEID a version-1 session was
 /// established under, and that the UPF still holds it under.
 pub fn legacy_cp_n4_seid(sm_context_ref: &str) -> u64 {
-    sm_context_ref.parse::<u64>().unwrap_or(1) | 0x1000
+    sm_context_ref_index(sm_context_ref).map_or(1, u64::from) | 0x1000
+}
+
+/// The session index an `smContextRef` carries (#1860).
+///
+/// A reference is `{index}-{32 random hex}` since #1860, so a peer that holds
+/// one cannot derive another (TS 29.502 §5.2.2.3: only the serving AMF holds a
+/// context's reference). A reference minted before then, or restored from a
+/// snapshot written before then, is the bare index. Only the index part is
+/// numeric, so the SEID derivation and the lookups stay what they were.
+pub fn sm_context_ref_index(sm_context_ref: &str) -> Option<u32> {
+    sm_context_ref
+        .split_once('-')
+        .map_or(sm_context_ref, |(index, _)| index)
+        .parse()
+        .ok()
+}
+
+/// A new `smContextRef` for session `index` (#1860): see [`sm_context_ref_index`].
+pub fn mint_sm_context_ref(index: u32) -> String {
+    format!("{index}-{}", crate::owner_binding::unguessable_id())
 }
 
 pub struct SmfContext {
@@ -2711,7 +2745,7 @@ impl SmfContext {
             .keys()
             .chain(policy_bindings.keys())
             .chain(cp_n4_seids.keys())
-            .filter_map(|r| r.parse::<u64>().ok())
+            .filter_map(|r| sm_context_ref_index(r).map(u64::from))
             .max();
         if let Some(max_ref) = max_ref {
             self.sess_index
@@ -3306,8 +3340,7 @@ impl SmfContext {
         sess.psi = psi;
         sess.smf_n4_seid = n4_seid;
         sess.smf_n4_teid = n4_seid as u32;
-        sess.sm_context_ref = Some(format!("{index}"));
-        sess.pdu_session_ref = Some(format!("{index}"));
+        sess.sm_context_ref = Some(mint_sm_context_ref(index));
         sess.charging.id = index;
 
         smf_n4_seid_hash.insert(n4_seid, id);
@@ -3503,18 +3536,15 @@ impl SmfContext {
 
     /// Find session by SM context ref
     pub fn sess_find_by_sm_context_ref(&self, sm_context_ref: &str) -> Option<SmfSess> {
-        if let Ok(index) = sm_context_ref.parse::<u32>() {
-            return self.sess_find_by_index(index);
-        }
-        None
-    }
-
-    /// Find session by PDU session ref
-    pub fn sess_find_by_pdu_session_ref(&self, pdu_session_ref: &str) -> Option<SmfSess> {
-        if let Ok(index) = pdu_session_ref.parse::<u32>() {
-            return self.sess_find_by_index(index);
-        }
-        None
+        // #1860: the whole reference must match, not only its index, or the random
+        // part would be decoration and `7-anything` would resolve session 7.
+        self.sess_find_by_index(sm_context_ref_index(sm_context_ref)?)
+            .filter(|s| match s.sm_context_ref.as_deref() {
+                Some(own) => own == sm_context_ref,
+                // A session given no reference yet (an EPC PDN connection) answers
+                // to its bare index only, as before.
+                None => !sm_context_ref.contains('-'),
+            })
     }
 
     /// Find session by IPv4 address
@@ -4984,7 +5014,8 @@ mod tests {
 
         let ue = ctx.ue_add_by_supi("imsi-001010000000718").expect("ue");
         let sess = ctx.sess_add_by_psi(ue.id, 5).expect("sess");
-        let r: u64 = sess.sm_context_ref.as_deref().unwrap().parse().unwrap();
+        // #1860: `{index}-{random}`; the index is what must be past the restored ones.
+        let r = u64::from(sm_context_ref_index(sess.sm_context_ref.as_deref().unwrap()).unwrap());
         assert!(r > 9, "the new reference {r} is past every restored one");
         assert_ne!(derive_cp_n4_seid(&r.to_string()), derive_cp_n4_seid("1"));
         // An EPC session's SEID is past the inherited one restored for ref 7.

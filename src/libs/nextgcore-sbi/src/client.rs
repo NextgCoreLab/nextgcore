@@ -1263,11 +1263,16 @@ impl SbiClient {
                             // so this cannot break the default or E2E paths -- it
                             // only stops a deployment that wanted authentication
                             // from silently losing it.
+                            // #1867: the URI can be a callback carrying its
+                            // notified NF's token (`.../dereg-notify/{token}`),
+                            // so it is logged redacted, as on every other path
+                            // (#940). The error is redacted too: it is free text.
                             log::error!(
                                 "OAuth2 token acquisition failed; refusing to send {} {} \
-                                 unauthenticated: {e}",
+                                 unauthenticated: {}",
                                 request.header.method,
-                                request.header.uri
+                                crate::log_redact::redact_callback_tokens(&request.header.uri),
+                                crate::log_redact::redact_callback_tokens(&e.to_string())
                             );
                             return Err(SbiError::AuthenticationFailed(format!(
                                 "could not obtain an access token for scope '{scope}': {e}"

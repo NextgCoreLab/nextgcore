@@ -707,6 +707,37 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     }
                 };
 
+            // #1934 review M1: one path shape for every check that follows. A
+            // router that drops empty segments and a scope rule that does not
+            // read `//` differently, so a resource scope keyed on segment
+            // positions was skipped while the router still served the route.
+            // Refused here, before the callback exemption, the OAuth2 checks and
+            // the NF router, for every NF.
+            if let Some(defect) = path_segment_refusal(&sbi_request.header.uri) {
+                // The defect is in the ProblemDetails only: it is derived from the
+                // path, which may carry a callback token.
+                log::debug!(
+                    "cid={} {} {} refused 400: malformed path",
+                    sbi_request.correlation_id,
+                    sbi_request.header.method,
+                    crate::log_redact::redact_callback_tokens(&sbi_request.header.uri)
+                );
+                let body = serde_json::json!({
+                    "title": "Bad Request",
+                    "status": 400,
+                    "detail": format!("the request path has {defect}"),
+                    "cause": "INVALID_MSG_FORMAT",
+                })
+                .to_string();
+                let resp =
+                    SbiResponse::with_status(400).with_body(body, "application/problem+json");
+                return Ok(convert_response_with_identity(
+                    resp,
+                    server_identity.as_ref(),
+                    overload_reporter.as_ref(),
+                ));
+            }
+
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
             // configured key material before dispatching to the NF handler.
             // An invalid token is the caller's fault (401); not being able to
@@ -905,6 +936,41 @@ impl Http2Limits {
             builder.max_header_list_size(sz);
         }
     }
+}
+
+/// What makes the request path `path` (no query) refused before routing (a
+/// phrase naming the defect, never the path itself, which may carry a callback
+/// token), or `None` when it is well formed (#1934 review M1).
+///
+/// An SBI resource URI is `{apiRoot}/{apiName}/{apiVersion}/{apiSpecificResourceUriPart}`
+/// (TS 29.501 §4.4.1), a sequence of non-empty segments. Refused:
+/// - an empty segment (`//`, a leading `//`, a trailing `/`);
+/// - a dot segment, `.` or `..`, also percent-encoded (RFC 3986 §3.3, §6.2.2.2);
+/// - a percent-encoded `/` or `\` inside a segment, which a router that decodes
+///   would split where the scope check did not.
+///
+/// The bare root `/` is accepted. So every NF router and every per-path check
+/// (resource scopes, callback exemptions) sees the same segments, whichever way
+/// each one splits.
+pub fn path_segment_refusal(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    if rest.is_empty() {
+        return None;
+    }
+    for segment in rest.split('/') {
+        if segment.is_empty() {
+            return Some("an empty segment".to_string());
+        }
+        let lower = segment.to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") {
+            return Some("an encoded path separator in a segment".to_string());
+        }
+        let decoded = lower.replace("%2e", ".");
+        if decoded == "." || decoded == ".." {
+            return Some("a dot segment".to_string());
+        }
+    }
+    None
 }
 
 /// Convert hyper request to SbiRequest, enforcing `max_body_size` (T1.4).
@@ -3700,7 +3766,7 @@ mod accept_path_tests {
 /// when their path carries a callback token the NF holds; nothing else is.
 #[cfg(test)]
 mod oauth2_callback_exemption_tests {
-    use super::{OAuth2CallbackExemption, SbiServer, SbiServerConfig};
+    use super::{path_segment_refusal, OAuth2CallbackExemption, SbiServer, SbiServerConfig};
     use crate::message::{SbiRequest, SbiResponse};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3773,6 +3839,53 @@ mod oauth2_callback_exemption_tests {
         (answer.status().as_u16(), www)
     }
 
+    /// #1934 review M1: the path shapes every check must agree on.
+    #[test]
+    fn malformed_paths_are_refused_before_routing_1934() {
+        for ok in [
+            "/",
+            "/nnsacf-nsac/v1/slices/local-configs/update",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription",
+            "/a/b.c/..d/x%20y",
+        ] {
+            assert_eq!(path_segment_refusal(ok), None, "{ok}");
+        }
+        for bad in [
+            "//nnsacf-nsac/v1/slices/local-configs/update",
+            "/nnsacf-nsac/v1//slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices//local-configs/update",
+            "/nnsacf-nsac/v1/slices/local-configs/update/",
+            "/nnsacf-nsac/v1/slices/./local-configs/update",
+            "/nnsacf-nsac/v1/x/../slices/local-configs/update",
+            "/nnsacf-nsac/v1/%2e%2E/slices",
+            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
+            "/nnsacf-nsac/v1/slices%5clocal-configs",
+        ] {
+            assert!(path_segment_refusal(bad).is_some(), "{bad}");
+        }
+    }
+
+    /// #1934: the server answers 400 for a malformed path before the OAuth2
+    /// check (no bearer here, and the answer is not 401) and before the handler.
+    #[tokio::test]
+    async fn the_server_refuses_a_malformed_path_before_auth_and_routing_1934() {
+        let (server, addr, seen) = start(empty_jwks()).await;
+        let before = seen.lock().unwrap().len();
+        for bad in [
+            format!("{CALLBACK}//{GOOD}"),
+            format!("{CALLBACK}/{GOOD}/"),
+            format!("{CALLBACK}/../{GOOD}"),
+        ] {
+            assert_eq!(send(addr, "POST", &bad).await.0, 400, "{bad}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), before, "no handler ran");
+        assert_eq!(
+            send(addr, "POST", &format!("{CALLBACK}/{GOOD}")).await.0,
+            204
+        );
+        server.stop().await.expect("stop");
+    }
+
     fn empty_jwks() -> Option<serde_json::Value> {
         Some(serde_json::json!({"keys": []}))
     }
@@ -3819,6 +3932,13 @@ mod oauth2_callback_exemption_tests {
         ];
         for path in &posts {
             let (status, www) = send(addr, "POST", path).await;
+            // #1934: a malformed spelling (empty, dot or encoded-separator
+            // segment) is refused 400 before the exemption is even consulted;
+            // every other one still needs a bearer.
+            if path_segment_refusal(path).is_some() {
+                assert_eq!(status, 400, "POST {path}");
+                continue;
+            }
             assert_eq!(status, 401, "POST {path}");
             assert!(
                 www.as_deref().is_some_and(|w| w.starts_with("Bearer")),

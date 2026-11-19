@@ -69,6 +69,10 @@ nextgcore-ausfd = { path = "../nextgcore-ausfd" }
 # from udmd's notify path to amfd's handler starts from what the UDR sends.
 # Dev-only edge; the binary graph is unchanged.
 nextgcore-udrd = { path = "../nextgcore-udrd" }
+# #1866: the NRF's REAL token-grant decision (`NfProfile::authorizes_service`)
+# over the profile this UDM registers, so "only the AUSF gets an nudm-ueau
+# token" is checked at the end that decides it. Dev-only edge.
+nextgcore-nrfd = { path = "../nextgcore-nrfd" }
 # F-07 independent MAC oracle: recompute the Annex A.17-A.20 MACs from a
 # raw HMAC-SHA-256 S-string assembly, NOT via nextgcore-crypt's KDF (which
 # the ausfd producer uses) — so the strict-peer equality is a genuine

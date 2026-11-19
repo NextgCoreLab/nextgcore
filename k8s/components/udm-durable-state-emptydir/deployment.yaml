@@ -1,0 +1,22 @@
+# Strategic merge into k8s/manifests/udm.yaml: volumes, volumeMounts and env
+# merge by name, so the base entries stay.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udm
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: udm
+          env:
+            - name: NEXTGCORE_UDM_STATE_FILE
+              value: /var/lib/nextgcore/udm-state.json
+          volumeMounts:
+            - name: udm-state
+              mountPath: /var/lib/nextgcore
+      volumes:
+        # Survives a container restart, NOT a pod delete or reschedule.
+        - name: udm-state
+          emptyDir: {}

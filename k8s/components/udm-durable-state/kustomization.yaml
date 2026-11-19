@@ -1,0 +1,36 @@
+# udmd's durable state file on a PersistentVolumeClaim (#1836, #1885).
+#
+# Off by default: the base udm Deployment (k8s/manifests/udm.yaml) runs udmd
+# memory-only, so a restart loses its SDM subscriptions, its am-data
+# subscriptions at the UDR and the am-data changes waiting for an AMF. This
+# component adds:
+#   - PersistentVolumeClaim udm-state (ReadWriteOnce, 1Gi, the default class);
+#   - the volume at /var/lib/nextgcore on the udm container, writable by the
+#     image's non-root user through the pod's fsGroup 999 (already in the base);
+#   - NEXTGCORE_UDM_STATE_FILE=/var/lib/nextgcore/udm-state.json;
+#   - replicas 1 and strategy Recreate.
+#
+# One writer per file. The state is one udmd instance's. A RollingUpdate would
+# start the new pod while the old one still writes; on the same node a
+# ReadWriteOnce claim lets both mount it. Recreate stops the old pod first.
+# Do not scale this Deployment: a second replica would share the claim.
+#
+# Use it from an overlay:
+#   components:
+#     - <path>/k8s/components/udm-durable-state
+# On EKS use deploy/eks/components/udm-durable-state (gp3), or
+# UDM_DURABLE_STATE=pvc ./deploy-eks.sh. With no volume provisioner, use
+# ../udm-durable-state-emptydir instead.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - pvc.yaml
+
+# target by kind and name, not namespace: a profile in another namespace
+# (deploy/eks/profiles/6g: nextg-6g) sets it after the patch runs.
+patches:
+  - path: deployment.yaml
+    target:
+      kind: Deployment
+      name: udm

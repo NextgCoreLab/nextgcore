@@ -613,7 +613,10 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("EES SBI: {method} {}", request_log_uri(uri));
+    log::debug!(
+        "EES SBI: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&request_log_uri(uri))
+    );
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();

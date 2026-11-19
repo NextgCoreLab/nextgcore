@@ -140,9 +140,17 @@ async fn n32_request_handler(request: HttpRequest) -> HttpResponse {
     let cid = request.correlation_id.clone();
 
     if !cid.is_empty() {
-        log::debug!("N32 request: cid={cid} {method} {path} ({}B)", body.len());
+        log::debug!(
+            "N32 request: cid={cid} {method} {path} ({}B)",
+            body.len(),
+            path = nextgcore_sbi::log_redact::redact_callback_tokens(&path)
+        );
     } else {
-        log::debug!("N32 request: {method} {path} ({}B)", body.len());
+        log::debug!(
+            "N32 request: {method} {path} ({}B)",
+            body.len(),
+            path = nextgcore_sbi::log_redact::redact_callback_tokens(&path)
+        );
     }
 
     match (method.as_str(), path.as_str()) {

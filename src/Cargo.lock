@@ -3447,6 +3447,7 @@ dependencies = [
  "nextgcore-crypt",
  "nextgcore-dbi",
  "nextgcore-metrics",
+ "nextgcore-nrfd",
  "nextgcore-sbi",
  "nextgcore-udrd",
  "p256",
