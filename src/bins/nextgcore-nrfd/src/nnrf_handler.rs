@@ -524,6 +524,14 @@ pub struct SubscriptionData {
     /// `notifCondition` (TS 29.510 §5.2.2.5.2): which NFProfile attributes the
     /// subscriber wants `NF_PROFILE_CHANGED` for. `None` => no restriction.
     pub notif_condition: Option<NotifCondition>,
+    /// #1809: the verified identity of the consumer that created the
+    /// subscription (its client-certificate NF Instance ID, else the `sub` of
+    /// the NRF-issued access token it presented). Only that consumer may update
+    /// (TS 29.510 §5.2.2.5.6) or remove (§5.2.2.6) it. `None` when the creator
+    /// presented no verified identity; such a subscription has nothing to bind
+    /// to. Never echoed on the wire: `reqNfInstanceId` is the consumer's claim,
+    /// this is what the NRF verified.
+    pub owner: Option<String>,
 }
 
 /// `NotifCondition` (TS 29.510 §5.2.2.5.2 / `NotifCondition` schema): the list
@@ -1417,6 +1425,9 @@ fn subscription_to_json(sub: &SubscriptionData) -> serde_json::Value {
     if let Some(ref cond) = sub.notif_condition {
         map.insert("notifCondition".into(), cond.to_json());
     }
+    if let Some(ref owner) = sub.owner {
+        map.insert("owner".into(), owner.clone().into());
+    }
     obj
 }
 
@@ -1466,6 +1477,7 @@ fn subscription_from_json(v: &serde_json::Value) -> Option<SubscriptionData> {
         validity_duration,
         req_notif_events,
         notif_condition,
+        owner: str_at("owner"),
     })
 }
 
@@ -2597,6 +2609,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         assert!(manager.add_subscription(subscription));
@@ -2759,6 +2772,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         let result = nrf_nnrf_handle_nf_status_subscribe(subscription);
@@ -3402,6 +3416,7 @@ mod tests {
                 validity_duration: 3600,
                 req_notif_events: None,
                 notif_condition: None,
+                owner: Some("amf-1-cert".to_string()),
             }));
         }
 
@@ -3440,6 +3455,9 @@ mod tests {
             assert_eq!(cond.kind, SubscrCondKind::NfType);
             assert_eq!(cond.str_at("nfType"), Some("SMF"));
             assert_eq!(sub.validity_duration, 3600);
+            // #1809: the verified creator survives too; a restart must not turn
+            // a bound subscription into one any caller can cancel.
+            assert_eq!(sub.owner.as_deref(), Some("amf-1-cert"));
         }
 
         let _ = std::fs::remove_file(&path);
