@@ -131,10 +131,40 @@ done
 | `global.nrfTls.secretVersion` | `""` | The nf-tls Secret version the pods mount (see NF -> NRF TLS). Empty: `nf-tls-<nf>`, which nothing creates. |
 | `global.nrfTls.serverName` | `nrf` | The name the NRF's certificate is checked against (the dev `nrf.crt` names `DNS:nrf`). `""`: the Service FQDN. |
 | `amf.ueContextStore.enabled`, `amf.ueContextStore.dbUri` | `false`, `""` | #686: the AMF stores every registered UE's context in MongoDB and restores it after a restart, so a returning UE keeps its 5G-GUTI, security context and PDU sessions. `dbUri` empty means the chart's MongoDB. The records hold NAS keys in clear, so MongoDB needs the same access control as the UDR's subscriber keys. |
+| `udm.durableState.enabled`, `udm.durableState.type` | `false`, `pvc` | #1885: udmd's state file (#1836), so its SDM subscriptions, UDR am-data subscriptions and queued am-data changes survive a restart. See "UDM durable state" below. |
 | `global.plmn` | 999-70 | Must match the simulator's PLMN. |
 | `subscriber.*` | test IMSI | Must match the UE's USIM config. |
 | `amf.service.headless`, `upf.service.headless` | `true` | Leave alone. NGAP and GTP-U are UDP; kube-proxy's per-flow balancing plus a conntrack timeout breaks both. |
 | `<nf>.service.type` | `ClusterIP` | Leave alone (#1365). The SBI and `/metrics` are unauthenticated in the dev profile; NodePort or LoadBalancer opens them on every node IP or to the load balancer's audience. Reach a Service from a workstation with `kubectl -n <ns> port-forward svc/<release>-nrf 7777:7777`, which listens on 127.0.0.1. CI renders the defaults and fails on any non-ClusterIP Service. |
+
+## UDM durable state
+
+Off by default: udmd runs memory-only and logs `no UDM state file` at start.
+`--set udm.durableState.enabled=true` mounts a volume at
+`udm.durableState.mountPath` (`/var/lib/nextgcore`) and sets
+`NEXTGCORE_UDM_STATE_FILE` to `<mountPath>/<fileName>`
+(`/var/lib/nextgcore/udm-state.json`). The pod's `fsGroup: 999` makes it writable
+by the image's non-root user. No securityContext changes, and nothing is
+exposed.
+
+| `udm.durableState.type` | Volume | Survives |
+|---|---|---|
+| `pvc` (default) | PersistentVolumeClaim `<release>-udm-state` (`persistence.size` 1Gi, `persistence.storageClass` empty = the cluster default, `persistence.accessMode` ReadWriteOnce), or `persistence.existingClaim` | a container restart and pod re-creation (a delete, a rollout, a node loss) |
+| `emptyDir` | an emptyDir | a container restart only. A deleted, evicted or rescheduled pod starts with no state. For clusters with no provisioner. |
+
+One writer per file: the state is one udmd instance's. With durable state on,
+the render fails for `udm.replicas > 1` and for a `ReadWriteMany` or
+`ReadOnlyMany` claim. The Deployment is `Recreate`, so a rollout stops the old pod
+before the new one mounts the claim. `Recreate` does not cover a `kubectl delete
+pod` or a node drain: the replacement starts while the old pod terminates, and on
+the same node a ReadWriteOnce claim lets both mount it for the grace period.
+`persistence.accessMode=ReadWriteOncePod` closes that window where the CSI driver
+supports it.
+
+The chart's claim is deleted with the release (`helm uninstall`). To keep the
+state across a reinstall, create the claim yourself and set
+`persistence.existingClaim`. CI renders the chart with durable state off, `pvc`
+and `emptyDir` (`deploy/check_udm_state_volume.py`) and checks both refusals.
 
 ## Verified
 

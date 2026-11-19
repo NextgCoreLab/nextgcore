@@ -222,6 +222,30 @@ const DEFAULT_SERVER_CERT: &str = "/etc/nextgcore/tls/server.crt";
 const DEFAULT_SERVER_KEY: &str = "/etc/nextgcore/tls/server.key";
 const DEFAULT_CLIENT_CA: &str = "/etc/nextgcore/tls/ca.crt";
 
+/// #1795: the NRF's listener under the SBI security profile. Under
+/// `production` it must serve TLS (TS 33.501 §13.1.0): with none configured
+/// this is a startup error, where it used to be a warning over a cleartext
+/// listener every production NF then failed to reach. The TLS itself stays the
+/// NRF's own (`nrf.sbi.server[0].tls`, its environment or `--tls`): the NRF is
+/// the token issuer and the root its peers bootstrap from, so a client
+/// certificate stays optional (#1617 step 2) and its token gate stays
+/// `nrf.sbi.oauth2.require_server`. Under `dev` cleartext is still allowed.
+fn check_listener_profile(
+    profile: nextgcore_sbi::security::SbiProfile,
+    server_tls: Option<&NrfServerTls>,
+) -> anyhow::Result<()> {
+    if profile.is_production() && server_tls.is_none() {
+        anyhow::bail!(
+            "the SBI profile is production but the NRF has no TLS configured, and it does not \
+             serve cleartext under production (TS 33.501 §13.1.0). Enable TLS \
+             (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls), or select \
+             {}=dev explicitly",
+            nextgcore_sbi::security::SBI_PROFILE_ENV
+        );
+    }
+    Ok(())
+}
+
 /// The TLS command-line flags.
 #[derive(Debug, Default, Clone)]
 struct TlsFlags {
@@ -593,6 +617,22 @@ struct NrfPolicy {
     /// opt-out (every shipped deployment presents NF certificates since steps
     /// d1-d3). A field rather than a constant only so the handlers read one policy.
     require_registrant_identity: bool,
+    /// #1809: NFStatusSubscribe needs a verified consumer identity, and an
+    /// ownerless subscription (restored from a state file written before
+    /// #1809) cannot be updated or removed. ON under the `production` SBI
+    /// profile (set in `main`), OFF under `dev`, where a plaintext stack has no
+    /// identity to bind to. Default ON: a policy nobody set fails closed.
+    require_subscriber_identity: bool,
+    /// #1917: NFRegister / NFUpdate / NFDeregister need the NF type from the
+    /// caller's OWN verified certificate (RFC 9310 NFTypes, TS 33.310 §6.1.3c.3),
+    /// and the profile's `nfType` must be one of them. Refused `400
+    /// INVALID_CLIENT` when the certificate names no NF type, or when the identity
+    /// came only through a forwarded header (the connection's certificate is then
+    /// the terminator's). Without this an SMF whose certificate carried no NFTypes
+    /// could register as AUSF and be granted nudm-ueau tokens (#1866). ON under the
+    /// `production` SBI profile (set in `main`), OFF under `dev`. Default ON: a
+    /// policy nobody set fails closed.
+    require_registrant_nf_types: bool,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
     /// signature (not just the claim binding). Default ON (issue #64 gap 2).
     cca_verify_signature: bool,
@@ -659,6 +699,8 @@ impl Default for NrfPolicy {
             // #1617 step f: no knob. TS 33.501 §13.3.1.1 permits implicit NF-NRF
             // authentication; the operator chose not to rely on it.
             require_registrant_identity: true,
+            require_subscriber_identity: true,
+            require_registrant_nf_types: true,
             cca_trusted_keys: std::collections::HashMap::new(),
             cca_conflicted: std::collections::HashSet::new(),
             cca_trusted_keys_dir: None,
@@ -1692,6 +1734,11 @@ async fn main() -> Result<()> {
             .and_then(|v| v.first())
             .and_then(|s| s.tls.as_ref()),
     )?;
+    // #1795: under the production SBI profile the NRF never serves cleartext.
+    check_listener_profile(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        server_tls.as_ref(),
+    )?;
     if let Some(tls) = &server_tls {
         tls.check_files()?;
     } else {
@@ -1702,13 +1749,7 @@ async fn main() -> Result<()> {
             "the NRF serves cleartext h2c: no NF can present a client certificate, so every \
              NFRegister / NFUpdate / NFDeregister is refused 400 INVALID_CLIENT (#1617). \
              Enable TLS (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls) \
-             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh).{}",
-            if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
-                " The SBI profile is production too: every NF on it dials its NRF over https \
-                 and cannot reach this one."
-            } else {
-                ""
-            }
+             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh)."
         );
     }
 
@@ -1830,6 +1871,37 @@ async fn main() -> Result<()> {
     // against this allowlist, and a heartbeating NF never re-registers, so the
     // claim is enforced here, before the policy is published.
     enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());
+    // #1809: subscriptions are bound to a verified identity under production.
+    policy.require_subscriber_identity =
+        nextgcore_sbi::security::SbiProfile::resolve().is_production();
+    // #1917: and NF management to the NF type the caller's certificate names.
+    policy.require_registrant_nf_types =
+        nextgcore_sbi::security::SbiProfile::resolve().is_production();
+    if !policy.require_registrant_nf_types {
+        log::warn!(
+            "nrfd-1917: dev SBI profile: a registrant whose certificate names no NF type              (RFC 9310 NFTypes), or whose identity was forwarded by a terminator, may              register as any NF type"
+        );
+    }
+    if policy.require_subscriber_identity {
+        let manager = nf_manager();
+        let unbound = manager
+            .subscription_ids()
+            .iter()
+            .filter(|id| {
+                manager
+                    .find_subscription(id)
+                    .is_some_and(|s| s.owner.is_none())
+            })
+            .count();
+        if unbound > 0 {
+            log::warn!(
+                "{unbound} restored subscription(s) carry no verified owner (written before \
+                 #1809): they keep their notifications until their validity lapses (at most \
+                 24 h after this restart), but no caller can update or remove them; their \
+                 consumers re-subscribe on the 404 that follows expiry"
+            );
+        }
+    }
     NRF_POLICY.set(policy).ok();
 
     // Client side (T1.1): when SBI OAuth2 is enabled, the NRF acquires and
@@ -2159,6 +2231,12 @@ fn oauth2_gate(
 /// is tested over real TLS (`server_tls_tests_1617`, `dev_pki_tests_1617`) and
 /// at the handlers (`unverified_registrant_tests_1617`). Test-only: nothing in
 /// the daemon can attach an identity a handshake did not verify.
+///
+/// #1917: that certificate also names the NF type the request registers as (a
+/// PUT's `nfType`) or manages (the stored profile's), as a production NF
+/// certificate does (RFC 9310 NFTypes); one naming none is refused under the
+/// production profile, and that refusal is tested in
+/// `registrant_nf_type_tests_1917`.
 #[cfg(test)]
 async fn nrf_handler_as_path_certificate(mut request: SbiRequest) -> SbiResponse {
     if request.peer_cert_nf_instance_id.is_none() {
@@ -2169,8 +2247,32 @@ async fn nrf_handler_as_path_certificate(mut request: SbiRequest) -> SbiResponse
             .and_then(|rest| rest.split(['/', '?']).next())
             .filter(|id| !id.is_empty())
             .map(str::to_string);
+        if let Some(id) = request.peer_cert_nf_instance_id.clone() {
+            if request.peer_cert_nf_types.is_empty() {
+                request.peer_cert_nf_types = test_certificate_nf_type(&request, &id)
+                    .into_iter()
+                    .collect();
+            }
+        }
     }
     nrf_sbi_request_handler(request).await
+}
+
+/// #1917, tests only: the NF type a stand-in certificate for `id` names, from a
+/// PUT body's `nfType`, else from the stored profile.
+#[cfg(test)]
+fn test_certificate_nf_type(request: &SbiRequest, id: &str) -> Option<String> {
+    request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .and_then(|v| v.get("nfType").and_then(|t| t.as_str()).map(str::to_string))
+        .or_else(|| {
+            nf_manager()
+                .get(&nextgcore_nrfd::nnrf_handler::canonical_nf_instance_id(id))
+                .map(|p| p.nf_type.clone())
+        })
 }
 
 async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
@@ -2196,7 +2298,10 @@ async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("NRF SBI request: {method} {uri}");
+    log::debug!(
+        "NRF SBI request: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -2275,7 +2380,7 @@ async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
         ("nnrf-nfm", "subscriptions", "DELETE") if parts.len() >= 4 => {
             // Unsubscribe: DELETE /nnrf-nfm/v1/subscriptions/{subscriptionId}
             let subscription_id = parts[3];
-            handle_subscription_delete(subscription_id).await
+            handle_subscription_delete(subscription_id, &request).await
         }
         ("nnrf-nfm", "subscriptions", "PATCH") if parts.len() >= 4 => {
             // Update subscription: PATCH /nnrf-nfm/v1/subscriptions/{subscriptionId}
@@ -2299,7 +2404,10 @@ async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
         ("nnrf-oauth2", "jwks", "GET") => handle_jwks(),
 
         _ => {
-            log::warn!("Unknown NRF request: {method} {uri}");
+            log::warn!(
+                "Unknown NRF request: {method} {uri}",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_method_not_allowed(method, uri)
         }
     };
@@ -2386,9 +2494,12 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         );
     }
     // #1611: and only as an NF type its verified certificate names.
-    if let Some(refused) =
-        registrant.bind_nf_type("NFRegister", nf_instance_id, &nf_profile.nf_type)
-    {
+    if let Some(refused) = registrant.bind_nf_type(
+        "NFRegister",
+        nf_instance_id,
+        &nf_profile.nf_type,
+        registrant_nf_types_required(),
+    ) {
         return refused;
     }
     // #1719: and claims only the NF Sets the operator provisioned it for.
@@ -2527,10 +2638,14 @@ async fn handle_nf_deregister(nf_instance_id: &str, request: &SbiRequest) -> Sbi
 
     // Fetch the profile before deregistering so we can notify subscribers
     let profile_for_notify = manager.get(nf_instance_id);
-    if let Some(refused) = profile_for_notify
-        .as_ref()
-        .and_then(|p| registrant.bind_nf_type("NFDeregister", nf_instance_id, &p.nf_type))
-    {
+    if let Some(refused) = profile_for_notify.as_ref().and_then(|p| {
+        registrant.bind_nf_type(
+            "NFDeregister",
+            nf_instance_id,
+            &p.nf_type,
+            registrant_nf_types_required(),
+        )
+    }) {
         return refused;
     }
 
@@ -2773,7 +2888,12 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     }
     // #1611: the patched profile's nfType must still be one the verified
     // certificate names (a patch must not re-type the instance either).
-    if let Some(refused) = registrant.bind_nf_type("NFUpdate", nf_instance_id, &updated.nf_type) {
+    if let Some(refused) = registrant.bind_nf_type(
+        "NFUpdate",
+        nf_instance_id,
+        &updated.nf_type,
+        registrant_nf_types_required(),
+    ) {
         return refused;
     }
     // #1719: a patch may not add an NF Set the registrant is not provisioned for.
@@ -3148,7 +3268,25 @@ fn query_params(uri: &str) -> Vec<(String, String)> {
 
 /// Handle Subscription Create request
 async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+    handle_subscription_create_under(request, nextgcore_sbi::security::SbiProfile::resolve()).await
+}
+
+/// [`handle_subscription_create`] under an explicit SBI profile, so a test can
+/// drive the production path without the process-global override (#1869).
+async fn handle_subscription_create_under(
+    request: &SbiRequest,
+    profile: nextgcore_sbi::security::SbiProfile,
+) -> SbiResponse {
     log::info!("Subscription Create");
+
+    // #1809: the verified identity this subscription is bound to, checked
+    // before the body is read or anything is stored.
+    let owner = match RegistrantIdentity::of(request, nrf_policy())
+        .subscription_owner(subscriber_identity_required())
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -3173,6 +3311,22 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
+    // #1869: under production the notification is sent over TLS with a token, so
+    // a cleartext callback is refused here, before anything is stored (TS 29.500
+    // §5.2.7.2: 400 with `invalidParams` naming the attribute).
+    if let Err(reason) =
+        nextgcore_nrfd::sbi_path::check_notification_uri(&notification_uri, profile)
+    {
+        let body = serde_json::json!({
+            "title": "Bad Request",
+            "status": 400,
+            "detail": reason,
+            "cause": "MANDATORY_IE_INCORRECT",
+            "invalidParams": [{ "param": "/nfStatusNotificationUri", "reason": reason }],
+        });
+        return SbiResponse::with_status(400)
+            .with_body(body.to_string(), "application/problem+json");
+    }
 
     // Generate subscription ID
     let subscription_id = uuid::Uuid::new_v4().to_string();
@@ -3319,6 +3473,8 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         validity_duration,
         req_notif_events,
         notif_condition,
+        // #1809: bound to who created it, so only that consumer can manage it.
+        owner,
     };
 
     // nrfd-08: the NRF-assigned validityTime is an absolute RFC 3339 timestamp
@@ -3416,9 +3572,14 @@ fn rearm_restored_timers() {
     let mut sub_count = 0usize;
     for id in manager.subscription_ids() {
         if let Some(sub) = manager.find_subscription(&id) {
+            let validity = restored_validity(&sub);
+            if validity != sub.validity_duration {
+                // Stored too, so what the NRF holds matches what it enforces.
+                manager.set_subscription_validity(&id, validity);
+            }
             timer_mgr.start_timer(
                 nextgcore_nrfd::NrfTimerId::SubscriptionValidity,
-                Duration::from_secs(sub.validity_duration),
+                Duration::from_secs(validity),
                 id.clone(),
             );
             sub_count += 1;
@@ -3444,11 +3605,37 @@ fn rearm_restored_timers() {
 // leap-year or offset fix applied here would otherwise stay unapplied in the other
 // five copies.
 
+/// #1809 (R26 on #1831): the validity a restored subscription is re-armed
+/// with. An ownerless one (written before #1809) is frozen under production,
+/// so it must not outlive the NRF's own maximum: it is capped at
+/// [`NRF_SUBSCRIPTION_DEFAULT_VALIDITY`] (24 h), after which its consumer
+/// re-subscribes, bound. Before that cap a PATCH could set any validity, so a
+/// frozen subscription could otherwise have lasted indefinitely. An owned
+/// subscription keeps what was stored: its owner can still extend or cancel it.
+fn restored_validity(sub: &nextgcore_nrfd::SubscriptionData) -> u64 {
+    if sub.owner.is_none() {
+        sub.validity_duration.min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY)
+    } else {
+        sub.validity_duration
+    }
+}
+
 /// Handle Subscription Delete request
-async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
+async fn handle_subscription_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("Subscription Delete: {subscription_id}");
 
     let manager = nf_manager();
+    // #1809: only the consumer that created the subscription may cancel it,
+    // checked before anything is removed.
+    if let Some(sub) = manager.find_subscription(subscription_id) {
+        if let Some(refused) = RegistrantIdentity::of(request, nrf_policy()).bind_subscription(
+            "NFStatusUnsubscribe",
+            &sub,
+            subscriber_identity_required(),
+        ) {
+            return refused;
+        }
+    }
     if manager.remove_subscription(subscription_id) {
         log::info!("Subscription {subscription_id} removed");
         SbiResponse::with_status(204) // No Content
@@ -3473,6 +3660,15 @@ async fn handle_subscription_update(subscription_id: &str, request: &SbiRequest)
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     };
+    // #1809: only the consumer that created the subscription may extend it,
+    // checked before the body is read or anything is stored.
+    if let Some(refused) = RegistrantIdentity::of(request, nrf_policy()).bind_subscription(
+        "NFStatusSubscribe update",
+        &existing,
+        subscriber_identity_required(),
+    ) {
+        return refused;
+    }
 
     let body = request.http.content.as_deref().unwrap_or("");
     let patch: serde_json::Value = match serde_json::from_str(body) {
@@ -3520,7 +3716,12 @@ async fn handle_subscription_update(subscription_id: &str, request: &SbiRequest)
             Some("INVALID_MSG_FORMAT"),
         );
     }
-    let validity_duration = absolute - now;
+    // R26 on #1831: the same maximum as Subscribe, so a PATCH cannot pin a
+    // subscription open past what the NRF would grant a new one.
+    let validity_duration = (absolute - now).min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY);
+    // The validity the NRF grants, which the response returns (TS 29.510
+    // §5.2.2.5.6), not the proposal it narrowed.
+    let validity_time = epoch_to_rfc3339(now + validity_duration);
 
     if !manager.set_subscription_validity(subscription_id, validity_duration) {
         return send_error(
@@ -3936,7 +4137,13 @@ fn producer_eligible(
 ///   2. verify each requested service-name scope is offered by — and permitted
 ///      to the consumer by — at least one registered producer of the target NF
 ///      type (`allowedNfTypes` profile- and service-level filters, TS 29.510
-///      §6.1.6.2; an empty/absent list is "no restriction").
+///      §6.1.6.2; an empty/absent list is "no restriction"); and
+///   3. (#1811) grant a resource/operation-level scope
+///      (`<service>:<resource>:<op>`) only when that producer's NFService lists
+///      it for the consumer in `allowedOperationsPerNfType` /
+///      `allowedOperationsPerNfInstance` (TS 29.510 Table 6.1.6.2.3-1 NOTE 11;
+///      TS 33.501 §13.4.1.1 "additional scope"). An ungranted scope is left out
+///      of the token, as RFC 6749 §3.3 lets the server do.
 ///
 /// Returns the granted scope subset, or an RFC 6749 §5.2 error
 /// `(code, description)` carried in the 400 `AccessTokenErr`.
@@ -3952,12 +4159,60 @@ fn producer_eligible(
 /// token minted while the producer was down outlive a restrictive
 /// `allowedNfTypes` the producer registered with afterwards.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn authorize_access_token(
     consumer: &NfProfile,
     req_nf_type: &str,
     target_nf_type: &str,
     requested_scopes: &[String],
     producers: &[NfProfile],
+    requester_plmns: &[serde_json::Value],
+    requester_snssais: &[serde_json::Value],
+) -> Result<Vec<String>, (&'static str, String)> {
+    authorize_access_token_for(
+        consumer,
+        req_nf_type,
+        target_nf_type,
+        requested_scopes,
+        producers,
+        producers,
+        requester_plmns,
+        requester_snssais,
+    )
+}
+
+/// #1828 (R26 on #1922): the producers that will ACCEPT the token being
+/// minted, which a resource scope must be allowed by. A type-targeted token's
+/// audience is the NF type (TS 29.510 §6.3.5.2.4), and every producer of that
+/// type accepts it (TS 33.501 §13.4.1.2), whatever its status, PLMN or slice.
+/// So the set is every registered producer of the type: SUSPENDED included
+/// (it can resume and accept the token while it is still valid), and never
+/// narrowed by the requester's own `requesterPlmnList` / `requesterSnssaiList`,
+/// which the requester chooses. An instance-targeted token's audience is that
+/// instance alone.
+fn token_acceptors(
+    registered: &[NfProfile],
+    target_nf_type: &str,
+    target_instance: Option<&NfProfile>,
+) -> Vec<NfProfile> {
+    match target_instance {
+        Some(p) => vec![p.clone()],
+        None => registered
+            .iter()
+            .filter(|p| p.nf_type.eq_ignore_ascii_case(target_nf_type))
+            .cloned()
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authorize_access_token_for(
+    consumer: &NfProfile,
+    req_nf_type: &str,
+    target_nf_type: &str,
+    requested_scopes: &[String],
+    producers: &[NfProfile],
+    acceptors: &[NfProfile],
     requester_plmns: &[serde_json::Value],
     requester_snssais: &[serde_json::Value],
 ) -> Result<Vec<String>, (&'static str, String)> {
@@ -3997,16 +4252,34 @@ fn authorize_access_token(
     let mut granted = Vec::new();
     let mut any_offered = false;
     for service in requested_scopes {
-        let mut offered = false;
-        let mut permitted = false;
-        for p in &eligible {
-            let (o, perm) = p.authorizes_service(&consumer.nf_type, service);
-            offered |= o;
-            permitted |= perm;
-            if perm {
-                break;
-            }
-        }
+        // #1811: a resource/operation-level scope is granted only to the
+        // consumers the producer's allowedOperationsPerNf* name.
+        let decisions: Vec<(bool, bool)> = eligible
+            .iter()
+            .map(|p| p.authorizes_scope(&consumer.nf_type, &consumer.nf_instance_id, service))
+            .collect();
+        let offered = decisions.iter().any(|(o, _)| *o);
+        let permitted = if service.contains(':') {
+            // #1828: TS 29.510 Table 6.1.6.2.3-1 NOTE 11 is per producer, and a
+            // token whose audience is the target TYPE is accepted by every
+            // producer of it. A resource scope is therefore granted only when
+            // an eligible producer allows it AND every ACCEPTOR of the token
+            // offering the service allows it too ([`token_acceptors`]: every
+            // registered producer of the type, whatever its status, and not
+            // the requester-filtered eligible set). One UDR registered with a
+            // wider map must not put the K-read scope into a token all UDRs
+            // accept. An instance-targeted token has one acceptor.
+            decisions.iter().any(|(_, perm)| *perm)
+                && acceptors
+                    .iter()
+                    .map(|p| {
+                        p.authorizes_scope(&consumer.nf_type, &consumer.nf_instance_id, service)
+                    })
+                    .filter(|(o, _)| *o)
+                    .all(|(_, perm)| perm)
+        } else {
+            decisions.iter().any(|(_, perm)| *perm)
+        };
         any_offered |= offered;
         if permitted {
             granted.push(service.clone());
@@ -4564,6 +4837,9 @@ struct RegistrantIdentity {
     /// The NF types the caller's verified certificate names. Empty means the
     /// certificate asserts none (or there is no certificate), never "any".
     nf_types: Vec<String>,
+    /// #1917: the certificate identity came only through a forwarded header, so
+    /// no NF type of the caller is known (see [`Self::bind_nf_type`]).
+    forwarded: bool,
 }
 
 impl RegistrantIdentity {
@@ -4602,6 +4878,7 @@ impl RegistrantIdentity {
         Self {
             instance_ids,
             nf_types,
+            forwarded,
         }
     }
 
@@ -4669,19 +4946,37 @@ impl RegistrantIdentity {
         )))
     }
 
-    /// The profile's `nfType` must be one the verified certificate names, when it
-    /// names any (TS 33.310 §6.1.3c.3, RFC 9310). `Some` is the refusal to send.
+    /// The profile's `nfType` must be one the verified certificate names (TS
+    /// 33.310 §6.1.3c.3, RFC 9310; TS 33.501 §5.9.2.2 NOTE). When it names none,
+    /// or the identity was forwarded, the type cannot be verified: `required`
+    /// ([`registrant_nf_types_required`], the production profile, #1917) refuses
+    /// it, otherwise it is accepted as asserted. `Some` is the refusal to send.
     fn bind_nf_type(
         &self,
         operation: &str,
         nf_instance_id: &str,
         nf_type: &str,
+        required: bool,
     ) -> Option<SbiResponse> {
-        if self.nf_types.is_empty()
-            || self
-                .nf_types
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(nf_type))
+        if self.nf_types.is_empty() {
+            if !required {
+                return None;
+            }
+            nextgcore_nrfd::metrics::observe_unverified_nf_management();
+            let why = if self.forwarded {
+                "its identity was forwarded by a TLS terminator, whose certificate names                  the terminator's NF types, not the requester's"
+            } else {
+                "its client certificate names no NF type (RFC 9310 NFTypes)"
+            };
+            log::debug!("{operation} for NF instance {nf_instance_id} as {nf_type} refused: {why}");
+            return Some(invalid_client(&format!(
+                "{operation}: nfType {nf_type:?} cannot be verified: {why} (TS 33.310                  §6.1.3c.3)"
+            )));
+        }
+        if self
+            .nf_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(nf_type))
         {
             return None;
         }
@@ -4695,6 +4990,121 @@ impl RegistrantIdentity {
              client certificate ({:?})",
             self.nf_types
         )))
+    }
+}
+
+/// #1917: [`NrfPolicy::require_registrant_nf_types`], which tests of the dev
+/// behaviour turn off for their own task only.
+fn registrant_nf_types_required() -> bool {
+    #[cfg(test)]
+    if let Ok(required) = registrant_nf_type_tests_1917::REQUIRED.try_with(|r| *r) {
+        return required;
+    }
+    nrf_policy().require_registrant_nf_types
+}
+
+/// #1809: [`NrfPolicy::require_subscriber_identity`], which tests of the dev
+/// behaviour turn off for their own task only.
+fn subscriber_identity_required() -> bool {
+    #[cfg(test)]
+    if let Ok(required) = subscription_owner_tests_1809::REQUIRED.try_with(|r| *r) {
+        return required;
+    }
+    nrf_policy().require_subscriber_identity
+}
+
+impl RegistrantIdentity {
+    /// #1809: the identity a new subscription is bound to. One rule for create
+    /// and manage: every verified identity of the caller (certificate, trusted
+    /// forwarded certificate, token `sub`) must name the same NF instance, so
+    /// the creator can always manage what it created. Callers whose identities
+    /// disagree are refused `400 INVALID_CLIENT` (TS 29.510 Table 6.1.7.3-1), as
+    /// `bind_instance` refuses them for NF management. A caller with no verified
+    /// identity is refused the same way when `required` (the production
+    /// profile, as #1617 refuses cert-less NF management), else `Ok(None)`.
+    fn subscription_owner(&self, required: bool) -> Result<Option<String>, Box<SbiResponse>> {
+        let Some((_, first)) = self.instance_ids.first() else {
+            if required {
+                nextgcore_nrfd::metrics::observe_unverified_nf_management();
+                return Err(Box::new(invalid_client(
+                    "NFStatusSubscribe: the requester has no verified identity (client \
+                     certificate or NRF-issued access token), so the subscription could not be \
+                     bound to it",
+                )));
+            }
+            return Ok(None);
+        };
+        if let Some((source, other)) = self
+            .instance_ids
+            .iter()
+            .find(|(_, id)| !same_nf_instance_id(id, first))
+        {
+            log::debug!(
+                "NFStatusSubscribe refused: the caller's identities disagree ({first} vs \
+                 {source} {other})"
+            );
+            return Err(Box::new(invalid_client(&format!(
+                "NFStatusSubscribe: the requester's {source} ({other:?}) does not match its \
+                 other verified identity ({first:?})"
+            ))));
+        }
+        Ok(Some(first.clone()))
+    }
+
+    /// #1809: a subscription is updated (TS 29.510 §5.2.2.5.6) or removed
+    /// (§5.2.2.6) only by the consumer that created it. When it was bound to an
+    /// identity, the caller must prove one and every identity it proves must be
+    /// that one (TS 33.501 §13.1: the NRF authorizes on the authenticated
+    /// identity, not on a claim). `403`, because the request is well formed and
+    /// the caller is simply not allowed to act on someone else's resource.
+    /// `Some` is the refusal to send; nothing has been read or changed yet.
+    ///
+    /// An ownerless subscription binds nothing under `dev`. When `required`
+    /// (production) it is refused instead: it can only be one restored from a
+    /// state file written before #1809, and nobody can prove they created it.
+    fn bind_subscription(
+        &self,
+        operation: &str,
+        sub: &nextgcore_nrfd::SubscriptionData,
+        required: bool,
+    ) -> Option<SbiResponse> {
+        let Some(owner) = sub.owner.as_deref() else {
+            return required.then(|| {
+                send_error(
+                    403,
+                    "Forbidden",
+                    &format!(
+                        "{operation}: subscription {} has no verified owner (it predates \
+                         #1809), so no requester can be shown to have created it",
+                        sub.id
+                    ),
+                    None,
+                )
+            });
+        };
+        let foreign = if self.instance_ids.is_empty() {
+            Some("no verified identity".to_string())
+        } else {
+            self.instance_ids
+                .iter()
+                .find(|(_, id)| !same_nf_instance_id(id, owner))
+                .map(|(source, id)| format!("{source} {id:?}"))
+        }?;
+        // debug, not warn: a peer can send these at will (#1620 review m7).
+        log::debug!(
+            "{operation} of subscription {} refused: the caller has {foreign}, the \
+             subscription belongs to NF instance {owner}",
+            sub.id
+        );
+        Some(send_error(
+            403,
+            "Forbidden",
+            &format!(
+                "{operation}: subscription {} was not created by the requester ({foreign})",
+                sub.id
+            ),
+            None,
+        ))
     }
 }
 
@@ -5231,8 +5641,11 @@ async fn handle_access_token_request_with_policy(
     // already bound to it must be able to refresh its token); SUSPENDED is "not
     // operative" (e.g. heartbeat failure), so it cannot vouch for a token. An
     // unknown status is treated as not operative.
-    let mut all: Vec<NfProfile> = manager
-        .list()
+    // #1828: every registered producer, whatever its status: the set a
+    // type-targeted token's resource scopes are checked against.
+    let registered: Vec<NfProfile> = manager.list();
+    let mut all: Vec<NfProfile> = registered
+        .clone()
         .into_iter()
         .filter(|p| {
             ["REGISTERED", "UNDISCOVERABLE", "CANARY_RELEASE"]
@@ -5313,12 +5726,14 @@ async fn handle_access_token_request_with_policy(
     // requested scope is permitted by the target producer set BEFORE minting a
     // token. Without this, the endpoint is an OAuth2 authorization bypass.
     let requested_scopes: Vec<String> = req.scope.split_whitespace().map(String::from).collect();
-    let granted_scopes = match authorize_access_token(
+    let acceptors = token_acceptors(&registered, &target_nf_type, target_instance.as_ref());
+    let granted_scopes = match authorize_access_token_for(
         &consumer,
         &nf_type,
         &target_nf_type,
         &requested_scopes,
         &producers,
+        &acceptors,
         &req.requester_plmns,
         &req.requester_snssais,
     ) {
@@ -5910,6 +6325,359 @@ mod tests {
         )
         .expect("permitted scope must be granted");
         assert_eq!(granted, vec!["nudm-sdm".to_string()]);
+    }
+
+    /// #1811: a UDR as udrd registers it -- nudr-dr open to UDM, PCF and NEF,
+    /// with `allowedOperationsPerNfType` granting the TS 29.505
+    /// AuthenticationSubscription scopes to the UDM alone.
+    fn udr_with_resource_scopes() -> NfProfile {
+        auth_producer(
+            "UDR",
+            serde_json::json!([{
+                "serviceInstanceId": "udr-dr",
+                "serviceName": "nudr-dr",
+                "allowedNfTypes": ["UDM", "PCF", "NEF"],
+                "allowedOperationsPerNfType": {
+                    "UDM": ["nudr-dr", AUTH_SUBS_READ, AUTH_SUBS_MODIFY],
+                    "PCF": ["nudr-dr"],
+                    "NEF": ["nudr-dr"]
+                }
+            }]),
+            Some(serde_json::json!(["UDM", "PCF", "NEF"])),
+        )
+    }
+
+    const AUTH_SUBS_READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
+    const AUTH_SUBS_MODIFY: &str = "nudr-dr:subscription-data:authentication-subscription:modify";
+
+    /// #1811: only the UDM is granted the AuthenticationSubscription scope.
+    /// A PCF or NEF asking for it gets the service scope alone (RFC 6749 §3.3
+    /// lets the server narrow the request), so its token cannot read K at the
+    /// UDR; asking for the resource scope ALONE gets nothing.
+    ///
+    /// REVERT-VERIFIED: with `authorize_access_token` calling
+    /// `authorizes_service(.., service)` again instead of `authorizes_scope`, the
+    /// UDM's token loses the resource scope and the first assertion fails.
+    #[test]
+    fn the_auth_subscription_scope_is_granted_to_the_udm_only_1811() {
+        let udr = udr_with_resource_scopes();
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&udr),
+            &[],
+            &[],
+        )
+        .expect("the UDM is authorized");
+        assert_eq!(udm, requested, "the UDM gets both scopes");
+        for nf_type in ["PCF", "NEF"] {
+            let granted = authorize_access_token(
+                &auth_consumer(nf_type),
+                nf_type,
+                "UDR",
+                &requested,
+                std::slice::from_ref(&udr),
+                &[],
+                &[],
+            )
+            .expect("the service scope is still granted");
+            assert_eq!(granted, vec!["nudr-dr".to_string()], "{nf_type}");
+            let err = authorize_access_token(
+                &auth_consumer(nf_type),
+                nf_type,
+                "UDR",
+                &[AUTH_SUBS_MODIFY.into()],
+                std::slice::from_ref(&udr),
+                &[],
+                &[],
+            )
+            .expect_err("the resource scope alone is refused");
+            assert_eq!(err.0, "unauthorized_client", "{nf_type}");
+        }
+    }
+
+    /// #1828: two UDRs whose `allowedOperationsPerNfType` maps disagree. One
+    /// grants the PCF the AuthenticationSubscription read scope; the standard
+    /// one grants it to the UDM alone. A type-targeted token (aud=UDR, accepted
+    /// by both) carries the resource scope only for a consumer EVERY candidate
+    /// allows, so the PCF gets the service scope alone while the UDM, allowed
+    /// by both, keeps the resource scope. Pinned to the wider UDR by instance,
+    /// the PCF's token names that UDR alone and is granted.
+    ///
+    /// REVERT-VERIFIED: with the any-producer rule restored for resource
+    /// scopes, the PCF's type-targeted token carries the K-read scope and the
+    /// first assertion fails.
+    #[test]
+    fn a_resource_scope_needs_every_candidate_udr_to_allow_it_1828() {
+        let udr = |id: &str, pcf_scopes: serde_json::Value| {
+            let mut attrs = udr_with_resource_scopes().attributes;
+            attrs["nfInstanceId"] = id.into();
+            attrs["nfServices"][0]["allowedOperationsPerNfType"]["PCF"] = pcf_scopes;
+            NfProfile::from_json(&attrs).expect("profile")
+        };
+        let standard = udr("udr-standard-1828", serde_json::json!(["nudr-dr"]));
+        let wider = udr(
+            "udr-wider-1828",
+            serde_json::json!(["nudr-dr", AUTH_SUBS_READ]),
+        );
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        let both = [standard.clone(), wider.clone()];
+
+        let pcf = authorize_access_token(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            &both,
+            &[],
+            &[],
+        )
+        .expect("the service scope is still granted");
+        assert_eq!(
+            pcf,
+            vec!["nudr-dr".to_string()],
+            "one UDR's wider map does not grant the resource scope to every UDR"
+        );
+        // Either order of the candidates.
+        let reversed = [wider.clone(), standard.clone()];
+        let pcf = authorize_access_token(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            &reversed,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pcf, vec!["nudr-dr".to_string()]);
+
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "UDR",
+            &requested,
+            &both,
+            &[],
+            &[],
+        )
+        .expect("the UDM is allowed by both");
+        assert_eq!(udm, requested, "allowed by every candidate");
+
+        // Instance-targeted: the one candidate's own map decides.
+        let pinned = authorize_access_token(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&wider),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pinned, requested, "the pinned UDR allows it");
+    }
+
+    /// R26 on #1922: a permissive UDR on a slice of its own, and a PCF naming
+    /// that slice in its token request. The eligible set is then the permissive
+    /// UDR alone, but the token's audience is still "UDR", so the standard UDR
+    /// accepts it too: the K-read scope must not be granted.
+    ///
+    /// REVERT-VERIFIED: with the acceptor check reading `decisions` (the
+    /// requester-filtered set) instead of `acceptors`, the PCF gets the scope.
+    #[test]
+    fn a_requester_chosen_slice_does_not_narrow_the_acceptors_1828() {
+        let udr = |id: &str, pcf_scopes: serde_json::Value, sst: Option<u64>| {
+            let mut attrs = udr_with_resource_scopes().attributes;
+            attrs["nfInstanceId"] = id.into();
+            attrs["nfServices"][0]["allowedOperationsPerNfType"]["PCF"] = pcf_scopes;
+            if let Some(sst) = sst {
+                attrs["sNssais"] = serde_json::json!([{ "sst": sst }]);
+            }
+            NfProfile::from_json(&attrs).expect("profile")
+        };
+        let standard = udr(
+            "udr-standard-1828b",
+            serde_json::json!(["nudr-dr"]),
+            Some(1),
+        );
+        let permissive = udr(
+            "udr-permissive-1828b",
+            serde_json::json!(["nudr-dr", AUTH_SUBS_READ]),
+            Some(99),
+        );
+        let all = [standard, permissive];
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        let slice = [serde_json::json!({ "sst": 99 })];
+        let granted = authorize_access_token_for(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            &all,
+            &token_acceptors(&all, "UDR", None),
+            &[],
+            &slice,
+        )
+        .expect("the service scope is granted");
+        assert_eq!(
+            granted,
+            vec!["nudr-dr".to_string()],
+            "the standard UDR accepts the token too, so no K-read scope"
+        );
+    }
+
+    /// R26 on #1922: a SUSPENDED UDR still accepts a type-targeted token once
+    /// it resumes, so it is an acceptor; the eligible set skips it.
+    ///
+    /// REVERT-VERIFIED: with `token_acceptors` filtering out non-operative
+    /// producers, the suspended standard UDR is ignored and the PCF gets the
+    /// scope; the first assertion fails.
+    #[test]
+    fn a_suspended_udr_still_counts_as_an_acceptor_1828() {
+        let udr = |id: &str, pcf_scopes: serde_json::Value, status: &str| {
+            let mut attrs = udr_with_resource_scopes().attributes;
+            attrs["nfInstanceId"] = id.into();
+            attrs["nfStatus"] = status.into();
+            attrs["nfServices"][0]["allowedOperationsPerNfType"]["PCF"] = pcf_scopes;
+            NfProfile::from_json(&attrs).expect("profile")
+        };
+        let suspended = udr(
+            "udr-suspended-1828c",
+            serde_json::json!(["nudr-dr"]),
+            "SUSPENDED",
+        );
+        let permissive = udr(
+            "udr-permissive-1828c",
+            serde_json::json!(["nudr-dr", AUTH_SUBS_READ]),
+            "REGISTERED",
+        );
+        let registered = [suspended.clone(), permissive.clone()];
+        let acceptors = token_acceptors(&registered, "UDR", None);
+        assert_eq!(acceptors.len(), 2, "the suspended UDR is an acceptor");
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        // The handler's operative set: the suspended UDR is not in it.
+        let granted = authorize_access_token_for(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&permissive),
+            &acceptors,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(granted, vec!["nudr-dr".to_string()]);
+        // Pinned to the permissive UDR, its own map decides.
+        let pinned = token_acceptors(&registered, "UDR", Some(&permissive));
+        let granted = authorize_access_token_for(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&permissive),
+            &pinned,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(granted, requested);
+    }
+
+    /// #1811, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: with neither
+    /// allowedOperationsPerNf* registered only the service scope is grantable,
+    /// even to a UDM; once one is registered, a type it does not list is barred
+    /// from the service scope too.
+    #[test]
+    fn resource_scopes_follow_note_11_of_the_nf_service_table_1811() {
+        let plain = auth_producer(
+            "UDR",
+            serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudr-dr"}]),
+            None,
+        );
+        let granted = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "UDR",
+            &["nudr-dr".into(), AUTH_SUBS_READ.into()],
+            &[plain],
+            &[],
+            &[],
+        )
+        .expect("service scope granted");
+        assert_eq!(granted, vec!["nudr-dr".to_string()]);
+
+        // AUSF passes allowedNfTypes (absent) but is not in the map.
+        let unlisted = auth_producer(
+            "UDR",
+            serde_json::json!([{
+                "serviceInstanceId": "s0", "serviceName": "nudr-dr",
+                "allowedOperationsPerNfType": {"UDM": ["nudr-dr", AUTH_SUBS_READ]}
+            }]),
+            None,
+        );
+        let err = authorize_access_token(
+            &auth_consumer("AUSF"),
+            "AUSF",
+            "UDR",
+            &["nudr-dr".into()],
+            &[unlisted],
+            &[],
+            &[],
+        )
+        .expect_err("a type the map does not list is barred");
+        assert_eq!(err.0, "unauthorized_client");
+    }
+
+    /// #1811, NOTE 11's instance map: by default either map grants; with
+    /// `allowedOperationsPerNfInstanceOverrides` the instance's own entry
+    /// replaces its type's.
+    #[test]
+    fn the_instance_map_adds_to_or_overrides_the_type_map_1811() {
+        let consumer = auth_consumer("PCF");
+        let id = consumer.nf_instance_id.clone();
+        let udr = |overrides: bool, instance_scopes: serde_json::Value| {
+            auth_producer(
+                "UDR",
+                serde_json::json!([{
+                    "serviceInstanceId": "s0", "serviceName": "nudr-dr",
+                    "allowedOperationsPerNfType": {"PCF": ["nudr-dr", AUTH_SUBS_READ]},
+                    "allowedOperationsPerNfInstance": {id.clone(): instance_scopes},
+                    "allowedOperationsPerNfInstanceOverrides": overrides
+                }]),
+                None,
+            )
+        };
+        let grant = |p: NfProfile, scope: &str| {
+            authorize_access_token(
+                &consumer,
+                "PCF",
+                "UDR",
+                &[scope.to_string()],
+                &[p],
+                &[],
+                &[],
+            )
+            .is_ok()
+        };
+        let modify = serde_json::json!(["nudr-dr", AUTH_SUBS_MODIFY]);
+        assert!(
+            grant(udr(false, modify.clone()), AUTH_SUBS_MODIFY),
+            "instance map adds"
+        );
+        assert!(
+            grant(udr(false, modify.clone()), AUTH_SUBS_READ),
+            "type map still grants"
+        );
+        assert!(grant(udr(true, modify.clone()), AUTH_SUBS_MODIFY));
+        assert!(
+            !grant(udr(true, modify), AUTH_SUBS_READ),
+            "overridden: the type map no longer grants this instance"
+        );
     }
 
     #[test]
@@ -7082,6 +7850,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         // Simulate a PATCH replacing /load.
@@ -7176,6 +7945,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
 
         let request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
@@ -7225,6 +7995,7 @@ mod tests {
             json!({"nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED"}).to_string(),
         );
         req.peer_cert_nf_instance_id = Some(id.into());
+        req.peer_cert_nf_types = vec!["SMF".into()];
         let resp = handle_nf_register(id, &req).await;
         assert_eq!(resp.status, 201);
         let body: serde_json::Value =
@@ -7245,6 +8016,7 @@ mod tests {
             .to_string(),
         );
         req2.peer_cert_nf_instance_id = Some(id2.into());
+        req2.peer_cert_nf_types = vec!["SMF".into()];
         let resp2 = handle_nf_register(id2, &req2).await;
         let body2: serde_json::Value =
             serde_json::from_str(resp2.http.content.as_deref().unwrap()).unwrap();
@@ -7269,6 +8041,99 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the #1753 check removed, the `EES` request is 200
     /// with `aud: "EES"`, and the first assertion names it.
+    /// R26 on #1922: the real token endpoint, end to end. A PCF names the slice
+    /// of a permissive UDR in `requesterSnssaiList`. While that UDR is the only
+    /// one registered, the K-read scope is granted (the control: no stray UDR
+    /// is refusing it). Once a standard UDR is registered too, SUSPENDED and on
+    /// another slice, it still accepts the aud=UDR token, so the scope is
+    /// withheld.
+    ///
+    /// REVERT-VERIFIED: with the handler passing `&producers` instead of
+    /// `&acceptors` to `authorize_access_token_for` (the pre-R26 call), the
+    /// second request is granted the K-read scope and the second assertion fails.
+    #[tokio::test]
+    async fn the_token_endpoint_withholds_k_read_when_any_udr_would_refuse_it_1828() {
+        use serde_json::json;
+        const READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
+        let mgr = nf_manager();
+        let pcf_id = "18280000-0000-4000-8000-0000000000f1";
+        let permissive_id = "18280000-0000-4000-8000-0000000000a1";
+        let standard_id = "18280000-0000-4000-8000-0000000000a2";
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": pcf_id, "nfType": "PCF", "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let udr = |id: &str, pcf_scopes: serde_json::Value, sst: u64, status: &str| {
+            NfProfile::from_json(&json!({
+                "nfInstanceId": id, "nfType": "UDR", "nfStatus": status,
+                "sNssais": [{"sst": sst, "sd": "182800"}],
+                "nfServices": [{
+                    "serviceInstanceId": "udr-dr", "serviceName": "nudr-dr",
+                    "allowedNfTypes": ["UDM", "PCF"],
+                    "allowedOperationsPerNfType": {
+                        "UDM": ["nudr-dr", READ],
+                        "PCF": pcf_scopes
+                    }
+                }],
+            }))
+            .unwrap()
+        };
+        mgr.register(udr(
+            permissive_id,
+            json!(["nudr-dr", READ]),
+            99,
+            "REGISTERED",
+        ))
+        .unwrap();
+
+        let policy = policy_without_client_auth();
+        let ask = || {
+            let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            r.http.set_content(
+                json!({
+                    "grant_type": "client_credentials", "nfInstanceId": pcf_id,
+                    "nfType": "PCF", "targetNfType": "UDR",
+                    "scope": format!("nudr-dr {READ}"),
+                    "requesterSnssaiList": [{"sst": 99, "sd": "182800"}],
+                })
+                .to_string(),
+            );
+            r
+        };
+        let granted_scope = |resp: &SbiResponse| -> String {
+            assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            body["scope"].as_str().unwrap_or_default().to_string()
+        };
+
+        let alone = granted_scope(&handle_access_token_request_with_policy(&ask(), &policy).await);
+        assert!(
+            alone.split(' ').any(|s| s == READ),
+            "control: the permissive UDR alone grants it ({alone:?})"
+        );
+
+        // SUSPENDED (missed heartbeats) and on another slice: out of the
+        // operative, requester-filtered set, yet it accepts the token once it
+        // resumes.
+        mgr.register(udr(standard_id, json!(["nudr-dr"]), 1, "SUSPENDED"))
+            .unwrap();
+        let both = granted_scope(&handle_access_token_request_with_policy(&ask(), &policy).await);
+        assert!(
+            !both.split(' ').any(|s| s == READ),
+            "the suspended standard UDR accepts the aud=UDR token too, whatever slice the \
+             PCF named, so no K-read scope ({both:?})"
+        );
+        assert!(both.split(' ').any(|s| s == "nudr-dr"), "{both:?}");
+
+        for id in [pcf_id, permissive_id, standard_id] {
+            mgr.deregister(id).ok();
+        }
+    }
+
     #[tokio::test]
     async fn no_token_is_issued_for_a_target_type_outside_ts29510_1753() {
         use serde_json::json;
@@ -7294,6 +8159,7 @@ mod tests {
         let mut put = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{rogue_id}"));
         put.http.set_content(profile(rogue_id, "EES").to_string());
         put.peer_cert_nf_instance_id = Some(rogue_id.into());
+        put.peer_cert_nf_types = vec!["EES".into()];
         let resp = handle_nf_register(rogue_id, &put).await;
         assert_eq!(
             resp.status, 201,
@@ -10486,6 +11352,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         };
         let body = subscription_response_json(&sub, "2023-11-14T22:13:20Z");
         assert_eq!(body["subscriptionId"], "sub-08");
@@ -10669,6 +11536,10 @@ mod tests {
     async fn subscription_patch_replaces_validity_and_404s_for_unknown_id() {
         nextgcore_nrfd::init_nf_manager(None);
         let manager = nf_manager();
+        let owned = |mut r: SbiRequest| {
+            r.peer_cert_nf_instance_id = Some("sub-68-owner".into());
+            r
+        };
 
         let sub = nextgcore_nrfd::SubscriptionData {
             id: "sub-68".to_string(),
@@ -10679,20 +11550,23 @@ mod tests {
             validity_duration: 60,
             req_notif_events: None,
             notif_condition: None,
+            // #1809: a bound subscription, managed by its owner below.
+            owner: Some("sub-68-owner".to_string()),
         };
         assert!(manager.add_subscription(sub));
 
         // An unknown id is 404, not a silent 200.
-        let missing = handle_subscription_update("no-such-sub", &SbiRequest::default()).await;
+        let missing =
+            handle_subscription_update("no-such-sub", &owned(SbiRequest::default())).await;
         assert_eq!(missing.status, 404, "unknown subscription must be 404");
 
         // A patch with nothing replaceable is a client error, not a 200.
-        let empty_req = SbiRequest::default().with_body("{}", "application/json");
+        let empty_req = owned(SbiRequest::default()).with_body("{}", "application/json");
         let empty = handle_subscription_update("sub-68", &empty_req).await;
         assert_eq!(empty.status, 400);
 
         // A malformed body is a 400.
-        let bad_req = SbiRequest::default().with_body("{not json", "application/json");
+        let bad_req = owned(SbiRequest::default()).with_body("{not json", "application/json");
         assert_eq!(
             handle_subscription_update("sub-68", &bad_req).await.status,
             400
@@ -10700,7 +11574,7 @@ mod tests {
 
         // A validityTime in the PAST is refused rather than applied as an
         // instant expiry.
-        let past_req = SbiRequest::default().with_body(
+        let past_req = owned(SbiRequest::default()).with_body(
             r#"{"validityTime":"1971-01-01T00:00:00Z"}"#,
             "application/json",
         );
@@ -10724,7 +11598,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let future = epoch_to_rfc3339(now + 3600);
-        let ok_req = SbiRequest::default().with_body(
+        let ok_req = owned(SbiRequest::default()).with_body(
             format!(r#"{{"validityTime":"{future}"}}"#),
             "application/json",
         );
@@ -10772,6 +11646,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_replacement_notifies_profile_changed_over_the_wire() {
         use serde_json::json;
+        // #1869: the subscriber is a loopback h2c callback, which only the dev
+        // profile dials. Set and left set (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use std::sync::Mutex as StdMutex;
 
         // A deliberately unique nfType: `nf_manager()` is process-global and
@@ -10812,6 +11689,7 @@ mod tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         });
 
         /// Wait until `want` notifications have arrived, or time out.
@@ -10837,6 +11715,7 @@ mod tests {
         let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
         req.http.set_content(profile.to_string());
         req.peer_cert_nf_instance_id = Some(nf_id.into());
+        req.peer_cert_nf_types = vec![TEST_NF_TYPE.into()];
 
         // --- First PUT: a new instance -> 201 and NF_REGISTERED -------------
         let first = handle_nf_register(nf_id, &req).await;
@@ -10857,6 +11736,7 @@ mod tests {
         let mut replacement = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
         replacement.http.set_content(replacement_body.to_string());
         replacement.peer_cert_nf_instance_id = Some(nf_id.into());
+        replacement.peer_cert_nf_types = vec![TEST_NF_TYPE.into()];
 
         let second = handle_nf_register(nf_id, &replacement).await;
         assert_eq!(second.status, 200, "a replacement is 200 OK");
@@ -11178,11 +12058,55 @@ mod tests {
     async fn subscribe(body: serde_json::Value) -> SbiResponse {
         let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
         req.http.set_content(body.to_string());
-        handle_subscription_create(&req).await
+        // #1809: a verified subscriber, as the production policy requires.
+        req.peer_cert_nf_instance_id = Some("nrfd68-subscriber".into());
+        // These tests subscribe http callbacks: the dev profile, set on the call
+        // rather than through the process-global override (#1869).
+        handle_subscription_create_under(&req, nextgcore_sbi::security::SbiProfile::Dev).await
     }
 
     fn problem_of(resp: &SbiResponse) -> serde_json::Value {
         serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON")
+    }
+
+    /// #1869: under production an http nfStatusNotificationUri is a 400 with
+    /// `invalidParams` naming it, and nothing is stored; https is accepted.
+    #[tokio::test]
+    async fn production_subscribe_refuses_an_http_notification_uri_1869() {
+        use nextgcore_sbi::security::SbiProfile;
+        let uri = format!("http://amf-1869-{}.example/cb", uuid::Uuid::new_v4());
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": uri }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(resp.status, 400);
+        let problem = problem_of(&resp);
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+        assert_eq!(
+            problem["invalidParams"][0]["param"],
+            "/nfStatusNotificationUri"
+        );
+        assert!(
+            !nextgcore_nrfd::nnrf_handler::nf_manager()
+                .list_subscriptions()
+                .iter()
+                .any(|s| s.notification_uri == uri),
+            "a refused subscription must not be stored"
+        );
+
+        let https = uri.replacen("http://", "https://", 1);
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        // #1809: a verified subscriber, so the URI check is what is exercised.
+        req.peer_cert_nf_instance_id = Some("nrf-1869-subscriber".into());
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": https }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(
+            resp.status, 201,
+            "an https callback is accepted under production"
+        );
     }
 
     #[tokio::test]
@@ -11654,7 +12578,12 @@ mod registrant_binding_tests_1611 {
     async fn the_registrant_binding_folds_only_uuid_case_1633() {
         let own = "nrfd1633-m2";
         let other = own.to_ascii_uppercase();
-        let (server, client) = mtls_nrf("m2-1633", Some(&format!("urn:uuid:{own}")), None).await;
+        let (server, client) = mtls_nrf(
+            "m2-1633",
+            Some(&format!("urn:uuid:{own}")),
+            Some(&["CUSTOM_T1633M2"]),
+        )
+        .await;
         let run = async {
             let resp = put(&client, &other, "CUSTOM_T1633M2").await;
             assert_eq!(resp.status, 400, "{:?}", resp.http.content);
@@ -11677,8 +12606,12 @@ mod registrant_binding_tests_1611 {
 
         let lower = "1633d0d0-0000-4000-8000-0000000000c3";
         let upper = lower.to_ascii_uppercase();
-        let (server, client) =
-            mtls_nrf("m2-1633-uuid", Some(&format!("urn:uuid:{upper}")), None).await;
+        let (server, client) = mtls_nrf(
+            "m2-1633-uuid",
+            Some(&format!("urn:uuid:{upper}")),
+            Some(&["CUSTOM_T1633M2"]),
+        )
+        .await;
         let run = async {
             let resp = put(&client, lower, "CUSTOM_T1633M2").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
@@ -11696,7 +12629,12 @@ mod registrant_binding_tests_1611 {
     }
 
     /// A verified certificate without an NFTypes extension still binds the
-    /// instance (TS 33.310 §6.1.3c.3 URI-ID), but asserts no type to bind.
+    /// instance (TS 33.310 §6.1.3c.3 URI-ID), but asserts no type to bind. Over
+    /// real mTLS and under the NRF's shipped (production) policy, #1917: it
+    /// therefore registers as no type at all, its own instance included.
+    ///
+    /// REVERT-VERIFIED (#1917): with the empty-NFTypes branch of `bind_nf_type`
+    /// returning `None` again, the own-instance PUT is 201 and this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_certificate_without_nf_types_binds_only_the_instance_1611() {
         let own = "1611c0c0-0000-4000-8000-00000000000c";
@@ -11707,7 +12645,18 @@ mod registrant_binding_tests_1611 {
             assert_eq!(resp.status, 400, "{:?}", resp.http.content);
             assert_eq!(cause(&resp), "INVALID_CLIENT");
             let resp = put(&client, own, "CUSTOM_T1611C").await;
-            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(cause(&resp), "INVALID_CLIENT");
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("names no NF type"),
+                "{:?}",
+                resp.http.content
+            );
+            assert!(stored_type(own).is_none(), "nothing stored for {own}");
         };
         tokio::time::timeout(Duration::from_secs(30), run)
             .await
@@ -11798,7 +12747,9 @@ mod registrant_binding_tests_1611 {
         );
         assert_eq!(none, RegistrantIdentity::default());
         assert!(none.bind_instance("NFRegister", "any").is_none());
-        assert!(none.bind_nf_type("NFRegister", "any", "UDM").is_none());
+        assert!(none
+            .bind_nf_type("NFRegister", "any", "UDM", false)
+            .is_none());
 
         // A verified token subject.
         let token = RegistrantIdentity::of(&request_with(None, &[], None, Some("nf-a")), &plain);
@@ -11822,7 +12773,22 @@ mod registrant_binding_tests_1611 {
             [("forwarded client certificate", "nf-c".to_string())]
         );
         assert!(fwd.nf_types.is_empty());
-        assert!(fwd.bind_nf_type("NFRegister", "nf-c", "AMF").is_none());
+        assert!(fwd.forwarded);
+        // Dev: accepted as asserted. Production (#1917): the forwarded caller's
+        // type cannot be verified, so it is refused.
+        assert!(fwd
+            .bind_nf_type("NFRegister", "nf-c", "AMF", false)
+            .is_none());
+        let refused = fwd
+            .bind_nf_type("NFRegister", "nf-c", "AMF", true)
+            .expect("#1917: a forwarded identity's type is unverifiable");
+        assert_eq!(refused.status, 400);
+        assert!(refused
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("forwarded by a TLS terminator"));
 
         // The direct certificate outranks the header and carries its types.
         let direct = RegistrantIdentity::of(
@@ -11833,9 +12799,12 @@ mod registrant_binding_tests_1611 {
             direct.instance_ids,
             [("client certificate", "nf-d".to_string())]
         );
-        assert!(direct.bind_nf_type("NFRegister", "nf-d", "amf").is_none());
+        assert!(!direct.forwarded);
+        assert!(direct
+            .bind_nf_type("NFRegister", "nf-d", "amf", true)
+            .is_none());
         let refused = direct
-            .bind_nf_type("NFRegister", "nf-d", "UDM")
+            .bind_nf_type("NFRegister", "nf-d", "UDM", false)
             .expect("refused");
         assert_eq!(refused.status, 400);
         assert!(refused
@@ -12991,16 +13960,26 @@ mod tests_nf_set_ids_1719 {
         let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"))
             .with_body(body.to_string(), "application/json");
         // #1617 step f: NF management needs a verified certificate identity, so
-        // each request carries one naming its own instance (no NF types, so the
-        // nfType binding admits any type). The allowlist check runs after it.
+        // each request carries one naming its own instance, and (#1917) the NF
+        // type it registers as. The allowlist check runs after both.
         req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = test_certificate_nf_type(&req, id).into_iter().collect();
         handle_nf_register(id, &req).await
     }
 
     async fn patch(id: &str, ops: serde_json::Value) -> SbiResponse {
+        patch_as(id, ops, &[]).await
+    }
+
+    /// A patch from a certificate naming the stored type and `more` (#1917: a
+    /// re-typing patch needs a certificate that names the new type too).
+    async fn patch_as(id: &str, ops: serde_json::Value, more: &[&str]) -> SbiResponse {
         let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}"))
             .with_body(ops.to_string(), "application/json-patch+json");
         req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = test_certificate_nf_type(&req, id).into_iter().collect();
+        req.peer_cert_nf_types
+            .extend(more.iter().map(|t| t.to_string()));
         handle_nf_update(id, &req).await
     }
 
@@ -13078,10 +14057,12 @@ mod tests_nf_set_ids_1719 {
                 assert_eq!(stored_sets(rogue), Some(vec![SET2.to_string()]));
 
                 // R19: NFUpdate re-typing the rogue to SMF while it keeps set 2,
-                // which only PCFs may claim: refused, type and sets unchanged.
-                let resp = patch(
+                // which only PCFs may claim: refused, type and sets unchanged. Its
+                // certificate names SMF too, so the set check is what refuses it.
+                let resp = patch_as(
                     rogue,
                     json!([{"op": "replace", "path": "/nfType", "value": "SMF"}]),
+                    &["SMF"],
                 )
                 .await;
                 assert_eq!(
@@ -13240,6 +14221,7 @@ mod tests_nf_set_ids_1719 {
                 validity_duration: 3600,
                 req_notif_events: None,
                 notif_condition: None,
+                owner: None,
             });
         }
         let policy = NrfPolicy {
@@ -13574,6 +14556,7 @@ mod unverified_registrant_tests_1617 {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         });
 
         let wait_for = |want: usize| {
@@ -13629,5 +14612,564 @@ mod unverified_registrant_tests_1617 {
             ),
             "the else branch drops the restored entry: {branch}"
         );
+    }
+}
+
+/// #1809: a subscription is managed only by the consumer that created it.
+/// Every request goes through `nrf_sbi_request_handler`, so the routing that
+/// hands the caller to the handler is covered as well as the check itself.
+#[cfg(test)]
+mod subscription_owner_tests_1809 {
+    use super::*;
+    use serde_json::json;
+
+    tokio::task_local! {
+        /// Overrides [`NrfPolicy::require_subscriber_identity`] for one test's
+        /// task, so the dev behaviour is testable without touching the
+        /// process-global policy the rest of the binary reads.
+        pub(super) static REQUIRED: bool;
+    }
+
+    const OWNER: &str = "18090000-0000-4000-8000-00000000000a";
+    const OTHER: &str = "18090000-0000-4000-8000-00000000000b";
+
+    fn as_caller(mut req: SbiRequest, cert: Option<&str>, token_sub: Option<&str>) -> SbiRequest {
+        req.peer_cert_nf_instance_id = cert.map(str::to_string);
+        req.oauth2_subject = token_sub.map(str::to_string);
+        req
+    }
+
+    /// Subscribe as `cert`/`token_sub` and return the new subscription's id.
+    /// https (#1869): an http callback is refused under the production
+    /// profile, which an unset environment resolves to.
+    async fn subscribe_as(cert: Option<&str>, token_sub: Option<&str>) -> String {
+        let req = SbiRequest::post("/nnrf-nfm/v1/subscriptions").with_body(
+            json!({
+                "nfStatusNotificationUri": "https://consumer.invalid/notify",
+                "reqNfInstanceId": OWNER,
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = nrf_sbi_request_handler(as_caller(req, cert, token_sub)).await;
+        assert_eq!(resp.status, 201, "subscribe: {:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+        body["subscriptionId"].as_str().expect("id").to_string()
+    }
+
+    fn patch(id: &str, cert: Option<&str>, token_sub: Option<&str>) -> SbiRequest {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req = SbiRequest::patch(format!("/nnrf-nfm/v1/subscriptions/{id}")).with_body(
+            json!({ "validityTime": epoch_to_rfc3339(now + 600) }).to_string(),
+            "application/json",
+        );
+        as_caller(req, cert, token_sub)
+    }
+
+    fn delete(id: &str, cert: Option<&str>, token_sub: Option<&str>) -> SbiRequest {
+        as_caller(
+            SbiRequest::delete(format!("/nnrf-nfm/v1/subscriptions/{id}")),
+            cert,
+            token_sub,
+        )
+    }
+
+    fn assert_forbidden(r: &SbiResponse, what: &str) {
+        assert_eq!(r.status, 403, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        assert!(
+            body.contains("was not created by the requester"),
+            "{what}: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_binds_the_verified_identity() {
+        let id = subscribe_as(Some(OWNER), Some(OWNER)).await;
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some(OWNER),
+            "certificate and token agree"
+        );
+        nf_manager().remove_subscription(&id);
+
+        let id = subscribe_as(Some(OWNER), None).await;
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some(OWNER),
+            "the certificate alone"
+        );
+        nf_manager().remove_subscription(&id);
+
+        let id = subscribe_as(None, Some(OTHER)).await;
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert_eq!(
+            stored.owner.as_deref(),
+            Some(OTHER),
+            "else the token subject"
+        );
+        nf_manager().remove_subscription(&id);
+    }
+
+    #[tokio::test]
+    async fn another_consumer_cannot_extend_a_subscription() {
+        let id = subscribe_as(Some(OWNER), None).await;
+        let before = nf_manager()
+            .find_subscription(&id)
+            .unwrap()
+            .validity_duration;
+
+        for (cert, sub, what) in [
+            (Some(OTHER), None, "another certificate"),
+            (None, Some(OTHER), "another token subject"),
+            (
+                Some(OWNER),
+                Some(OTHER),
+                "the owner's certificate with a foreign token",
+            ),
+            (None, None, "an anonymous caller"),
+        ] {
+            let r = nrf_sbi_request_handler(patch(&id, cert, sub)).await;
+            assert_forbidden(&r, what);
+            assert_eq!(
+                nf_manager()
+                    .find_subscription(&id)
+                    .unwrap()
+                    .validity_duration,
+                before,
+                "{what}: a refused PATCH must leave the validity untouched"
+            );
+        }
+
+        let r = nrf_sbi_request_handler(patch(&id, Some(OWNER), None)).await;
+        assert_eq!(r.status, 200, "the owner extends: {:?}", r.http.content);
+        assert!(
+            (595..=600).contains(
+                &nf_manager()
+                    .find_subscription(&id)
+                    .unwrap()
+                    .validity_duration
+            ),
+            "the owner's PATCH is applied"
+        );
+        nf_manager().remove_subscription(&id);
+    }
+
+    #[tokio::test]
+    async fn another_consumer_cannot_cancel_a_subscription() {
+        let id = subscribe_as(Some(OWNER), None).await;
+
+        for (cert, sub, what) in [
+            (Some(OTHER), None, "another certificate"),
+            (None, Some(OTHER), "another token subject"),
+            (None, None, "an anonymous caller"),
+        ] {
+            let r = nrf_sbi_request_handler(delete(&id, cert, sub)).await;
+            assert_forbidden(&r, what);
+            assert!(
+                nf_manager().find_subscription(&id).is_some(),
+                "{what}: a refused DELETE must leave the subscription in place"
+            );
+        }
+
+        // The UUID compares case-insensitively, as the registry keys it.
+        let upper = OWNER.to_ascii_uppercase();
+        // The owner's certificate with a foreign token is not the owner either.
+        let r = nrf_sbi_request_handler(delete(&id, Some(OWNER), Some(OTHER))).await;
+        assert_forbidden(&r, "the owner's certificate with a foreign token");
+        assert!(nf_manager().find_subscription(&id).is_some());
+
+        let r = nrf_sbi_request_handler(delete(&id, None, Some(&upper))).await;
+        assert_eq!(r.status, 204, "the owner cancels: {:?}", r.http.content);
+        assert!(nf_manager().find_subscription(&id).is_none());
+    }
+
+    /// Under `dev` a subscription created without any verified identity (a
+    /// plaintext stack) has nothing to bind to and stays manageable.
+    #[tokio::test]
+    async fn under_dev_an_unbound_subscription_stays_manageable() {
+        REQUIRED
+            .scope(false, async {
+                let id = subscribe_as(None, None).await;
+                assert_eq!(nf_manager().find_subscription(&id).unwrap().owner, None);
+                let r = nrf_sbi_request_handler(patch(&id, None, None)).await;
+                assert_eq!(r.status, 200, "{:?}", r.http.content);
+                let r = nrf_sbi_request_handler(delete(&id, None, None)).await;
+                assert_eq!(r.status, 204, "{:?}", r.http.content);
+            })
+            .await;
+    }
+
+    fn assert_invalid_client(r: &SbiResponse, needle: &str, what: &str) {
+        assert_eq!(r.status, 400, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        let problem: serde_json::Value = serde_json::from_str(body).expect("ProblemDetails");
+        assert_eq!(problem["cause"], "INVALID_CLIENT", "{what}: {body}");
+        assert!(body.contains(needle), "{what}: {body}");
+    }
+
+    fn subscribe_req(cert: Option<&str>, token_sub: Option<&str>, uri: &str) -> SbiRequest {
+        as_caller(
+            SbiRequest::post("/nnrf-nfm/v1/subscriptions").with_body(
+                json!({ "nfStatusNotificationUri": uri }).to_string(),
+                "application/json",
+            ),
+            cert,
+            token_sub,
+        )
+    }
+
+    /// No stored subscription carries `uri`.
+    fn nothing_stored_for(uri: &str) -> bool {
+        let m = nf_manager();
+        !m.subscription_ids().iter().any(|id| {
+            m.find_subscription(id)
+                .is_some_and(|s| s.notification_uri == uri)
+        })
+    }
+
+    /// Under production (the policy default) a Subscribe with no verified
+    /// identity is refused as #1617 refuses cert-less NF management, and
+    /// nothing is stored.
+    ///
+    /// REVERT-VERIFIED: with `subscription_owner` returning `Ok(None)` for a
+    /// caller with no identity whatever `required` says, the Subscribe is 201.
+    #[tokio::test]
+    async fn under_production_an_anonymous_subscribe_is_refused() {
+        assert!(NrfPolicy::default().require_subscriber_identity);
+        let uri = "https://anonymous-1809.invalid/notify";
+        let r = nrf_sbi_request_handler(subscribe_req(None, None, uri)).await;
+        assert_invalid_client(&r, "no verified identity", "anonymous");
+        assert!(
+            nothing_stored_for(uri),
+            "a refused Subscribe stores nothing"
+        );
+    }
+
+    /// One identity rule on create and on manage: a caller whose certificate
+    /// and token name different NFs cannot subscribe, so no creator is ever
+    /// locked out of its own subscription.
+    ///
+    /// REVERT-VERIFIED: with the disagreement check removed from
+    /// `subscription_owner`, the mixed caller gets 201.
+    #[tokio::test]
+    async fn a_caller_whose_identities_disagree_cannot_subscribe() {
+        let uri = "https://mixed-1809.invalid/notify";
+        let r = nrf_sbi_request_handler(subscribe_req(Some(OWNER), Some(OTHER), uri)).await;
+        assert_invalid_client(&r, "does not match its other verified identity", "mixed");
+        assert!(
+            nothing_stored_for(uri),
+            "a refused Subscribe stores nothing"
+        );
+    }
+
+    /// R26 on #1831: a restart re-arms an ownerless subscription for at most
+    /// 24 h, whatever validity an old PATCH stored, and leaves an owned one as
+    /// stored; and a PATCH is capped at 24 h like a Subscribe.
+    ///
+    /// REVERT-VERIFIED: with `restored_validity` returning the stored value,
+    /// the ownerless subscription keeps its 10 days and the first assertion
+    /// fails; with the PATCH cap removed, the PATCH stores 10 days.
+    #[tokio::test]
+    async fn validity_is_capped_at_24_hours_for_restored_ownerless_and_patched_1809() {
+        const TEN_DAYS: u64 = 10 * 86400;
+        let sub = |id: &str, owner: Option<&str>| nextgcore_nrfd::SubscriptionData {
+            id: id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://{id}.invalid/notify"),
+            subscr_cond: None,
+            validity_duration: TEN_DAYS,
+            req_notif_events: None,
+            notif_condition: None,
+            owner: owner.map(str::to_string),
+        };
+        let m = nf_manager();
+        m.add_subscription(sub("cap-ownerless-1809", None));
+        m.add_subscription(sub("cap-owned-1809", Some(OWNER)));
+        rearm_restored_timers();
+        assert_eq!(
+            m.find_subscription("cap-ownerless-1809")
+                .unwrap()
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "an ownerless subscription lapses within 24 h of the restart"
+        );
+        assert_eq!(
+            m.find_subscription("cap-owned-1809")
+                .unwrap()
+                .validity_duration,
+            TEN_DAYS,
+            "an owned one keeps what was stored"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req = as_caller(
+            SbiRequest::patch("/nnrf-nfm/v1/subscriptions/cap-owned-1809").with_body(
+                json!({ "validityTime": epoch_to_rfc3339(now + TEN_DAYS) }).to_string(),
+                "application/json",
+            ),
+            Some(OWNER),
+            None,
+        );
+        let r = nrf_sbi_request_handler(req).await;
+        assert_eq!(r.status, 200, "{:?}", r.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+        let granted = rfc3339_to_epoch(body["validityTime"].as_str().unwrap()).unwrap();
+        assert!(
+            granted <= now + NRF_SUBSCRIPTION_DEFAULT_VALIDITY + 5,
+            "the response returns the granted validity, not the proposal"
+        );
+        assert_eq!(
+            m.find_subscription("cap-owned-1809")
+                .unwrap()
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "a PATCH is capped like a Subscribe"
+        );
+        m.remove_subscription("cap-ownerless-1809");
+        m.remove_subscription("cap-owned-1809");
+    }
+
+    /// Under production an ownerless subscription (restored from a state file
+    /// written before #1809) cannot be updated or removed by anyone, the
+    /// consumer that may have created it included: nobody can prove it.
+    ///
+    /// REVERT-VERIFIED: with `bind_subscription` returning `None` for an
+    /// ownerless subscription whatever `required` says, both succeed.
+    #[tokio::test]
+    async fn under_production_an_ownerless_restored_subscription_is_frozen() {
+        let id = "restored-ownerless-1809";
+        nf_manager().add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: Some(OWNER.to_string()),
+            notification_uri: "http://restored-1809.invalid/notify".to_string(),
+            subscr_cond: None,
+            validity_duration: 600,
+            req_notif_events: None,
+            notif_condition: None,
+            owner: None,
+        });
+        for (cert, what) in [(Some(OWNER), "the claimed consumer"), (None, "anonymous")] {
+            let r = nrf_sbi_request_handler(patch(id, cert, None)).await;
+            assert_eq!(r.status, 403, "{what} PATCH: {:?}", r.http.content);
+            assert!(
+                r.http
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no verified owner"),
+                "{what}"
+            );
+            assert_eq!(
+                nf_manager()
+                    .find_subscription(id)
+                    .unwrap()
+                    .validity_duration,
+                600,
+                "{what}: nothing applied"
+            );
+            let r = nrf_sbi_request_handler(delete(id, cert, None)).await;
+            assert_eq!(r.status, 403, "{what} DELETE: {:?}", r.http.content);
+            assert!(
+                nf_manager().find_subscription(id).is_some(),
+                "{what}: still stored"
+            );
+        }
+        nf_manager().remove_subscription(id);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_subscription_is_still_404() {
+        let r = nrf_sbi_request_handler(delete("no-such-1809", Some(OTHER), None)).await;
+        assert_eq!(r.status, 404);
+        let r = nrf_sbi_request_handler(patch("no-such-1809", Some(OTHER), None)).await;
+        assert_eq!(r.status, 404);
+    }
+}
+
+/// #1795: the NRF's listener follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::*;
+    use nextgcore_sbi::security::SbiProfile;
+
+    /// REVERT-VERIFIED: with the production arm of `check_listener_profile`
+    /// removed, a cleartext NRF is admitted under production and this fails.
+    #[test]
+    fn the_nrf_never_serves_cleartext_under_production_1795() {
+        let err = check_listener_profile(SbiProfile::Production, None)
+            .expect_err("a cleartext NRF is refused under production");
+        assert!(
+            err.to_string().contains("does not serve cleartext"),
+            "{err}"
+        );
+        let tls = NrfServerTls {
+            cert: "/c".into(),
+            key: "/k".into(),
+            ca: "/ca".into(),
+            client_auth: ClientAuth::Optional,
+        };
+        check_listener_profile(SbiProfile::Production, Some(&tls))
+            .expect("the NRF's own TLS is admitted under production");
+        check_listener_profile(SbiProfile::Dev, None).expect("dev keeps its cleartext NRF");
+    }
+}
+
+/// #1917: under the production profile, NF management is bound to the NF type the
+/// caller's OWN verified certificate names (RFC 9310 NFTypes, TS 33.310 §6.1.3c.3,
+/// TS 33.501 §5.9.2.2 NOTE). A certificate naming none cannot register, update or
+/// deregister as any type; under dev it still may.
+#[cfg(test)]
+mod registrant_nf_type_tests_1917 {
+    use super::*;
+    use serde_json::json;
+
+    tokio::task_local! {
+        /// Overrides [`NrfPolicy::require_registrant_nf_types`] for one test's
+        /// task, so the dev behaviour is testable without touching the
+        /// process-global policy the rest of the binary reads.
+        pub(super) static REQUIRED: bool;
+    }
+
+    /// A request from a directly verified certificate for `id` naming `types`.
+    fn from_cert(mut req: SbiRequest, id: &str, types: &[&str]) -> SbiRequest {
+        req.peer_cert_nf_instance_id = Some(id.to_string());
+        req.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+        req
+    }
+
+    fn put(id: &str, nf_type: &str, types: &[&str]) -> SbiRequest {
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"));
+        req.http.set_content(
+            json!({"nfInstanceId": id, "nfType": nf_type, "nfStatus": "REGISTERED"}).to_string(),
+        );
+        from_cert(req, id, types)
+    }
+
+    fn patch(id: &str, types: &[&str]) -> SbiRequest {
+        let req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}")).with_body(
+            json!([{"op": "replace", "path": "/nfStatus", "value": "SUSPENDED"}]).to_string(),
+            "application/json-patch+json",
+        );
+        from_cert(req, id, types)
+    }
+
+    fn assert_unverifiable_type(r: &SbiResponse, what: &str) {
+        assert_eq!(r.status, 400, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        assert!(body.contains("INVALID_CLIENT"), "{what}: {body}");
+        assert!(
+            body.contains("names no NF type"),
+            "{what}: refused for the missing NFTypes, not another reason: {body}"
+        );
+    }
+
+    /// The default fails closed, and the dev opt-out is per task only.
+    #[test]
+    fn a_policy_nobody_set_requires_the_certificate_nf_type_1917() {
+        assert!(NrfPolicy::default().require_registrant_nf_types);
+    }
+
+    /// **#1917.** A certificate with no NFTypes registers as no type under
+    /// production (an SMF could otherwise register as AUSF and be granted
+    /// nudm-ueau tokens, #1866), but as the asserted type under dev. A certificate
+    /// naming the type registers under production.
+    ///
+    /// REVERT-VERIFIED: with the empty-NFTypes branch of `bind_nf_type` returning
+    /// `None` again, the production PUT is 201 and the first assertion fails.
+    #[tokio::test]
+    async fn a_certificate_without_nf_types_registers_as_no_type_under_production_1917() {
+        let id = "19170000-0000-4000-8000-000000000001";
+        let r = REQUIRED
+            .scope(true, handle_nf_register(id, &put(id, "AUSF", &[])))
+            .await;
+        assert_unverifiable_type(&r, "production NFRegister without NFTypes");
+        assert!(nf_manager().get(id).is_none(), "nothing stored");
+
+        let r = REQUIRED
+            .scope(false, handle_nf_register(id, &put(id, "AUSF", &[])))
+            .await;
+        assert_eq!(
+            r.status, 201,
+            "dev keeps today's behaviour: {:?}",
+            r.http.content
+        );
+        let _ = nf_manager().deregister(id);
+
+        // Positive control: the certificate names the type it registers as.
+        let r = REQUIRED
+            .scope(true, handle_nf_register(id, &put(id, "AUSF", &["AUSF"])))
+            .await;
+        assert_eq!(r.status, 201, "{:?}", r.http.content);
+        // ... and only that type.
+        let other = "19170000-0000-4000-8000-000000000002";
+        let r = REQUIRED
+            .scope(
+                true,
+                handle_nf_register(other, &put(other, "AUSF", &["SMF"])),
+            )
+            .await;
+        assert_eq!(r.status, 400, "an SMF certificate cannot register an AUSF");
+        let _ = nf_manager().deregister(id);
+    }
+
+    /// **#1917.** NFUpdate and NFDeregister bind the same way: a certificate with
+    /// no NFTypes cannot manage the entry under production, and can under dev.
+    ///
+    /// REVERT-VERIFIED: with `registrant_nf_types_required()` passed as `false`
+    /// at the NFUpdate site, the production PATCH succeeds and this fails; the
+    /// same at the NFDeregister site fails the DELETE assertion.
+    #[tokio::test]
+    async fn update_and_deregister_need_the_certificate_nf_type_under_production_1917() {
+        let id = "19170000-0000-4000-8000-000000000003";
+        nf_manager()
+            .register(
+                NfProfile::from_json(
+                    &json!({"nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED"}),
+                )
+                .expect("profile"),
+            )
+            .expect("stored");
+
+        let r = REQUIRED
+            .scope(true, handle_nf_update(id, &patch(id, &[])))
+            .await;
+        assert_unverifiable_type(&r, "production NFUpdate without NFTypes");
+        let delete = from_cert(
+            SbiRequest::delete(format!("/nnrf-nfm/v1/nf-instances/{id}")),
+            id,
+            &[],
+        );
+        let r = REQUIRED
+            .scope(true, handle_nf_deregister(id, &delete))
+            .await;
+        assert_unverifiable_type(&r, "production NFDeregister without NFTypes");
+        assert!(nf_manager().get(id).is_some(), "the entry is untouched");
+
+        let r = REQUIRED
+            .scope(false, handle_nf_update(id, &patch(id, &[])))
+            .await;
+        assert!(
+            (200..300).contains(&r.status),
+            "dev NFUpdate: {} {:?}",
+            r.status,
+            r.http.content
+        );
+        let r = REQUIRED
+            .scope(false, handle_nf_deregister(id, &delete))
+            .await;
+        assert_eq!(r.status, 204, "dev NFDeregister: {:?}", r.http.content);
     }
 }

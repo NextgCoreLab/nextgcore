@@ -54,7 +54,11 @@ struct Fingerprint {
 struct Cached {
     request: Fingerprint,
     response: Vec<u8>,
-    at: Instant,
+    /// Which insertion this is: the [`ResponseCache::order`] item that stands for
+    /// it carries the same stamp, and the time expiry reads. Unique even when two
+    /// insertions share an `Instant`, so a replaced entry's old item can never
+    /// remove its successor.
+    stamp: u64,
 }
 
 /// The request being handled now, and the response it has been given so far.
@@ -74,8 +78,13 @@ struct InFlight {
 pub struct ResponseCache {
     entries: HashMap<Key, Cached>,
     /// Insertion order, for expiry and the cap. A key replaced by a newer request
-    /// stays here with its old time and is skipped when it surfaces.
-    order: VecDeque<(Key, Instant)>,
+    /// stays here with its old stamp and is skipped when it surfaces. Bounded by
+    /// `cap` itself (#1898), not only through `entries`: a peer re-using its
+    /// Sequence Numbers with new content replaces entries without growing them,
+    /// and the stale items would otherwise pile up for the whole window.
+    order: VecDeque<(Key, Instant, u64)>,
+    /// The next insertion's stamp.
+    next_stamp: u64,
     in_flight: Option<InFlight>,
     hasher: RandomState,
     window: Duration,
@@ -95,6 +104,7 @@ impl ResponseCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             in_flight: None,
+            next_stamp: 0,
             hasher: RandomState::new(),
             window,
             cap: cap.max(1),
@@ -110,14 +120,11 @@ impl ResponseCache {
 
     /// Drop what has outlived the window.
     fn expire(&mut self, now: Instant) {
-        while let Some(&(key, at)) = self.order.front() {
+        while let Some(&(_, at, _)) = self.order.front() {
             if now.saturating_duration_since(at) < self.window {
                 break;
             }
-            self.order.pop_front();
-            if self.entries.get(&key).is_some_and(|c| c.at == at) {
-                self.entries.remove(&key);
-            }
+            self.pop_oldest();
         }
     }
 
@@ -178,21 +185,31 @@ impl ResponseCache {
             return;
         }
         self.expire(now);
+        let stamp = self.next_stamp;
+        self.next_stamp += 1;
         self.entries.insert(
             key,
             Cached {
                 request,
                 response,
-                at: now,
+                stamp,
             },
         );
-        self.order.push_back((key, now));
-        while self.entries.len() > self.cap {
-            let Some((old, at)) = self.order.pop_front() else {
-                break;
-            };
-            if self.entries.get(&old).is_some_and(|c| c.at == at) {
-                self.entries.remove(&old);
+        self.order.push_back((key, now, stamp));
+        // Every kept entry has exactly one item here, so bounding the queue bounds
+        // both (#1898). A stale front item goes for free; a live one is the oldest
+        // response, and it goes first.
+        while self.order.len() > self.cap {
+            self.pop_oldest();
+        }
+    }
+
+    /// Drop the oldest queue item, and its entry when the entry is still the one
+    /// the item stands for.
+    fn pop_oldest(&mut self) {
+        if let Some((key, _, stamp)) = self.order.pop_front() {
+            if self.entries.get(&key).is_some_and(|c| c.stamp == stamp) {
+                self.entries.remove(&key);
             }
         }
     }
@@ -204,6 +221,12 @@ impl ResponseCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+    }
+
+    /// How many insertion-order items are held (test accessor, #1898).
+    #[cfg(test)]
+    fn order_len(&self) -> usize {
+        self.order.len()
     }
 
     /// How many responses are kept (test/diagnostic accessor).
@@ -385,6 +408,46 @@ mod tests {
         let now = Instant::now();
         assert!(c.replay(peer(8805), 1, b"old", now).is_none());
         assert!(c.replay(peer(8805), 2, b"setup", now).is_some());
+    }
+
+    /// **#1898.** The insertion-order queue is bounded by the cap even when no
+    /// entry is added: a peer re-using one Sequence Number with new content
+    /// replaces the entry each time, and each replacement used to leave its old
+    /// item queued for the whole window. The live entry survives the bound.
+    #[test]
+    fn the_order_queue_is_bounded_by_the_cap_1898() {
+        let mut c = ResponseCache::new(Duration::from_secs(12), 4);
+        for n in 0u8..50 {
+            answer(&mut c, peer(8805), 1, &[n], &node_response(1, n));
+        }
+        assert!(c.order_len() <= 4, "queue held {} items", c.order_len());
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c.replay(peer(8805), 1, &[49], Instant::now()),
+            Some(node_response(1, 49)),
+            "the live entry is not evicted by its predecessors' stale items"
+        );
+    }
+
+    /// **#1898.** Two insertions at the SAME instant: the replaced entry's stale
+    /// item must not remove its successor when it is popped (identity is the
+    /// stamp, not the time).
+    #[test]
+    fn a_stale_item_at_the_same_instant_does_not_remove_its_successor_1898() {
+        let mut c = ResponseCache::new(Duration::from_secs(12), 2);
+        let t = Instant::now();
+        for (n, content) in [(0u8, b"a"), (1, b"b")] {
+            c.begin(peer(8805), 1, content);
+            c.record(peer(8805), &node_response(1, n));
+            c.finish(true, t);
+        }
+        // A third key pushes the queue past the cap of 2: the stale (1, "a")
+        // item is popped first and must leave (1, "b") in place.
+        c.begin(peer(8805), 2, b"c");
+        c.record(peer(8805), &node_response(2, 2));
+        c.finish(true, t);
+        assert_eq!(c.replay(peer(8805), 1, b"b", t), Some(node_response(1, 1)));
+        assert_eq!(c.replay(peer(8805), 2, b"c", t), Some(node_response(2, 2)));
     }
 
     #[test]

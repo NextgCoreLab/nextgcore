@@ -92,7 +92,7 @@ pub fn build_udm_nf_profile(
     let services: Vec<serde_json::Value> = UDM_ADVERTISED_SERVICES
         .iter()
         .map(|(name, version, _)| {
-            serde_json::json!({
+            let mut service = serde_json::json!({
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{
@@ -103,7 +103,13 @@ pub fn build_udm_nf_profile(
                 "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            })
+            });
+            // #1866: the NRF grants this service's token only to these types
+            // (TS 29.510 Table 6.1.6.2.3-1, both levels must allow).
+            if let Some(types) = crate::consumer_gate::service_allowed_nf_types(name) {
+                service["allowedNfTypes"] = serde_json::json!(types);
+            }
+            service
         })
         .collect();
     nextgcore_sbi::nf_addressing::classify_profile_host(
@@ -551,6 +557,18 @@ pub async fn udm_nudr_dr_send_auth_subscription_patch(
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }
 
+/// The UDR path of `supi`'s provisioned data set `dataset`, or of the combined
+/// `ProvisionedDataSets` when `dataset` is empty (TS 29.505
+/// `/subscription-data/{ueId}/provisioned-data`). The combined form has no
+/// trailing `/`: an empty path segment is refused by every SBI server (#1934).
+fn provisioned_data_path(supi: &str, dataset: &str) -> String {
+    if dataset.is_empty() {
+        format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data")
+    } else {
+        format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}")
+    }
+}
+
 /// Build and send provisioned data GET to UDR
 ///
 /// Builds: GET /nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}
@@ -560,7 +578,7 @@ pub async fn udm_nudr_dr_send_provisioned_data_get(
     udm_ue_id: u64,
     stream_id: u64,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}");
+    let path = provisioned_data_path(supi, dataset);
     let request = SbiRequest::get(&path);
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }
@@ -575,7 +593,7 @@ pub async fn udm_nudr_dr_send_provisioned_data_get_with_params(
     dataset: &str,
     params: &std::collections::HashMap<String, String>,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}");
+    let path = provisioned_data_path(supi, dataset);
     let mut request = SbiRequest::get(&path);
     for (k, v) in params {
         request = request.with_param(k, v);
