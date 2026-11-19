@@ -1103,25 +1103,32 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 sess.pcf_diam_realm = Some(v.to_string());
             }
 
-            // Update session in context, then persist off-thread (guard
-            // dropped before any await).
-            if let Ok(context) = ctx.read() {
-                context.sess_update(&sess);
+            // #2084: the binding's deadline is part of the record, from the RFC 3339
+            // expiry when given, else the default TTL. It used to live only in the
+            // in-memory timer, so a restart (which reloads the record but not the
+            // timer) left the binding with none, never swept. Persisted with the
+            // record, and swept by `sweep_expired` whatever happens to the timer.
+            if sess.expiry_epoch.is_none() {
+                sess.expiry_epoch =
+                    Some(context::now_epoch() + timer::defaults::BINDING_EXPIRY.as_secs() as i64);
             }
-            context::persist_binding_async(sess.clone()).await;
-
-            // Arm the expiry timer: from the RFC 3339 expiry when given,
-            // otherwise the default TTL.
             let ttl_secs = sess
                 .expiry_epoch
                 .map(|e| (e - context::now_epoch()).max(0) as u64)
                 .unwrap_or(timer::defaults::BINDING_EXPIRY.as_secs());
+            // Update session in context and arm its expiry timer, both BEFORE the
+            // awaited persist (#2084): a future dropped at that await used to leave a
+            // binding with no timer, and no deadline, whose id the PCF never received.
+            if let Ok(context) = ctx.read() {
+                context.sess_update(&sess);
+            }
             let timer_mgr = timer_manager();
             timer_mgr.start(
                 BsfTimerId::BindingExpiry,
                 Duration::from_secs(ttl_secs),
                 Some(sess.binding_id.clone()),
             );
+            context::persist_binding_async(sess.clone()).await;
 
             log::info!(
                 "PCF Binding created (id={}, ipv4={:?}, ipv6={:?}, mac={:?}, TTL={}s)",
@@ -1299,13 +1306,34 @@ fn parse_bsf_subscription(
         )));
     }
 
+    // #2084, TS 29.521 Table 5.6.2.4-1: a suggested `expiry` is confirmed no later
+    // than [`timer::defaults::SUBSCRIPTION_VALIDITY`] from now ("the confirmed expiry
+    // time shall be less than or equal to the expiry time suggested in the request"),
+    // and the confirmed one is what the response carries and the BSF keeps.
+    let mut doc = doc.clone();
+    let mut expiry = doc.get("expiry").and_then(|v| v.as_str()).map(String::from);
+    if let Some(suggested) = expiry
+        .as_deref()
+        .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
+    {
+        let cap = nextgcore_sbi::datetime::now_epoch_secs() as i64
+            + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs() as i64;
+        if suggested > cap {
+            let confirmed = nextgcore_sbi::datetime::epoch_to_rfc3339_signed(cap);
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("expiry".to_string(), serde_json::json!(confirmed));
+            }
+            expiry = Some(confirmed);
+        }
+    }
+
     Ok(context::BsfSubscription {
         sub_id: sub_id.to_string(),
         notif_uri: notif_uri.to_string(),
         notif_corre_id: notif_corre_id.expect("checked above").to_string(),
         supi: supi.expect("checked above").to_string(),
         events,
-        expiry: doc.get("expiry").and_then(|v| v.as_str()).map(String::from),
+        expiry,
         raw: doc,
         owner: None,
     })
@@ -1335,8 +1363,22 @@ async fn handle_bsf_subscription_create(request: &SbiRequest) -> SbiResponse {
     };
     let raw = sub.raw.clone();
     let ctx = context::bsf_self();
-    if let Ok(c) = ctx.read() {
-        c.subscription_add(sub);
+    let stored = ctx.read().map(|c| c.subscription_add(sub)).unwrap_or(false);
+    if !stored {
+        // #2084: bounded, so a consumer cannot grow the set without limit.
+        log::warn!(
+            "Nbsf_Management subscription refused: {} are already held",
+            context::MAX_SUBSCRIPTIONS
+        );
+        return nextgcore_sbi::server::send_error(
+            500,
+            "Internal Server Error",
+            &format!(
+                "the BSF holds the maximum of {} subscriptions",
+                context::MAX_SUBSCRIPTIONS
+            ),
+            Some("INSUFFICIENT_RESOURCES"),
+        );
     }
     log::info!("Nbsf_Management subscription created: {sub_id}");
     SbiResponse::with_status(201)
@@ -1387,7 +1429,8 @@ async fn handle_bsf_subscription_replace(sub_id: &str, request: &SbiRequest) -> 
     };
     let raw = sub.raw.clone();
     if let Ok(c) = ctx.read() {
-        c.subscription_add(sub);
+        // A replacement of a held subscription is never refused by the bound.
+        let _ = c.subscription_add(sub);
     }
     log::info!("Nbsf_Management subscription {sub_id} replaced");
     SbiResponse::with_status(200)
@@ -1498,6 +1541,10 @@ fn spawn_bsf_notifications(
                     "subscription {sub_id}: unusable notifUri {uri}",
                     uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
                 );
+                // #2084: it can never be delivered, so it counts as a failure.
+                if let Ok(c) = context::bsf_self().read() {
+                    c.note_notification(&sub_id, false);
+                }
                 return;
             };
             let client = nextgcore_sbi::client::SbiClient::new(
@@ -1505,16 +1552,44 @@ fn spawn_bsf_notifications(
                     .with_connect_timeout(Duration::from_secs(2))
                     .with_request_timeout(Duration::from_secs(3)),
             );
-            match client.post_json(&path, &body).await {
-                Ok(resp) => log::debug!(
-                    "BsfNotification delivered to {uri} for {sub_id} (status {})",
-                    resp.status,
+            let delivered = match client.post_json(&path, &body).await {
+                Ok(resp) if resp.is_success() => {
+                    log::debug!(
+                        "BsfNotification delivered to {uri} for {sub_id} (status {})",
+                        resp.status,
+                        uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
+                    );
+                    true
+                }
+                Ok(resp) => {
+                    log::warn!(
+                        "BsfNotification to {uri} for {sub_id} answered {}",
+                        resp.status,
+                        uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
+                    );
+                    false
+                }
+                Err(e) => {
+                    log::warn!(
+                        "BsfNotification to {uri} for {sub_id} failed: {e}",
+                        uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
+                    );
+                    false
+                }
+            };
+            // #2084: a consumer that stopped answering loses its subscription after
+            // MAX_NOTIFY_FAILURES in a row, rather than keeping it for good.
+            let removed = context::bsf_self()
+                .read()
+                .map(|c| c.note_notification(&sub_id, delivered))
+                .unwrap_or(false);
+            if removed {
+                log::warn!(
+                    "Nbsf_Management subscription {sub_id} removed: {} notifications in a \
+                     row to {uri} failed",
+                    context::MAX_NOTIFY_FAILURES,
                     uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
-                ),
-                Err(e) => log::warn!(
-                    "BsfNotification to {uri} for {sub_id} failed: {e}",
-                    uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
-                ),
+                );
             }
         });
     }
@@ -2900,6 +2975,14 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
         };
         for binding_id in swept {
             context::unpersist_binding_async(binding_id).await;
+        }
+        // #2084: and subscriptions whose `expiry` has passed.
+        let swept_subs = bsf_self()
+            .read()
+            .map(|c| c.subscriptions_sweep_expired(nextgcore_sbi::datetime::now_epoch_secs()))
+            .unwrap_or_default();
+        for sub_id in swept_subs {
+            log::info!("Nbsf_Management subscription {sub_id} expired, removed");
         }
 
         // Check for shutdown
@@ -5485,6 +5568,188 @@ mod tests {
                 .subscriptions_wanting("PCF_UE_BINDING_REGISTRATION", Some(supi))
                 .is_empty(),
             "nothing stored"
+        );
+    }
+
+    /// #2084: a binding created without an `expiry` has its deadline in the record,
+    /// the default TTL from now, so a restart (which reloads the record but not the
+    /// timer) still sweeps it. PcfBinding still has no `expiry` on the wire.
+    ///
+    /// REVERT-VERIFIED: with the create not filling `expiry_epoch`, this fails: the
+    /// stored binding has no deadline.
+    #[tokio::test]
+    async fn a_binding_without_an_expiry_has_a_deadline_in_its_record_2084() {
+        let (server, client) = start_bsf().await;
+        let before = context::now_epoch();
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet", "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.208.4", "supi": "imsi-001010000020841",
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = resp
+            .http
+            .get_header("Location")
+            .expect("Location")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let deadline = bsf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.sess_find_by_binding_id(&id))
+            .and_then(|s| s.expiry_epoch);
+        let _ = client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await;
+        server.stop().await.ok();
+
+        let ttl = timer::defaults::BINDING_EXPIRY.as_secs() as i64;
+        assert!(
+            deadline.is_some_and(|d| d >= before + ttl && d <= context::now_epoch() + ttl),
+            "the default TTL from now: {deadline:?}"
+        );
+        assert!(
+            created.get("expiry").is_none(),
+            "PcfBinding has no expiry: {created}"
+        );
+    }
+
+    /// #2084, TS 29.521 Table 5.6.2.4-1: a suggested subscription `expiry` is
+    /// confirmed no later than SUBSCRIPTION_VALIDITY from now, and the confirmed one
+    /// is in the response and kept; a sooner one is confirmed as suggested.
+    ///
+    /// REVERT-VERIFIED: with the clamp removed, this fails: 2099 is confirmed.
+    #[tokio::test]
+    async fn a_suggested_subscription_expiry_is_confirmed_within_the_validity_2084() {
+        let (server, client) = start_bsf().await;
+        let far = {
+            let mut d = bsf_sub_doc(
+                "http://127.0.0.1:9/bsf-notify-2084",
+                "imsi-001010000020842",
+                &["PCF_PDU_SESSION_BINDING_REGISTRATION"],
+            );
+            d["expiry"] = json!("2099-01-01T00:00:00Z");
+            d
+        };
+        let resp = client
+            .post_json("/nbsf-management/v1/subscriptions", &far)
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let sub_id = resp
+            .http
+            .get_header("Location")
+            .expect("Location")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let kept = bsf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.subscription_get(&sub_id))
+            .and_then(|s| s.expiry);
+        let soon = nextgcore_sbi::datetime::epoch_to_rfc3339_signed(
+            nextgcore_sbi::datetime::now_epoch_secs() as i64 + 60,
+        );
+        let mut near = far.clone();
+        near["expiry"] = json!(soon);
+        let near_resp = client
+            .put_json(
+                &format!("/nbsf-management/v1/subscriptions/{sub_id}"),
+                &near,
+            )
+            .await
+            .expect("PUT");
+        let near_body: serde_json::Value =
+            serde_json::from_str(near_resp.http.content.as_deref().unwrap()).unwrap();
+        let _ = client
+            .delete(&format!("/nbsf-management/v1/subscriptions/{sub_id}"))
+            .await;
+        server.stop().await.ok();
+
+        let confirmed = body["expiry"]
+            .as_str()
+            .expect("confirmed expiry in the response");
+        let confirmed_at =
+            nextgcore_sbi::datetime::rfc3339_to_epoch_signed(confirmed).expect("RFC 3339");
+        let cap = nextgcore_sbi::datetime::now_epoch_secs() as i64
+            + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs() as i64;
+        assert!(confirmed_at <= cap, "confirmed {confirmed}, not 2099");
+        assert_eq!(
+            kept.as_deref(),
+            Some(confirmed),
+            "and the confirmed one is kept"
+        );
+        assert_eq!(near_body["expiry"], json!(soon), "a sooner one stands");
+    }
+
+    /// #2084: a subscription whose consumer stopped answering is removed after
+    /// MAX_NOTIFY_FAILURES failed notifications in a row, through the live fan-out.
+    ///
+    /// REVERT-VERIFIED: with the fan-out not recording outcomes, this fails: the
+    /// subscription stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_consumers_subscription_is_removed_by_the_fan_out_2084() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        bsf_context_init(1024);
+        let supi = "imsi-001010000020843";
+        let sub_id = "sub-2084-dead";
+        // A port nothing listens on: every notification fails to connect.
+        let ctx = bsf_self();
+        assert!(ctx
+            .read()
+            .map(|c| c.subscription_add(context::BsfSubscription {
+                sub_id: sub_id.to_string(),
+                notif_uri: "http://127.0.0.1:1/bsf-notify".to_string(),
+                notif_corre_id: "corr-2084".to_string(),
+                supi: supi.to_string(),
+                events: vec!["PCF_PDU_SESSION_BINDING_REGISTRATION".to_string()],
+                expiry: None,
+                raw: json!({}),
+                owner: None,
+            }))
+            .unwrap_or(false));
+        let held = || {
+            bsf_self()
+                .read()
+                .map(|c| c.subscription_get(sub_id).is_some())
+                .unwrap_or(false)
+        };
+        for _ in 0..context::MAX_NOTIFY_FAILURES {
+            spawn_bsf_notifications(
+                "PCF_PDU_SESSION_BINDING_REGISTRATION",
+                Some(supi),
+                "2084",
+                json!({}),
+            );
+            // One at a time, so each failure is counted before the next is sent.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while held() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let still = held();
+        if let Ok(c) = bsf_self().read() {
+            c.subscription_remove(sub_id);
+        }
+        assert!(
+            !still,
+            "removed after {} failures",
+            context::MAX_NOTIFY_FAILURES
         );
     }
 
