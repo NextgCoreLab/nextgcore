@@ -806,6 +806,73 @@ mod tests {
         panic!("timed out waiting for: {what}");
     }
 
+    /// **#2062**: a ContextCreate dropped mid-flight -- here its task aborted
+    /// while the AMF holds the request -- forgets the notify token it minted. The
+    /// token was Live, which the mint cap never reclaims, so leaked ones would
+    /// fill it and refuse every later create.
+    ///
+    /// REVERT-VERIFIED: with the token held as a plain `String` (forgotten only
+    /// on a failed answer), the aborted create leaves it behind and "the
+    /// cancelled create forgets its token" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_create_forgets_its_notify_token_2062() {
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let a = arrived.clone();
+        // Holds every ContextCreate unanswered.
+        let (_server, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let a = a.clone();
+                async move {
+                    a.notify_one();
+                    std::future::pending::<nextgcore_sbi::message::SbiResponse>().await
+                }
+            },
+        )
+        .await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        ctx.read()
+            .unwrap()
+            .set_amf_notify_base("http://127.0.0.1:1");
+        let session = ctx
+            .read()
+            .unwrap()
+            .session_add(
+                tmgi_1758([0x20, 0x62, 0x01]),
+                crate::MbsSessionType::Broadcast,
+            )
+            .expect("session");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let create = tokio::spawn(crate::create_amf_mbs_context(
+            session.id,
+            tmgi_1758([0x20, 0x62, 0x01]),
+            amf,
+            leg(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("the ContextCreate reaches the AMF");
+        assert_eq!(
+            ctx.read().unwrap().amf_notify_tokens_of(session.id).len(),
+            1,
+            "the create in flight holds its token"
+        );
+        create.abort();
+        assert!(create.await.expect_err("aborted").is_cancelled());
+        assert_eq!(
+            ctx.read().unwrap().amf_notify_tokens_of(session.id),
+            Vec::<String>::new(),
+            "the cancelled create forgets its token"
+        );
+    }
+
     /// #1758 (failure-path check 1): a ContextDelete the AMF refuses is retried,
     /// not forgotten.
     ///
