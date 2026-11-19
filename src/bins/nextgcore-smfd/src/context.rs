@@ -1679,6 +1679,13 @@ pub struct PolicyBinding {
     /// identity). `None` for a context created with no verified identity (the
     /// `dev` profile) or restored from a snapshot written before #1860.
     pub serving_amf: Option<String>,
+    /// #2003 review MAJOR: which UpdateSMContext last recorded an AMF change on
+    /// this binding (its request sequence number; 0 for none). A failed or
+    /// cancelled update undoes its AMF change only while it is still the last
+    /// writer, so a later update that wrote the SAME values is never undone.
+    /// Process-local, so not persisted.
+    #[serde(skip)]
+    pub serving_amf_writer: u64,
     /// GSM (5G session management) FSM for this session
     pub fsm: crate::gsm_sm::GsmFsm,
     /// EASDF DNS-context id for this session, when one was created (#114,
@@ -1946,6 +1953,7 @@ impl PolicyBinding {
             ambr_dl_bps: 0,
             sm_context_status_uri: None,
             serving_amf: None,
+            serving_amf_writer: 0,
             fsm: crate::gsm_sm::GsmFsm::new(0),
             easdf_dns_context_id: None,
             mapped_eps_bearer_id: None,

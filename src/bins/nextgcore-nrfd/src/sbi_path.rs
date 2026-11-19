@@ -1184,6 +1184,16 @@ fn plmn_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 }
 
 /// GUAMI equality (TS 29.571 `Guami`: plmnId + amfId).
+/// #2035: the `amfInfo.guamiList` entries of an NF profile document. The
+/// `backupInfoAmfFailure` / `backupInfoAmfRemoval` lists are other members and
+/// are not included: an AMF lists another's GUAMI there to back it up.
+pub fn guami_list_of(doc: &serde_json::Value) -> Vec<&serde_json::Value> {
+    doc.pointer("/amfInfo/guamiList")
+        .and_then(|v| v.as_array())
+        .map(|l| l.iter().collect())
+        .unwrap_or_default()
+}
+
 fn guami_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     fn amf_id(v: &serde_json::Value) -> &str {
         v.get("amfId").and_then(|x| x.as_str()).unwrap_or_default()

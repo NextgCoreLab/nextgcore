@@ -1299,6 +1299,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         ambr_dl_bps: sess.session_ambr.downlink,
                         sm_context_status_uri: sess.sm_context_status_uri.clone(),
                         serving_amf: None,
+                        serving_amf_writer: 0,
                         fsm,
                         easdf_dns_context_id: None,
                         easdf_reported_eas: Vec::new(),

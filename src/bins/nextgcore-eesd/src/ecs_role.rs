@@ -101,6 +101,11 @@ pub struct StoredEesRegistration {
     /// returned on a refresh rather than silently dropped.
     #[serde(flatten)]
     pub registration: EesRegistration,
+    /// #1937: the verified identity of the EES that registered
+    /// (`nextgcore_sbi::owner_binding`); only it may refresh, read or remove
+    /// the registration. Never on the wire.
+    #[serde(skip)]
+    pub owner: Option<String>,
 }
 
 /// Registered EESs, keyed by `registrationId`.
@@ -142,6 +147,14 @@ pub const API_TARGET_EES_DISCOVERY: &str = "eecs-targeteesdiscovery/v1";
 /// no EES could never be returned by discovery, which is the un-discoverable state
 /// worth refusing rather than accepting and never matching.
 pub fn handle_registration_create(request: &SbiRequest) -> SbiResponse {
+    // #1937: the EES this registration is bound to, before anything is stored.
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+        request,
+        "CreateEESRegistration",
+    ) {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = &request.http.content else {
         return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING"));
     };
@@ -162,6 +175,7 @@ pub fn handle_registration_create(request: &SbiRequest) -> SbiResponse {
     let stored = StoredEesRegistration {
         registration_id: registration_id.clone(),
         registration,
+        owner,
     };
     let location = format!("/{API_EES_REGISTRATION}/registrations/{registration_id}");
     if let Ok(mut r) = registry().lock() {
@@ -201,6 +215,14 @@ pub fn handle_registration_update(registration_id: &str, request: &SbiRequest) -
         match registry().lock() {
             Ok(mut r) => match r.get_mut(registration_id) {
                 Some(existing) => {
+                    // #1937: only the EES that registered, under the same lock.
+                    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                        existing.owner.as_deref(),
+                        request,
+                        "UpdateEESRegistration",
+                    ) {
+                        return refused;
+                    }
                     existing.registration = registration;
                     Some(existing.clone())
                 }
@@ -221,15 +243,25 @@ pub fn handle_registration_update(registration_id: &str, request: &SbiRequest) -
 }
 
 /// `GET`/`DELETE /eecs-eesregistration/v1/registrations/{registrationId}`.
-pub fn handle_registration_get(registration_id: &str) -> SbiResponse {
+pub fn handle_registration_get(registration_id: &str, request: &SbiRequest) -> SbiResponse {
     match registry()
         .lock()
         .ok()
         .and_then(|r| r.get(registration_id).cloned())
     {
-        Some(stored) => SbiResponse::with_status(200)
-            .with_json_body(&stored)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        // #1937: only the EES that registered.
+        Some(stored) => {
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                stored.owner.as_deref(),
+                request,
+                "GetEESRegistration",
+            ) {
+                return refused;
+            }
+            SbiResponse::with_status(200)
+                .with_json_body(&stored)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
         None => send_not_found(
             &format!("EES registration {registration_id} not found"),
             Some("REGISTRATION_NOT_FOUND"),
@@ -238,9 +270,22 @@ pub fn handle_registration_get(registration_id: &str) -> SbiResponse {
 }
 
 /// `DELETE` — 204, or 404 for an unknown id.
-pub fn handle_registration_delete(registration_id: &str) -> SbiResponse {
+pub fn handle_registration_delete(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1937: only the EES that registered, checked and removed under one lock.
     let removed = match registry().lock() {
-        Ok(mut r) => r.remove(registration_id).is_some(),
+        Ok(mut r) => match r.get(registration_id) {
+            Some(existing) => {
+                if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                    existing.owner.as_deref(),
+                    request,
+                    "DeleteEESRegistration",
+                ) {
+                    return refused;
+                }
+                r.remove(registration_id).is_some()
+            }
+            None => false,
+        },
         Err(_) => false,
     };
     if removed {
@@ -393,22 +438,64 @@ pub const SCOPE_TARGET_EES_DISCOVERY: &str = "eecs-targeteesdiscovery";
 /// a bad token is never ignored. `Some` is the refusal to send (401 for no or
 /// a bad credential, 403 for a token without the scope); nothing has run yet.
 fn require_verified_caller(request: &mut SbiRequest, scope: &str) -> Option<SbiResponse> {
+    let unauthorized = |why: &str| {
+        Some(nextgcore_sbi::server::send_unauthorized(
+            &format!(
+                "the ECS {scope} API needs a verified caller (a client certificate naming its NF \
+                 type, or an access token for {scope}): {why}"
+            ),
+            Some("UNAUTHORIZED"),
+        ))
+    };
     if request.http.get_header("authorization").is_some() {
-        return crate::auth::authorize(request, scope);
+        if let Some(refused) = crate::auth::authorize(request, scope) {
+            return Some(refused);
+        }
     }
-    let has_cert = request
-        .peer_cert_nf_instance_id
+    // R30 on #2053: the shared identity rule (`owner_binding`). A relay's
+    // certificate (SCP, SEPP) is not the caller's, so it counts only through
+    // the token `sub` it carries; a certificate and a token must agree.
+    match nextgcore_sbi::owner_binding::verified_consumer_id(request) {
+        Err(why) => Some(nextgcore_sbi::server::send_forbidden(&why, None)),
+        Ok(None) => unauthorized("no verified identity"),
+        Ok(Some(_)) => {
+            let has_token = request
+                .oauth2_subject
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            // A certificate alone must say what it is (RFC 9310 NFTypes): a
+            // typeless one names no role this ECS could admit.
+            if !has_token && request.peer_cert_nf_types.is_empty() {
+                return unauthorized("a client certificate without NF types");
+            }
+            None
+        }
+    }
+}
+
+/// R30 on #2053: EES registration is for EESs. A caller identified by its
+/// certificate alone must present one whose NFTypes name the EES; an AMF's
+/// certificate cannot register as an EES. A token caller was granted the
+/// `eecs-eesregistration` scope for its type by the token issuer.
+fn require_ees_type(request: &SbiRequest) -> Option<SbiResponse> {
+    let has_token = request
+        .oauth2_subject
         .as_deref()
-        .is_some_and(|id| !id.trim().is_empty());
-    if has_cert {
+        .is_some_and(|s| !s.trim().is_empty());
+    if has_token
+        || request
+            .peer_cert_nf_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("EES"))
+    {
         return None;
     }
-    Some(nextgcore_sbi::server::send_unauthorized(
+    Some(nextgcore_sbi::server::send_forbidden(
         &format!(
-            "the ECS {scope} API needs a verified caller: a client certificate or an access \
-             token for {scope}"
+            "EES registration is for an EES; the requester's certificate names {:?}",
+            request.peer_cert_nf_types
         ),
-        Some("UNAUTHORIZED"),
+        None,
     ))
 }
 
@@ -428,6 +515,11 @@ pub fn route(parts: &[&str], request: &SbiRequest) -> Option<SbiResponse> {
         return Some(refused);
     }
     let request = &verified;
+    if scope == SCOPE_EES_REGISTRATION {
+        if let Some(refused) = require_ees_type(request) {
+            return Some(refused);
+        }
+    }
     match parts {
         ["eecs-eesregistration", "v1", "registrations"] => Some(match method {
             "POST" => handle_registration_create(request),
@@ -435,8 +527,8 @@ pub fn route(parts: &[&str], request: &SbiRequest) -> Option<SbiResponse> {
         }),
         ["eecs-eesregistration", "v1", "registrations", registration_id] => Some(match method {
             "PUT" => handle_registration_update(registration_id, request),
-            "GET" => handle_registration_get(registration_id),
-            "DELETE" => handle_registration_delete(registration_id),
+            "GET" => handle_registration_get(registration_id, request),
+            "DELETE" => handle_registration_delete(registration_id, request),
             _ => send_method_not_allowed(method, "registrations/{registrationId}"),
         }),
         ["eecs-serviceprovisioning", "v1", "provisioning-requests"] => Some(match method {
@@ -459,10 +551,21 @@ mod tests {
     /// #2050: the verified EES the route-level tests act as.
     const TEST_EES_2050: &str = "20500000-0000-4000-8000-0000000000e5";
 
+    /// #1937: the verified EES these tests act as, since an EES registration is
+    /// bound to the EES that made it.
+    const TEST_EES_1937: &str = "19370000-0000-4000-8000-0000000000e5";
+
+    fn as_test_ees(mut r: SbiRequest) -> SbiRequest {
+        r.oauth2_subject = Some(TEST_EES_1937.to_string());
+        r
+    }
+
     fn post(path: &str, body: serde_json::Value) -> SbiRequest {
-        SbiRequest::post(path)
-            .with_json_body(&body)
-            .expect("serialize test body")
+        as_test_ees(
+            SbiRequest::post(path)
+                .with_json_body(&body)
+                .expect("serialize test body"),
+        )
     }
 
     fn registration_body(ees_id: &str, eas_ids: Option<Vec<&str>>) -> serde_json::Value {
@@ -727,6 +830,7 @@ mod tests {
             let mut get = SbiRequest::get(path.join("/"));
             // #2050: a verified caller, so the method check is what answers.
             get.peer_cert_nf_instance_id = Some(TEST_EES_2050.into());
+            get.peer_cert_nf_types = vec!["EES".into()];
             let resp = route(&path, &get).expect("routed");
             assert_eq!(
                 resp.status, 405,
@@ -754,7 +858,7 @@ mod tests {
             .get_header("location")
             .and_then(|l| l.rsplit('/').next().map(str::to_string))
             .expect("id");
-        let got = handle_registration_get(&id);
+        let got = handle_registration_get(&id, &as_test_ees(SbiRequest::default()));
         assert_eq!(got.status, 200);
         let body: serde_json::Value =
             serde_json::from_str(got.http.content.as_deref().expect("body")).expect("json");
@@ -765,8 +869,76 @@ mod tests {
             "expTime must survive: an ECS that forgot it could not expire the registration"
         );
 
-        assert_eq!(handle_registration_delete(&id).status, 204);
-        assert_eq!(handle_registration_get(&id).status, 404);
+        assert_eq!(
+            handle_registration_delete(&id, &as_test_ees(SbiRequest::default())).status,
+            204
+        );
+        assert_eq!(
+            handle_registration_get(&id, &as_test_ees(SbiRequest::default())).status,
+            404
+        );
+    }
+
+    /// #1937: an EES registration is refreshed, read and removed only by the
+    /// EES that registered it. Every stranger gets 403 with the registration
+    /// kept; the owner then succeeds.
+    ///
+    /// REVERT-VERIFIED: with the DELETE check removed, a stranger's DELETE is
+    /// 204 and the first DELETE assertion fails; with `owner` not stored at
+    /// create, the strangers pass.
+    #[test]
+    fn an_ees_registration_is_managed_only_by_its_ees_1937() {
+        let _g = crate::context::PROCESS_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_registry_for_test();
+        let created = handle_registration_create(&post(
+            "/eecs-eesregistration/v1/registrations",
+            registration_body("ees-1937.example.com", Some(vec!["eas1"])),
+        ));
+        assert_eq!(created.status, 201);
+        let id = created
+            .http
+            .get_header("location")
+            .and_then(|l| l.rsplit('/').next().map(str::to_string))
+            .expect("id");
+        const OTHER: &str = "19370000-0000-4000-8000-0000000000ee";
+        let stranger = |mut r: SbiRequest, which: u8| {
+            match which {
+                0 => r.peer_cert_nf_instance_id = Some(OTHER.into()),
+                1 => r.oauth2_subject = Some(OTHER.into()),
+                2 => {
+                    r.peer_cert_nf_instance_id = Some(TEST_EES_1937.into());
+                    r.oauth2_subject = Some(OTHER.into());
+                }
+                _ => {}
+            }
+            r
+        };
+        let update_body = registration_body("ees-1937.example.com", Some(vec!["hijacked"]));
+        for which in 0..4u8 {
+            let r = handle_registration_get(&id, &stranger(SbiRequest::default(), which));
+            assert_eq!(r.status, 403, "GET by stranger {which}");
+            let r = handle_registration_update(
+                &id,
+                &stranger(
+                    SbiRequest::put("/eecs-eesregistration/v1/registrations/x")
+                        .with_json_body(&update_body)
+                        .unwrap(),
+                    which,
+                ),
+            );
+            assert_eq!(r.status, 403, "PUT by stranger {which}");
+            let r = handle_registration_delete(&id, &stranger(SbiRequest::default(), which));
+            assert_eq!(r.status, 403, "DELETE by stranger {which}");
+        }
+        let got = handle_registration_get(&id, &as_test_ees(SbiRequest::default()));
+        assert_eq!(got.status, 200, "still there, unchanged");
+        assert!(!got.http.content.unwrap_or_default().contains("hijacked"));
+        assert_eq!(
+            handle_registration_delete(&id, &as_test_ees(SbiRequest::default())).status,
+            204
+        );
     }
 
     /// The registry is keyed by a server-minted id, so two EESs with the SAME

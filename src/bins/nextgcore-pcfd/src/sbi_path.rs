@@ -1650,13 +1650,26 @@ pub async fn pcf_discover_amf_endpoint(
     ))
 }
 
+/// #2035: the discovery page size [`amf_serves_guami`] asks for, and the pages it
+/// reads before refusing a result that does not end.
+const AMF_DISCOVERY_PAGE_SIZE: usize = 100;
+const AMF_DISCOVERY_MAX_PAGES: usize = 50;
+
 /// #1992 (R30 on #2013): whether the NRF holds an AMF profile for
 /// `nf_instance_id` whose `amfInfo.guamiList` includes `guami`. The profile is
 /// the AMF's own declaration: nrfd binds NF-profile writes to the registrant's
-/// verified identity (#1611). Discovery by `target-nf-instance-id`, then
-/// matched here, because this tree's nrfd ignores the `guami` query parameter.
+/// verified identity (#1611), and (#2035) refuses a GUAMI another AMF Set
+/// already lists. Matched here, because this tree's nrfd ignores the `guami`
+/// query parameter.
+///
+/// #2035 (defence in depth): every AMF the NRF returns is looked at, and the
+/// GUAMI must be listed only within one AMF Set (TS 23.003 §2.10.1: a GUAMI
+/// identifies one AMF; TS 23.501 §5.21.2: an AMF Set shares them). Listed by
+/// AMFs of two sets, or by two AMFs naming no set, it is `false`: one of them
+/// is not who it claims, and the PCF cannot tell which.
+///
 /// Fails closed: no NRF, an error, no profile, a profile that is not an AMF's,
-/// or no matching GUAMI is `false`.
+/// no matching GUAMI, or a GUAMI listed outside one set is `false`.
 pub async fn amf_serves_guami(nf_instance_id: &str, guami: &ue_policy::AmfGuami) -> bool {
     let ctx = global_context();
     let Some(nrf_uri) = ctx.get_nrf_uri().await else {
@@ -1667,40 +1680,88 @@ pub async fn amf_serves_guami(nf_instance_id: &str, guami: &ue_policy::AmfGuami)
         return false;
     };
     let client = ctx.get_client(&nrf_host, nrf_port).await;
-    let path = format!(
-        "/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=PCF&target-nf-instance-id={}",
-        percent_encode(nf_instance_id)
-    );
-    let Ok(response) = client.get(&path).await else {
-        return false;
-    };
-    if response.status != 200 {
+    // #2035 (R30 on #2044): every page. A SearchResult that is cut short says so
+    // with `nfInstanceListUri` (TS 29.510 Table 6.2.6.2.2); a holder of the GUAMI
+    // past the first page must be seen, or the one-set check fails open. Past
+    // `AMF_DISCOVERY_MAX_PAGES` pages, the answer is refused (fail closed).
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    let mut complete = false;
+    for page in 1..=AMF_DISCOVERY_MAX_PAGES {
+        let path = format!(
+            "/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=PCF\
+             &limit={AMF_DISCOVERY_PAGE_SIZE}&page={page}"
+        );
+        let Ok(response) = client.get(&path).await else {
+            return false;
+        };
+        if response.status != 200 {
+            return false;
+        }
+        let Some(json) = response
+            .http
+            .content
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        else {
+            return false;
+        };
+        let Some(instances) = json.get("nfInstances").and_then(|v| v.as_array()) else {
+            return false;
+        };
+        list.extend(instances.iter().cloned());
+        if json.get("nfInstanceListUri").is_none() {
+            complete = true;
+            break;
+        }
+    }
+    if !complete {
+        log::warn!(
+            "AMF discovery did not end within {AMF_DISCOVERY_MAX_PAGES} pages; not believing a \
+             GUAMI claim"
+        );
         return false;
     }
-    let Some(json) = response
-        .http
-        .content
-        .as_deref()
-        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
-    else {
-        return false;
-    };
-    json.get("nfInstances")
-        .and_then(|v| v.as_array())
-        .is_some_and(|list| {
-            list.iter().any(|nf| {
-                nf.get("nfInstanceId")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|id| {
-                        nextgcore_sbi::owner_binding::same_nf_instance_id(id, nf_instance_id)
-                    })
-                    && nf
-                        .get("nfType")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|t| t.eq_ignore_ascii_case("AMF"))
-                    && instance_serves_guami(nf, guami)
-            })
+    let holders: Vec<&serde_json::Value> = list
+        .iter()
+        .filter(|nf| {
+            nf.get("nfType")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case("AMF"))
+                && instance_serves_guami(nf, guami)
         })
+        .collect();
+    let caller_holds = holders.iter().any(|nf| {
+        nf.get("nfInstanceId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| nextgcore_sbi::owner_binding::same_nf_instance_id(id, nf_instance_id))
+    });
+    if !caller_holds {
+        return false;
+    }
+    let set_of = |nf: &serde_json::Value| {
+        let member = |k: &str| {
+            nf.pointer(&format!("/amfInfo/{k}"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+        };
+        Some((member("amfRegionId")?, member("amfSetId")?))
+    };
+    let one_set = match holders.as_slice() {
+        [_] => true,
+        [first, rest @ ..] => {
+            let set = set_of(first);
+            set.is_some() && rest.iter().all(|nf| set_of(nf) == set)
+        }
+        [] => false,
+    };
+    if !one_set {
+        log::warn!(
+            "the NRF lists GUAMI {guami:?} for {} AMFs outside one AMF Set; not believing any",
+            holders.len()
+        );
+    }
+    one_set
 }
 
 /// Resolve the serving AMF's `namf-comm` endpoint for `pol_asso_id` and log which
