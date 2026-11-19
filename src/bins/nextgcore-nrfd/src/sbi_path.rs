@@ -12,6 +12,7 @@ use crate::nnrf_handler::{
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::message::SbiRequest;
 use nextgcore_sbi::oauth::OAuth2Client;
+use nextgcore_sbi::security::{sbi_client_config_for_profile, SbiProfile};
 use nextgcore_sbi::types::{NfType, UriScheme};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -191,6 +192,56 @@ pub enum NotifySendResult {
     NoClient,
 }
 
+/// Whether a subscription may name `notification_uri` under `profile` (#1869).
+///
+/// Under [`SbiProfile::Production`] every SBI hop is TLS (TS 33.501 §13.1.0),
+/// and an NF status notification is dialled with an OAuth2 access token, so an
+/// `http` (or scheme-less) callback would put that token, and the subscriber's
+/// callback secret, on a cleartext hop. Only `https` is accepted there. Under
+/// [`SbiProfile::Dev`] any URI is accepted, as before.
+///
+/// `Err` carries the reason for the subscriber's `invalidParams`.
+pub fn check_notification_uri(notification_uri: &str, profile: SbiProfile) -> Result<(), String> {
+    if !profile.is_production() {
+        return Ok(());
+    }
+    match parse_notification_uri(notification_uri) {
+        Some((_, _, _, UriScheme::Https)) => Ok(()),
+        _ => Err(
+            "nfStatusNotificationUri must be an https URI under the production SBI profile \
+             (TS 33.501 §13.1.0): notifications are sent over TLS only"
+                .to_string(),
+        ),
+    }
+}
+
+/// The client configuration for dialling a subscriber at `host:port` with
+/// `scheme` under `profile` (#1869).
+///
+/// Under production an `http` subscriber is refused (`Err`), never dialled, so
+/// no token is attached to a cleartext request; an `https` one is dialled with
+/// the profile CA and this NRF's client certificate, as every NF dials its
+/// peers ([`sbi_client_config_for_profile`]). Under dev the URI's own scheme is
+/// used with no TLS material, as before.
+fn notify_client_config(
+    host: &str,
+    port: u16,
+    scheme: UriScheme,
+    profile: SbiProfile,
+) -> Result<SbiClientConfig, String> {
+    if !profile.is_production() {
+        return Ok(SbiClientConfig::new(host, port).with_scheme(scheme));
+    }
+    if scheme != UriScheme::Https {
+        return Err(
+            "the notification URI is not https; the production SBI profile notifies \
+                    over TLS only"
+                .to_string(),
+        );
+    }
+    Ok(sbi_client_config_for_profile(host, port, profile))
+}
+
 /// Send a pre-built notify request over HTTP/2 to the subscriber URI.
 /// Shared by all async single-subscriber send functions.
 async fn dispatch_notify_request_async(
@@ -199,6 +250,27 @@ async fn dispatch_notify_request_async(
     notification_uri: &str,
     req_nf_type: Option<&str>,
     event_str: &str,
+) -> NotifySendResult {
+    dispatch_notify_request_under(
+        notify_request,
+        nf_instance_id,
+        notification_uri,
+        req_nf_type,
+        event_str,
+        SbiProfile::resolve(),
+    )
+    .await
+}
+
+/// [`dispatch_notify_request_async`] under an explicit profile, so a test can
+/// drive the production path without the process-global override.
+async fn dispatch_notify_request_under(
+    notify_request: &crate::nnrf_build::SbiNotifyRequest,
+    nf_instance_id: &str,
+    notification_uri: &str,
+    req_nf_type: Option<&str>,
+    event_str: &str,
+    profile: SbiProfile,
 ) -> NotifySendResult {
     // #940: the subscriber's callback URI may carry a bearer token (the AMF's does),
     // so it is logged with its last segment redacted, never whole. Every use below
@@ -218,7 +290,16 @@ async fn dispatch_notify_request_async(
         }
     };
 
-    let client_config = SbiClientConfig::new(&host, port).with_scheme(scheme);
+    // #1869: a subscription stored before the subscribe check (or restored from
+    // an older build) can still name an http URI; under production it is refused
+    // here rather than dialled with a token.
+    let client_config = match notify_client_config(&host, port, scheme, profile) {
+        Ok(config) => config,
+        Err(reason) => {
+            log::warn!("NF status notify to {logged_uri} not sent: {reason}");
+            return NotifySendResult::Failed(reason);
+        }
+    };
     let client = SbiClient::new(client_config);
 
     // OAuth2 audience must be the ACTUAL subscriber NF type (TS 33.501 §13.4.1:
@@ -2211,5 +2292,136 @@ mod tests {
             &sub,
             &paths(&["/load"])
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // #1869: under production a notification goes over TLS only
+    // ------------------------------------------------------------------
+
+    /// #1869: the subscribe-time check accepts only https under production and
+    /// anything under dev.
+    #[test]
+    fn production_accepts_only_https_notification_uris_1869() {
+        let prod = SbiProfile::Production;
+        assert!(check_notification_uri("https://amf.5gc.example:8443/cb", prod).is_ok());
+        for refused in [
+            "http://amf.5gc.example/cb",
+            "amf.5gc.example/cb",
+            "ftp://amf/cb",
+        ] {
+            assert!(
+                check_notification_uri(refused, prod).is_err(),
+                "{refused} must be refused under production"
+            );
+        }
+        assert!(check_notification_uri("http://amf.5gc.example/cb", SbiProfile::Dev).is_ok());
+    }
+
+    /// #1869: an https subscriber is dialled under production with the profile
+    /// CA and this NRF's client certificate; an http one is not dialled at all.
+    #[test]
+    fn production_notify_client_is_mutually_authenticated_tls_1869() {
+        let config = notify_client_config(
+            "amf.5gc.example",
+            8443,
+            UriScheme::Https,
+            SbiProfile::Production,
+        )
+        .expect("https is dialled");
+        let tls = nextgcore_sbi::security::TlsPaths::from_env();
+        assert_eq!(config.scheme, UriScheme::Https);
+        assert_eq!(config.ca_cert.as_deref(), Some(tls.ca_cert.as_str()));
+        assert_eq!(config.client_cert, tls.client_cert);
+        assert!(config.client_cert.is_some());
+        assert!(!config.insecure_skip_verify);
+
+        assert!(notify_client_config("amf", 80, UriScheme::Http, SbiProfile::Production).is_err());
+        let dev = notify_client_config("amf", 80, UriScheme::Http, SbiProfile::Dev).unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http);
+    }
+
+    /// #1869: a stored http subscription is not dialled under production, so
+    /// no token rides a cleartext request; the dev half proves the same
+    /// subscriber is reachable, so the zero is the guard's.
+    #[tokio::test]
+    async fn production_never_dials_an_http_subscriber_1869() {
+        use std::sync::atomic::AtomicU64;
+        let hits = Arc::new(AtomicU64::new(0));
+        let seen = hits.clone();
+        let (_server, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let mut sub = create_test_subscription(None);
+        sub.notification_uri = format!("http://{addr}/nnrf-callback/notify");
+        let profile = create_test_profile();
+        let request = nrf_nnrf_nfm_build_nf_status_notify(
+            &sub,
+            NotificationEventType::NfRegistered,
+            &profile,
+            "https://nrf.5gc.example:7777",
+        )
+        .expect("notify request");
+        let send = |p: SbiProfile| {
+            dispatch_notify_request_under(
+                &request,
+                &profile.nf_instance_id,
+                &sub.notification_uri,
+                sub.req_nf_type.as_deref(),
+                "NF_REGISTERED",
+                p,
+            )
+        };
+
+        assert!(matches!(
+            send(SbiProfile::Production).await,
+            NotifySendResult::Failed(_)
+        ));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no cleartext dial under production"
+        );
+
+        // Not even a connection: a bare listener nobody accepts on keeps any
+        // dial, http or an upgraded https, in its backlog for `accept` to find.
+        let (bare, bare_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        bare.set_nonblocking(true).unwrap();
+        let bare_uri = format!("http://{bare_addr}/nnrf-callback/notify");
+        let mut bare_sub = sub.clone();
+        bare_sub.notification_uri = bare_uri.clone();
+        let bare_request = nrf_nnrf_nfm_build_nf_status_notify(
+            &bare_sub,
+            NotificationEventType::NfRegistered,
+            &profile,
+            "https://nrf.5gc.example:7777",
+        )
+        .expect("notify request");
+        let sent = dispatch_notify_request_under(
+            &bare_request,
+            &profile.nf_instance_id,
+            &bare_uri,
+            sub.req_nf_type.as_deref(),
+            "NF_REGISTERED",
+            SbiProfile::Production,
+        )
+        .await;
+        assert!(matches!(sent, NotifySendResult::Failed(_)));
+        assert_eq!(
+            bare.accept().map(|_| ()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "an http subscriber must not be dialled at all under production"
+        );
+
+        assert!(matches!(
+            send(SbiProfile::Dev).await,
+            NotifySendResult::Success
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

@@ -316,6 +316,28 @@ fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServe
     cfg
 }
 
+/// #1795: the DCCF's SBI listener under the SBI security profile. Under
+/// `production`: TLS from `policy`'s certificate paths (whatever `--tls` or the
+/// config file said), the client certificate verified against its CA, and an
+/// access token required, with DCCF as the audience and the NRF's JWKS unless
+/// the NF configured its own (TS 33.501 §13.1.0, §13.3, §13.4.1). A missing
+/// certificate fails startup, naming it, rather than serving cleartext. Under
+/// `dev` the config is left as the NF's own settings made it.
+fn sbi_listener_config(
+    config: SbiServerConfig,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<SbiServerConfig> {
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Dccf,
+        nrf_uri,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -373,8 +395,9 @@ async fn main() -> Result<()> {
     // #1665: the outbound token client follows the SBI security profile as well
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
-        nextgcore_sbi::security::SbiProfile::resolve(),
+        sbi_profile,
         require_oauth2,
         Some(&args.nrf_uri),
     ));
@@ -383,6 +406,14 @@ async fn main() -> Result<()> {
     if require_oauth2 {
         sbi_config = apply_oauth2_enforcement(sbi_config, &args.nrf_uri);
     }
+    // #1795: the listener follows the SBI security profile.
+    let sbi_config = sbi_listener_config(
+        sbi_config,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &args.nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
 
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_config.scheme;
@@ -2786,5 +2817,19 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1795: the listener `main` builds follows the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    /// REVERT-VERIFIED: with `sbi_listener_config` returning its input, the
+    /// production half serves cleartext and the helper fails naming DCCF.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1795() {
+        nextgcore_sbi::test_support::assert_listener_follows_sbi_profile(
+            nextgcore_sbi::types::NfType::Dccf,
+            super::sbi_listener_config,
+        );
     }
 }
