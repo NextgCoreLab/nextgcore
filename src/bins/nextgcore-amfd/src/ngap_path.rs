@@ -26777,23 +26777,21 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let (_nwdaf, port, _) = nwdaf_standin(
-                Some(nwdafd_predicts(&nwdaf_cell_of(predicted))),
-                Duration::ZERO,
-                None,
-            )
-            .await;
-            let _ep = NwdafEndpointOverride::set(port);
             let ue = 464_041u64 + i as u64;
-            insert_nwdaf_ue(
-                &ngap,
-                ue,
-                base + 1,
-                Some(&format!("imsi-00101000046404{i}")),
-                Some(1),
+            let supi = format!("imsi-00101000046404{i}");
+            // #2008: nwdafd's answer, in hand at once. Through a loopback stand-in it
+            // had to arrive within HINT_TIMEOUT (300 ms); on a loaded host it did not,
+            // the page failed open to the whole area, and this test, which is about
+            // where a PREDICTED page goes, failed. The HTTP path is
+            // `nwdaf_mobility_pages_the_predicted_gnb_then_widens_to_the_area`'s.
+            crate::nwdaf_mobility::set_canned_answer_for_test(
+                &supi,
+                Some(nwdafd_predicts(&nwdaf_cell_of(predicted))),
             );
+            insert_nwdaf_ue(&ngap, ue, base + 1, Some(&supi), Some(1));
             queue_paging(&ngap, ue);
             assert!(nwdaf_answer_applied(ue).await, "released");
+            crate::nwdaf_mobility::set_canned_answer_for_test(&supi, None);
             take_sent_ngap(&mut ngap);
             ngap.process_paging_with(Duration::from_secs(3600)).await;
             assert_eq!(
@@ -26802,6 +26800,7 @@ mod tests {
                 "predicted gNB {predicted}: attempt 1 reaches the UE's own gNB 1"
             );
             crate::context::amf_self().read().unwrap().paging_remove(ue);
+            ngap.ue_auth_state.remove(ue);
         }
     }
 
@@ -36030,7 +36029,7 @@ mod tests {
         );
 
         // HandoverCancel: the source abandoned it.
-        let ue_cancel = 78_002u64;
+        let ue_cancel = 78_022u64; // #2008: not 78_002, a sibling's UE id in the global store
         server.handover_target_assoc.insert(ue_cancel, (target, 1));
         let cancel = nextgcore_ngap::builder::build_handover_cancel(
             &nextgcore_ngap::types::HandoverCancel {
@@ -36048,7 +36047,7 @@ mod tests {
         // HandoverFailure: the target refused. Dropped even though this UE has no
         // ue_auth_state entry, because a stale record would misroute the NEXT
         // handover's status transfer to a gNB that already rejected the UE.
-        let ue_failure = 78_003u64;
+        let ue_failure = 78_023u64; // #2008: not 78_003 (likewise)
         server.handover_target_assoc.insert(ue_failure, (target, 1));
         // The HandoverRequest of the current preparation went to `target` (#742 review:
         // only that association may answer it).
@@ -40116,10 +40115,15 @@ mod tests {
     async fn a_periodic_subscription_needs_a_rep_period_1819() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let before = crate::context::amf_self()
-            .read()
-            .expect("ctx lock")
-            .event_subscription_count();
+        // #2008: this test's own subscriptions only. The store is process-global and
+        // most tests that subscribe do not take CONTEXT_GUARD, so a count of every
+        // subscription moved whenever a sibling subscribed or unsubscribed meanwhile.
+        let own = || {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx lock")
+                .event_subscription_count_notifying("/notify/1819-bad")
+        };
         for (options, cause) in [
             (
                 serde_json::json!({ "trigger": "PERIODIC" }),
@@ -40138,13 +40142,7 @@ mod tests {
             assert_eq!(v["cause"], cause, "{v}");
             sink.stop().await.expect("sink stop");
         }
-        assert_eq!(
-            crate::context::amf_self()
-                .read()
-                .expect("ctx lock")
-                .event_subscription_count(),
-            before
-        );
+        assert_eq!(own(), 0, "nothing is stored");
     }
 
     /// **#1737, #1760**: the first report is the subscription's own baseline, and for
@@ -42469,7 +42467,9 @@ mod tests {
     async fn handover_notify_consumes_the_recorded_target_transfer() {
         let mut server = test_ngap_server().await;
         let (source, target) = (9304u64, 9305u64);
-        let amf_ue_ngap_id = 78_003u64;
+        // #2008: an id of its own; `an_intra_gnb_handover_notify_releases_the_old_ran_ue_context`
+        // uses 78_003 in the same process-global UE store.
+        let amf_ue_ngap_id = 78_013u64;
         seed_gnb_session(&server, source).await;
         seed_gnb_session(&server, target).await;
         server.ue_auth_state.insert(
@@ -46424,11 +46424,13 @@ mod tests {
         let hold = crate::sbi_path::REGISTRATION_STATUS_UPDATE_TIMEOUT + Duration::from_millis(500);
         let holds = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let applied = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // #2008: told when the NOT_TRANSFERRED reaches the old AMF.
+        let held = Arc::new(tokio::sync::Notify::new());
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let peer = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
-        let (h, a) = (holds.clone(), applied.clone());
+        let (h, a, n) = (holds.clone(), applied.clone(), held.clone());
         peer.start(move |req: SbiRequest| {
-            let (holds, applied) = (h.clone(), a.clone());
+            let (holds, applied, held) = (h.clone(), a.clone(), n.clone());
             async move {
                 let body: serde_json::Value =
                     serde_json::from_str(req.http.content.as_deref().unwrap_or("{}"))
@@ -46442,6 +46444,7 @@ mod tests {
                     applied.lock().expect("applied").push(status);
                 };
                 if body["transferStatus"] == "NOT_TRANSFERRED" {
+                    held.notify_one();
                     // Delayed past the client's timeout, and applied regardless.
                     tokio::spawn(async move {
                         tokio::time::sleep(hold).await;
@@ -46462,7 +46465,13 @@ mod tests {
 
         let first =
             spawn_registration_status_update(pending_1769(port, 18201), false).expect("runtime");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // #2008: the retry's outcome is decided once the first update is on the wire.
+        // A fixed 50 ms sleep raced the first task under load: when it had not taken
+        // its turn on the lane by then, the TRANSFERRED's ticket superseded it and it
+        // was never sent, so the late NOT_TRANSFERRED this test is about never came.
+        tokio::time::timeout(Duration::from_secs(10), held.notified())
+            .await
+            .expect("the NOT_TRANSFERRED reaches the old AMF");
         let second =
             spawn_registration_status_update(pending_1769(port, 18201), true).expect("runtime");
         let started = std::time::Instant::now();

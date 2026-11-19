@@ -185,6 +185,40 @@ fn warn_cap_full(amf_ue_ngap_id: u64) {
     }
 }
 
+/// Tests (#2008): AnalyticsData bodies [`query_prediction`] answers at once for a
+/// SUPI, parsed as an NWDAF's 200 would be. For a test about what the paging pump
+/// does WITH a prediction: a stand-in NWDAF reached over loopback HTTP has to
+/// answer within [`HINT_TIMEOUT`], and on a loaded host it did not, so the page went
+/// to the whole area (fail-open) and the test failed. Keyed by SUPI, so a test sees
+/// only its own UEs' answers. The HTTP path keeps its own tests.
+#[cfg(test)]
+static CANNED_ANSWERS: std::sync::Mutex<Option<std::collections::HashMap<String, Value>>> =
+    std::sync::Mutex::new(None);
+
+/// Tests (#2008): answer [`query_prediction`] for `supi` with `body` (`None` removes it).
+#[cfg(test)]
+pub(crate) fn set_canned_answer_for_test(supi: &str, body: Option<Value>) {
+    let mut answers = CANNED_ANSWERS.lock().unwrap_or_else(|e| e.into_inner());
+    let answers = answers.get_or_insert_with(std::collections::HashMap::new);
+    match body {
+        Some(body) => {
+            answers.insert(supi.to_string(), body);
+        }
+        None => {
+            answers.remove(supi);
+        }
+    }
+}
+
+#[cfg(test)]
+fn canned_answer(supi: &str) -> Option<Value> {
+    CANNED_ANSWERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|a| a.get(supi).cloned())
+}
+
 /// The NWDAF a test points [`resolve_nwdaf_endpoint`] at, declared beside its one
 /// reader. Callers that set it hold `test_support::CONTEXT_GUARD`, which every
 /// paging test already holds. Production never sets it.
@@ -325,6 +359,10 @@ pub async fn resolve_nwdaf_endpoint() -> Option<(String, u16)> {
 /// with no prediction (204, a body naming no NR cell, or statistics); `Err` is a
 /// failure.
 pub async fn query_prediction(supi: &str) -> Result<Option<PredictedCell>, String> {
+    #[cfg(test)]
+    if let Some(body) = canned_answer(supi) {
+        return Ok(parse_ue_mobility(&body));
+    }
     let (host, port) = resolve_nwdaf_endpoint()
         .await
         .ok_or_else(|| "no NWDAF (NRF discovery found none, NWDAF_SBI_ADDR unset)".to_string())?;
