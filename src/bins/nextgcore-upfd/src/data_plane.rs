@@ -2187,9 +2187,21 @@ impl DataPlaneUrr {
         self.time_threshold_hit.store(false, Ordering::SeqCst);
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
+        // #1902: the counters are taken under the meter lock, which `record` holds for
+        // every counter add of a packet. Taken lock-free, one after another, a packet
+        // recorded between the byte and the packet swaps put its bytes in this report
+        // and its packet in the next: a torn report whose volume and packet counts are
+        // not the same measurement (TS 29.244 §5.2.2.3.1 reports both "since the last
+        // usage report"). One critical section also makes the volume and the time IEs
+        // below the same instant.
+        let mut m = self.meter.lock().unwrap();
+        let ul_bytes = self.acc_ul_bytes.swap(0, Ordering::AcqRel);
+        let dl_bytes = self.acc_dl_bytes.swap(0, Ordering::AcqRel);
+        #[cfg(test)]
+        tests::run_take_hook();
         let usage = UrrUsage {
-            ul_bytes: self.acc_ul_bytes.swap(0, Ordering::AcqRel),
-            dl_bytes: self.acc_dl_bytes.swap(0, Ordering::AcqRel),
+            ul_bytes,
+            dl_bytes,
             ul_pkts: self.acc_ul_pkts.swap(0, Ordering::AcqRel),
             dl_pkts: self.acc_dl_pkts.swap(0, Ordering::AcqRel),
         };
@@ -2200,7 +2212,6 @@ impl DataPlaneUrr {
         let times = {
             // #820: the next report's measurement starts here on the measured clock; a
             // threshold report re-applies the time threshold from here too.
-            let mut m = self.meter.lock().unwrap();
             let now = m.measured(std::time::Instant::now());
             let wall = std::time::SystemTime::now();
             let times = ReportTimes {
@@ -2223,14 +2234,14 @@ impl DataPlaneUrr {
             times
         };
         if threshold_report {
-            // Read AFTER the swaps: a packet whose bytes this report took has already
-            // added to these counters, so it is subtracted; one recorded after the read
-            // stays, counting toward the re-applied threshold.
+            // Still under the meter lock: every packet this report took has added to
+            // these counters and none has been recorded since, so the re-applied
+            // threshold counts from exactly this report.
             for c in [&self.thr_used_total, &self.thr_used_ul, &self.thr_used_dl] {
-                let v = c.load(Ordering::Acquire);
-                c.fetch_sub(v, Ordering::AcqRel);
+                c.store(0, Ordering::Release);
             }
         }
+        drop(m);
         (usage, times)
     }
 
@@ -2402,6 +2413,9 @@ impl DataPlaneUrr {
     /// Put back usage that was taken for a report which was never delivered (#780
     /// review m2), so it is carried by the next report instead of being lost.
     pub fn restore_usage(&self, usage: &UrrUsage) {
+        // #1902: under the meter lock, like `record` and the take, so a racing take
+        // gets all of the restored report or none of it.
+        let _meter = self.meter.lock().unwrap();
         self.acc_total_bytes
             .fetch_add(usage.total_bytes(), Ordering::AcqRel);
         self.acc_total_pkts
@@ -6217,6 +6231,21 @@ pub fn decap_gtp(gtp_bytes: &[u8]) -> Option<&[u8]> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// #1902: run by `take_report_for` between its byte and packet swaps, on the
+        /// taking thread only, so a test can put a `record` in that gap.
+        static TAKE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_take_hook() {
+        TAKE_HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
     #[test]
     fn test_build_gtpu_header() {
         let header = build_gtpu_header(0x12345678, 100);
@@ -8277,8 +8306,14 @@ mod tests {
                     };
                     // A take of nothing still returns an (empty) entry; keeping only
                     // the ones that carried usage bounds the Vec while a starved
-                    // recorder idles. Empty entries add nothing to the sums.
-                    reports.extend(taken.into_iter().filter(|r| r.total_pkts > 0));
+                    // recorder idles. Empty entries add nothing to the sums. Bytes OR
+                    // packets (#1956 review): a report must never be dropped for one
+                    // of the two being zero.
+                    reports.extend(
+                        taken
+                            .into_iter()
+                            .filter(|r| r.total_pkts > 0 || r.total_bytes > 0),
+                    );
                     pass += 1;
                     passes.store(pass, Ordering::SeqCst);
                     if last {
@@ -8312,6 +8347,52 @@ mod tests {
             packets,
             "every packet exactly once"
         );
+    }
+
+    /// #1902 (#1956 review): a report's volume and packet counts are one measurement
+    /// (TS 29.244 §5.2.2.3.1, both "since the last usage report"). A packet recorded
+    /// while a take is in progress goes WHOLLY into this report or wholly into the
+    /// next. Before, the take swapped the byte and packet counters one after another
+    /// without the meter lock `record` holds, so a packet landing between the swaps
+    /// put its bytes in one report and its packet in the other. The take hook puts
+    /// a `record` in exactly that gap. Under the lock the record cannot finish there
+    /// (the hook's wait runs out), so the outcome does not depend on timing.
+    #[test]
+    fn a_packet_recorded_during_a_take_is_not_torn_across_two_reports() {
+        const B: u64 = 639;
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.record(B, true);
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let recorder = {
+            let urr = Arc::clone(&urr);
+            std::thread::spawn(move || {
+                go_rx.recv().expect("go");
+                urr.record(B, true);
+                let _ = done_tx.send(());
+            })
+        };
+        TAKE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = go_tx.send(());
+                // Lock-free, the record completes here, between the swaps. Under the
+                // meter lock it blocks until the take is done.
+                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+            }))
+        });
+        let (first, _) = urr.take_report(false);
+        TAKE_HOOK.with(|h| *h.borrow_mut() = None);
+        recorder.join().expect("recorder");
+        let (second, _) = urr.take_report(false);
+        for (name, u) in [("first", first), ("second", second)] {
+            assert_eq!(
+                u.total_bytes(),
+                u.total_pkts() * B,
+                "{name} report is torn: bytes and packets from different instants: {u:?}"
+            );
+        }
+        assert_eq!(first.total_bytes() + second.total_bytes(), 2 * B);
+        assert_eq!(first.total_pkts() + second.total_pkts(), 2);
     }
 
     /// #842 review BLOCKER (TS 29.244 §5.2.2.3.1): a usage report that is NOT
