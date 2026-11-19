@@ -785,7 +785,9 @@ fn udm_context_write_refusal(request: &SbiRequest, production: bool) -> Option<S
     }
     match request.oauth2_scope.as_deref() {
         Some(granted) if !token_grants(granted, scope) => {
-            log::debug!("UDM context write refused: the token lacks {scope}");
+            // The scope is a constant, but it is derived from the request URI, which
+            // the #1018 log lint treats as a callback URI: the 403 body names it.
+            log::debug!("UDM context write refused: the token lacks the resource scope");
             Some(
                 nextgcore_sbi::server::BearerRefusal::InsufficientScope {
                     scope: scope.to_string(),
