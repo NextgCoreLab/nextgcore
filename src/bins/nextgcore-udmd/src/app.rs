@@ -1124,6 +1124,15 @@ async fn route_nudm_ueau(
     request: &SbiRequest,
     uri: &str,
 ) -> SbiResponse {
+    // #1866: KAUSF goes to the AUSF only. Refused before the SUPI is parsed or
+    // the UDR is read, so a refusal has no side effect.
+    if let Some(refused) = crate::consumer_gate::refuse_consumer_type(
+        request,
+        "nudm-ueau",
+        crate::consumer_gate::UEAU_CONSUMER_NF_TYPES,
+    ) {
+        return refused;
+    }
     let supi = parts.get(2).copied().unwrap_or("");
     let resource = parts.get(3).copied().unwrap_or("");
     let action = parts.get(4).copied().unwrap_or("");
@@ -4075,6 +4084,124 @@ mod tests {
             .as_str()
             .expect("apiVersionInUri must be a string")
             .to_string()
+    }
+
+    /// #1866: the NRF grants an `nudm-ueau` token only to the types listed on the
+    /// NFService (TS 29.510 Table 6.1.6.2.3-1), so the profile must carry
+    /// `["AUSF"]` there, and nowhere else narrower than the profile-level list.
+    #[test]
+    fn the_profile_offers_nudm_ueau_to_the_ausf_only_1866() {
+        let profile = build_udm_nf_profile(
+            "udm-test-instance",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let ueau = services
+            .iter()
+            .find(|s| s["serviceName"] == "nudm-ueau")
+            .expect("nudm-ueau registered");
+        assert_eq!(ueau["allowedNfTypes"], serde_json::json!(["AUSF"]));
+        for s in services.iter().filter(|s| s["serviceName"] != "nudm-ueau") {
+            assert!(s.get("allowedNfTypes").is_none(), "{s}");
+        }
+        // The profile-level list must still admit the AUSF, or nothing could
+        // authenticate (the NRF ANDs both levels).
+        assert!(profile["allowedNfTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "AUSF"));
+    }
+
+    /// #1866: the NRF's own grant decision over this profile. The access token
+    /// has no consumer-type claim, so this is what makes a verified `nudm-ueau`
+    /// scope mean "an AUSF".
+    #[test]
+    fn the_nrf_grants_nudm_ueau_to_the_ausf_only_1866() {
+        let profile = build_udm_nf_profile(
+            "5a4e8f2c-0000-4000-8000-000000000001",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let nrf_view = nextgcore_nrfd::NfProfile::from_json(&profile).expect("NRF accepts it");
+        assert_eq!(
+            nrf_view.authorizes_service("AUSF", "nudm-ueau"),
+            (true, true)
+        );
+        for t in ["SMF", "PCF", "AMF", "SCP"] {
+            assert_eq!(
+                nrf_view.authorizes_service(t, "nudm-ueau"),
+                (true, false),
+                "{t}"
+            );
+        }
+        // Control: the other services are unchanged.
+        assert_eq!(nrf_view.authorizes_service("SMF", "nudm-sdm"), (true, true));
+        assert_eq!(
+            nrf_view.authorizes_service("AMF", "nudm-uecm"),
+            (true, true)
+        );
+    }
+
+    /// #1866: through the real router, a peer whose verified certificate names
+    /// another NF type gets 403 on every Nudm_UEAU operation, before the body is
+    /// read; the AUSF reaches the handler (its 400 names the missing IE, which
+    /// only the handler produces).
+    #[tokio::test]
+    async fn nudm_ueau_is_refused_to_a_non_ausf_certificate_1866() {
+        const SUPI: &str = "imsi-001010000000001";
+        let gen = format!("/nudm-ueau/v1/{SUPI}/security-information/generate-auth-data");
+        let request = |method: &str, uri: &str, types: &[&str], body: serde_json::Value| {
+            let mut r = SbiRequest {
+                header: nextgcore_sbi::message::SbiHeader::with_method_uri(method, uri),
+                ..SbiRequest::default()
+            };
+            r.http.set_content(body.to_string());
+            r.http.set_header("Content-Type", "application/json");
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let full = serde_json::json!({
+            "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org",
+            "ausfInstanceId": "c0ffee00-0000-4000-8000-000000000001",
+        });
+        for (method, uri) in [
+            ("POST", gen.clone()),
+            ("POST", format!("/nudm-ueau/v1/{SUPI}/auth-events")),
+            ("PUT", format!("/nudm-ueau/v1/{SUPI}/auth-events/1")),
+        ] {
+            for t in ["SMF", "PCF", "AMF"] {
+                let resp = udm_sbi_request_handler(request(method, &uri, &[t], full.clone())).await;
+                let body = resp.http.content.clone().unwrap_or_default();
+                assert_eq!(resp.status, 403, "{t} {method} {uri}: {body}");
+                let pd: serde_json::Value = serde_json::from_str(&body).expect("ProblemDetails");
+                let detail = pd["detail"].as_str().unwrap_or_default();
+                assert!(
+                    detail.contains("served to NF type(s) [\"AUSF\"] only") && detail.contains(t),
+                    "{body}"
+                );
+                assert!(
+                    !body.contains("kausf") && !body.contains("xresStar"),
+                    "{body}"
+                );
+            }
+        }
+        // The AUSF (and an SCP relaying for it) gets past the gate into the handler.
+        for t in ["AUSF", "SCP"] {
+            let resp = udm_sbi_request_handler(request(
+                "POST",
+                &gen,
+                &[t],
+                serde_json::json!({"ausfInstanceId": "c0ffee00-0000-4000-8000-000000000001"}),
+            ))
+            .await;
+            let body = resp.http.content.clone().unwrap_or_default();
+            assert_eq!(resp.status, 400, "{t}: {body}");
+            assert!(body.contains("MANDATORY_IE_MISSING"), "{t}: {body}");
+        }
     }
 
     #[test]

@@ -1,0 +1,15 @@
+# udmd's state file (#1885). ReadWriteOnce: one node mounts it, and the
+# Deployment's single Recreate replica is its one writer.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: udm-state
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: udm
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi

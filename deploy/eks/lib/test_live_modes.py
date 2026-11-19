@@ -3,7 +3,7 @@ from deploy/eks/lib."""
 
 import unittest
 
-from live_modes import dataplane_mode, immutable_diff, storage_mode
+from live_modes import dataplane_mode, immutable_diff, storage_mode, udm_state_mode
 
 GP3_CLAIM = {
     'metadata': {'name': 'mongodb-data'},
@@ -90,6 +90,43 @@ class DataplaneMode(unittest.TestCase):
 
     def test_no_live_upf_is_absent(self):
         self.assertEqual(dataplane_mode(None, 'upf'), 'absent')
+
+
+class UdmStateMode(unittest.TestCase):
+    """#1885: a re-run keeps the live udm's state file mode."""
+
+    ENV = {'name': 'NEXTGCORE_UDM_STATE_FILE', 'value': '/var/lib/nextgcore/udm-state.json'}
+
+    def deploy(self, env=False, vol=None):
+        c = {'name': 'udm', 'env': [{'name': 'RUST_LOG', 'value': 'info'}]}
+        if env:
+            c['env'].append(self.ENV)
+        vols = [{'name': 'logs', 'emptyDir': {}}]
+        if vol is not None:
+            vols.append(dict({'name': 'udm-state'}, **vol))
+        # An init container first, as the base manifest has.
+        return {'spec': {'template': {'spec': {
+            'initContainers': [{'name': 'wait-nrf'}],
+            'containers': [c], 'volumes': vols}}}}
+
+    def test_the_pvc_component_reads_as_pvc(self):
+        live = self.deploy(True, {'persistentVolumeClaim': {'claimName': 'udm-state'}})
+        self.assertEqual(udm_state_mode(live), 'pvc')
+
+    def test_the_emptydir_component_reads_as_emptydir(self):
+        self.assertEqual(udm_state_mode(self.deploy(True, {'emptyDir': {}})), 'emptydir')
+
+    def test_the_memory_only_base_reads_as_false(self):
+        self.assertEqual(udm_state_mode(self.deploy()), 'false')
+
+    def test_a_hand_patch_reads_as_custom(self):
+        # The env var on another volume (README's old kubectl patch), or the
+        # volume left without the env var: neither is a mode to re-render.
+        self.assertEqual(udm_state_mode(self.deploy(True)), 'custom')
+        self.assertEqual(udm_state_mode(self.deploy(False, {'emptyDir': {}})), 'custom')
+
+    def test_no_live_udm_is_absent(self):
+        self.assertEqual(udm_state_mode(None), 'absent')
 
 
 if __name__ == '__main__':

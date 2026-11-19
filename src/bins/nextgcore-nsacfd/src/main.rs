@@ -608,7 +608,12 @@ async fn nsacf_admin_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let method = method.as_str();
     let uri = request.header.uri.clone();
-    log::debug!("NSACF admin: {method} {uri}");
+    // #1867: logged through the redactor, as the SBI handler's line is; the admin
+    // listener (#1912) shares the URI shapes, so the same rule applies.
+    log::debug!(
+        "NSACF admin: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
     let path = uri.split('?').next().unwrap_or(&uri);
     let parts: Vec<&str> = path
         .trim_start_matches('/')
@@ -645,7 +650,10 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = method.as_str();
     let uri = request.header.uri.clone();
 
-    log::debug!("NSACF SBI: {method} {uri}");
+    log::debug!(
+        "NSACF SBI: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(&uri);
