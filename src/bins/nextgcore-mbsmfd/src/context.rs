@@ -161,6 +161,21 @@ fn boot_session_id_base() -> usize {
         .max(1)
 }
 
+/// #1930: an AMF context's identity: the AMF and its `mbsContextRef`.
+type ContextKey = (String, u16, String);
+
+fn context_key(c: &AmfMbsContext) -> ContextKey {
+    (c.host.clone(), c.port, c.context_ref.clone())
+}
+
+/// #1796/#1930: one live notify token: the session holding it and the AMF
+/// context it names (`None` until the ContextCreate answered).
+#[derive(Debug, Clone)]
+struct NotifyToken {
+    session_id: u64,
+    context: Option<ContextKey>,
+}
+
 /// #1796: the most AMF ContextStatusNotify tokens held at once. One is minted per
 /// ContextCreate and forgotten when its context is released; past the cap a
 /// ContextCreate is not sent.
@@ -754,9 +769,11 @@ pub struct MbSmfContext {
     /// clone written back by `session_update` can erase one. Lock order:
     /// `session_list` before this.
     amf_contexts: Mutex<HashMap<u64, Vec<AmfMbsContext>>>,
-    /// #1796: the live AMF ContextStatusNotify tokens, by token, with the session
-    /// each was minted for. Lock order: after `amf_contexts`.
-    amf_notify_tokens: Mutex<HashMap<String, u64>>,
+    /// #1796: the live AMF ContextStatusNotify tokens, by token: the session that
+    /// holds it and, once the ContextCreate answered, the AMF context it names.
+    /// #1930: a token lives as long as its AMF context, not its session (see
+    /// [`Self::record_amf_context`]). Lock order: after `amf_contexts`.
+    amf_notify_tokens: Mutex<HashMap<String, NotifyToken>>,
     /// #1796: `{scheme}://{advertised host:port}`, the base of the `notifyUri`s
     /// this MB-SMF gives the AMF; `None` until startup sets it.
     amf_notify_base: RwLock<Option<String>>,
@@ -802,13 +819,42 @@ impl MbSmfContext {
             return None;
         }
         let token = uuid::Uuid::new_v4().simple().to_string();
-        tokens.insert(token.clone(), id);
+        tokens.insert(
+            token.clone(),
+            NotifyToken {
+                session_id: id,
+                context: None,
+            },
+        );
         Some(token)
     }
 
-    /// #1796: the session a live ContextStatusNotify token was minted for.
+    /// #1796: the session a live ContextStatusNotify token belongs to (#1930: the
+    /// session holding its AMF context now).
     pub fn amf_notify_session(&self, token: &str) -> Option<u64> {
-        self.amf_notify_tokens.lock().ok()?.get(token).copied()
+        self.amf_notify_tokens
+            .lock()
+            .ok()?
+            .get(token)
+            .map(|t| t.session_id)
+    }
+
+    /// #1930: forget every notify token of the AMF context `c` names (and `c`'s
+    /// own): the context is released at the AMF, so nothing will be notified on
+    /// them. Returns how many were forgotten.
+    pub fn forget_amf_context_tokens(&self, c: &AmfMbsContext) -> usize {
+        let key = context_key(c);
+        let Ok(mut tokens) = self.amf_notify_tokens.lock() else {
+            return 0;
+        };
+        let before = tokens.len();
+        tokens.retain(|t, v| *t != c.notify_token && v.context.as_ref() != Some(&key));
+        before - tokens.len()
+    }
+
+    /// #1930: how many notify tokens are held.
+    pub fn amf_notify_token_count(&self) -> usize {
+        self.amf_notify_tokens.lock().map_or(0, |t| t.len())
     }
 
     /// #1796: forget a token whose AMF context is gone (or was never created).
@@ -822,18 +868,33 @@ impl MbSmfContext {
     /// drop its record, so the session's release does not delete it again, and
     /// the token. Returns whether a record was dropped.
     pub fn drop_amf_context_by_token(&self, token: &str) -> bool {
-        let dropped = self.amf_contexts.lock().is_ok_and(|mut map| {
-            let mut dropped = false;
+        // #1930: the token names an AMF context; the record of it may carry
+        // another token of the same context (a session that took it over).
+        let key = self
+            .amf_notify_tokens
+            .lock()
+            .ok()
+            .and_then(|t| t.get(token).and_then(|v| v.context.clone()));
+        let names =
+            |c: &AmfMbsContext| c.notify_token == token || key.as_ref() == Some(&context_key(c));
+        let mut dropped_records = Vec::new();
+        if let Ok(mut map) = self.amf_contexts.lock() {
             for list in map.values_mut() {
-                let before = list.len();
-                list.retain(|c| c.notify_token != token);
-                dropped |= list.len() != before;
+                list.retain(|c| {
+                    let gone = names(c);
+                    if gone {
+                        dropped_records.push(c.clone());
+                    }
+                    !gone
+                });
             }
             map.retain(|_, list| !list.is_empty());
-            dropped
-        });
+        }
         self.forget_amf_notify_token(token);
-        dropped
+        for c in &dropped_records {
+            self.forget_amf_context_tokens(c);
+        }
+        !dropped_records.is_empty()
     }
 
     /// #1758: record an AMF MBS context for session `id`, only while the session
@@ -857,6 +918,23 @@ impl MbSmfContext {
         }
         drop(map);
         drop(session_list);
+        // #1930: every notify token of this AMF context now belongs to session
+        // `id`. The AMF answers a ContextCreate for a TMGI whose context it still
+        // holds with that same context (a released session's, whose delete is
+        // then dropped) and may keep notifying the notifyUri of the FIRST create,
+        // so that token is the live session's now, not the released one's. Each
+        // is forgotten when the context is released ([`Self::forget_amf_context_tokens`]).
+        let key = context_key(&context);
+        if let Ok(mut tokens) = self.amf_notify_tokens.lock() {
+            if let Some(own) = tokens.get_mut(&context.notify_token) {
+                own.context = Some(key.clone());
+            }
+            for t in tokens.values_mut() {
+                if t.context.as_ref() == Some(&key) {
+                    t.session_id = id;
+                }
+            }
+        }
         // R24: the AMF hands a session reusing a released session's TMGI the same
         // `mbsContextRef`, so a parked delete of it must not run.
         crate::reconcile::unpark(&context);
