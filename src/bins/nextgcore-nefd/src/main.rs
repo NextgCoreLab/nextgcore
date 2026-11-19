@@ -52,10 +52,11 @@ use nextgcore_sbi::server::{
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod context;
+mod southbound_reconcile; // #1877: failed southbound unsubscribes, retried until delivered
 /// nextgsim#480 (demo d445a-fl-t8): TS 29.522 UE ID retrieval for an AF.
 #[cfg(feature = "demo-d445a-fl-t8")]
 mod ueid;
@@ -660,6 +661,8 @@ async fn main() -> Result<()> {
             reconcile_pending_subscriptions().await;
         }
     });
+    // #1877: and southbound unsubscribes that failed are retried until delivered.
+    drop(southbound_reconcile::spawn_reconciler());
 
     // Register with NRF as nfType NEF advertising nnef-eventexposure
     // (registration failure is non-fatal, mirroring nwdafd).
@@ -965,7 +968,139 @@ async fn handle_nnef_event_exposure_delete(sub_id: &str, request: &SbiRequest) -
 /// request (mandatory-IE parity with udmd's `handle_ee_subscribe`),
 /// translates it into a southbound producer subscription (best-effort),
 /// stores the northbound↔southbound mapping, and returns 201 with Location.
+/// #1877: spawn `fut` on its own task, so dropping its caller (an AF request that
+/// went away) cannot cut it short. Test builds carry the caller's OAuth2 scope over.
+fn spawn_detached<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, fut));
+    }
+    tokio::spawn(fut)
+}
+
+/// #1877: what became of a detached create, shared by its task and the request.
+#[derive(Debug, Default)]
+enum CreateHandoff {
+    #[default]
+    Pending,
+    /// The AF went away first: the task removes what it creates.
+    Abandoned,
+    /// The create finished; the subscription id of a 201, else `None`.
+    Finished(Option<String>),
+}
+
+/// The subscription id a 201's Location names.
+fn created_subscription_id(response: &SbiResponse) -> Option<String> {
+    if response.status != 201 {
+        return None;
+    }
+    response
+        .http
+        .get_header("Location")?
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// #1877: remove a subscription whose 201 the AF never received, and its producer
+/// leg: the AF holds no `self` link to delete it by, so nothing else ever would.
+fn spawn_abandoned_create_removal(sub_id: String) {
+    log::warn!(
+        "monitoring subscription {sub_id}: its create was abandoned by the AF after it \
+         was established; removing it and its southbound leg"
+    );
+    let removed = {
+        let ctx = nef_self();
+        let c = ctx.read().ok();
+        let found = c.as_ref().and_then(|c| c.subscription_find(&sub_id));
+        if let Some(c) = c.as_ref() {
+            c.subscription_remove(&sub_id);
+        }
+        found
+    };
+    if let Some(southbound) = removed.and_then(|s| s.southbound) {
+        let uri = producer_uri(southbound.producer);
+        drop(spawn_detached(southbound_unsubscribe(uri, southbound)));
+    }
+}
+
+impl CreateHandoff {
+    fn finish(handoff: &Mutex<Self>, response: &SbiResponse) {
+        let created = created_subscription_id(response);
+        let mut state = handoff.lock().unwrap_or_else(|e| e.into_inner());
+        match *state {
+            CreateHandoff::Abandoned => {
+                if let Some(id) = created {
+                    spawn_abandoned_create_removal(id);
+                }
+            }
+            _ => *state = CreateHandoff::Finished(created),
+        }
+    }
+
+    fn abandon(handoff: &Mutex<Self>) {
+        let mut state = handoff.lock().unwrap_or_else(|e| e.into_inner());
+        if let CreateHandoff::Finished(Some(id)) =
+            std::mem::replace(&mut *state, CreateHandoff::Abandoned)
+        {
+            spawn_abandoned_create_removal(id);
+        }
+    }
+}
+
+/// Held by the request awaiting a detached create; dropped unanswered, it hands
+/// the subscription to the task.
+struct CreateAbandonGuard {
+    handoff: Arc<Mutex<CreateHandoff>>,
+    answered: bool,
+}
+
+impl Drop for CreateAbandonGuard {
+    fn drop(&mut self) {
+        if !self.answered {
+            CreateHandoff::abandon(&self.handoff);
+        }
+    }
+}
+
+/// POST of a monitoring subscription, run on its own task (#1877).
+///
+/// The southbound subscribe at the AMF or UDM is awaited before the local record
+/// is stored, and the SBI server polls a handler inline in the request's stream:
+/// an AF that went away after the producer accepted dropped the create there, and
+/// the producer subscription was recorded nowhere (the #1755 shape). On its own
+/// task the create always reaches its insert, or its rollback; and a 201 the AF
+/// never read is removed, with its producer leg ([`spawn_abandoned_create_removal`]).
 async fn handle_monitoring_subscription_create(
+    scs_as_id: &str,
+    request: &SbiRequest,
+    api: NorthboundApi,
+) -> SbiResponse {
+    let handoff = Arc::new(Mutex::new(CreateHandoff::Pending));
+    let mut guard = CreateAbandonGuard {
+        handoff: handoff.clone(),
+        answered: false,
+    };
+    let (scs_as_id, request) = (scs_as_id.to_string(), request.clone());
+    let task = spawn_detached(async move {
+        let response = handle_monitoring_subscription_create_inner(&scs_as_id, &request, api).await;
+        CreateHandoff::finish(&handoff, &response);
+        response
+    });
+    let result = task.await;
+    guard.answered = true;
+    match result {
+        Ok(response) => response,
+        Err(e) => send_internal_error(&format!("the monitoring subscription create failed: {e}")),
+    }
+}
+
+async fn handle_monitoring_subscription_create_inner(
     scs_as_id: &str,
     request: &SbiRequest,
     api: NorthboundApi,
@@ -1265,19 +1400,24 @@ async fn handle_monitoring_subscription_delete(
         }
     };
 
-    if let Some(southbound) = &sub.southbound {
-        let producer_uri = match southbound.producer {
-            SouthboundProducer::Amf => amf_uri,
-            SouthboundProducer::Udm => udm_uri,
-        };
-        southbound_unsubscribe(producer_uri, southbound.clone()).await;
-    }
-
+    // #1877: the record goes first, then the producer leg on its own task, so a
+    // request dropped mid-DELETE (the AF went away) cannot leave the producer
+    // subscription behind with nothing left to remove it. A DELETE that fails is
+    // parked for the reconciler.
     {
         let ctx = nef_self();
         if let Ok(c) = ctx.read() {
             c.subscription_remove(sub_id);
         };
+    }
+    if let Some(southbound) = sub.southbound.clone() {
+        let producer_uri = match southbound.producer {
+            SouthboundProducer::Amf => amf_uri,
+            SouthboundProducer::Udm => udm_uri,
+        };
+        let task = spawn_detached(southbound_unsubscribe(producer_uri, southbound));
+        // Answered once the leg is done, as before, unless the caller goes first.
+        let _ = task.await;
     }
     log::info!("Monitoring event subscription removed: id={sub_id}, scsAsId={scs_as_id}");
     SbiResponse::with_status(204)
@@ -1869,7 +2009,11 @@ async fn attempt_southbound_subscribe(
     match client.post_json(&req.path, &req.body).await {
         Ok(response) if response.status == 200 || response.status == 201 => {
             match extract_southbound_ref(producer, &req.path, &response) {
-                Some(southbound) => SouthboundOutcome::Live(southbound),
+                // #1877 (R27): remember where it was made.
+                Some(southbound) => SouthboundOutcome::Live(SouthboundRef {
+                    producer_base: Some(uri.clone()),
+                    ..southbound
+                }),
                 None => {
                     // The producer created something and did not say what. The NEF
                     // cannot unsubscribe it later, so accepting the northbound
@@ -1934,6 +2078,7 @@ fn extract_southbound_ref(
             producer,
             subscription_id,
             delete_path,
+            producer_base: None,
         });
     }
     let body: serde_json::Value = serde_json::from_str(response.http.content.as_deref()?).ok()?;
@@ -1948,34 +2093,62 @@ fn extract_southbound_ref(
         producer,
         subscription_id: subscription_id.clone(),
         delete_path: format!("{subscribe_path}/{subscription_id}"),
+        producer_base: None,
     })
 }
 
 /// Best-effort DELETE of the southbound producer subscription.
+/// #1877: the producer URI configured now for `producer`.
+pub(crate) fn producer_uri(producer: SouthboundProducer) -> Option<String> {
+    let ctx = nef_self();
+    let c = ctx.read().ok()?;
+    match producer {
+        SouthboundProducer::Amf => c.amf_uri(),
+        SouthboundProducer::Udm => c.udm_uri(),
+    }
+}
+
+/// Best-effort DELETE of the southbound producer subscription; one that fails is
+/// parked for [`southbound_reconcile`] and retried until the producer takes it
+/// (#1877). It used to be tried once and only logged.
 async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: SouthboundRef) {
+    if !try_southbound_unsubscribe(producer_uri, &southbound).await {
+        southbound_reconcile::park(southbound);
+    }
+}
+
+/// One DELETE of the southbound producer subscription: whether the producer
+/// answered 2xx, or 404 (it does not hold the subscription, the state wanted).
+pub(crate) async fn try_southbound_unsubscribe(
+    producer_uri: Option<String>,
+    southbound: &SouthboundRef,
+) -> bool {
     let producer = southbound.producer;
-    let Some(uri) = producer_uri else {
+    // #1877 (R27): the producer it was made at, else the one configured now.
+    let Some(uri) = southbound.producer_base.clone().or(producer_uri) else {
         log::debug!(
-            "no {} URI configured; southbound unsubscribe skipped",
+            "no {} URI configured; southbound unsubscribe not sent",
             producer.as_str()
         );
-        return;
+        return false;
     };
     let Some((host, port)) = parse_host_port(&uri) else {
         log::warn!(
-            "invalid {} URI '{uri}'; southbound unsubscribe skipped",
+            "invalid {} URI '{uri}'; southbound unsubscribe not sent",
             producer.as_str()
         );
-        return;
+        return false;
     };
     let client = service_client(&host, port, producer.nf_type());
     match client.delete(&southbound.delete_path).await {
-        Ok(response) if response.is_success() => {
+        Ok(response) if response.is_success() || response.status == 404 => {
             log::debug!(
-                "{} subscription {} removed",
+                "{} subscription {} removed (status {})",
                 producer.as_str(),
-                southbound.subscription_id
+                southbound.subscription_id,
+                response.status
             );
+            true
         }
         Ok(response) => {
             log::warn!(
@@ -1983,9 +2156,11 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
                 producer.as_str(),
                 response.status
             );
+            false
         }
         Err(e) => {
             log::warn!("{} unsubscribe failed: {e}", producer.as_str());
+            false
         }
     }
 }
@@ -2326,6 +2501,7 @@ fn render_prometheus() -> String {
         nrf_client: true,
     });
     DROPPED_PRODUCER_REPORTS.render(&mut out);
+    southbound_reconcile::render(&mut out);
     ueid::render_metrics(&mut out);
     out
 }
@@ -3217,6 +3393,424 @@ mod tests {
         }
     }
 
+    type Seen1877 = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// How long [`amf_1877`] holds a DELETE before answering it (ms). Set only by
+    /// tests that hold `lock_globals`, which the AMF stand-ins are used under.
+    static DELETE_DELAY_1877: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A stand-in AMF: POST answered 201 with a Location after `post_delay`; DELETE
+    /// answered with `delete` as it stands. Recorded as (method, uri).
+    async fn amf_1877(
+        post_delay: Duration,
+        delete: Arc<std::sync::atomic::AtomicU16>,
+    ) -> (nextgcore_sbi::server::SbiServer, String, Seen1877) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Seen1877 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                let delete = delete.load(Ordering::SeqCst);
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    if req.header.method == "DELETE" {
+                        let held = DELETE_DELAY_1877.load(Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(held)).await;
+                        return SbiResponse::with_status(delete);
+                    }
+                    tokio::time::sleep(post_delay).await;
+                    SbiResponse::with_status(201)
+                        .with_header("location", "/namf-evts/v1/subscriptions/s-1877")
+                }
+            })
+            .await;
+        (srv, format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    fn deletes_1877(seen: &Seen1877) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, u)| m == "DELETE" && u.ends_with("/subscriptions/s-1877"))
+            .count()
+    }
+
+    /// #1877: a create the AF drops while the AMF's subscribe is out leaves no AMF
+    /// subscription behind and no record: the create finishes on its own task, and
+    /// the 201 nobody read is removed with its producer leg.
+    ///
+    /// REVERT-VERIFIED: with the create awaited inline again, this fails: the AMF
+    /// subscription is never deleted.
+    #[test]
+    fn a_create_dropped_mid_subscribe_leaves_no_amf_subscription_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let (amf, amf_uri, seen) = amf_1877(
+                Duration::from_millis(300),
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            set_producers(Some(&amf_uri), None);
+            let request = monitoring_request(valid_monitoring_body());
+            {
+                let mut create = Box::pin(handle_monitoring_subscription_create(
+                    "af1",
+                    &request,
+                    NorthboundApi::T8MonitoringEvent,
+                ));
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !seen.lock().unwrap().iter().any(|(m, _)| m == "POST") {
+                    assert!(tokio::time::Instant::now() < deadline, "never subscribed");
+                    if tokio::time::timeout(Duration::from_millis(5), &mut create)
+                        .await
+                        .is_ok()
+                    {
+                        panic!("answered before the subscribe was out");
+                    }
+                }
+                // Dropped here: the AF went away.
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while deletes_1877(&seen) == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let held = nef_self().read().unwrap().subscription_count();
+            let deleted = deletes_1877(&seen);
+            amf.stop().await.ok();
+            assert_eq!(deleted, 1, "the AMF subscription is deleted");
+            assert_eq!(held, 0, "and the NEF holds no record of it");
+        });
+        reset_context();
+    }
+
+    /// #1877 (R27 #1947): a create that finished, whose 201 the AF never read, is
+    /// removed with its AMF subscription: the AF holds no `self` link to delete it by.
+    ///
+    /// REVERT-VERIFIED: with `CreateHandoff::abandon` ignoring a finished 201, this
+    /// fails: the record and the AMF subscription stay.
+    #[test]
+    fn a_create_whose_201_is_never_read_is_removed_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let (amf, amf_uri, seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            set_producers(Some(&amf_uri), None);
+            let request = monitoring_request(valid_monitoring_body());
+            {
+                let mut create = Box::pin(handle_monitoring_subscription_create(
+                    "af1",
+                    &request,
+                    NorthboundApi::T8MonitoringEvent,
+                ));
+                // Polled once (enough to start it), then never read.
+                let _ = tokio::time::timeout(Duration::from_millis(1), &mut create).await;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while nef_self().read().unwrap().subscription_count() == 0 {
+                    assert!(tokio::time::Instant::now() < deadline, "never stored");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Dropped here: the 201 is built and nobody reads it.
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while deletes_1877(&seen) == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let held = nef_self().read().unwrap().subscription_count();
+            let deleted = deletes_1877(&seen);
+            amf.stop().await.ok();
+            assert_eq!(held, 0, "the record is removed");
+            assert_eq!(deleted, 1, "with its AMF subscription");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #1877 (R27 #1947): an AF delete dropped while the AMF holds its producer
+    /// DELETE does not lose it. The DELETE runs on its own task, so when the AMF then
+    /// fails it the failure is still parked for the reconciler; the record it would
+    /// be found by is already gone, so nothing else would retry it.
+    ///
+    /// REVERT-VERIFIED: with the producer DELETE awaited inline again, this fails:
+    /// the dropped request takes the DELETE's outcome with it and nothing is parked.
+    #[test]
+    fn a_delete_dropped_mid_producer_delete_still_reconciles_it_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let status = Arc::new(std::sync::atomic::AtomicU16::new(204));
+            let (amf, amf_uri, seen) = amf_1877(Duration::ZERO, status.clone()).await;
+            set_producers(Some(&amf_uri), None);
+            let created = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            let sub_id = created_subscription_id(&created).expect("id");
+            // The AMF now holds a DELETE 300 ms, then fails it.
+            status.store(503, Ordering::SeqCst);
+            DELETE_DELAY_1877.store(300, Ordering::SeqCst);
+            let request = SbiRequest::delete(format!(
+                "/3gpp-monitoring-event/v1/af1/subscriptions/{sub_id}"
+            ));
+            {
+                let mut delete = Box::pin(handle_monitoring_subscription_delete(
+                    "af1", &sub_id, &request,
+                ));
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while deletes_1877(&seen) == 0 {
+                    assert!(tokio::time::Instant::now() < deadline, "DELETE never sent");
+                    let _ = tokio::time::timeout(Duration::from_millis(5), &mut delete).await;
+                }
+                // Dropped here, while the AMF holds the DELETE: the AF went away.
+            }
+            let ours = |r: &SouthboundRef| r.subscription_id == "s-1877";
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !southbound_reconcile::parked().iter().any(ours)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let parked = southbound_reconcile::parked().iter().any(ours);
+            let held = nef_self().read().unwrap().subscription_count();
+            DELETE_DELAY_1877.store(0, Ordering::SeqCst);
+            amf.stop().await.ok();
+            assert_eq!(held, 0, "the record is gone");
+            assert!(parked, "and the failed DELETE is parked for the reconciler");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #1877 (R27 #1947 minor): a parked producer DELETE goes to the producer the
+    /// subscription was made at, not to whichever AMF is configured when it is
+    /// retried (the new one answers 404 while the old one keeps the subscription).
+    ///
+    /// REVERT-VERIFIED: with the configured URI used instead of `producer_base`, this
+    /// fails: the retry goes to the new AMF.
+    #[test]
+    fn a_retried_unsubscribe_goes_to_the_producer_it_was_made_at_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+            let (old_amf, old_uri, old_seen) = amf_1877(Duration::ZERO, status.clone()).await;
+            let (new_amf, new_uri, new_seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(404)),
+            )
+            .await;
+            set_producers(Some(&old_uri), None);
+            let created = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            let sub_id = created_subscription_id(&created).expect("id");
+            let request = SbiRequest::delete(format!(
+                "/3gpp-monitoring-event/v1/af1/subscriptions/{sub_id}"
+            ));
+            handle_monitoring_subscription_delete("af1", &sub_id, &request).await;
+            // The operator re-points the NEF at another AMF; the old one recovers.
+            set_producers(Some(&new_uri), None);
+            status.store(204, Ordering::SeqCst);
+            southbound_reconcile::reconcile_once().await;
+            let (to_old, to_new) = (deletes_1877(&old_seen), deletes_1877(&new_seen));
+            old_amf.stop().await.ok();
+            new_amf.stop().await.ok();
+            assert_eq!(
+                to_old, 2,
+                "failed once, then delivered at the AMF it was made at"
+            );
+            assert_eq!(to_new, 0, "never sent to the AMF configured later");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #1877 (R30 #1954): a parked unsubscribe toward a blackholed producer does
+    /// not starve one toward a healthy producer behind it. The one tried and failed
+    /// goes to the back, the untried keeps its turn, so the healthy one is sent on
+    /// the next pass.
+    ///
+    /// REVERT-VERIFIED: with every entry re-parked at the front in order, as before,
+    /// this fails: the healthy producer's DELETE is never sent.
+    #[test]
+    fn a_blackholed_producer_does_not_starve_a_healthy_one_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hole = blackhole.local_addr().unwrap();
+            let held = tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((c, _)) = blackhole.accept().await {
+                    conns.push(c);
+                }
+            });
+            let (amf, amf_uri, seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            let at = |base: String, id: &str| SouthboundRef {
+                producer: SouthboundProducer::Amf,
+                subscription_id: id.to_string(),
+                delete_path: format!("/namf-evts/v1/subscriptions/{id}"),
+                producer_base: Some(base),
+            };
+            southbound_reconcile::park(at(format!("http://{hole}"), "dead-1877"));
+            southbound_reconcile::park(at(amf_uri.clone(), "s-1877"));
+
+            southbound_reconcile::reconcile_once().await;
+            southbound_reconcile::reconcile_once().await;
+            let delivered = deletes_1877(&seen);
+            let dead_parked = southbound_reconcile::parked()
+                .iter()
+                .any(|r| r.subscription_id == "dead-1877");
+            held.abort();
+            amf.stop().await.ok();
+            assert_eq!(delivered, 1, "the healthy producer's DELETE is sent");
+            assert!(dead_parked, "the blackholed one stays parked");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #1877 (R27 #1972): several unsubscribes toward one failing producer cost one
+    /// attempt per pass, not one each (the rest of that producer's are skipped for
+    /// the pass), and a healthy producer behind them is still served in that pass.
+    /// A second pass inside the producer's backoff tries it not at all.
+    ///
+    /// REVERT-VERIFIED: with the backoff disabled, this fails: three attempts at the
+    /// failing producer in one pass.
+    #[test]
+    fn a_failing_producer_costs_one_attempt_per_pass_and_backs_off_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let (dead, dead_uri, dead_seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(503)),
+            )
+            .await;
+            let (live, live_uri, live_seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            let at = |base: &str, id: &str| SouthboundRef {
+                producer: SouthboundProducer::Amf,
+                subscription_id: id.to_string(),
+                delete_path: format!("/namf-evts/v1/subscriptions/{id}"),
+                producer_base: Some(base.to_string()),
+            };
+            for n in 0..3 {
+                southbound_reconcile::park(at(&dead_uri, &format!("dead-{n}")));
+            }
+            southbound_reconcile::park(at(&live_uri, "s-1877"));
+            let attempts = |seen: &Seen1877| {
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(m, _)| m == "DELETE")
+                    .count()
+            };
+
+            southbound_reconcile::reconcile_once().await;
+            let first = (attempts(&dead_seen), deletes_1877(&live_seen));
+            southbound_reconcile::reconcile_once().await;
+            let second = attempts(&dead_seen);
+            tokio::time::sleep(southbound_reconcile::BACKOFF_BASE + Duration::from_millis(100))
+                .await;
+            southbound_reconcile::reconcile_once().await;
+            let third = attempts(&dead_seen);
+            dead.stop().await.ok();
+            live.stop().await.ok();
+
+            assert_eq!(
+                first,
+                (1, 1),
+                "one attempt at the failing producer, the healthy one served"
+            );
+            assert_eq!(second, 1, "none inside its backoff");
+            assert_eq!(third, 2, "one again once the backoff ran out");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #1877: an AF delete whose AMF unsubscribe fails is parked and retried until
+    /// the AMF takes it; the record is gone at once.
+    ///
+    /// REVERT-VERIFIED: with `southbound_unsubscribe` not parking a failure, this
+    /// fails: nothing is parked and the AMF keeps the subscription.
+    #[test]
+    fn a_failed_unsubscribe_is_reconciled_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+            let (amf, amf_uri, seen) = amf_1877(Duration::ZERO, status.clone()).await;
+            set_producers(Some(&amf_uri), None);
+            let created = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            assert_eq!(created.status, 201);
+            let sub_id = created_subscription_id(&created).expect("id");
+            let deleted = handle_monitoring_subscription_delete(
+                "af1",
+                &sub_id,
+                &SbiRequest::delete(format!(
+                    "/3gpp-monitoring-event/v1/af1/subscriptions/{sub_id}"
+                )),
+            )
+            .await;
+            let ours = |r: &SouthboundRef| r.subscription_id == "s-1877";
+            let parked_after_delete = southbound_reconcile::parked().iter().any(ours);
+            let held = nef_self().read().unwrap().subscription_count();
+            status.store(204, Ordering::SeqCst);
+            southbound_reconcile::reconcile_once().await;
+            let parked_after = southbound_reconcile::parked().iter().any(ours);
+            let tries = deletes_1877(&seen);
+            amf.stop().await.ok();
+            southbound_reconcile::clear_for_test();
+
+            assert_eq!(deleted.status, 204);
+            assert_eq!(held, 0, "the record goes at once");
+            assert!(parked_after_delete, "the failed unsubscribe is parked");
+            assert!(!parked_after, "and delivered once the AMF answers");
+            assert_eq!(tries, 2, "once at delete, once reconciled");
+        });
+        reset_context();
+    }
+
     /// **Issue #111, criterion 1.** Every `serviceName` in the NRF profile resolves
     /// to a real northbound route, not to the router's `send_not_found`.
     ///
@@ -3431,6 +4025,7 @@ mod tests {
             producer,
             subscription_id: format!("p-{id}"),
             delete_path: format!("/x/{id}"),
+            producer_base: None,
         });
         if !tokened {
             sub.notify_token = None;
@@ -4926,8 +5521,11 @@ mod southbound_oauth2_1661_tests {
     /// and its unsubscribe are not sent, not even bare. The subscribe is not
     /// Live, so no southbound reference is stored for it. The recorder here is
     /// UNGATED, so it would see a bare send.
+    #[allow(clippy::await_holding_lock)] // the NEF state lock, held across the test (#1877)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_token_fetch_sends_nothing_1661() {
+        // #1877: its unsubscribe fails and parks into the NEF's global set.
+        let _globals = crate::context::lock_nef_context_for_test();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sink = std::sync::Arc::clone(&seen);
@@ -4964,6 +5562,7 @@ mod southbound_oauth2_1661_tests {
                         producer: SouthboundProducer::Amf,
                         subscription_id: "s-1".to_string(),
                         delete_path: "/namf-evts/v1/subscriptions/s-1".to_string(),
+                        producer_base: None,
                     },
                 )
                 .await;
@@ -4983,9 +5582,12 @@ mod southbound_oauth2_1661_tests {
     /// #1661: the GPSI resolution (UDM), and the AMF and UDM southbound
     /// subscriptions and their unsubscribes, pass OAuth2-required producers of the
     /// right NF type with the installed client, and are refused 401 without one.
+    #[allow(clippy::await_holding_lock)] // the NEF state lock, held across the test (#1877)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gpsi_resolution_and_the_amf_and_udm_subscriptions_pass_oauth2_required_producers_1661()
     {
+        // #1877: an unsubscribe that fails parks into the NEF's global set.
+        let _globals = crate::context::lock_nef_context_for_test();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let sk = nextgcore_sbi::oauth::generate_es256_key();
         let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;

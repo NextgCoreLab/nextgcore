@@ -88,11 +88,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          only by its resource scope (#1811)",
     ),
     (
-        "nextgcore-pcfd",
-        r#"parts[4] == "events-subscription""#,
-        "#1937: the app-session events-subscription sub-resource is not yet bound",
-    ),
-    (
         "nextgcore-nwdafd",
         r#"["subscriptions", id] if m.role == Role::Anlf"#,
         "#1937: MLModelMonitor subscriptions (demo-feature gated) are not yet bound",

@@ -672,13 +672,26 @@ mod tests {
                 );
 
                 let id = format!("mbs-sess-{}", session.id);
-                assert_eq!(crate::handle_mbs_session_release(&id).await.status, 204);
+                assert_eq!(
+                    crate::handle_mbs_session_release(
+                        &id,
+                        &nextgcore_sbi::message::SbiRequest::default()
+                    )
+                    .await
+                    .status,
+                    204
+                );
                 assert!(
                     !amf_holds(&context_ref),
                     "after release the AMF holds no context for the session"
                 );
                 assert_eq!(
-                    crate::handle_mbs_session_release(&id).await.status,
+                    crate::handle_mbs_session_release(
+                        &id,
+                        &nextgcore_sbi::message::SbiRequest::default()
+                    )
+                    .await
+                    .status,
                     404,
                     "a repeated release is idempotent"
                 );
@@ -1047,7 +1060,10 @@ mod tests {
 
         // A is released; its ContextDelete is held at the AMF.
         let a_id = format!("mbs-sess-{}", a_session.id);
-        let release = tokio::spawn(async move { crate::handle_mbs_session_release(&a_id).await });
+        let release = tokio::spawn(async move {
+            crate::handle_mbs_session_release(&a_id, &nextgcore_sbi::message::SbiRequest::default())
+                .await
+        });
         arrived.notified().await;
         // B, on the same TMGI, is created while that delete is in flight.
         let b_session = session(&ctx);
@@ -1184,8 +1200,9 @@ mod tests {
         assert!(ctx.read().unwrap().record_amf_context(session.id, context));
 
         let id = format!("mbs-sess-{}", session.id);
+        let anonymous = nextgcore_sbi::message::SbiRequest::default();
         tokio::select! {
-            _ = crate::handle_mbs_session_release(&id) => {
+            _ = crate::handle_mbs_session_release(&id, &anonymous) => {
                 panic!("the AMF holds the delete; the release cannot finish")
             }
             _ = arrived.notified() => {}
@@ -1458,6 +1475,149 @@ mod tests {
             "nor is the token admitted any more"
         );
         ctx.read().unwrap().session_remove(session.id);
+    }
+
+    /// **#1930**: a released session's ContextDelete dropped because a later
+    /// session holds the same AMF context leaves no notify token behind. The
+    /// released session's token (the one the AMF notifies: it keeps the first
+    /// create's notifyUri) passes to the session holding the context, and every
+    /// token of the context goes with that session's release.
+    ///
+    /// REVERT-VERIFIED: with `forget_amf_context_tokens` forgetting only the
+    /// record's own token, A's token outlives B's release ("A's token goes with the
+    /// context"); with the hand-over loop in `record_amf_context` removed, A's
+    /// token still names the released session ("A's token is B's now").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_delete_leaves_no_token_behind_1930() {
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        let _ngap = stand_in_ngap();
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let tmgi = tmgi_1758([0x07, 0x19, 0x30]);
+        let ctx = crate::mbsmf_self();
+        crate::TEST_OAUTH2_CLIENT
+            .scope(oauth2, async {
+                let a = ctx
+                    .read()
+                    .unwrap()
+                    .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+                    .expect("A");
+                let a_ref = crate::create_amf_mbs_context(a.id, tmgi.clone(), amf.clone(), leg())
+                    .await
+                    .expect("A's context");
+                // A's release, up to its ContextDelete.
+                ctx.read().unwrap().session_remove(a.id);
+                let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+                let a_token = a_contexts[0].notify_token.clone();
+                // B, on the same TMGI, is handed the same AMF context.
+                let b = ctx
+                    .read()
+                    .unwrap()
+                    .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+                    .expect("B");
+                let b_ref = crate::create_amf_mbs_context(b.id, tmgi.clone(), amf.clone(), leg())
+                    .await
+                    .expect("B's context");
+                assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
+                let b_token = ctx.read().unwrap().amf_contexts_of(b.id)[0]
+                    .notify_token
+                    .clone();
+                // A's delete is dropped: B holds the context.
+                assert!(crate::release_amf_contexts(a_contexts).await);
+                assert!(amf_holds(&b_ref), "B keeps the context");
+                assert_eq!(
+                    ctx.read().unwrap().amf_notify_session(&a_token),
+                    Some(b.id),
+                    "A's token is B's now"
+                );
+
+                let id = format!("mbs-sess-{}", b.id);
+                assert_eq!(
+                    crate::handle_mbs_session_release(
+                        &id,
+                        &nextgcore_sbi::message::SbiRequest::default()
+                    )
+                    .await
+                    .status,
+                    204
+                );
+                eventually("A's token goes with the context", || {
+                    let c = ctx.read().unwrap();
+                    c.amf_notify_session(&a_token).is_none()
+                        && c.amf_notify_session(&b_token).is_none()
+                })
+                .await;
+            })
+            .await;
+    }
+
+    /// **#1930**: more dropped deletes than MAX_AMF_NOTIFY_TOKENS, each followed by
+    /// the release of the session that held the context, leave the token map with
+    /// room: a new ContextCreate still gets a token.
+    ///
+    /// REVERT-VERIFIED: with `forget_amf_context_tokens` forgetting only the
+    /// record's own token, every released session's token stays, the map fills,
+    /// and a mint inside the loop fails ("B's token").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_deletes_past_the_cap_still_let_a_create_through_1930() {
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        let tmgi = tmgi_1758([0x08, 0x19, 0x30]);
+        let record = |token: String, n: usize| crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            // Nothing is sent: the delete of a context in use is dropped first.
+            port: 9,
+            nf_instance_id: None,
+            context_ref: format!("cap-1930-{n}"),
+            notify_token: token,
+            tmgi: Some(tmgi.clone()),
+        };
+        let add = || {
+            ctx.read()
+                .unwrap()
+                .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+                .expect("session")
+        };
+        for n in 0..crate::context::MAX_AMF_NOTIFY_TOKENS + 8 {
+            let a = add();
+            let a_token = ctx
+                .read()
+                .unwrap()
+                .mint_amf_notify_token(a.id)
+                .expect("A's token");
+            assert!(ctx
+                .read()
+                .unwrap()
+                .record_amf_context(a.id, record(a_token, n)));
+            let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+            ctx.read().unwrap().session_remove(a.id);
+            let b = add();
+            let b_token = ctx
+                .read()
+                .unwrap()
+                .mint_amf_notify_token(b.id)
+                .expect("B's token");
+            assert!(ctx
+                .read()
+                .unwrap()
+                .record_amf_context(b.id, record(b_token, n)));
+            assert_eq!(crate::delete_in_lane(&a_contexts[0]).await, None, "dropped");
+            // B's release: the AMF answers 404 (gone), so its tokens go at once.
+            // Taken first: retiring re-reads the global context, and a read guard
+            // held across it deadlocks behind another test's queued writer
+            // (`mbsmf_context_init`).
+            let b_contexts = ctx.read().unwrap().take_amf_contexts(b.id);
+            for c in b_contexts {
+                crate::retire_amf_notify_token(&c, ContextDeleteOutcome::Gone);
+            }
+            ctx.read().unwrap().session_remove(b.id);
+        }
+        let c = add();
+        assert!(
+            ctx.read().unwrap().mint_amf_notify_token(c.id).is_some(),
+            "a token is still minted past the cap"
+        );
+        ctx.read().unwrap().session_remove(c.id);
     }
 }
 

@@ -213,7 +213,7 @@ async fn delete_posts_a_terminate_notification() {
         format!("http://127.0.0.1:{port}/namf-callback/v1/supi/ue-policy-notify");
     let assoc = ue_policy_add("imsi-001010000009211", &notification_uri, "");
 
-    let resp = handle_ue_policy_delete(&assoc.pol_asso_id).await;
+    let resp = handle_ue_policy_delete(&assoc.pol_asso_id, &Req::default()).await;
     assert_eq!(resp.status, 204, "the delete itself answers 204");
     assert!(
         ue_policy_find(&assoc.pol_asso_id).is_none(),

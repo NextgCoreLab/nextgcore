@@ -242,6 +242,7 @@ where
         peer_cert_nf_instance_id: None,
         peer_cert_nf_types: Vec::new(),
         oauth2_subject: None,
+        oauth2_scope: None,
     };
 
     let sbi_response = handler.handle(sbi_request).await;

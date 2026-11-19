@@ -101,6 +101,9 @@ pub struct PcfUeBinding {
     // PcfForUeBinding (:1390-1420) does not define them, so emitting them here
     // polluted the resource representation.
     pub management_features: u64,
+    /// #1937: the verified identity of the PCF that registered it
+    /// (`nextgcore_sbi::owner_binding`); only it may update or delete it.
+    pub owner: Option<String>,
 }
 
 /// PCF for MBS binding (TS 29.521 §4.2.2.4, pcf-mbs-bindings resource).
@@ -120,6 +123,9 @@ pub struct PcfMbsBinding {
     pub bind_level: Option<String>,
     pub recovery_time: Option<String>,
     pub management_features: u64,
+    /// #1937: the verified identity of the PCF that registered it
+    /// (`nextgcore_sbi::owner_binding`); only it may update or delete it.
+    pub owner: Option<String>,
 }
 
 /// Canonical comparison key for a TS 29.571 `MbsSessionId`.
@@ -445,6 +451,13 @@ pub struct BsfSess {
 
     /// SBI management features
     pub management_features: u64,
+
+    /// #1937: the verified identity of the PCF that registered this binding
+    /// (`nextgcore_sbi::owner_binding`); only it may update or deregister it
+    /// (TS 29.521 §5.2.2.3, §5.2.2.4). `None` when the creator proved none
+    /// (dev), or for a binding restored from before #1937, which is frozen
+    /// under the production profile.
+    pub owner: Option<String>,
 }
 
 /// SBI feature flag for binding update
@@ -479,6 +492,7 @@ impl BsfSess {
             recovery_time: None,
             pcf_diam_host: None,
             pcf_diam_realm: None,
+            owner: None,
             management_features: SBI_NBSF_MANAGEMENT_BINDING_UPDATE,
         }
     }
@@ -923,27 +937,57 @@ impl BsfContext {
 
     /// Remove session
     pub fn sess_remove(&self, id: u64) -> Option<BsfSess> {
-        let mut sess_list = self.sess_list.write().ok()?;
+        self.sess_remove_checked(id, |_| Ok::<(), ()>(()))
+            .ok()
+            .flatten()
+    }
+
+    /// #1937 (R32 on #1959): remove session `id` only if `check` admits the
+    /// session stored under it AT REMOVAL TIME. The check and the removal run
+    /// under one `sess_list` write lock, so a pool id freed and reused by
+    /// another PCF's binding in between cannot be removed on the strength of
+    /// a check made against the old one. `Ok(None)`: nothing stored under `id`.
+    pub fn sess_remove_checked<E>(
+        &self,
+        id: u64,
+        check: impl FnOnce(&BsfSess) -> Result<(), E>,
+    ) -> Result<Option<BsfSess>, E> {
+        let Ok(mut sess_list) = self.sess_list.write() else {
+            return Ok(None);
+        };
+        match sess_list.get(&id) {
+            Some(current) => check(current)?,
+            None => return Ok(None),
+        }
 
         if let Some(sess) = sess_list.remove(&id) {
-            // Remove from IPv4 hash
+            // #1877 (R27 on #1976): an address index entry goes only when it still
+            // names THIS binding. A newer binding for the same UE address (a PDU
+            // session re-established with a new SM policy) re-pointed it, and an
+            // unconditional remove dropped the newer binding from discovery by UE
+            // address (TS 29.521 §5.2.2.4) while it stayed stored.
             if let (Ok(mut hash), Some(addr)) = (self.ipv4addr_hash.write(), sess.ipv4addr) {
-                hash.remove(&addr);
+                if hash.get(&addr) == Some(&id) {
+                    hash.remove(&addr);
+                }
             }
-            // Remove from IPv6 hash
             if let (Ok(mut hash), Some(ref prefix)) =
                 (self.ipv6prefix_hash.write(), &sess.ipv6prefix)
             {
-                hash.remove(&prefix.hash_key());
+                let key = prefix.hash_key();
+                if hash.get(&key) == Some(&id) {
+                    hash.remove(&key);
+                }
             }
-            // Remove from MAC hash
             if let (Ok(mut hash), Some(ref mac)) = (self.mac_hash.write(), &sess.mac_addr48) {
-                hash.remove(mac);
+                if hash.get(mac) == Some(&id) {
+                    hash.remove(mac);
+                }
             }
             log::debug!("BSF session removed (id={id})");
-            return Some(sess);
+            return Ok(Some(sess));
         }
-        None
+        Ok(None)
     }
 
     /// Remove all sessions
@@ -1094,6 +1138,12 @@ impl BsfContext {
     pub fn sess_update(&self, sess: &BsfSess) -> bool {
         if let Ok(mut sess_list) = self.sess_list.write() {
             if let Some(existing) = sess_list.get_mut(&sess.id) {
+                // #1937: a pool id freed and reused by another PCF's binding
+                // while this update ran is not overwritten with the old one.
+                // A fresh register sets the owner of an ownerless record.
+                if existing.owner.is_some() && existing.owner != sess.owner {
+                    return false;
+                }
                 *existing = sess.clone();
                 return true;
             }
@@ -1276,6 +1326,23 @@ impl BsfContext {
         self.ue_binding_list.write().ok()?.remove(id)
     }
 
+    /// #1937: remove binding `id` only if `check` admits it, under one
+    /// write lock. `Ok(None)`: no such binding.
+    pub fn ue_binding_remove_checked<E>(
+        &self,
+        id: &str,
+        check: impl FnOnce(&PcfUeBinding) -> Result<(), E>,
+    ) -> Result<Option<PcfUeBinding>, E> {
+        let Ok(mut list) = self.ue_binding_list.write() else {
+            return Ok(None);
+        };
+        match list.get(id) {
+            Some(current) => check(current)?,
+            None => return Ok(None),
+        }
+        Ok(list.remove(id))
+    }
+
     pub fn ue_binding_update(&self, binding: &PcfUeBinding) -> bool {
         if let Ok(mut list) = self.ue_binding_list.write() {
             if let Some(existing) = list.get_mut(&binding.binding_id) {
@@ -1324,6 +1391,23 @@ impl BsfContext {
 
     pub fn mbs_binding_remove(&self, id: &str) -> Option<PcfMbsBinding> {
         self.mbs_binding_list.write().ok()?.remove(id)
+    }
+
+    /// #1937: remove binding `id` only if `check` admits it, under one
+    /// write lock. `Ok(None)`: no such binding.
+    pub fn mbs_binding_remove_checked<E>(
+        &self,
+        id: &str,
+        check: impl FnOnce(&PcfMbsBinding) -> Result<(), E>,
+    ) -> Result<Option<PcfMbsBinding>, E> {
+        let Ok(mut list) = self.mbs_binding_list.write() else {
+            return Ok(None);
+        };
+        match list.get(id) {
+            Some(current) => check(current)?,
+            None => return Ok(None),
+        }
+        Ok(list.remove(id))
     }
 
     pub fn mbs_binding_update(&self, binding: &PcfMbsBinding) -> bool {
@@ -1448,6 +1532,9 @@ pub fn sess_to_doc(sess: &BsfSess) -> nextgcore_dbi::mongodb::bson::Document {
     if let Some(ref v) = sess.pcf_diam_host {
         d.insert("pcf_diam_host", v);
     }
+    if let Some(ref v) = sess.owner {
+        d.insert("owner", v);
+    }
     if let Some(ref v) = sess.pcf_diam_realm {
         d.insert("pcf_diam_realm", v);
     }
@@ -1532,6 +1619,9 @@ pub fn doc_to_sess(doc: &nextgcore_dbi::mongodb::bson::Document) -> BsfSess {
     }
     if let Ok(v) = doc.get_str("pcf_diam_host") {
         sess.pcf_diam_host = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("owner") {
+        sess.owner = Some(v.to_string());
     }
     if let Ok(v) = doc.get_str("pcf_diam_realm") {
         sess.pcf_diam_realm = Some(v.to_string());
@@ -1835,6 +1925,44 @@ mod tests {
         let ctx = BsfContext::new();
         assert!(!ctx.is_initialized());
         assert_eq!(ctx.sess_count(), 0);
+    }
+
+    /// #1877 (R27 on #1976): removing an old binding keeps a newer binding for the
+    /// same UE address (and IPv6 prefix and MAC) discoverable by that address.
+    ///
+    /// REVERT-VERIFIED: with the index entries removed unconditionally, this fails:
+    /// the newer binding is no longer found by its UE address.
+    #[test]
+    fn removing_an_old_binding_keeps_the_new_one_found_by_address_1877() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let mac = "02-00-00-00-18-76";
+        let old = ctx
+            .sess_add_binding(Some("10.18.76.1"), Some("fd18::1/128"), Some(mac))
+            .expect("old");
+        let new = ctx
+            .sess_add_binding(Some("10.18.76.1"), Some("fd18::1/128"), Some(mac))
+            .expect("new");
+        assert_ne!(old.id, new.id);
+
+        ctx.sess_remove(old.id);
+
+        let by_v4 = ctx.sess_find_by_ipv4addr("10.18.76.1").map(|s| s.id);
+        let by_v6 = ctx.sess_find_by_ipv6prefix("fd18::1/128").map(|s| s.id);
+        let by_mac = ctx.sess_find_by_mac(mac).map(|s| s.id);
+        assert_eq!(
+            by_v4,
+            Some(new.id),
+            "the new binding is found by its UE address"
+        );
+        assert_eq!(by_v6, Some(new.id), "and by its IPv6 prefix");
+        assert_eq!(by_mac, Some(new.id), "and by its MAC address");
+
+        ctx.sess_remove(new.id);
+        assert!(
+            ctx.sess_find_by_ipv4addr("10.18.76.1").is_none(),
+            "and gone with it"
+        );
     }
 
     #[test]
@@ -2414,6 +2542,7 @@ mod tests {
         sess.recovery_time = Some("2026-06-01T00:00:00Z".to_string());
         sess.pcf_diam_host = Some("pcf.diam.example.com".to_string());
         sess.pcf_diam_realm = Some("example.com".to_string());
+        sess.owner = Some("19370000-0000-4000-8000-0000000000bf".to_string());
 
         let doc = sess_to_doc(&sess);
         let restored = doc_to_sess(&doc);
@@ -2449,6 +2578,11 @@ mod tests {
             Some("pcf.diam.example.com")
         );
         assert_eq!(restored.pcf_diam_realm.as_deref(), Some("example.com"));
+        // #1937: the registering PCF survives a restart.
+        assert_eq!(
+            restored.owner.as_deref(),
+            Some("19370000-0000-4000-8000-0000000000bf")
+        );
     }
 
     // bsfd-07: sess_find_by_dnn_snssai_supi
@@ -2511,6 +2645,7 @@ mod tests {
             bind_level: None,
             recovery_time: None,
             management_features: 0x1,
+            owner: None,
         };
         ctx.ue_binding_add(b.clone());
 
@@ -2572,6 +2707,7 @@ mod tests {
             bind_level: None,
             recovery_time: None,
             management_features: 0x1,
+            owner: None,
         };
         ctx.mbs_binding_add(b1.clone());
 
@@ -2593,6 +2729,7 @@ mod tests {
             bind_level: None,
             recovery_time: None,
             management_features: 0x1,
+            owner: None,
         };
         ctx.mbs_binding_add(b2);
         assert_eq!(ctx.mbs_binding_find_by_mbs_session_id(&id_abc).len(), 2);
