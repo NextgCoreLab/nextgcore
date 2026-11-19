@@ -6854,6 +6854,9 @@ impl NgapServer {
             return Ok(());
         }
         state.amf_ue.allowed_nssai = allowed;
+        // #1999: a registration starts with no NSAC rejection of its own; one from an
+        // earlier registration is not this one's to report.
+        state.amf_ue.rejected_nssai.clear();
 
         // Network Slice Admission Control (TS 29.536 / TS 23.501 §5.15.11):
         // query the NSACF for each Allowed S-NSSAI subject to admission control
@@ -7470,8 +7473,8 @@ impl NgapServer {
         reconciled: Option<UpdateSessionOutcome>,
         ul_count: u32,
     ) -> Result<()> {
-        let Some(mut plain) = gmm_build::build_registration_accept_for_sessions(
-            &state.amf_ue,
+        let Some(mut plain) = registration_accept_once(
+            &mut state.amf_ue,
             reconciled.as_ref().and_then(|r| r.pdu_session_status),
             reconciled.as_ref().and_then(|r| r.reactivation_result),
         ) else {
@@ -21699,12 +21702,24 @@ impl NgapServer {
 // NAS parsing / helper functions (TS 24.501)
 // ============================================================================
 
-/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
-///
-/// #753: this used to be a SECOND random UUID per process, so it could not be
-/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
-/// UDM therefore saw a "new AMF" and sent the restarted AMF a
-/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
+/// #1999: build a Registration Accept, then forget the Rejected NSSAI it carried. The
+/// rejection belongs to the registration procedure that produced it (TS 24.501
+/// §5.5.1.2.4): a later accept that ran no NSAC must not report it again, stale. A
+/// T3550 retransmission resends the stored PDU, so it still carries it.
+fn registration_accept_once(
+    amf_ue: &mut crate::context::AmfUe,
+    pdu_session_status: Option<u16>,
+    reactivation_result: Option<u16>,
+) -> Option<Vec<u8>> {
+    let accept = gmm_build::build_registration_accept_for_sessions(
+        amf_ue,
+        pdu_session_status,
+        reactivation_result,
+    );
+    amf_ue.rejected_nssai.clear();
+    accept
+}
+
 /// #1942: apply NSAC's answer to a registering UE. The rejected S-NSSAIs leave the
 /// Allowed NSSAI and are recorded as the Rejected NSSAI the Registration Accept
 /// carries. When none is left, the Registration Reject to send: 5GMM #62 "No network
@@ -21736,6 +21751,12 @@ fn nsac_access_type(access_type: u8) -> &'static str {
     }
 }
 
+/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
+///
+/// #753: this used to be a SECOND random UUID per process, so it could not be
+/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
+/// UDM therefore saw a "new AMF" and sent the restarted AMF a
+/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
 fn amf_instance_id() -> String {
     nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
 }
@@ -43734,6 +43755,30 @@ mod tests {
             "with the NAS state gone too, which is the pre-#361 behaviour this setting \
              preserves for a deployment whose regulation forbids the feature"
         );
+    }
+
+    /// #1999: the Rejected NSSAI goes out in the Registration Accept of the
+    /// procedure whose NSAC produced it, and not again in a later accept.
+    ///
+    /// REVERT-VERIFIED: with the accept not clearing it, this fails: the second
+    /// accept repeats the stale Rejected NSSAI IE.
+    #[test]
+    fn the_rejected_nssai_is_reported_once_1999() {
+        let mut ue = UeNasContext::new(7_199_901, 1, 1, false).amf_ue;
+        ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        ue.rejected_nssai = vec![SNssai { sst: 2, sd: None }];
+        let ie = [0x11u8, 0x02, 0x11, 0x02];
+        let carries = |pdu: &[u8]| pdu.windows(ie.len()).any(|w| w == ie);
+
+        let first = registration_accept_once(&mut ue, None, None).expect("accept");
+        let second = registration_accept_once(&mut ue, None, None).expect("accept");
+
+        assert!(
+            carries(&first),
+            "the procedure's own accept carries it: {first:02x?}"
+        );
+        assert!(!carries(&second), "a later accept does not: {second:02x?}");
+        assert!(ue.rejected_nssai.is_empty());
     }
 
     /// #1942: NSAC's answer applied to a registering UE. A rejected S-NSSAI leaves
