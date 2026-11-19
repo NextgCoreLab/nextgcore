@@ -445,6 +445,13 @@ pub struct BsfSess {
 
     /// SBI management features
     pub management_features: u64,
+
+    /// #1937: the verified identity of the PCF that registered this binding
+    /// (`nextgcore_sbi::owner_binding`); only it may update or deregister it
+    /// (TS 29.521 §5.2.2.3, §5.2.2.4). `None` when the creator proved none
+    /// (dev), or for a binding restored from before #1937, which is frozen
+    /// under the production profile.
+    pub owner: Option<String>,
 }
 
 /// SBI feature flag for binding update
@@ -479,6 +486,7 @@ impl BsfSess {
             recovery_time: None,
             pcf_diam_host: None,
             pcf_diam_realm: None,
+            owner: None,
             management_features: SBI_NBSF_MANAGEMENT_BINDING_UPDATE,
         }
     }
@@ -1448,6 +1456,9 @@ pub fn sess_to_doc(sess: &BsfSess) -> nextgcore_dbi::mongodb::bson::Document {
     if let Some(ref v) = sess.pcf_diam_host {
         d.insert("pcf_diam_host", v);
     }
+    if let Some(ref v) = sess.owner {
+        d.insert("owner", v);
+    }
     if let Some(ref v) = sess.pcf_diam_realm {
         d.insert("pcf_diam_realm", v);
     }
@@ -1532,6 +1543,9 @@ pub fn doc_to_sess(doc: &nextgcore_dbi::mongodb::bson::Document) -> BsfSess {
     }
     if let Ok(v) = doc.get_str("pcf_diam_host") {
         sess.pcf_diam_host = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("owner") {
+        sess.owner = Some(v.to_string());
     }
     if let Ok(v) = doc.get_str("pcf_diam_realm") {
         sess.pcf_diam_realm = Some(v.to_string());
@@ -2414,6 +2428,7 @@ mod tests {
         sess.recovery_time = Some("2026-06-01T00:00:00Z".to_string());
         sess.pcf_diam_host = Some("pcf.diam.example.com".to_string());
         sess.pcf_diam_realm = Some("example.com".to_string());
+        sess.owner = Some("19370000-0000-4000-8000-0000000000bf".to_string());
 
         let doc = sess_to_doc(&sess);
         let restored = doc_to_sess(&doc);
@@ -2449,6 +2464,11 @@ mod tests {
             Some("pcf.diam.example.com")
         );
         assert_eq!(restored.pcf_diam_realm.as_deref(), Some("example.com"));
+        // #1937: the registering PCF survives a restart.
+        assert_eq!(
+            restored.owner.as_deref(),
+            Some("19370000-0000-4000-8000-0000000000bf")
+        );
     }
 
     // bsfd-07: sess_find_by_dnn_snssai_supi
