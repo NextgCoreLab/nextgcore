@@ -1301,20 +1301,21 @@ pub fn handle_subscribe(
     request: &SbiRequest,
     required: bool,
 ) -> SbiResponse {
-    let parse = || -> Result<MonitorSub, SbiResponse> {
+    let parse = || -> Result<MonitorSub, Box<SbiResponse>> {
         let Some(body) = body_json(request) else {
-            return Err(send_bad_request(
+            return Err(Box::new(send_bad_request(
                 "body is not JSON",
                 Some("INVALID_MSG_FORMAT"),
-            ));
+            )));
         };
-        parse_subscription(&body).map_err(|e| send_bad_request(&e, Some("MANDATORY_IE_MISSING")))
+        parse_subscription(&body)
+            .map_err(|e| Box::new(send_bad_request(&e, Some("MANDATORY_IE_MISSING"))))
     };
     match id {
         None => {
             let sub = match parse() {
                 Ok(s) => s,
-                Err(bad) => return bad,
+                Err(bad) => return *bad,
             };
             let owner = match owner_binding::owner_for_new_resource_with(
                 request,
@@ -1356,7 +1357,7 @@ pub fn handle_subscribe(
             }
             let sub = match parse() {
                 Ok(s) => s,
-                Err(bad) => return bad,
+                Err(bad) => return *bad,
             };
             // An update keeps the reporting phase and the owner.
             let sub = MonitorSub {
