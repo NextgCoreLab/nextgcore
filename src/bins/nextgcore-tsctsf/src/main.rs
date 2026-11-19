@@ -488,7 +488,7 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "configuration"),
         },
         ["ntsctsf-time-synchronization", "v1", "configuration", config_id] => match method {
-            "GET" => handle_config_get(config_id).await,
+            "GET" => handle_config_get(config_id, &request).await,
             // #113: ConfigUpdate (§5.2.27.2.3). PATCH merges; PUT replaces. Both
             // are served because §5.2.27.2.3's only required input is the PTP
             // instance reference and every parameter is optional, which is merge
@@ -496,7 +496,7 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             // configuration should not be forced into a merge.
             "PATCH" => handle_config_update(config_id, &request).await,
             "PUT" => handle_config_replace(config_id, &request).await,
-            "DELETE" => handle_config_delete(config_id).await,
+            "DELETE" => handle_config_delete(config_id, &request).await,
             _ => send_method_not_allowed(method, "configuration/{configId}"),
         },
         // #113: CapsSubscribe / CapsUnsubscribe (§5.2.27.2.6, §5.2.27.2.7).
@@ -516,9 +516,9 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "configurations"),
         },
         ["ntsctsf-asti", "v1", "configurations", config_id] => match method {
-            "GET" => handle_asti_get(config_id).await,
+            "GET" => handle_asti_get(config_id, &request).await,
             "PATCH" | "PUT" => handle_asti_update(config_id, &request).await,
-            "DELETE" => handle_asti_delete(config_id).await,
+            "DELETE" => handle_asti_delete(config_id, &request).await,
             _ => send_method_not_allowed(method, "configurations/{configId}"),
         },
 
@@ -528,9 +528,9 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "tsc-qos-requests"),
         },
         ["ntsctsf-qos-tsctsf", "v1", "tsc-qos-requests", transaction_id] => match method {
-            "GET" => handle_qos_tsc_get(transaction_id).await,
+            "GET" => handle_qos_tsc_get(transaction_id, &request).await,
             "PATCH" | "PUT" => handle_qos_tsc_update(transaction_id, &request).await,
-            "DELETE" => handle_qos_tsc_delete(transaction_id).await,
+            "DELETE" => handle_qos_tsc_delete(transaction_id, &request).await,
             _ => send_method_not_allowed(method, "tsc-qos-requests/{transactionId}"),
         },
         ["ntsctsf-qos-tsctsf", "v1", "subscriptions"] => match method {
@@ -565,7 +565,20 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// exposure configuration (TS 29.565 subset): the body must be a JSON
 /// object; an optional `timeDomain` must be an integer 0..=255
 /// (IEEE 802.1AS domain number).
+/// #1937: the owner a new configuration, ASTI configuration or QoS/TSC
+/// session is bound to, refused (403) before anything is parsed or stored.
+fn new_resource_owner(
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    owner_binding::owner_for_new_resource(request, operation)
+}
+
 async fn handle_config_create(request: &SbiRequest) -> SbiResponse {
+    let owner = match new_resource_owner(request, "ConfigCreate") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let (data, config) = match parse_typed_body::<context::TimeSyncExposureConfig>(request) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
@@ -576,7 +589,8 @@ async fn handle_config_create(request: &SbiRequest) -> SbiResponse {
     let mut config = config;
     config.raw = data.clone();
 
-    let stored = context::TimeSyncConfig::new(config.clone());
+    let mut stored = context::TimeSyncConfig::new(config.clone());
+    stored.owner = owner;
     let config_id = stored.id.clone();
     let ctx = tsctsf_self();
     let insert = match ctx.read() {
@@ -664,7 +678,38 @@ fn config_body(config_id: &str, raw: &serde_json::Value, self_link: &str) -> ser
 
 /// PATCH /ntsctsf-time-synchronization/v1/configuration/{configId} — ConfigUpdate
 /// (#113, TS 23.502 §5.2.27.2.3). 200 on success, 404 for an unknown id.
+/// #1937: the stored configuration `config_id` if `request` may act on it:
+/// 404 for an unknown id, 403 for anyone but its creator, both before the body
+/// is read or anything changes.
+fn owned_config(
+    config_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<context::TimeSyncConfig, Box<SbiResponse>> {
+    let found = match tsctsf_self().read() {
+        Ok(c) => c.config_find(config_id),
+        Err(_) => {
+            return Err(Box::new(send_internal_error(
+                "TSCTSF context lock poisoned",
+            )))
+        }
+    };
+    let Some(found) = found else {
+        return Err(Box::new(send_not_found(
+            &format!("Configuration {config_id} not found"),
+            Some("CONFIG_NOT_FOUND"),
+        )));
+    };
+    match owner_binding::refuse_non_owner(found.owner.as_deref(), request, operation) {
+        Some(refused) => Err(Box::new(refused)),
+        None => Ok(found),
+    }
+}
+
 async fn handle_config_update(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_config(config_id, request, "ConfigUpdate") {
+        return *refused;
+    }
     let Some(body) = &request.http.content else {
         return send_bad_request("Missing request body", Some("MISSING_BODY"));
     };
@@ -715,6 +760,9 @@ async fn handle_config_update(config_id: &str, request: &SbiRequest) -> SbiRespo
 /// PUT /ntsctsf-time-synchronization/v1/configuration/{configId} — ConfigUpdate as
 /// a whole-resource replace (#113).
 async fn handle_config_replace(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_config(config_id, request, "ConfigUpdate") {
+        return *refused;
+    }
     let (data, config) = match parse_typed_body::<context::TimeSyncExposureConfig>(request) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
@@ -776,17 +824,10 @@ fn updated_config_body(stored: &context::TimeSyncConfig, self_link: &str) -> ser
 }
 
 /// GET /ntsctsf-time-synchronization/v1/configuration/{configId} — 200/404.
-async fn handle_config_get(config_id: &str) -> SbiResponse {
-    let ctx = tsctsf_self();
-    let config = match ctx.read() {
-        Ok(c) => c.config_find(config_id),
-        Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
-    };
-    let Some(config) = config else {
-        return send_not_found(
-            &format!("Configuration {config_id} not found"),
-            Some("CONFIG_NOT_FOUND"),
-        );
+async fn handle_config_get(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    let config = match owned_config(config_id, request, "ConfigGet") {
+        Ok(config) => config,
+        Err(refused) => return *refused,
     };
     // Returns the same server-canonical `self` link the create response carried,
     // overriding any client-supplied value in the stored body.
@@ -800,7 +841,10 @@ async fn handle_config_get(config_id: &str) -> SbiResponse {
 }
 
 /// DELETE /ntsctsf-time-synchronization/v1/configuration/{configId} — 204/404.
-async fn handle_config_delete(config_id: &str) -> SbiResponse {
+async fn handle_config_delete(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_config(config_id, request, "ConfigDelete") {
+        return *refused;
+    }
     let ctx = tsctsf_self();
     let removed = match ctx.read() {
         Ok(c) => c.config_remove(config_id),
@@ -945,10 +989,15 @@ async fn handle_caps_unsubscribe(subscription_id: &str, request: &SbiRequest) ->
 
 /// POST /ntsctsf-asti/v1/configurations — ASTI_Create (§5.2.27.4.2).
 async fn handle_asti_create(request: &SbiRequest) -> SbiResponse {
-    let (data, cfg) = match parse_typed_body::<context::AstiConfig>(request) {
+    let owner = match new_resource_owner(request, "ASTI_Create") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    let (data, mut cfg) = match parse_typed_body::<context::AstiConfig>(request) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
+    cfg.owner = owner;
     if let Err(err) = cfg.validate() {
         return send_bad_request(&err.detail(), Some(err.cause()));
     }
@@ -983,27 +1032,49 @@ async fn handle_asti_create(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-/// GET /ntsctsf-asti/v1/configurations/{configId} — ASTI_Get (§5.2.27.4.5).
-async fn handle_asti_get(config_id: &str) -> SbiResponse {
-    let ctx = tsctsf_self();
-    let cfg = match ctx.read() {
+/// #1937: the stored ASTI configuration if `request` may act on it (404,
+/// then 403 for anyone but its creator), before anything changes.
+fn owned_asti(
+    config_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<context::AstiConfig, Box<SbiResponse>> {
+    let found = match tsctsf_self().read() {
         Ok(c) => c.asti_find(config_id),
-        Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
+        Err(_) => {
+            return Err(Box::new(send_internal_error(
+                "TSCTSF context lock poisoned",
+            )))
+        }
     };
-    match cfg {
-        Some(cfg) => SbiResponse::with_status(200)
-            .with_json_body(&cfg)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
+    let Some(found) = found else {
+        return Err(Box::new(send_not_found(
             &format!("ASTI configuration {config_id} not found"),
             Some("CONFIG_NOT_FOUND"),
-        ),
+        )));
+    };
+    match owner_binding::refuse_non_owner(found.owner.as_deref(), request, operation) {
+        Some(refused) => Err(Box::new(refused)),
+        None => Ok(found),
+    }
+}
+
+/// GET /ntsctsf-asti/v1/configurations/{configId} — ASTI_Get (§5.2.27.4.5).
+async fn handle_asti_get(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    match owned_asti(config_id, request, "ASTI_Get") {
+        Ok(cfg) => SbiResponse::with_status(200)
+            .with_json_body(&cfg)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(refused) => *refused,
     }
 }
 
 /// PATCH/PUT /ntsctsf-asti/v1/configurations/{configId} — ASTI_Update
 /// (§5.2.27.4.3).
 async fn handle_asti_update(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_asti(config_id, request, "ASTI_Update") {
+        return *refused;
+    }
     let Some(body) = &request.http.content else {
         return send_bad_request("Missing request body", Some("MISSING_BODY"));
     };
@@ -1035,7 +1106,10 @@ async fn handle_asti_update(config_id: &str, request: &SbiRequest) -> SbiRespons
 
 /// DELETE /ntsctsf-asti/v1/configurations/{configId} — ASTI_Delete
 /// (§5.2.27.4.4). 204/404.
-async fn handle_asti_delete(config_id: &str) -> SbiResponse {
+async fn handle_asti_delete(config_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_asti(config_id, request, "ASTI_Delete") {
+        return *refused;
+    }
     let ctx = tsctsf_self();
     let removed = match ctx.read() {
         Ok(c) => c.asti_remove(config_id),
@@ -1060,10 +1134,15 @@ async fn handle_asti_delete(config_id: &str) -> SbiResponse {
 /// POST /ntsctsf-qos-tsctsf/v1/tsc-qos-requests — Create (§5.2.27.3.2). The
 /// response carries the Transaction Reference ID.
 async fn handle_qos_tsc_create(request: &SbiRequest) -> SbiResponse {
-    let (data, session) = match parse_typed_body::<context::QosTscSession>(request) {
+    let owner = match new_resource_owner(request, "Create") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    let (data, mut session) = match parse_typed_body::<context::QosTscSession>(request) {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
+    session.owner = owner;
     if let Err(err) = session.validate() {
         return send_bad_request(&err.detail(), Some(err.cause()));
     }
@@ -1122,27 +1201,49 @@ async fn handle_qos_tsc_create(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-/// GET /ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transactionRefId} — 200/404.
-async fn handle_qos_tsc_get(transaction_id: &str) -> SbiResponse {
-    let ctx = tsctsf_self();
-    let session = match ctx.read() {
+/// #1937: the stored QoS/TSC session if `request` may act on it (404, then
+/// 403 for anyone but its creator), before anything changes.
+fn owned_qos_tsc(
+    transaction_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<context::QosTscSession, Box<SbiResponse>> {
+    let found = match tsctsf_self().read() {
         Ok(c) => c.qos_tsc_find(transaction_id),
-        Err(_) => return send_internal_error("TSCTSF context lock poisoned"),
+        Err(_) => {
+            return Err(Box::new(send_internal_error(
+                "TSCTSF context lock poisoned",
+            )))
+        }
     };
-    match session {
-        Some(s) => SbiResponse::with_status(200)
-            .with_json_body(&s)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
+    let Some(found) = found else {
+        return Err(Box::new(send_not_found(
             &format!("Transaction {transaction_id} not found"),
             Some("TRANSACTION_NOT_FOUND"),
-        ),
+        )));
+    };
+    match owner_binding::refuse_non_owner(found.owner.as_deref(), request, operation) {
+        Some(refused) => Err(Box::new(refused)),
+        None => Ok(found),
+    }
+}
+
+/// GET /ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transactionRefId} — 200/404.
+async fn handle_qos_tsc_get(transaction_id: &str, request: &SbiRequest) -> SbiResponse {
+    match owned_qos_tsc(transaction_id, request, "Get") {
+        Ok(s) => SbiResponse::with_status(200)
+            .with_json_body(&s)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(refused) => *refused,
     }
 }
 
 /// PATCH/PUT /ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transactionRefId} — Update
 /// (§5.2.27.3.3).
 async fn handle_qos_tsc_update(transaction_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_qos_tsc(transaction_id, request, "Update") {
+        return *refused;
+    }
     let Some(body) = &request.http.content else {
         return send_bad_request("Missing request body", Some("MISSING_BODY"));
     };
@@ -1174,7 +1275,10 @@ async fn handle_qos_tsc_update(transaction_id: &str, request: &SbiRequest) -> Sb
 
 /// DELETE /ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transactionRefId} — Delete
 /// (§5.2.27.3.4). 204/404.
-async fn handle_qos_tsc_delete(transaction_id: &str) -> SbiResponse {
+async fn handle_qos_tsc_delete(transaction_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Err(refused) = owned_qos_tsc(transaction_id, request, "Delete") {
+        return *refused;
+    }
     let ctx = tsctsf_self();
     let removed = match ctx.read() {
         Ok(c) => c.qos_tsc_remove(transaction_id),
@@ -1783,6 +1887,115 @@ mod tests {
         ]
     }
 
+    /// #1937: a time-sync configuration, an ASTI configuration and a QoS/TSC
+    /// session are each read, updated and removed only by the AF that created
+    /// it. Every other caller gets 403 on GET, PATCH, PUT and DELETE, and the
+    /// resource is unchanged and still there; the owner then succeeds; a create
+    /// whose certificate and token disagree stores nothing. Through the real
+    /// router.
+    ///
+    /// REVERT-VERIFIED separately: with `owned_config`, `owned_asti` or
+    /// `owned_qos_tsc` returning the record unchecked, a stranger's GET of that
+    /// resource is 200 and the first stranger assertion names it; with
+    /// `new_resource_owner` returning `Ok(None)`, the mismatched create is 201.
+    #[test]
+    fn config_asti_and_qos_tsc_are_managed_by_their_creator_1937() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            for (collection, body, id_member) in [
+                (
+                    "/ntsctsf-time-synchronization/v1/configuration",
+                    serde_json::json!({
+                        "timeDomain": 1, "timeSyncErrorBudget": 250,
+                        "notificationTargetAddr": "http://af.example.com/notify",
+                        "upNodeId": "upf1.example.com",
+                    }),
+                    "configId",
+                ),
+                (
+                    "/ntsctsf-asti/v1/configurations",
+                    serde_json::json!({
+                        "afId": "af-1937", "supi": "imsi-001010000001937",
+                        "asTimeDisEnabled": true,
+                    }),
+                    "configId",
+                ),
+                (
+                    "/ntsctsf-qos-tsctsf/v1/tsc-qos-requests",
+                    serde_json::json!({
+                        "afId": "af-1937", "gpsi": "msisdn-491700001937",
+                        "flowDescriptions": ["permit out ip from any to assigned"],
+                        "qosReference": "qos-ref-1937",
+                    }),
+                    "transactionRefId",
+                ),
+            ] {
+                // A mismatched create stores nothing.
+                let mut mismatched = post(collection, body.clone());
+                mismatched.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+                mismatched.oauth2_subject = Some(OTHER_1865.to_string());
+                let r = super::tsctsf_sbi_request_handler(mismatched).await;
+                assert_eq!(
+                    r.status, 403,
+                    "{collection} mismatched create: {:?}",
+                    r.http.content
+                );
+
+                let created =
+                    super::tsctsf_sbi_request_handler(owned_1865(post(collection, body.clone())))
+                        .await;
+                assert_eq!(
+                    created.status, 201,
+                    "{collection}: {:?}",
+                    created.http.content
+                );
+                let created: serde_json::Value =
+                    serde_json::from_str(created.http.content.as_deref().unwrap()).unwrap();
+                let id = created[id_member].as_str().expect("id").to_string();
+                let path = format!("{collection}/{id}");
+                let get = || SbiRequest::get(path.clone());
+                let still_there = || async {
+                    super::tsctsf_sbi_request_handler(owned_1865(get()))
+                        .await
+                        .status
+                        == 200
+                };
+
+                for (who, req) in strangers_1865(get) {
+                    let r = super::tsctsf_sbi_request_handler(req).await;
+                    assert_eq!(r.status, 403, "{path} GET by {who}: {:?}", r.http.content);
+                }
+                for (who, req) in strangers_1865(|| SbiRequest::delete(path.clone())) {
+                    let r = super::tsctsf_sbi_request_handler(req).await;
+                    assert_eq!(
+                        r.status, 403,
+                        "{path} DELETE by {who}: {:?}",
+                        r.http.content
+                    );
+                    assert!(still_there().await, "{path}: still there after {who}");
+                }
+                for (who, req) in strangers_1865(|| patch(&path, serde_json::json!({}))) {
+                    let r = super::tsctsf_sbi_request_handler(req).await;
+                    assert_eq!(r.status, 403, "{path} PATCH by {who}: {:?}", r.http.content);
+                }
+                for (who, req) in strangers_1865(|| put(&path, body.clone())) {
+                    let r = super::tsctsf_sbi_request_handler(req).await;
+                    assert_eq!(r.status, 403, "{path} PUT by {who}: {:?}", r.http.content);
+                }
+
+                let r =
+                    super::tsctsf_sbi_request_handler(owned_1865(SbiRequest::delete(path.clone())))
+                        .await;
+                assert_eq!(
+                    r.status, 204,
+                    "{path}: the owner deletes: {:?}",
+                    r.http.content
+                );
+            }
+        });
+    }
+
     /// #1865: a time-sync capability subscription and a QoS/TSC subscription
     /// are each read and removed only by the consumer that created it; every
     /// other caller gets 403 and the subscription stays; the owner then
@@ -1888,6 +2101,13 @@ mod tests {
     /// pre-#113 tests below keep testing what they were written to test (the
     /// create/get/delete flow, the capacity cap) rather than re-testing validation.
     /// A caller that wants to exercise validation passes its own value for one.
+    /// #1937: direct handler calls act as the same consumer the router wrapper
+    /// gives an anonymous request ([`TEST_CONSUMER_1865`]).
+    fn as_test_af(mut r: SbiRequest) -> SbiRequest {
+        r.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+        r
+    }
+
     fn create_request(body: serde_json::Value) -> SbiRequest {
         let mut body = body;
         if let Some(obj) = body.as_object_mut() {
@@ -1896,6 +2116,11 @@ mod tests {
             obj.entry("upNodeId".to_string())
                 .or_insert_with(|| serde_json::json!("upf1.example.com"));
         }
+        // #1937: these tests describe a dev-profile deployment, whose anonymous
+        // creates are unbound; ownership is tested with explicit identities in
+        // `config_asti_and_qos_tsc_are_managed_by_their_creator_1937`.
+        // Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         SbiRequest::post("/ntsctsf-time-synchronization/v1/configuration")
             .with_json_body(&body)
             .expect("serialize test body")
@@ -1963,7 +2188,10 @@ mod tests {
         assert_eq!(body["self"], location);
 
         // GET → 200 with the stored configuration.
-        let fetched = block_on(handle_config_get(&config_id));
+        let fetched = block_on(handle_config_get(
+            &config_id,
+            &as_test_af(SbiRequest::default()),
+        ));
         assert_eq!(fetched.status, 200);
         let body: serde_json::Value =
             serde_json::from_str(fetched.http.content.as_deref().unwrap()).unwrap();
@@ -1975,15 +2203,40 @@ mod tests {
         );
 
         // DELETE → 204; the configuration is gone.
-        assert_eq!(block_on(handle_config_delete(&config_id)).status, 204);
+        assert_eq!(
+            block_on(handle_config_delete(
+                &config_id,
+                &as_test_af(SbiRequest::default())
+            ))
+            .status,
+            204
+        );
 
         // Subsequent GET → 404 (and DELETE → 404).
-        assert_eq!(block_on(handle_config_get(&config_id)).status, 404);
-        assert_eq!(block_on(handle_config_delete(&config_id)).status, 404);
+        assert_eq!(
+            block_on(handle_config_get(
+                &config_id,
+                &as_test_af(SbiRequest::default())
+            ))
+            .status,
+            404
+        );
+        assert_eq!(
+            block_on(handle_config_delete(
+                &config_id,
+                &as_test_af(SbiRequest::default())
+            ))
+            .status,
+            404
+        );
     }
 
     #[test]
     fn config_create_validation_400s() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let no_body = SbiRequest::post("/ntsctsf-time-synchronization/v1/configuration");
         assert_eq!(block_on(handle_config_create(&no_body)).status, 400);
 
@@ -2031,6 +2284,10 @@ mod tests {
     // ── Router (create → get → delete through the full dispatcher) ──────────
     #[test]
     fn router_dispatches_and_rejects() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = lock_globals();
         reset_context();
 
@@ -2207,6 +2464,10 @@ mod tests {
     /// which is what the criterion demands instead of a log line.
     #[test]
     fn the_switch_on_issues_policy_authorization_create_and_delete() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = lock_globals();
         reset_context();
         block_on(async {
@@ -2293,6 +2554,10 @@ mod tests {
     /// (JWKS and audience PCF), so a request it recorded is one that passed it.
     #[test]
     fn policy_authorization_create_and_delete_pass_an_oauth2_required_pcf_1658() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::test_support::oauth2 as stand_in;
         let _g = lock_globals();
         reset_context();
@@ -2488,6 +2753,10 @@ mod tests {
     /// `appSessionId`, and is retried until the PCF accepts it.
     #[test]
     fn a_failed_delete_keeps_the_app_session_and_is_retried_1754() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = lock_globals();
         reset_context();
         block_on(async {
@@ -2531,6 +2800,10 @@ mod tests {
     /// out.
     #[test]
     fn a_pcf_back_after_the_retry_budget_still_gets_the_delete_1817() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = lock_globals();
         reset_context();
         block_on(async {
@@ -2651,6 +2924,10 @@ mod tests {
     /// (that Delete found nothing to retract) is retracted when it lands.
     #[test]
     fn a_create_landing_after_its_delete_is_retracted_1754() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = lock_globals();
         reset_context();
         block_on(async {
@@ -2688,6 +2965,10 @@ mod tests {
     /// does not lose the retraction: the refused Delete is kept and retried.
     #[test]
     fn a_cancelled_delete_is_still_retracted_1754() {
+        // #1937: these requests carry no verified identity, which only the dev
+        // profile admits for a create (production binds every resource to its
+        // creator). Declared, not inherited; never reset (#308).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = lock_globals();
         reset_context();
         block_on(async {

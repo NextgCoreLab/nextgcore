@@ -1435,6 +1435,9 @@ fn spawn_policy_delete(pol_asso_id: String, kind: PolicyKind) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    // The resolution runs on the spawned task; the check is made on the caller's (#1933).
+    #[cfg(test)]
+    crate::test_support::assert_pcf_env_lock_held();
     handle.spawn(async move {
         let (host, port) = match crate::sbi_path::resolve_nf_endpoint_async(
             crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
