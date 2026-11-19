@@ -6612,6 +6612,13 @@ impl NgapServer {
         let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
             return Ok(());
         };
+        // #1999: a registration starts with no NSAC rejection of its own; one from an
+        // earlier procedure is not this one's to report. #2022: cleared HERE, before
+        // the unauthenticated-emergency branch, which runs no NSAC and so would
+        // otherwise send whatever an earlier procedure left (TS 24.501 §5.5.1.2.4:
+        // the Rejected NSSAI is the current procedure's). Every other registration
+        // also reaches `apply_nsac_outcome`, which sets it afresh.
+        state.amf_ue.rejected_nssai.clear();
 
         // #361: an UNAUTHENTICATED emergency registration takes none of the SBI steps below.
         //
@@ -6860,9 +6867,6 @@ impl NgapServer {
             return Ok(());
         }
         state.amf_ue.allowed_nssai = allowed;
-        // #1999: a registration starts with no NSAC rejection of its own; one from an
-        // earlier registration is not this one's to report.
-        state.amf_ue.rejected_nssai.clear();
 
         // Network Slice Admission Control (TS 29.536 / TS 23.501 §5.15.11):
         // query the NSACF for each Allowed S-NSSAI subject to admission control
@@ -7216,7 +7220,7 @@ impl NgapServer {
                 &guard,
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                &state.amf_ue.allowed_nssai,
+                &guard.ngap_allowed_nssai(&state.amf_ue),
                 &state.amf_ue.ue_security_capability,
                 &kgnb,
                 Some(protected),
@@ -7695,7 +7699,12 @@ impl NgapServer {
         state.amf_ue.init_next_hop_chain();
 
         let tmsi = state.amf_ue.next_guti.tmsi;
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        // #2033: NGAP's Allowed NSSAI is mandatory; an unauthenticated emergency UE's
+        // is the emergency S-NSSAI, while the NAS Accept built above carries none.
+        let allowed_nssai = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ngap_allowed_nssai(&state.amf_ue);
         // #361: §6.7.3.6 requires the NGAP UE INITIAL CONTEXT SETUP to carry only the null
         // algorithms for an unauthenticated emergency session. Narrowed here, on the NAS
         // octets, because this is the one egress site that hands `ngap_asn1` the NAS-shaped
@@ -8709,7 +8718,11 @@ impl NgapServer {
             pdu_session_status,
             uplink_data_status.then_some(reactivation_failed),
         );
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        // #2033: NGAP's Allowed NSSAI, the emergency S-NSSAI for an emergency-only UE.
+        let allowed_nssai = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ngap_allowed_nssai(&state.amf_ue);
         let ue_security_capability = state.amf_ue.ue_security_capability.clone();
         let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
             .then_some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink));
@@ -17159,9 +17172,11 @@ impl NgapServer {
                     },
                 )
                 .collect(),
-            allowed_nssai: state
-                .amf_ue
-                .allowed_nssai
+            // #2033: mandatory in the Handover Request, as in the ICS.
+            allowed_nssai: crate::context::amf_self()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ngap_allowed_nssai(&state.amf_ue)
                 .iter()
                 .map(|s| nextgcore_ngap::types::SNssai {
                     sst: s.sst,
@@ -44098,6 +44113,51 @@ mod tests {
              against the unconfigured fallback and releases the UE -- so the skip above is \
              the §4.12.2.3 exemption and not an early return that applies to everyone"
         );
+    }
+
+    /// **#2022.** A registration that runs no NSAC (the unauthenticated emergency one,
+    /// TS 23.502 §4.12.2.3) must not send a Rejected NSSAI an earlier procedure left
+    /// on the UE: the Rejected NSSAI is the current procedure's (TS 24.501
+    /// §5.5.1.2.4). Every other registration sets it afresh in `apply_nsac_outcome`;
+    /// this is the path the registration-start clear is for.
+    ///
+    /// REVERT-VERIFIED: with the clear back after the emergency branch (where the
+    /// NSAC that follows it made it redundant), the stale Rejected NSSAI IE goes out
+    /// in this Accept and the assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_without_nsac_sends_no_stale_rejected_nssai_2022() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _policy = crate::emergency::emergency_policy_test_guard().await;
+        let _guami = handler_tests::ServeOneGuami::install();
+        let mut ngap = capturing_ngap_server().await;
+        seed_gnb_session(&ngap, 1).await;
+        let id = 7_202_201u64;
+        let mut ue_ctx = UeNasContext::new(id, 72, 1, false);
+        ue_ctx.amf_ue.registration_type = crate::gmm_build::registration_type::EMERGENCY;
+        ue_ctx.amf_ue.unauthenticated_emergency = true;
+        // What an earlier procedure's all-rejected NSAC left: S-NSSAI sst 2, cause 1.
+        ue_ctx.amf_ue.rejected_nssai = vec![SNssai { sst: 2, sd: None }];
+        ngap.ue_auth_state.insert(id, ue_ctx);
+        ngap.emergency.handle_emergency_registration(id, false);
+
+        let _ = ngap.complete_registration(1, id, 72).await;
+
+        let sent = take_sent_ngap(&mut ngap);
+        assert!(!sent.is_empty(), "the Registration Accept was sent");
+        // The Rejected NSSAI IE (IEI 0x11, length 2, {len 1 | cause 1}, sst 2), as in
+        // `the_rejected_nssai_is_reported_once_1999`; NEA0 leaves it readable.
+        let ie = [0x11u8, 0x02, 0x11, 0x02];
+        assert!(
+            !sent
+                .iter()
+                .any(|(_, pdu)| pdu.windows(ie.len()).any(|w| w == ie)),
+            "the Accept carries a Rejected NSSAI no NSAC of this registration produced"
+        );
+        assert!(ngap
+            .ue_auth_state
+            .get(id)
+            .is_some_and(|s| s.amf_ue.rejected_nssai.is_empty()));
+        ngap.forget_ue(id);
     }
 
     /// **#361:** the UE security capabilities this AMF conveys to the RAN are narrowed to the
