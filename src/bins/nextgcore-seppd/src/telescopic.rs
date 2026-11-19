@@ -171,11 +171,27 @@ pub fn clear_mappings() {
 mod tests {
     use super::*;
 
-    /// Serializes tests that touch the process-global mapping store.
-    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Serializes tests that touch the process-global mapping store, on the
+    /// crate's ONE test lock (#1870). This used to be a `STORE_LOCK` of its own,
+    /// while `n32_server`'s telescopic tests cleared the same store under
+    /// `context::lock_global_test_state()`: two locks for one global, so a clear
+    /// there could land between a store and a lookup here.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::context::lock_global_test_state()
+    }
+
+    /// #1870: the store's test lock IS the crate's global test lock, so a test
+    /// holding it excludes `n32_server`'s telescopic tests too.
+    #[test]
+    fn the_store_lock_is_the_crate_test_lock_1870() {
+        let _g = lock();
+        assert!(
+            matches!(
+                crate::context::GLOBAL_TEST_LOCK.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "holding the telescopic lock must hold context::GLOBAL_TEST_LOCK"
+        );
     }
 
     /// The label is one legal DNS label, whatever the input FQDN looks like — the

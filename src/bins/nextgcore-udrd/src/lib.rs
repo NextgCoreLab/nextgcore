@@ -17,7 +17,7 @@ pub mod metrics;
 /// re-exported as part of the public crate API.  No handler in this module
 /// is reachable from `udr_sbi_request_handler`.
 mod nudr_handler;
-pub mod owner_binding; // #1861: subscriptions bound to their creator
+pub use nextgcore_sbi::owner_binding; // #1861, on the shared #1865 helper
 pub mod sbi_path;
 pub mod sess_sm;
 pub mod udr_sm;

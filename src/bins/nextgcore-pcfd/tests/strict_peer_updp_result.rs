@@ -228,9 +228,11 @@ async fn subscribe_to_delivery_events(addr: std::net::SocketAddr, notif_id: &str
         "notifId": notif_id,
         "eventSubs": ["SUCCESS_UE_POL_DEL_SP", "UNSUCCESS_UE_POL_DEL_SP"],
     });
-    let req = nextgcore_sbi::message::SbiRequest::post("/npcf-eventexposure/v1/subscriptions")
+    let mut req = nextgcore_sbi::message::SbiRequest::post("/npcf-eventexposure/v1/subscriptions")
         .with_json_body(&body)
         .expect("subscription body serialises");
+    // #1865: a verified consumer, so the subscription is owned under either profile.
+    req.oauth2_subject = Some("c0c0c0c0-1865-4000-8000-0000000000ca".to_string());
     let resp = pcf_sbi_request_handler(req).await;
     assert_eq!(
         resp.status, 201,
@@ -247,7 +249,9 @@ async fn subscribe_to_delivery_events(addr: std::net::SocketAddr, notif_id: &str
 /// Remove the subscription again, so a later test's firing cannot be POSTed at a
 /// stub consumer this test has already stopped.
 async fn delete_subscription(location: &str) {
-    let resp = pcf_sbi_request_handler(nextgcore_sbi::message::SbiRequest::delete(location)).await;
+    let mut req = nextgcore_sbi::message::SbiRequest::delete(location);
+    req.oauth2_subject = Some("c0c0c0c0-1865-4000-8000-0000000000ca".to_string());
+    let resp = pcf_sbi_request_handler(req).await;
     assert_eq!(resp.status, 204, "the subscription must be removable");
 }
 

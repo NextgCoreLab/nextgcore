@@ -771,7 +771,7 @@ async fn terminate_while_the_ausf_holds_1774(
     release: &tokio::sync::Notify,
 ) -> u16 {
     seen.notified().await;
-    let status = crate::namf_server::namf_request_handler(
+    let status = crate::namf_server::test_namf_request_handler(
         nextgcore_sbi::message::SbiRequest::post(format!(
             "/namf-callback/v1/{supi}/am-policy-notify/amp-1774/terminate"
         ))

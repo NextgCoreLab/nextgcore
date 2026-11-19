@@ -141,6 +141,14 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 - **Multiple NRF entries** in `sbi.client.nrf` are parsed but only the first is used — additional entries are currently inert.
 - `amf.ngap.server[0]` and `amf.sbi.server[0]` are the NGAP and SBI listen addresses (#1311). `--ngap-addr` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` override them; with neither, loopback (#1308). There is no `amf.metrics.server` (#1312); the metrics endpoint is `NEXTGCORE_METRICS_BIND`:`AMF_METRICS_PORT`.
 
+## Network Slice Admission Control (#1876)
+
+With an NSACF configured or discoverable, a registering UE is counted in on each Allowed S-NSSAI with Nnsacf_NSAC_NumOfUEsUpdate INCREASE, and counted out again with DECREASE (TS 23.502 §4.2.11.2). Before #1876 the AMF only ever sent the INCREASE.
+
+- **Count-in.** One INCREASE per Allowed S-NSSAI, in order, stopping at the first denial. A denial rejects the registration with 5GMM cause #69. An NSACF that is absent, unreachable or answers unexpectedly degrades open: the UE is admitted, but nothing was counted, so nothing is recorded. An INCREASE that got no answer at all may have been applied, so a precautionary DECREASE follows. That DECREASE is not retried.
+- **Count-out.** A DECREASE on every S-NSSAI the NSACF admitted the UE to, sent to the NSACF that granted it under the same nfId. This happens on every deregistration (UE-initiated, network-initiated, local, implicit), for an S-NSSAI dropped from the Allowed NSSAI by a later registration, and for every admission of a UE whose registration is denied on a later S-NSSAI.
+- **Reconciler.** A DECREASE that fails (no answer, a 5xx, a refused token) is parked and retried every 30 s until the NSACF accepts it; a 404 counts as accepted. At most 4096 are kept, and the oldest is evicted and counted `abandoned`. A parked DECREASE for an (SUPI, access type, S-NSSAI) that has been admitted again since is `superseded` and not sent: the NSACF counts a UE once, so it would count the live registration out. The set is memory-only, like amfd's UE contexts. Every DECREASE (immediate, precautionary or reconciled) is registered as in flight in the same step as its check, so a quick re-registration's INCREASE for the same UE and S-NSSAI waits for it to land first. A DECREASE that finds an INCREASE being decided is not sent: that INCREASE takes the count over and sends the DECREASE afterwards if it does not count the UE (#1940 review).
+
 ## Paging strategy
 
 `amf.paging.strategy` decides which NG-RAN nodes receive the NGAP PAGING for a CM-IDLE UE. TS 23.501 §5.4.3.1 leaves this to local configuration. The AMF logs the value in effect at startup, as `Paging strategy: <value>`.

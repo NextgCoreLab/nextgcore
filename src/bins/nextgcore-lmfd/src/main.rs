@@ -11,6 +11,7 @@ use clap::Parser;
 use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as NextgcoreSbiServerConfig,
@@ -604,7 +605,7 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "up-subscriptions"),
         },
         ["nlmf-loc", "v1", "up-subscriptions", subscription_id] => match method {
-            "DELETE" => handle_up_unsubscribe(subscription_id).await,
+            "DELETE" => handle_up_unsubscribe(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "up-subscriptions/{subscriptionId}"),
         },
         // A4: Namf_Communication notify callbacks (TS 29.518 §5.2.2.3.5
@@ -654,7 +655,7 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["nlmf-dataexposure", "v1", "subscriptions", subscription_id] => match method {
             "PATCH" => handle_exposure_modify(subscription_id, &request).await,
-            "DELETE" => handle_exposure_unsubscribe(subscription_id).await,
+            "DELETE" => handle_exposure_unsubscribe(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -730,6 +731,12 @@ async fn handle_cipher_key_data(request: &SbiRequest) -> SbiResponse {
 /// `POST /nlmf-dataexposure/v1/subscriptions` — `CreateSubscription`
 /// (TS 29.572 §5.4), #104. `201` + `Location` + the echoed resource.
 async fn handle_exposure_subscribe(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the verified identity of its creator, checked before the
+    // body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "CreateSubscription") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let Some(body) = request.http.content.as_deref() else {
         return problem(
             400,
@@ -758,7 +765,7 @@ async fn handle_exposure_subscribe(request: &SbiRequest) -> SbiResponse {
     let Some(id) = lmf_self()
         .read()
         .ok()
-        .and_then(|c| c.exposure_subscription_insert(sub.clone()))
+        .and_then(|c| c.exposure_subscription_insert(sub.clone(), owner))
     else {
         return problem(
             500,
@@ -797,6 +804,11 @@ async fn handle_exposure_modify(subscription_id: &str, request: &SbiRequest) -> 
             &format!("No data-exposure subscription {subscription_id}"),
         );
     };
+    // #1865: only the consumer that created the subscription may modify it,
+    // checked before the body is read or anything is stored.
+    if let Some(refused) = exposure_owner_refusal(subscription_id, request, "ModifySubscription") {
+        return refused;
+    }
     let Some(body) = request.http.content.as_deref() else {
         return problem(
             400,
@@ -895,8 +907,12 @@ async fn handle_exposure_modify(subscription_id: &str, request: &SbiRequest) -> 
 }
 
 /// `DELETE /nlmf-dataexposure/v1/subscriptions/{id}` — `DeleteSubscription`, #104.
-/// `204` when it existed, `404` when it did not.
-async fn handle_exposure_unsubscribe(subscription_id: &str) -> SbiResponse {
+/// `204` when it existed, `404` when it did not, `403` when the caller is not
+/// the consumer that created it (#1865; nothing is removed).
+async fn handle_exposure_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    if let Some(refused) = exposure_owner_refusal(subscription_id, request, "DeleteSubscription") {
+        return refused;
+    }
     match lmf_self()
         .read()
         .ok()
@@ -912,6 +928,21 @@ async fn handle_exposure_unsubscribe(subscription_id: &str) -> SbiResponse {
             &format!("No data-exposure subscription {subscription_id}"),
         ),
     }
+}
+
+/// #1865: the `403` for a caller that did not create data-exposure
+/// subscription `subscription_id`; `None` when it may act, or when the id is
+/// unknown (the handler answers that 404 itself).
+fn exposure_owner_refusal(
+    subscription_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let owner = lmf_self()
+        .read()
+        .ok()?
+        .exposure_subscription_owner(subscription_id)?;
+    owner_binding::refuse_non_owner(owner.as_deref(), request, operation)
 }
 
 /// Build a `ProblemDetails` error response (`application/problem+json`,
@@ -2739,6 +2770,12 @@ async fn handle_configure_up(request: &SbiRequest) -> SbiResponse {
 /// Creates a UP location reporting subscription. Returns 201 Created with the
 /// subscription resource location header and the subscription body.
 async fn handle_up_subscribe(request: &SbiRequest) -> SbiResponse {
+    // #1865: bound to the verified identity of its creator, checked before the
+    // body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let body = match &request.http.content {
         Some(c) => c,
         None => {
@@ -2764,7 +2801,7 @@ async fn handle_up_subscribe(request: &SbiRequest) -> SbiResponse {
     let Some(id) = lmf_self()
         .read()
         .ok()
-        .and_then(|c| c.up_subscription_insert(sub.clone()))
+        .and_then(|c| c.up_subscription_insert(sub.clone(), owner))
     else {
         return problem(
             500,
@@ -2795,7 +2832,21 @@ async fn handle_up_subscribe(request: &SbiRequest) -> SbiResponse {
 /// reconciling its state by deleting a stale subscription was told the delete
 /// succeeded against an LMF that had never held one. §6.1.4.9 requires the 404,
 /// and the distinction is the only way a consumer can detect the divergence.
-async fn handle_up_unsubscribe(subscription_id: &str) -> SbiResponse {
+///
+/// #1865: only the consumer that subscribed may unsubscribe; another caller gets
+/// `403` and the subscription stays.
+async fn handle_up_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    let owner = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.up_subscription_owner(subscription_id));
+    if let Some(owner) = owner {
+        if let Some(refused) =
+            owner_binding::refuse_non_owner(owner.as_deref(), request, "Unsubscribe")
+        {
+            return refused;
+        }
+    }
     match lmf_self()
         .read()
         .ok()
@@ -4890,7 +4941,7 @@ mod tests {
         }"#;
         let req =
             SbiRequest::post("/nlmf-loc/v1/up-subscriptions").with_body(body, "application/json");
-        let resp = handle_up_subscribe(&req).await;
+        let resp = handle_up_subscribe(&owned_1865(req)).await;
         assert_eq!(resp.status, 201);
         let location = resp
             .http
@@ -4916,17 +4967,189 @@ mod tests {
         // requires a 404 for a subscription that does not exist, and answering 204
         // told a consumer reconciling its state that a delete had succeeded against
         // an LMF that never held the subscription.
-        assert_eq!(handle_up_unsubscribe(&id).await.status, 204);
         assert_eq!(
-            handle_up_unsubscribe(&id).await.status,
+            handle_up_unsubscribe(&id, &owned_1865(SbiRequest::delete("/")))
+                .await
+                .status,
+            204
+        );
+        assert_eq!(
+            handle_up_unsubscribe(&id, &owned_1865(SbiRequest::delete("/")))
+                .await
+                .status,
             404,
             "a second delete of the same id must be 404, not another 204"
         );
         assert_eq!(
-            handle_up_unsubscribe("sub-never-existed").await.status,
+            handle_up_unsubscribe("sub-never-existed", &owned_1865(SbiRequest::delete("/")))
+                .await
+                .status,
             404,
             "an id that was never issued must be 404"
         );
+    }
+
+    const OWNER_1865: &str = "aaaaaaaa-1865-4000-8000-00000000000a";
+    const OTHER_1865: &str = "bbbbbbbb-1865-4000-8000-00000000000b";
+
+    /// #1865: `request` from the consumer [`OWNER_1865`], proven by its token.
+    fn owned_1865(mut request: SbiRequest) -> SbiRequest {
+        request.oauth2_subject = Some(OWNER_1865.to_string());
+        request
+    }
+
+    /// #1865: every caller that is not the creator, each with how it fails to be.
+    fn strangers_1865(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
+        let mut foreign_cert = request();
+        foreign_cert.peer_cert_nf_instance_id = Some(OTHER_1865.to_string());
+        let mut foreign_token = request();
+        foreign_token.oauth2_subject = Some(OTHER_1865.to_string());
+        let mut mismatch = request();
+        mismatch.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        mismatch.oauth2_subject = Some(OTHER_1865.to_string());
+        vec![
+            ("foreign certificate", foreign_cert),
+            ("foreign token", foreign_token),
+            ("anonymous", request()),
+            ("certificate/token mismatch", mismatch),
+        ]
+    }
+
+    /// #1865: an Nlmf_DataExposure subscription is modified and deleted only by
+    /// the consumer that created it; every other caller gets 403 and nothing
+    /// changes. REVERT-VERIFIED: with the PATCH check removed the foreign PATCH
+    /// returns 204; with the DELETE check removed the foreign DELETE returns
+    /// 204; with the owner not recorded at create (`None` passed to the insert)
+    /// the bound-owner assertion fails; with the create check ignored the
+    /// mismatched create returns 201.
+    #[tokio::test]
+    async fn data_exposure_subscriptions_are_managed_by_their_creator_1865() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let body = r#"{"notificationUri":"http://nwdaf/x","notifyCorrelationId":"c-1865",
+            "aoi":{"praId":"pra-1"},"numOfSamples":10}"#;
+        let create = || {
+            SbiRequest::post("/nlmf-dataexposure/v1/subscriptions")
+                .with_body(body, "application/json")
+        };
+        let resp = lmf_sbi_request_handler(owned_1865(create())).await;
+        assert_eq!(resp.status, 201);
+        let id = resp
+            .http
+            .get_header("Location")
+            .and_then(|l| l.rsplit('/').next().map(str::to_string))
+            .expect("Location");
+        let uri = format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}");
+        assert_eq!(
+            lmf_self().read().unwrap().exposure_subscription_owner(&id),
+            Some(Some(OWNER_1865.to_string())),
+            "bound to the verified creator"
+        );
+        let samples = || {
+            lmf_self()
+                .read()
+                .unwrap()
+                .exposure_subscription_find(&id)
+                .and_then(|s| s.num_of_samples)
+        };
+        let patch = || {
+            SbiRequest::patch(uri.clone()).with_body(
+                r#"[{"op":"replace","path":"/numOfSamples","value":99}]"#,
+                "application/json",
+            )
+        };
+        for (who, req) in strangers_1865(patch) {
+            assert_eq!(
+                lmf_sbi_request_handler(req).await.status,
+                403,
+                "{who} PATCH"
+            );
+            assert_eq!(samples(), Some(10), "{who}: the PATCH applied nothing");
+        }
+        for (who, req) in strangers_1865(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(
+                lmf_sbi_request_handler(req).await.status,
+                403,
+                "{who} DELETE"
+            );
+            assert_eq!(
+                samples(),
+                Some(10),
+                "{who}: the subscription is still stored"
+            );
+        }
+        // The owner, proven by its certificate this time.
+        let mut by_cert = patch();
+        by_cert.peer_cert_nf_instance_id = Some(OWNER_1865.to_uppercase());
+        assert_eq!(lmf_sbi_request_handler(by_cert).await.status, 204);
+        assert_eq!(samples(), Some(99));
+        assert_eq!(
+            lmf_sbi_request_handler(owned_1865(SbiRequest::delete(uri.clone())))
+                .await
+                .status,
+            204
+        );
+        assert_eq!(samples(), None);
+
+        // A caller whose certificate and token disagree stores nothing.
+        let before = lmf_self().read().unwrap().exposure_subscription_count();
+        let mut mixed = create();
+        mixed.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        mixed.oauth2_subject = Some(OTHER_1865.to_string());
+        assert_eq!(lmf_sbi_request_handler(mixed).await.status, 403);
+        assert_eq!(
+            lmf_self().read().unwrap().exposure_subscription_count(),
+            before
+        );
+    }
+
+    /// #1865: a UP-location subscription is deleted only by the consumer that
+    /// created it. REVERT-VERIFIED: with the DELETE check removed every
+    /// stranger's DELETE returns 204; with the create check removed the
+    /// mismatched create returns 201 and the count grows.
+    #[tokio::test]
+    async fn up_subscriptions_are_deleted_by_their_creator_only_1865() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let create = || {
+            SbiRequest::post("/nlmf-loc/v1/up-subscriptions").with_body(
+                r#"{"upNotifyCallBackUri":"http://af/up","notifCorrelationId":"nc-1865",
+                    "supi":"imsi-001010000001865"}"#,
+                "application/json",
+            )
+        };
+        let resp = lmf_sbi_request_handler(owned_1865(create())).await;
+        assert_eq!(resp.status, 201);
+        let id = resp
+            .http
+            .get_header("Location")
+            .and_then(|l| l.rsplit('/').next().map(str::to_string))
+            .expect("Location");
+        let uri = format!("/nlmf-loc/v1/up-subscriptions/{id}");
+        for (who, req) in strangers_1865(|| SbiRequest::delete(uri.clone())) {
+            assert_eq!(lmf_sbi_request_handler(req).await.status, 403, "{who}");
+            assert!(
+                lmf_self()
+                    .read()
+                    .unwrap()
+                    .up_subscription_find(&id)
+                    .is_some(),
+                "{who}: the subscription is still stored"
+            );
+        }
+        assert_eq!(
+            lmf_sbi_request_handler(owned_1865(SbiRequest::delete(uri.clone())))
+                .await
+                .status,
+            204
+        );
+
+        let before = lmf_self().read().unwrap().up_subscription_count();
+        let mut mixed = create();
+        mixed.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        mixed.oauth2_subject = Some(OTHER_1865.to_string());
+        assert_eq!(lmf_sbi_request_handler(mixed).await.status, 403);
+        assert_eq!(lmf_self().read().unwrap().up_subscription_count(), before);
     }
 
     /// #104: `configure-up` PERSISTS the configuration; it used to validate and
@@ -5113,7 +5336,7 @@ mod tests {
         }"#;
         let req = SbiRequest::post("/nlmf-dataexposure/v1/subscriptions")
             .with_body(body, "application/json");
-        let resp = lmf_sbi_request_handler(req).await;
+        let resp = lmf_sbi_request_handler(owned_1865(req)).await;
         assert_ne!(resp.status, 404, "the service must be routed");
         assert_eq!(resp.status, 201);
         let location = resp
@@ -5143,7 +5366,7 @@ mod tests {
             r#"[{"op":"replace","path":"/numOfSamples","value":42}]"#,
             "application/json",
         );
-        assert_eq!(lmf_sbi_request_handler(patch).await.status, 204);
+        assert_eq!(lmf_sbi_request_handler(owned_1865(patch)).await.status, 204);
         assert_eq!(
             lmf_self()
                 .read()
@@ -5163,7 +5386,7 @@ mod tests {
             let bad = SbiRequest::patch(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"))
                 .with_body(patch_body, "application/json");
             assert_eq!(
-                lmf_sbi_request_handler(bad).await.status,
+                lmf_sbi_request_handler(owned_1865(bad)).await.status,
                 400,
                 "patch {patch_body}"
             );
@@ -5171,16 +5394,24 @@ mod tests {
 
         // DELETE -> 204, then 404: the same honesty as up-unsubscribe.
         let del = SbiRequest::delete(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"));
-        assert_eq!(lmf_sbi_request_handler(del).await.status, 204);
+        assert_eq!(lmf_sbi_request_handler(owned_1865(del)).await.status, 204);
         let del_again = SbiRequest::delete(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"));
-        assert_eq!(lmf_sbi_request_handler(del_again).await.status, 404);
+        assert_eq!(
+            lmf_sbi_request_handler(owned_1865(del_again)).await.status,
+            404
+        );
         // PATCH on an unknown id is 404, not a create at a consumer-chosen id.
         let patch_unknown = SbiRequest::patch(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"))
             .with_body(
                 r#"[{"op":"replace","path":"/numOfSamples","value":1}]"#,
                 "application/json",
             );
-        assert_eq!(lmf_sbi_request_handler(patch_unknown).await.status, 404);
+        assert_eq!(
+            lmf_sbi_request_handler(owned_1865(patch_unknown))
+                .await
+                .status,
+            404
+        );
 
         // Each mandatory member is enforced on create.
         for (body, why) in [
@@ -5200,7 +5431,7 @@ mod tests {
             let req = SbiRequest::post("/nlmf-dataexposure/v1/subscriptions")
                 .with_body(body, "application/json");
             assert_eq!(
-                lmf_sbi_request_handler(req).await.status,
+                lmf_sbi_request_handler(owned_1865(req)).await.status,
                 400,
                 "must be 400: {why}"
             );
@@ -8970,11 +9201,15 @@ mod positioning_chain_strict_peer {
             .unwrap()
             .amf_subscription_begin(&amf_peer.non_ue_subscription_key(), &amf_peer, None)
             .expect("no subscription yet");
-        let sub = namf_client::build_non_ue_nrppa_subscription_request(
+        let mut sub = namf_client::build_non_ue_nrppa_subscription_request(
             "lmf-807",
             "http://127.0.0.1:7816",
             &start.n2_token,
         );
+        // #1865: amfd binds the subscription to a verified LMF; without one the
+        // production profile refuses it, so this would depend on a sibling test
+        // having selected dev.
+        sub.oauth2_subject = Some("lmf-807".into());
         let resp = nextgcore_amfd::namf_request_handler(sub).await;
         assert_eq!(resp.status, 201, "{:?}", resp.http.content);
 
@@ -9878,6 +10113,11 @@ mod callback_tokens_1518 {
         // deployment. Without the override it relied on a sibling having set it.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // Plaintext loopback AMF: under the default production profile the
+        // client fails at once for want of TLS material and the task finishes
+        // before it can be cancelled, so this test passed only after a sibling
+        // had set `dev` (found running it alone under #1865).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         lmf_context_init(1024);
         lmf_self()
             .read()

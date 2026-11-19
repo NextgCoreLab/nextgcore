@@ -115,6 +115,10 @@ pub struct EventSubscription {
     /// re-serialisation of the subset this SMF models. A consumer that sent
     /// `sampRatio` or `partitionCriteria` gets them back.
     pub document: Value,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed
+    /// (`nextgcore_sbi::owner_binding`), the only one that may read, replace or
+    /// remove it. `None` when it subscribed with no verified identity (`dev`).
+    pub owner: Option<String>,
 }
 
 impl EventSubscription {
@@ -251,6 +255,7 @@ pub fn parse_subscription(body: &Value, id: String) -> Result<EventSubscription,
             .and_then(|v| u8::try_from(v).ok()),
         features,
         document,
+        owner: None,
     })
 }
 

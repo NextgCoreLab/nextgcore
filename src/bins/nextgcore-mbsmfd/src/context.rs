@@ -1104,6 +1104,12 @@ impl MbSmfContext {
             .and_then(|mut s| s.patch(id, ops))
     }
 
+    /// #1865: the owner of Status subscription `id` (`None`: no such
+    /// subscription; `Some(None)`: ownerless).
+    pub fn status_sub_owner(&self, id: &str) -> Option<Option<String>> {
+        self.status_subs.lock().ok().and_then(|s| s.owner_of(id))
+    }
+
     /// Remove a Status subscription (DELETE). Returns false if not found.
     pub fn status_sub_remove(&self, id: &str) -> bool {
         self.status_subs
@@ -1147,6 +1153,15 @@ impl MbSmfContext {
             .lock()
             .ok()
             .and_then(|mut s| s.patch(id, ops))
+    }
+
+    /// #1865: the owner of ContextStatus subscription `id` (`None`: no such
+    /// subscription; `Some(None)`: ownerless).
+    pub fn ctx_sub_owner(&self, id: &str) -> Option<Option<String>> {
+        self.context_status_subs
+            .lock()
+            .ok()
+            .and_then(|s| s.owner_of(id))
     }
 
     /// Remove a ContextStatus subscription (DELETE). Returns false if not found.

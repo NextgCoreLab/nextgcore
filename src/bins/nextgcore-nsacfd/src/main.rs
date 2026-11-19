@@ -25,6 +25,7 @@ use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{
     send_method_not_allowed, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
@@ -723,7 +724,7 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             // so a consumer had to delete and re-create to change anything.
             "PATCH" => handle_slice_ee_modify_partial(sub_id, &request).await,
             "PUT" => handle_slice_ee_modify_complete(sub_id, &request).await,
-            "DELETE" => handle_slice_ee_unsubscribe(sub_id).await,
+            "DELETE" => handle_slice_ee_unsubscribe(sub_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
 
@@ -1925,6 +1926,14 @@ async fn handle_roaming_quotas_query(request: &SbiRequest) -> SbiResponse {
 async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
     log::info!("SliceEventExposure Subscribe");
 
+    // #1865: bound to the verified identity of the subscriber (never the
+    // self-declared nfId), decided before the body is read or anything stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "SliceEventExposure Subscribe")
+    {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+
     let body = match &request.http.content {
         Some(content) => content,
         None => {
@@ -2002,7 +2011,8 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
         .collect();
 
     let subscription_id = uuid::Uuid::new_v4().to_string();
-    let sub = build_subscription(&subscription_id, &data, event_type, snssais);
+    let mut sub = build_subscription(&subscription_id, &data, event_type, snssais);
+    sub.owner = owner;
     let immediate = sub.immediate_flag;
     let snssais_for_immediate = sub.snssais.clone();
     with_nsacf_context(|c| c.subscription_add(sub));
@@ -2086,6 +2096,8 @@ fn build_subscription(
             .map(String::from),
         over_threshold: false,
         last_report_at: 0,
+        // Set by the caller: create binds the subscriber, modify keeps it.
+        owner: None,
     }
 }
 
@@ -2189,6 +2201,14 @@ async fn handle_slice_ee_modify_partial(
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     };
+    // #1865: only the subscriber may modify, before the body is read.
+    if let Some(refused) = owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "SliceEventExposure PartialModifySubscription",
+    ) {
+        return refused;
+    }
 
     // TS 29.536 / TS 29.500: the media type is part of the contract, and a
     // consumer sending a merge-patch body under the wrong type must be told so
@@ -2247,6 +2267,7 @@ async fn handle_slice_ee_modify_partial(
     updated.report_count = existing.report_count;
     updated.over_threshold = existing.over_threshold;
     updated.last_report_at = existing.last_report_at;
+    updated.owner = existing.owner.clone();
     with_nsacf_context(|c| c.subscription_add(updated));
 
     log::info!("SliceEventExposure subscription {subscription_id} partially modified");
@@ -2273,6 +2294,14 @@ async fn handle_slice_ee_modify_complete(
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     };
+    // #1865: only the subscriber may replace, before the body is read.
+    if let Some(refused) = owner_binding::refuse_non_owner(
+        existing.owner.as_deref(),
+        request,
+        "SliceEventExposure CompleteModifySubscription",
+    ) {
+        return refused;
+    }
 
     let Some(body) = &request.http.content else {
         return problem_details(
@@ -2301,6 +2330,7 @@ async fn handle_slice_ee_modify_complete(
     updated.report_count = existing.report_count;
     updated.over_threshold = existing.over_threshold;
     updated.last_report_at = existing.last_report_at;
+    updated.owner = existing.owner.clone();
     with_nsacf_context(|c| c.subscription_add(updated));
 
     log::info!("SliceEventExposure subscription {subscription_id} replaced");
@@ -2349,8 +2379,20 @@ fn subscription_to_document(sub: &SacSubscription) -> serde_json::Value {
 }
 
 /// DELETE /nnsacf-slice-ee/v1/subscriptions/{subscriptionId}
-async fn handle_slice_ee_unsubscribe(subscription_id: &str) -> SbiResponse {
+async fn handle_slice_ee_unsubscribe(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("SliceEventExposure Unsubscribe: {subscription_id}");
+
+    // #1865: only the subscriber may unsubscribe, checked before the removal.
+    // An unknown id falls through to the 404 below.
+    if let Some(existing) = with_nsacf_context(|c| c.subscription_get(subscription_id)).flatten() {
+        if let Some(refused) = owner_binding::refuse_non_owner(
+            existing.owner.as_deref(),
+            request,
+            "SliceEventExposure Unsubscribe",
+        ) {
+            return refused;
+        }
+    }
 
     let removed = with_nsacf_context(|c| c.subscription_remove(subscription_id)).unwrap_or(false);
 
@@ -2784,6 +2826,15 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
+    /// #1865: the verified subscriber the handler-level tests act as, so they
+    /// pass under both SBI profiles (production refuses an anonymous
+    /// subscribe and freezes an ownerless subscription).
+    const TEST_NF_1865: &str = "aaaaaaaa-1865-4000-8000-0000000000c1";
+
+    fn as_nf_1865(mut r: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiRequest {
+        r.oauth2_subject = Some(TEST_NF_1865.to_string());
+        r
+    }
 
     /// Issue #27: the `nsacf.sla` field is a raw Value precisely so a
     /// malformed block can NEVER fail the whole config parse (which would
@@ -5274,7 +5325,7 @@ nsacf:
         let _ctx_guard = GLOBAL_CTX_TEST_LOCK.lock().await;
         nsacf_context_init(64);
         let post = |doc: &serde_json::Value| {
-            SbiRequest::post("/nnsacf-slice-ee/v1/subscriptions")
+            as_nf_1865(SbiRequest::post("/nnsacf-slice-ee/v1/subscriptions"))
                 .with_body(doc.to_string(), "application/json")
         };
         for bad in [
@@ -5361,14 +5412,17 @@ nsacf:
         );
         let (event_type, snssais) = validate_subscription_doc(&doc).expect("valid");
         let mut stored = build_subscription("sub-96c", &doc, &event_type, snssais);
+        stored.owner = Some(TEST_NF_1865.to_string());
         // Pretend two reports have already been sent.
         stored.report_count = 2;
         with_nsacf_context(|c| c.subscription_add(stored));
 
         // PATCH (RFC 6902) raises the threshold.
         let patch = json!([{"op": "replace", "path": "/event/notifThreshold/percValueNumUes", "value": 80}]);
-        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
-            .with_body(patch.to_string(), "application/json-patch+json");
+        let req = as_nf_1865(SbiRequest::patch(
+            "/nnsacf-slice-ee/v1/subscriptions/sub-96c",
+        ))
+        .with_body(patch.to_string(), "application/json-patch+json");
         let resp = handle_slice_ee_modify_partial("sub-96c", &req).await;
         assert_eq!(resp.status, 200, "PATCH must modify, not 405");
         let after = with_nsacf_context(|c| c.subscription_get("sub-96c"))
@@ -5384,8 +5438,10 @@ nsacf:
         );
 
         // The wrong media type is refused rather than applied as something else.
-        let bad = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
-            .with_body(patch.to_string(), "application/merge-patch+json");
+        let bad = as_nf_1865(SbiRequest::patch(
+            "/nnsacf-slice-ee/v1/subscriptions/sub-96c",
+        ))
+        .with_body(patch.to_string(), "application/merge-patch+json");
         assert_eq!(
             handle_slice_ee_modify_partial("sub-96c", &bad).await.status,
             415
@@ -5393,8 +5449,10 @@ nsacf:
 
         // A patch that breaks the document is refused and does NOT commit.
         let destructive = json!([{"op": "remove", "path": "/eventNotifyUri"}]);
-        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
-            .with_body(destructive.to_string(), "application/json-patch+json");
+        let req = as_nf_1865(SbiRequest::patch(
+            "/nnsacf-slice-ee/v1/subscriptions/sub-96c",
+        ))
+        .with_body(destructive.to_string(), "application/json-patch+json");
         assert_eq!(
             handle_slice_ee_modify_partial("sub-96c", &req).await.status,
             400
@@ -5413,7 +5471,7 @@ nsacf:
             json!({"eventTrigger": "PERIODIC", "notificationPeriod": 60}),
             json!({"maxReports": 9}),
         );
-        let req = SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
+        let req = as_nf_1865(SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/sub-96c"))
             .with_json_body(&replacement)
             .expect("body");
         let resp = handle_slice_ee_modify_complete("sub-96c", &req).await;
@@ -5550,13 +5608,17 @@ nsacf:
         let doc = subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({}));
         let (event_type, snssais) = validate_subscription_doc(&doc).expect("valid");
         with_nsacf_context(|c| {
-            c.subscription_add(build_subscription("sub-96r", &doc, &event_type, snssais))
+            let mut sub = build_subscription("sub-96r", &doc, &event_type, snssais);
+            sub.owner = Some(TEST_NF_1865.to_string());
+            c.subscription_add(sub)
         });
 
         // PATCH through the router.
         let patch = json!([{"op": "replace", "path": "/event/eventType", "value": "NUM_OF_ESTD_PDU_SESSIONS"}]);
-        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96r")
-            .with_body(patch.to_string(), "application/json-patch+json");
+        let req = as_nf_1865(SbiRequest::patch(
+            "/nnsacf-slice-ee/v1/subscriptions/sub-96r",
+        ))
+        .with_body(patch.to_string(), "application/json-patch+json");
         let resp = nsacf_sbi_request_handler(req).await;
         assert_ne!(
             resp.status, 405,
@@ -5566,7 +5628,7 @@ nsacf:
         assert_eq!(resp.status, 200);
 
         // PUT through the router.
-        let req = SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/sub-96r")
+        let req = as_nf_1865(SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/sub-96r"))
             .with_json_body(&doc)
             .expect("body");
         let resp = nsacf_sbi_request_handler(req).await;
@@ -5577,9 +5639,10 @@ nsacf:
         assert_eq!(resp.status, 200);
 
         // A verb the resource genuinely does not support is still 405.
-        let resp =
-            nsacf_sbi_request_handler(SbiRequest::get("/nnsacf-slice-ee/v1/subscriptions/sub-96r"))
-                .await;
+        let resp = nsacf_sbi_request_handler(as_nf_1865(SbiRequest::get(
+            "/nnsacf-slice-ee/v1/subscriptions/sub-96r",
+        )))
+        .await;
         assert_eq!(resp.status, 405, "GET is not defined on this resource");
 
         with_nsacf_context(|c| c.subscription_remove("sub-96r"));
@@ -5664,6 +5727,170 @@ mod tests_advertised_scheme_1791 {
                 );
             }
         }
+    }
+}
+
+/// #1865: a SliceEventExposure subscription is modified, replaced or cancelled
+/// only by the consumer that created it (TS 33.501 §13.4.1), never by whoever
+/// learns its ID or claims its `nfId`. Every request goes through
+/// `nsacf_sbi_request_handler`, so the routing that hands the caller to each
+/// handler is covered as well as the check.
+#[cfg(test)]
+mod subscription_owner_tests_1865 {
+    use super::*;
+    use serde_json::json;
+
+    const OWNER: &str = "aaaaaaaa-1865-4000-8000-0000000000d1";
+    const OTHER: &str = "bbbbbbbb-1865-4000-8000-0000000000d2";
+
+    fn with_identity(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
+        r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        r.oauth2_subject = token.map(str::to_string);
+        r
+    }
+
+    fn doc(uri: &str) -> serde_json::Value {
+        json!({
+            "eventNotifyUri": uri,
+            // The self-declared nfId names the OWNER: claiming it proves nothing.
+            "nfId": OWNER,
+            "notifyCorrelationId": "orig",
+            "event": {"eventType": "NUM_OF_REGD_UES", "eventFilter": [{"sst": 18}]}
+        })
+    }
+
+    fn uri(id: &str) -> String {
+        format!("/nnsacf-slice-ee/v1/subscriptions/{id}")
+    }
+
+    /// REVERT-VERIFIED: with `sub.owner = owner` dropped at create the
+    /// bound-owner assertion fails; with the PartialModify check removed the
+    /// intruder PATCH gets 200; with the CompleteModify check removed the
+    /// intruder PUT gets 200; with the Unsubscribe check removed the intruder
+    /// DELETE gets 204; with `updated.owner = existing.owner` dropped the
+    /// owner's second PATCH (after its own PUT) gets 403.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_subscriber_manages_its_slice_ee_subscription_1865() {
+        nsacf_context_init(64);
+        let rsp = nsacf_sbi_request_handler(with_identity(
+            SbiRequest::post("/nnsacf-slice-ee/v1/subscriptions").with_body(
+                doc("http://127.0.0.1:9/own-1865").to_string(),
+                "application/json",
+            ),
+            Some(OWNER),
+            None,
+        ))
+        .await;
+        assert_eq!(rsp.status, 201, "{:?}", rsp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(rsp.http.content.as_deref().unwrap()).unwrap();
+        let id = body["subscriptionId"].as_str().unwrap().to_string();
+        let stored = || {
+            with_nsacf_context(|c| c.subscription_get(&id))
+                .flatten()
+                .expect("still stored")
+        };
+        assert_eq!(stored().owner.as_deref(), Some(OWNER));
+
+        let patch = json!([{"op": "replace", "path": "/notifyCorrelationId", "value": "hijacked"}]);
+        for (cert, token) in [
+            (Some(OTHER), None),
+            (None, Some(OTHER)),
+            (None, None),
+            (Some(OWNER), Some(OTHER)),
+        ] {
+            let r = nsacf_sbi_request_handler(with_identity(
+                SbiRequest::patch(uri(&id))
+                    .with_body(patch.to_string(), "application/json-patch+json"),
+                cert,
+                token,
+            ))
+            .await;
+            assert_eq!(r.status, 403, "PATCH by cert={cert:?} token={token:?}");
+            let r = nsacf_sbi_request_handler(with_identity(
+                SbiRequest::put(uri(&id))
+                    .with_json_body(&doc("http://127.0.0.1:9/hijacked"))
+                    .unwrap(),
+                cert,
+                token,
+            ))
+            .await;
+            assert_eq!(r.status, 403, "PUT by cert={cert:?} token={token:?}");
+            let r =
+                nsacf_sbi_request_handler(with_identity(SbiRequest::delete(uri(&id)), cert, token))
+                    .await;
+            assert_eq!(r.status, 403, "DELETE by cert={cert:?} token={token:?}");
+            let s = stored();
+            assert_eq!(s.notify_correlation_id.as_deref(), Some("orig"));
+            assert_eq!(s.notification_uri, "http://127.0.0.1:9/own-1865");
+        }
+
+        // The owner replaces, then patches (the PUT kept the owner), then cancels.
+        let r = nsacf_sbi_request_handler(with_identity(
+            SbiRequest::put(uri(&id))
+                .with_json_body(&doc("http://127.0.0.1:9/moved-1865"))
+                .unwrap(),
+            None,
+            Some(OWNER),
+        ))
+        .await;
+        assert_eq!(r.status, 200);
+        let r = nsacf_sbi_request_handler(with_identity(
+            SbiRequest::patch(uri(&id)).with_body(patch.to_string(), "application/json-patch+json"),
+            Some(OWNER),
+            None,
+        ))
+        .await;
+        assert_eq!(r.status, 200, "the owner survives its own PUT");
+        assert_eq!(stored().owner.as_deref(), Some(OWNER));
+        let r = nsacf_sbi_request_handler(with_identity(
+            SbiRequest::delete(uri(&id)),
+            Some(&OWNER.to_uppercase()),
+            None,
+        ))
+        .await;
+        assert_eq!(r.status, 204);
+        assert!(with_nsacf_context(|c| c.subscription_get(&id))
+            .flatten()
+            .is_none());
+        // Gone is 404, for anyone.
+        let r = nsacf_sbi_request_handler(with_identity(
+            SbiRequest::delete(uri(&id)),
+            Some(OTHER),
+            None,
+        ))
+        .await;
+        assert_eq!(r.status, 404);
+    }
+
+    /// REVERT-VERIFIED: with the create-side `owner_for_new_resource` replaced
+    /// by `Ok(None)` the mismatched subscribe gets 201 and is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscriber_whose_identities_disagree_stores_nothing_1865() {
+        nsacf_context_init(64);
+        let before = with_nsacf_context(|c| {
+            c.subscriptions_matching(&SNssai::new(19, None))
+                .into_iter()
+                .filter(|s| s.notification_uri.ends_with("/mixed-1865"))
+                .count()
+        });
+        let mut d = doc("http://127.0.0.1:9/mixed-1865");
+        d["event"]["eventFilter"] = json!([{"sst": 19}]);
+        let r = nsacf_sbi_request_handler(with_identity(
+            SbiRequest::post("/nnsacf-slice-ee/v1/subscriptions")
+                .with_body(d.to_string(), "application/json"),
+            Some(OWNER),
+            Some(OTHER),
+        ))
+        .await;
+        assert_eq!(r.status, 403);
+        let after = with_nsacf_context(|c| {
+            c.subscriptions_matching(&SNssai::new(19, None))
+                .into_iter()
+                .filter(|s| s.notification_uri.ends_with("/mixed-1865"))
+                .count()
+        });
+        assert_eq!(before, after, "nothing stored for a refused subscribe");
     }
 }
 

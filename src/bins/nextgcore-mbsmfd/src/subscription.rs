@@ -174,6 +174,10 @@ pub struct SubEntry {
     /// Bare subscription document (MbsSessionSubscription or ContextStatusSubscription
     /// serialized to JSON) — the source of truth for PATCH echo.
     pub document: serde_json::Value,
+    /// #1865: the verified NF Instance ID of the consumer that subscribed, the
+    /// only one that may modify or unsubscribe (TS 33.501 §13.4.1). `None`
+    /// when it subscribed with no verified identity (`dev` profile).
+    pub owner: Option<String>,
 }
 
 impl SubEntry {
@@ -245,6 +249,12 @@ impl SubscriptionStore {
     /// Remove a subscription (DELETE). Returns false if not found.
     pub fn remove(&mut self, id: &str) -> bool {
         self.entries.remove(id).is_some()
+    }
+
+    /// #1865: the owner of subscription `id`: `None` if there is no such
+    /// subscription, `Some(None)` if it is ownerless.
+    pub fn owner_of(&self, id: &str) -> Option<Option<String>> {
+        self.entries.get(id).map(|e| e.owner.clone())
     }
 
     /// Retrieve a subscription by ID.
@@ -416,6 +426,7 @@ mod tests {
             event_types: vec![],
             mbs_session_id: None,
             document: serde_json::json!({}),
+            owner: None,
         }
     }
 
@@ -449,6 +460,7 @@ mod tests {
             event_types: vec![],
             mbs_session_id: None,
             document: doc,
+            owner: None,
         });
 
         // Patch replaces notifyCorrelationId.
@@ -481,6 +493,7 @@ mod tests {
             event_types: vec!["SESSION_RELEASE".to_string()],
             mbs_session_id: None,
             document: serde_json::json!({}),
+            owner: None,
         });
 
         // Both A and B match SESSION_RELEASE.
@@ -513,6 +526,7 @@ mod tests {
             event_types: vec![],
             mbs_session_id: None,
             document: serde_json::json!({}),
+            owner: None,
         };
         assert!(all_events.matches("SESSION_RELEASE"));
         assert!(all_events.matches("QOS_INFO"));
@@ -523,6 +537,7 @@ mod tests {
             notify_correlation_id: None,
             mbs_session_id: None,
             document: serde_json::json!({}),
+            owner: None,
         };
         assert!(release_only.matches("SESSION_RELEASE"));
         assert!(!release_only.matches("QOS_INFO"));

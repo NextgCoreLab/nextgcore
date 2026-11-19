@@ -738,6 +738,12 @@ pub struct AnalyticsSubscription {
     /// so it is emitted exactly once (issue #108).
     #[serde(default)]
     pub termination_notified: bool,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription, the only one that may update or delete it (TS 33.501
+    /// §13.4.1). `None` when created with no verified identity (`dev`) or
+    /// restored from a state file written before #1865.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// TS 29.520 `TerminationCause` — why the NWDAF stopped reporting.
@@ -802,6 +808,7 @@ impl AnalyticsSubscription {
             max_report_nbr: None,
             reports_sent: 0,
             termination_notified: false,
+            owner: None,
         }
     }
 
@@ -916,6 +923,12 @@ pub struct MlProvSubscription {
     /// (nextgsim#468: the threshold of the AnLF that registers a model).
     #[serde(default)]
     pub consumer_id: Option<String>,
+    /// #1865: the verified NF Instance ID of the consumer that created this
+    /// subscription, the only one that may update or delete it. Never the
+    /// self-declared `User-Agent` ([`Self::consumer_id`]). `None` when created
+    /// with no verified identity (`dev`) or restored from before #1865.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl MlProvSubscription {
@@ -935,6 +948,7 @@ impl MlProvSubscription {
             supp_feats: None,
             accuracy_thresholds: Vec::new(),
             consumer_id: None,
+            owner: None,
         }
     }
 

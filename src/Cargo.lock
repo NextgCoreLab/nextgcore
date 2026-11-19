@@ -3287,6 +3287,7 @@ dependencies = [
  "p256",
  "proptest",
  "rand 0.9.2",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",
@@ -3425,7 +3426,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
- "uuid",
 ]
 
 [[package]]
