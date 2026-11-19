@@ -124,13 +124,13 @@ Every refused datagram increments `smf_pfcp_unauthorized_messages_total`. This i
 | `PCF_URI` / `NSACF_URI` | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
 | `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port: the shared families, the PDU session establishment counters (#1368) and the SMF gauges; see the Observability chapter. |
 | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
-| `SMF_UDM` | off | `1`/`true` turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
+| `SMF_UDM` | off | `1`/`true` turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. With it on, the `sm-data` entry used is the one for the session's own S-NSSAI, its SD compared in either case (TS 29.571 §5.4.4.2; FFFFFF is no SD). When the UDM answers only with entries for other slices, the create is refused 403 `SNSSAI_DENIED` with 5GSM cause #70 (#1878). Before #1878 it took the first entry, so the session got another slice's AMBR and 5QI. |
 | `SMF_EPS_INTERWORKING` | off | `1`/`true` makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
 | `SMF_IWK_SNSSAI` | SST `1` | S-NSSAI (`sst` or `sst:sd`, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475). |
 | `SMF_PGW_FQDN` | unset | PGW-C+SMF FQDN registered with the UDM; blank is treated as unset. |
 | `SMF_INDIRECT_FORWARDING_TIMER_MS` | `3000` | How long the UPF keeps EPS→5GS indirect data-forwarding tunnels after the handover executes. |
 | `SMF_GN_ADDR` | `127.0.0.1` | GGSN address this SMF puts in Gn Create/Update PDP Context Responses (GTPv1 interworking). |
-| `SMF_EASDF` / `SMF_EASDF_EDGE_FQDN` | off / unset | `1`/`true` enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); `SMF_EASDF_EDGE_FQDN` lists the FQDN patterns (e.g. `*.edge.example.com`) to steer. Enabled with no pattern logs a warning and steers nothing. Under the `production` SBI profile the SMF dials the EASDF (and the NRF for its discovery) over https with its client certificate (#1648), so run easdfd with `--tls`: easdfd does not follow `NEXTGCORE_SBI_PROFILE`. With OAuth2 enforcement on, the DNS-context requests carry the NRF-issued token. Each DNS context is given its own report URI, `{apiRoot}/nsmf-callback/v1/{smContextRef}/easdf-dns-report/{token}` (#1518). An OAuth2-required listener admits the EASDF's token-less report on that token, and the report is applied only to that session's own DNS context. The old `nsmf-pdusession/v1/easdf-dns-reports` route is served only for DNS contexts created before #1518. |
+| `SMF_EASDF` / `SMF_EASDF_EDGE_FQDN` | off / unset | `1`/`true` enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); `SMF_EASDF_EDGE_FQDN` lists the FQDN patterns (e.g. `*.edge.example.com`) to steer. Enabled with no pattern logs a warning and steers nothing. Under the `production` SBI profile the SMF dials the EASDF (and the NRF for its discovery) over https with its client certificate (#1648), which easdfd serves under the same profile (#1677). With OAuth2 enforcement on, the DNS-context requests carry the NRF-issued token. Each DNS context is given its own report URI, `{apiRoot}/nsmf-callback/v1/{smContextRef}/easdf-dns-report/{token}` (#1518). An OAuth2-required listener admits the EASDF's token-less report on that token, and the report is applied only to that session's own DNS context. The old `nsmf-pdusession/v1/easdf-dns-reports` route is served only for DNS contexts created before #1518. |
 | `REDCAP_SESS_AMBR_DL_BPS` / `_UL_BPS` | `150000000` / `50000000` | Session-AMBR caps for RedCap UEs. |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | unset | `1`/`true`/`yes` forces OAuth2 enforcement, taking precedence over the YAML knob. |
 | `NEXTGCORE_SMF_STATE_FILE` | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when `--state-file` is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
@@ -229,7 +229,21 @@ With an NSACF configured (`NSACF_URI`) or discoverable, every PDU session is cou
 - **Count-out.** Every release sends the DECREASE, alongside the UDM cleanup. A same-PSI re-establishment on the same S-NSSAI waits for the old session's DECREASE if it is already sent, and takes the admission over if it is not (then neither a DECREASE nor a new INCREASE is sent). A re-establishment on another S-NSSAI waits for neither.
 - **Shutdown and boot.** A shutdown that releases the association counts out every session still admitted, alongside the #39 fan-out and the Association Release, within the shutdown deadline. A durable shutdown counts nothing out: the sessions continue. At boot, a snapshot session that cannot be restored is counted out.
 
-`smf_nsac_decrease_failures_total` counts the DECREASEs the NSACF refused or did not answer. Each such session stays counted at the NSACF. Precautionary DECREASEs are not counted.
+`smf_nsac_decrease_failures_total` counts the DECREASEs the NSACF refused or did not answer, the reconciler's retries included. Precautionary DECREASEs are not counted. (Before #1875 each such session stayed counted at the NSACF for good; that no longer holds.)
+
+## Release-cleanup reconciler (#1875)
+
+A release (or a create's rollback) owes four peers a cleanup: the NSACF DECREASE, the SM Policy Association delete (TS 29.512 §4.2.5), the Nudm_UECM_Deregistration and the Nudm_SDM_Unsubscribe (TS 23.502 §4.3.4.2 steps 14-15). One that fails or times out is parked and retried every 30 s until the peer accepts it; a 404 counts as accepted, because the peer does not hold the record. A 4xx the PCF refuses with is not retried.
+
+- **Bounded.** At most 4096 parked cleanups. Parking one more evicts the oldest, which is logged at error and counted `abandoned`. One pass sends for at most 30 s.
+- **Durable.** The parked set is written into the state snapshot (`pendingCleanups`) and restored at boot, when the durable state is configured (`--state-file` / `NEXTGCORE_SMF_STATE_FILE`). Without it the set is memory-only, like the sessions.
+- **Never against a live session.** A DECREASE or deregistration names a (SUPI, PSI). A new session for that pair supersedes it: its INCREASE or registration is the live one, so nothing is sent. A session for the pair still being created defers it to the next pass.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `smf_release_cleanups_pending` | gauge | `kind`: `nsac_decrease`, `sm_policy_delete`, `uecm_deregister`, `sdm_unsubscribe` | cleanups parked now |
+| `smf_release_cleanups_parked_total` | counter | `kind` | cleanups that failed and were parked |
+| `smf_release_cleanups_reconciled_total` | counter | `kind`, `result`: `delivered`, `superseded`, `refused`, `abandoned` | parked cleanups the reconciler ended, and how |
 
 ## Restoration signalling (#193)
 
@@ -329,6 +343,17 @@ counter and registered nothing, so every `Retrieve` answered
 reference is read back out of the session rather than computed alongside it because
 `sess_add_by_psi` mints it from the *same* counter — computing both would consume the
 counter twice and leave the handler's reference one behind the session's.
+
+**Serving-AMF binding (#1860).** The `smContextRef` is `{index}-{32 random hex}`, so
+one reference says nothing about another, and only the full string resolves. Each SM
+context is bound to the verified identity of the AMF that created it: the access
+token's `sub`, or its client certificate's NF Instance ID (not an SCP's). The binding
+is persisted with the policy binding. Modify, release and retrieve from any other
+caller are refused `403` before the handler runs. An AMF change (TS 29.502 Table
+6.1.6.2.3-1: `servingNfId` with the new `smContextStatusUri`) is admitted only from the
+new AMF itself, whose verified identity must be that `servingNfId`. A context created
+with no verified identity (the `dev` profile), or restored from a snapshot written
+before #1860, is not bound.
 
 A create that fails after registration **rolls the registration back**. An abandoned
 registration would be an SM context the AMF never learned about and will never

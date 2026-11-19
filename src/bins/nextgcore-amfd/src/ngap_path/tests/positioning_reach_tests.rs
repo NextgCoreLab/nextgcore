@@ -34,6 +34,16 @@ fn positioning_transfer_notifying(
     supi: &str,
     failure_uri: Option<&str>,
 ) -> nextgcore_sbi::SbiRequest {
+    positioning_transfer_tagged(supi, failure_uri, None)
+}
+
+/// [`positioning_transfer_notifying`], with `correlation` as its lcsCorrelationId:
+/// another transfer from the same LMF.
+fn positioning_transfer_tagged(
+    supi: &str,
+    failure_uri: Option<&str>,
+    correlation: Option<&str>,
+) -> nextgcore_sbi::SbiRequest {
     let mut body = serde_json::json!({
         "n1MessageContainer": {
             "n1MessageClass": "LPP",
@@ -52,6 +62,9 @@ fn positioning_transfer_notifying(
     });
     if let Some(uri) = failure_uri {
         body["n1n2FailureTxfNotifURI"] = serde_json::json!(uri);
+    }
+    if let Some(c) = correlation {
+        body["lcsCorrelationId"] = serde_json::json!(c);
     }
     nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
         .with_json_body(&body)
@@ -646,6 +659,7 @@ async fn a_positioning_transfer_joining_a_location_page_is_told_it_failed_1837()
         .paging_join_or_add_location(location_page, "sub-1837-b"));
 
     let lmf = format!("http://127.0.0.1:{port}/lmf-fail-1837");
+    let mut locations = Vec::new();
     for _ in 0..2 {
         let resp = crate::namf_server::test_namf_request_handler(positioning_transfer_notifying(
             supi,
@@ -654,7 +668,14 @@ async fn a_positioning_transfer_joining_a_location_page_is_told_it_failed_1837()
         .await;
         assert_eq!(resp.status, 202, "{}", cause_of(&resp));
         assert_eq!(cause_of(&resp), "ATTEMPTING_TO_REACH_UE");
+        locations.push(
+            resp.http
+                .get_header("location")
+                .expect("Location")
+                .to_string(),
+        );
     }
+    assert_eq!(locations[0], locations[1], "a retry is the same transfer");
     let page = crate::context::amf_self()
         .read()
         .expect("ctx")
@@ -669,8 +690,8 @@ async fn a_positioning_transfer_joining_a_location_page_is_told_it_failed_1837()
     let (cause, uri) = next_failure(&mut rx).await;
     assert_eq!(cause, "UE_NOT_RESPONDING");
     assert_eq!(
-        uri,
-        format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        uri, locations[0],
+        "the notification names the transfer's Location"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), rx.recv())
@@ -731,6 +752,11 @@ async fn a_failed_page_notifies_every_transfer_it_holds_at_its_own_uri_1837() {
     ))
     .await;
     assert_eq!(resp.status, 202, "{}", cause_of(&resp));
+    let lmf_location = resp
+        .http
+        .get_header("location")
+        .expect("Location")
+        .to_string();
     let page = crate::context::amf_self()
         .read()
         .expect("ctx")
@@ -759,11 +785,228 @@ async fn a_failed_page_notifies_every_transfer_it_holds_at_its_own_uri_1837() {
     let lmf_got = lmf_got.expect("the LMF is told");
     let v: serde_json::Value = serde_json::from_str(&lmf_got).expect("JSON");
     assert_eq!(v["cause"], "UE_NOT_RESPONDING");
-    assert_eq!(
-        v["n1n2MsgDataUri"],
-        format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
-    );
+    assert_eq!(v["n1n2MsgDataUri"], lmf_location.as_str());
     server.forget_ue(ue);
     smf_sink.stop().await.expect("sink stop");
     lmf_sink.stop().await.expect("sink stop");
+}
+
+/// An SMF's PDU_RES_SETUP_REQ N1N2MessageTransfer for `psi`, notifying `failure_uri`.
+fn sm_setup_transfer(supi: &str, psi: u8, failure_uri: &str) -> nextgcore_sbi::SbiRequest {
+    nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+        .with_json_body(&serde_json::json!({
+            "pduSessionId": psi,
+            "n1n2FailureTxfNotifURI": failure_uri,
+            "n2InfoContainer": {
+                "n2InformationClass": "SM",
+                "smInfo": {
+                    "pduSessionId": psi,
+                    "n2InfoContent": {
+                        "ngapIeType": "PDU_RES_SETUP_REQ",
+                        "ngapData": { "contentId": "ngap-sm" },
+                    },
+                },
+            },
+        }))
+        .expect("json")
+        .with_part(SbiPart::with_content(
+            "ngap-sm",
+            "application/vnd.3gpp.ngap",
+            bytes::Bytes::from_static(&[0x00, 0x18, 0x58]),
+        ))
+}
+
+/// **#1858 (1)**, TS 23.502 §4.2.3.3 step 3b (`23502-k20.txt:7177-7183`): a page an
+/// LMF's positioning transfer started is not a page for a request of the same or a
+/// higher priority than an SMF's downlink data, so the SMF's N1N2MessageTransfer is
+/// not refused 409 HIGHER_PRIORITY_REQUEST_ONGOING: it is answered 202
+/// ATTEMPTING_TO_REACH_UE and takes the page over. Before #1858 it got 409.
+/// - Answered: the page then holds the SMF's N2, and the LMF's held LPP and NRPPa
+///   still go out once the UE is connected.
+/// - Unanswered: both the SMF and the LMF that started the page are told, each at
+///   its own URI.
+///
+/// REVERT-VERIFIED: with `PagingContext::holds_transfer` ignoring
+/// `positioning_only`, the SMF gets 409 ("not refused for a positioning page");
+/// with the started page keeping the LMF's URI as its own rather than as a joined
+/// transfer, the takeover drops it ("the LMF that started the page is told").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_smf_transfer_takes_over_a_positioning_page_1858() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (smf_sink, smf_port, mut smf_rx) = notify_sink().await;
+    let (lmf_sink, lmf_port, mut lmf_rx) = notify_sink().await;
+    let mut server = capturing_ngap_server().await;
+    let smf = format!("http://127.0.0.1:{smf_port}/smf-fail-1858");
+    let lmf = format!("http://127.0.0.1:{lmf_port}/lmf-fail-1858");
+    let page_of = |ue: u64| {
+        crate::context::amf_self()
+            .read()
+            .expect("ctx")
+            .paging_find(ue)
+    };
+
+    for (answered, ue, ran, supi) in [
+        (true, 18_580_001u64, 94u32, "imsi-001010018580001"),
+        (false, 18_580_002, 95, "imsi-001010018580002"),
+    ] {
+        idle_ue(&mut server, ue, ran, supi);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx");
+            let mut sess = guard.sess_add(ue, 5).expect("session");
+            sess.sm_context_ref = Some(format!("smctx-1858-{ue}"));
+            sess.s_nssai.sst = 1;
+            guard.sess_update(&sess);
+        }
+        let resp =
+            crate::namf_request_handler(positioning_transfer_notifying(supi, Some(&lmf))).await;
+        assert_eq!(resp.status, 202, "{}", cause_of(&resp));
+        let lmf_location = resp
+            .http
+            .get_header("location")
+            .expect("Location")
+            .to_string();
+        let page = page_of(ue).expect("the LMF's transfer pages the UE");
+        assert!(page.positioning_only);
+
+        let resp = crate::namf_request_handler(sm_setup_transfer(supi, 5, &smf)).await;
+        assert_eq!(
+            resp.status, 202,
+            "not refused for a positioning page: {:?}",
+            resp.http.content
+        );
+        assert_eq!(cause_of(&resp), "ATTEMPTING_TO_REACH_UE");
+        let mut page = page_of(ue).expect("still paged");
+        assert!(
+            !page.positioning_only,
+            "the page now holds the SMF's transfer"
+        );
+        assert_eq!(page.pdu_session_id, Some(5));
+        assert_eq!(page.pending_n2.as_deref(), Some(&[0x00, 0x18, 0x58][..]));
+        assert!(
+            crate::namf_request_handler(sm_setup_transfer(supi, 5, &smf))
+                .await
+                .status
+                == 409,
+            "a second SM transfer is refused: the page holds one now"
+        );
+
+        if answered {
+            server.process_positioning_downlinks().await;
+            assert_eq!(
+                positioning_sent(&mut server, ue),
+                (0, 0),
+                "held while paged"
+            );
+            // The UE answers: the page is consumed and the UE is connected.
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .paging_remove(ue);
+            server.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
+            server.process_positioning_downlinks().await;
+            assert_eq!(
+                positioning_sent(&mut server, ue),
+                (1, 1),
+                "the LMF's held downlinks go out once the UE is connected"
+            );
+        } else {
+            page.max_retransmit = 0;
+            {
+                let ctx = crate::context::amf_self();
+                let guard = ctx.read().expect("ctx");
+                // The same page, on its last attempt.
+                guard.paging_remove(ue);
+                assert!(guard.paging_add(page));
+            }
+            run_page_out(&mut server, ue).await;
+            let (cause, _) = next_failure(&mut smf_rx).await;
+            assert_eq!(cause, "UE_NOT_RESPONDING", "the SMF is told");
+            let got = tokio::time::timeout(Duration::from_secs(3), lmf_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .expect("the LMF that started the page is told");
+            let v: serde_json::Value = serde_json::from_str(&got).expect("JSON");
+            assert_eq!(v["cause"], "UE_NOT_RESPONDING");
+            assert_eq!(v["n1n2MsgDataUri"], lmf_location.as_str());
+        }
+        server.forget_ue(ue);
+    }
+    smf_sink.stop().await.expect("sink stop");
+    lmf_sink.stop().await.expect("sink stop");
+}
+
+/// **#1858 (2)**, TS 29.518 §5.2.2.3.1: two LMF positioning transfers that share
+/// one n1n2FailureTxfNotifURI are two transfers. Each is answered with its own
+/// Location, and when the page fails each is told, naming its own resource. A
+/// retry of one of them is still told once. Before #1858 both had one resource,
+/// the join keyed on the URI, and they collapsed into a single notification.
+///
+/// REVERT-VERIFIED: with `join_transfer` keyed by the callback URI again, the
+/// second transfer is not recorded ("each transfer is told"); with
+/// `positioning_transfer_id` ignoring the request (one id for every transfer), the
+/// two get one Location ("two transfers, two resources").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_lmf_transfers_sharing_one_callback_uri_are_each_told_1858() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (sink, port, mut rx) = notify_sink().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (18_580_011u64, 96, "imsi-001010018580011");
+    idle_ue(&mut server, ue, ran, supi);
+    let lmf = format!("http://127.0.0.1:{port}/lmf-fail-1858-shared");
+
+    let mut locations = Vec::new();
+    for corr in ["corr-a", "corr-b", "corr-b"] {
+        let resp =
+            crate::namf_request_handler(positioning_transfer_tagged(supi, Some(&lmf), Some(corr)))
+                .await;
+        assert_eq!(resp.status, 202, "{}", cause_of(&resp));
+        locations.push(
+            resp.http
+                .get_header("location")
+                .expect("Location")
+                .to_string(),
+        );
+    }
+    assert_ne!(locations[0], locations[1], "two transfers, two resources");
+    assert_eq!(locations[1], locations[2], "a retry is the same transfer");
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx");
+        let mut page = guard.paging_remove(ue).expect("paged");
+        // The same page, on its last attempt.
+        page.max_retransmit = 0;
+        assert!(guard.paging_add(page));
+    }
+
+    run_page_out(&mut server, ue).await;
+    let mut told = Vec::new();
+    for _ in 0..2 {
+        let got = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .expect("each transfer is told");
+        let v: serde_json::Value = serde_json::from_str(&got).expect("JSON");
+        told.push(v["n1n2MsgDataUri"].as_str().unwrap_or_default().to_string());
+    }
+    told.sort();
+    let mut want = vec![locations[0].clone(), locations[1].clone()];
+    want.sort();
+    assert_eq!(told, want, "each names its own resource");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "the retried transfer is told once"
+    );
+    server.forget_ue(ue);
+    sink.stop().await.expect("sink stop");
 }

@@ -54,12 +54,14 @@ mod n4_build;
 mod n4_handler;
 mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod n6_delay; // #1502: N6 delay measurement, provisioned over N4 association (TS 29.244 §5.33.8)
+mod owner_binding; // #1860: SM contexts bound to the verified serving AMF
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
 #[cfg(test)]
 mod property_tests;
 mod qos_mon; // #1390: QOS_MON through per QoS flow QoS monitoring (N4 SRR, N2 id 181)
+mod reconcile; // #1875: parked release-side cleanups, retried until delivered
 mod restoration; // #193: restoration signalling for resources the UPF no longer holds
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
 mod session_metrics; // #1368: PDU session establishment counters (TS 28.552 §5.3.1)
@@ -136,6 +138,7 @@ fn render_metrics() -> String {
         nrf_client: true,
     });
     session_metrics::render(&mut out);
+    reconcile::render(&mut out);
     out.push_str(&render_smf_families());
     n6_delay::render(&mut out);
     out
@@ -169,7 +172,7 @@ fn render_smf_families() -> String {
          # HELP smf_pfcp_unauthorized_messages_total PFCP messages refused or dropped because their sender is no UPF of this SMF, or reported on another UPF's session\n\
          # TYPE smf_pfcp_unauthorized_messages_total counter\n\
          smf_pfcp_unauthorized_messages_total {}\n\
-         # HELP smf_sm_policy_delete_failures_total SM Policy Association terminations (Npcf_SMPolicyControl_Delete) that failed after every attempt; each leaves an association at the PCF\n\
+         # HELP smf_sm_policy_delete_failures_total SM Policy Association terminations (Npcf_SMPolicyControl_Delete) that failed after every attempt; each is parked for the release-cleanup reconciler (smf_release_cleanups_*)\n\
          # TYPE smf_sm_policy_delete_failures_total counter\n\
          smf_sm_policy_delete_failures_total {}\n\
          # HELP smf_up_path_failures_total Remote GTP-U peers a UPF reported a user plane path failure toward (PFCP Node Report, TS 29.244 §5.10A)\n\
@@ -187,7 +190,7 @@ fn render_smf_families() -> String {
          # HELP smf_up_path_sessions_released_total Sessions released because their path was still down after SMF_UP_PATH_FAILURE_HOLD_SECS\n\
          # TYPE smf_up_path_sessions_released_total counter\n\
          smf_up_path_sessions_released_total {}\n\
-         # HELP smf_nsac_decrease_failures_total NSACF DECREASEs (Nnsacf_NSAC_NumOfPDUsUpdate) that failed or timed out; each leaves a PDU session counted at the NSACF\n\
+         # HELP smf_nsac_decrease_failures_total NSACF DECREASEs (Nnsacf_NSAC_NumOfPDUsUpdate) that failed or timed out, the reconciler's retries included; each failed one is parked for the release-cleanup reconciler (smf_release_cleanups_*)\n\
          # TYPE smf_nsac_decrease_failures_total counter\n\
          smf_nsac_decrease_failures_total {}\n\
          # HELP smf_ipv4_pool_stale_releases_total UE IPv4 addresses released while already free: each is a double free\n\
@@ -693,6 +696,48 @@ pub(crate) async fn rollback_nsac_as(
     if !admitted {
         return true;
     }
+    let accepted = nsac_decrease_once(nf_id, nsacf, plmn, supi, psi, sst, sd).await;
+    if !accepted {
+        // #1875: a DECREASE that failed is retried until the NSACF takes it; each one
+        // lost used to shrink the slice's quota for good (TS 23.502 §4.2.11.4).
+        reconcile::park(nsac_cleanup(nf_id, nsacf, plmn, supi, psi, sst, sd));
+    }
+    accepted
+}
+
+/// #1875: the parked form of a DECREASE [`rollback_nsac_as`] could not deliver.
+fn nsac_cleanup(
+    nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> reconcile::Cleanup {
+    reconcile::Cleanup::NsacDecrease {
+        supi: supi.to_string(),
+        psi,
+        sst,
+        sd: sd.map(str::to_string),
+        nf_id: nf_id.map(str::to_string),
+        nsacf: nsacf.cloned(),
+        plmn: plmn.map(|(mcc, mnc)| (mcc.to_string(), mnc.to_string())),
+    }
+}
+
+/// One NSACF DECREASE for (SUPI, PSI), at the NSACF the INCREASE went to when known,
+/// else one resolved afresh. Whether the NSACF accepted it; parks nothing (the
+/// reconciler's own attempt, #1875).
+pub(crate) async fn nsac_decrease_once(
+    nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
     let pinned = nsacf.cloned();
     let resolved = match pinned {
         Some(nsacf) => Some(nsacf),
@@ -1204,6 +1249,9 @@ async fn main() -> Result<()> {
              sessions, policy bindings and IPv4 allocations are memory-only and lost on restart"
         );
     }
+    // #1875: the release-side cleanups that failed (restored above with the state, when
+    // it is durable) are retried from here on, for the life of the process.
+    drop(reconcile::spawn_reconciler());
 
     // Initialize SMF state machine
     let mut smf_sm = SmfFsm::new();
@@ -2444,13 +2492,22 @@ fn select_default_dnn(
         Some(sd) => format!("{sst:02x}-{sd}"),
         None => format!("{sst:02x}"),
     };
-    let infos = smf_sel_data.get("subscribedSnssaiInfos");
+    let infos = smf_sel_data
+        .get("subscribedSnssaiInfos")
+        .and_then(|i| i.as_object());
+    // #1878: the SD is hex in either case (TS 29.571 §5.4.4.2), so the key is
+    // compared that way too.
+    let lookup = |want: &str| {
+        infos.and_then(|i| {
+            i.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                .map(|(_, v)| v)
+        })
+    };
     // Fall back to the key with no SD when the exact key is absent: a subscription
     // provisioned without an SD still applies to a request that carries one, the
     // same widening `nsacfd`'s quota lookup does.
-    let entry = infos
-        .and_then(|i| i.get(&key))
-        .or_else(|| infos.and_then(|i| i.get(format!("{sst:02x}"))));
+    let entry = lookup(&key).or_else(|| lookup(&format!("{sst:02x}")));
 
     let dnn_infos = entry
         .and_then(|e| e.get("dnnInfos"))
@@ -2901,13 +2958,26 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Create SM Context (N11)
         // POST /nsmf-pdusession/v1/sm-contexts
         ("nsmf-pdusession", "sm-contexts", "POST") if resource_id.is_none() => {
-            handle_sm_context_create(&request).await
+            // #1860: the creating AMF's verified identity, taken before anything is
+            // created so a caller whose two identities disagree creates nothing.
+            let owner = match owner_binding::owner_for_new_resource(&request, "CreateSMContext") {
+                Ok(owner) => owner,
+                Err(refused) => return *refused,
+            };
+            let resp = handle_sm_context_create(&request).await;
+            bind_created_sm_context(&resp, owner);
+            resp
         }
 
         // Update SM Context
         // POST /nsmf-pdusession/v1/sm-contexts/{smContextRef}/modify
         ("nsmf-pdusession", "sm-contexts", "POST") if parts.len() >= 5 && parts[4] == "modify" => {
             let sm_context_ref = parts[3];
+            if let Some(refused) =
+                refuse_sm_context_caller(sm_context_ref, &request, "UpdateSMContext")
+            {
+                return refused;
+            }
             handle_sm_context_update(sm_context_ref, &request).await
         }
 
@@ -2915,6 +2985,11 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // POST /nsmf-pdusession/v1/sm-contexts/{smContextRef}/release
         ("nsmf-pdusession", "sm-contexts", "POST") if parts.len() >= 5 && parts[4] == "release" => {
             let sm_context_ref = parts[3];
+            if let Some(refused) =
+                refuse_sm_context_caller(sm_context_ref, &request, "ReleaseSMContext")
+            {
+                return refused;
+            }
             handle_sm_context_release(sm_context_ref, Some(&request)).await
         }
 
@@ -2924,6 +2999,11 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             if parts.len() >= 5 && parts[4] == "retrieve" =>
         {
             let sm_context_ref = parts[3];
+            if let Some(refused) =
+                refuse_sm_context_caller(sm_context_ref, &request, "RetrieveSMContext")
+            {
+                return refused;
+            }
             handle_sm_context_retrieve(sm_context_ref).await
         }
 
@@ -4688,6 +4768,298 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
         return eps_to_5gs::handle_create(&req_body).await;
     }
 
+    establish_detached(request.clone(), req_body).await
+}
+
+/// #1874: what became of a detached establishment, shared by the task running it
+/// and the request awaiting it, so exactly one of them disposes of a 201 nobody
+/// received.
+#[derive(Debug, Default)]
+enum CreateHandoff {
+    /// The establishment is still running and its caller still waiting.
+    #[default]
+    Pending,
+    /// The caller went away first: the task disposes of whatever it creates.
+    Abandoned,
+    /// The establishment finished; the `smContextRef` of a 201, else `None`.
+    Finished(Option<String>),
+}
+
+/// The `smContextRef` a 201 SmContextCreatedData names, from its Location.
+fn created_sm_context_ref(response: &SbiResponse) -> Option<String> {
+    if response.status != 201 {
+        return None;
+    }
+    let location = response.http.get_header("Location")?;
+    location
+        .rsplit('/')
+        .next()
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+}
+
+/// #1874: release a session whose 201 its AMF never received, as a UE-requested
+/// release would be: N4 session, SM policy, context and address, then the NSACF,
+/// UDM, EASDF and EBI effects. PDU_SES_EST was announced before the 201 was built,
+/// so PDU_SES_REL is too.
+fn spawn_abandoned_create_release(sm_context_ref: String) {
+    session_metrics::observe_abandoned_release();
+    log::warn!(
+        "SM context {sm_context_ref}: its CreateSMContext was abandoned by the AMF after \
+         the session was established; releasing it (TS 29.502 §5.2.2.2: the AMF holds no \
+         reference to release it by)"
+    );
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::error!("SM context {sm_context_ref}: no runtime to release the abandoned create on");
+        return;
+    };
+    RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
+    handle.spawn(async move {
+        // Its own N4 session and SM policy association, by reference.
+        release_user_plane(&sm_context_ref).await;
+        if let Some(Some(binding)) = take_sm_context(&sm_context_ref) {
+            qos_mon::forget(&sm_context_ref);
+            // R27 #1890: the AMF's retry for the same (SUPI, PSI) is the normal
+            // follow-up to the timeout that abandoned this create, so a newer
+            // session may hold the pair by now. In flight FIRST, then the check, so
+            // a create that registers after the check finds this entry and
+            // supersedes or waits for it (`await_release_in_flight_on`), and one
+            // that registered before it is seen by the check.
+            let in_flight =
+                ReleaseInFlight::begin_with(&binding.supi, binding.psi, nsac_release_of(&binding));
+            let newer = newer_session_for(
+                &binding.supi,
+                binding.psi,
+                ABANDONED_RELEASE_WAITS_FOR_CREATE,
+            )
+            .await;
+            let announce = match newer {
+                NewerSession::None => true,
+                held => {
+                    // The newer session wins (TS 29.502 §5.2.2.2.1: a create for a
+                    // PSI the SMF holds replaces the old session). Its UECM
+                    // registration replaced this one's record, so no deregistration;
+                    // on the same S-NSSAI the NSACF counts both under one entry (UE,
+                    // PSI, S-NSSAI), so no DECREASE; and no PDU_SES_REL, which would
+                    // follow its PDU_SES_EST.
+                    log::info!(
+                        "[{}] PSI {}: a newer session holds the pair; the abandoned create \
+                         releases only its own N4 session, SM policy, address and DNS \
+                         context",
+                        binding.supi,
+                        binding.psi
+                    );
+                    in_flight.entry.supersede();
+                    if held.shares_slice_with(&binding) {
+                        in_flight
+                            .entry
+                            .supersede_nsac((binding.sst, binding.sd.as_deref()));
+                    }
+                    false
+                }
+            };
+            tokio::join!(
+                release_nsac_admission(&binding, Some(&in_flight.entry)),
+                release_udm_cleanup(&binding, Some(&in_flight.entry)),
+            );
+            drop(in_flight);
+            if let Ok(_permit) = release_side_effect_permits().clone().acquire_owned().await {
+                release_side_effects(&sm_context_ref, &binding, announce).await;
+            }
+        }
+        RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
+    });
+}
+
+/// How long an abandoned create's release waits for a newer create of the same
+/// (SUPI, PSI) to settle, to learn its S-NSSAI (R27 #1890).
+const ABANDONED_RELEASE_WAITS_FOR_CREATE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What holds a (SUPI, PSI) besides the session being rolled back (R27 #1890).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NewerSession {
+    /// Nothing: the rollback may remove the pair's records.
+    None,
+    /// An established session on this S-NSSAI (SST, SD).
+    Established(u8, Option<String>),
+    /// A create still in flight (registered, no binding yet): its S-NSSAI is not
+    /// known, so it is treated as sharing every one.
+    Creating,
+}
+
+impl NewerSession {
+    /// Whether the NSACF counts this and `binding`'s session under one entry.
+    fn shares_slice_with(&self, binding: &context::PolicyBinding) -> bool {
+        match self {
+            NewerSession::None => false,
+            NewerSession::Established(sst, sd) => {
+                same_snssai((*sst, sd.as_deref()), (binding.sst, binding.sd.as_deref()))
+            }
+            NewerSession::Creating => true,
+        }
+    }
+}
+
+/// The session holding (SUPI, PSI) now, waiting at most `wait` for one still being
+/// created to settle. Call it after the rolled-back session's own context is gone.
+async fn newer_session_for(supi: &str, psi: u8, wait: std::time::Duration) -> NewerSession {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let now = {
+            let handle = smf_self();
+            let Ok(ctx) = handle.read() else {
+                return NewerSession::Creating;
+            };
+            let bound = ctx.policy_bindings.read().ok().and_then(|m| {
+                m.values()
+                    .find(|b| b.supi == supi && b.psi == psi)
+                    .map(|b| NewerSession::Established(b.sst, b.sd.clone()))
+            });
+            bound.unwrap_or_else(|| {
+                let registered = ctx
+                    .ue_find_by_supi(supi)
+                    .and_then(|ue| ctx.sess_find_by_psi(ue.id, psi))
+                    .is_some();
+                if registered {
+                    NewerSession::Creating
+                } else {
+                    NewerSession::None
+                }
+            })
+        };
+        if now != NewerSession::Creating || tokio::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// R27 #1890: a failed create's NSACF DECREASE, unless a newer session for the same
+/// (SUPI, PSI) on the same S-NSSAI holds the NSACF entry it would remove. Call it
+/// after `rollback()` removed this create's own context.
+#[allow(clippy::too_many_arguments)]
+async fn rollback_create_nsac(
+    admitted: bool,
+    nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
+    if admitted {
+        let held = match newer_session_for(supi, psi, std::time::Duration::ZERO).await {
+            NewerSession::None => false,
+            NewerSession::Established(s, d) => same_snssai((s, d.as_deref()), (sst, sd)),
+            NewerSession::Creating => true,
+        };
+        if held {
+            log::info!(
+                "[{supi}] PSI {psi}: a newer session holds the NSACF entry; the failed \
+                 create sends no DECREASE"
+            );
+            return true;
+        }
+    }
+    rollback_nsac_as(admitted, nf_id, nsacf, plmn, supi, psi, sst, sd).await
+}
+
+impl CreateHandoff {
+    /// The task's half: record `response`, or release it if the caller is gone.
+    fn finish(handoff: &std::sync::Mutex<Self>, response: &SbiResponse) {
+        let created = created_sm_context_ref(response);
+        let mut state = handoff.lock().unwrap_or_else(|e| e.into_inner());
+        match *state {
+            CreateHandoff::Abandoned => {
+                if let Some(reference) = created {
+                    spawn_abandoned_create_release(reference);
+                }
+            }
+            _ => *state = CreateHandoff::Finished(created),
+        }
+    }
+
+    /// The caller's half, when it goes away unanswered: mark the establishment
+    /// abandoned, or release a 201 that finished but was never read.
+    fn abandon(handoff: &std::sync::Mutex<Self>) {
+        session_metrics::observe_abandoned();
+        let mut state = handoff.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *state, CreateHandoff::Abandoned) {
+            CreateHandoff::Finished(Some(reference)) => spawn_abandoned_create_release(reference),
+            CreateHandoff::Finished(None) | CreateHandoff::Pending | CreateHandoff::Abandoned => {}
+        }
+    }
+}
+
+/// #1874: held by the request awaiting a detached establishment; dropped unanswered
+/// (the AMF reset the stream, or timed out), it hands the session to the task.
+struct CreateAbandonGuard {
+    handoff: std::sync::Arc<std::sync::Mutex<CreateHandoff>>,
+    answered: bool,
+}
+
+impl Drop for CreateAbandonGuard {
+    fn drop(&mut self) {
+        if !self.answered {
+            CreateHandoff::abandon(&self.handoff);
+        }
+    }
+}
+
+/// #1874: run an establishment on its own task, so dropping the request awaiting it
+/// cannot strand what the establishment has already done.
+///
+/// The SBI server runs a handler inline in the HTTP/2 stream's service future
+/// (nextgcore-sbi `server.rs`), and hyper drops that future when the AMF resets the
+/// stream or its request times out. Awaited inline, an establishment dropped
+/// between its UE IP allocation (persisted) and its 201 left the address, the NSACF
+/// admission, the UECM registration, the SDM subscription, the SM policy
+/// association and the N4 session behind it, recorded nowhere that a release
+/// reaches. On its own task every failure path's rollback still runs, and a 201 no
+/// one received is released ([`spawn_abandoned_create_release`]): the AMF holds no
+/// `smContextRef` for it, so nothing else ever would. Same shape as #894's
+/// [`eps_to_5gs::handle_create`] and #1755's dccfd create.
+///
+/// R27 #1890: which create wins. The AMF's usual answer to the timeout that
+/// abandons a create is to retry it, for the same SUPI and PSI. The retry wins (TS
+/// 29.502 §5.2.2.2.1: a create for a PSI the SMF holds replaces the old session): the
+/// abandoned create, whether it then fails or reaches its 201, releases only what is
+/// its own (N4 session, SM policy, address, SDM subscription, DNS context) and
+/// leaves the pair's NSACF entry, UECM registration and event state to the newer
+/// session ([`newer_session_for`]).
+async fn establish_detached(request: SbiRequest, req_body: serde_json::Value) -> SbiResponse {
+    let handoff = std::sync::Arc::new(std::sync::Mutex::new(CreateHandoff::Pending));
+    let mut guard = CreateAbandonGuard {
+        handoff: handoff.clone(),
+        answered: false,
+    };
+    let establishment = async move {
+        let response = establish_sm_context(&request, req_body).await;
+        CreateHandoff::finish(&handoff, &response);
+        response
+    };
+    #[cfg(test)]
+    let task = match TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        Ok(oauth2) => tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, establishment)),
+        Err(_) => tokio::spawn(establishment),
+    };
+    #[cfg(not(test))]
+    let task = tokio::spawn(establishment);
+    let result = task.await;
+    guard.answered = true;
+    match result {
+        Ok(response) => response,
+        Err(e) => {
+            log::error!("SM context establishment task failed: {e}");
+            eps_to_5gs::sm_context_error(500, "SYSTEM_FAILURE", "the establishment failed")
+        }
+    }
+}
+
+/// The establishment half of CreateSMContext (TS 29.502 §5.2.2.2.1, TS 23.502
+/// §4.3.2.2.1), run on its own task by [`establish_detached`] (#1874).
+async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value) -> SbiResponse {
     // ---- Strict mandatory/conditional IE validation (smfd-06) ----
     // Reject genuinely-missing mandatory IEs up front with the correct
     // ProblemDetails cause (default-permissive on supi/anType, which the
@@ -5116,7 +5488,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
     };
 
     // ---- GSM FSM: Initial → Wait5gcSmPolicyAssociation ----
-    let sess_idx_u64 = sm_context_ref.parse::<u64>().unwrap_or(0);
+    let sess_idx_u64 = context::sm_context_ref_index(&sm_context_ref).map_or(0, u64::from);
     let mut fsm = gsm_sm::GsmFsm::new(sess_idx_u64);
     fsm.init();
     fsm.dispatch(&event::SmfEvent::gsm_message(
@@ -5242,7 +5614,42 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
         eps_interworking,
     )
     .await;
-    let subscribed = udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await;
+    let subscribed = match udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await {
+        Ok(subscribed) => subscribed,
+        Err(udm::SliceNotSubscribed) => {
+            // #1878: the UDM holds this DNN's subscription for other slices only. TS
+            // 29.502 Table 6.1.3.2.3.1-3: 403 SNSSAI_DENIED, "the subscriber does not
+            // have the necessary subscription to access the SNSSAI"; TS 24.501
+            // §9.11.4.2: 5GSM cause #70, missing or unknown DNN in a slice. Before,
+            // the session took the first entry's (another slice's) AMBR and 5QI.
+            log::warn!(
+                "[{supi}] DNN {dnn} is not subscribed on S-NSSAI[SST:{sst} SD:{snssai_sd:?}]: \
+                 rejecting (SNSSAI_DENIED, 5GSM cause #70)"
+            );
+            fsm.transition_to(gsm_sm::GsmState::Exception);
+            rollback();
+            spawn_create_udm_rollback(&supi, pdu_session_id, None);
+            rollback_create_nsac(
+                nsac_admitted,
+                nsac_nf_id.as_deref(),
+                nsac_nsacf.as_ref(),
+                policy::plmn_ref(&nsac_plmn),
+                &supi,
+                pdu_session_id,
+                sst,
+                snssai_sd.as_deref(),
+            )
+            .await;
+            return sm_context_create_error(
+                403,
+                "SNSSAI_DENIED",
+                pdu_session_id,
+                pti,
+                policy::gsm_cause::MISSING_OR_UNKNOWN_DNN_IN_A_SLICE,
+                reject_to,
+            );
+        }
+    };
 
     // #293: subscribe to changes in what was just fetched, so an administrative edit
     // reaches a session that is already up (TS 23.502 §4.3.2.2.1 step 4,
@@ -5340,7 +5747,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     fsm_dispatch_policy_response(&mut fsm, status);
                     rollback();
                     spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
-                    rollback_nsac_as(
+                    rollback_create_nsac(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
                         nsac_nsacf.as_ref(),
@@ -5367,7 +5774,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     fsm.transition_to(gsm_sm::GsmState::Exception);
                     rollback();
                     spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
-                    rollback_nsac_as(
+                    rollback_create_nsac(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
                         nsac_nsacf.as_ref(),
@@ -5523,15 +5930,27 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                 if let Some(ref pol_id) =
                     (!decision.is_config_default).then_some(decision.sm_policy_id.clone())
                 {
-                    if let Some(pcf) = policy::resolve_pcf_endpoint().await {
-                        if let Err(e) = policy::sm_policy_delete(&pcf, pol_id).await {
-                            log::warn!("SM policy rollback delete failed: {e}");
+                    let deleted = match policy::resolve_pcf_endpoint().await {
+                        Some(pcf) => policy::sm_policy_delete(&pcf, pol_id).await,
+                        None => Err(policy::PolicyError::Transport("PCF unresolved".into())),
+                    };
+                    match deleted {
+                        Ok(()) | Err(policy::PolicyError::Rejected { status: 404, .. }) => {}
+                        Err(policy::PolicyError::Rejected { status, detail }) if status < 500 => {
+                            log::warn!("SM policy rollback delete refused: {status} {detail}");
+                        }
+                        Err(e) => {
+                            // #1875: retried until the PCF takes it.
+                            log::warn!("SM policy rollback delete failed: {e}; parked");
+                            reconcile::park(reconcile::Cleanup::SmPolicyDelete {
+                                sm_policy_id: pol_id.clone(),
+                            });
                         }
                     }
                 }
                 rollback();
                 spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
-                rollback_nsac_as(
+                rollback_create_nsac(
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
                     nsac_nsacf.as_ref(),
@@ -5742,6 +6161,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     ambr_ul_bps: decision.sess_ambr_ul_bps,
                     ambr_dl_bps: decision.sess_ambr_dl_bps,
                     sm_context_status_uri: sm_context_status_uri.clone(),
+                    serving_amf: None,
                     fsm: fsm.clone(),
                     easdf_dns_context_id: easdf_dns_context_id.clone(),
                     easdf_reported_eas: Vec::new(),
@@ -6442,6 +6862,12 @@ fn record_serving_amf(sm_context_ref: &str, serving_nf_id: &str, status_uri: &st
     if let Ok(mut bindings) = ctx.policy_bindings.write() {
         if let Some(b) = bindings.get_mut(sm_context_ref) {
             b.sm_context_status_uri = Some(status_uri.to_string());
+            // #1860: a bound context follows the AMF change. The router admitted
+            // this request only if `serving_nf_id` is the caller's own verified
+            // identity (`refuse_sm_context_caller`), so the new owner proved it.
+            if b.serving_amf.is_some() {
+                b.serving_amf = Some(serving_nf_id.to_string());
+            }
         }
     }
     if let Some(mut sess) = ctx
@@ -7112,6 +7538,99 @@ async fn pfcp_deactivate_dl_far(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
 /// n2SmInfoType (all inbound values of TS 29.502 Table 6.1.6.3.3-1 that can
 /// arrive on /modify) and on upCnxState.
 async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
+    // #1899 review M1: an AMF change is recorded before the rest of the request is
+    // validated, so a request answered 4xx/5xx would still have moved the owner
+    // and rebound the status URI. Whatever this request recorded is put back when
+    // it fails, so a rejected request applies nothing.
+    let before = ServingAmfState::read(sm_context_ref);
+    let resp = handle_sm_context_update_inner(sm_context_ref, request).await;
+    if resp.status >= 400 {
+        if let Some(before) = before {
+            before.restore_if_rebound_by(sm_context_ref, request);
+        }
+    }
+    resp
+}
+
+/// The serving-AMF state an AMF change rewrites (#1899 review M1): the bound
+/// owner and the status URI, on the policy binding and on the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServingAmfState {
+    serving_amf: Option<String>,
+    binding_status_uri: Option<String>,
+    sess_status_uri: Option<String>,
+}
+
+impl ServingAmfState {
+    fn read(sm_context_ref: &str) -> Option<Self> {
+        let handle = smf_self();
+        let ctx = handle.read().ok()?;
+        let bindings = ctx.policy_bindings.read().ok()?;
+        let b = bindings.get(sm_context_ref)?;
+        Some(Self {
+            serving_amf: b.serving_amf.clone(),
+            binding_status_uri: b.sm_context_status_uri.clone(),
+            sess_status_uri: ctx
+                .sess_find_by_sm_context_ref(sm_context_ref)
+                .and_then(|s| s.sm_context_status_uri),
+        })
+    }
+
+    /// Put `self` back if `request` was an AMF change and the context still holds
+    /// exactly what it recorded. A later change by another request is left alone.
+    fn restore_if_rebound_by(self, sm_context_ref: &str, request: &SbiRequest) {
+        let Some(body) = request
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        else {
+            return;
+        };
+        let (Some(serving), Some(status_uri)) = (
+            body["servingNfId"].as_str(),
+            body["smContextStatusUri"].as_str(),
+        ) else {
+            return;
+        };
+        let handle = smf_self();
+        let Ok(ctx) = handle.read() else {
+            return;
+        };
+        let mut restored = false;
+        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+            if let Some(b) = bindings.get_mut(sm_context_ref) {
+                let ours = b.sm_context_status_uri.as_deref() == Some(status_uri)
+                    && (b.serving_amf == self.serving_amf
+                        || b.serving_amf.as_deref() == Some(serving));
+                if ours
+                    && (b.sm_context_status_uri != self.binding_status_uri
+                        || b.serving_amf != self.serving_amf)
+                {
+                    b.sm_context_status_uri = self.binding_status_uri.clone();
+                    b.serving_amf = self.serving_amf.clone();
+                    restored = true;
+                }
+            }
+        }
+        if restored {
+            if let Some(mut sess) = ctx
+                .sess_find_by_sm_context_ref(sm_context_ref)
+                .filter(|s| s.sm_context_status_uri.as_deref() == Some(status_uri))
+            {
+                sess.sm_context_status_uri = self.sess_status_uri.clone();
+                ctx.sess_update(&sess);
+            }
+            ctx.persist();
+            log::info!(
+                "SM Context Update for ref={sm_context_ref} failed: the AMF change to {serving} \
+                 is undone"
+            );
+        }
+    }
+}
+
+async fn handle_sm_context_update_inner(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Update request for ref={sm_context_ref}");
 
     // Parse request body for N2 SM Info (gNB TEID)
@@ -7428,10 +7947,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 );
             };
             let binding = lookup_policy_binding(sm_context_ref);
-            let psi = binding
-                .as_ref()
-                .map(|b| b.psi)
-                .unwrap_or_else(|| sm_context_ref.parse().unwrap_or(1));
+            let psi = binding.as_ref().map(|b| b.psi).unwrap_or_else(|| {
+                context::sm_context_ref_index(sm_context_ref)
+                    .and_then(|i| u8::try_from(i).ok())
+                    .unwrap_or(1)
+            });
             let pti = hdr.pti;
             log::info!(
                 "SM Context Update (UE modification): PSI={psi}, PTI={pti}, msg=0x{:02x}",
@@ -8198,8 +8718,8 @@ pub(crate) async fn abandon_gsm_procedure_for_test(sm_context_ref: &str) {
 }
 
 /// SM Policy Association terminations that failed after every attempt (#719
-/// review m2); each one leaves an association at the PCF until the PCF's own
-/// supervision removes it. Exported as `smf_sm_policy_delete_failures_total`.
+/// review m2); each one is parked for the reconciler (#1875), which retries it until
+/// the PCF takes it. Exported as `smf_sm_policy_delete_failures_total`.
 static SM_POLICY_DELETE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// How many Npcf_SMPolicyControl_Delete attempts one termination makes, and the
@@ -8284,9 +8804,13 @@ async fn delete_sm_policy(pol_id: &str) {
             Err(e) => {
                 log::warn!(
                     "SM policy delete for {pol_id} failed after {attempt} attempt(s): {e} \
-                     (continuing release; the association stays at the PCF)"
+                     (continuing release; parked for the reconciler)"
                 );
                 SM_POLICY_DELETE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                // #1875: retried until the PCF takes it, rather than left at the PCF.
+                reconcile::park(reconcile::Cleanup::SmPolicyDelete {
+                    sm_policy_id: pol_id.to_string(),
+                });
             }
         }
     }
@@ -9029,11 +9553,11 @@ async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<
         {
             policy::NSAC_DECREASE_FAILURES.fetch_add(1, Ordering::Relaxed);
             log::warn!(
-                "[{}] NSACF DECREASE for PSI {} timed out; the session stays counted at the \
-                 NSACF",
+                "[{}] NSACF DECREASE for PSI {} timed out; parked for the reconciler",
                 binding.supi,
                 binding.psi
             );
+            reconcile::park(reconcile::Cleanup::nsac_of(binding));
         }
     }
     if let Some(e) = entry {
@@ -9070,6 +9594,15 @@ fn spawn_create_udm_rollback(supi: &str, psi: u8, sdm_subscription_id: Option<St
     let in_flight = ReleaseInFlight::begin(&binding.supi, binding.psi);
     RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(async move {
+        // R27 #1890: in flight first, then the check (see
+        // `spawn_abandoned_create_release`). A newer session for the pair registered
+        // at the UDM after this create, so its record is the one a deregistration
+        // would delete; this create's own SDM subscription still goes.
+        if newer_session_for(&binding.supi, binding.psi, std::time::Duration::ZERO).await
+            != NewerSession::None
+        {
+            in_flight.entry.supersede();
+        }
         release_udm_cleanup(&binding, Some(&in_flight.entry)).await;
         drop(in_flight);
         RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
@@ -9103,15 +9636,23 @@ async fn release_udm_cleanup(binding: &context::PolicyBinding, entry: Option<&Re
     // smContextRef no longer resolves; without the deregistration it accumulates
     // serving-SMF records for released sessions, so a procedure resolving the serving
     // SMF through the UDM resolves a released session to this SMF.
+    //
+    // #1875: either one that fails (or times out) is parked and retried until the UDM
+    // takes it. Only with the UDM leg on: off, neither was ever created.
     if let Some(sub_id) = &binding.sdm_subscription_id {
-        if tokio::time::timeout(
+        let done = tokio::time::timeout(
             UDM_RELEASE_TIMEOUT,
             udm::unsubscribe_sm_data(&binding.supi, sub_id),
         )
-        .await
-        .is_err()
-        {
+        .await;
+        if done.is_err() {
             log::warn!("[{}] Nudm_SDM_Unsubscribe timed out", binding.supi);
+        }
+        if !matches!(done, Ok(true)) && udm::enabled() {
+            reconcile::park(reconcile::Cleanup::SdmUnsubscribe {
+                supi: binding.supi.clone(),
+                subscription_id: sub_id.clone(),
+            });
         }
     }
     if !entry.is_none_or(ReleaseEntry::begin_deregistration) {
@@ -9123,18 +9664,23 @@ async fn release_udm_cleanup(binding: &context::PolicyBinding, entry: Option<&Re
         );
         return;
     }
-    if tokio::time::timeout(
+    let done = tokio::time::timeout(
         UDM_RELEASE_TIMEOUT,
         udm::deregister_serving_smf(&binding.supi, binding.psi),
     )
-    .await
-    .is_err()
-    {
+    .await;
+    if done.is_err() {
         log::warn!(
             "[{}] Nudm_UECM_Deregistration (PSI {}) timed out",
             binding.supi,
             binding.psi
         );
+    }
+    if !matches!(done, Ok(true)) && udm::enabled() {
+        reconcile::park(reconcile::Cleanup::UecmDeregister {
+            supi: binding.supi.clone(),
+            psi: binding.psi,
+        });
     }
     if let Some(e) = entry {
         e.finish();
@@ -11409,6 +11955,222 @@ fn register_sm_context(
 /// they are separate maps: requiring both would make a reference the SMF can
 /// plainly act on look unknown if one half was lost, which is a worse answer than
 /// acting on the half that survived.
+/// #1860: record the creating AMF as the owner of the SM context a `201` created.
+///
+/// Read back from the `Location` the AMF is handed, so the EPS->5GS create path
+/// (`eps_to_5gs::handle_create`) is bound exactly like the 5GC one. The reference
+/// is unguessable and not yet known to anyone but the creator, so nobody can use
+/// the context before this runs.
+fn bind_created_sm_context(resp: &SbiResponse, owner: Option<String>) {
+    let Some(owner) = owner else {
+        return;
+    };
+    if resp.status != 201 {
+        return;
+    }
+    let Some(reference) = resp
+        .http
+        .get_header("Location")
+        .and_then(|l| l.rsplit('/').next())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return;
+    };
+    if let Ok(mut bindings) = ctx.policy_bindings.write() {
+        if let Some(b) = bindings.get_mut(&reference) {
+            b.serving_amf = Some(owner);
+        }
+    }
+    ctx.persist();
+}
+
+/// #1860: the SM context's bound serving AMF, `None` when it has none.
+fn sm_context_owner(sm_context_ref: &str) -> Option<String> {
+    let handle = smf_self();
+    let ctx = handle.read().ok()?;
+    let bindings = ctx.policy_bindings.read().ok()?;
+    bindings.get(sm_context_ref)?.serving_amf.clone()
+}
+
+/// #1860, TS 29.502 §5.2.2.3-§5.2.2.5 / TS 33.501 §13.4.1: only the serving AMF
+/// modifies, releases or retrieves an SM context. `Some` is the `403` to send,
+/// before the handler reads the body or changes anything.
+///
+/// An unknown reference is left to the handler's `404`. For an Update, a request naming a NEW serving AMF (`servingNfId` with
+/// `smContextStatusUri`, TS 29.502 Table 6.1.6.2.3-1: "shall be present upon
+/// inter-AMF change") is admitted from that new AMF only: its own verified
+/// identity must be the `servingNfId`, and a certificate that names NF types must
+/// name AMF. That is the spec's AMF change, by an AMF that obtained the
+/// unguessable reference through the UE context transfer (TS 23.502 §4.2.2.2.2
+/// step 5). The owner itself may not hand the context to another AMF.
+fn refuse_sm_context_caller(
+    sm_context_ref: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let amf_change = operation == "UpdateSMContext";
+    if !sm_context_exists(sm_context_ref) {
+        return None;
+    }
+    let Some(owner) = sm_context_owner(sm_context_ref) else {
+        return refuse_ownerless_sm_context_caller(
+            sm_context_ref,
+            request,
+            operation,
+            nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+        );
+    };
+    let new_serving = amf_change
+        .then(|| {
+            let body: serde_json::Value =
+                serde_json::from_str(request.http.content.as_deref()?).ok()?;
+            let serving = body["servingNfId"].as_str()?.to_string();
+            body["smContextStatusUri"].as_str()?;
+            Some(serving)
+        })
+        .flatten()
+        .filter(|serving| !owner_binding::same_nf_instance_id(serving, &owner));
+    let Some(new_serving) = new_serving else {
+        return owner_binding::refuse_non_owner(Some(&owner), request, operation);
+    };
+    let caller = match owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        Ok(None) => {
+            return owner_binding::refuse_non_owner(Some(&owner), request, operation);
+        }
+        Err(why) => {
+            return Some(nextgcore_sbi::server::send_forbidden(
+                &format!("{operation}: {why}"),
+                None,
+            ))
+        }
+    };
+    let types = &request.peer_cert_nf_types;
+    let amf_typed = types.is_empty()
+        || types.iter().any(|t| t.eq_ignore_ascii_case("AMF"))
+        || types.iter().any(|t| {
+            owner_binding::RELAY_NF_TYPES
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(t))
+        });
+    if owner_binding::same_nf_instance_id(&caller, &new_serving) && amf_typed {
+        return None;
+    }
+    let why = format!(
+        "an AMF change to {new_serving} must come from that AMF; the requester is {caller}          (certificate NF types {types:?}) and the context belongs to {owner}"
+    );
+    log::debug!("{operation} of SM context {sm_context_ref} refused: {why}");
+    Some(nextgcore_sbi::server::send_forbidden(
+        &format!("{operation}: {why}"),
+        None,
+    ))
+}
+
+/// #1899 review M2 (DECISIONS 2026-11-18: under production an ownerless record
+/// is frozen, and where the spec defines a single owner the first verified
+/// caller is adopted): an SM context with no owner, i.e. one restored from a
+/// snapshot written before #1860 (it keeps its bare sequential reference, which
+/// the AMF holds) or one created under `dev`.
+///
+/// Under `dev` it is managed as before. Under production:
+/// - a request that rebinds it (`servingNfId` or `smContextStatusUri`, the N1N2
+///   redirect vector) is refused `403`;
+/// - a caller with no verified identity, or whose client certificate names NF
+///   types without AMF (or a relay), is refused `403`;
+/// - otherwise the caller is the serving AMF (TS 29.502 §5.2.2.3-§5.2.2.5: the
+///   SM context has exactly one consumer) and is adopted as its owner before the
+///   handler runs, so from then on the context is bound like a new one.
+fn refuse_ownerless_sm_context_caller(
+    sm_context_ref: &str,
+    request: &SbiRequest,
+    operation: &str,
+    production: bool,
+) -> Option<SbiResponse> {
+    if !production {
+        return None;
+    }
+    let refuse = |why: String| {
+        log::debug!("{operation} of ownerless SM context {sm_context_ref} refused: {why}");
+        Some(nextgcore_sbi::server::send_forbidden(
+            &format!("{operation}: {why}"),
+            None,
+        ))
+    };
+    let rebinds = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .is_some_and(|b| !b["servingNfId"].is_null() || !b["smContextStatusUri"].is_null());
+    if rebinds {
+        return refuse(
+            "the SM context predates its serving-AMF binding and may not be rebound; \
+             an AMF change needs a bound context"
+                .into(),
+        );
+    }
+    let caller = match owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        Ok(None) => {
+            return refuse("the requester has no verified identity".into());
+        }
+        Err(why) => return refuse(why),
+    };
+    let types = &request.peer_cert_nf_types;
+    let amf_typed = types.is_empty()
+        || types.iter().any(|t| {
+            t.eq_ignore_ascii_case("AMF")
+                || owner_binding::RELAY_NF_TYPES
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(t))
+        });
+    if !amf_typed {
+        return refuse(format!(
+            "only the serving AMF manages an SM context; the requester's certificate names \
+             {types:?}"
+        ));
+    }
+    if !adopt_sm_context_owner(sm_context_ref, &caller) {
+        // Another request adopted it first: judge this one against that owner.
+        // With no binding to adopt into, the context stays frozen.
+        return match sm_context_owner(sm_context_ref) {
+            Some(owner) => owner_binding::refuse_non_owner(Some(&owner), request, operation),
+            None => refuse("the SM context has no policy binding to bind an owner to".into()),
+        };
+    }
+    log::info!(
+        "SM context {sm_context_ref} had no serving-AMF binding; {caller} is adopted as its owner"
+    );
+    None
+}
+
+/// Bind an ownerless SM context to `owner` (#1899 review M2). `false` when it
+/// already had an owner (a racing request adopted it) or is gone.
+fn adopt_sm_context_owner(sm_context_ref: &str, owner: &str) -> bool {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return false;
+    };
+    let adopted = match ctx.policy_bindings.write() {
+        Ok(mut bindings) => match bindings.get_mut(sm_context_ref) {
+            Some(b) if b.serving_amf.is_none() => {
+                b.serving_amf = Some(owner.to_string());
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if adopted {
+        ctx.persist();
+    }
+    adopted
+}
+
 fn sm_context_exists(sm_context_ref: &str) -> bool {
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
@@ -11632,6 +12394,15 @@ async fn handle_pdu_session_create(_request: &SbiRequest) -> SbiResponse {
 /// instead of proceeding on a session that was never built. All three operations
 /// answer the same way, because a partner that cannot create can never legitimately
 /// update or release either, and leaving those at `2xx` would say otherwise.
+///
+/// **No caller binding is needed while this holds (#1891).** Update and Release
+/// look nothing up and change nothing, for any caller and any reference, and no
+/// session carries a `pduSessionRef` (one used to be minted as the bare session
+/// index and never read). An implementation of this service must mint the
+/// reference with `owner_binding::unguessable_id` and bind it to the creating
+/// V-SMF / I-SMF's verified identity, refusing any other caller `403` before a
+/// side effect (TS 29.502 §5.2.2.8-§5.2.2.9, TS 33.501 §13.4.1), as #1860 does for
+/// `sm-contexts`, before Update or Release answers anything but `501`.
 fn hsmf_not_implemented(operation: &str) -> SbiResponse {
     nextgcore_sbi::server::send_error(
         501,
@@ -12623,7 +13394,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     // #310: this re-read is now shared by BOTH arms. Before, the PCF arm returned 204
     // before reaching it, so the change reached a PCF-authorised session through no
     // path at all.
-    let Some(subscribed) = udm::fetch_sm_data(
+    let Ok(Some(subscribed)) = udm::fetch_sm_data(
         &binding.supi,
         &binding.dnn,
         binding.sst,
@@ -12631,6 +13402,8 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     )
     .await
     else {
+        // #1878: an `Err` (the slice is no longer subscribed for the DNN) is not
+        // answered with another slice's values either; the session keeps its QoS.
         log::warn!(
             "[{}] SM data changed but could not be re-read: ref={sm_context_ref} keeps \
              the QoS it was established with",
@@ -18433,6 +19206,7 @@ mod tests {
                         // No AMF callback URI: nothing to notify, and no
                         // N1N2MessageTransfer is attempted.
                         sm_context_status_uri: None,
+                        serving_amf: None,
                         fsm: gsm_sm::GsmFsm::new(0),
                         // #114: no EASDF DNS context by default, so the release
                         // path has nothing to delete.
@@ -22481,6 +23255,661 @@ mod tests {
         assert_eq!(order, vec!["INC", "DEC"], "counted out once");
     }
 
+    /// #1878: a create whose DNN the UDM subscribes on other slices only is refused
+    /// 403 SNSSAI_DENIED with 5GSM cause #70, and rolled back: its address is freed,
+    /// its UECM registration removed and its NSACF admission counted out. Before, it
+    /// was established on the first entry's (another slice's) AMBR and 5QI.
+    ///
+    /// REVERT-VERIFIED: with `parse_sm_data` falling back to the first entry again,
+    /// this fails: the create answers 201.
+    #[tokio::test]
+    async fn a_create_on_an_unsubscribed_slice_is_refused_and_rolled_back_1878() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, nsac_seen) = recording_nsacf(204, 204, zero, zero).await;
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (udm_srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    if req.header.uri.contains("/sm-data") {
+                        // The DNN is subscribed, on SST 2 only.
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!([{
+                                "singleNssai": { "sst": 2 },
+                                "dnnConfigurations": { "internet": {
+                                    "sessionAmbr": { "uplink": "1 Mbps", "downlink": "1 Mbps" },
+                                    "5gQosProfile": { "5qi": 8 } } }
+                            }]))
+                            .unwrap();
+                    }
+                    if req.header.method == "DELETE" {
+                        return SbiResponse::with_status(204);
+                    }
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010000018781";
+        let addresses = smf_self().read().unwrap().ipv4_pool.active_count();
+
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            5,
+            &n1(
+                5,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        side_effects_settled().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deregistered = || {
+            seen.lock().unwrap().iter().any(|(m, u)| {
+                m == "DELETE" && u.ends_with(&format!("{supi}/registrations/smf-registrations/5"))
+            })
+        };
+        while !deregistered() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let body: serde_json::Value = resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default();
+        let gsm_cause = resp.http.parts.iter().find_map(|p| {
+            let n1 = p.data.as_ref();
+            (n1.len() >= 5 && n1[0] == 0x2E && n1[3] == 0xC3).then(|| n1[4])
+        });
+        let order = nsac_order(&nsac_seen, supi);
+        let addresses_after = smf_self().read().unwrap().ipv4_pool.active_count();
+        let was_deregistered = deregistered();
+        stop_udm_leg();
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        udm_srv.stop().await.ok();
+
+        assert_eq!(resp.status, 403, "{body}");
+        assert_eq!(body["error"]["cause"], "SNSSAI_DENIED", "{body}");
+        assert_eq!(gsm_cause, Some(70), "5GSM #70 in the N1 reject");
+        assert_eq!(addresses_after, addresses, "the address is freed");
+        assert!(was_deregistered, "the UECM registration is removed");
+        assert_eq!(order, vec!["INC", "DEC"], "counted out");
+    }
+
+    /// #1878: the smf-select-data `subscribedSnssaiInfos` key carries the SD in
+    /// either case (TS 29.571 §5.4.4.2).
+    ///
+    /// REVERT-VERIFIED: with the exact-case key lookup back, this fails with
+    /// NoSubscribedDnn.
+    #[test]
+    fn the_default_dnn_key_matches_the_sd_in_either_case_1878() {
+        let upper = serde_json::json!({
+            "subscribedSnssaiInfos": { "01-0A0B0C": { "dnnInfos": [{ "dnn": "corp" }] } }
+        });
+        assert_eq!(
+            select_default_dnn(&upper, 1, Some("0a0b0c")),
+            Ok("corp".to_string())
+        );
+    }
+
+    // ---- #1874: a CreateSMContext dropped mid-way leaves nothing behind ----
+
+    /// Where a #1874 test cancels the create: at the request a peer is holding.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum CreateStage1874 {
+        Nsac,
+        Uecm,
+        Sdm,
+        Pcf,
+        Pfcp,
+        Easdf,
+    }
+
+    /// Whether `(method, uri, body)` is the request that stage `stage` holds.
+    fn held_at_1874(stage: CreateStage1874, method: &str, uri: &str, body: &str) -> bool {
+        match stage {
+            CreateStage1874::Nsac => uri.contains("/nnsacf-nsac/") && body.contains("INCREASE"),
+            CreateStage1874::Uecm => method == "PUT" && uri.contains("/smf-registrations/"),
+            CreateStage1874::Sdm => method == "POST" && uri.ends_with("/sdm-subscriptions"),
+            CreateStage1874::Pcf => method == "POST" && uri.ends_with("/sm-policies"),
+            CreateStage1874::Easdf => method == "POST" && uri.ends_with("/dns-contexts"),
+            CreateStage1874::Pfcp => false,
+        }
+    }
+
+    type Seen1874 = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// One SBI peer playing the NSACF, UDM, PCF, EASDF and the EASDF's NRF, all
+    /// admitting. The request `stage` names is recorded on arrival and answered
+    /// 300 ms later, so a test can cancel the create while that request is out.
+    async fn create_peers_1874(
+        stage: CreateStage1874,
+    ) -> (nextgcore_sbi::server::SbiServer, Seen1874) {
+        let seen: Seen1874 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port_slot = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port_seen = port_slot.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                let port = port_seen.load(Ordering::SeqCst);
+                async move {
+                    let method = req.header.method.clone();
+                    let uri = req.header.uri.clone();
+                    let body = req.http.content.clone().unwrap_or_default();
+                    sink.lock()
+                        .unwrap()
+                        .push((method.clone(), uri.clone(), body.clone()));
+                    if held_at_1874(stage, &method, &uri, &body) {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                    let json = |status: u16, v: serde_json::Value| {
+                        SbiResponse::with_status(status)
+                            .with_json_body(&v)
+                            .unwrap_or_else(|_| SbiResponse::with_status(status))
+                    };
+                    if uri.contains("/nnsacf-nsac/") || method == "DELETE" {
+                        return SbiResponse::with_status(204);
+                    }
+                    if uri.contains("/nnrf-disc/") {
+                        return json(
+                            200,
+                            serde_json::json!({
+                                "validityPeriod": 3600,
+                                "nfInstances": [{
+                                    "nfInstanceId": "easdf-1874",
+                                    "nfType": "EASDF",
+                                    "nfStatus": "REGISTERED",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "nfServices": [{
+                                        "serviceName": "neasdf-dnscontext",
+                                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                    }]
+                                }]
+                            }),
+                        );
+                    }
+                    if uri.ends_with("/dns-contexts") {
+                        return json(201, serde_json::json!({ "dnsContextId": "ctx-1874" }))
+                            .with_header("Location", "/neasdf-dnscontext/v1/dns-contexts/ctx-1874");
+                    }
+                    if uri.ends_with("/sm-policies") {
+                        return json(
+                            201,
+                            serde_json::json!({
+                                "sessRules": { "SessRule-1874": {
+                                    "sessRuleId": "SessRule-1874",
+                                    "authSessAmbr": { "uplink": "100 Mbps", "downlink": "100 Mbps" },
+                                    "authDefQos": { "5qi": 9, "arp": { "priorityLevel": 8 } },
+                                }},
+                                "pccRules": {}, "qosDecs": {}, "chgDecs": {}, "traffContDecs": {},
+                            }),
+                        )
+                        .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/pol-1874");
+                    }
+                    if uri.contains("/delete") {
+                        return SbiResponse::with_status(204);
+                    }
+                    if uri.ends_with("/sdm-subscriptions") {
+                        return json(201, serde_json::json!({ "subscriptionId": "sub-1874" }));
+                    }
+                    if uri.contains("/sm-data") {
+                        return json(200, serde_json::json!([]));
+                    }
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        port_slot.store(addr.port(), Ordering::SeqCst);
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        std::env::set_var("NSACF_URI", &base);
+        std::env::set_var("PCF_URI", &base);
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        easdf::set_for_test(Some(easdf::EasdfConfig {
+            nrf_uri: base,
+            edge_fqdn_patterns: vec!["*.edge.example.com".to_string()],
+        }));
+        (srv, seen)
+    }
+
+    /// What a #1874 create left at its peers: each pair is (created, removed).
+    #[derive(Debug, PartialEq, Eq)]
+    struct Leftovers1874 {
+        nsac: (usize, usize),
+        uecm: (usize, usize),
+        sdm: (usize, usize),
+        sm_policy: (usize, usize),
+        n4: (usize, usize),
+        dns_context: (usize, usize),
+    }
+
+    impl Leftovers1874 {
+        fn read(seen: &Seen1874, upf: &pfcp_path::stand_in::StandInUpf, supi: &str) -> Self {
+            let log = seen.lock().unwrap().clone();
+            let count = |f: &dyn Fn(&str, &str, &str) -> bool| {
+                log.iter().filter(|(m, u, b)| f(m, u, b)).count()
+            };
+            let types = upf.seen();
+            let n4 = |t: u8| types.iter().filter(|x| **x == t).count();
+            Self {
+                nsac: (
+                    count(&|_, u, b| u.contains("/nnsacf-nsac/") && b.contains("INCREASE")),
+                    count(&|_, u, b| u.contains("/nnsacf-nsac/") && b.contains("DECREASE")),
+                ),
+                uecm: (
+                    count(&|m, u, _| {
+                        m == "PUT" && u.contains(supi) && u.contains("/smf-registrations/")
+                    }),
+                    count(&|m, u, _| {
+                        m == "DELETE" && u.contains(supi) && u.contains("/smf-registrations/")
+                    }),
+                ),
+                sdm: (
+                    count(&|m, u, _| m == "POST" && u.ends_with("/sdm-subscriptions")),
+                    count(&|m, u, _| m == "DELETE" && u.ends_with("/sdm-subscriptions/sub-1874")),
+                ),
+                sm_policy: (
+                    count(&|m, u, _| m == "POST" && u.ends_with("/sm-policies")),
+                    count(&|_, u, _| u.ends_with("/sm-policies/pol-1874/delete")),
+                ),
+                n4: (
+                    n4(pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST),
+                    n4(pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+                ),
+                dns_context: (
+                    count(&|m, u, _| m == "POST" && u.ends_with("/dns-contexts")),
+                    count(&|m, u, _| m == "DELETE" && u.ends_with("/dns-contexts/ctx-1874")),
+                ),
+            }
+        }
+
+        /// Every resource created was removed.
+        fn balanced(&self) -> bool {
+            [
+                self.nsac,
+                self.uecm,
+                self.sdm,
+                self.sm_policy,
+                self.n4,
+                self.dns_context,
+            ]
+            .iter()
+            .all(|(created, removed)| created == removed)
+        }
+    }
+
+    /// Cancel a create while `stage`'s request is out, then check nothing it did is
+    /// left: the address and SM context are freed, and every peer resource it
+    /// created is removed. `None` cancels after the create finished but before its
+    /// 201 was read.
+    async fn cancelled_create_1874(stage: Option<CreateStage1874>, supi: &str, psi: u8) {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (peers, seen) = create_peers_1874(stage.unwrap_or(CreateStage1874::Nsac)).await;
+        if stage == Some(CreateStage1874::Pfcp) {
+            upf.delay_establishments(300);
+        }
+        let addresses = smf_self().read().unwrap().ipv4_pool.active_count();
+        let sessions = smf_self().read().unwrap().sess_count();
+        let abandoned = session_metrics::value("smf_session_abandoned_total");
+        let released = session_metrics::value("smf_session_abandoned_released_total");
+        let request = create_request(
+            supi,
+            psi,
+            &n1(
+                psi,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        );
+
+        {
+            let mut create = Box::pin(handle_sm_context_create(&request));
+            let reached = || match stage {
+                Some(CreateStage1874::Pfcp) => upf
+                    .seen()
+                    .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST),
+                Some(s) => seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(m, u, b)| held_at_1874(s, m, u, b)),
+                // Finished: its binding is stored, and the 201 follows at once.
+                None => smf_self()
+                    .read()
+                    .unwrap()
+                    .policy_bindings
+                    .read()
+                    .unwrap()
+                    .values()
+                    .any(|b| b.supi == supi),
+            };
+            if stage.is_none() {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(1), &mut create).await;
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !reached() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{stage:?} never reached"
+                );
+                if stage.is_none() {
+                    // Polled once (enough to start it), then never read.
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+                if let Ok(resp) =
+                    tokio::time::timeout(std::time::Duration::from_millis(5), &mut create).await
+                {
+                    panic!("answered {} before {stage:?} was reached", resp.status);
+                }
+            }
+            if stage.is_none() {
+                // Let the task finish while nobody reads its answer.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            // Dropped here, unanswered: the AMF reset the stream.
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let settled = || {
+            let smf = smf_self();
+            let ctx = smf.read().unwrap();
+            ctx.ipv4_pool.active_count() == addresses
+                && ctx.sess_count() == sessions
+                && Leftovers1874::read(&seen, &upf, supi).balanced()
+        };
+        while !settled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        side_effects_settled().await;
+        let left = Leftovers1874::read(&seen, &upf, supi);
+        let (now_addresses, now_sessions, bound) = {
+            let smf = smf_self();
+            let ctx = smf.read().unwrap();
+            let bound = ctx
+                .policy_bindings
+                .read()
+                .unwrap()
+                .values()
+                .any(|b| b.supi == supi);
+            (ctx.ipv4_pool.active_count(), ctx.sess_count(), bound)
+        };
+        let abandoned_now = session_metrics::value("smf_session_abandoned_total");
+        let released_now = session_metrics::value("smf_session_abandoned_released_total");
+        std::env::remove_var("NSACF_URI");
+        std::env::remove_var("PCF_URI");
+        stop_udm_leg();
+        easdf::set_for_test(None);
+        upf.delay_establishments(0);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peers.stop()).await;
+
+        assert_eq!(
+            now_addresses, addresses,
+            "{stage:?}: the UE address is freed"
+        );
+        assert_eq!(
+            now_sessions, sessions,
+            "{stage:?}: the SM context is removed"
+        );
+        assert!(!bound, "{stage:?}: no binding is left");
+        // Every leg before the held one (all of them, for a finished create) ran.
+        let order = [
+            (CreateStage1874::Nsac, left.nsac.0),
+            (CreateStage1874::Uecm, left.uecm.0),
+            (CreateStage1874::Sdm, left.sdm.0),
+            (CreateStage1874::Pcf, left.sm_policy.0),
+            (CreateStage1874::Pfcp, left.n4.0),
+            (CreateStage1874::Easdf, left.dns_context.0),
+        ];
+        let held = order
+            .iter()
+            .position(|(s, _)| Some(*s) == stage)
+            .unwrap_or(order.len() - 1);
+        for (s, created) in &order[..=held] {
+            assert_eq!(*created, 1, "{stage:?}: the {s:?} leg ran once: {left:?}");
+        }
+        assert!(
+            left.balanced(),
+            "{stage:?}: every peer resource is removed: {left:?}"
+        );
+        assert!(abandoned_now > abandoned, "{stage:?}: counted as abandoned");
+        // The held peer admits, so each create still reaches its 201, unread.
+        assert!(released_now > released, "{stage:?}: and as released");
+    }
+
+    /// #1874: a create dropped while its NSACF INCREASE is out counts the session
+    /// out again, and frees its address and SM context.
+    ///
+    /// REVERT-VERIFIED: with the establishment awaited inline again (no
+    /// `establish_detached`), each of these six fails: the address stays allocated.
+    /// So does each with `CreateHandoff::finish` ignoring an abandoned 201 (the held
+    /// peer admits, so every one of these creates still reaches its 201, unread).
+    #[tokio::test]
+    async fn a_create_cancelled_at_the_nsacf_leaves_nothing_1874() {
+        cancelled_create_1874(Some(CreateStage1874::Nsac), "imsi-001010000018741", 3).await;
+    }
+
+    /// #1874: dropped during the Nudm_UECM_Registration.
+    #[tokio::test]
+    async fn a_create_cancelled_at_the_uecm_registration_leaves_nothing_1874() {
+        cancelled_create_1874(Some(CreateStage1874::Uecm), "imsi-001010000018742", 4).await;
+    }
+
+    /// #1874: dropped during the Nudm_SDM_Subscribe.
+    #[tokio::test]
+    async fn a_create_cancelled_at_the_sdm_subscribe_leaves_nothing_1874() {
+        cancelled_create_1874(Some(CreateStage1874::Sdm), "imsi-001010000018743", 5).await;
+    }
+
+    /// #1874: dropped during the Npcf_SMPolicyControl_Create.
+    #[tokio::test]
+    async fn a_create_cancelled_at_the_pcf_leaves_nothing_1874() {
+        cancelled_create_1874(Some(CreateStage1874::Pcf), "imsi-001010000018744", 6).await;
+    }
+
+    /// #1874: dropped during the PFCP Session Establishment.
+    #[tokio::test]
+    async fn a_create_cancelled_at_the_pfcp_establishment_leaves_nothing_1874() {
+        cancelled_create_1874(Some(CreateStage1874::Pfcp), "imsi-001010000018745", 7).await;
+    }
+
+    /// #1874: dropped during the Neasdf_DNSContext_Create.
+    #[tokio::test]
+    async fn a_create_cancelled_at_the_easdf_leaves_nothing_1874() {
+        cancelled_create_1874(Some(CreateStage1874::Easdf), "imsi-001010000018746", 8).await;
+    }
+
+    /// #1874: a create that finished, whose 201 the AMF never read, is released: the
+    /// AMF holds no `smContextRef` to release it by.
+    ///
+    /// REVERT-VERIFIED: with `CreateHandoff::abandon` ignoring a finished 201, this
+    /// fails: the session, its address and its peer resources stay.
+    #[tokio::test]
+    async fn a_create_whose_201_is_never_read_is_released_1874() {
+        cancelled_create_1874(None, "imsi-001010000018747", 9).await;
+    }
+
+    /// R27 #1890: create A is abandoned at PFCP (the AMF timed out) and the AMF's
+    /// retry, create B for the same SUPI and PSI, succeeds before A's 201 lands. A's
+    /// release then removes only what is A's own. It sends no NSACF DECREASE (the
+    /// NSACF counts both under one entry, so it would count B out), no UECM
+    /// deregistration (B's registration replaced the record), and no PDU_SES_REL
+    /// (which would follow B's PDU_SES_EST). A's address is still freed.
+    ///
+    /// REVERT-VERIFIED: with `newer_session_for` answering `None` in the abandoned
+    /// release, this fails: nsac INC, INC, DEC, a UECM DELETE, and a PDU_SES_REL.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_abandoned_create_spares_the_retry_that_replaced_it_1890() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _g = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        // Nothing held at the SBI peers; the UPF answers establishments 300 ms late.
+        let (peers, seen) = create_peers_1874(CreateStage1874::Pfcp).await;
+        upf.delay_establishments(300);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = events.clone();
+        let (consumer, consumer_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(req.http.content.clone().unwrap_or_default());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let supi = "imsi-001010000018901";
+        let psi = 10;
+        let subscribed = smf_sbi_request_handler(events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body(
+                &format!("http://127.0.0.1:{}/nsmf-events", consumer_addr.port()),
+                Some(supi),
+            )),
+        ))
+        .await;
+        assert_eq!(subscribed.status, 201);
+        let request = || {
+            create_request(
+                supi,
+                psi,
+                &n1(
+                    psi,
+                    1,
+                    gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                    &[0x91, 0x00],
+                ),
+            )
+        };
+        let addresses = smf_self().read().unwrap().ipv4_pool.active_count();
+
+        // A: dropped while its PFCP establishment is out.
+        {
+            let a = request();
+            let mut create = Box::pin(handle_sm_context_create(&a));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !upf
+                .seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A never reached PFCP"
+                );
+                if tokio::time::timeout(std::time::Duration::from_millis(5), &mut create)
+                    .await
+                    .is_ok()
+                {
+                    panic!("A answered before PFCP");
+                }
+            }
+        }
+        // B: the AMF's retry.
+        let b = handle_sm_context_create(&request()).await;
+        // A's 201 lands and its release runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while smf_self().read().unwrap().ipv4_pool.active_count() != addresses + 1
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        side_effects_settled().await;
+        let log = seen.lock().unwrap().clone();
+        let nsac: Vec<&str> = log
+            .iter()
+            .filter(|(_, u, _)| u.contains("/nnsacf-nsac/"))
+            .map(|(_, _, b)| if b.contains("DECREASE") { "DEC" } else { "INC" })
+            .collect();
+        let uecm: Vec<&str> = log
+            .iter()
+            .filter(|(_, u, _)| u.contains(supi) && u.contains("/smf-registrations/"))
+            .map(|(m, _, _)| m.as_str())
+            .collect();
+        let b_bound = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, bd)| bd.supi == supi)
+            .map(|(r, _)| r.clone())
+            .collect::<Vec<_>>();
+        let addresses_now = smf_self().read().unwrap().ipv4_pool.active_count();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let released_events = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.contains("PDU_SES_REL"))
+            .count();
+        for r in &b_bound {
+            let _ = release_sm_context_locally(r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        std::env::remove_var("PCF_URI");
+        stop_udm_leg();
+        easdf::set_for_test(None);
+        upf.delay_establishments(0);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peers.stop()).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), consumer.stop()).await;
+
+        assert_eq!(b.status, 201, "B, the retry, is established");
+        assert_eq!(b_bound.len(), 1, "and is the one session left for the pair");
+        assert_eq!(
+            addresses_now,
+            addresses + 1,
+            "A's address is freed, B's held"
+        );
+        assert_eq!(
+            nsac,
+            vec!["INC", "INC"],
+            "A sends no DECREASE that would count B out"
+        );
+        assert_eq!(
+            uecm,
+            vec!["PUT", "PUT"],
+            "nor a UECM DELETE of B's registration"
+        );
+        assert_eq!(
+            released_events, 0,
+            "nor a PDU_SES_REL after B's PDU_SES_EST"
+        );
+    }
+
     /// #1072 review M3: a DECREASE the NSACF refuses is logged and counted.
     #[tokio::test]
     async fn a_refused_nsacf_decrease_is_counted() {
@@ -22502,6 +23931,420 @@ mod tests {
 
         assert_eq!(n, 1);
         assert_eq!(after - before, 1, "a 500 is a failed DECREASE");
+    }
+
+    // ---- #1875: release-side cleanups that fail are parked and reconciled ----
+
+    type Seen1875 = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// One SBI peer playing the NSACF, PCF and UDM, answering every request with
+    /// `status` as it stands when the request arrives. Recorded as (method, uri, body).
+    async fn flaky_peer_1875(
+        status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    ) -> (nextgcore_sbi::server::SbiServer, Seen1875) {
+        let seen: Seen1875 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                let status = status.load(Ordering::SeqCst);
+                async move {
+                    sink.lock().unwrap().push((
+                        req.header.method.clone(),
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ));
+                    SbiResponse::with_status(status)
+                }
+            })
+            .await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        std::env::set_var("NSACF_URI", &base);
+        std::env::set_var("PCF_URI", &base);
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        (srv, seen)
+    }
+
+    fn stop_flaky_peer_1875() {
+        std::env::remove_var("NSACF_URI");
+        std::env::remove_var("PCF_URI");
+        stop_udm_leg();
+    }
+
+    /// Whether a parked cleanup matches `f`.
+    fn parked_1875(f: impl Fn(&reconcile::Cleanup) -> bool) -> bool {
+        reconcile::snapshot().iter().any(f)
+    }
+
+    fn sent_1875(seen: &Seen1875, f: impl Fn(&str, &str, &str) -> bool) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, u, b)| f(m, u, b))
+            .count()
+    }
+
+    /// #1875: a NSACF DECREASE that fails is parked, retried while the NSACF still
+    /// fails, and delivered once it recovers; then it is no longer parked.
+    ///
+    /// REVERT-VERIFIED: with `rollback_nsac_as` not parking, this fails: nothing is
+    /// parked, so the slice stays one session short for good.
+    #[tokio::test]
+    async fn a_failed_nsac_decrease_is_reconciled_when_the_nsacf_recovers_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let (peer, seen) = flaky_peer_1875(status.clone()).await;
+        let supi = "imsi-001010000018751";
+        let is_ours = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::NsacDecrease { supi: s, psi: 4, .. } if s == supi);
+        let delivered = || reconcile::RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+
+        let accepted = rollback_nsac(true, supi, 4, 1, Some("010203")).await;
+        let parked_at_release = parked_1875(is_ours);
+        reconcile::reconcile_once().await;
+        let parked_while_down = parked_1875(is_ours);
+        status.store(204, Ordering::SeqCst);
+        reconcile::reconcile_once().await;
+        let parked_after = parked_1875(is_ours);
+        let decreases = sent_1875(&seen, |_, u, b| {
+            u.contains("/nnsacf-nsac/") && b.contains("DECREASE") && b.contains(supi)
+        });
+        let delivered_after = delivered();
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert!(!accepted, "the NSACF refused the first DECREASE");
+        assert!(parked_at_release, "so it is parked");
+        assert!(parked_while_down, "and stays parked while the NSACF fails");
+        assert!(!parked_after, "until the NSACF takes it");
+        assert_eq!(decreases, 3, "one at release, one per pass");
+        assert_eq!(delivered_after - before, 1, "counted as delivered");
+    }
+
+    /// #1875: an SM Policy Association termination that fails every attempt is
+    /// parked and delivered once the PCF recovers.
+    ///
+    /// REVERT-VERIFIED: with `delete_sm_policy` not parking, this fails: nothing is
+    /// parked, and the association stays at the PCF.
+    #[tokio::test]
+    async fn a_failed_sm_policy_delete_is_reconciled_when_the_pcf_recovers_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let (peer, seen) = flaky_peer_1875(status.clone()).await;
+        let is_ours = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::SmPolicyDelete { sm_policy_id } if sm_policy_id == "pol-1875");
+
+        let _ = spawn_sm_policy_delete("pol-1875".to_string()).await;
+        let parked_at_release = parked_1875(is_ours);
+        status.store(204, Ordering::SeqCst);
+        reconcile::reconcile_once().await;
+        let parked_after = parked_1875(is_ours);
+        let deletes = sent_1875(&seen, |_, u, _| u.ends_with("/sm-policies/pol-1875/delete"));
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert!(
+            parked_at_release,
+            "a delete that failed every attempt is parked"
+        );
+        assert!(!parked_after, "and delivered once the PCF answers");
+        assert_eq!(
+            deletes,
+            SM_POLICY_DELETE_ATTEMPTS as usize + 1,
+            "the release's attempts, then the reconciler's one"
+        );
+    }
+
+    /// #1875: a release whose Nudm_SDM_Unsubscribe and Nudm_UECM_Deregistration both
+    /// fail parks both, and both are delivered once the UDM recovers.
+    ///
+    /// REVERT-VERIFIED: with `release_udm_cleanup` not parking, this fails: neither
+    /// is parked, and the UDM keeps both records.
+    #[tokio::test]
+    async fn failed_udm_release_cleanups_are_reconciled_when_the_udm_recovers_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let (peer, seen) = flaky_peer_1875(status.clone()).await;
+        let supi = "imsi-001010000018752";
+        let mut binding = context::PolicyBinding::snapshot_default();
+        binding.supi = supi.to_string();
+        binding.psi = 6;
+        binding.sdm_subscription_id = Some("sub-1875".to_string());
+        let uecm = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::UecmDeregister { supi: s, psi: 6 } if s == supi);
+        let sdm = |c: &reconcile::Cleanup| matches!(c, reconcile::Cleanup::SdmUnsubscribe { subscription_id, .. } if subscription_id == "sub-1875");
+
+        release_udm_cleanup(&binding, None).await;
+        let parked_at_release = (parked_1875(uecm), parked_1875(sdm));
+        status.store(204, Ordering::SeqCst);
+        reconcile::reconcile_once().await;
+        let parked_after = (parked_1875(uecm), parked_1875(sdm));
+        let deregs = sent_1875(&seen, |m, u, _| {
+            m == "DELETE" && u.ends_with(&format!("{supi}/registrations/smf-registrations/6"))
+        });
+        let unsubs = sent_1875(&seen, |m, u, _| {
+            m == "DELETE" && u.ends_with("/sdm-subscriptions/sub-1875")
+        });
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert_eq!(parked_at_release, (true, true), "both are parked");
+        assert_eq!(parked_after, (false, false), "both are delivered");
+        assert_eq!((deregs, unsubs), (2, 2), "once at release, once reconciled");
+    }
+
+    /// #1875: a parked DECREASE or UECM deregistration names a (SUPI, PSI), not a
+    /// session. A new session holding the pair supersedes it (nothing is sent: it
+    /// would remove the live session's count or registration), and one still being
+    /// created defers it.
+    ///
+    /// REVERT-VERIFIED: with `reconcile::holder` answering `None` always, this fails:
+    /// both DELETEs go out against the live session.
+    #[tokio::test]
+    async fn a_new_session_for_the_pair_supersedes_a_parked_cleanup_1875() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204));
+        let (peer, seen) = flaky_peer_1875(status).await;
+        let (live, creating) = ("imsi-001010000018753", "imsi-001010000018754");
+        for supi in [live, creating] {
+            reconcile::park(reconcile::Cleanup::UecmDeregister {
+                supi: supi.to_string(),
+                psi: 7,
+            });
+            reconcile::park(reconcile::Cleanup::NsacDecrease {
+                supi: supi.to_string(),
+                psi: 7,
+                sst: 1,
+                sd: None,
+                nf_id: Some("smf-1875".to_string()),
+                nsacf: None,
+                plmn: None,
+            });
+        }
+        let reference = seed_established_session(live, 7, std::net::Ipv4Addr::new(10, 45, 18, 75));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.nsac_admitted = true;
+                // On the parked DECREASE's own slice (R27: another slice's does not
+                // supersede it, `a_live_session_on_another_slice_..._1900`).
+                b.sst = 1;
+            }
+        }
+        // Registered, no binding yet: a create in flight.
+        let (creating_ref, _) =
+            register_sm_context(&smf_self().read().unwrap(), creating, 7).expect("register");
+        let superseded = || {
+            (
+                reconcile::RECONCILED.get(&["uecm_deregister", "superseded"]),
+                reconcile::RECONCILED.get(&["nsac_decrease", "superseded"]),
+            )
+        };
+        let before = superseded();
+
+        reconcile::reconcile_once().await;
+        let after = superseded();
+        let sent = seen.lock().unwrap().clone();
+        let deferred = parked_1875(
+            |c| matches!(c, reconcile::Cleanup::UecmDeregister { supi, .. } if supi == creating),
+        ) && parked_1875(
+            |c| matches!(c, reconcile::Cleanup::NsacDecrease { supi, .. } if supi == creating),
+        );
+        let live_parked = parked_1875(|c| match c {
+            reconcile::Cleanup::UecmDeregister { supi, .. }
+            | reconcile::Cleanup::NsacDecrease { supi, .. } => supi == live,
+            _ => false,
+        });
+        forget_seeded_session(&reference);
+        forget_seeded_session(&creating_ref);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 18, 75));
+        }
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert!(sent.is_empty(), "nothing is sent for a held pair: {sent:?}");
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (1, 1),
+            "the live session's pair supersedes both"
+        );
+        assert!(!live_parked, "and they are no longer parked");
+        assert!(deferred, "a create in flight defers them");
+    }
+
+    /// R27 #1900: the NSACF counts per (UE, PSI, S-NSSAI), so a live session for the
+    /// pair on ANOTHER slice does not supersede a parked DECREASE for the old one: it
+    /// is sent, or the old slice's quota leaks.
+    ///
+    /// REVERT-VERIFIED: with the guard matching on (SUPI, PSI) only, this fails: the
+    /// DECREASE is counted `superseded` and never sent.
+    #[tokio::test]
+    async fn a_live_session_on_another_slice_does_not_supersede_a_decrease_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let (peer, seen) =
+            flaky_peer_1875(std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204))).await;
+        let supi = "imsi-001010000019001";
+        let reference = seed_established_session(supi, 7, std::net::Ipv4Addr::new(10, 45, 19, 1));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.nsac_admitted = true;
+                b.sst = 2;
+            }
+        }
+        reconcile::park(reconcile::Cleanup::NsacDecrease {
+            supi: supi.to_string(),
+            psi: 7,
+            sst: 1,
+            sd: None,
+            nf_id: Some("smf-1900".to_string()),
+            nsacf: None,
+            plmn: None,
+        });
+        let delivered = || reconcile::RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+
+        reconcile::reconcile_once().await;
+        let sent = sent_1875(&seen, |_, u, b| {
+            u.contains("/nnsacf-nsac/") && b.contains("DECREASE") && b.contains(supi)
+        });
+        let after = delivered();
+        forget_seeded_session(&reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 19, 1));
+        }
+        stop_flaky_peer_1875();
+        reconcile::clear_for_test();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), peer.stop()).await;
+
+        assert_eq!(sent, 1, "the old slice's DECREASE is sent");
+        assert_eq!(after - before, 1, "and delivered");
+    }
+
+    /// R27 #1900: a reconciler DECREASE on the wire is in flight for its (SUPI, PSI),
+    /// so a create for the pair on the same S-NSSAI counts in only after it lands.
+    /// Otherwise the new session's INCREASE (a no-op at the NSACF, whose entry the old
+    /// count still holds) could land first, and the DECREASE then counts it out.
+    ///
+    /// REVERT-VERIFIED: with the attempt taking no `ReleaseInFlight` entry, this
+    /// fails: the NSACF sees INC then DEC.
+    #[tokio::test]
+    async fn a_create_waits_for_a_reconciler_decrease_on_the_wire_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        reconcile::clear_for_test();
+        let (nsacf, seen) = recording_nsacf(
+            204,
+            204,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let supi = "imsi-001010000019003";
+        reconcile::park(reconcile::Cleanup::NsacDecrease {
+            supi: supi.to_string(),
+            psi: 11,
+            sst: 1,
+            sd: Some("010203".to_string()),
+            nf_id: Some("smf-1900".to_string()),
+            nsacf: None,
+            plmn: None,
+        });
+
+        let pass = tokio::spawn(reconcile::reconcile_once());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            11,
+            &n1(
+                11,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let _ = pass.await;
+        let order = nsac_order(&seen, supi);
+        let leftover = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi)
+            .map(|(r, _)| r.clone());
+        if let Some(r) = leftover {
+            let _ = release_sm_context_locally(&r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        reconcile::clear_for_test();
+
+        assert_eq!(resp.status, 201);
+        assert_eq!(order.first().map(String::as_str), Some("DEC"), "{order:?}");
+        assert_eq!(
+            &order[..2],
+            ["DEC", "INC"],
+            "the DECREASE lands first: {order:?}"
+        );
+    }
+
+    /// R27 #1900: `park` writes the set into the durable snapshot at once, so a
+    /// cleanup parked just before a crash is not lost.
+    ///
+    /// REVERT-VERIFIED: with `persist()` dropped from `park`, this fails: the state
+    /// file does not name the parked cleanup.
+    #[tokio::test]
+    async fn a_parked_cleanup_is_in_the_state_file_at_once_1900() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        reconcile::clear_for_test();
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-smf-park-1900-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let armed = ArmedStateFile::arm(&path, "19001", 0x1900, 0x1900);
+        reconcile::park(reconcile::Cleanup::SdmUnsubscribe {
+            supi: "imsi-001010000019002".to_string(),
+            subscription_id: "sub-park-1900".to_string(),
+        });
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        reconcile::clear_for_test();
+        drop(armed);
+
+        assert!(
+            written.contains("sub-park-1900"),
+            "the parked cleanup is in the state file: {written}"
+        );
     }
 
     /// #1072 review m2: an INCREASE that is never answered fails open and is
@@ -26657,6 +28500,415 @@ mod tests {
         assert_eq!(stored_seid, Some(upf.upf_seid));
     }
 
+    const AMF_A_1860: &str = "aaaaaaaa-1860-4000-8000-00000000000a";
+    const AMF_B_1860: &str = "bbbbbbbb-1860-4000-8000-00000000000b";
+
+    /// A request carrying `token_sub` as its verified access-token subject.
+    fn as_nf_1860(mut req: SbiRequest, token_sub: Option<&str>) -> SbiRequest {
+        req.oauth2_subject = token_sub.map(str::to_string);
+        req
+    }
+
+    fn sm_op_1860(
+        reference: &str,
+        op: &str,
+        body: serde_json::Value,
+        who: Option<&str>,
+    ) -> SbiRequest {
+        as_nf_1860(
+            SbiRequest::post(format!("/nsmf-pdusession/v1/sm-contexts/{reference}/{op}"))
+                .with_body(body.to_string(), "application/json"),
+            who,
+        )
+    }
+
+    /// Create a real SM context through the router as `who` (the stand-in UPF
+    /// answers N4), returning its reference.
+    async fn create_as_1860(supi: &str, psi: u8, who: Option<&str>) -> String {
+        let n1_msg = n1(
+            psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let resp =
+            smf_sbi_request_handler(as_nf_1860(create_request(supi, psi, &n1_msg), who)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let location = resp.http.get_header("Location").expect("Location").clone();
+        location.rsplit('/').next().unwrap().to_string()
+    }
+
+    fn detail_1860(resp: &SbiResponse) -> String {
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        pd["detail"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// #1860, TS 29.502 §5.2.2.3-§5.2.2.5: the SM context is bound to the
+    /// verified identity of the AMF that created it. Another NF holding an
+    /// nsmf-pdusession token is refused 403 on modify, release and retrieve with
+    /// nothing changed, and the reference it would need is not derivable.
+    #[tokio::test]
+    async fn only_the_serving_amf_modifies_releases_or_retrieves_its_sm_context_1860() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000001860", 5, Some(AMF_A_1860)).await;
+
+        // Bound to the creator's verified identity, and not a bare index.
+        assert_eq!(
+            lookup_policy_binding(&reference)
+                .and_then(|b| b.serving_amf)
+                .as_deref(),
+            Some(AMF_A_1860)
+        );
+        let (index, random) = reference.split_once('-').expect("index-random");
+        assert!(
+            index.parse::<u32>().is_ok() && random.len() == 32,
+            "{reference}"
+        );
+        for guess in [index.to_string(), format!("{index}-{}", "0".repeat(32))] {
+            let resp = smf_sbi_request_handler(sm_op_1860(
+                &guess,
+                "retrieve",
+                serde_json::json!({}),
+                Some(AMF_A_1860),
+            ))
+            .await;
+            assert_eq!(
+                resp.status, 404,
+                "the index alone must not resolve: {guess}"
+            );
+        }
+
+        // Another NF, and a caller with no verified identity: 403 on each.
+        for who in [Some(AMF_B_1860), None] {
+            for (op, body) in [
+                ("retrieve", serde_json::json!({})),
+                ("modify", serde_json::json!({ "upCnxState": "DEACTIVATED" })),
+                (
+                    "modify",
+                    serde_json::json!({ "smContextStatusUri": "http://evil.example/status" }),
+                ),
+                (
+                    "release",
+                    serde_json::json!({ "cause": "REL_DUE_TO_UE_REQ" }),
+                ),
+            ] {
+                let resp = smf_sbi_request_handler(sm_op_1860(&reference, op, body, who)).await;
+                assert_eq!(resp.status, 403, "{who:?} {op}");
+                assert!(
+                    detail_1860(&resp).contains(&format!("belongs to NF instance {AMF_A_1860}")),
+                    "{who:?} {op}: {}",
+                    detail_1860(&resp)
+                );
+            }
+        }
+
+        // Nothing changed: the owner still retrieves it, ACTIVATING as created.
+        let resp = smf_sbi_request_handler(sm_op_1860(
+            &reference,
+            "retrieve",
+            serde_json::json!({}),
+            Some(&AMF_A_1860.to_uppercase()),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "the owner (case-insensitive UUID) retrieves"
+        );
+        let binding = lookup_policy_binding(&reference).expect("still bound");
+        assert_eq!(binding.serving_amf.as_deref(), Some(AMF_A_1860));
+        assert_ne!(
+            binding.sm_context_status_uri.as_deref(),
+            Some("http://evil.example/status")
+        );
+
+        // The owner releases it.
+        let resp = smf_sbi_request_handler(sm_op_1860(
+            &reference,
+            "release",
+            serde_json::json!({ "cause": "REL_DUE_TO_UE_REQ" }),
+            Some(AMF_A_1860),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        assert!(lookup_policy_binding(&reference).is_none());
+    }
+
+    /// #1860, TS 29.502 Table 6.1.6.2.3-1 (`servingNfId` "shall be present upon
+    /// inter-AMF change"): the NEW AMF takes the context over by naming itself, and
+    /// only it can. The old AMF, a third NF, or a non-AMF certificate cannot move
+    /// it; after the change the old AMF is refused.
+    #[tokio::test]
+    async fn an_amf_change_moves_the_binding_only_for_the_new_amf_itself_1860() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000011860", 6, Some(AMF_A_1860)).await;
+        let change = serde_json::json!({
+            "servingNfId": AMF_B_1860,
+            "smContextStatusUri": "http://amf-b.example/nsmf-callback/status",
+        });
+
+        // Handed over by the old AMF, claimed by a third NF, or by B under an SMF
+        // certificate: refused, binding unchanged.
+        let third = "cccccccc-1860-4000-8000-00000000000c";
+        let mut smf_cert = sm_op_1860(&reference, "modify", change.clone(), None);
+        smf_cert.peer_cert_nf_instance_id = Some(AMF_B_1860.to_string());
+        smf_cert.peer_cert_nf_types = vec!["SMF".to_string()];
+        for req in [
+            sm_op_1860(&reference, "modify", change.clone(), Some(AMF_A_1860)),
+            sm_op_1860(&reference, "modify", change.clone(), Some(third)),
+            sm_op_1860(&reference, "modify", change.clone(), None),
+            smf_cert,
+        ] {
+            let resp = smf_sbi_request_handler(req).await;
+            assert_eq!(resp.status, 403, "{}", detail_1860(&resp));
+            assert_eq!(
+                lookup_policy_binding(&reference)
+                    .and_then(|b| b.serving_amf)
+                    .as_deref(),
+                Some(AMF_A_1860)
+            );
+        }
+
+        // The new AMF names itself: admitted, and the context is now its.
+        let resp =
+            smf_sbi_request_handler(sm_op_1860(&reference, "modify", change, Some(AMF_B_1860)))
+                .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let binding = lookup_policy_binding(&reference).expect("bound");
+        assert_eq!(binding.serving_amf.as_deref(), Some(AMF_B_1860));
+        assert_eq!(
+            binding.sm_context_status_uri.as_deref(),
+            Some("http://amf-b.example/nsmf-callback/status")
+        );
+        let retrieve = |who| sm_op_1860(&reference, "retrieve", serde_json::json!({}), who);
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_A_1860)))
+                .await
+                .status,
+            403
+        );
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_B_1860)))
+                .await
+                .status,
+            200
+        );
+    }
+
+    /// #1899 review M1: an AMF change in a request that is then rejected moves
+    /// nothing. B names itself (so the caller check admits it) but the request
+    /// carries `PATH_SWITCH_REQ` with no `n2SmInfo`, which is answered 400: the
+    /// context stays A's, with A's status URI, and A still manages it.
+    #[tokio::test]
+    async fn a_rejected_amf_change_moves_nothing_1899() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000001899", 5, Some(AMF_A_1860)).await;
+        let uri_before = lookup_policy_binding(&reference)
+            .expect("bound")
+            .sm_context_status_uri;
+        let sess_uri_before = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .and_then(|s| s.sm_context_status_uri);
+
+        let resp = smf_sbi_request_handler(sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({
+                "servingNfId": AMF_B_1860,
+                "smContextStatusUri": "http://amf-b.example/nsmf-callback/status",
+                "n2SmInfoType": "PATH_SWITCH_REQ",
+            }),
+            Some(AMF_B_1860),
+        ))
+        .await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+
+        let binding = lookup_policy_binding(&reference).expect("bound");
+        assert_eq!(
+            binding.serving_amf.as_deref(),
+            Some(AMF_A_1860),
+            "a rejected AMF change must not move the owner"
+        );
+        assert_eq!(binding.sm_context_status_uri, uri_before);
+        assert_eq!(
+            smf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_context_ref(&reference)
+                .and_then(|s| s.sm_context_status_uri),
+            sess_uri_before
+        );
+        let retrieve = |who| sm_op_1860(&reference, "retrieve", serde_json::json!({}), who);
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_A_1860)))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            smf_sbi_request_handler(retrieve(Some(AMF_B_1860)))
+                .await
+                .status,
+            403
+        );
+    }
+
+    /// #1899 review M2: under production an ownerless SM context (restored from
+    /// before #1860, or created under `dev`) is frozen against a rebind, an
+    /// anonymous caller and a non-AMF certificate, and the first verified AMF is
+    /// adopted as its owner, after which it is bound like any other. Under `dev`
+    /// it is managed as before.
+    #[tokio::test]
+    async fn an_ownerless_sm_context_is_frozen_then_adopted_under_production_1899() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000011899", 6, None).await;
+        assert_eq!(lookup_policy_binding(&reference).unwrap().serving_amf, None);
+        let op = "UpdateSMContext";
+
+        // Dev: as before.
+        let anon = sm_op_1860(&reference, "modify", serde_json::json!({}), None);
+        assert!(refuse_ownerless_sm_context_caller(&reference, &anon, op, false).is_none());
+
+        // Production: refused, and still ownerless.
+        let rebind = sm_op_1860(
+            &reference,
+            "modify",
+            serde_json::json!({ "smContextStatusUri": "http://evil.example/status" }),
+            Some(AMF_B_1860),
+        );
+        let mut smf_cert = sm_op_1860(&reference, "retrieve", serde_json::json!({}), None);
+        smf_cert.peer_cert_nf_instance_id = Some(AMF_B_1860.to_string());
+        smf_cert.peer_cert_nf_types = vec!["SMF".to_string()];
+        for (req, expect) in [
+            (&rebind, "may not be rebound"),
+            (&anon, "no verified identity"),
+            (&smf_cert, "only the serving AMF"),
+        ] {
+            let resp = refuse_ownerless_sm_context_caller(&reference, req, op, true)
+                .unwrap_or_else(|| panic!("{expect}: admitted"));
+            assert_eq!(resp.status, 403);
+            assert!(
+                detail_1860(&resp).contains(expect),
+                "{}",
+                detail_1860(&resp)
+            );
+            assert_eq!(lookup_policy_binding(&reference).unwrap().serving_amf, None);
+        }
+
+        // The first verified AMF is adopted, and then the context is A's.
+        let a = sm_op_1860(
+            &reference,
+            "retrieve",
+            serde_json::json!({}),
+            Some(AMF_A_1860),
+        );
+        assert!(refuse_ownerless_sm_context_caller(&reference, &a, op, true).is_none());
+        assert_eq!(
+            lookup_policy_binding(&reference)
+                .unwrap()
+                .serving_amf
+                .as_deref(),
+            Some(AMF_A_1860)
+        );
+        let b = sm_op_1860(
+            &reference,
+            "retrieve",
+            serde_json::json!({}),
+            Some(AMF_B_1860),
+        );
+        assert_eq!(smf_sbi_request_handler(b).await.status, 403);
+        assert_eq!(smf_sbi_request_handler(a).await.status, 200);
+    }
+
+    /// #1899 review M2: the router judges an ownerless context under the process's
+    /// real SBI profile. Tests call the gate with the profile passed in (flipping
+    /// the process-wide override would race every sibling that sets Dev), so this
+    /// pins that the router's call is the profile, not a constant.
+    #[test]
+    fn the_router_passes_the_real_profile_to_the_ownerless_gate_1899() {
+        let src = include_str!("main.rs");
+        let call = "refuse_ownerless_sm_context_caller(\n            sm_context_ref,\n            \
+                    request,\n            operation,\n            \
+                    nextgcore_sbi::security::SbiProfile::resolve().is_production(),\n        );";
+        assert_eq!(src.matches(call).count(), 1);
+    }
+
+    /// #1860: a caller whose access token and client certificate name different NF
+    /// instances creates nothing.
+    #[tokio::test]
+    async fn a_create_with_disagreeing_identities_creates_nothing_1860() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let n1_msg = n1(
+            5,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let mut req = as_nf_1860(
+            create_request("imsi-001010000021860", 5, &n1_msg),
+            Some(AMF_A_1860),
+        );
+        req.peer_cert_nf_instance_id = Some(AMF_B_1860.to_string());
+        let before = smf_self().read().unwrap().sess_count();
+        let resp = smf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 403);
+        assert!(
+            detail_1860(&resp).contains("name different NF instances"),
+            "{}",
+            detail_1860(&resp)
+        );
+        assert_eq!(smf_self().read().unwrap().sess_count(), before);
+    }
+
+    /// #1860: the binding survives a restart (it is on the persisted
+    /// PolicyBinding), and a snapshot written before #1860 loads ownerless.
+    #[test]
+    fn the_serving_amf_binding_is_persisted_1860() {
+        let mut b = context::PolicyBinding::snapshot_default();
+        b.serving_amf = Some(AMF_A_1860.to_string());
+        let doc = serde_json::to_value(&b).unwrap();
+        let back: context::PolicyBinding = serde_json::from_value(doc.clone()).unwrap();
+        assert_eq!(back.serving_amf.as_deref(), Some(AMF_A_1860));
+        let mut old = doc;
+        old.as_object_mut().unwrap().remove("serving_amf");
+        let back: context::PolicyBinding = serde_json::from_value(old).unwrap();
+        assert_eq!(back.serving_amf, None);
+    }
+
+    /// #1860: the minted reference keeps the index the SEID derivation and the
+    /// snapshot's index recovery read, so neither changes.
+    #[test]
+    fn the_unguessable_reference_keeps_its_index_1860() {
+        let r = context::mint_sm_context_ref(4097);
+        assert_eq!(context::sm_context_ref_index(&r), Some(4097));
+        assert_eq!(
+            context::derive_cp_n4_seid(&r),
+            context::derive_cp_n4_seid("4097")
+        );
+        assert_eq!(context::sm_context_ref_index("12"), Some(12));
+        assert_ne!(
+            context::mint_sm_context_ref(1),
+            context::mint_sm_context_ref(1)
+        );
+    }
+
     /// #78 criterion 1's invariant, at the function the create handler calls: the
     /// reference a registration returns is the one that resolves to it.
     ///
@@ -27298,6 +29550,49 @@ mod tests {
             assert_eq!(json["cause"], serde_json::json!("NOT_IMPLEMENTED"));
             assert_eq!(json["status"], serde_json::json!(501));
         }
+    }
+
+    /// #1891: the H-SMF `pdu-sessions` Update and Release cannot touch a session,
+    /// whoever asks and whatever reference they guess.
+    ///
+    /// The issue's premise was a sequential `pduSessionRef` with no caller binding.
+    /// The routes already answered `501` without a lookup, but every session was
+    /// given `pduSessionRef = "{index}"`, so the first implementation to resolve it
+    /// would have inherited the gap. Now no session carries one, and a stranger's
+    /// modify or release by the index, or by the `smContextRef`, leaves it intact.
+    #[tokio::test]
+    async fn a_stranger_cannot_reach_a_session_through_the_pdu_sessions_routes_1891() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        smf_context_init(64, 256, 512);
+        let sess = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let ue = context.ue_add_by_supi("imsi-001010000001891").expect("ue");
+            context.sess_add_by_psi(ue.id, 5).expect("session")
+        };
+        assert_eq!(
+            sess.pdu_session_ref, None,
+            "this SMF is never the H-SMF, so no session has a pduSessionRef"
+        );
+        let index = sess.index.to_string();
+        let sm_ref = sess.sm_context_ref.clone().expect("smContextRef");
+        for r in [index.as_str(), sm_ref.as_str()] {
+            for op in ["modify", "release"] {
+                let path = format!("/nsmf-pdusession/v1/pdu-sessions/{r}/{op}");
+                let mut req = events_request("POST", &path, Some(serde_json::json!({})));
+                req.oauth2_subject = Some("bbbbbbbb-0000-4000-8000-000000001891".into());
+                let resp = smf_sbi_request_handler(req).await;
+                assert_eq!(resp.status, 501, "POST {path}");
+            }
+        }
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let after = context
+            .sess_find_by_index(sess.index)
+            .expect("the session survives every stranger's release");
+        assert_eq!(after.sm_context_ref, sess.sm_context_ref);
+        context.sess_remove(sess.id);
     }
 
     /// #79 criteria 1 + 2: the subscribed session-AMBR and default 5QI are applied,

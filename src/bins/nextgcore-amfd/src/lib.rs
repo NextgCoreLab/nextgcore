@@ -18,6 +18,7 @@ pub mod event;
 pub mod gmm_build;
 pub mod gmm_handler;
 pub mod gmm_sm;
+pub mod mbs_broadcast; // #1796: Namf_MBSBroadcast contexts + NGAP Broadcast Session Setup/Release
 pub mod metrics;
 pub mod n26_build; // #408: Forward Relocation build/parse (TS 29.274 §7.3.1-§7.3.4)
 pub mod n26_eps_to_5gs; // #418: EPS→5GS handover, AMF as target (TS 23.502 §4.11.1.2.2)
@@ -91,6 +92,14 @@ pub mod test_support {
     /// so two such tests in parallel steal each other's transfers. A tokio mutex,
     /// because the guard is held across the drain's `.await`s.
     pub static CONNECTED_DOWNLINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// #1776: serialises tests that read or drain the process-global UE-AMBR
+    /// modification queue (`AmfContext::ue_ambr_modification_queue`, drained by
+    /// `NgapServer::process_ue_ambr_modifications`), for the reason given for
+    /// [`CONNECTED_DOWNLINK_LOCK`]. A test that also takes the Namf tests'
+    /// `DEREG_QUEUE_TEST_LOCK` takes that one first.
+    pub static UE_AMBR_MODIFICATION_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// Serialises tests that drain the process-global positioning / UE-policy
     /// downlink queue (`AmfContext::positioning_dl_queue`, drained by

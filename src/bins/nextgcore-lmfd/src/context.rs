@@ -2919,6 +2919,15 @@ pub fn lmf_context_init(max_measurements: usize) {
             if let Ok(mut ids) = context.dl_prs_ids.write() {
                 ids.clear();
             }
+            // #1884: and so are the UEs' last fixes. `fini` clears them, but a test
+            // binary never runs it. So a fix one test seeded (main.rs's velocity
+            // test caches one for imsi-001010000000103) could answer a later test's
+            // DetermineLocation for the same SUPI. When the velocity test ran first,
+            // that answer was a 200 from the cache instead of the "no reference
+            // points" 500 the later test asserts.
+            if let Ok(mut locs) = context.ue_locations.write() {
+                locs.clear();
+            }
         }
     };
 }

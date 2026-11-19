@@ -735,6 +735,9 @@ pub fn handle_event_subscribe(
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        rep_period: None,
+        max_reports: None,
+        reports_made: std::collections::HashMap::new(),
         one_time: false,
         first_location_pending: false,
         reporting_threshold: None,
@@ -1026,6 +1029,7 @@ pub(crate) fn idle_ue_paging_context(
         location_report_subs: Vec::new(),
         location_only: false,
         joined_transfers: Vec::new(),
+        positioning_only: false,
     };
     let mut paging_ctx = paging_ctx;
     // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility`, the first PAGING
@@ -1054,14 +1058,20 @@ pub(crate) fn idle_ue_paging_context(
 /// is joined, not replaced, and the LMF's `failure_notify_uri` is kept on it, so a
 /// failed page notifies the LMF too. Join-or-start is one step under the paging-map
 /// write lock ([`crate::context::AmfContext::paging_join_or_add_transfer`]).
-/// Returns the transfer's `Location`, as [`page_idle_ue_for_n1`] does, or `None`
-/// when the queued page can take no more requesters (nothing changed).
+/// Returns the transfer's own `Location`, `.../n1-n2-messages/{transfer_id}`
+/// (#1858), or `None` when the queued page can take no more requesters (nothing
+/// changed).
 pub fn page_idle_ue_for_positioning(
     amf_ue: &AmfUe,
     failure_notify_uri: Option<&str>,
+    transfer_id: &str,
 ) -> Option<String> {
-    let paging_ctx =
+    let mut paging_ctx =
         idle_ue_paging_context(amf_ue, None, None, PagedN2::Setup, None, failure_notify_uri);
+    // #1858: the transfer's own resource (TS 29.518 §5.2.2.3.1: the Location
+    // ".../n1-n2-messages/{n1N2MessageId}"), which its failure notification names, so
+    // two LMF transfers sharing one callback URI are told apart.
+    paging_ctx.n1n2_msg_data_uri = format!("{}/{transfer_id}", paging_ctx.n1n2_msg_data_uri);
     let location = paging_ctx.n1n2_msg_data_uri.clone();
     let joined = {
         let ctx = amf_self();

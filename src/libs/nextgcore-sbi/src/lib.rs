@@ -64,6 +64,7 @@ pub mod owner_binding; // a resource is managed by the consumer that created it 
 pub mod peer_cert; // NF identity from a verified TLS peer certificate (issue #186)
 #[cfg(feature = "6g-extensions")]
 pub mod pubsub;
+pub mod resource_scope; // resource/operation-level OAuth2 scopes, both ends (#1811)
 pub mod scp;
 pub mod security;
 pub mod test_support; // Shared test helpers (NOT cfg(test): other crates' tests use it)

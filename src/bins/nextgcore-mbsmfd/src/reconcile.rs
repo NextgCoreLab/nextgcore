@@ -18,7 +18,7 @@
 //! covers that case.
 
 use crate::context::AmfMbsContext;
-use crate::namf_client::{self, ContextDeleteOutcome};
+use crate::namf_client::ContextDeleteOutcome;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -102,16 +102,6 @@ fn same_context(a: &AmfMbsContext, b: &AmfMbsContext) -> bool {
     a.host == b.host && a.port == b.port && a.context_ref == b.context_ref
 }
 
-/// R24: whether a live MBS session holds `c`. The AMF's ContextCreate is
-/// idempotent on the TMGI, so a new session reusing a released one's TMGI is
-/// handed the SAME `mbsContextRef`; deleting it then would tear down the new
-/// session's live context.
-fn held_by_a_live_session(c: &AmfMbsContext) -> bool {
-    crate::mbsmf_self()
-        .read()
-        .is_ok_and(|ctx| ctx.amf_context_in_use(c))
-}
-
 /// R24: a session recorded `c` as its own: a parked delete of the same context is
 /// dropped, as it would delete that session's live context. Called by
 /// `record_amf_context` after the record is made.
@@ -159,19 +149,12 @@ pub async fn reconcile_once() -> usize {
             still.push(c);
             continue;
         }
-        if held_by_a_live_session(&c) {
-            log::info!(
-                "MBS: AMF {}:{} MBS context {} is in use again; its parked ContextDelete is \
-                 dropped",
-                c.host,
-                c.port,
-                c.context_ref
-            );
-            RECONCILED.inc(&["reused"]);
-            continue;
-        }
-        match namf_client::context_delete(&c).await {
-            ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone => {
+        // #1854: in the (AMF, TMGI) lane, the in-use check and the send together.
+        match crate::delete_in_lane(&c).await {
+            None => {
+                RECONCILED.inc(&["reused"]);
+            }
+            Some(ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone) => {
                 log::info!(
                     "MBS: reconciler released AMF {}:{} MBS context {}",
                     c.host,
@@ -181,7 +164,7 @@ pub async fn reconcile_once() -> usize {
                 RECONCILED.inc(&["deleted"]);
                 ended += 1;
             }
-            ContextDeleteOutcome::Failed => still.push(c),
+            Some(ContextDeleteOutcome::Failed) => still.push(c),
         }
     }
     if !still.is_empty() {
@@ -260,6 +243,8 @@ mod tests {
             port: 9,
             nf_instance_id: None,
             context_ref: n.to_string(),
+            notify_token: String::new(),
+            tmgi: None,
         }
     }
 

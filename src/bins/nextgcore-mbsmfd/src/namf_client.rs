@@ -133,15 +133,53 @@ fn mbs_session_id_json(tmgi: &Tmgi) -> Value {
 /// The MBS context reference an AMF returned from ContextCreate.
 pub type MbsContextRef = String;
 
+/// #1796: the path under which this MB-SMF serves the AMF's
+/// Namf_MBSBroadcast_ContextStatusNotify (TS 29.518 §5.6.2.5):
+/// `{AMF_NOTIFY_PREFIX}/{token}`, the token minted for the ContextCreate.
+pub const AMF_NOTIFY_PREFIX: &str = "/nmbsmf-mbssession/v1/amf-context-status";
+
+/// The `notifyUri` for `token` under `base` (`{scheme}://{host:port}`).
+pub fn amf_notify_uri(base: &str, token: &str) -> String {
+    format!("{}{AMF_NOTIFY_PREFIX}/{token}", base.trim_end_matches('/'))
+}
+
+/// The binary part carrying the N2 MBS SM container of a ContextCreate.
+const N2_CONTENT_ID: &str = "n2MbsSmInfo";
+
+/// What the MB-SMF hands the AMF for a broadcast session (TS 23.247 §7.3.1
+/// step 2: TMGI, N2 SM information, MBS service area), #1796.
+#[derive(Debug, Clone)]
+pub struct AmfLeg {
+    /// The session's TS 29.571 `MbsServiceArea`, as the consumer gave it.
+    pub mbs_service_area: Value,
+    /// The session's TS 29.571 `Snssai`.
+    pub snssai: Value,
+    /// The MBS QoS flow of the N2 SM information.
+    pub qfi: u8,
+    pub five_qi: u8,
+}
+
 /// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
-/// (TS 29.518 §5.6), i.e. TS 23.247 §7.3.1's request for broadcast setup toward
+/// (TS 29.518 §5.6.2.2), i.e. TS 23.247 §7.3.1's request for broadcast setup toward
 /// the RAN.
+///
+/// #1796: a `ContextCreateReqData` with every member the AMF needs to drive the
+/// Broadcast Session Setup: the TMGI, the MBS service area, the MBS Session Setup
+/// or Modification Request Transfer as an `MBS_SES_REQ` binary part, the S-NSSAI,
+/// and the `notifyUri` the AMF reports later NG-RAN answers to.
 ///
 /// Returns the AMF's `mbsContextRef` on 201. `None` on any failure, logged:
 /// this is best-effort relative to the session create, which has already
 /// succeeded locally by the time it runs. A failed AMF leg means the RAN does
 /// not have the session, which the caller reports rather than hides.
-pub async fn context_create(amf: &DiscoveredAmf, tmgi: &Tmgi) -> Option<MbsContextRef> {
+pub async fn context_create(
+    amf: &DiscoveredAmf,
+    tmgi: &Tmgi,
+    leg: &AmfLeg,
+    notify_base: &str,
+    notify_token: &str,
+) -> Option<MbsContextRef> {
+    let request = context_create_request(tmgi, leg, notify_base, notify_token)?;
     // #1662: a service request to the AMF, so it carries the NRF-issued token.
     let client = crate::attach_oauth2(
         SbiClient::new(
@@ -151,12 +189,7 @@ pub async fn context_create(amf: &DiscoveredAmf, tmgi: &Tmgi) -> Option<MbsConte
         ),
         nextgcore_sbi::types::NfType::Amf,
     );
-
-    let body = json!({ "mbsSessionId": mbs_session_id_json(tmgi) });
-    let response = match client
-        .post_json("/namf-mbs-bc/v1/mbs-contexts", &body)
-        .await
-    {
+    let response = match client.send_request(request).await {
         Ok(r) => r,
         Err(e) => {
             log::warn!(
@@ -187,7 +220,57 @@ pub async fn context_create(amf: &DiscoveredAmf, tmgi: &Tmgi) -> Option<MbsConte
     if context_ref.is_none() {
         log::warn!("MBS: ContextCreate 201 carried no mbsContextRef");
     }
+    log::info!(
+        "MBS: ContextCreate answered with {} N2 container(s), operationStatus {:?}",
+        json.get("n2MbsSmInfoList")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        json.get("operationStatus").and_then(Value::as_str)
+    );
     context_ref
+}
+
+/// The multipart ContextCreate request (`ContextCreateReqData` and the N2 MBS SM
+/// container part), with the `notifyUri` for `notify_token` under `notify_base`.
+/// Built here so the notifyUri, a callback URI, stays out of everything the
+/// caller logs.
+fn context_create_request(
+    tmgi: &Tmgi,
+    leg: &AmfLeg,
+    notify_base: &str,
+    notify_token: &str,
+) -> Option<nextgcore_sbi::message::SbiRequest> {
+    let transfer = match crate::n2_mbs_transfer::setup_or_mod_request_transfer(leg.qfi, leg.five_qi)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("MBS: no ContextCreate: the N2 MBS SM container could not be built: {e}");
+            return None;
+        }
+    };
+    let body = json!({
+        "mbsSessionId": mbs_session_id_json(tmgi),
+        "mbsServiceArea": leg.mbs_service_area,
+        "n2MbsSmInfo": {
+            "ngapIeType": "MBS_SES_REQ",
+            "ngapData": { "contentId": N2_CONTENT_ID },
+        },
+        "notifyUri": amf_notify_uri(notify_base, notify_token),
+        "snssai": leg.snssai,
+    });
+    match nextgcore_sbi::message::SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+        .with_json_body(&body)
+    {
+        Ok(r) => Some(r.with_part(nextgcore_sbi::message::SbiPart::with_content(
+            N2_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::from(transfer),
+        ))),
+        Err(e) => {
+            log::warn!("MBS: ContextCreate body build failed: {e}");
+            None
+        }
+    }
 }
 
 /// How one Namf_MBSBroadcast ContextDelete ended (#1758).
@@ -258,6 +341,88 @@ mod tests {
         }
     }
 
+    /// #1796: the TAC of the MBS service area the stand-in gNB serves.
+    const AREA_TAC: u32 = 0x00_1796;
+
+    /// #1796: the broadcast session's AMF leg: one TAI, SST 1, QFI 1 / 5QI 9.
+    fn leg() -> AmfLeg {
+        AmfLeg {
+            mbs_service_area: json!({ "taiList": [ { "plmnId": { "mcc": "001", "mnc": "01" },
+                                                     "tac": format!("{AREA_TAC:06x}") } ] }),
+            snssai: json!({ "sst": 1 }),
+            qfi: 1,
+            five_qi: 9,
+        }
+    }
+
+    const NOTIFY_BASE: &str = "http://127.0.0.1:1";
+
+    /// #1796: a gNB of the AMF serving [`AREA_TAC`], as amfd's NGAP task sees it.
+    fn stand_in_gnb(association_id: u64) -> nextgcore_amfd::mbs_broadcast::LiveGnb {
+        let plmn = nextgcore_amfd::context::PlmnId::new("001", "01");
+        nextgcore_amfd::mbs_broadcast::LiveGnb {
+            association_id,
+            node: nextgcore_amfd::mbs_broadcast::RanNode {
+                plmn: plmn.clone(),
+                gnb_id: association_id as u32,
+                gnb_id_len: 32,
+            },
+            tais: vec![(plmn, AREA_TAC)],
+        }
+    }
+
+    type SentPdus = std::sync::Arc<
+        std::sync::Mutex<Vec<(nextgcore_amfd::mbs_broadcast::BroadcastProcedure, Vec<u8>)>>,
+    >;
+
+    /// #1796: the AMF's NGAP side for amfd's real Namf handler, which in this
+    /// process has no NGAP task: every 5 ms it runs amfd's broadcast step against
+    /// the `live` gNBs, records each Broadcast Session Setup / Release Request,
+    /// answers each with a Response from the gNB it went to, and sends the
+    /// resulting ContextStatusNotify requests. Aborted on drop.
+    struct StandInNgap {
+        task: tokio::task::JoinHandle<()>,
+        sent: SentPdus,
+        live: std::sync::Arc<std::sync::Mutex<Vec<nextgcore_amfd::mbs_broadcast::LiveGnb>>>,
+    }
+
+    impl Drop for StandInNgap {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn stand_in_ngap() -> StandInNgap {
+        use nextgcore_amfd::mbs_broadcast::{dispatch_notifies, BroadcastProcedure};
+        let sent: SentPdus = std::sync::Arc::default();
+        let live = std::sync::Arc::new(std::sync::Mutex::new(vec![stand_in_gnb(1)]));
+        let (s, l) = (sent.clone(), live.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let mcast = nextgcore_amfd::context::amf_mcast();
+                let gnbs = l.lock().unwrap().clone();
+                let plan = mcast.broadcast_plan(&gnbs, std::time::Instant::now());
+                let mut notifies = plan.notifies;
+                for send in plan.sends {
+                    for assoc in &send.associations {
+                        s.lock().unwrap().push((send.procedure, send.pdu.clone()));
+                        notifies.extend(match send.procedure {
+                            BroadcastProcedure::Setup => {
+                                mcast.broadcast_setup_outcome(&send.tmgi, *assoc, true, None)
+                            }
+                            BroadcastProcedure::Release => {
+                                mcast.broadcast_release_outcome(&send.tmgi, *assoc, None)
+                            }
+                        });
+                    }
+                }
+                dispatch_notifies(notifies);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        StandInNgap { task, sent, live }
+    }
+
     /// #1662: ContextCreate passes an OAuth2-required AMF with the installed
     /// client, and is refused 401 without one. The stand-in AMF is gated by
     /// nextgcore-sbi's own check (JWKS, audience AMF), so `Some(ref)` is a
@@ -281,11 +446,11 @@ mod tests {
             nf_instance_id: None,
         };
 
-        let without = context_create(&amf, &tmgi()).await;
+        let without = context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t").await;
         let with = crate::TEST_OAUTH2_CLIENT
             .scope(
                 stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf),
-                context_create(&amf, &tmgi()),
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
             )
             .await;
 
@@ -330,7 +495,7 @@ mod tests {
         let outcome = crate::TEST_OAUTH2_CLIENT
             .scope(
                 stand_in::oauth2_client_for(1, NfType::Mbsmf),
-                context_create(&amf, &tmgi()),
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
             )
             .await;
 
@@ -355,6 +520,8 @@ mod tests {
         use nextgcore_sbi::types::NfType;
         // #1758: counts amfd's process-global contexts, which the release tests delete.
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         nextgcore_amfd::test_support::init_context();
         let sk = nextgcore_sbi::oauth::generate_es256_key();
@@ -376,18 +543,21 @@ mod tests {
         let sessions = || nextgcore_amfd::context::amf_mcast().session_count();
         let before = sessions();
 
-        let bare = context_create(&amf, &tmgi()).await;
+        let bare = context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t").await;
         let after_bare = sessions();
         let oauth2 = stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf);
         let first = crate::TEST_OAUTH2_CLIENT
             .scope(
                 std::sync::Arc::clone(&oauth2),
-                context_create(&amf, &tmgi()),
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
             )
             .await;
         let after_first = sessions();
         let retry = crate::TEST_OAUTH2_CLIENT
-            .scope(oauth2, context_create(&amf, &tmgi()))
+            .scope(
+                oauth2,
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
+            )
             .await;
 
         assert_eq!(bare, None, "the AMF's gate refuses a bare ContextCreate");
@@ -419,6 +589,10 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         nextgcore_amfd::test_support::init_context();
         crate::mbsmf_context_init(256);
+        crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .set_amf_notify_base("http://127.0.0.1:1");
         let sk = nextgcore_sbi::oauth::generate_es256_key();
         let (nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -471,6 +645,8 @@ mod tests {
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
         // R24: after MBS_CONTEXT_LOCK, the order every holder of both takes them in.
         let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
         let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
         let tmgi = tmgi_1758([0x00, 0x17, 0x58]);
         let session = crate::mbsmf_self()
@@ -481,7 +657,7 @@ mod tests {
 
         crate::TEST_OAUTH2_CLIENT
             .scope(oauth2, async {
-                let context_ref = crate::create_amf_mbs_context(session.id, tmgi, amf)
+                let context_ref = crate::create_amf_mbs_context(session.id, tmgi, amf, leg())
                     .await
                     .expect("the AMF creates the context");
                 assert!(amf_holds(&context_ref));
@@ -519,6 +695,8 @@ mod tests {
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
         // R24: after MBS_CONTEXT_LOCK, the order every holder of both takes them in.
         let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
         let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
         let tmgi = tmgi_1758([0x01, 0x17, 0x58]);
         let ctx = crate::mbsmf_self();
@@ -532,7 +710,7 @@ mod tests {
         crate::TEST_OAUTH2_CLIENT
             .scope(oauth2, async {
                 assert_eq!(
-                    crate::create_amf_mbs_context(session.id, tmgi.clone(), amf).await,
+                    crate::create_amf_mbs_context(session.id, tmgi.clone(), amf, leg()).await,
                     None
                 );
             })
@@ -599,6 +777,8 @@ mod tests {
             port: addr.port(),
             nf_instance_id: None,
             context_ref: "7".to_string(),
+            notify_token: String::new(),
+            tmgi: None,
         };
         (server, context, deletes, arrived, release)
     }
@@ -675,7 +855,7 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the `unpark` call removed from `record_amf_context`,
     /// "recording the reused context unparks its delete" fails; with the
-    /// `held_by_a_live_session` check removed from `reconcile_once`, the AMF sees
+    /// in-use check removed from `delete_in_lane`, the AMF sees
     /// the delete ("the live context is not deleted").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_parked_delete_spares_a_context_a_live_session_reuses_1817() {
@@ -786,6 +966,8 @@ mod tests {
                 port,
                 nf_instance_id: None,
                 context_ref: format!("hole-{n}"),
+                notify_token: String::new(),
+                tmgi: None,
             })
             .collect();
         crate::reconcile::park(parked);
@@ -803,6 +985,179 @@ mod tests {
         );
         crate::reconcile::clear_for_test();
         hole.abort();
+    }
+
+    /// **#1854**: a ContextCreate for session B lands while session A's ContextDelete
+    /// for the same TMGI is in flight at the (real, TMGI-idempotent) AMF. B's create
+    /// waits for the delete in their (AMF, TMGI) lane, so the AMF hands it a FRESH
+    /// context rather than A's, and B's recorded context is live at the AMF
+    /// afterwards. No lane is left behind.
+    ///
+    /// REVERT-VERIFIED: with the create taking no lane, B is handed A's context,
+    /// the delete then removes it, and "B's context is live at the AMF" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_racing_a_delete_on_one_tmgi_gets_a_live_context_1854() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .set_amf_notify_base("http://127.0.0.1:1");
+        // The real amfd handler, its ContextDelete held 400 ms on the way in.
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let a = arrived.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf_server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let a = a.clone();
+                async move {
+                    if req.header.method == "DELETE" {
+                        a.notify_one();
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    nextgcore_amfd::namf_request_handler(req).await
+                }
+            })
+            .await
+            .expect("AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let tmgi = tmgi_1758([0x05, 0x18, 0x54]);
+        let ctx = crate::mbsmf_self();
+        let session = |ctx: &std::sync::Arc<std::sync::RwLock<crate::MbSmfContext>>| {
+            ctx.read()
+                .unwrap()
+                .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+                .expect("session")
+        };
+        let a_session = session(&ctx);
+        let a_ref = crate::create_amf_mbs_context(a_session.id, tmgi.clone(), amf.clone(), leg())
+            .await
+            .expect("A's context");
+
+        // A is released; its ContextDelete is held at the AMF.
+        let a_id = format!("mbs-sess-{}", a_session.id);
+        let release = tokio::spawn(async move { crate::handle_mbs_session_release(&a_id).await });
+        arrived.notified().await;
+        // B, on the same TMGI, is created while that delete is in flight.
+        let b_session = session(&ctx);
+        let b_ref = crate::create_amf_mbs_context(b_session.id, tmgi.clone(), amf.clone(), leg())
+            .await
+            .expect("B's context");
+        release.await.expect("release");
+
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
+            .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
+        assert!(
+            live.is_some(),
+            "B's context is live at the AMF (A's was {a_ref}, B's is {b_ref})"
+        );
+        assert_eq!(
+            crate::lane::count_for_port(addr.port()),
+            0,
+            "no lane is left behind"
+        );
+        ctx.read().unwrap().take_amf_contexts(b_session.id);
+        ctx.read().unwrap().session_remove(b_session.id);
+    }
+
+    /// **#1854**, the other order: session B's ContextCreate on the TMGI takes the
+    /// lane first (the AMF holds it), and released session A's ContextDelete waits
+    /// behind it. B is handed A's context (the AMF is idempotent on the TMGI) and
+    /// records it, so A's delete, in the lane, sees B holding it and is not sent.
+    ///
+    /// REVERT-VERIFIED: with the in-use check removed from `delete_in_lane`, A's
+    /// delete removes B's live context ("B keeps the context A released").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_spares_the_context_a_later_session_holds_1854() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .set_amf_notify_base("http://127.0.0.1:1");
+        // The real amfd handler; once armed, the next ContextCreate is held 400 ms.
+        let arm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let deletes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ar, a2, d2) = (arm.clone(), arrived.clone(), deletes.clone());
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf_server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let (ar, a2, d2) = (ar.clone(), a2.clone(), d2.clone());
+                async move {
+                    if req.header.method == "DELETE" {
+                        d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if req.header.method == "POST"
+                        && ar.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        a2.notify_one();
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    nextgcore_amfd::namf_request_handler(req).await
+                }
+            })
+            .await
+            .expect("AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let tmgi = tmgi_1758([0x06, 0x18, 0x54]);
+        let ctx = crate::mbsmf_self();
+        let a = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("A");
+        let a_ref = crate::create_amf_mbs_context(a.id, tmgi.clone(), amf.clone(), leg())
+            .await
+            .expect("A's context");
+        // A's release, up to its ContextDelete: removed here, contexts taken.
+        ctx.read().unwrap().session_remove(a.id);
+        let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+        // B's ContextCreate takes the lane first; the AMF holds it.
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("B");
+        arm.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (b_id, b_tmgi, b_amf) = (b.id, tmgi.clone(), amf.clone());
+        let create = tokio::spawn(crate::create_amf_mbs_context(b_id, b_tmgi, b_amf, leg()));
+        arrived.notified().await;
+        // A's delete now waits behind B's create in the lane.
+        let release = tokio::spawn(crate::release_amf_contexts(a_contexts));
+        let b_ref = create.await.expect("create").expect("B's context");
+        release.await.expect("release");
+        assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
+            .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
+        assert!(live.is_some(), "B keeps the context A released");
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
     }
 
     /// #1758 (check 3): a session release whose consumer disconnects while the AMF
@@ -899,6 +1254,210 @@ mod tests {
                 .is_none(),
             "an instance with no address at all must not be selected"
         );
+    }
+
+    /// #1796 (R29): after the AMF's 204 to ContextDelete the notify token is still
+    /// admitted for the grace, so a Release Response Transfer the AMF reports late
+    /// is accepted; after the grace it is refused. On a 404 it goes at once.
+    ///
+    /// REVERT-VERIFIED: with the token forgotten at the 204, the late notification
+    /// is refused and "a late Release Response Transfer is still accepted" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_release_transfer_is_still_admitted_after_the_204_1796() {
+        let (_server, mut context, _deletes, _arrived, _release) = scripted_amf(false, &[]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        let token = ctx
+            .read()
+            .unwrap()
+            .mint_amf_notify_token(1796)
+            .expect("a token");
+        context.notify_token = token.clone();
+        let late = || {
+            nextgcore_sbi::message::SbiRequest::post(format!("{AMF_NOTIFY_PREFIX}/{token}"))
+                .with_json_body(&json!({
+                    "mbsSessionId": {},
+                    "n2MbsSmInfoList": [ { "ngapIeType": "MBS_SES_REL_RSP",
+                                           "ngapData": { "contentId": "n2-1" } } ],
+                }))
+                .unwrap()
+        };
+
+        assert!(crate::release_amf_contexts(vec![context]).await, "204");
+        assert_eq!(
+            crate::handle_amf_context_status_notify(&token, &late())
+                .await
+                .status,
+            204,
+            "a late Release Response Transfer is still accepted"
+        );
+        eventually("the token goes after the grace", || {
+            ctx.read().unwrap().amf_notify_session(&token).is_none()
+        })
+        .await;
+        assert_eq!(
+            crate::handle_amf_context_status_notify(&token, &late())
+                .await
+                .status,
+            404
+        );
+
+        // A 404 from the AMF: nothing left to notify, so the token goes at once.
+        let (_server, mut gone, _d, _a, _r) = scripted_amf(false, &[404]).await;
+        let token = ctx
+            .read()
+            .unwrap()
+            .mint_amf_notify_token(1797)
+            .expect("a token");
+        gone.notify_token = token.clone();
+        assert!(crate::release_amf_contexts(vec![gone]).await);
+        assert!(ctx.read().unwrap().amf_notify_session(&token).is_none());
+    }
+
+    /// #1796, MB-SMF -> AMF: the ContextCreate this MB-SMF sends passes amfd's
+    /// real handler (which refuses one lacking any mandatory member), and the
+    /// BROADCAST SESSION SETUP REQUEST the gNB then receives carries the MBS
+    /// service area's TAI and, byte for byte, the MBS Session Setup or
+    /// Modification Request Transfer this MB-SMF built: one QoS flow, QFI 1, 5QI 9.
+    ///
+    /// REVERT-VERIFIED: with the n2MbsSmInfo part left out of the request, amfd
+    /// answers 400 and no Setup is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_context_create_carries_the_n2_container_to_the_gnb_1796() {
+        use nextgcore_ngap_gen::generated as g;
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let ngap = stand_in_ngap();
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let tmgi = tmgi_1758([0x02, 0x17, 0x96]);
+
+        let context_ref = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                oauth2.clone(),
+                context_create(&amf, &tmgi, &leg(), NOTIFY_BASE, "t"),
+            )
+            .await
+            .expect("amfd creates the context");
+        let sent = ngap.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one Setup to the one gNB");
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(&sent[0].1).unwrap()
+        else {
+            panic!("an initiating message");
+        };
+        let g::InitiatingMessageValue::Id_BroadcastSessionSetup(req) = m.value else {
+            panic!("a Broadcast Session Setup Request");
+        };
+        let (mut transfer, mut tais) = (None, None);
+        for ie in req.protocol_i_es.0 {
+            match ie.value {
+                g::BroadcastSessionSetupRequestProtocolIEs_EntryValue::Id_MBSSessionSetupRequestTransfer(t) => transfer = Some(t.0),
+                g::BroadcastSessionSetupRequestProtocolIEs_EntryValue::Id_MBS_ServiceArea(
+                    g::MBS_ServiceArea::Locationindependent(a),
+                ) => tais = a.mbs_service_area_tai_list.map(|l| l.0),
+                _ => {}
+            }
+        }
+        let tais = tais.expect("the service area's TAI list");
+        assert_eq!(tais.len(), 1);
+        assert_eq!(tais[0].tac.0, vec![0x00, 0x17, 0x96]);
+        let transfer = transfer.expect("the MB-SMF's container");
+        assert_eq!(
+            transfer,
+            crate::n2_mbs_transfer::setup_or_mod_request_transfer(1, 9).unwrap()
+        );
+        let decoded =
+            nextgcore_ngap_gen::decode_contained::<g::MBSSessionSetupOrModRequestTransfer>(
+                &transfer,
+            )
+            .unwrap();
+        let g::MBSSessionSetupOrModRequestTransferProtocolIEs_EntryValue::Id_MBS_QoSFlowsToBeSetupModList(flows) =
+            &decoded.protocol_i_es.0[0].value
+        else {
+            panic!("the QoS flow list");
+        };
+        assert_eq!(flows.0[0].mb_sqos_flow_identifier.0, 1);
+
+        let record = crate::context::AmfMbsContext {
+            host: amf.host.clone(),
+            port: amf.port,
+            nf_instance_id: None,
+            context_ref,
+            notify_token: String::new(),
+            tmgi: None,
+        };
+        crate::TEST_OAUTH2_CLIENT
+            .scope(oauth2, async {
+                assert_eq!(context_delete(&record).await, ContextDeleteOutcome::Deleted);
+            })
+            .await;
+    }
+
+    /// #1796, AMF -> MB-SMF: when the last gNB holding the session is lost, amfd
+    /// releases the context and sends a token-less ContextStatusNotify with
+    /// `releasedInd` to the `notifyUri` this MB-SMF minted; the MB-SMF's
+    /// OAuth2-required listener admits it on the token and drops its record of
+    /// the context. A forged token is refused at the gate.
+    ///
+    /// REVERT-VERIFIED: with the callback exemption not installed, the notify is
+    /// refused 401 and the record stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_amfs_status_notify_passes_the_mbsmf_gate_on_its_token_1796() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let ngap = stand_in_ngap();
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr)
+            .with_oauth2_callback_exemptions(crate::oauth2_callback_exemptions());
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(json!({ "keys": [] }));
+        let mbsmf = SbiServer::on_listener(cfg, listener);
+        mbsmf
+            .start(crate::mbsmf_sbi_request_handler)
+            .await
+            .expect("mbsmfd listener");
+        let ctx = crate::mbsmf_self();
+        ctx.read()
+            .unwrap()
+            .set_amf_notify_base(format!("http://127.0.0.1:{}", addr.port()));
+        let tmgi = tmgi_1758([0x03, 0x17, 0x96]);
+        let session = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("session");
+
+        let context_ref = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                oauth2,
+                crate::create_amf_mbs_context(session.id, tmgi, amf, leg()),
+            )
+            .await
+            .expect("created");
+        let records = ctx.read().unwrap().amf_contexts_of(session.id);
+        assert_eq!(records.len(), 1);
+        let token = records[0].notify_token.clone();
+
+        let forged = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port())
+            .post_json(
+                &format!("{AMF_NOTIFY_PREFIX}/forged"),
+                &json!({ "mbsSessionId": {}, "releasedInd": true }),
+            )
+            .await
+            .expect("answered");
+        assert_eq!(forged.status, 401, "a token this MB-SMF never minted");
+
+        ngap.live.lock().unwrap().clear();
+        nextgcore_amfd::context::amf_mcast().broadcast_rescan();
+        eventually("the MB-SMF drops the record the AMF released", || {
+            ctx.read().unwrap().amf_contexts_of(session.id).is_empty()
+        })
+        .await;
+        assert!(!amf_holds(&context_ref), "and the AMF holds no context");
+        assert!(
+            ctx.read().unwrap().amf_notify_session(&token).is_none(),
+            "nor is the token admitted any more"
+        );
+        ctx.read().unwrap().session_remove(session.id);
     }
 }
 
