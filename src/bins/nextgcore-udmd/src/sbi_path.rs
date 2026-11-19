@@ -92,7 +92,7 @@ pub fn build_udm_nf_profile(
     let services: Vec<serde_json::Value> = UDM_ADVERTISED_SERVICES
         .iter()
         .map(|(name, version, _)| {
-            serde_json::json!({
+            let mut service = serde_json::json!({
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{
@@ -103,7 +103,13 @@ pub fn build_udm_nf_profile(
                 "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            })
+            });
+            // #1866: the NRF grants this service's token only to these types
+            // (TS 29.510 Table 6.1.6.2.3-1, both levels must allow).
+            if let Some(types) = crate::consumer_gate::service_allowed_nf_types(name) {
+                service["allowedNfTypes"] = serde_json::json!(types);
+            }
+            service
         })
         .collect();
     nextgcore_sbi::nf_addressing::classify_profile_host(

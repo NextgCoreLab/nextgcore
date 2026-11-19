@@ -10,6 +10,7 @@
 /// sub-handlers below) in-process for strict-peer tests.
 pub mod app;
 pub mod av_algorithm; // #115: which f1-f5* algorithm generates a subscriber's AVs
+pub mod consumer_gate; // #1866 TS 29.503 §5.4: Nudm_UEAU is the AUSF's only
 pub mod context;
 pub mod ee_amf; // #1440 TS 23.502 §4.15.3.2.3 step 3a: AMF-detected EE events subscribed at the AMF
 pub mod event;
