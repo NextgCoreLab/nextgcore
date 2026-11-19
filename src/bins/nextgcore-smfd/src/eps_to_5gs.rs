@@ -1077,7 +1077,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         );
     };
 
-    let sm_context_ref = format!("{}", sess.index);
+    // #1860: unguessable, like every other SM context reference.
+    let sm_context_ref = context::mint_sm_context_ref(sess.index);
     // #894 review m1: serialised with PREPARED, COMPLETED and CANCELLED of the same SM
     // context, and the session re-read under the lock.
     let _procedure = handover_lock(&sm_context_ref).await;
@@ -1233,7 +1234,6 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     // The PDN connection becomes PDU session `psi`, still `epc` until execution completes.
     sess.psi = psi;
     sess.sm_context_ref = Some(sm_context_ref.clone());
-    sess.pdu_session_ref = Some(sm_context_ref.clone());
     sess.sm_context_status_uri = body["smContextStatusUri"].as_str().map(str::to_string);
     sess.full_dnn = sess.session_name.clone();
     sess.handover.eps_to_5gs = true;
@@ -1258,7 +1258,6 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     {
         fresh.psi = sess.psi;
         fresh.sm_context_ref = sess.sm_context_ref.clone();
-        fresh.pdu_session_ref = sess.pdu_session_ref.clone();
         fresh.sm_context_status_uri = sess.sm_context_status_uri.clone();
         fresh.full_dnn = sess.full_dnn.clone();
         fresh.handover = sess.handover.clone();
@@ -1299,6 +1298,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         ambr_ul_bps: sess.session_ambr.uplink,
                         ambr_dl_bps: sess.session_ambr.downlink,
                         sm_context_status_uri: sess.sm_context_status_uri.clone(),
+                        serving_amf: None,
                         fsm,
                         easdf_dns_context_id: None,
                         easdf_reported_eas: Vec::new(),
@@ -2000,7 +2000,6 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
                 }
                 sess.psi = 0;
                 sess.sm_context_ref = None;
-                sess.pdu_session_ref = None;
                 ctx.persist();
             }
             // #1072 round 2 m8: and the 5G count the preparation took is given back,
