@@ -21,8 +21,10 @@ const { sbiProfile } = require('./insecure-dev');
 const REDACTED = '<redacted>';
 // The long-term key, the operator variant and its derived OPc, and common
 // spellings of them (#1983): `ki` (2G/3G), and any name that says it holds a
-// permanent key, an OP(c) key, an encrypted key or a secret.
-const KEY_FIELDS = new Set(['k', 'ki', 'op', 'opc', 'encpermanentkey', 'encopckey']);
+// permanent key, an OP(c) key, an encrypted key or a secret. #2021: and an
+// account's password `hash` and `salt` (passport-local-mongoose's fields).
+const KEY_FIELDS = new Set(['k', 'ki', 'op', 'opc', 'encpermanentkey', 'encopckey', 'hash',
+  'salt']);
 const KEY_WORDS = ['permanentkey', 'opckey', 'opkey', 'enckey', 'secret'];
 
 /** Whether a single field name names key material. */
