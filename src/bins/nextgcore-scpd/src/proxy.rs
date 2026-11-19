@@ -662,6 +662,47 @@ fn upstream_error_response(target: &str, err: &SbiError) -> SbiResponse {
     }
 }
 
+/// Check, at startup, the TLS material the production forwarding client needs
+/// (#1868 review): the CA that verifies producers, and the SCP's own client
+/// certificate and key, without which every mTLS producer refuses the SCP. Each
+/// must be configured and exist, named when it does not, so a missing file is a
+/// startup error rather than a TLS failure on the first forward (as #1795 makes
+/// it for the listener). Dev needs none.
+pub fn check_forward_tls(profile: SbiProfile, tls: &TlsPaths) -> Result<(), String> {
+    if !profile.is_production() {
+        return Ok(());
+    }
+    let required = [
+        ("CA certificate (NEXTGCORE_SBI_TLS_CA)", Some(&tls.ca_cert)),
+        (
+            "client certificate (NEXTGCORE_SBI_TLS_CLIENT_CERT)",
+            tls.client_cert.as_ref(),
+        ),
+        (
+            "client private key (NEXTGCORE_SBI_TLS_CLIENT_KEY)",
+            tls.client_key.as_ref(),
+        ),
+    ];
+    for (label, path) in required {
+        match path {
+            Some(p) if std::path::Path::new(p).is_file() => {}
+            Some(p) => {
+                return Err(format!(
+                    "the SBI profile is production and the SCP's forwarding {label} {p} does \
+                     not exist"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "the SBI profile is production and no SCP forwarding {label} is \
+                     configured, so mTLS producers would refuse every forward"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The 400 for a pinned `http` target under the production profile (#1868).
 ///
 /// TS 33.501 §13.1.0 puts every SBI hop on TLS, and the request names a target
@@ -6664,5 +6705,47 @@ mod tests {
         };
         assert_eq!(scheme_of(production_config()), UriScheme::Https);
         assert_eq!(scheme_of(dev_config()), UriScheme::Http);
+    }
+
+    /// #1868 review: under production a missing forwarding CA, client
+    /// certificate or key is a startup error naming it; all present passes; dev
+    /// needs none.
+    #[test]
+    fn production_refuses_to_start_without_the_forwarding_material_1868() {
+        let dir = std::env::temp_dir().join(format!(
+            "h2-1868-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, "pem").unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let complete = TlsPaths {
+            cert: file("server.crt"),
+            key: file("server.key"),
+            ca_cert: file("ca.crt"),
+            client_cert: Some(file("client.crt")),
+            client_key: Some(file("client.key")),
+        };
+        assert!(check_forward_tls(SbiProfile::Production, &complete).is_ok());
+
+        let mut no_cert = complete.clone();
+        no_cert.client_cert = None;
+        let err = check_forward_tls(SbiProfile::Production, &no_cert).unwrap_err();
+        assert!(err.contains("client certificate"), "{err}");
+
+        let mut missing = complete.clone();
+        missing.client_key = Some(dir.join("absent.key").to_string_lossy().into_owned());
+        let err = check_forward_tls(SbiProfile::Production, &missing).unwrap_err();
+        assert!(err.contains("absent.key"), "{err}");
+
+        assert!(check_forward_tls(SbiProfile::Dev, &no_cert).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

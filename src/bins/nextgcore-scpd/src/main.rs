@@ -298,6 +298,10 @@ async fn main() -> Result<()> {
     // #1868: say how producers are dialled. Under production the forwarding
     // client is https-only with the SCP's own client certificate and the profile
     // CA, and an `http` target is refused rather than dialled.
+    // #1868 review: under production the forwarding material must exist, or
+    // the SCP refuses to start instead of forwarding without a certificate.
+    proxy::check_forward_tls(defaults.sbi_profile, &defaults.forward_tls)
+        .map_err(|e| anyhow::anyhow!(e))?;
     if defaults.sbi_profile.is_production() {
         log::info!(
             "SCP forwarding: production SBI profile, https only; CA={} client \
