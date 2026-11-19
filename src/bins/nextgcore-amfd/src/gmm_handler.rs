@@ -188,12 +188,7 @@ pub fn handle_registration_request(
         amf_ue.redcap_indication = true;
         log::info!("UE indicates RedCap (Reduced Capability) device");
         // Apply reduced AMBR for RedCap UEs
-        if amf_ue.ue_ambr.downlink > 150_000_000 {
-            amf_ue.ue_ambr.downlink = 150_000_000; // Cap at 150 Mbps DL
-        }
-        if amf_ue.ue_ambr.uplink > 50_000_000 {
-            amf_ue.ue_ambr.uplink = 50_000_000; // Cap at 50 Mbps UL
-        }
+        amf_ue.cap_ue_ambr_for_redcap();
     }
 
     // SNPN access authorization (TS 23.501 Rel-17)
