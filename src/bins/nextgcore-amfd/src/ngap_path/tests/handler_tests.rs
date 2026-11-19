@@ -6736,3 +6736,52 @@ async fn an_existing_emergency_session_request_goes_to_its_own_smf_2058() {
         assert_eq!(create["dnn"], emergency_dnn.as_str());
     }
 }
+
+/// **#2071** (R30 on #2066). The #2058 pin is for the emergency session's own PSI: a
+/// type-4 request naming ANOTHER PSI does not inherit it, even with a routing context at
+/// the same SMF, and is selected afresh (TS 24.501 §5.4.5.2.5 a) vii) is about "the PDU
+/// session ID" whose routing context indicates the emergency session; viii) otherwise).
+///
+/// REVERT-VERIFIED: with the PSI guard in `emergency_session_smf` removed, this fails:
+/// the PSI 6 request is pinned to the emergency session's SMF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_type_4_for_another_psi_is_selected_afresh_2071() {
+    let (_owner, owner_port, owner_seen) = create_body_recording_smf_2041().await;
+    let (_selected, selected_port, selected_seen) = create_body_recording_smf_2041().await;
+    let _env = super::SmfEnvGuard::acquire(selected_port).await;
+    let mut server = capturing_ngap_server().await;
+    for (ue, ran, authenticated) in [(7_207_101u64, 271u32, false), (7_207_102, 272, true)] {
+        emergency_registered_ue_2041(&mut server, ue, ran, authenticated);
+        // The emergency PDU session is PSI 5; PSI 6 also has a routing context at the same
+        // SMF, so only the PSI tells them apart.
+        assert!(server.emergency.assign_emergency_pdu_session(ue, 5));
+        for psi in [5u8, 6] {
+            server
+                .sm_context_smfs
+                .insert((ue, psi), ("127.0.0.1".to_string(), owner_port));
+        }
+        let request = [0x2E, 0x06, 0x01, 0xC1, 0xFF, 0xFF];
+        server
+            .handle_uplink_nas_transport(
+                ASSOC,
+                &uplink_nas_transport(ue, ran, &ul_nas_transport_2041(&request, 4, None, None, 0)),
+            )
+            .await
+            .expect("handled");
+        settle_establishments(&mut server).await;
+        server.sbi_offload.settle().await;
+        server.forget_ue(ue);
+    }
+    let selected = selected_seen.lock().expect("seen").clone();
+    assert!(
+        owner_seen.lock().expect("seen").is_empty(),
+        "PSI 6 does not inherit the emergency session's SMF: {:?}",
+        owner_seen.lock().expect("seen")
+    );
+    assert_eq!(selected.len(), 2, "both are selected afresh: {selected:?}");
+    for create in &selected {
+        assert_eq!(create["pduSessionId"], 6);
+        assert_eq!(create["requestType"], "EXISTING_EMERGENCY_PDU_SESSION");
+    }
+}
