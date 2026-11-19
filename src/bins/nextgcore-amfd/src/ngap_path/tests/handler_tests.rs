@@ -6438,3 +6438,233 @@ fn the_ngap_allowed_nssai_falls_back_to_the_emergency_slice_2033() {
         "SST 0 is no slice"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2041: a UE registered for emergency services gets emergency PDU sessions only
+// ---------------------------------------------------------------------------
+
+/// A protected UL NAS TRANSPORT carrying `sm` for PSI `sm[1]`, with Request type
+/// `request_type` and, when given, the S-NSSAI (IEI 0x22) and DNN (IEI 0x25) IEs
+/// (TS 24.501 §8.2.10).
+fn ul_nas_transport_2041(
+    sm: &[u8],
+    request_type: u8,
+    s_nssai_sst: Option<u8>,
+    dnn: Option<&str>,
+    count: u8,
+) -> Vec<u8> {
+    let mut inner = vec![0x7E, 0x00, 0x67, 0x01];
+    inner.extend_from_slice(&(sm.len() as u16).to_be_bytes());
+    inner.extend_from_slice(sm);
+    inner.extend_from_slice(&[0x12, sm[1], 0x80 | request_type]);
+    if let Some(sst) = s_nssai_sst {
+        inner.extend_from_slice(&[0x22, 0x01, sst]);
+    }
+    if let Some(dnn) = dnn {
+        let label = dnn.as_bytes();
+        inner.extend_from_slice(&[0x25, label.len() as u8 + 1, label.len() as u8]);
+        inner.extend_from_slice(label);
+    }
+    ue_protect(&inner, count)
+}
+
+/// A stand-in SMF that records each CreateSMContext body, and answers it.
+async fn create_body_recording_smf_2041() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if !req.header.uri.ends_with("/nsmf-pdusession/v1/sm-contexts") {
+                    return SResp::no_content();
+                }
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                sink.lock().expect("sink").push(body);
+                let body = serde_json::json!({
+                    "smContextRef": "est-2041",
+                    "n1SmMsg": base64::engine::general_purpose::STANDARD
+                        .encode([0x2E, 0x05, 0x01, 0xC2]),
+                    "n2SmInfo": base64::engine::general_purpose::STANDARD
+                        .encode(transfer_for("est-2041")),
+                });
+                SResp::with_status(201).with_body(body.to_string(), "application/json")
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    (server, addr.port(), seen)
+}
+
+/// A UE registered for emergency services: `authenticated` as the AUSF confirmed it,
+/// else unauthenticated (no Allowed NSSAI, TS 23.502 §4.12.2.3).
+fn emergency_registered_ue_2041(server: &mut NgapServer, ue: u64, ran: u32, authenticated: bool) {
+    ue_ready_for_sessions(server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.amf_ue.registration_type = crate::gmm_build::registration_type::EMERGENCY;
+        if authenticated {
+            s.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 2, sd: None }];
+        } else {
+            s.amf_ue.unauthenticated_emergency = true;
+            s.amf_ue.allowed_nssai.clear();
+        }
+    });
+    server.emergency.handle_emergency_registration(ue, false);
+    if authenticated {
+        server.emergency.mark_authenticated(ue);
+    }
+}
+
+/// **#2041.** A UE registered for emergency services, authenticated or not, that asks
+/// for a normal PDU session (Request type "initial request", a normal DNN and
+/// S-NSSAI) gets it sent back before an SMF is selected: a DL NAS TRANSPORT with the
+/// PDU session ID, the 5GSM message that was not forwarded and 5GMM cause #90 (TS
+/// 24.501 §5.4.5.2.5 a) 20), §5.4.5.3.1 case e); TS 23.501 §5.16.4.9a). Asked on the
+/// emergency DNN with no S-NSSAI, an "initial request" is still not an emergency one.
+/// Decoded from the NGAP the AMF sent.
+///
+/// REVERT-VERIFIED: with the emergency-request fence removed, this fails: the SMF is
+/// sent a CreateSMContext and no DL NAS TRANSPORT comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_emergency_registered_ue_gets_a_normal_establishment_sent_back_2041() {
+    let (_smf, port, seen) = create_body_recording_smf_2041().await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let emergency_dnn = server.emergency.emergency_dnn().to_string();
+    let cases = [
+        ((7_204_101u64, 241u32), false, Some(1u8), Some("internet")),
+        ((7_204_102, 242), true, Some(1), Some("internet")),
+        ((7_204_103, 243), false, None, Some(emergency_dnn.as_str())),
+        ((7_204_104, 244), true, None, None),
+    ];
+    for ((ue, ran), authenticated, sst, dnn) in cases {
+        emergency_registered_ue_2041(&mut server, ue, ran, authenticated);
+        let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+        server
+            .handle_uplink_nas_transport(
+                ASSOC,
+                &uplink_nas_transport(ue, ran, &ul_nas_transport_2041(&request, 1, sst, dnn, 0)),
+            )
+            .await
+            .expect("handled");
+        settle_establishments(&mut server).await;
+        server.sbi_offload.settle().await;
+
+        let sent: Vec<Sent> = take_sent_ngap(&mut server)
+            .iter()
+            .map(|(_, p)| decode_sent(p))
+            .collect();
+        let [Sent::DownlinkNas {
+            amf_ue_ngap_id,
+            nas_pdu,
+        }] = sent.as_slice()
+        else {
+            panic!("authenticated={authenticated}: one DL NAS Transport, got {sent:?}");
+        };
+        assert_eq!(*amf_ue_ngap_id, ue);
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+            parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+        else {
+            panic!("a DL NAS TRANSPORT: {nas_pdu:02x?}");
+        };
+        assert_eq!(dl.gmm_cause, Some(90), "5GMM #90 payload was not forwarded");
+        assert_eq!(dl.pdu_session_id, Some(5), "with the PDU session ID");
+        assert_eq!(
+            dl.payload_container.data.to_vec(),
+            request.to_vec(),
+            "and the 5GSM message that was not forwarded"
+        );
+        assert!(
+            !server.pending_establishments.contains_key(&(ue, 5)),
+            "nothing waits for an SMF"
+        );
+        server.forget_ue(ue);
+    }
+    assert!(
+        seen.lock().expect("seen").is_empty(),
+        "no SMF is selected: {:?}",
+        seen.lock().expect("seen")
+    );
+}
+
+/// **#2041.** An "initial emergency request" goes to the SMF on the emergency DNN and
+/// the emergency S-NSSAI of the AMF's emergency configuration data, whatever the UE
+/// named (TS 24.501 §5.4.5.2.5 a) v)), for an unauthenticated UE (no Allowed NSSAI)
+/// and an authenticated one (an Allowed NSSAI of another slice) alike.
+///
+/// REVERT-VERIFIED: with the S-NSSAI taken from the Allowed NSSAI again, this fails:
+/// the unauthenticated UE's create names SST 1 and the authenticated one's SST 2; with
+/// the UE's DNN forwarded again, the create names "internet".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_initial_emergency_request_uses_the_emergency_dnn_and_slice_2041() {
+    let _policy = crate::emergency::emergency_policy_test_guard().await;
+    let (_smf, port, seen) = create_body_recording_smf_2041().await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    struct EmergencySlice(Option<crate::context::SNssai>);
+    impl Drop for EmergencySlice {
+        fn drop(&mut self) {
+            let ctx = crate::context::amf_self();
+            ctx.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .emergency_s_nssai = self.0.take();
+        }
+    }
+    let mut server = capturing_ngap_server().await;
+    let _slice = {
+        let ctx = crate::context::amf_self();
+        let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+        EmergencySlice(guard.emergency_s_nssai.replace(crate::context::SNssai {
+            sst: 4,
+            sd: Some(0x00_20_41),
+        }))
+    };
+    let emergency_dnn = server.emergency.emergency_dnn().to_string();
+    for (ue, ran, authenticated) in [(7_204_111u64, 251u32, false), (7_204_112, 252, true)] {
+        emergency_registered_ue_2041(&mut server, ue, ran, authenticated);
+        let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+        server
+            .handle_uplink_nas_transport(
+                ASSOC,
+                &uplink_nas_transport(
+                    ue,
+                    ran,
+                    &ul_nas_transport_2041(&request, 3, Some(1), Some("internet"), 0),
+                ),
+            )
+            .await
+            .expect("handled");
+        settle_establishments(&mut server).await;
+        server.sbi_offload.settle().await;
+        server.forget_ue(ue);
+    }
+    let creates = seen.lock().expect("seen").clone();
+    assert_eq!(creates.len(), 2, "both are forwarded: {creates:?}");
+    for create in &creates {
+        assert_eq!(create["requestType"], "INITIAL_EMERGENCY_REQUEST");
+        assert_eq!(create["dnn"], emergency_dnn.as_str(), "the emergency DNN");
+        assert_eq!(
+            create["sNssai"]["sst"], 4,
+            "the emergency S-NSSAI: {create}"
+        );
+        assert_eq!(create["sNssai"]["sd"], "002041");
+    }
+}

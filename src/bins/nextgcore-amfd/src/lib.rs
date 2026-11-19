@@ -843,6 +843,20 @@ impl AmfApp {
             }
             ctx.emergency_s_nssai = Some(context::SNssai { sst, sd: n.sd });
             log::info!("Emergency S-NSSAI: sst={sst} sd={:?}", n.sd);
+        } else if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+            // #2041 (the #2037 question): not required. The fallback is this AMF's default
+            // S-NSSAI, the first `plmn_support` one, a slice it serves, and a production AMF
+            // that offers no emergency service should still start. But emergency sessions
+            // and the unauthenticated-emergency NGAP Allowed NSSAI then ride an ordinary
+            // slice, so a production start says so.
+            let fallback = ctx.emergency_s_nssai();
+            log::warn!(
+                "amf.emergency.s_nssai is unset: emergency services use the default S-NSSAI \
+                 sst={} sd={:?} (TS 23.501 §5.16.4.1 Emergency Configuration Data); set it to \
+                 the operator's emergency slice",
+                fallback.sst,
+                fallback.sd
+            );
         }
 
         // Security algorithms
