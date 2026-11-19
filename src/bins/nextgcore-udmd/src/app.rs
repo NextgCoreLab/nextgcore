@@ -5933,7 +5933,8 @@ mod tests {
         // The combined provisioned-data document, keyed as udmd asks for it. This
         // stands in for udrd's own `dataset-names` filtering, which udrd tests.
         store.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/"),
+            // #1934: the combined resource, with no trailing `/`.
+            format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data"),
             serde_json::json!({
                 "amData": {"subscribedUeAmbr": {"uplink": "1 Gbps", "downlink": "1 Gbps"}},
                 "smfSelData": {"subscribedSnssaiInfos": {}},
