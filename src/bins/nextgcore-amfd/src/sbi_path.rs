@@ -4539,15 +4539,24 @@ pub async fn call_nsacf_ue_decrease(
     match client.post_json("/nnsacf-nsac/v1/slices/ues", &body).await {
         Ok(r) if r.is_success() || r.status == 404 => Outcome::Accepted,
         Ok(r) if (r.status == 401 || r.status == 403) && r.is_bearer_refusal() => {
-            log::warn!("[{supi}] NSACF refused the AMF's token for a DECREASE ({})", r.status);
+            log::warn!(
+                "[{supi}] NSACF refused the AMF's token for a DECREASE ({})",
+                r.status
+            );
             Outcome::Failed
         }
         Ok(r) if (400..500).contains(&r.status) => {
-            log::warn!("[{supi}] NSACF refused a DECREASE for SST={snssai_sst}: {}", r.status);
+            log::warn!(
+                "[{supi}] NSACF refused a DECREASE for SST={snssai_sst}: {}",
+                r.status
+            );
             Outcome::Refused
         }
         Ok(r) => {
-            log::warn!("[{supi}] NSACF DECREASE for SST={snssai_sst} answered {}", r.status);
+            log::warn!(
+                "[{supi}] NSACF DECREASE for SST={snssai_sst} answered {}",
+                r.status
+            );
             Outcome::Failed
         }
         Err(e) => {

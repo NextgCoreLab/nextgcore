@@ -43673,7 +43673,11 @@ mod tests {
         let _g = crate::nsac::NSAC_TEST_LOCK.lock().await;
         crate::nsac::clear_for_test();
         crate::context::amf_context_init(64, 1024, 4096);
-        let (srv, port, seen) = nsacf(&[], std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204))).await;
+        let (srv, port, seen) = nsacf(
+            &[],
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204)),
+        )
+        .await;
         let mut ngap = test_ngap_server().await;
         let admit = |supi: &str, sst: u8| crate::nsac::Admission {
             supi: supi.to_string(),

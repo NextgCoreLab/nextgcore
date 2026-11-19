@@ -529,8 +529,8 @@ pub(crate) mod tests {
     /// #1876: a re-registration whose Allowed NSSAI drops an S-NSSAI counts the UE
     /// out of it, and keeps the one still allowed.
     ///
-    /// REVERT-VERIFIED: with `take` given `&[]`-less behaviour (nothing taken on
-    /// success), this fails: no DECREASE for SST 2.
+    /// REVERT-VERIFIED: with `admit_registration` taking nothing back on success,
+    /// this fails: no DECREASE for SST 2.
     #[tokio::test]
     async fn an_snssai_removed_from_the_allowed_nssai_is_counted_out_1876() {
         let _g = NSAC_TEST_LOCK.lock().await;
@@ -538,8 +538,7 @@ pub(crate) mod tests {
         let (srv, port, seen) = nsacf(&[], Arc::new(AtomicU16::new(204))).await;
         let supi = "imsi-001010000018762";
         let admit = |allowed: Vec<SNssai>| async move {
-            admit_registration(supi, "3GPP_ACCESS", &allowed, "127.0.0.1", port, "amf-1876")
-                .await
+            admit_registration(supi, "3GPP_ACCESS", &allowed, "127.0.0.1", port, "amf-1876").await
         };
 
         admit(vec![snssai(1), snssai(2)]).await;
@@ -563,15 +562,25 @@ pub(crate) mod tests {
 
     /// #1876: an INCREASE that degraded open (no NSACF answered) counted nothing,
     /// so nothing is recorded and a deregistration parks nothing.
+    ///
+    /// REVERT-VERIFIED: with every admitted answer recorded (not only `counted`),
+    /// this fails: the degrade-open admission is held, to be counted out of an NSACF
+    /// that never counted it.
     #[tokio::test]
     async fn a_degraded_open_admission_is_not_recorded_1876() {
         let _g = NSAC_TEST_LOCK.lock().await;
         clear_for_test();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let supi = "imsi-001010000018763";
-        let out =
-            admit_registration(supi, "3GPP_ACCESS", &[snssai(1)], "127.0.0.1", 1, "amf-1876")
-                .await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            1,
+            "amf-1876",
+        )
+        .await;
         let held = is_admitted(supi, "3GPP_ACCESS", &snssai(1));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let parked_now = pending_count();
@@ -579,7 +588,10 @@ pub(crate) mod tests {
 
         assert!(out.granted && out.denied.is_none(), "degrade-open admits");
         assert!(!held, "but counted nothing to undo");
-        assert_eq!(parked_now, 0, "and its precautionary DECREASE is not parked");
+        assert_eq!(
+            parked_now, 0,
+            "and its precautionary DECREASE is not parked"
+        );
     }
 
     /// #1876: a DECREASE that fails is parked, retried while the NSACF fails, and
@@ -623,7 +635,10 @@ pub(crate) mod tests {
         assert_eq!(first, Outcome::Failed);
         assert_eq!(parked_after_failure, 2, "both parked");
         assert_eq!(left, 0, "both ended");
-        assert_eq!(sent_for_back, 3, "two failures, then one delivered; none for `back`");
+        assert_eq!(
+            sent_for_back, 3,
+            "two failures, then one delivered; none for `back`"
+        );
         assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
     }
 

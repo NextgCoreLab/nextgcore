@@ -30,8 +30,8 @@ pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
 pub mod ngap_sm;
-pub mod nsac; // #1876: NSAC UE counts out as well as in, with a reconciler
 pub mod nrf_subscription; // #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5)
+pub mod nsac; // #1876: NSAC UE counts out as well as in, with a reconciler
 pub mod nwdaf_mobility; // nextgsim#464: UE Mobility analytics for paging (TS 23.501 §5.4.3.1)
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
