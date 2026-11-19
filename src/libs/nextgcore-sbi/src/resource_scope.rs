@@ -25,7 +25,9 @@
 //! `security` of `QueryAuthSubsData` (GET) and
 //! `ModifyAuthenticationSubscription` (PATCH) on
 //! `/subscription-data/{ueId}/authentication-data/authentication-subscription`
-//! (also TS 29.504 Table 6.1.7-1).
+//! (also TS 29.504 Table 6.1.7-1), and `TS29536_Nnsacf_NSAC.yaml`
+//! `LocalNumberUpdate` on `/slices/local-configs/update` (TS 29.536 Table
+//! 6.1.9-1, #1892).
 
 /// TS 29.505 / TS 29.504 Table 6.1.7-1: read the AuthenticationSubscription
 /// resource (K, OPc/TOPc, SQN).
@@ -36,6 +38,10 @@ pub const NUDR_DR_AUTH_SUBSCRIPTION_READ: &str =
 /// resource.
 pub const NUDR_DR_AUTH_SUBSCRIPTION_MODIFY: &str =
     "nudr-dr:subscription-data:authentication-subscription:modify";
+
+/// TS 29.536 Table 6.1.9-1: "Access (from a primary NSACF) to update the
+/// network slice local configuration" of a distributed NSACF (#1892).
+pub const NNSACF_NSAC_LOCAL_CONFIGS_UPDATE: &str = "nnsacf-nsac:local-configs-update";
 
 /// The resource-level scope `method uri` needs on top of its service-level
 /// scope, or `None` when the service-level scope alone authorizes it.
@@ -52,9 +58,20 @@ pub const NUDR_DR_AUTH_SUBSCRIPTION_MODIFY: &str =
 /// same resource and needs `:modify` too. Every other method on the resource
 /// (and any method spelled in another case) is treated as a modification, so
 /// an unexpected method can never fall through to "no extra scope".
+///
+/// `nnsacf-nsac` `slices/local-configs/update` (TS 29.536 `LocalNumberUpdate`,
+/// POST) needs [`NNSACF_NSAC_LOCAL_CONFIGS_UPDATE`] for every method, so a
+/// method nsacfd answers 405 cannot be the one that slips through either.
 pub fn required_resource_scope(method: &str, uri: &str) -> Option<&'static str> {
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if parts.first() == Some(&"nnsacf-nsac")
+        && parts.get(2) == Some(&"slices")
+        && parts.get(3) == Some(&"local-configs")
+        && parts.get(4) == Some(&"update")
+    {
+        return Some(NNSACF_NSAC_LOCAL_CONFIGS_UPDATE);
+    }
     let is_auth_subscription = parts.first() == Some(&"nudr-dr")
         && parts.get(2) == Some(&"subscription-data")
         && parts.get(4) == Some(&"authentication-data")
@@ -133,6 +150,44 @@ mod tests {
                 Some(NUDR_DR_AUTH_SUBSCRIPTION_READ),
                 "{uri}"
             );
+        }
+    }
+
+    /// #1892: spelled as TS 29.536 Table 6.1.9-1 defines it, and required on
+    /// the local-configs update only, not on the AMF's and SMF's operations.
+    #[test]
+    fn the_nsacf_local_configs_update_needs_its_own_scope_1892() {
+        assert_eq!(
+            NNSACF_NSAC_LOCAL_CONFIGS_UPDATE,
+            "nnsacf-nsac:local-configs-update"
+        );
+        for uri in [
+            "/nnsacf-nsac/v1/slices/local-configs/update",
+            "/nnsacf-nsac/v1/slices/local-configs/update?x=1",
+            "nnsacf-nsac/v1/slices/local-configs/update/",
+        ] {
+            for m in ["POST", "post", "PUT", "GET"] {
+                assert_eq!(
+                    required_resource_scope(m, uri),
+                    Some(NNSACF_NSAC_LOCAL_CONFIGS_UPDATE),
+                    "{m} {uri}"
+                );
+            }
+        }
+        assert_eq!(
+            access_token_scope(
+                "nnsacf-nsac",
+                "POST",
+                "/nnsacf-nsac/v1/slices/local-configs/update"
+            ),
+            "nnsacf-nsac nnsacf-nsac:local-configs-update"
+        );
+        for uri in [
+            "/nnsacf-nsac/v1/slices/ues",
+            "/nnsacf-nsac/v1/slices/pdus",
+            "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+        ] {
+            assert_eq!(required_resource_scope("POST", uri), None, "{uri}");
         }
     }
 
