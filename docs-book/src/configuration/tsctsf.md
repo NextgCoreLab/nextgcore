@@ -126,6 +126,8 @@ From the clap `Args` struct in `src/bins/nextgcore-tsctsf/src/main.rs`:
 
 ## Behavior notes
 
+- **Resources are bound to their creator (#1865, #1937).** Time-sync configurations, ASTI configurations, QoS/TSC sessions and both kinds of subscription record the verified identity of the AF/NEF that created them (`nextgcore_sbi::owner_binding`: client certificate unless it names a relay, else token `sub`; the two must agree). GET, PATCH, PUT and DELETE by anyone else are refused 403 before anything is read or changed. Under the `production` SBI profile an anonymous create is refused.
+
 - **All three services are advertised to the NRF.** The NFProfile lists
   `ntsctsf-time-synchronization`, `ntsctsf-asti` and `ntsctsf-qos-tsctsf`, so the
   profile and the router change together — advertising one while serving three makes

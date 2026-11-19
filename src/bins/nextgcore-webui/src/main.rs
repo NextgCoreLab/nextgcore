@@ -2087,6 +2087,27 @@ mod shipped_artefact_guards {
     /// (TS 33.117 §4.2.5.1). `httpOnly` used to sit on the session options object
     /// rather than inside `cookie`, where express-session reads it, so it had no
     /// effect; `secure` was absent entirely.
+    /// #1970: mongoose query logging writes subscriber documents (K, OPc) to the
+    /// log. index.js must decide it through lib/mongoose-debug, which is off
+    /// under the production SBI profile and redacts key fields (pinned by
+    /// webui/server/lib/mongoose-debug.check.js, run in CI), never turn it on
+    /// directly.
+    ///
+    /// REVERT-VERIFIED: with index.js back to `mongoose.set('debug', true)`,
+    /// this fails.
+    #[test]
+    fn mongoose_debug_goes_through_the_redacting_helper_1970() {
+        let server = read_code("webui/server/index.js");
+        assert!(
+            !server.contains("mongoose.set('debug', true)"),
+            "index.js must not enable raw mongoose debug logging"
+        );
+        assert!(
+            server.contains("require('./lib/mongoose-debug').mongooseDebug(process.env)"),
+            "index.js must decide mongoose debug through lib/mongoose-debug"
+        );
+    }
+
     #[test]
     fn the_session_cookie_is_hardened() {
         let server = read_code("webui/server/index.js");

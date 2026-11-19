@@ -48,8 +48,12 @@ co(function* () {
   yield app.prepare();
 
   mongoose.Promise = global.Promise;
-  if (dev) {
-    mongoose.set('debug', true);
+  // #1970: query logging only under the dev SBI profile, and through a logger
+  // that redacts K / OPc / OP. It used to follow NODE_ENV alone, which logged
+  // key material from any non-production NODE_ENV.
+  const mongooseDebug = require('./lib/mongoose-debug').mongooseDebug(process.env);
+  if (mongooseDebug) {
+    mongoose.set('debug', mongooseDebug);
   }
   const db = yield mongoose.connect(process.env.DB_URI, {
     useNewUrlParser: true,
