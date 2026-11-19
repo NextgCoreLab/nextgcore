@@ -1910,25 +1910,32 @@ fn parse_connect_target(uri: &str) -> SbiResult<ConnectTarget> {
                     .ok_or_else(|| invalid("has an invalid port"))?,
             )?,
         };
-        (v6.to_string(), port)
+        (canonical_v6(v6), port)
     } else {
-        match authority.rsplit_once(':') {
+        let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) => (h.to_string(), parse_port(p)?),
             None => (authority.to_string(), default_port),
+        };
+        // #1932: an IPv6 literal in an authority is bracketed (RFC 3986
+        // §3.2.2). Unbracketed, `fd00::1:8080` would split into host `fd00::1`
+        // and port 8080 -- or `fd00::1` alone into host `fd00:` -- so a colon
+        // left in the host is refused, never guessed at.
+        if host.is_empty() || host.contains(':') {
+            return Err(invalid(
+                "has no usable host (an IPv6 literal must be bracketed)",
+            ));
         }
+        (canonical_host(&host), port)
     };
-    let is_v6 = host.parse::<std::net::Ipv6Addr>().is_ok();
-    if host.is_empty() || (host.contains(':') && !is_v6) {
-        return Err(invalid("has no usable host"));
-    }
-    let host = if is_v6 { host } else { canonical_host(&host) };
     Ok(ConnectTarget { scheme, host, port })
 }
 
 /// A host as policies compare it (#1915): lowercase, no trailing root dot, no
 /// IPv6 brackets, and an IPv4 literal in any inet_aton form (`127.1`,
 /// `0x7f.1`, `017700000001`, `2130706433`) rewritten dotted-quad, because the
-/// resolver dials all of those as the same address.
+/// resolver dials all of those as the same address. #1932: so is an
+/// IPv4-mapped IPv6 address (`::ffff:127.0.0.1`, RFC 4291 §2.5.5.2), which is
+/// unmapped to its IPv4 address.
 fn canonical_host(host: &str) -> String {
     let host = host
         .trim_start_matches('[')
@@ -1936,11 +1943,23 @@ fn canonical_host(host: &str) -> String {
         .trim_end_matches('.')
         .to_ascii_lowercase();
     if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
-        return v6.to_string();
+        return canonical_v6(v6);
     }
     match inet_aton(&host) {
         Some(v4) => v4.to_string(),
         None => host,
+    }
+}
+
+/// An IPv6 address as policies compare it (#1932): an IPv4-mapped address
+/// (`::ffff:a.b.c.d`) is its IPv4 address, since a dual-stack socket dials it as
+/// that; any other address in its canonical RFC 5952 text. `to_ipv4_mapped`,
+/// not `to_ipv4`: the latter also reads IPv4-compatible addresses, so `::1`
+/// (loopback) would become `0.0.0.1`.
+fn canonical_v6(v6: std::net::Ipv6Addr) -> String {
+    match v6.to_ipv4_mapped() {
+        Some(v4) => v4.to_string(),
+        None => v6.to_string(),
     }
 }
 
@@ -4793,5 +4812,48 @@ mod tests {
             "not an IPv4 literal"
         );
         assert_eq!(canonical_host("[FD00::1]"), "fd00::1");
+    }
+
+    /// **#1932.** An IPv4-mapped IPv6 address is unmapped before any policy sees
+    /// it, so `[::ffff:127.0.0.1]` is `127.0.0.1` to an allow- or deny-list, and
+    /// an unbracketed IPv6 literal in the authority is refused, never split into
+    /// a host and a port.
+    ///
+    /// REVERT-VERIFIED: with `canonical_v6` returning `v6.to_string()`, the
+    /// mapped assertions fail; with the unbracketed-colon refusal removed,
+    /// `http://fd00::1:8080/x` parses to host `fd00::1` and the refusal
+    /// assertions fail.
+    #[test]
+    fn redirect_targets_unmap_ipv4_and_refuse_unbracketed_ipv6_1932() {
+        let t = |u: &str| parse_connect_target(u).map(|t| (t.host, t.port));
+        assert_eq!(
+            t("http://[::ffff:127.0.0.1]:8080/x").unwrap(),
+            ("127.0.0.1".to_string(), 8080)
+        );
+        assert_eq!(
+            t("https://[::FFFF:7f00:1]/x").unwrap(),
+            ("127.0.0.1".to_string(), 443),
+            "the hex spelling is the same address"
+        );
+        assert_eq!(canonical_host("[::ffff:10.0.0.1]"), "10.0.0.1");
+        assert_eq!(canonical_host("::ffff:10.0.0.1"), "10.0.0.1");
+        // Not mapped: kept as IPv6, loopback included.
+        assert_eq!(t("http://[::1]/x").unwrap(), ("::1".to_string(), 80));
+        assert_eq!(canonical_host("::1"), "::1");
+        assert_eq!(
+            t("http://[fd00::1]:9/").unwrap(),
+            ("fd00::1".to_string(), 9)
+        );
+        // Unbracketed IPv6 in the authority: refused.
+        for bad in [
+            "http://fd00::1:8080/x",
+            "http://fd00::1/x",
+            "http://::1/x",
+            "http://::ffff:127.0.0.1/x",
+        ] {
+            assert!(t(bad).is_err(), "{bad} must be refused");
+        }
+        // A host:port with one colon still parses.
+        assert_eq!(t("http://udm:7777/").unwrap(), ("udm".to_string(), 7777));
     }
 }
