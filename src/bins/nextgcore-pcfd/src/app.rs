@@ -12847,9 +12847,11 @@ mod tests {
     /// requirement dropped, the guami-less AM update does.
     /// #2035: the new AMF's token relayed by a SEPP is refused, and so is the new
     /// AMF while an AMF of another AMF Set lists the GUAMI too; an AMF of its
-    /// own set listing it is no conflict. REVERT-VERIFIED: without the SEPP
-    /// refusal the SEPP-relayed takeover succeeds; with the one-set check always
-    /// passing, the takeover during the conflict does.
+    /// own set listing it is no conflict. The conflicting AMF is on the second
+    /// discovery page (R30 on #2044). REVERT-VERIFIED: without the SEPP refusal
+    /// the SEPP-relayed takeover succeeds; with the one-set check always
+    /// passing, or with only the first discovery page read, the takeover during
+    /// the conflict does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn a_new_amf_relocating_an_association_takes_it_over_1992() {
@@ -12868,12 +12870,13 @@ mod tests {
         // A stand-in NRF answering every AMF discovery with all of them: NEW_AMF
         // and PEER_AMF of AMF Set 20/001 serve GUAMI 020041, OTHER_AMF (set
         // 20/003) 020099, and SMF is an SMF. #2035: while IMPOSTOR is set, an AMF
-        // of set 20/002 lists 020041 too.
+        // of set 20/002 lists 020041 too, on a second discovery page.
         static IMPOSTOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let nrf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
-        nrf.start(|_req: SbiRequest| async move {
+        nrf.start(|req: SbiRequest| async move {
+            let page = req.http.get_param("page").cloned().unwrap_or_else(|| "1".into());
             let profile = |id: &str, ty: &str, set: &str, amf_id: &str| {
                 serde_json::json!({
                     "nfInstanceId": id, "nfType": ty, "nfStatus": "REGISTERED",
@@ -12882,17 +12885,24 @@ mod tests {
                     ]},
                 })
             };
-            let mut instances = vec![
-                profile(NEW_AMF, "AMF", "001", "020041"),
-                profile(PEER_AMF, "AMF", "001", "020041"),
-                profile(OTHER_AMF, "AMF", "003", "020099"),
-                profile(SMF, "SMF", "001", "020041"),
-            ];
-            if IMPOSTOR.load(std::sync::atomic::Ordering::SeqCst) {
-                instances.push(profile(IMPOSTOR_AMF, "AMF", "002", "020041"));
+            // #2035 (R30 on #2044): the impostor is on page 2, so a PCF that
+            // reads page 1 only would not see it.
+            let impostor = IMPOSTOR.load(std::sync::atomic::Ordering::SeqCst);
+            let mut result = if page == "1" {
+                serde_json::json!({ "nfInstances": [
+                    profile(NEW_AMF, "AMF", "001", "020041"),
+                    profile(PEER_AMF, "AMF", "001", "020041"),
+                    profile(OTHER_AMF, "AMF", "003", "020099"),
+                    profile(SMF, "SMF", "001", "020041"),
+                ]})
+            } else {
+                serde_json::json!({ "nfInstances": [profile(IMPOSTOR_AMF, "AMF", "002", "020041")] })
+            };
+            if impostor && page == "1" {
+                result["nfInstanceListUri"] = serde_json::json!("http://nrf/next?page=2");
             }
             SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({ "nfInstances": instances }))
+                .with_json_body(&result)
                 .unwrap_or_else(|_| SbiResponse::with_status(500))
         })
         .await

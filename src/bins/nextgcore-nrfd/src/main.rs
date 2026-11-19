@@ -913,36 +913,124 @@ fn refuse_unallowed_nf_sets(
     ))
 }
 
-/// #2035: refuse an NFRegister or NFUpdate of an AMF whose `amfInfo.guamiList`
-/// adds a GUAMI another AMF, outside its AMF Set, already lists. A GUAMI
-/// identifies one AMF (TS 23.003 §2.10.1), shared only within an AMF Set; an
-/// AMF listing another's would be believed to serve it (pcfd's AMF-relocation
-/// check, #2013). `backupInfoAmfFailure` / `backupInfoAmfRemoval` are not
-/// checked: there an AMF names the GUAMIs it backs up. 403, nothing stored.
-fn refuse_guami_of_another_set(
+/// #2035 (R30 on #2044): an AMF's `amfInfo.(amfRegionId, amfSetId)`, as the
+/// numbers TS 29.571 `AmfRegionId` (2 hex digits, 8 bits) and `AmfSetId` (3 hex
+/// digits, 10 bits) carry. `None` when either is missing or malformed.
+fn amf_region_and_set(doc: &serde_json::Value) -> Option<(u32, u32)> {
+    let hex = |k: &str, digits: usize, max: u32| {
+        let v = doc.pointer(&format!("/amfInfo/{k}"))?.as_str()?.trim();
+        (v.len() == digits)
+            .then(|| u32::from_str_radix(v, 16).ok())
+            .flatten()
+            .filter(|n| *n <= max)
+    };
+    Some((hex("amfRegionId", 2, 0xff)?, hex("amfSetId", 3, 0x3ff)?))
+}
+
+/// #2035 (R30 on #2044): the AMF Region and AMF Set a GUAMI's AMF ID encodes:
+/// AMF Region ID (8 bits) + AMF Set ID (10 bits) + AMF Pointer (6 bits), six
+/// hex digits (TS 23.003 §2.10.1).
+fn guami_region_and_set(guami: &serde_json::Value) -> Option<(u32, u32)> {
+    let id = guami.get("amfId")?.as_str()?.trim();
+    let n = (id.len() == 6)
+        .then(|| u32::from_str_radix(id, 16).ok())
+        .flatten()?;
+    Some((n >> 16, (n >> 6) & 0x3ff))
+}
+
+/// #2035 (R30 on #2044): the AMF Set NF Set ID (TS 23.003 §28.12) of region
+/// `region`, set `set` in the PLMN of `guami`:
+/// `set<AMF Set ID>.region<AMF Region ID>.amfset.5gc.mnc<MNC>.mcc<MCC>`, the IDs
+/// in the hex `amfSetId` / `amfRegionId` form and the MNC as three digits.
+fn amf_set_nf_set_id(region: u32, set: u32, guami: &serde_json::Value) -> Option<String> {
+    let mcc = guami.pointer("/plmnId/mcc")?.as_str()?.trim();
+    let mnc = guami.pointer("/plmnId/mnc")?.as_str()?.trim();
+    Some(format!(
+        "set{set:03x}.region{region:02x}.amfset.5gc.mnc{mnc:0>3}.mcc{mcc}"
+    ))
+}
+
+/// #2035 (R30 on #2044): an AMF may list only GUAMIs of the AMF Region and Set
+/// it is provisioned for. `amfSetId` and `amfRegionId` are self-declared, so
+/// each is checked:
+/// - the profile names both (TS 29.510 `AmfInfo`: mandatory);
+/// - every `guamiList` entry's AMF ID encodes them (TS 23.003 §2.10.1), so an
+///   AMF cannot list a GUAMI of another region or set;
+/// - the registrant is provisioned for that set: `nrf.nf_set_allowlist` (#1719)
+///   admits the AMF Set's NF Set ID ([`amf_set_nf_set_id`], per GUAMI PLMN) for
+///   this AMF. With no allowlist, under the `production` SBI profile any
+///   `guamiList` is refused (fail closed); under `dev` the encoding is still
+///   checked but the set is believed.
+///
+/// 403, nothing stored. `guamis` are the entries to check (an NFUpdate passes
+/// the ones it adds). `Some` is the refusal.
+fn refuse_unbound_amf_guamis(
     operation: &str,
     nf_instance_id: &str,
     nf_type: &str,
     doc: &serde_json::Value,
-    added: &[&serde_json::Value],
+    guamis: &[&serde_json::Value],
+    profile: nextgcore_sbi::security::SbiProfile,
 ) -> Option<SbiResponse> {
-    if !nf_type.eq_ignore_ascii_case("AMF") || added.is_empty() {
+    if !nf_type.eq_ignore_ascii_case("AMF") || guamis.is_empty() {
         return None;
     }
-    let others = nf_manager().list();
-    let (guami, holder) =
-        nextgcore_nrfd::sbi_path::guami_listed_by_another_set(nf_instance_id, doc, added, &others)?;
-    log::warn!(
-        "{operation} for AMF {nf_instance_id} refused: its guamiList has {guami}, which AMF          {holder} of another AMF Set already lists"
-    );
-    Some(send_error(
-        403,
-        "Forbidden",
-        &format!(
-            "{operation}: AMF {nf_instance_id:?} may not list GUAMI {guami}: another AMF              outside its AMF Set lists it (TS 23.003 §2.10.1)"
-        ),
-        None,
-    ))
+    let refuse = |why: String| {
+        log::warn!("{operation} for AMF {nf_instance_id} refused: {why}");
+        Some(send_error(
+            403,
+            "Forbidden",
+            &format!("{operation}: {why}"),
+            None,
+        ))
+    };
+    let Some((region, set)) = amf_region_and_set(doc) else {
+        return refuse(
+            "a guamiList needs the AMF's amfRegionId and amfSetId (TS 29.510 AmfInfo)".into(),
+        );
+    };
+    for g in guamis {
+        if guami_region_and_set(g) != Some((region, set)) {
+            return refuse(format!(
+                "GUAMI {g} does not encode the AMF's region {region:02x} and set {set:03x} \
+                 (TS 23.003 §2.10.1)"
+            ));
+        }
+    }
+    #[cfg(test)]
+    let test_policy = tests_nf_set_ids_1719::ALLOWLIST
+        .try_with(|allow| NrfPolicy {
+            nf_set_allowlist: allow.clone(),
+            ..NrfPolicy::default()
+        })
+        .ok();
+    #[cfg(not(test))]
+    let test_policy: Option<NrfPolicy> = None;
+    let policy = test_policy.as_ref().unwrap_or_else(|| nrf_policy());
+    let Some(allow) = policy.nf_set_allowlist.as_ref() else {
+        if profile.is_production() {
+            return refuse(
+                "no nrf.nf_set_allowlist binds this AMF to an AMF Set, so under the production \
+                 profile it may list no GUAMI"
+                    .into(),
+            );
+        }
+        return None;
+    };
+    for g in guamis {
+        let Some(set_id) = amf_set_nf_set_id(region, set, g) else {
+            return refuse(format!("GUAMI {g} names no PLMN"));
+        };
+        if !allow
+            .iter()
+            .any(|a| a.admits(&set_id, nf_type, nf_instance_id))
+        {
+            return refuse(format!(
+                "nrf.nf_set_allowlist does not provision it for AMF Set {set_id}"
+            ));
+        }
+    }
+    None
 }
 
 /// The CCA trusted keys one source configures, keyed canonically (#1633).
@@ -2630,13 +2718,14 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
     ) {
         return refused;
     }
-    // #2035: and lists no GUAMI an AMF of another AMF Set lists.
-    if let Some(refused) = refuse_guami_of_another_set(
+    // #2035 (R30 on #2044): only GUAMIs of the AMF Set it is provisioned for.
+    if let Some(refused) = refuse_unbound_amf_guamis(
         "NFRegister",
         nf_instance_id,
         &nf_profile.nf_type,
         &profile,
         &nextgcore_nrfd::sbi_path::guami_list_of(&profile),
+        nextgcore_sbi::security::SbiProfile::resolve(),
     ) {
         return refused;
     }
@@ -3059,8 +3148,8 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     {
         return refused;
     }
-    // #2035: nor add a GUAMI an AMF of another AMF Set lists. As for the sets,
-    // only the GUAMIs it adds (all of them when the patch re-types it, or
+    // #2035: nor add a GUAMI of an AMF Set it is not provisioned for. As for
+    // the sets, only the GUAMIs it adds (all of them when the patch re-types it, or
     // changes its AMF Set), so a heartbeat of a profile restored from before
     // the check is not refused.
     let reset = retyped
@@ -3075,12 +3164,13 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         .into_iter()
         .filter(|g| !held_guamis.contains(g))
         .collect();
-    if let Some(refused) = refuse_guami_of_another_set(
+    if let Some(refused) = refuse_unbound_amf_guamis(
         "NFUpdate",
         nf_instance_id,
         &updated.nf_type,
         &doc,
         &added_guamis,
+        nextgcore_sbi::security::SbiProfile::resolve(),
     ) {
         return refused;
     }
@@ -15146,19 +15236,46 @@ mod nrf_api_tokens_tests_1667 {
 /// the real NFRegister and NFUpdate handlers.
 #[cfg(test)]
 mod tests_guami_uniqueness_2035 {
+    use super::tests_nf_set_ids_1719::ALLOWLIST;
     use super::*;
     use serde_json::json;
+
+    const VICTIM: &str = "20350a0a-0000-4000-8000-00000000000a";
+    const PEER: &str = "20350c0c-0000-4000-8000-00000000000c";
+    const ATTACKER: &str = "20350b0b-0000-4000-8000-00000000000b";
+    const SET1: &str = "set001.region20.amfset.5gc.mnc001.mcc001";
+    const SET2: &str = "set002.region20.amfset.5gc.mnc001.mcc001";
+
+    /// VICTIM and PEER are provisioned for AMF Set 20/001, ATTACKER for 20/002.
+    fn allowlist() -> Option<Vec<NfSetAllowYaml>> {
+        let entry = |set: &str, ids: &[&str]| NfSetAllowYaml {
+            nf_set_id: set.to_string(),
+            nf_types: Some(vec!["AMF".to_string()]),
+            nf_instance_ids: Some(ids.iter().map(|i| i.to_string()).collect()),
+        };
+        Some(vec![entry(SET1, &[VICTIM, PEER]), entry(SET2, &[ATTACKER])])
+    }
+
+    /// The AMF ID of region 0x20, `set`, pointer `ptr` (TS 23.003 §2.10.1).
+    fn amf_id(set: u32, ptr: u32) -> String {
+        format!("{:06x}", (0x20 << 16) | (set << 6) | ptr)
+    }
 
     fn guami(amf_id: &str) -> serde_json::Value {
         json!({ "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": amf_id })
     }
 
-    async fn put_amf(id: &str, set: Option<&str>, guamis: &[&str], backup: &[&str]) -> SbiResponse {
+    async fn put_amf(
+        id: &str,
+        region_set: Option<(&str, &str)>,
+        guamis: &[&str],
+        backup: &[&str],
+    ) -> SbiResponse {
         let mut amf_info = json!({
-            "amfRegionId": "20",
             "guamiList": guamis.iter().map(|g| guami(g)).collect::<Vec<_>>(),
         });
-        if let Some(set) = set {
+        if let Some((region, set)) = region_set {
+            amf_info["amfRegionId"] = json!(region);
             amf_info["amfSetId"] = json!(set);
         }
         if !backup.is_empty() {
@@ -15196,56 +15313,109 @@ mod tests_guami_uniqueness_2035 {
             .unwrap_or_default()
     }
 
-    /// #2035: a GUAMI identifies one AMF (TS 23.003 §2.10.1) and only an AMF Set
-    /// shares it, so an AMF may not register, or patch in, a GUAMI that an AMF
-    /// of another AMF Set (or naming none) already lists: 403, nothing stored.
-    /// An AMF of the same set may list it, an AMF of another set may name it in
-    /// `backupInfoAmfFailure`, and a heartbeat patch of a held profile passes.
+    /// #2035, with R30's three probes on #2044. An AMF lists only GUAMIs of
+    /// the AMF Region and Set `nrf.nf_set_allowlist` provisions it for, and
+    /// whose AMF ID encodes that region and set (TS 23.003 §2.10.1); anything
+    /// else is 403 with nothing stored.
+    /// - P1: an AMF naming the victim's set, for which it is not provisioned,
+    ///   with the victim's GUAMI: refused.
+    /// - P2: an AMF registering the victim's GUAMI first, from its own set,
+    ///   while the victim is away: refused, and the victim then registers it.
+    /// - P3: a GUAMI whose AMF ID encodes another region (`ffffff` in region
+    ///   20, set 3ff): refused.
     ///
-    /// REVERT-VERIFIED: with `refuse_guami_of_another_set` returning `None`, the
-    /// other set's registration is 201; with the patch's added GUAMIs left
-    /// empty, the patch adding the GUAMI is 200.
+    /// An AMF of the same set may list the GUAMI; another may name it in
+    /// `backupInfoAmfFailure` but not patch it into its own `guamiList`; a
+    /// profile with a `guamiList` and no region or set is refused; a heartbeat
+    /// patch passes.
+    ///
+    /// REVERT-VERIFIED: with the allowlist check dropped, P1's attacker is
+    /// 201; with the encoding check dropped, P2's is; with the patch's added
+    /// GUAMIs left empty, the patch adding the GUAMI is 200.
     #[tokio::test]
-    async fn a_guami_is_listed_only_within_one_amf_set_2035() {
-        let a = "20350a0a-0000-4000-8000-00000000000a";
-        let b = "20350b0b-0000-4000-8000-00000000000b";
-        let c = "20350c0c-0000-4000-8000-00000000000c";
-        let d = "20350d0d-0000-4000-8000-00000000000d";
-        let e = "20350e0e-0000-4000-8000-00000000000e";
-        let g = "2035a1";
-        let resp = put_amf(a, Some("001"), &[g], &[]).await;
-        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-        // Another set: refused, nothing stored.
-        let resp = put_amf(b, Some("002"), &[g, "2035b1"], &[]).await;
-        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
-        assert!(nf_manager().get(b).is_none());
-        // No set named: refused too.
-        let resp = put_amf(e, None, &[g], &[]).await;
-        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
-        // The same set (case aside): admitted.
-        let resp = put_amf(c, Some("001"), &[&g.to_ascii_uppercase()], &[]).await;
-        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-        // Another set backing it up: admitted.
-        let resp = put_amf(d, Some("002"), &["2035d1"], &[g]).await;
-        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-        // ...but not patching it into its own guamiList.
-        let resp = patch(
-            d,
-            json!([{ "op": "add", "path": "/amfInfo/guamiList/-", "value": guami(g) }]),
-        )
-        .await;
-        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
-        assert_eq!(listed(d), vec!["2035d1".to_string()]);
-        // A heartbeat of a held profile passes.
-        let resp = patch(
-            a,
-            json!([{ "op": "replace", "path": "/nfStatus", "value": "REGISTERED" }]),
-        )
-        .await;
-        assert!(matches!(resp.status, 200 | 204), "{:?}", resp.http.content);
-        for id in [a, c, d] {
+    async fn an_amf_lists_only_guamis_of_its_provisioned_amf_set_2035() {
+        ALLOWLIST
+            .scope(allowlist(), async {
+                let g = amf_id(1, 1);
+                let g2 = amf_id(1, 2);
+                let own = amf_id(2, 1);
+                // P2: the attacker, from its own set 002, lists the victim's
+                // GUAMI while the victim is away: refused.
+                let resp = put_amf(ATTACKER, Some(("20", "002")), &[&own, &g], &[]).await;
+                assert_eq!(resp.status, 403, "P2: {:?}", resp.http.content);
+                assert!(nf_manager().get(ATTACKER).is_none());
+                // The victim registers it.
+                let resp = put_amf(VICTIM, Some(("20", "001")), &[&g], &[]).await;
+                assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+                // P1: the attacker names the victim's set: it is not
+                // provisioned for it.
+                let resp = put_amf(ATTACKER, Some(("20", "001")), &[&g], &[]).await;
+                assert_eq!(resp.status, 403, "P1: {:?}", resp.http.content);
+                assert!(nf_manager().get(ATTACKER).is_none());
+                // P3: an AMF ID that encodes region ff.
+                let resp = put_amf(ATTACKER, Some(("20", "3ff")), &["ffffff"], &[]).await;
+                assert_eq!(resp.status, 403, "P3: {:?}", resp.http.content);
+                // No region or set: refused.
+                let resp = put_amf(PEER, None, &[&g], &[]).await;
+                assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+                // The same set (case aside): admitted.
+                let upper = g.to_ascii_uppercase();
+                let resp = put_amf(PEER, Some(("20", "001")), &[&upper, &g2], &[]).await;
+                assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+                // The attacker in its own set, backing up the victim: admitted.
+                let resp = put_amf(ATTACKER, Some(("20", "002")), &[&own], &[&g]).await;
+                assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+                // ...but not patching the GUAMI into its own guamiList.
+                let resp = patch(
+                    ATTACKER,
+                    json!([{ "op": "add", "path": "/amfInfo/guamiList/-", "value": guami(&g) }]),
+                )
+                .await;
+                assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+                assert_eq!(listed(ATTACKER), vec![own.clone()]);
+                // A heartbeat of a held profile passes.
+                let resp = patch(
+                    VICTIM,
+                    json!([{ "op": "replace", "path": "/nfStatus", "value": "REGISTERED" }]),
+                )
+                .await;
+                assert!(matches!(resp.status, 200 | 204), "{:?}", resp.http.content);
+            })
+            .await;
+        for id in [VICTIM, PEER, ATTACKER] {
             let _ = nf_manager().deregister(id);
         }
+    }
+
+    /// #2035 (R30 on #2044): with no `nrf.nf_set_allowlist` binding an AMF to
+    /// its set, a `guamiList` is refused under the production profile (fail
+    /// closed); under dev only its encoding is checked.
+    ///
+    /// REVERT-VERIFIED: with the production refusal dropped, the first
+    /// assertion fails; with the encoding check dropped, the last does.
+    #[test]
+    fn with_no_binding_production_refuses_any_guami_list_2035() {
+        use nextgcore_sbi::security::SbiProfile;
+        let doc = json!({ "amfInfo": { "amfRegionId": "20", "amfSetId": "001" } });
+        let g = guami(&amf_id(1, 0));
+        let wrong = guami("ffffff");
+        let check = |g: &serde_json::Value, profile| {
+            refuse_unbound_amf_guamis("NFRegister", VICTIM, "AMF", &doc, &[g], profile)
+        };
+        assert!(
+            nrf_policy().nf_set_allowlist.is_none(),
+            "no process allowlist"
+        );
+        let refused = check(&g, SbiProfile::Production).expect("refused under production");
+        assert_eq!(refused.status, 403);
+        assert!(
+            check(&g, SbiProfile::Dev).is_none(),
+            "dev: the encoding is right"
+        );
+        assert!(
+            check(&wrong, SbiProfile::Dev).is_some(),
+            "dev: a wrong encoding"
+        );
     }
 }
 
