@@ -981,7 +981,7 @@ pub async fn subscribe_at_anlf(
         .ok_or_else(|| format!("the NRF knows no {SERVICE_NAME} at NWDAF {consumer}"))?;
     let body = subscription_body(m, registration_id, reg.model_id, threshold);
     let c = m.client(&host, port);
-    let post = SbiRequest::post(&format!("/{SERVICE_NAME}/v1/subscriptions"))
+    let post = SbiRequest::post(format!("/{SERVICE_NAME}/v1/subscriptions"))
         .with_json_body(&body)
         .map_err(|e| format!("MLModelMonitorSub does not serialise: {e}"))?
         .with_header(
@@ -1350,7 +1350,7 @@ async fn register_locked(
             }
         }
     };
-    let post = SbiRequest::post(&format!("/{SERVICE_NAME}/v1/registrations"))
+    let post = SbiRequest::post(format!("/{SERVICE_NAME}/v1/registrations"))
         .with_json_body(&body)
         .map_err(|e| format!("MLModelMonitorReg does not serialise: {e}"))?
         .with_header(
