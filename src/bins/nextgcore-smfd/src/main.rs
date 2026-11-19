@@ -28775,6 +28775,10 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
+        // #1865: an anonymous create is refused under production (the shared
+        // owner_binding rule), so the ownerless context this test needs is made
+        // under dev; the checks below pass the profile explicitly.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let reference = create_as_1860("imsi-001010000011899", 6, None).await;
         assert_eq!(lookup_policy_binding(&reference).unwrap().serving_amf, None);
         let op = "UpdateSMContext";
