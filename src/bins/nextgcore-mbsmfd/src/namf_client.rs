@@ -1887,6 +1887,200 @@ mod tests {
         assert!(!kept, "an expired delete takes its token");
     }
 
+    /// **#2015** (item 4): a session that re-records a context after its parked
+    /// delete left the pending set (drained by the pass, then expired) found
+    /// nothing to unpark; the expiry's forget must then leave the tokens, which
+    /// are that session's now. The seam lands B's record exactly between the
+    /// expiry and the forget.
+    ///
+    /// REVERT-VERIFIED: with `forget_abandoned` forgetting without the held check
+    /// (`forget_amf_notify_token`), "B keeps its token" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_context_re_recorded_before_the_expiry_forget_keeps_its_token_2015() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        crate::mbsmf_context_init(256);
+        let blank = crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            nf_instance_id: None,
+            context_ref: "expire-2015".to_string(),
+            notify_token: String::new(),
+            tmgi: None,
+        };
+        let (record, ta) = released_record_1985(blank, [0x0f, 0x20, 0x15]);
+        crate::reconcile::park(vec![record.clone()]);
+        crate::reconcile::backdate_for_test(
+            crate::reconcile::MAX_AGE + std::time::Duration::from_secs(1),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        *crate::reconcile::BEFORE_FORGET_SEAM.lock().unwrap() = Some(Box::new(move || {
+            // B's create is answered with the same context (amfd keeps A's
+            // notifyUri), and B records it.
+            let ctx = crate::mbsmf_self();
+            let b = ctx
+                .read()
+                .unwrap()
+                .session_add(
+                    tmgi_1758([0x0f, 0x20, 0x16]),
+                    crate::MbsSessionType::Broadcast,
+                )
+                .expect("B");
+            let tb = ctx
+                .read()
+                .unwrap()
+                .mint_amf_notify_token(b.id)
+                .expect("B's token");
+            let mine = crate::context::AmfMbsContext {
+                notify_token: tb.clone(),
+                ..record
+            };
+            assert!(ctx.read().unwrap().record_amf_context(b.id, mine));
+            tx.send((b.id, tb)).unwrap();
+        }));
+        assert_eq!(crate::reconcile::reconcile_once().await, 0);
+        let fired = rx.try_recv();
+        crate::reconcile::BEFORE_FORGET_SEAM.lock().unwrap().take();
+        let (b, tb) = fired.expect("the seam ran between the expiry and the forget");
+        let ctx = crate::mbsmf_self();
+        let (on_a, on_b) = {
+            let g = ctx.read().unwrap();
+            (g.amf_notify_session(&ta), g.amf_notify_session(&tb))
+        };
+        ctx.read().unwrap().take_amf_contexts(b);
+        ctx.read().unwrap().session_remove(b);
+        crate::reconcile::clear_for_test();
+        assert_eq!(on_b, Some(b), "B keeps its token");
+        assert_eq!(on_a, Some(b), "and A's, on which amfd notifies B");
+    }
+
+    /// **#2015** (item 4), both peers through amfd's real handler: A's delete is
+    /// parked and expires; between the expiry and its forget (the seam), B's
+    /// create is answered by amfd with A's context, which amfd keeps notifying
+    /// on A's token. The expiry's forget leaves that token, so amfd's
+    /// `releasedInd` on it reaches B and ends B's record.
+    ///
+    /// REVERT-VERIFIED: with `forget_abandoned` forgetting without the held check,
+    /// "A's token is B's" fails (amfd's notify on it would then be answered 404).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expiry_racing_a_reuse_leaves_b_notified_by_amfd_2015() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let ngap = stand_in_ngap();
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr)
+            .with_oauth2_callback_exemptions(crate::oauth2_callback_exemptions());
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(json!({ "keys": [] }));
+        let mbsmf = SbiServer::on_listener(cfg, listener);
+        mbsmf
+            .start(crate::mbsmf_sbi_request_handler)
+            .await
+            .expect("mbsmfd listener");
+        let ctx = crate::mbsmf_self();
+        ctx.read()
+            .unwrap()
+            .set_amf_notify_base(format!("http://127.0.0.1:{}", addr.port()));
+        let tmgi = tmgi_1758([0x11, 0x20, 0x15]);
+
+        let a = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("A");
+        let a_ref = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                oauth2.clone(),
+                crate::create_amf_mbs_context(a.id, tmgi.clone(), amf.clone(), leg()),
+            )
+            .await
+            .expect("A's context");
+        ctx.read().unwrap().session_remove(a.id);
+        let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+        let a_token = a_contexts[0].notify_token.clone();
+        // Parked directly (as the retry task leaves it), then aged past MAX_AGE.
+        crate::reconcile::park(a_contexts);
+        crate::reconcile::backdate_for_test(
+            crate::reconcile::MAX_AGE + std::time::Duration::from_secs(1),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rt = tokio::runtime::Handle::current();
+        let (b_tmgi, b_amf) = (tmgi.clone(), amf.clone());
+        *crate::reconcile::BEFORE_FORGET_SEAM.lock().unwrap() = Some(Box::new(move || {
+            let ctx = crate::mbsmf_self();
+            let b = ctx
+                .read()
+                .unwrap()
+                .session_add(b_tmgi.clone(), crate::MbsSessionType::Broadcast)
+                .expect("B");
+            let b_ref = tokio::task::block_in_place(|| {
+                rt.block_on(crate::TEST_OAUTH2_CLIENT.scope(
+                    oauth2,
+                    crate::create_amf_mbs_context(b.id, b_tmgi, b_amf, leg()),
+                ))
+            });
+            tx.send((b.id, b_ref)).unwrap();
+        }));
+        assert_eq!(crate::reconcile::reconcile_once().await, 0, "expired");
+        crate::reconcile::BEFORE_FORGET_SEAM.lock().unwrap().take();
+        let (b, b_ref) = rx.try_recv().expect("the seam ran");
+        assert_eq!(
+            b_ref.as_ref(),
+            Some(&a_ref),
+            "amfd handed B the context A held"
+        );
+        assert_eq!(
+            ctx.read().unwrap().amf_notify_session(&a_token),
+            Some(b),
+            "A's token is B's"
+        );
+
+        ngap.live.lock().unwrap().clear();
+        nextgcore_amfd::context::amf_mcast().broadcast_rescan();
+        eventually("B is notified on A's token", || {
+            ctx.read().unwrap().amf_contexts_of(b).is_empty()
+        })
+        .await;
+        assert!(!amf_holds(&a_ref));
+        assert!(!admitted(&a_token), "releasedInd ends the context's tokens");
+        ctx.read().unwrap().session_remove(b);
+        crate::reconcile::clear_for_test();
+    }
+
+    /// **#2015**: the AMF's 204 marks the context released (only its grace is
+    /// left), which is what lets the token cap reclaim it; a delete that has not
+    /// been answered leaves it unmarked.
+    ///
+    /// REVERT-VERIFIED: with the `mark_amf_context_released` call removed from
+    /// `retire_amf_notify_token`, "a 204 marks it released" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_204_marks_the_context_released_for_the_cap_2015() {
+        crate::mbsmf_context_init(256);
+        let blank = crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            nf_instance_id: None,
+            context_ref: "released-2015".to_string(),
+            notify_token: String::new(),
+            tmgi: None,
+        };
+        let (record, token) = released_record_1985(blank, [0x10, 0x20, 0x15]);
+        let released = |t: &str| {
+            crate::mbsmf_self()
+                .read()
+                .unwrap()
+                .amf_notify_token_released(t)
+        };
+        assert!(!released(&token), "pending: not released");
+        crate::retire_amf_notify_token(&record, ContextDeleteOutcome::Deleted);
+        assert!(released(&token), "a 204 marks it released");
+        assert!(admitted(&token), "still admitted through the grace");
+    }
+
     /// **#1985** (cancellation): a reconcile pass aborted while its delete is in
     /// flight re-parks that record, so its context's token still has a path to its
     /// end (the next pass) rather than being orphaned.
