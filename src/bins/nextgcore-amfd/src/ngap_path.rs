@@ -1787,6 +1787,10 @@ struct PendingEstablishment {
     /// establishment and the same on every attempt; recorded on the session once
     /// the SMF created it.
     status_nonce: String,
+    /// #2058: the SMF every attempt goes to, instead of a fresh selection: that of the
+    /// emergency PDU session's routing context, for an "existing emergency PDU session"
+    /// (TS 24.501 §5.4.5.2.5 a) vii)). `None` selects as usual.
+    smf: Option<(String, u16)>,
 }
 
 /// #774 review M1: the earlier registration's sessions are being released at
@@ -11237,6 +11241,7 @@ impl NgapServer {
                     origination_timestamp: origination,
                     request_type: self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied(),
                     status_nonce: crate::sbi_path::new_callback_token(),
+                    smf: self.emergency_session_smf(amf_ue_ngap_id, psi, request_type),
                 };
                 self.spawn_establishment_attempt(amf_ue_ngap_id, &pending, &state);
                 self.pending_establishments
@@ -12639,6 +12644,14 @@ impl NgapServer {
                     )
                 },
             );
+        // #2058: a retry goes to the same pinned SMF, if the establishment has one.
+        let pinned_smf = self.pending_establishments.get(&key).map_or_else(
+            || {
+                let request_type = self.ul_request_types.get(&key).copied();
+                self.emergency_session_smf(amf_ue_ngap_id, psi, request_type)
+            },
+            |p| p.smf.clone(),
+        );
         let full = !self.pending_establishments.contains_key(&key)
             && self.pending_establishments.len() >= MAX_PENDING_ESTABLISHMENTS;
         if full || now.duration_since(first_failure) >= ESTABLISHMENT_RETRY_WINDOW {
@@ -12679,9 +12692,35 @@ impl NgapServer {
                 origination_timestamp,
                 request_type,
                 status_nonce,
+                smf: pinned_smf,
             },
         );
         Ok(())
+    }
+
+    /// #2058, TS 24.501 §5.4.5.2.5 a) vii): for an "existing emergency PDU session" whose
+    /// PSI has a routing context marked emergency (the UE's emergency context names the
+    /// PSI as its emergency PDU session), the SMF of that routing context. The AMF sends
+    /// the request there, rather than selecting one afresh, which could land the
+    /// session's transfer on an SMF that does not hold it. `None` otherwise: viii) (no
+    /// routing context) selects an SMF, on the emergency DNN.
+    fn emergency_session_smf(
+        &self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        request_type: Option<u8>,
+    ) -> Option<(String, u16)> {
+        if request_type != Some(REQUEST_TYPE_EXISTING_EMERGENCY_PDU_SESSION) {
+            return None;
+        }
+        let emergency_psi = self
+            .emergency
+            .emergency_context(amf_ue_ngap_id)
+            .and_then(|c| c.pdu_session_id);
+        if emergency_psi != Some(psi) {
+            return None;
+        }
+        self.sm_context_smfs.get(&(amf_ue_ngap_id, psi)).cloned()
     }
 
     /// The routing-failure answer (#796): a DL NAS TRANSPORT carrying the UE's own
@@ -12849,6 +12888,7 @@ impl NgapServer {
         let sm_pdu = p.sm_pdu.clone();
         let dnn = p.dnn_override.clone();
         let generation = p.generation;
+        let pinned_smf = p.smf.clone();
         log::info!(
             "UE {amf_ue_ngap_id}: CreateSMContext for PDU session establishment PSI={psi}, off \
              the NGAP task (#796, #922)"
@@ -12860,11 +12900,15 @@ impl NgapServer {
         // released rather than lost. The SBI client's own timeout bounds it.
         self.sbi_offload
             .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
-                let smf = crate::sbi_path::resolve_nf_endpoint_async(
-                    crate::sbi_path::SbiServiceType::NsmfPdusession,
-                )
-                .await
-                .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+                // #2058: the emergency session's own SMF, else a selection.
+                let smf = match pinned_smf {
+                    Some(smf) => smf,
+                    None => crate::sbi_path::resolve_nf_endpoint_async(
+                        crate::sbi_path::SbiServiceType::NsmfPdusession,
+                    )
+                    .await
+                    .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777)),
+                };
                 let result = crate::sbi_path::call_smf_create_sm_context(
                     &smf.0,
                     smf.1,
