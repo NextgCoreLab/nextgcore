@@ -3609,6 +3609,8 @@ impl NgapServer {
                         },
                     ));
                     self.terminate_policy_associations(amf_ue_ngap_id);
+                    // #1876: a de-registration an NG Reset aborted is a de-registration.
+                    self.count_out_at_nsacf(amf_ue_ngap_id);
                     self.forget_ue(amf_ue_ngap_id);
                 }
                 Some((true, _)) => {
@@ -6866,48 +6868,21 @@ impl NgapServer {
             )
             .await
             .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
-            let access_type = if state.amf_ue.access_type == 0 || state.amf_ue.access_type == 1 {
-                "3GPP_ACCESS"
-            } else {
-                "NON_3GPP_ACCESS"
-            };
+            let access_type = nsac_access_type(state.amf_ue.access_type);
             let nf_id = amf_instance_id();
-            let mut admission_denied: Option<SNssai> = None;
-            for snssai in state.amf_ue.allowed_nssai.clone() {
-                match crate::sbi_path::call_nsacf_ue_admission(
-                    &nsacf_host,
-                    nsacf_port,
-                    &nf_id,
-                    &supi,
-                    snssai.sst,
-                    snssai.sd,
-                    access_type,
-                    true, // updateFlag: enforce/increase the per-slice UE count
-                )
-                .await
-                {
-                    Ok(res) => {
-                        state.amf_ue.slice_admission_granted = res.admitted;
-                        if !res.admitted {
-                            admission_denied = Some(snssai);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // NSACF unreachable: admission control cannot be
-                        // performed. Per TS 23.501 §5.15.11 the AMF treats the
-                        // slice as not-admitted to avoid exceeding quotas.
-                        log::error!(
-                            "[{supi}] NSACF UE admission query failed for SST={}: {e}",
-                            snssai.sst
-                        );
-                        state.amf_ue.slice_admission_granted = false;
-                        admission_denied = Some(snssai);
-                        break;
-                    }
-                }
-            }
-            if let Some(denied) = admission_denied {
+            // #1876: counted in, and on a denial counted out again; an S-NSSAI the UE
+            // no longer has in its Allowed NSSAI is counted out too.
+            let admitted = crate::nsac::admit_registration(
+                &supi,
+                access_type,
+                &state.amf_ue.allowed_nssai,
+                &nsacf_host,
+                nsacf_port,
+                &nf_id,
+            )
+            .await;
+            state.amf_ue.slice_admission_granted = admitted.granted;
+            if let Some(denied) = admitted.denied {
                 log::warn!(
                     "[{supi}] Slice admission denied by NSACF (SST={}, SD={:?}); rejecting registration",
                     denied.sst,
@@ -10112,6 +10087,21 @@ impl NgapServer {
             .await
     }
 
+    /// #1876: count a deregistering UE out at the NSACF on every S-NSSAI it was
+    /// admitted to on this access (TS 23.502 §4.2.11.2), off the caller's path; a
+    /// DECREASE that fails is parked for the reconciler. Reads the SUPI from
+    /// `ue_auth_state`, so call it before the entry is removed.
+    fn count_out_at_nsacf(&self, amf_ue_ngap_id: u64) {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            return;
+        };
+        let Some(supi) = state.amf_ue.supi.as_deref() else {
+            return;
+        };
+        let access_type = nsac_access_type(state.amf_ue.access_type);
+        crate::nsac::spawn_decreases(crate::nsac::take(supi, access_type, &[]));
+    }
+
     /// Terminate the UE's policy associations at the PCF, for a UE that is being
     /// deregistered.
     ///
@@ -10187,6 +10177,7 @@ impl NgapServer {
     /// for a UE with no N2 connection.
     fn deregistered_ue_cleanup(&mut self, amf_ue_ngap_id: u64) {
         self.terminate_policy_associations(amf_ue_ngap_id);
+        self.count_out_at_nsacf(amf_ue_ngap_id);
         // #1650: a deregistered UE is paged no more. Before the remove below, which
         // drops the SUPI a queued downlink's notification names.
         self.stop_paging_on_deregistration(amf_ue_ngap_id);
@@ -14601,6 +14592,8 @@ impl NgapServer {
                 );
                 self.offload_release_held_sessions(id);
                 self.terminate_policy_associations(id);
+                // #1876: and so is one a release aborted.
+                self.count_out_at_nsacf(id);
                 self.forget_ue(id);
                 return Ok(());
             }
@@ -14959,6 +14952,8 @@ impl NgapServer {
         // policy associations end with it (TS 23.502 §4.16.3.2). Before
         // `forget_ue`, which drops the ids.
         self.terminate_policy_associations(amf_ue_ngap_id);
+        // #1876: and the NSACF counts the UE out.
+        self.count_out_at_nsacf(amf_ue_ngap_id);
         // `forget_ue`, not a bare remove (#356): this path never reaches
         // `release_ue` -- deliberately, since no NAS message can be sent to an
         // unreachable UE -- so it is the third place an emergency context has
@@ -21690,6 +21685,15 @@ impl NgapServer {
 /// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
 /// UDM therefore saw a "new AMF" and sent the restarted AMF a
 /// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
+/// The TS 29.571 AccessType an NSAC request names for an `AmfUe::access_type`.
+fn nsac_access_type(access_type: u8) -> &'static str {
+    if access_type == 0 || access_type == 1 {
+        "3GPP_ACCESS"
+    } else {
+        "NON_3GPP_ACCESS"
+    }
+}
+
 fn amf_instance_id() -> String {
     nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
 }
@@ -43674,6 +43678,58 @@ mod tests {
             "with the NAS state gone too, which is the pre-#361 behaviour this setting \
              preserves for a deployment whose regulation forbids the feature"
         );
+    }
+
+    /// #1876: every deregistration counts the UE out at the NSACF on each S-NSSAI it
+    /// was admitted to, the UE-initiated one (through `deregistered_ue_cleanup`) and
+    /// the implicit one alike (TS 23.502 §4.2.11.2). amfd used to send no DECREASE at
+    /// all, so the slice's maximum number of UEs filled up.
+    ///
+    /// REVERT-VERIFIED: with `count_out_at_nsacf` a no-op, this fails: no DECREASE
+    /// arrives and both admissions stay held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deregistration_counts_the_ue_out_at_the_nsacf_1876() {
+        use crate::nsac::tests::{decreases, nsacf, snssai};
+        let _g = crate::nsac::NSAC_TEST_LOCK.lock().await;
+        crate::nsac::clear_for_test();
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (srv, port, seen) = nsacf(
+            &[],
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204)),
+        )
+        .await;
+        let mut ngap = test_ngap_server().await;
+        let admit = |supi: &str, sst: u8| crate::nsac::Admission {
+            supi: supi.to_string(),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(sst),
+            nf_id: "amf-1876".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        };
+        let (explicit, implicit) = ("imsi-001010000018766", "imsi-001010000018767");
+        for (id, supi) in [(7_187_601u64, explicit), (7_187_602u64, implicit)] {
+            let mut ue = UeNasContext::new(id, 76, 1, false);
+            ue.amf_ue.supi = Some(supi.to_string());
+            ngap.ue_auth_state.insert(id, ue);
+            crate::nsac::record(admit(supi, 1));
+        }
+        crate::nsac::record(admit(explicit, 2));
+
+        ngap.deregistered_ue_cleanup(7_187_601);
+        ngap.implicit_deregistration(7_187_602).await;
+        let mut decreased = decreases(&seen, 3).await;
+        decreased.sort_unstable();
+        let held = [
+            crate::nsac::is_admitted(explicit, "3GPP_ACCESS", &snssai(1)),
+            crate::nsac::is_admitted(explicit, "3GPP_ACCESS", &snssai(2)),
+            crate::nsac::is_admitted(implicit, "3GPP_ACCESS", &snssai(1)),
+        ];
+        crate::nsac::clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(decreased, vec![1, 1, 2], "one DECREASE per admission");
+        assert_eq!(held, [false; 3], "and none is held");
     }
 
     /// **#361:** `complete_registration` for an UNAUTHENTICATED emergency UE makes NONE of the

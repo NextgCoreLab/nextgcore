@@ -20,6 +20,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use nextgcore_sbi::message::{SbiRequest as HttpRequest, SbiResponse as HttpResponse};
+use nextgcore_sbi::security::{SbiProfile, TlsPaths};
 use nextgcore_sbi::server::{send_error, SbiServer, SbiServerConfig};
 
 use crate::context::{sepp_self, PlmnId, SecurityCapability, SeppNode};
@@ -871,12 +872,322 @@ async fn forward_and_protect_response(
     }
 }
 
+// ============================================================================
+// N32-f target policy (#1870)
+// ============================================================================
+
+/// Where the receiving SEPP may forward a reconstructed N32-f request, and how
+/// (#1870, TS 33.501 §13.1.0 / §13.2, TS 29.573 §6.2).
+///
+/// The target apiRoot arrives from the PEER SEPP (in `3gpp-Sbi-Target-apiRoot`
+/// or the request URL), so without a policy the SEPP dials whatever a foreign
+/// network names: a server-side request forgery into the home PLMN, and a
+/// cleartext copy of every header, the consumer's access token included.
+///
+/// Under [`SbiProfile::Production`] the target must be `https` and inside this
+/// PLMN: a host under one of `home_domains` (the TS 23.003 §28.2 home network
+/// domains of the serving PLMNs, `5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`) or an
+/// operator entry in `allowed_targets`. It is dialled with the profile CA and
+/// this SEPP's SBI client certificate ([`TlsPaths`]), as every NF dials a peer.
+/// Under [`SbiProfile::Dev`] any `http`/`https` target is dialled, as before.
+#[derive(Debug, Clone)]
+pub struct N32fForwardPolicy {
+    /// The SBI security profile the forwarding follows.
+    pub profile: SbiProfile,
+    /// Home network domains a target host may sit under (lowercase, no dots at
+    /// the ends). See [`home_network_domain`].
+    pub home_domains: Vec<String>,
+    /// Operator-declared targets inside this PLMN: `host`, `host:port`
+    /// (`[v6]:port` for IPv6), or `.suffix` for every host under a domain.
+    pub allowed_targets: Vec<String>,
+    /// The TLS material for the SEPP-to-NF hop under production.
+    pub tls: TlsPaths,
+    /// The SBI ports a home-domain host, a bare-host entry or a `.suffix` entry
+    /// is admitted on (#1870 review: not every port of a home host). A
+    /// `host:port` entry names its own port. Default `[443]`, the https default
+    /// port an apiRoot without a port uses (TS 29.501 §4.4.1).
+    pub allowed_ports: Vec<u16>,
+}
+
+/// Default [`N32fForwardPolicy::allowed_ports`].
+pub const DEFAULT_N32F_TARGET_PORTS: &[u16] = &[443];
+
+impl N32fForwardPolicy {
+    /// The policy for `profile` with this process's TLS paths and no targets
+    /// beyond `home_domains`.
+    pub fn new(
+        profile: SbiProfile,
+        home_domains: Vec<String>,
+        allowed_targets: Vec<String>,
+    ) -> Self {
+        Self {
+            profile,
+            home_domains: home_domains
+                .into_iter()
+                .map(|d| d.trim_matches('.').to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect(),
+            allowed_targets: allowed_targets
+                .into_iter()
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            tls: TlsPaths::from_env(),
+            allowed_ports: DEFAULT_N32F_TARGET_PORTS.to_vec(),
+        }
+    }
+
+    /// The same policy admitting home and bare/suffix targets on `ports`
+    /// instead of [`DEFAULT_N32F_TARGET_PORTS`]. An empty list keeps the default.
+    pub fn with_allowed_ports(mut self, ports: Vec<u16>) -> Self {
+        if !ports.is_empty() {
+            self.allowed_ports = ports;
+        }
+        self
+    }
+
+    /// Under production, the TLS files the SEPP-to-NF hop needs must exist at
+    /// startup (#1870 review), named when one does not, rather than failing on
+    /// the first forward. Dev needs none.
+    pub fn check_files(&self) -> Result<(), String> {
+        if !self.profile.is_production() {
+            return Ok(());
+        }
+        check_tls_files(
+            "N32-f forwarding",
+            &[
+                ("CA (NEXTGCORE_SBI_TLS_CA)", Some(&self.tls.ca_cert)),
+                (
+                    "client certificate (NEXTGCORE_SBI_TLS_CLIENT_CERT)",
+                    self.tls.client_cert.as_ref(),
+                ),
+                (
+                    "client key (NEXTGCORE_SBI_TLS_CLIENT_KEY)",
+                    self.tls.client_key.as_ref(),
+                ),
+            ],
+        )
+    }
+
+    /// Whether `host:port` is a target this PLMN owns. Production only; dev
+    /// admits every target.
+    fn admits(&self, host: &str, port: u16) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let under = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+        // #1870 review: only the SBI port(s), not every port of a home host.
+        let sbi_port = self.allowed_ports.contains(&port);
+        if sbi_port && self.home_domains.iter().any(|d| under(d)) {
+            return true;
+        }
+        self.allowed_targets.iter().any(|entry| {
+            if let Some(suffix) = entry.strip_prefix('.') {
+                return sbi_port && under(suffix.trim_end_matches('.'));
+            }
+            match entry.rsplit_once(':') {
+                // `host:port` or `[v6]:port`; a bare IPv6 literal's last group
+                // does not parse as a port unless it is bracketed.
+                Some((h, p)) if (!h.contains(':') || h.ends_with(']')) => match p.parse::<u16>() {
+                    Ok(p) => h == host && p == port,
+                    Err(_) => sbi_port && *entry == host,
+                },
+                _ => sbi_port && *entry == host,
+            }
+        })
+    }
+
+    /// Check a peer-supplied target apiRoot and build the client for it, or say
+    /// why it is refused.
+    fn client_for(&self, api_root: &str) -> Result<nextgcore_sbi::client::SbiClient, String> {
+        if !self.profile.is_production() {
+            // Dev: the target's own scheme and no TLS material, as before. Not
+            // the peer-SEPP material `n32_client` falls back to: that is N32's.
+            return n32_client_with(api_root, None);
+        }
+        let (https, host, port) = parse_api_root(api_root)?;
+        self.check_target(https, &host, port)
+            .map_err(|e| format!("target apiRoot {api_root} {e}"))?;
+        let mut config = nextgcore_sbi::client::SbiClientConfig::new(&host, port)
+            .with_connect_timeout(N32_CONNECT_TIMEOUT)
+            .with_request_timeout(N32_REQUEST_TIMEOUT)
+            .with_https();
+        config.ca_cert = Some(self.tls.ca_cert.clone());
+        config.client_cert = self.tls.client_cert.clone();
+        config.client_key = self.tls.client_key.clone();
+        // #1915 / R26 MAJOR on #1901: a 307/308 (or an OCI alternate) from an
+        // admitted target is re-checked against this same policy before it is
+        // dialled, so an admitted host cannot bounce the roaming request (SUPI,
+        // bearer) out of the PLMN or onto cleartext.
+        let policy = self.clone();
+        Ok(
+            nextgcore_sbi::client::SbiClient::new(config).with_target_policy(std::sync::Arc::new(
+                move |t: &nextgcore_sbi::client::SbiTarget| {
+                    // The client hands an IPv6 host unbracketed; admission and the
+                    // allowlist use the bracketed authority form.
+                    let host = if t.host.parse::<std::net::Ipv6Addr>().is_ok() {
+                        format!("[{}]", t.host)
+                    } else {
+                        t.host.clone()
+                    };
+                    policy.check_target(
+                        t.scheme == nextgcore_sbi::types::UriScheme::Https,
+                        &host,
+                        t.port,
+                    )
+                },
+            )),
+        )
+    }
+
+    /// The production admission rule for one target (#1870), shared by the
+    /// first dial and every redirect or alternate (#1915): `https`, a DNS name or
+    /// an IP literal, and inside this PLMN on an allowed port.
+    fn check_target(&self, https: bool, host: &str, port: u16) -> Result<(), String> {
+        if !https {
+            return Err(
+                "is not https; under the production SBI profile the SEPP forwards \
+                        over TLS only (TS 33.501 §13.1.0)"
+                    .to_string(),
+            );
+        }
+        // Only a DNS name or an IP literal: userinfo, a fragment or any other
+        // character is a way to make the authority mean something other than
+        // the name the allowlist matched.
+        let literal = host.starts_with('[') && host.ends_with(']');
+        let legal = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-';
+        let well_formed = if literal {
+            host[1..host.len() - 1]
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok()
+        } else {
+            !host.is_empty() && host.chars().all(legal)
+        };
+        if !well_formed {
+            return Err("has a malformed host".to_string());
+        }
+        if !self.admits(host, port) {
+            return Err(format!(
+                "is not inside this PLMN (home domains {:?}, allowed targets {:?}, ports {:?}); \
+                 refusing to forward a peer-supplied target",
+                self.home_domains, self.allowed_targets, self.allowed_ports
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Each `(label, path)` must be configured and an existing file (#1870 review).
+fn check_tls_files(what: &str, files: &[(&str, Option<&String>)]) -> Result<(), String> {
+    for (label, path) in files {
+        match path {
+            Some(p) if std::path::Path::new(p.as_str()).is_file() => {}
+            Some(p) => {
+                return Err(format!(
+                    "the SBI profile is production and the {what} {label} {p} does not exist"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "the SBI profile is production and no {what} {label} is configured"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The TS 23.003 §28.2 home network domain of `plmn`:
+/// `5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`, a two-digit MNC padded to three.
+pub fn home_network_domain(plmn: &PlmnId) -> String {
+    format!("5gc.mnc{:03}.mcc{:03}.3gppnetwork.org", plmn.mnc, plmn.mcc)
+}
+
+static N32F_FORWARD_POLICY: std::sync::RwLock<Option<N32fForwardPolicy>> =
+    std::sync::RwLock::new(None);
+
+/// Install the N32-f target policy (called once from `main`).
+pub fn set_n32f_forward_policy(policy: N32fForwardPolicy) {
+    *N32F_FORWARD_POLICY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(policy);
+}
+
+/// The installed policy, or the resolved profile's with the serving PLMNs'
+/// home domains when none was installed. Never "anything goes" by default.
+fn n32f_forward_policy() -> N32fForwardPolicy {
+    if let Some(p) = N32F_FORWARD_POLICY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return p;
+    }
+    let home_domains = sepp_self()
+        .read()
+        .map(|c| c.serving_plmn_ids.iter().map(home_network_domain).collect())
+        .unwrap_or_default();
+    N32fForwardPolicy::new(SbiProfile::resolve(), home_domains, Vec::new())
+}
+
+/// Request headers the receiving SEPP does not copy onto the SEPP-to-NF hop
+/// (#1870): RFC 9110 §7.6.1 hop-by-hop fields, the length the client recomputes,
+/// the N32 hop's own proxy credentials, and the SEPP routing header.
+///
+/// `Authorization` is deliberately NOT here. In roaming the consumer's access
+/// token is minted by the home NRF for the home producer and carried through
+/// both SEPPs to it (TS 33.501 §13.4.1.2), protected on N32-f (§13.2.4.4).
+/// Stripping it would make the producer refuse every roaming request 401.
+fn is_n32f_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+            | "3gpp-sbi-target-apiroot"
+    ) || name.starts_with(':')
+}
+
+/// The headers of `rec` to copy to the target NF: [`is_n32f_hop_header`] is
+/// dropped, and so is every field the request's own `Connection` names
+/// (RFC 9110 §7.6.1).
+fn forwardable_n32f_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let named: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    headers
+        .iter()
+        .filter(|(k, _)| !is_n32f_hop_header(k) && !named.contains(&k.to_ascii_lowercase()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Resolve and reach the target NF for a reconstructed N32-f request, returning
 /// (status, headers, body). Resolution prefers the `3gpp-Sbi-Target-apiRoot`
 /// header, then the absolute URL authority. Unresolvable/unreachable targets
 /// map to a synthesized problem+json response.
 async fn forward_to_target_nf(
     rec: &prins::ReconstructedRequest,
+) -> (u16, Vec<(String, String)>, Option<Vec<u8>>) {
+    forward_to_target_nf_under(rec, &n32f_forward_policy()).await
+}
+
+/// [`forward_to_target_nf`] under an explicit policy (#1870), so a test can
+/// drive the production path without a process-global.
+async fn forward_to_target_nf_under(
+    rec: &prins::ReconstructedRequest,
+    policy: &N32fForwardPolicy,
 ) -> (u16, Vec<(String, String)>, Option<Vec<u8>>) {
     let api_root = rec
         .headers
@@ -888,9 +1199,13 @@ async fn forward_to_target_nf(
     let Some(api_root) = api_root else {
         return problem_response(400, "target NF apiRoot could not be resolved");
     };
-    let client = match n32_client(&api_root, None) {
+    // #1870: a peer-supplied target is checked before anything is dialled.
+    let client = match policy.client_for(&api_root) {
         Ok(c) => c,
-        Err(e) => return problem_response(400, &format!("bad target apiRoot: {e}")),
+        Err(e) => {
+            log::warn!("N32-f: refusing target NF [{api_root}]: {e}");
+            return problem_response(400, &format!("bad target apiRoot: {e}"));
+        }
     };
 
     let path = path_and_query_from_url(&rec.url);
@@ -902,12 +1217,9 @@ async fn forward_to_target_nf(
         "DELETE" => HttpRequest::delete(&path),
         other => return problem_response(405, &format!("unsupported method {other}")),
     };
-    for (k, v) in &rec.headers {
-        // Do not forward the SEPP routing header to the NF.
-        if k.eq_ignore_ascii_case("3gpp-Sbi-Target-apiRoot") {
-            continue;
-        }
-        request.http.set_header(k.clone(), v.clone());
+    // #1870: hop-by-hop fields and the SEPP routing header stay on this hop.
+    for (k, v) in forwardable_n32f_headers(&rec.headers) {
+        request.http.set_header(k, v);
     }
     if let Some(body) = &rec.body {
         if let Ok(s) = String::from_utf8(body.clone()) {
@@ -1005,7 +1317,39 @@ fn parse_api_root(api_root: &str) -> Result<(bool, String, u16), String> {
     Ok((https, host, port))
 }
 
+static N32_CLIENT_TLS: std::sync::RwLock<Option<N32TlsConfig>> = std::sync::RwLock::new(None);
+
+/// Install the TLS material this SEPP presents when it dials a PEER SEPP
+/// (called once from `main` when `--tls` is set). A call site that has no
+/// config of its own, the n32f-error report and the SBI-side forward among
+/// them, then still presents the SEPP's client certificate on an `https` peer
+/// instead of dialling without one (#1870).
+pub fn set_n32_client_tls(tls: Option<N32TlsConfig>) {
+    *N32_CLIENT_TLS.write().unwrap_or_else(|e| e.into_inner()) = tls;
+}
+
+/// A client for the PEER SEPP at `api_root`, with `tls` or, when the caller has
+/// none, the installed [`set_n32_client_tls`] material.
 fn n32_client(
+    api_root: &str,
+    tls: Option<&N32TlsConfig>,
+) -> Result<nextgcore_sbi::client::SbiClient, String> {
+    let installed;
+    let tls = match tls {
+        Some(t) => Some(t),
+        None => {
+            installed = N32_CLIENT_TLS
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            installed.as_ref()
+        }
+    };
+    n32_client_with(api_root, tls)
+}
+
+/// A client for `api_root` presenting exactly `tls` (none when `None`).
+fn n32_client_with(
     api_root: &str,
     tls: Option<&N32TlsConfig>,
 ) -> Result<nextgcore_sbi::client::SbiClient, String> {
@@ -2023,6 +2367,488 @@ mod tests {
         assert!(select_peer_for_target("nf.local.example.com").is_err());
         // A VPLMN with no peer SEPP errors.
         assert!(select_peer_for_target("nrf.5gc.mnc999.mcc999.3gppnetwork.org").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // #1870: a peer-supplied N32-f target is https, in-PLMN, and TLS-dialled
+    // ------------------------------------------------------------------
+
+    const HOME: &str = "5gc.mnc070.mcc999.3gppnetwork.org";
+
+    fn production_policy(allowed: &[&str]) -> N32fForwardPolicy {
+        let mut policy = N32fForwardPolicy::new(
+            SbiProfile::Production,
+            vec![HOME.to_string()],
+            allowed.iter().map(|s| s.to_string()).collect(),
+        );
+        policy.tls = TlsPaths {
+            cert: "/tls/sepp/server.crt".to_string(),
+            key: "/tls/sepp/server.key".to_string(),
+            ca_cert: "/tls/ca/ca.crt".to_string(),
+            client_cert: Some("/tls/sepp/client.crt".to_string()),
+            client_key: Some("/tls/sepp/client.key".to_string()),
+        };
+        policy
+    }
+
+    fn reconstructed(target: &str, headers: &[(&str, &str)]) -> prins::ReconstructedRequest {
+        let mut map: std::collections::HashMap<String, String> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        map.insert("3gpp-Sbi-Target-apiRoot".to_string(), target.to_string());
+        prins::ReconstructedRequest {
+            method: "GET".to_string(),
+            url: "/nudm-sdm/v2/imsi-999700000000001/am-data".to_string(),
+            headers: map,
+            body: None,
+            message_id: String::new(),
+        }
+    }
+
+    /// A loopback listener nobody accepts on: any dial leaves a connection in
+    /// its backlog, so `accept` afterwards says whether one was made.
+    fn bare_listener() -> (std::net::TcpListener, std::net::SocketAddr) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        listener.set_nonblocking(true).unwrap();
+        (listener, addr)
+    }
+
+    fn was_dialled(listener: &std::net::TcpListener) -> bool {
+        !matches!(
+            listener.accept().map(|_| ()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock)
+        )
+    }
+
+    /// #1870: under production an http target is refused 400 and never dialled,
+    /// even when its host is allowlisted.
+    #[tokio::test]
+    async fn production_refuses_an_http_target_without_dialling_it_1870() {
+        let (listener, addr) = bare_listener();
+        let rec = reconstructed(
+            &format!("http://{addr}"),
+            &[("authorization", "Bearer roaming-token")],
+        );
+        let (status, _, body) =
+            forward_to_target_nf_under(&rec, &production_policy(&["127.0.0.1"])).await;
+        assert_eq!(status, 400);
+        let text = String::from_utf8(body.unwrap()).unwrap();
+        assert!(text.contains("not https"), "{text}");
+        assert!(
+            !was_dialled(&listener),
+            "an http target must not be dialled"
+        );
+    }
+
+    /// #1870: under production an https target outside this PLMN, or one whose
+    /// authority hides another host, is refused 400 and never dialled.
+    #[tokio::test]
+    async fn production_refuses_a_target_outside_the_plmn_1870() {
+        let (listener, addr) = bare_listener();
+        let port = addr.port();
+        for target in [
+            format!("https://127.0.0.1:{port}"),
+            format!("https://udm.{HOME}@127.0.0.1:{port}"),
+        ] {
+            let rec = reconstructed(&target, &[]);
+            let (status, _, _) = forward_to_target_nf_under(&rec, &production_policy(&[])).await;
+            assert_eq!(status, 400, "{target} must be refused");
+        }
+        assert!(
+            !was_dialled(&listener),
+            "an out-of-PLMN target must not be dialled"
+        );
+    }
+
+    /// #1870: which hosts the production policy admits.
+    #[test]
+    fn the_production_policy_admits_only_this_plmn_1870() {
+        let p = production_policy(&[
+            "10.0.0.5",
+            "udr.internal:8443",
+            ".core.example",
+            "[fd00::5]:443",
+        ]);
+        assert!(p.admits(&format!("udm.{HOME}"), 443));
+        // #1870 review: a home host, a bare-host entry or a suffix entry only on
+        // the SBI port(s), never on any port.
+        assert!(
+            !p.admits(&format!("udm.{HOME}"), 22),
+            "a home host's non-SBI port"
+        );
+        assert!(
+            !p.admits("10.0.0.5", 6379),
+            "a bare-host entry's non-SBI port"
+        );
+        assert!(
+            !p.admits("ausf.core.example", 8080),
+            "a suffix entry's non-SBI port"
+        );
+        let wider = production_policy(&[]).with_allowed_ports(vec![443, 7777]);
+        assert!(wider.admits(&format!("udm.{HOME}"), 7777));
+        assert!(p.admits(&format!("UDM.{}.", HOME.to_uppercase()), 443));
+        assert!(p.admits("10.0.0.5", 443));
+        assert!(p.admits("udr.internal", 8443));
+        assert!(
+            !p.admits("udr.internal", 8444),
+            "a host:port entry pins the port"
+        );
+        assert!(p.admits("ausf.core.example", 443));
+        assert!(p.admits("[fd00::5]", 443));
+        assert!(!p.admits("[fd00::5]", 444));
+        assert!(
+            !p.admits(&format!("evil{HOME}"), 443),
+            "a suffix matches on a label boundary"
+        );
+        assert!(
+            !p.admits("udm.5gc.mnc071.mcc999.3gppnetwork.org", 443),
+            "another PLMN"
+        );
+        assert!(!p.admits("evilcore.example", 443));
+        assert_eq!(home_network_domain(&PlmnId::new(999, 70, 2)), HOME);
+        // A host that ENDS like a home NF but is not a DNS name is refused
+        // before the suffix match can admit it.
+        let hidden = format!("https://127.0.0.1#.udm.{HOME}:443");
+        assert!(
+            p.client_for(&hidden)
+                .is_err_and(|e| e.contains("malformed")),
+            "{hidden} must be refused as malformed"
+        );
+    }
+
+    /// #1870: an admitted target is dialled over https with the profile CA and
+    /// this SEPP's client certificate; dev keeps the target's scheme and no TLS
+    /// material.
+    #[test]
+    fn production_dials_an_admitted_target_with_mutual_tls_1870() {
+        let client = production_policy(&[])
+            .client_for(&format!("https://udm.{HOME}"))
+            .expect("admitted on the default SBI port");
+        assert!(
+            production_policy(&[])
+                .client_for(&format!("https://udm.{HOME}:8443"))
+                .is_err(),
+            "a home host off the allowed SBI ports is refused"
+        );
+        let config = client.config();
+        assert_eq!(config.scheme, nextgcore_sbi::types::UriScheme::Https);
+        assert_eq!(config.ca_cert.as_deref(), Some("/tls/ca/ca.crt"));
+        assert_eq!(config.client_cert.as_deref(), Some("/tls/sepp/client.crt"));
+        assert_eq!(config.client_key.as_deref(), Some("/tls/sepp/client.key"));
+
+        let dev = N32fForwardPolicy::new(SbiProfile::Dev, Vec::new(), Vec::new())
+            .client_for("http://127.0.0.1:7777")
+            .expect("dev dials anything");
+        assert_eq!(dev.config().scheme, nextgcore_sbi::types::UriScheme::Http);
+        assert_eq!(dev.config().client_cert, None);
+    }
+
+    /// #1870: hop-by-hop fields, the ones `Connection` names, the N32 hop's
+    /// proxy credentials and the routing header stay on this hop; the
+    /// consumer's end-to-end `Authorization` reaches the producer
+    /// (TS 33.501 §13.4.1.2).
+    #[tokio::test]
+    async fn hop_by_hop_headers_stay_on_the_n32_hop_1870() {
+        let (_server, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|req: HttpRequest| async move {
+                let names: Vec<String> = req
+                    .http
+                    .headers
+                    .keys()
+                    .map(|k| k.to_ascii_lowercase())
+                    .collect();
+                HttpResponse::ok()
+                    .with_body(serde_json::json!(names).to_string(), "application/json")
+            })
+            .await;
+        let rec = reconstructed(
+            &format!("http://{addr}"),
+            &[
+                ("authorization", "Bearer roaming-token"),
+                ("connection", "x-hop-secret"),
+                ("x-hop-secret", "n32-only"),
+                ("proxy-authorization", "Basic c2VwcDpzZWNyZXQ="),
+                ("keep-alive", "timeout=5"),
+                ("3gpp-sbi-message-priority", "5"),
+            ],
+        );
+        let dev = N32fForwardPolicy::new(SbiProfile::Dev, Vec::new(), Vec::new());
+        let (status, _, body) = forward_to_target_nf_under(&rec, &dev).await;
+        assert_eq!(status, 200);
+        let names: Vec<String> = serde_json::from_slice(&body.unwrap()).unwrap();
+        for kept in ["authorization", "3gpp-sbi-message-priority"] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "{kept} must reach the NF: {names:?}"
+            );
+        }
+        for dropped in [
+            "connection",
+            "x-hop-secret",
+            "proxy-authorization",
+            "keep-alive",
+            "3gpp-sbi-target-apiroot",
+        ] {
+            assert!(
+                !names.contains(&dropped.to_string()),
+                "{dropped} leaked: {names:?}"
+            );
+        }
+    }
+
+    /// #1870: a peer-SEPP client built with no TLS of its own (the n32f-error
+    /// report, the SBI-side forward) presents the installed N32 client
+    /// certificate on https.
+    #[test]
+    fn a_peer_sepp_call_without_its_own_tls_presents_the_installed_one_1870() {
+        let _g = crate::context::lock_global_test_state();
+        set_n32_client_tls(Some(N32TlsConfig {
+            client_cert: Some("/tls/n32/client.crt".to_string()),
+            client_key: Some("/tls/n32/client.key".to_string()),
+            ca_cert: Some("/tls/n32/ca.crt".to_string()),
+            ..Default::default()
+        }));
+        let client = n32_client("https://sepp.peer.example:443", None).unwrap();
+        let config = client.config().clone();
+        set_n32_client_tls(None);
+        assert_eq!(config.client_cert.as_deref(), Some("/tls/n32/client.crt"));
+        assert_eq!(config.ca_cert.as_deref(), Some("/tls/n32/ca.crt"));
+    }
+
+    /// The installed peer TLS for the two site tests: a client certificate that
+    /// does not exist, so a dial that USES it fails naming it.
+    fn install_missing_peer_cert() -> &'static str {
+        const CERT: &str = "/nonexistent/h2-1870/peer-client.crt";
+        set_n32_client_tls(Some(N32TlsConfig {
+            client_cert: Some(CERT.to_string()),
+            client_key: Some("/nonexistent/h2-1870/peer-client.key".to_string()),
+            ca_cert: Some("/nonexistent/h2-1870/peer-ca.crt".to_string()),
+            ..Default::default()
+        }));
+        CERT
+    }
+
+    /// #1870 / R26 MAJOR 2 on #1881: the N32-f error report to the peer SEPP is
+    /// dialled with the SEPP's own client certificate.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn the_n32f_error_report_presents_the_sepp_certificate_1870() {
+        let _g = crate::context::lock_global_test_state();
+        let cert = install_missing_peer_cert();
+        let (_listener, addr) = bare_listener();
+        let info = N32fErrorInfo {
+            n32f_message_id: "m-1870".to_string(),
+            n32f_error_type: N32fErrorType::IntegrityCheckFailed,
+            failed_modification_list: Vec::new(),
+            error_details_list: Vec::new(),
+            n32f_context_id: None,
+        };
+        let err = send_n32f_error(&format!("https://{addr}"), &info)
+            .await
+            .unwrap_err();
+        set_n32_client_tls(None);
+        assert!(
+            err.contains(cert),
+            "the report must dial with the SEPP certificate: {err}"
+        );
+    }
+
+    /// #1870 / R26 MAJOR 1 on #1881: forwarded roaming traffic (the SBI-side
+    /// forward, which passes no TLS of its own) is dialled with the SEPP's own
+    /// client certificate.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn forwarded_roaming_traffic_presents_the_sepp_certificate_1870() {
+        let _g = crate::context::lock_global_test_state();
+        let cert = install_missing_peer_cert();
+        let (_listener, addr) = bare_listener();
+        let id = tls_peer_with_context("sepp-1870.peer.example", "ctx-1870");
+        {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let mut node = c.node_find(id).unwrap();
+            node.peer_api_root = Some(format!("https://{addr}"));
+            c.node_update(&node);
+        }
+        let err = forward_via_n32f(id, "GET", "/nudm-sdm/v2/x/am-data", &[], None, None)
+            .await
+            .unwrap_err();
+        set_n32_client_tls(None);
+        assert!(
+            err.contains(cert),
+            "the forward must dial with the SEPP certificate: {err}"
+        );
+    }
+
+    /// #1870 review: under production the forwarding TLS files must exist at
+    /// startup, named when one does not; dev needs none. (The peer-SEPP files
+    /// are #1881's `n32_peer_client_tls` check.)
+    #[test]
+    fn production_checks_the_tls_files_at_startup_1870() {
+        let dir = std::env::temp_dir().join(format!(
+            "h2-1870-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, "pem").unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let mut policy = production_policy(&[]);
+        policy.tls.ca_cert = file("ca.crt");
+        policy.tls.client_cert = Some(file("client.crt"));
+        policy.tls.client_key = Some(file("client.key"));
+        assert!(policy.check_files().is_ok());
+        policy.tls.client_key = Some(dir.join("absent.key").to_string_lossy().into_owned());
+        let err = policy.check_files().unwrap_err();
+        assert!(err.contains("absent.key"), "{err}");
+        let mut dev = policy.clone();
+        dev.profile = SbiProfile::Dev;
+        assert!(dev.check_files().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A self-signed `localhost` certificate written into `dir`, as
+    /// `(key_path, cert_path)`; the cert is also the CA to trust it by.
+    fn localhost_pem(dir: &std::path::Path) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("cert");
+        let key_path = dir.join("localhost.key");
+        let cert_path = dir.join("localhost.crt");
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        (
+            key_path.to_string_lossy().into_owned(),
+            cert_path.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// A TLS SbiServer on a free port answering every request with `respond`,
+    /// and a counter of the requests it received.
+    async fn tls_target<F>(
+        pem: &(String, String),
+        respond: F,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    )
+    where
+        F: Fn() -> HttpResponse + Send + Sync + Clone + 'static,
+    {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (key, cert) = pem.clone();
+        let (server, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port_with(
+            |addr| SbiServerConfig::new(addr).with_tls(key, cert),
+            move |_req: HttpRequest| {
+                let respond = respond.clone();
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    respond()
+                }
+            },
+        )
+        .await;
+        (server, addr, hits)
+    }
+
+    /// #1870 / #1915, R26's redirect MAJOR on #1901: an ADMITTED target that
+    /// answers 307 with an off-PLMN Location, or with a cleartext one, does not
+    /// bounce the roaming request (SUPI, bearer) there. Through the real
+    /// `forward_to_target_nf_under` with the production policy, neither host
+    /// sees so much as a TCP connection. The control, a redirect to another
+    /// ADMITTED host, is followed and served, so the zeroes are the policy's.
+    #[tokio::test]
+    async fn a_redirect_from_an_admitted_target_to_off_plmn_is_not_followed_1870() {
+        let dir = std::env::temp_dir().join(format!(
+            "h2-1870-redir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem = localhost_pem(&dir);
+        let (off_plmn, off_addr) = bare_listener();
+        let (cleartext, clear_addr) = bare_listener();
+        let (_final, final_addr, final_hits) =
+            tls_target(&pem, || HttpResponse::with_status(200)).await;
+
+        for (location, followed) in [
+            // Off-PLMN: 127.0.0.1 is no home host and not allowlisted.
+            (
+                format!("https://127.0.0.1:{}/nudm-sdm/v2/x", off_addr.port()),
+                false,
+            ),
+            // Cleartext: http, whatever the host.
+            (
+                format!("http://localhost:{}/nudm-sdm/v2/x", clear_addr.port()),
+                false,
+            ),
+            // Control: another admitted https host.
+            (
+                format!("https://localhost:{}/nudm-sdm/v2/x", final_addr.port()),
+                true,
+            ),
+        ] {
+            let loc = location.clone();
+            let (_admitted, admitted_addr, admitted_hits) = tls_target(&pem, move || {
+                HttpResponse::with_status(307).with_header("Location", loc.clone())
+            })
+            .await;
+            let mut policy = production_policy(&[
+                &format!("localhost:{}", admitted_addr.port()),
+                &format!("localhost:{}", final_addr.port()),
+            ]);
+            policy.tls.ca_cert = pem.1.clone();
+            policy.tls.client_cert = None;
+            policy.tls.client_key = None;
+            let rec = reconstructed(
+                &format!("https://localhost:{}", admitted_addr.port()),
+                &[("authorization", "Bearer roaming-token")],
+            );
+            let before = final_hits.load(std::sync::atomic::Ordering::SeqCst);
+            let (status, _, body) = forward_to_target_nf_under(&rec, &policy).await;
+            let text = body
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            assert_eq!(
+                admitted_hits.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{location}: the admitted host was reached"
+            );
+            if followed {
+                assert_eq!(status, 200, "{location}: followed and served: {text}");
+                assert_eq!(
+                    final_hits.load(std::sync::atomic::Ordering::SeqCst),
+                    before + 1
+                );
+            } else {
+                assert_ne!(status, 200, "{location}: not followed: {text}");
+                assert!(text.contains("refused"), "{location}: refused: {text}");
+            }
+        }
+        assert!(
+            !was_dialled(&off_plmn),
+            "the off-PLMN host must not be dialled"
+        );
+        assert!(
+            !was_dialled(&cleartext),
+            "the cleartext host must not be dialled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
