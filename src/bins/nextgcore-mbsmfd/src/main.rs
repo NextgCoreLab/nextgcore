@@ -1818,6 +1818,51 @@ async fn release_n4mb_transport(session_id: u64) -> bool {
     acknowledged
 }
 
+/// #2060: a ContextUpdate names its consumer in `nfcInstanceId`; a Start
+/// registers it and a Terminate deregisters it (the last one releases the
+/// shared N4mb transport, #295). That must be the calling NF itself, or any NF
+/// could tear down another SMF's multicast leg. The caller is its verified NF
+/// instance ID (`owner_binding::verified_consumer_id`: the client certificate's
+/// when direct, with or without NFTypes; the verified token `sub` behind an
+/// SCP or SEPP). A mismatch, or conflicting identities, is 403 before anything
+/// changes. A caller with no verified identity is refused under the production
+/// profile and, as for every `owner_binding` resource, admitted under dev.
+/// `Some` is the refusal.
+fn refuse_foreign_nfc_instance(
+    request: &SbiRequest,
+    nfc_instance_id: &str,
+    terminate: bool,
+) -> Option<SbiResponse> {
+    let operation = if terminate {
+        "ContextUpdate Terminate"
+    } else {
+        "ContextUpdate"
+    };
+    let forbidden = |detail: String| {
+        Some(nextgcore_sbi::server::send_error(
+            403,
+            "Forbidden",
+            &detail,
+            None,
+        ))
+    };
+    let caller = match owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        Ok(None) if !owner_binding::identity_required() => return None,
+        Ok(None) => return forbidden(format!("{operation}: the caller proved no NF identity")),
+        Err(why) => return forbidden(format!("{operation}: {why}")),
+    };
+    if owner_binding::same_nf_instance_id(&caller, nfc_instance_id) {
+        return None;
+    }
+    log::warn!(
+        "{operation} refused: nfcInstanceId {nfc_instance_id:?} is not the caller ({caller})"
+    );
+    forbidden(format!(
+        "{operation}: nfcInstanceId {nfc_instance_id:?} is not the calling NF"
+    ))
+}
+
 /// Handle ContextUpdate (TS 29.532 §5.3.2.5) - start/terminate MBS data
 /// reception. [mbsmfd-03] On an SMF multicast Start the MB-SMF allocates and
 /// returns a `cTeid` + `llSsm` and drives N4mb establishment; on Terminate /
@@ -1882,6 +1927,12 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
     let is_amf = req.ran_node_id.is_some() || req.n2_mbs_sm_info.is_some();
     let terminate =
         matches!(action, types::ContextUpdateAction::Terminate) || req.leave_ind == Some(true);
+
+    // #2060: the consumer a ContextUpdate joins or terminates is the body's
+    // `nfcInstanceId`, so it must be the caller's own; before any change.
+    if let Some(refused) = refuse_foreign_nfc_instance(request, &req.nfc_instance_id, terminate) {
+        return refused;
+    }
 
     let ctx = mbsmf_self();
 
@@ -3239,7 +3290,26 @@ mod tests {
     /// test that needs another caller sets its identity, or calls
     /// `super::mbsmf_sbi_request_handler` for an anonymous one.
     async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
-        super::mbsmf_sbi_request_handler(as_test_consumer(request)).await
+        super::mbsmf_sbi_request_handler(as_test_consumer(as_its_nfc_instance(request))).await
+    }
+
+    /// #2060: a ContextUpdate is sent by the NF its `nfcInstanceId` names, so
+    /// one with no identity calls as that NF (`as_test_consumer` would make it
+    /// TEST_CONSUMER_1863, which the check refuses). A test of another caller
+    /// sets its identity itself.
+    fn as_its_nfc_instance(mut request: SbiRequest) -> SbiRequest {
+        let unidentified =
+            request.peer_cert_nf_instance_id.is_none() && request.oauth2_subject.is_none();
+        if unidentified && request.header.uri.contains("/contexts/update") {
+            let body = request.http.content.clone().unwrap_or_default();
+            let marker = "\"nfcInstanceId\":\"";
+            if let Some(start) = body.find(marker).map(|i| i + marker.len()) {
+                if let Some(len) = body[start..].find('"') {
+                    request.oauth2_subject = Some(body[start..start + len].to_string());
+                }
+            }
+        }
+        request
     }
     // #417: the Setup Response is read back by the generated codec's strict
     // decode and pinned whole against the hand-derived octets
@@ -3586,6 +3656,84 @@ mod tests {
             .unwrap()
             .session_find_by_tmgi(&tmgi)
             .expect("session exists")
+    }
+
+    /// #2060: a ContextUpdate joins or terminates only the caller's own
+    /// `nfcInstanceId`. Another SMF naming smf-a is refused 403, and smf-a stays
+    /// a consumer, whether it calls directly with an SMF certificate, with a
+    /// certificate naming no NF type, or through an SCP with its token; so is a
+    /// Start naming smf-a, and a caller whose token and certificate disagree.
+    /// smf-a's own Terminate is a 204.
+    ///
+    /// REVERT-VERIFIED: with `refuse_foreign_nfc_instance` returning `None`,
+    /// smf-b's Terminate naming smf-a is 204 and smf-a is gone.
+    #[tokio::test]
+    async fn a_context_update_names_only_the_calling_nf_2060() {
+        const SMF_A: &str = "aaaaaaaa-2060-4000-8000-0000000000a1";
+        const SMF_B: &str = "bbbbbbbb-2060-4000-8000-0000000000b2";
+        let svc_id = [0xC2, 0x06, 0x60];
+        let svc = seed_global_session(svc_id);
+        let update = |nfc: &str, action: &str| {
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(smf_ctx_update_body(&svc, nfc, action), "application/json")
+        };
+        let direct = |mut r: SbiRequest, id: &str, types: &[&str]| {
+            r.peer_cert_nf_instance_id = Some(id.to_string());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let via_scp = |mut r: SbiRequest, sub: &str| {
+            r.peer_cert_nf_instance_id = Some("cccccccc-2060-4000-8000-0000000000c3".into());
+            r.peer_cert_nf_types = vec!["SCP".into()];
+            r.oauth2_subject = Some(sub.to_string());
+            r
+        };
+        let rsp =
+            super::mbsmf_sbi_request_handler(direct(update(SMF_A, "START"), SMF_A, &["SMF"])).await;
+        assert_eq!(rsp.status, 200, "{:?}", rsp.http.content);
+        let consumers = || {
+            stored_session(svc_id)
+                .consumers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(consumers(), vec![SMF_A.to_string()]);
+
+        let mut mismatched = direct(update(SMF_A, "TERMINATE"), SMF_B, &["SMF"]);
+        mismatched.oauth2_subject = Some(SMF_A.to_string());
+        for (req, who) in [
+            (
+                direct(update(SMF_A, "TERMINATE"), SMF_B, &["SMF"]),
+                "smf-b, directly",
+            ),
+            (
+                direct(update(SMF_A, "TERMINATE"), SMF_B, &[]),
+                "smf-b, a typeless certificate",
+            ),
+            (
+                via_scp(update(SMF_A, "TERMINATE"), SMF_B),
+                "smf-b, through the SCP",
+            ),
+            (
+                direct(update(SMF_A, "START"), SMF_B, &["SMF"]),
+                "smf-b's Start naming smf-a",
+            ),
+            (mismatched, "a token naming smf-a on smf-b's certificate"),
+        ] {
+            let rsp = super::mbsmf_sbi_request_handler(req).await;
+            assert_eq!(rsp.status, 403, "{who}: {:?}", rsp.http.content);
+            assert_eq!(consumers(), vec![SMF_A.to_string()], "{who}");
+        }
+        assert!(
+            stored_session(svc_id).n4mb_session.is_some(),
+            "the transport is up"
+        );
+        // smf-a through the SCP, with its own token: its Terminate is served.
+        let rsp =
+            super::mbsmf_sbi_request_handler(via_scp(update(SMF_A, "TERMINATE"), SMF_A)).await;
+        assert_eq!(rsp.status, 204, "{:?}", rsp.http.content);
+        assert!(consumers().is_empty());
     }
 
     /// #295 criteria 1-3: two consumers share one transport, the first TERMINATE
