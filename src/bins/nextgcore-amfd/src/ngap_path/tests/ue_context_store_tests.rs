@@ -2358,6 +2358,8 @@ async fn a_live_old_amf_forgets_a_taken_over_ue_without_releasing_it() {
 /// forgotten. A UE whose record is still this AMF's is implicitly deregistered as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_implicit_deregistration_of_a_taken_over_ue_releases_nothing() {
+    // #1974: the NAS-timer sweep walks the whole process-global UE store.
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
     use super::super::ue_context_store::UeContextBackend as _;
     let (_smf, port, seen) = fake_activating_smf().await;
     let _env = SmfEnvGuard::acquire(port).await;
@@ -2441,6 +2443,8 @@ async fn an_implicit_deregistration_of_a_taken_over_ue_releases_nothing() {
 /// would otherwise release its sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ue_back_during_the_owner_check_is_not_implicitly_deregistered() {
+    // #1974: the NAS-timer sweep walks the whole process-global UE store.
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
     let (_smf, port, seen) = fake_activating_smf().await;
     let _env = SmfEnvGuard::acquire(port).await;
     crate::context::amf_context_init(64, 1024, 4096);

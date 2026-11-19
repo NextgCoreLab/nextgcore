@@ -482,6 +482,10 @@ pub struct AmfContext {
     pub num_of_plmn_support: usize,
     /// PLMN support list
     pub plmn_support: Vec<PlmnSupport>,
+    /// #2033: the S-NSSAI of the AMF's Emergency Configuration Data (TS 23.501
+    /// §5.16.4.1: it "contains the S-NSSAI and Emergency DNN"), `amf.emergency.s_nssai`.
+    /// `None`: the [default S-NSSAI](Self::default_s_nssai).
+    pub emergency_s_nssai: Option<SNssai>,
 
     // Access Control
     /// Default reject cause
@@ -1474,6 +1478,7 @@ impl AmfContext {
             served_tai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA),
             num_of_plmn_support: 0,
             plmn_support: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
+            emergency_s_nssai: None,
             default_reject_cause: 0,
             num_of_access_control: 0,
             access_control: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
@@ -1485,7 +1490,7 @@ impl AmfContext {
             full_name: NetworkName::default(),
             amf_name: None,
             relative_capacity: 255,
-            amf_ue_ngap_id_generator: AtomicU64::new(1),
+            amf_ue_ngap_id_generator: AtomicU64::new(FIRST_AMF_UE_NGAP_ID),
             gnb_list: RwLock::new(HashMap::new()),
             amf_ue_list: RwLock::new(HashMap::new()),
             ran_ue_list: RwLock::new(HashMap::new()),
@@ -2266,6 +2271,28 @@ impl AmfContext {
             .unwrap_or(SNssai { sst: 1, sd: None })
     }
 
+    /// #2033: the S-NSSAI emergency services use, from the Emergency Configuration Data
+    /// (TS 23.501 §5.16.4.1), else this AMF's [default](Self::default_s_nssai).
+    pub fn emergency_s_nssai(&self) -> SNssai {
+        self.emergency_s_nssai
+            .clone()
+            .filter(|s| s.sst != 0)
+            .unwrap_or_else(|| self.default_s_nssai())
+    }
+
+    /// #2033: the Allowed NSSAI an NGAP message for `ue` carries. TS 38.413 makes it
+    /// mandatory, SIZE(1..8), in the Initial Context Setup Request and the Handover
+    /// Request; an unauthenticated emergency UE has none (TS 23.502 §4.12.2.3: "The AMF
+    /// shall not send the Allowed NSSAI in the Registration Accept message"), so NGAP
+    /// names the emergency S-NSSAI while the NAS Accept still omits the IE. It used to
+    /// be the empty list, which does not encode: the UE never got its Accept.
+    pub fn ngap_allowed_nssai(&self, ue: &AmfUe) -> Vec<SNssai> {
+        if ue.allowed_nssai.is_empty() && ue.unauthenticated_emergency {
+            return vec![self.emergency_s_nssai()];
+        }
+        ue.allowed_nssai.clone()
+    }
+
     /// `candidate`, unless it is missing or names SST 0 (no slice), in which case the
     /// [default](Self::default_s_nssai) (#920 follow-up). Every writer of a session's
     /// S-NSSAI goes through this, so SST 0 never reaches NGAP or NAS from a record.
@@ -2417,6 +2444,33 @@ impl AmfContext {
     /// for the paging strategy): adding to or pumping the GLOBAL context's paging map
     /// panics when nobody holds the lock, so a test that misses it fails on its own,
     /// deterministically when it runs alone. A local `AmfContext::new()` is exempt.
+    /// Test-only: whether `self` is the process-global context (not a local
+    /// `AmfContext::new()`), identified by the address of its paging map (#1974).
+    #[cfg(test)]
+    fn is_global_context(&self) -> bool {
+        GLOBAL_PAGING_MAP_ADDR.get().copied() == Some(std::ptr::addr_of!(self.paging_map) as usize)
+    }
+
+    /// Test-only enforcement of the lock declared for one of the GLOBAL context's
+    /// NGAP-task queues (#1974, as [`Self::assert_paging_map_lock_held`] does for the
+    /// paging map): enqueuing on or draining the queue panics when nobody holds
+    /// `lock`. A drain takes EVERY queued item, so a test that enqueues without the
+    /// lock has its item taken, and sent on a sibling's server, by a sibling's drain
+    /// (seen as `an_unbound_ue_context_is_not_connected`'s "nothing is sent" and
+    /// `a_setup_that_does_not_go_out_rolls_the_activation_back`'s injected send
+    /// failure spent on a sibling's transfer). With this check such a test fails on
+    /// its own, deterministically. A local `AmfContext::new()` is exempt.
+    #[cfg(test)]
+    #[track_caller]
+    fn assert_queue_lock_held(&self, lock: &tokio::sync::Mutex<()>, queue: &str) {
+        if self.is_global_context() && lock.try_lock().is_ok() {
+            panic!(
+                "the global {queue} was used with its test lock free: take the lock \
+                 declared for it in this test (#1974)"
+            );
+        }
+    }
+
     #[cfg(test)]
     #[track_caller]
     fn assert_paging_map_lock_held(&self) {
@@ -2659,14 +2713,26 @@ impl AmfContext {
     }
 
     /// Enqueue a positioning downlink for NGAP-task egress (TS 23.273).
+    #[cfg_attr(test, track_caller)]
     pub fn positioning_dl_add(&self, item: PendingPositioningDl) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::POSITIONING_DL_LOCK,
+            "positioning downlink queue",
+        );
         if let Ok(mut q) = self.positioning_dl_queue.write() {
             q.push(item);
         }
     }
 
     /// Drain all pending positioning downlinks (called by the NGAP server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn positioning_dl_drain(&self) -> Vec<PendingPositioningDl> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::POSITIONING_DL_LOCK,
+            "positioning downlink queue",
+        );
         match self.positioning_dl_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
@@ -2675,21 +2741,36 @@ impl AmfContext {
 
     /// Enqueue a network-initiated deregistration for NGAP-task egress (WSB-4,
     /// TS 23.502 §4.2.2.3.3 / TS 24.501 §5.5.2.3).
+    #[cfg_attr(test, track_caller)]
     pub fn network_dereg_add(&self, item: PendingNetworkDereg) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(&DEREG_QUEUE_TEST_LOCK, "network deregistration queue");
         if let Ok(mut q) = self.network_dereg_queue.write() {
             q.push(item);
         }
     }
 
     /// Enqueue an N1N2MessageTransfer for a CM-CONNECTED UE (#666).
+    #[cfg_attr(test, track_caller)]
     pub fn connected_downlink_add(&self, item: PendingConnectedDownlink) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::CONNECTED_DOWNLINK_LOCK,
+            "connected-UE downlink queue",
+        );
         if let Ok(mut q) = self.connected_downlink_queue.write() {
             q.push(item);
         }
     }
 
     /// Drain every pending connected-UE transfer (called by the NGAP server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn connected_downlink_drain(&self) -> Vec<PendingConnectedDownlink> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::CONNECTED_DOWNLINK_LOCK,
+            "connected-UE downlink queue",
+        );
         match self.connected_downlink_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
@@ -2698,7 +2779,13 @@ impl AmfContext {
 
     /// #1776: queue a UE Context Modification of the UE's UE-AMBR for the NGAP task.
     /// A UE already queued stays queued once.
+    #[cfg_attr(test, track_caller)]
     pub fn ue_ambr_modification_add(&self, amf_ue_ngap_id: u64) {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::UE_AMBR_MODIFICATION_LOCK,
+            "UE-AMBR modification queue",
+        );
         let mut q = self
             .ue_ambr_modification_queue
             .write()
@@ -2707,7 +2794,13 @@ impl AmfContext {
     }
 
     /// #1776: take every queued UE-AMBR modification (called by the NGAP server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn ue_ambr_modification_drain(&self) -> Vec<u64> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(
+            &crate::test_support::UE_AMBR_MODIFICATION_LOCK,
+            "UE-AMBR modification queue",
+        );
         let mut q = self
             .ue_ambr_modification_queue
             .write()
@@ -2734,7 +2827,10 @@ impl AmfContext {
 
     /// Drain all pending network-initiated deregistrations (called by the NGAP
     /// server pump).
+    #[cfg_attr(test, track_caller)]
     pub fn network_dereg_drain(&self) -> Vec<PendingNetworkDereg> {
+        #[cfg(test)]
+        self.assert_queue_lock_held(&DEREG_QUEUE_TEST_LOCK, "network deregistration queue");
         match self.network_dereg_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
@@ -3487,6 +3583,21 @@ impl AmfContext {
         self.event_subscriptions
             .read()
             .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Tests (#2008): how many stored subscriptions notify a URI containing
+    /// `notify_uri_part`. The store is process-global, so a test counting every
+    /// subscription also counts the ones its siblings create and delete meanwhile.
+    #[cfg(test)]
+    pub(crate) fn event_subscription_count_notifying(&self, notify_uri_part: &str) -> usize {
+        self.event_subscriptions
+            .read()
+            .map(|m| {
+                m.values()
+                    .filter(|s| s.notify_uri.contains(notify_uri_part))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -6417,9 +6528,33 @@ pub(crate) static PAGING_MAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 /// a fresh implicit-deregistration deadline over the expired one the sibling had just set,
 /// and the sibling's UE was never deregistered. Declared beside the global it guards, so
 /// there is one lock for it rather than one per test module.
+///
+/// #1974: it is the lock of EVERY whole-store sweep, and the NAS procedure timers
+/// (`NgapServer::process_nas_timers`, T3550/T3555/T3560/T3570/T3522) sweep the same
+/// store the same way: a sibling's NAS-timer pass retransmitted
+/// `t3555_retransmits_then_aborts_keeping_the_current_guti`'s expired T3555 a second
+/// time ("expiry 3 must retransmit", `Some(4)`), or aborted it. So the NAS-timer
+/// sweep takes this lock too, rather than a second lock over the same store, and
+/// [`assert_ue_store_sweep_lock_held`] enforces it at both sweeps. Taken FIRST,
+/// before `CONTEXT_GUARD`, `SmfEnvGuard` and every queue lock, as the existing
+/// sweeping tests already do.
 #[cfg(test)]
 pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+/// Test-only enforcement of [`REACHABILITY_SWEEP_TEST_LOCK`] (#1974): each sweep of
+/// the process-global UE store calls this first, and it panics when nobody holds the
+/// lock, so a sweeping test that misses it fails on its own, deterministically.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_ue_store_sweep_lock_held() {
+    if REACHABILITY_SWEEP_TEST_LOCK.try_lock().is_ok() {
+        panic!(
+            "the process-global UE store was swept with REACHABILITY_SWEEP_TEST_LOCK free: \
+             take it in this test (#1974)"
+        );
+    }
+}
 
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {
@@ -6473,6 +6608,21 @@ pub fn amf_mcast() -> Arc<crate::ngap_mcast::NgapMcastContext> {
         .get_or_init(|| Arc::new(crate::ngap_mcast::NgapMcastContext::new()))
         .clone()
 }
+
+/// The first AMF UE NGAP ID the allocator hands out.
+#[cfg(not(test))]
+const FIRST_AMF_UE_NGAP_ID: u64 = 1;
+
+/// Tests (#2008): the UE store is process-global, and tests key their UEs by
+/// literal AMF UE NGAP IDs (1 for the 5GS-to-EPS tests, up to 1_794_000_488).
+/// Allocated from 1, the id the allocator handed one test (`setup_ue`, an Initial UE
+/// Message) could be the literal another test inserts at the same moment, and one
+/// would replace the other's UE. `test_n1n2_subscription_missing_pair_400` resolves
+/// its UE by SUPI over this store, so it would then get 404 where it expects 400.
+/// Allocated ids start above every literal, so the two ranges cannot meet. Still within u32 and within
+/// the AMF UE NGAP ID range (0..2^40-1, TS 38.413 §9.3.3.1).
+#[cfg(test)]
+const FIRST_AMF_UE_NGAP_ID: u64 = 2_000_000_000;
 
 /// Initialize the global AMF context
 pub fn amf_context_init(max_gnb: usize, max_ue: usize, max_sess: usize) {
@@ -6830,6 +6980,22 @@ mod tests {
         assert!(!ctx.is_initialized());
         assert_eq!(ctx.gnb_count(), 0);
         assert_eq!(ctx.amf_ue_count(), 0);
+    }
+
+    /// #2008: in a test build the allocator's ids start above every literal AMF UE
+    /// NGAP ID a test keys a UE by, so an allocated UE and a literal one never share
+    /// a key in the process-global UE store.
+    ///
+    /// REVERT-VERIFIED: with the test start back at 1, this fails.
+    #[test]
+    fn allocated_ue_ids_start_above_every_literal_test_id_2008() {
+        let ctx = AmfContext::new();
+        let first = ctx.next_amf_ue_ngap_id();
+        assert!(
+            first > 1_794_000_488,
+            "allocated id {first} is in the range tests use as literal UE ids"
+        );
+        assert!(first < (1 << 40), "an AMF UE NGAP ID (TS 38.413 §9.3.3.1)");
     }
 
     #[test]

@@ -401,6 +401,88 @@ pub struct SbiClient {
     /// #1915: whether a 307/308 is followed at all (after the checks). `false`
     /// hands every redirect back to the caller verbatim.
     follow_redirects: bool,
+    /// #1986: `(target NF type, scope, producer instance)` triples whose fresh
+    /// token the producer ALSO refused with `invalid_token`, until when the
+    /// refusal is believed to persist ([`TOKEN_REFUSAL_BACKOFF`]). #2023: the
+    /// instance ([`refusing_instance`]) keeps one misconfigured producer behind
+    /// an SCP from suspending the resend for its healthy peers.
+    /// #2031: bounded ([`record_refusal`]), with a type-wide backstop.
+    token_refusals: Arc<StdMutex<HashMap<RefusalKey, Instant>>>,
+}
+
+/// #1986: how long a persistent `invalid_token` refusal (the fresh token was
+/// refused too, e.g. the NRF keeps minting an `aud` the producer rejects)
+/// suspends the evict-and-resend for that target and scope. Each request then
+/// costs one producer hit and no NRF fetch, instead of two and one. Short, so a
+/// fixed NRF or producer is picked up within seconds: the first refusal after
+/// it evicts and resends again.
+const TOKEN_REFUSAL_BACKOFF: Duration = Duration::from_secs(10);
+
+/// #2031: when this many instances of one target type and scope are backed
+/// off at once, the whole type and scope is ([`TYPE_WIDE_REFUSAL`]). A
+/// producer (or an SCP) naming a new `3gpp-Sbi-Producer-Id` on every answer
+/// would otherwise open a new key, and so revive one NRF token fetch, per
+/// request.
+const TOKEN_REFUSAL_TYPE_WIDE_AFTER: usize = 8;
+/// #2031: the most refusal entries one client holds. A new key past it backs
+/// off its whole type and scope instead (evicting the entry nearest expiry to
+/// make room if it must), so the map stays bounded by more than its expiry.
+const TOKEN_REFUSAL_CAP: usize = 256;
+/// #2031: the instance key of a type-wide refusal.
+const TYPE_WIDE_REFUSAL: &str = "*";
+
+type RefusalKey = (NfType, String, String);
+
+/// #2031: whether `key` is backed off at `now`: its own instance, or its
+/// whole type and scope. Expired entries are dropped first.
+fn refusal_active(
+    refusals: &mut HashMap<RefusalKey, Instant>,
+    key: &RefusalKey,
+    now: Instant,
+) -> bool {
+    refusals.retain(|_, until| *until > now);
+    let wide = (key.0, key.1.clone(), TYPE_WIDE_REFUSAL.to_string());
+    refusals.contains_key(key) || refusals.contains_key(&wide)
+}
+
+/// #2031: record a persistent refusal by `key`'s instance until `until`,
+/// bounded: [`TOKEN_REFUSAL_TYPE_WIDE_AFTER`] instances of one type and scope,
+/// or a full map ([`TOKEN_REFUSAL_CAP`]), back off the type and scope instead.
+fn record_refusal(
+    refusals: &mut HashMap<RefusalKey, Instant>,
+    key: RefusalKey,
+    now: Instant,
+    until: Instant,
+) {
+    refusals.retain(|_, t| *t > now);
+    let wide = (key.0, key.1.clone(), TYPE_WIDE_REFUSAL.to_string());
+    let same_type = refusals
+        .keys()
+        .filter(|k| k.0 == key.0 && k.1 == key.1 && k.2 != TYPE_WIDE_REFUSAL && **k != key)
+        .count();
+    let target = if refusals.contains_key(&key) || refusals.len() < TOKEN_REFUSAL_CAP {
+        if same_type + 1 >= TOKEN_REFUSAL_TYPE_WIDE_AFTER {
+            wide
+        } else {
+            key
+        }
+    } else {
+        wide
+    };
+    if !refusals.contains_key(&target) && refusals.len() >= TOKEN_REFUSAL_CAP {
+        if let Some(soonest) = refusals
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(k, _)| k.clone())
+        {
+            refusals.remove(&soonest);
+        }
+    }
+    if target.2 == TYPE_WIDE_REFUSAL {
+        // The instances it now covers need no entries of their own.
+        refusals.retain(|k, _| !(k.0 == target.0 && k.1 == target.1));
+    }
+    refusals.insert(target, until);
 }
 
 impl SbiClient {
@@ -422,6 +504,7 @@ impl SbiClient {
             bindings: Arc::new(StdMutex::new(HashMap::new())),
             target_policy: None,
             follow_redirects: true,
+            token_refusals: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -869,6 +952,10 @@ impl SbiClient {
     ///   producer failing until the cached token expired. `insufficient_scope`
     ///   (a fresh token carries the same scope) and a caller-supplied
     ///   `Authorization` are left alone.
+    /// * **#1986**: when the fresh token is refused with `invalid_token` too,
+    ///   the refusal is taken as persistent for that target and scope for
+    ///   [`TOKEN_REFUSAL_BACKOFF`]: its `invalid_token` answers are returned
+    ///   without an eviction or a resend until then.
     pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
         // The token is ours to replace only when this client attaches it: OAuth2
         // applies to the request, and the caller set no Authorization. It is
@@ -911,6 +998,25 @@ impl SbiClient {
         {
             return Ok(response);
         }
+        let refusal = (target, scope.clone(), refusing_instance(&resend, &response));
+        let now = Instant::now();
+        {
+            let mut refusals = self
+                .token_refusals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if refusal_active(&mut refusals, &refusal, now) {
+                log::debug!(
+                    "{} {}: {} invalid_token again within the refusal backoff for {} \
+                     scope '{scope}'; not resending",
+                    resend.header.method,
+                    crate::log_redact::redact_callback_tokens(&resend.header.uri),
+                    response.status,
+                    target.to_str()
+                );
+                return Ok(response);
+            }
+        }
         log::warn!(
             "{} {}: the producer refused our access token ({} invalid_token); evicting \
              the cached {} token for scope '{scope}' and resending once with a fresh one",
@@ -923,7 +1029,42 @@ impl SbiClient {
         oauth2
             .invalidate_token_if(&oauth2.self_consumer(), target, &scope, rejected)
             .await;
-        Box::pin(self.send_with_overload_reaction(resend)).await
+        let request_of_resend = resend.clone();
+        let response = Box::pin(self.send_with_overload_reaction(resend)).await?;
+        // #1986: the fresh token refused as well is not a stale token: back off.
+        if matches!(response.status, 401 | 403)
+            && response
+                .http
+                .get_header("WWW-Authenticate")
+                .and_then(|v| bearer_challenge_error(v))
+                .is_some_and(|e| e == "invalid_token")
+        {
+            log::warn!(
+                "the producer refused a fresh {} token for scope '{scope}' too ({} \
+                 invalid_token); not resending for that target and scope for {}s",
+                target.to_str(),
+                response.status,
+                TOKEN_REFUSAL_BACKOFF.as_secs()
+            );
+            // #2023: the instance that refused the fresh token, which behind an
+            // SCP may not be the one that refused the first.
+            let refusal = (
+                target,
+                scope.clone(),
+                refusing_instance(&request_of_resend, &response),
+            );
+            let now = Instant::now();
+            record_refusal(
+                &mut self
+                    .token_refusals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                refusal,
+                now,
+                now + TOKEN_REFUSAL_BACKOFF,
+            );
+        }
+        Ok(response)
     }
 
     /// #65: the TS 29.500 §6.4/§6.5 reaction that used to be missing entirely.
@@ -1820,6 +1961,62 @@ fn bearer_challenge_error(www_authenticate: &str) -> Option<String> {
             .eq_ignore_ascii_case("error")
             .then(|| val.trim().trim_matches('"').to_string())
     })
+}
+
+/// #2023: which producer instance refused a token, as a backoff key.
+/// #2031: always in `nfinst=<id>` form (lowercase), whichever header named it,
+/// so the same instance is one key.
+///
+/// - The instance the request named (`3gpp-Sbi-Target-Nf-Id`, else
+///   `3gpp-Sbi-Discovery-target-nf-instance-id`) wins: a
+///   `3gpp-Sbi-Producer-Id` naming another instance is ignored, so an answer
+///   cannot move the backoff off the instance this client addressed.
+/// - Else the answer's `3gpp-Sbi-Producer-Id` (TS 29.500 §5.2.3.2.x: its
+///   `nfinst` parameter, or a bare NF instance ID).
+/// - Else the request's `3gpp-Sbi-Target-apiRoot`, as `apiroot=<uri>`, since
+///   it names no instance ID.
+/// - Else `""`: this client's one producer (direct communication).
+fn refusing_instance(request: &SbiRequest, response: &SbiResponse) -> String {
+    use crate::constants::{custom_header, discovery_header};
+    let header = |v: Option<&String>| {
+        v.map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    let named = header(request.http.get_header(custom_header::TARGET_NF_ID))
+        .or_else(|| {
+            header(
+                request
+                    .http
+                    .get_header(discovery_header::TARGET_NF_INSTANCE_ID),
+            )
+        })
+        .and_then(|v| nf_instance_of(&v));
+    if let Some(named) = named {
+        return format!("nfinst={named}");
+    }
+    if let Some(producer) = header(response.http.get_header(custom_header::PRODUCER_ID))
+        .and_then(|v| nf_instance_of(&v))
+    {
+        return format!("nfinst={producer}");
+    }
+    header(request.http.get_header(custom_header::TARGET_APIROOT))
+        .map(|root| format!("apiroot={root}"))
+        .unwrap_or_default()
+}
+
+/// #2031: the NF instance ID a (lowercased) header value names: the `nfinst`
+/// parameter of a `3gpp-Sbi-Producer-Id`-style value (`nfinst=<id>; nfset=...`),
+/// or the value itself when it carries no parameters.
+fn nf_instance_of(value: &str) -> Option<String> {
+    let id = if value.contains('=') {
+        value.split(';').find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            (k.trim() == "nfinst").then(|| v.trim().to_string())
+        })?
+    } else {
+        value.to_string()
+    };
+    (!id.is_empty()).then_some(id)
 }
 
 /// #1811: the scope this client asks the NRF for to send `request`: the
@@ -3021,6 +3218,217 @@ mod tests {
                 counts.producer_hits.load(SeqCst)
             ),
             (2, 2)
+        );
+    }
+
+    /// **#1986.** A refusal that persists (the fresh token is refused too) is
+    /// not resent again for [`TOKEN_REFUSAL_BACKOFF`]: the next request costs
+    /// one producer hit and no NRF fetch, and another scope is not affected.
+    /// Once the backoff is over, the next refusal evicts and resends again.
+    ///
+    /// REVERT-VERIFIED: without the backoff, the second request costs two more
+    /// hits and one more fetch and the first assertion after it fails.
+    #[tokio::test]
+    async fn a_persistent_invalid_token_backs_off_the_resend_1986() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) = serve_rotating_token_producer(
+            &["token-1", "token-2", "token-3", "token-4"],
+            403,
+            "invalid_token",
+        )
+        .await;
+        let (client, _) = client_1676(addr);
+        let counted = || {
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst),
+            )
+        };
+        let get = || SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+        assert_eq!(client.send_request(get()).await.expect("sent").status, 403);
+        assert_eq!(counted(), (2, 2), "one evict-and-resend");
+        assert_eq!(client.send_request(get()).await.expect("sent").status, 403);
+        assert_eq!(counted(), (2, 3), "backing off: one hit, no fetch");
+        // Another scope is not backed off by this one's refusal.
+        assert_eq!(
+            client
+                .send_request(SbiRequest::get("/nudm-uecm/v1/imsi-1/registrations"))
+                .await
+                .expect("sent")
+                .status,
+            403
+        );
+        assert_eq!(counted(), (4, 5), "another scope still evicts and resends");
+        // The backoff over, a refusal evicts and resends again, and a token the
+        // producer now accepts (token-5) is used.
+        for until in client.token_refusals.lock().unwrap().values_mut() {
+            *until = Instant::now();
+        }
+        assert_eq!(client.send_request(get()).await.expect("sent").status, 200);
+        assert_eq!(counted(), (5, 7), "after the backoff, one evict-and-resend");
+    }
+
+    /// **#2023.** Behind an SCP one client reaches many instances of a type: the
+    /// backoff a persistent refusal by one instance starts does not suspend the
+    /// evict-and-resend for another. Keyed by the instance the request names
+    /// (here `3gpp-Sbi-Discovery-target-nf-instance-id`) or the answer's
+    /// `3gpp-Sbi-Producer-Id`.
+    ///
+    /// REVERT-VERIFIED: with the instance left out of the key, instance B's
+    /// refusal is not resent and the first assertion after it fails (403).
+    #[tokio::test]
+    async fn the_refusal_backoff_is_per_producer_instance_2023() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1", "token-2"], 403, "invalid_token").await;
+        let (client, _) = client_1676(addr);
+        let counted = || {
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst),
+            )
+        };
+        let to = |instance: &str| {
+            let mut r = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+            r.http.set_header(
+                crate::constants::discovery_header::TARGET_NF_INSTANCE_ID,
+                instance,
+            );
+            r
+        };
+        let a = "20230000-0000-4000-8000-00000000000a";
+        let b = "20230000-0000-4000-8000-00000000000b";
+        assert_eq!(client.send_request(to(a)).await.expect("sent").status, 403);
+        assert_eq!(counted(), (2, 2), "instance A refuses the fresh token too");
+        // Instance B, through the same client, still gets its one resend.
+        assert_eq!(client.send_request(to(b)).await.expect("sent").status, 200);
+        assert_eq!(counted(), (3, 4), "B: evicted and resent");
+        // And the Producer-Id of the answer, when given, is the instance.
+        let other = SbiResponse::with_status(403)
+            .with_header(crate::constants::custom_header::PRODUCER_ID, "nfinst=CCCC");
+        assert_eq!(
+            refusing_instance(&SbiRequest::get("/x"), &other),
+            "nfinst=cccc"
+        );
+        assert_eq!(
+            refusing_instance(&SbiRequest::get("/x"), &SbiResponse::with_status(403)),
+            ""
+        );
+    }
+
+    /// **#2031.** The refusal key is one `nfinst=<id>` form whichever header
+    /// named the instance, and a `3gpp-Sbi-Producer-Id` naming another instance
+    /// than the request did is ignored.
+    ///
+    /// REVERT-VERIFIED: keyed by the raw header value, the same instance named
+    /// three ways is three keys; with the Producer-Id preferred again, the
+    /// mismatching one moves the key off the named instance.
+    #[test]
+    fn the_refusal_key_is_the_named_nf_instance_in_nfinst_form_2031() {
+        use crate::constants::{custom_header, discovery_header};
+        let req = |h: &[(&str, &str)]| {
+            let mut r = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+            for (k, v) in h {
+                r.http.set_header(*k, *v);
+            }
+            r
+        };
+        let answer = |pid: Option<&str>| {
+            let r = SbiResponse::with_status(403);
+            match pid {
+                Some(p) => r.with_header(custom_header::PRODUCER_ID, p),
+                None => r,
+            }
+        };
+        let id = "2031AAAA-0000-4000-8000-00000000000A";
+        let key = "nfinst=2031aaaa-0000-4000-8000-00000000000a";
+        // The same instance, three ways: one key.
+        assert_eq!(
+            refusing_instance(&req(&[(custom_header::TARGET_NF_ID, id)]), &answer(None)),
+            key
+        );
+        assert_eq!(
+            refusing_instance(
+                &req(&[(discovery_header::TARGET_NF_INSTANCE_ID, id)]),
+                &answer(None)
+            ),
+            key
+        );
+        let pid = format!("nfinst={id}; nfset=set1.udmset.5gc.mnc001.mcc001");
+        assert_eq!(refusing_instance(&req(&[]), &answer(Some(&pid))), key);
+        assert_eq!(refusing_instance(&req(&[]), &answer(Some(id))), key);
+        // A Producer-Id naming another instance than the request is ignored.
+        assert_eq!(
+            refusing_instance(
+                &req(&[(discovery_header::TARGET_NF_INSTANCE_ID, id)]),
+                &answer(Some("nfinst=2031bbbb-0000-4000-8000-00000000000b"))
+            ),
+            key
+        );
+        // A Producer-Id without an nfinst names no instance.
+        assert_eq!(
+            refusing_instance(&req(&[]), &answer(Some("nfset=set1"))),
+            ""
+        );
+        assert_eq!(
+            refusing_instance(
+                &req(&[(custom_header::TARGET_APIROOT, "http://UDM1:8080")]),
+                &answer(None)
+            ),
+            "apiroot=http://udm1:8080"
+        );
+    }
+
+    /// **#2031.** The refusal map is bounded: once
+    /// `TOKEN_REFUSAL_TYPE_WIDE_AFTER` instances of one type and scope are
+    /// backed off, the whole type and scope is, so a new instance (a fresh
+    /// random Producer-Id) costs no NRF fetch; and the map never exceeds
+    /// `TOKEN_REFUSAL_CAP`, a new key past it backing off its type and scope.
+    ///
+    /// REVERT-VERIFIED: without the type-wide backstop, a ninth instance is not
+    /// backed off; without the cap, the map grows past it.
+    #[test]
+    fn the_refusal_map_is_capped_with_a_type_wide_backstop_2031() {
+        let now = Instant::now();
+        let until = now + TOKEN_REFUSAL_BACKOFF;
+        let key = |scope: &str, i: usize| (NfType::Udm, scope.to_string(), format!("nfinst={i}"));
+        let mut m = HashMap::new();
+        for i in 0..TOKEN_REFUSAL_TYPE_WIDE_AFTER - 1 {
+            record_refusal(&mut m, key("nudm-sdm", i), now, until);
+        }
+        assert!(
+            !refusal_active(&mut m, &key("nudm-sdm", 999), now),
+            "not yet type-wide"
+        );
+        record_refusal(&mut m, key("nudm-sdm", 1000), now, until);
+        assert!(
+            refusal_active(&mut m, &key("nudm-sdm", 999), now),
+            "a new instance of the type and scope is backed off"
+        );
+        assert!(
+            !refusal_active(&mut m, &key("nudm-uecm", 999), now),
+            "another scope is not"
+        );
+        assert_eq!(
+            m.len(),
+            1,
+            "the type-wide entry replaces its instances: {m:?}"
+        );
+        // Past expiry, nothing.
+        assert!(!refusal_active(&mut m, &key("nudm-sdm", 999), until));
+
+        // The cap: one instance in each of many scopes (none type-wide).
+        let mut m = HashMap::new();
+        for i in 0..TOKEN_REFUSAL_CAP + 50 {
+            record_refusal(&mut m, key(&format!("s{i}"), i), now, until);
+            assert!(m.len() <= TOKEN_REFUSAL_CAP, "{} entries", m.len());
+        }
+        let last = key(&format!("s{}", TOKEN_REFUSAL_CAP + 49), 1);
+        assert!(
+            refusal_active(&mut m, &last, now),
+            "a key past the cap backs off its type and scope"
         );
     }
 

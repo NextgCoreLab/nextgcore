@@ -169,7 +169,29 @@ pub mod test_support {
     /// Serialises tests that set the AUSF endpoint environment variables
     /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
+    ///
+    /// #1974: and every test that RESOLVES the AUSF (a registration reaching
+    /// `start_authentication`), including the ones that rely on NO AUSF being
+    /// reachable: while a sibling's stand-in AUSF is pointed at, their
+    /// Nausf_UEAuthentication call reaches it and succeeds, so the failure arm they
+    /// assert never runs (`an_ausf_failure_whose_reject_cannot_be_sent_still_releases_the_ue`),
+    /// and the sibling's stand-in sees a request it did not expect
+    /// (`a_callback_while_the_ausf_confirms_is_kept_1774`'s "the UE").
+    /// [`assert_ausf_env_lock_held`] enforces it at the resolution sites.
     pub static AUSF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Test-only enforcement of [`AUSF_ENV_LOCK`] (#1974), as
+    /// [`assert_pcf_env_lock_held`] is for the PCF.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn assert_ausf_env_lock_held() {
+        if AUSF_ENV_LOCK.try_lock().is_ok() {
+            panic!(
+                "the AUSF endpoint was resolved with AUSF_ENV_LOCK free: take it in this \
+                 test (#1974)"
+            );
+        }
+    }
 
     /// Serialises tests that set the UCMF endpoint environment variables
     /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
@@ -287,6 +309,8 @@ struct NasYaml {
 #[derive(Debug, Default, Deserialize)]
 struct EmergencyYaml {
     allow_unauthenticated: Option<bool>,
+    /// #2033: the Emergency Configuration Data's S-NSSAI (TS 23.501 §5.16.4.1).
+    s_nssai: Option<SNssaiYaml>,
 }
 
 /// A single `<timer>: { value: <seconds> }` entry under `amf.time`.
@@ -810,6 +834,22 @@ impl AmfApp {
             }
             ctx.num_of_plmn_support = plmns.len();
             ctx.plmn_support = plmns;
+        }
+        // #2033: the emergency S-NSSAI. SST 0 is no slice (TS 23.501 §5.15.2.2), refused
+        // as `plmn_support` refuses it; unset is the default S-NSSAI.
+        if let Some(n) = amf_section
+            .emergency
+            .as_ref()
+            .and_then(|e| e.s_nssai.as_ref())
+        {
+            let sst = n.sst.unwrap_or(1);
+            if sst == 0 {
+                return Err(anyhow::anyhow!(
+                    "amf.emergency.s_nssai has SST 0, which is not a slice (TS 23.501 §5.15.2.2)"
+                ));
+            }
+            ctx.emergency_s_nssai = Some(context::SNssai { sst, sd: n.sd });
+            log::info!("Emergency S-NSSAI: sst={sst} sd={:?}", n.sd);
         }
 
         // Security algorithms
@@ -1922,6 +1962,58 @@ mod tests {
     fn test_amf_app_creation() {
         let app = AmfApp::new();
         assert!(app.running.load(Ordering::SeqCst));
+    }
+
+    /// **#2033:** `amf.emergency.s_nssai` reaches the context the Initial Context Setup
+    /// reads its emergency Allowed NSSAI from, and SST 0 (no slice) refuses to start.
+    ///
+    /// REVERT-VERIFIED: with the loader not reading the key, the context's emergency
+    /// S-NSSAI stays `None` and the first assertion fails.
+    #[tokio::test]
+    async fn the_config_loader_reads_the_emergency_s_nssai_2033() {
+        use std::io::Write;
+        let _policy = crate::emergency::emergency_policy_test_guard().await;
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        context::amf_context_init(64, 1024, 4096);
+        let load = |name: &str, yaml: &str| {
+            let path = unique_fixture_path(name);
+            std::fs::File::create(&path)
+                .and_then(|mut f| f.write_all(yaml.as_bytes()))
+                .expect("write the fixture config");
+            path
+        };
+        let path = load(
+            "nextgcore-amfd-2033-emergency-snssai.yaml",
+            "amf:\n  amf_name: amf-2033\n  emergency:\n    s_nssai: { sst: 1, sd: 8243 }\n",
+        );
+        AmfApp::new()
+            .load_config(path.to_str().expect("utf-8"))
+            .await
+            .expect("loads");
+        remove_fixture(&path);
+        assert_eq!(
+            context::amf_self()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .emergency_s_nssai,
+            Some(context::SNssai {
+                sst: 1,
+                sd: Some(8243)
+            })
+        );
+        let path = load(
+            "nextgcore-amfd-2033-emergency-snssai-sst0.yaml",
+            "amf:\n  amf_name: amf-2033\n  emergency:\n    s_nssai: { sst: 0 }\n",
+        );
+        let refused = AmfApp::new()
+            .load_config(path.to_str().expect("utf-8"))
+            .await;
+        remove_fixture(&path);
+        assert!(refused.is_err(), "SST 0 is not a slice");
+        context::amf_self()
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .emergency_s_nssai = None;
     }
 
     /// **#361:** `amf.emergency.allow_unauthenticated: false` from the YAML actually reaches the

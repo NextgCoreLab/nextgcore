@@ -1409,10 +1409,12 @@ mod tests {
     // reregistration_required distinction are verified over the wire in the
     // `namf_server` router-arm tests (they serialize the destructive
     // process-global-queue drain). These two only assert the accept/skip
-    // contract, so they never touch the shared queue.
+    // contract. #1974: an ACCEPTED notify does enqueue on the shared queue,
+    // so `test_handle_dereg_notify` takes its lock and takes its item back out.
 
     #[test]
     fn test_handle_dereg_notify() {
+        let _serial = crate::context::DEREG_QUEUE_TEST_LOCK.blocking_lock();
         let ue = create_test_ue();
         let data = DeregistrationData {
             dereg_reason: DeregistrationReason::SubscriptionWithdrawn,
@@ -1422,6 +1424,14 @@ mod tests {
         // WSB-4: a 3GPP-access notify is accepted (and enqueues a
         // network-initiated deregistration — asserted in the namf_server tests).
         assert!(handle_dereg_notify(&ue, &data).is_ok());
+        // #1974: take this UE's deregistration back out, leaving any other.
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        for item in guard.network_dereg_drain() {
+            if item.amf_ue_ngap_id != ue.id {
+                guard.network_dereg_add(item);
+            }
+        }
     }
 
     #[test]

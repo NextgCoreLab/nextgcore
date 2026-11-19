@@ -2330,8 +2330,10 @@ impl NgapServer {
     }
 
     /// The timers of this server's own UEs, run first on every [`Self::poll`]. Unlike
-    /// the rest of `poll`, nothing here drains a process-global queue, so a unit test
-    /// can drive it without taking work other tests own (#1120 review).
+    /// the rest of `poll`, nothing here drains a process-global queue (#1120 review).
+    /// But the NAS and reachability timers sweep the process-global UE store (#341),
+    /// so a unit test that drives this takes `context::REACHABILITY_SWEEP_TEST_LOCK`
+    /// (#1974).
     async fn process_local_timers(&mut self) -> Result<()> {
         // Check GMM procedure timers (T3550/T3555/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
@@ -3559,9 +3561,11 @@ impl NgapServer {
             log::error!("Failed to build NG Reset Acknowledge");
         }
 
-        for call in smf_work {
-            self.offload_ng_reset_smf_call(call);
-        }
+        let superseded: Vec<(u64, u8)> = smf_work
+            .into_iter()
+            .filter_map(|call| self.offload_ng_reset_smf_call(call))
+            .collect();
+        self.resolve_superseded_join_parts(&superseded).await;
 
         Ok(())
     }
@@ -3668,9 +3672,11 @@ impl NgapServer {
              {} SMF update(s) to follow)",
             smf_work.len()
         );
-        for call in smf_work {
-            self.offload_ng_reset_smf_call(call);
-        }
+        let superseded: Vec<(u64, u8)> = smf_work
+            .into_iter()
+            .filter_map(|call| self.offload_ng_reset_smf_call(call))
+            .collect();
+        self.resolve_superseded_join_parts(&superseded).await;
     }
 
     /// Parse NG Setup Request (fallback when ASN.1 parsing fails)
@@ -6606,6 +6612,13 @@ impl NgapServer {
         let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
             return Ok(());
         };
+        // #1999: a registration starts with no NSAC rejection of its own; one from an
+        // earlier procedure is not this one's to report. #2022: cleared HERE, before
+        // the unauthenticated-emergency branch, which runs no NSAC and so would
+        // otherwise send whatever an earlier procedure left (TS 24.501 §5.5.1.2.4:
+        // the Rejected NSSAI is the current procedure's). Every other registration
+        // also reaches `apply_nsac_outcome`, which sets it afresh.
+        state.amf_ue.rejected_nssai.clear();
 
         // #361: an UNAUTHENTICATED emergency registration takes none of the SBI steps below.
         //
@@ -6884,19 +6897,29 @@ impl NgapServer {
             )
             .await;
             state.amf_ue.slice_admission_granted = admitted.granted;
-            if let Some(denied) = admitted.denied {
+            // #1942, TS 23.502 §4.2.11.2 / TS 24.501 §5.5.1.2.4: an S-NSSAI whose
+            // maximum number of UEs is reached is rejected, and the registration goes
+            // on with the others. This AMF does not offer the Extended rejected NSSAI
+            // (it does not read the UE's ER-NSSAI bit), so the cause is the one §5.5.1.2.4
+            // gives a UE without it: "S-NSSAI not available in the current registration
+            // area", in the Rejected NSSAI IE. It used to reject the whole registration
+            // on the first denial.
+            if let Some(reject) = apply_nsac_outcome(&mut state.amf_ue, &admitted) {
                 log::warn!(
-                    "[{supi}] Slice admission denied by NSACF (SST={}, SD={:?}); rejecting registration",
-                    denied.sst,
-                    denied.sd
-                );
-                let reject = gmm_build::build_registration_reject(
-                    GmmCause::InsufficientResourcesForSpecificSlice,
+                    "[{supi}] NSACF admitted no S-NSSAI of the Allowed NSSAI; rejecting the \
+                     registration with 5GMM #62"
                 );
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
                 return Ok(());
+            }
+            if !admitted.rejected.is_empty() {
+                log::warn!(
+                    "[{supi}] NSACF denied {:?}; they are rejected and the registration goes on \
+                     with the rest of the Allowed NSSAI",
+                    admitted.rejected
+                );
             }
         }
 
@@ -7197,7 +7220,7 @@ impl NgapServer {
                 &guard,
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                &state.amf_ue.allowed_nssai,
+                &guard.ngap_allowed_nssai(&state.amf_ue),
                 &state.amf_ue.ue_security_capability,
                 &kgnb,
                 Some(protected),
@@ -7460,8 +7483,8 @@ impl NgapServer {
         reconciled: Option<UpdateSessionOutcome>,
         ul_count: u32,
     ) -> Result<()> {
-        let Some(mut plain) = gmm_build::build_registration_accept_for_sessions(
-            &state.amf_ue,
+        let Some(mut plain) = registration_accept_once(
+            &mut state.amf_ue,
             reconciled.as_ref().and_then(|r| r.pdu_session_status),
             reconciled.as_ref().and_then(|r| r.reactivation_result),
         ) else {
@@ -7676,7 +7699,12 @@ impl NgapServer {
         state.amf_ue.init_next_hop_chain();
 
         let tmsi = state.amf_ue.next_guti.tmsi;
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        // #2033: NGAP's Allowed NSSAI is mandatory; an unauthenticated emergency UE's
+        // is the emergency S-NSSAI, while the NAS Accept built above carries none.
+        let allowed_nssai = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ngap_allowed_nssai(&state.amf_ue);
         // #361: §6.7.3.6 requires the NGAP UE INITIAL CONTEXT SETUP to carry only the null
         // algorithms for an unauthenticated emergency session. Narrowed here, on the NAS
         // octets, because this is the one egress site that hands `ngap_asn1` the NAS-shaped
@@ -8690,7 +8718,11 @@ impl NgapServer {
             pdu_session_status,
             uplink_data_status.then_some(reactivation_failed),
         );
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        // #2033: NGAP's Allowed NSSAI, the emergency S-NSSAI for an emergency-only UE.
+        let allowed_nssai = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ngap_allowed_nssai(&state.amf_ue);
         let ue_security_capability = state.amf_ue.ue_security_capability.clone();
         let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
             .then_some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink));
@@ -14680,7 +14712,10 @@ impl NgapServer {
     /// runs in order, a newer reset supersedes a queued older one, and a later activation
     /// is queued behind it, dropping it first if it has not started (`spawn_join_activation`). A release for an aborted
     /// de-registration is independent work: the UE is already forgotten.
-    fn offload_ng_reset_smf_call(&mut self, call: NgResetSmfCall) {
+    /// Returns the key whose not-yet-started work the call superseded (#1924):
+    /// that work delivers no outcome, so a join waiting on it is resolved by the
+    /// caller ([`Self::resolve_superseded_join_parts`]).
+    fn offload_ng_reset_smf_call(&mut self, call: NgResetSmfCall) -> Option<(u64, u8)> {
         match call {
             NgResetSmfCall::Deactivate {
                 amf_ue_ngap_id,
@@ -14693,7 +14728,7 @@ impl NgapServer {
                 // A second reset before the first one's call ran: one is enough. Only
                 // non-durable work is dropped: a queued handover CANCELLED or COMPLETED
                 // for the session is durable and still runs first (#978 review, m6).
-                self.sbi_offload.supersede_key(key);
+                let superseded = self.sbi_offload.supersede_key(key);
                 self.sbi_offload.spawn_keyed_moot(key, move || async move {
                     match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
                         .await
@@ -14708,6 +14743,7 @@ impl NgapServer {
                     }
                     None
                 });
+                superseded.then_some(key)
             }
             NgResetSmfCall::Release {
                 amf_ue_ngap_id,
@@ -14715,18 +14751,55 @@ impl NgapServer {
                 sm_ref,
                 host,
                 port,
-            } => self.sbi_offload.spawn(async move {
-                match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
-                    Ok(()) => log::info!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by \
+            } => {
+                self.sbi_offload.spawn(async move {
+                    match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
+                        Ok(()) => log::info!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by \
                          NG Reset)"
-                    ),
-                    Err(e) => log::warn!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
-                    ),
-                }
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
+                        ),
+                    }
+                    None
+                });
                 None
-            }),
+            }
+        }
+    }
+
+    /// #1924: an NG Reset (or an association loss handled as one) superseded the
+    /// not-yet-started work for these `(UE, PSI)` keys, so their outcomes will never
+    /// arrive. A join waiting on one of them stops waiting for it, as its deadline
+    /// would have it, and a join left waiting for nothing is finished now rather than
+    /// at [`SMF_JOIN_MAX_WAIT`]. Under load the Service Request's activations could
+    /// still be waiting for a permit when the reset superseded them; the join then
+    /// lingered until its deadline (#1924's flake: "both answers came in").
+    async fn resolve_superseded_join_parts(&mut self, superseded: &[(u64, u8)]) {
+        if superseded.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        for (id, j) in self.smf_joins.iter_mut() {
+            for (ue, psi) in superseded {
+                if j.amf_ue_ngap_id == *ue && j.waiting.remove(psi) {
+                    log::info!(
+                        "UE {ue}: PDU session {psi}'s SMF exchange was superseded by an NG \
+                         release; its join stops waiting for it"
+                    );
+                }
+            }
+            if j.waiting.is_empty() {
+                done.push(*id);
+            }
+        }
+        for id in done {
+            if let Some(j) = self.smf_joins.remove(&id) {
+                if let Err(e) = self.finish_smf_join(j).await {
+                    log::warn!("SMF join not finished: {e}");
+                }
+            }
         }
     }
 
@@ -14848,6 +14921,9 @@ impl NgapServer {
     /// Driven from the same poll as the retransmission timers, so there is one clock in
     /// this path rather than two that can disagree.
     async fn process_reachability_timers(&mut self) -> Result<()> {
+        // #1974: the sweep walks the whole process-global UE store.
+        #[cfg(test)]
+        crate::context::assert_ue_store_sweep_lock_held();
         let now = Instant::now();
         let due: Vec<u64> = self
             .ue_auth_state
@@ -14990,6 +15066,9 @@ impl NgapServer {
     /// then apply the per-timer abnormal action (TS 24.501 Sections 5.4.1.3.7,
     /// 5.4.3.7, 5.5.1.2.8, 5.5.2.3.6)
     async fn process_nas_timers(&mut self) -> Result<()> {
+        // #1974: the sweep walks the whole process-global UE store.
+        #[cfg(test)]
+        crate::context::assert_ue_store_sweep_lock_held();
         let now = Instant::now();
         let due: Vec<u64> = self
             .ue_auth_state
@@ -15040,13 +15119,20 @@ impl NgapServer {
             );
             let association_id = state.association_id;
             let ran_ue_ngap_id = state.ran_ue_ngap_id;
-            match retx.timer {
+            let timer = retx.timer;
+            // #1974: one UE's abnormal action failing (typically the UE Context
+            // Release Command to an association that is gone, after `release_ue` has
+            // already forgotten the UE) is that UE's failure, logged here. It used to
+            // be `?`-propagated, which ended the sweep there: every later due UE in this
+            // pass was skipped, and `poll` skipped the rest of its local timers too.
+            let outcome: Result<()> = match timer {
                 NasProcTimer::T3550 => {
                     // Abort; the network considers the new GUTI valid
                     // (TS 24.501 Section 5.5.1.2.8 case c)
                     state.registered = true;
                     state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    Ok(())
                 }
                 NasProcTimer::T3560 => {
                     // Abort authentication/SMC and release the N1 connection.
@@ -15059,7 +15145,7 @@ impl NgapServer {
                     // is added beside it.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                     self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                        .await?;
+                        .await
                 }
                 NasProcTimer::T3570 => {
                     if state.pei_requested {
@@ -15067,13 +15153,13 @@ impl NgapServer {
                         state.pei_requested = false;
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
                         self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
-                            .await?;
+                            .await
                     } else {
                         // SUCI identification aborted: release. `release_ue` -> `forget_ue`
                         // owns the removal; see the T3560 arm.
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
                         self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                            .await?;
+                            .await
                     }
                 }
                 NasProcTimer::T3555 => {
@@ -15112,6 +15198,7 @@ impl NgapServer {
                         state.amf_ue.next_guti.tmsi
                     );
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    Ok(())
                 }
                 NasProcTimer::T3522 => {
                     // Implicit deregistration (TS 24.501 Section 5.5.2.3.6).
@@ -15127,8 +15214,11 @@ impl NgapServer {
                     // are terminated too. Before `release_ue`, which drops the ids.
                     self.terminate_policy_associations(amf_ue_ngap_id);
                     self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
-                        .await?;
+                        .await
                 }
+            };
+            if let Err(e) = outcome {
+                log::warn!("{timer:?} abort for UE {amf_ue_ngap_id} did not complete: {e}");
             }
         }
         Ok(())
@@ -17082,9 +17172,11 @@ impl NgapServer {
                     },
                 )
                 .collect(),
-            allowed_nssai: state
-                .amf_ue
-                .allowed_nssai
+            // #2033: mandatory in the Handover Request, as in the ICS.
+            allowed_nssai: crate::context::amf_self()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ngap_allowed_nssai(&state.amf_ue)
                 .iter()
                 .map(|s| nextgcore_ngap::types::SNssai {
                     sst: s.sst,
@@ -21689,12 +21781,46 @@ impl NgapServer {
 // NAS parsing / helper functions (TS 24.501)
 // ============================================================================
 
-/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
-///
-/// #753: this used to be a SECOND random UUID per process, so it could not be
-/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
-/// UDM therefore saw a "new AMF" and sent the restarted AMF a
-/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
+/// #1999: build a Registration Accept, then forget the Rejected NSSAI it carried. The
+/// rejection belongs to the registration procedure that produced it (TS 24.501
+/// §5.5.1.2.4): a later accept that ran no NSAC must not report it again, stale. A
+/// T3550 retransmission resends the stored PDU, so it still carries it.
+fn registration_accept_once(
+    amf_ue: &mut crate::context::AmfUe,
+    pdu_session_status: Option<u16>,
+    reactivation_result: Option<u16>,
+) -> Option<Vec<u8>> {
+    let accept = gmm_build::build_registration_accept_for_sessions(
+        amf_ue,
+        pdu_session_status,
+        reactivation_result,
+    );
+    amf_ue.rejected_nssai.clear();
+    accept
+}
+
+/// #1942: apply NSAC's answer to a registering UE. The rejected S-NSSAIs leave the
+/// Allowed NSSAI and are recorded as the Rejected NSSAI the Registration Accept
+/// carries. When none is left, the Registration Reject to send: 5GMM #62 "No network
+/// slices available", with every S-NSSAI asked for in its Rejected NSSAI (TS 24.501
+/// §5.5.1.2.5).
+fn apply_nsac_outcome(
+    amf_ue: &mut crate::context::AmfUe,
+    admitted: &crate::nsac::Admitted,
+) -> Option<Vec<u8>> {
+    amf_ue.rejected_nssai = admitted.rejected.clone();
+    if admitted.all_rejected(&amf_ue.allowed_nssai) {
+        return Some(gmm_build::build_registration_reject_with_rejected_nssai(
+            GmmCause::NoNetworkSlicesAvailable,
+            &admitted.rejected,
+        ));
+    }
+    amf_ue
+        .allowed_nssai
+        .retain(|s| !admitted.rejected.contains(s));
+    None
+}
+
 /// The TS 29.571 AccessType an NSAC request names for an `AmfUe::access_type`.
 fn nsac_access_type(access_type: u8) -> &'static str {
     if access_type == 0 || access_type == 1 {
@@ -21704,6 +21830,12 @@ fn nsac_access_type(access_type: u8) -> &'static str {
     }
 }
 
+/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
+///
+/// #753: this used to be a SECOND random UUID per process, so it could not be
+/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
+/// UDM therefore saw a "new AMF" and sent the restarted AMF a
+/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
 fn amf_instance_id() -> String {
     nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
 }
@@ -26660,23 +26792,21 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let (_nwdaf, port, _) = nwdaf_standin(
-                Some(nwdafd_predicts(&nwdaf_cell_of(predicted))),
-                Duration::ZERO,
-                None,
-            )
-            .await;
-            let _ep = NwdafEndpointOverride::set(port);
             let ue = 464_041u64 + i as u64;
-            insert_nwdaf_ue(
-                &ngap,
-                ue,
-                base + 1,
-                Some(&format!("imsi-00101000046404{i}")),
-                Some(1),
+            let supi = format!("imsi-00101000046404{i}");
+            // #2008: nwdafd's answer, in hand at once. Through a loopback stand-in it
+            // had to arrive within HINT_TIMEOUT (300 ms); on a loaded host it did not,
+            // the page failed open to the whole area, and this test, which is about
+            // where a PREDICTED page goes, failed. The HTTP path is
+            // `nwdaf_mobility_pages_the_predicted_gnb_then_widens_to_the_area`'s.
+            crate::nwdaf_mobility::set_canned_answer_for_test(
+                &supi,
+                Some(nwdafd_predicts(&nwdaf_cell_of(predicted))),
             );
+            insert_nwdaf_ue(&ngap, ue, base + 1, Some(&supi), Some(1));
             queue_paging(&ngap, ue);
             assert!(nwdaf_answer_applied(ue).await, "released");
+            crate::nwdaf_mobility::set_canned_answer_for_test(&supi, None);
             take_sent_ngap(&mut ngap);
             ngap.process_paging_with(Duration::from_secs(3600)).await;
             assert_eq!(
@@ -26685,6 +26815,7 @@ mod tests {
                 "predicted gNB {predicted}: attempt 1 reaches the UE's own gNB 1"
             );
             crate::context::amf_self().read().unwrap().paging_remove(ue);
+            ngap.ue_auth_state.remove(ue);
         }
     }
 
@@ -30774,6 +30905,8 @@ mod tests {
     /// neither.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_t3522_exhaustion_terminates_the_policy_associations() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
         set_pcf_env(port);
@@ -31485,6 +31618,8 @@ mod tests {
     /// Command is retransmitted on the reset association.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ng_reset_aborts_the_kept_ues_procedures() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
@@ -31575,6 +31710,8 @@ mod tests {
     /// T3522 UE is kept; without `terminate_policy_associations` no PCF DELETE comes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_aborts_the_ues_nas_procedure() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
         // #1588: this test reads the paging strategy.
@@ -35907,7 +36044,7 @@ mod tests {
         );
 
         // HandoverCancel: the source abandoned it.
-        let ue_cancel = 78_002u64;
+        let ue_cancel = 78_022u64; // #2008: not 78_002, a sibling's UE id in the global store
         server.handover_target_assoc.insert(ue_cancel, (target, 1));
         let cancel = nextgcore_ngap::builder::build_handover_cancel(
             &nextgcore_ngap::types::HandoverCancel {
@@ -35925,7 +36062,7 @@ mod tests {
         // HandoverFailure: the target refused. Dropped even though this UE has no
         // ue_auth_state entry, because a stale record would misroute the NEXT
         // handover's status transfer to a gNB that already rejected the UE.
-        let ue_failure = 78_003u64;
+        let ue_failure = 78_023u64; // #2008: not 78_003 (likewise)
         server.handover_target_assoc.insert(ue_failure, (target, 1));
         // The HandoverRequest of the current preparation went to `target` (#742 review:
         // only that association may answer it).
@@ -39393,8 +39530,8 @@ mod tests {
             .remove(id);
     }
 
-    /// #1832: a subscription for `events` about `supi` (or any UE when `None`),
-    /// with `options`. Returns the sink, its receiver, the response and its id.
+    /// #1832: a subscription for `events` about `supi` (or any UE when `None`, or
+    /// the group `<id>` when `supi` is `group:<id>`), with `options`. Returns the sink, its receiver, the response and its id.
     async fn subscription_1832(
         supi: Option<&str>,
         tag: &str,
@@ -39431,7 +39568,11 @@ mod tests {
             "options": options,
         });
         match supi {
-            Some(s) => subscription["supi"] = serde_json::json!(s),
+            // #1974: `group:<id>` targets a group, which no fire point matches.
+            Some(s) => match s.strip_prefix("group:") {
+                Some(group) => subscription["groupId"] = serde_json::json!(group),
+                None => subscription["supi"] = serde_json::json!(s),
+            },
             None => subscription["anyUE"] = serde_json::json!(true),
         }
         let resp = crate::namf_server::namf_request_handler(
@@ -39687,12 +39828,21 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with an arbitrary count evicted at the bound, the new UE's
     /// claim is granted ("a new UE at the bound is refused").
+    ///
+    /// #1974: a GROUP subscription, not an any-UE one. The count map's bound is the
+    /// same for both (each is a multi-UE subscription, so neither ends at one UE's
+    /// maximum), but an any-UE subscription is matched by EVERY sibling test's
+    /// location fire, and one such fire landing while this test fills the map took
+    /// the last slot ("left: Refused" at `imsi-b{MAX-1}`). The fire points run in
+    /// hundreds of tests that do not take `CONTEXT_GUARD`, so no lock can keep them
+    /// out; `event_subscriptions_matching_ue` matches no group subscription, so no
+    /// sibling's fire can reach this one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn max_reports_counts_are_not_evicted_1832() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let (sink, _rx, resp, sub_id) = subscription_1832(
-            None,
+            Some("group:1832-bound-group"),
             "1832-bound",
             serde_json::json!([{ "type": "LOCATION_REPORT" }]),
             serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 1 }),
@@ -39980,10 +40130,15 @@ mod tests {
     async fn a_periodic_subscription_needs_a_rep_period_1819() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let before = crate::context::amf_self()
-            .read()
-            .expect("ctx lock")
-            .event_subscription_count();
+        // #2008: this test's own subscriptions only. The store is process-global and
+        // most tests that subscribe do not take CONTEXT_GUARD, so a count of every
+        // subscription moved whenever a sibling subscribed or unsubscribed meanwhile.
+        let own = || {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx lock")
+                .event_subscription_count_notifying("/notify/1819-bad")
+        };
         for (options, cause) in [
             (
                 serde_json::json!({ "trigger": "PERIODIC" }),
@@ -40002,13 +40157,7 @@ mod tests {
             assert_eq!(v["cause"], cause, "{v}");
             sink.stop().await.expect("sink stop");
         }
-        assert_eq!(
-            crate::context::amf_self()
-                .read()
-                .expect("ctx lock")
-                .event_subscription_count(),
-            before
-        );
+        assert_eq!(own(), 0, "nothing is stored");
     }
 
     /// **#1737, #1760**: the first report is the subscription's own baseline, and for
@@ -42333,7 +42482,9 @@ mod tests {
     async fn handover_notify_consumes_the_recorded_target_transfer() {
         let mut server = test_ngap_server().await;
         let (source, target) = (9304u64, 9305u64);
-        let amf_ue_ngap_id = 78_003u64;
+        // #2008: an id of its own; `an_intra_gnb_handover_notify_releases_the_old_ran_ue_context`
+        // uses 78_003 in the same process-global UE store.
+        let amf_ue_ngap_id = 78_013u64;
         seed_gnb_session(&server, source).await;
         seed_gnb_session(&server, target).await;
         server.ue_auth_state.insert(
@@ -43427,6 +43578,8 @@ mod tests {
     /// either_guti` pins the other half — that the retained identity then resolves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn t3555_retransmits_then_aborts_keeping_the_current_guti() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_200_011u64;
@@ -43488,6 +43641,57 @@ mod tests {
         );
     }
 
+    /// #1974: one UE's abnormal action failing does not end the NAS-timer sweep. UE A's
+    /// T3560 is exhausted and its release goes to an association this AMF does not
+    /// have ("Association not found"); UE B, later in the same pass, still has its
+    /// expired T3555 retransmitted, and the pass reports success.
+    ///
+    /// REVERT-VERIFIED: with the abort's error `?`-propagated again, the pass ends at
+    /// A and B is never reached ("a later due UE is still swept").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_abort_does_not_end_the_nas_timer_sweep_1974() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // The sweep takes due UEs in id order, so A comes first.
+        let (a, b) = (7_197_401u64, 7_197_402u64);
+        let (max_count, _) = NasProcTimer::T3560.config(&ngap.timer_configs);
+        let mut ue_a = UeNasContext::new(a, 74, 19_740_001, false);
+        ue_a.amf_ue.supi = Some("imsi-001010001974001".to_string());
+        ngap.ue_auth_state.insert(a, ue_a);
+        ngap.arm_retx(a, NasProcTimer::T3560, vec![0x00, 0x04]);
+        ngap.ue_auth_state
+            .insert(b, UeNasContext::new(b, 75, 19_740_001, false));
+        ngap.arm_retx(b, NasProcTimer::T3555, vec![0x00, 0x2E]);
+        for (id, retries) in [(a, max_count), (b, 0)] {
+            ngap.ue_auth_state.with_mut(id, |state| {
+                let retx = state.retx.as_mut().expect("armed");
+                retx.retries = retries;
+                retx.deadline = Instant::now() - Duration::from_secs(1);
+            });
+        }
+
+        let pass = ngap.process_nas_timers().await;
+
+        assert!(
+            !ngap.ue_auth_state.contains(a),
+            "precondition: A's exhausted T3560 was aborted (release_ue forgot it)"
+        );
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(b)
+                .and_then(|s| s.retx)
+                .map(|r| r.retries),
+            Some(1),
+            "a later due UE is still swept after an earlier UE's abort failed"
+        );
+        assert!(
+            pass.is_ok(),
+            "one UE's failure is not the sweep's: {pass:?}"
+        );
+        ngap.forget_ue(b);
+    }
+
     /// Criterion 8: an EMERGENCY registration reaches the emergency handler from the live
     /// NAS path (TS 24.501 §5.5.1.2, TS 23.167), **and #361: with no AUSF reachable it now
     /// CONTINUES as an unauthenticated emergency registration rather than being refused.**
@@ -43523,6 +43727,8 @@ mod tests {
         // order against the emergency module's own tests. The guard also resets the posture to
         // the shipped default (permitted), which is what this test needs.
         let _policy = crate::emergency::emergency_policy_test_guard().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_200_012u64;
         ngap.emergency
@@ -43655,6 +43861,8 @@ mod tests {
     ) {
         crate::context::amf_context_init(64, 1024, 4096);
         let _policy = crate::emergency::emergency_policy_test_guard().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         let mut ngap = test_ngap_server().await;
         // A distinct literal id from every sibling test: the emergency contexts and the NAS
         // store are process-global and keyed on it, so a shared id would have one test's
@@ -43702,6 +43910,60 @@ mod tests {
             "with the NAS state gone too, which is the pre-#361 behaviour this setting \
              preserves for a deployment whose regulation forbids the feature"
         );
+    }
+
+    /// #1999: the Rejected NSSAI goes out in the Registration Accept of the
+    /// procedure whose NSAC produced it, and not again in a later accept.
+    ///
+    /// REVERT-VERIFIED: with the accept not clearing it, this fails: the second
+    /// accept repeats the stale Rejected NSSAI IE.
+    #[test]
+    fn the_rejected_nssai_is_reported_once_1999() {
+        let mut ue = UeNasContext::new(7_199_901, 1, 1, false).amf_ue;
+        ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        ue.rejected_nssai = vec![SNssai { sst: 2, sd: None }];
+        let ie = [0x11u8, 0x02, 0x11, 0x02];
+        let carries = |pdu: &[u8]| pdu.windows(ie.len()).any(|w| w == ie);
+
+        let first = registration_accept_once(&mut ue, None, None).expect("accept");
+        let second = registration_accept_once(&mut ue, None, None).expect("accept");
+
+        assert!(
+            carries(&first),
+            "the procedure's own accept carries it: {first:02x?}"
+        );
+        assert!(!carries(&second), "a later accept does not: {second:02x?}");
+        assert!(ue.rejected_nssai.is_empty());
+    }
+
+    /// #1942: NSAC's answer applied to a registering UE. A rejected S-NSSAI leaves
+    /// the Allowed NSSAI and is carried as the Rejected NSSAI, the registration
+    /// goes on; with every S-NSSAI rejected it is refused with #62.
+    ///
+    /// REVERT-VERIFIED: with any rejection refusing the registration again, this
+    /// fails: the partial case answers a reject.
+    #[test]
+    fn a_rejected_snssai_leaves_the_allowed_nssai_and_the_rest_goes_on_1942() {
+        let s = |sst| SNssai { sst, sd: None };
+        let mut ue = UeNasContext::new(7_194_201, 1, 1, false).amf_ue;
+        ue.allowed_nssai = vec![s(1), s(2)];
+        let partial = crate::nsac::Admitted {
+            granted: true,
+            rejected: vec![s(2)],
+        };
+        assert_eq!(apply_nsac_outcome(&mut ue, &partial), None, "goes on");
+        assert_eq!(ue.allowed_nssai, vec![s(1)]);
+        assert_eq!(ue.rejected_nssai, vec![s(2)]);
+
+        let mut ue = UeNasContext::new(7_194_202, 1, 1, false).amf_ue;
+        ue.allowed_nssai = vec![s(1), s(2)];
+        let none = crate::nsac::Admitted {
+            granted: false,
+            rejected: vec![s(1), s(2)],
+        };
+        let reject = apply_nsac_outcome(&mut ue, &none).expect("refused");
+        assert_eq!(reject[3], 62, "5GMM #62 No network slices available");
+        assert_eq!(&reject[4..6], &[0x69, 0x04], "with the Rejected NSSAI");
     }
 
     /// #1876: every deregistration counts the UE out at the NSACF on each S-NSSAI it
@@ -43851,6 +44113,51 @@ mod tests {
              against the unconfigured fallback and releases the UE -- so the skip above is \
              the §4.12.2.3 exemption and not an early return that applies to everyone"
         );
+    }
+
+    /// **#2022.** A registration that runs no NSAC (the unauthenticated emergency one,
+    /// TS 23.502 §4.12.2.3) must not send a Rejected NSSAI an earlier procedure left
+    /// on the UE: the Rejected NSSAI is the current procedure's (TS 24.501
+    /// §5.5.1.2.4). Every other registration sets it afresh in `apply_nsac_outcome`;
+    /// this is the path the registration-start clear is for.
+    ///
+    /// REVERT-VERIFIED: with the clear back after the emergency branch (where the
+    /// NSAC that follows it made it redundant), the stale Rejected NSSAI IE goes out
+    /// in this Accept and the assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_without_nsac_sends_no_stale_rejected_nssai_2022() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _policy = crate::emergency::emergency_policy_test_guard().await;
+        let _guami = handler_tests::ServeOneGuami::install();
+        let mut ngap = capturing_ngap_server().await;
+        seed_gnb_session(&ngap, 1).await;
+        let id = 7_202_201u64;
+        let mut ue_ctx = UeNasContext::new(id, 72, 1, false);
+        ue_ctx.amf_ue.registration_type = crate::gmm_build::registration_type::EMERGENCY;
+        ue_ctx.amf_ue.unauthenticated_emergency = true;
+        // What an earlier procedure's all-rejected NSAC left: S-NSSAI sst 2, cause 1.
+        ue_ctx.amf_ue.rejected_nssai = vec![SNssai { sst: 2, sd: None }];
+        ngap.ue_auth_state.insert(id, ue_ctx);
+        ngap.emergency.handle_emergency_registration(id, false);
+
+        let _ = ngap.complete_registration(1, id, 72).await;
+
+        let sent = take_sent_ngap(&mut ngap);
+        assert!(!sent.is_empty(), "the Registration Accept was sent");
+        // The Rejected NSSAI IE (IEI 0x11, length 2, {len 1 | cause 1}, sst 2), as in
+        // `the_rejected_nssai_is_reported_once_1999`; NEA0 leaves it readable.
+        let ie = [0x11u8, 0x02, 0x11, 0x02];
+        assert!(
+            !sent
+                .iter()
+                .any(|(_, pdu)| pdu.windows(ie.len()).any(|w| w == ie)),
+            "the Accept carries a Rejected NSSAI no NSAC of this registration produced"
+        );
+        assert!(ngap
+            .ue_auth_state
+            .get(id)
+            .is_some_and(|s| s.amf_ue.rejected_nssai.is_empty()));
+        ngap.forget_ue(id);
     }
 
     /// **#361:** the UE security capabilities this AMF conveys to the RAN are narrowed to the
@@ -44014,6 +44321,8 @@ mod tests {
     /// sites, where the state was re-inserted before the send and so used to linger.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ausf_failure_whose_reject_cannot_be_sent_still_releases_the_ue() {
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_359_001u64;
@@ -44613,6 +44922,8 @@ mod tests {
         // beside it in `congestion.rs`, not a private one here that could not order
         // against the congestion module's own tests.
         let _guard = crate::congestion::congestion_test_guard().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         let previous = crate::congestion::set_forced(true);
         assert!(
             ngap.nas_congestion_backoff().is_some(),
@@ -44871,6 +45182,8 @@ mod tests {
         // The AMF context and `served_guami` are process-global, so this serialises
         // with every other test that writes them, on the EXISTING guard.
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
 
@@ -46171,11 +46484,13 @@ mod tests {
         let hold = crate::sbi_path::REGISTRATION_STATUS_UPDATE_TIMEOUT + Duration::from_millis(500);
         let holds = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let applied = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // #2008: told when the NOT_TRANSFERRED reaches the old AMF.
+        let held = Arc::new(tokio::sync::Notify::new());
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let peer = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
-        let (h, a) = (holds.clone(), applied.clone());
+        let (h, a, n) = (holds.clone(), applied.clone(), held.clone());
         peer.start(move |req: SbiRequest| {
-            let (holds, applied) = (h.clone(), a.clone());
+            let (holds, applied, held) = (h.clone(), a.clone(), n.clone());
             async move {
                 let body: serde_json::Value =
                     serde_json::from_str(req.http.content.as_deref().unwrap_or("{}"))
@@ -46189,6 +46504,7 @@ mod tests {
                     applied.lock().expect("applied").push(status);
                 };
                 if body["transferStatus"] == "NOT_TRANSFERRED" {
+                    held.notify_one();
                     // Delayed past the client's timeout, and applied regardless.
                     tokio::spawn(async move {
                         tokio::time::sleep(hold).await;
@@ -46209,7 +46525,13 @@ mod tests {
 
         let first =
             spawn_registration_status_update(pending_1769(port, 18201), false).expect("runtime");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // #2008: the retry's outcome is decided once the first update is on the wire.
+        // A fixed 50 ms sleep raced the first task under load: when it had not taken
+        // its turn on the lane by then, the TRANSFERRED's ticket superseded it and it
+        // was never sent, so the late NOT_TRANSFERRED this test is about never came.
+        tokio::time::timeout(Duration::from_secs(10), held.notified())
+            .await
+            .expect("the NOT_TRANSFERRED reaches the old AMF");
         let second =
             spawn_registration_status_update(pending_1769(port, 18201), true).expect("runtime");
         let started = std::time::Instant::now();
@@ -46421,6 +46743,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_ausf_after_a_transfer_hands_the_context_back_1731() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -46688,6 +47012,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn after_an_aborted_reallocation_the_ue_may_present_either_guti() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1974: this test resolves the AUSF (process-global endpoint).
+        let _ausf = crate::test_support::AUSF_ENV_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
 
@@ -47729,6 +48055,8 @@ mod tests {
     /// UE keeps its entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
+        // #1974: the NAS-timer sweep walks the whole process-global UE store.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         // #1588: this test reads the paging strategy.
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);

@@ -1650,6 +1650,59 @@ pub async fn pcf_discover_amf_endpoint(
     ))
 }
 
+/// #1992 (R30 on #2013): whether the NRF holds an AMF profile for
+/// `nf_instance_id` whose `amfInfo.guamiList` includes `guami`. The profile is
+/// the AMF's own declaration: nrfd binds NF-profile writes to the registrant's
+/// verified identity (#1611). Discovery by `target-nf-instance-id`, then
+/// matched here, because this tree's nrfd ignores the `guami` query parameter.
+/// Fails closed: no NRF, an error, no profile, a profile that is not an AMF's,
+/// or no matching GUAMI is `false`.
+pub async fn amf_serves_guami(nf_instance_id: &str, guami: &ue_policy::AmfGuami) -> bool {
+    let ctx = global_context();
+    let Some(nrf_uri) = ctx.get_nrf_uri().await else {
+        log::debug!("No NRF URI configured; cannot check an AMF's GUAMI");
+        return false;
+    };
+    let Ok((nrf_host, nrf_port)) = parse_uri_host_port(&nrf_uri) else {
+        return false;
+    };
+    let client = ctx.get_client(&nrf_host, nrf_port).await;
+    let path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=PCF&target-nf-instance-id={}",
+        percent_encode(nf_instance_id)
+    );
+    let Ok(response) = client.get(&path).await else {
+        return false;
+    };
+    if response.status != 200 {
+        return false;
+    }
+    let Some(json) = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    else {
+        return false;
+    };
+    json.get("nfInstances")
+        .and_then(|v| v.as_array())
+        .is_some_and(|list| {
+            list.iter().any(|nf| {
+                nf.get("nfInstanceId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| {
+                        nextgcore_sbi::owner_binding::same_nf_instance_id(id, nf_instance_id)
+                    })
+                    && nf
+                        .get("nfType")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| t.eq_ignore_ascii_case("AMF"))
+                    && instance_serves_guami(nf, guami)
+            })
+        })
+}
+
 /// Resolve the serving AMF's `namf-comm` endpoint for `pol_asso_id` and log which
 /// rule chose it (#92).
 ///

@@ -626,6 +626,10 @@ struct SbiService<H: SbiRequestHandler> {
     /// callback-exemption decision and (#1611) copied onto every request as
     /// [`SbiRequest::peer_cert_nf_types`].
     peer_cert_nf_types: Vec<String>,
+    /// #1990: a verified client certificate was presented on this connection.
+    peer_cert_present: bool,
+    /// #2000: [`SbiRequest::peer_cert_uri_sans`] of that certificate.
+    peer_cert_uri_sans: Vec<String>,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
@@ -642,6 +646,8 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             tls_exporter_secret: self.tls_exporter_secret.clone(),
             peer_cert_nf_instance_id: self.peer_cert_nf_instance_id.clone(),
             peer_cert_nf_types: self.peer_cert_nf_types.clone(),
+            peer_cert_present: self.peer_cert_present,
+            peer_cert_uri_sans: self.peer_cert_uri_sans.clone(),
             server_identity: self.server_identity.clone(),
             overload_reporter: self.overload_reporter.clone(),
         }
@@ -660,6 +666,8 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let tls_exporter_secret = self.tls_exporter_secret.clone();
         let peer_cert_nf_instance_id = self.peer_cert_nf_instance_id.clone();
         let peer_cert_nf_types = self.peer_cert_nf_types.clone();
+        let peer_cert_present = self.peer_cert_present;
+        let peer_cert_uri_sans = self.peer_cert_uri_sans.clone();
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
@@ -692,6 +700,8 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         // #1611: the verified leaf's RFC 9310 NF types travel with
                         // the request (the NRF binds an NFRegister's nfType to them).
                         request.peer_cert_nf_types = peer_cert_nf_types.clone();
+                        request.peer_cert_present = peer_cert_present;
+                        request.peer_cert_uri_sans = peer_cert_uri_sans.clone();
                         request
                     }
                     Err(ConvertRequestError::BodyTooLarge) => {
@@ -976,13 +986,20 @@ impl Http2Limits {
 /// An SBI resource URI is `{apiRoot}/{apiName}/{apiVersion}/{apiSpecificResourceUriPart}`
 /// (TS 29.501 §4.4.1), a sequence of non-empty segments. Refused:
 /// - an empty segment (`//`, a leading `//`, a trailing `/`);
-/// - a dot segment, `.` or `..`, also percent-encoded (RFC 3986 §3.3, §6.2.2.2);
-/// - a percent-encoded `/` or `\` inside a segment, which a router that decodes
-///   would split where the scope check did not.
+/// - a dot segment, `.` or `..`, also percent-encoded (RFC 3986 §3.3, §6.2.2.2).
 ///
 /// The bare root `/` is accepted. So every NF router and every per-path check
 /// (resource scopes, callback exemptions) sees the same segments, whichever way
 /// each one splits.
+///
+/// #1939 item 1: a percent-encoded `/` (`%2F`) or `\` (`%5C`) INSIDE a segment
+/// is accepted. TS 29.501 §5.2 has a resource URI variable that is a free-form
+/// string carry such characters percent-encoded (TS 29.519 `{appId}`, TS 29.122
+/// `{scsAsId}` / `{afId}`, TS 29.522 `{afId}`), and no router or per-path check
+/// in this tree decodes a path before splitting it (they all split on the raw
+/// `/` and compare raw segments), so an encoded separator is one segment to
+/// every one of them. A future router that decodes a path must decode AFTER
+/// splitting, segment by segment, or it reintroduces #1934's disagreement.
 pub fn path_segment_refusal(path: &str) -> Option<String> {
     let rest = path.strip_prefix('/').unwrap_or(path);
     if rest.is_empty() {
@@ -992,11 +1009,7 @@ pub fn path_segment_refusal(path: &str) -> Option<String> {
         if segment.is_empty() {
             return Some("an empty segment".to_string());
         }
-        let lower = segment.to_ascii_lowercase();
-        if lower.contains("%2f") || lower.contains("%5c") {
-            return Some("an encoded path separator in a segment".to_string());
-        }
-        let decoded = lower.replace("%2e", ".");
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
         if decoded == "." || decoded == ".." {
             return Some("a dot segment".to_string());
         }
@@ -1197,6 +1210,8 @@ async fn convert_request(
         // runs before authorization, so it cannot know it here.
         oauth2_subject: None,
         oauth2_scope: None,
+        peer_cert_present: false,
+        peer_cert_uri_sans: Vec::new(),
     })
 }
 
@@ -1670,6 +1685,27 @@ impl SbiServer {
                                                         })
                                                         .unwrap_or_default()
                                                 };
+                                                // #1990: whether any verified client
+                                                // certificate was presented at all.
+                                                let peer_cert_present = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .is_some_and(|chain| !chain.is_empty())
+                                                };
+                                                // #2000: all of its URI SANs.
+                                                let peer_cert_uri_sans = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .map(|leaf| {
+                                                            crate::peer_cert::uri_sans_from_der(
+                                                                leaf.as_ref(),
+                                                            )
+                                                        })
+                                                        .unwrap_or_default()
+                                                };
                                                 let service = SbiService {
                                                     handler: handler_ref,
                                                     oauth: oauth_ref,
@@ -1677,6 +1713,8 @@ impl SbiServer {
                                                     tls_exporter_secret,
                                                     peer_cert_nf_instance_id,
                                                     peer_cert_nf_types,
+                                                    peer_cert_present,
+                                                    peer_cert_uri_sans,
                                                     server_identity: server_identity_ref,
                                                     overload_reporter:
                                                         overload_reporter_ref,
@@ -1711,6 +1749,8 @@ impl SbiServer {
                                         tls_exporter_secret: None,
                                         peer_cert_nf_instance_id: None,
                                         peer_cert_nf_types: Vec::new(),
+                                        peer_cert_present: false,
+                                        peer_cert_uri_sans: Vec::new(),
                                         server_identity: server_identity_ref,
                                         overload_reporter: overload_reporter_ref,
                                     };
@@ -3949,6 +3989,9 @@ mod oauth2_callback_exemption_tests {
             "/nnsacf-nsac/v1/slices/local-configs/update",
             "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription",
             "/a/b.c/..d/x%20y",
+            // #1939 item 1: an encoded separator inside an identifier.
+            "/nudr-dr/v2/application-data/pfds/vendor%2Fapp",
+            "/nnef-pfdmanagement/v1/applications/a%5Cb",
         ] {
             assert_eq!(path_segment_refusal(ok), None, "{ok}");
         }
@@ -3960,8 +4003,7 @@ mod oauth2_callback_exemption_tests {
             "/nnsacf-nsac/v1/slices/./local-configs/update",
             "/nnsacf-nsac/v1/x/../slices/local-configs/update",
             "/nnsacf-nsac/v1/%2e%2E/slices",
-            "/nnsacf-nsac/v1/slices/local-configs%2Fupdate",
-            "/nnsacf-nsac/v1/slices%5clocal-configs",
+            "/nnsacf-nsac/v1/%2E/slices",
         ] {
             assert!(path_segment_refusal(bad).is_some(), "{bad}");
         }

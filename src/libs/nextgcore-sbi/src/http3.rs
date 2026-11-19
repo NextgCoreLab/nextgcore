@@ -171,6 +171,25 @@ where
 {
     let (parts, ()) = request.into_parts();
 
+    // #1939 item 2: the same path check the HTTP/2 server makes before routing
+    // (#1934), so this transport cannot reintroduce a router / scope-check
+    // disagreement once it is wired.
+    if crate::server::path_segment_refusal(parts.uri.path()).is_some() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .body(())
+            .map_err(|e| SbiError::ServerError(format!("h3 400 build: {e}")))?;
+        stream
+            .send_response(response)
+            .await
+            .map_err(|e| SbiError::ConnectionError(format!("h3 send_response: {e}")))?;
+        stream
+            .finish()
+            .await
+            .map_err(|e| SbiError::ConnectionError(format!("h3 finish: {e}")))?;
+        return Ok(());
+    }
+
     // Mirror the HTTP/2 server's convert_request: headers into the message
     // map, correlation-ID extraction, query string split into params (and
     // stripped from the URI), then TS 29.501 URI decomposition.
@@ -241,6 +260,8 @@ where
         // HTTP/2 server fills them from mTLS and `OAuth2Verifier::authorize`.
         peer_cert_nf_instance_id: None,
         peer_cert_nf_types: Vec::new(),
+        peer_cert_present: false,
+        peer_cert_uri_sans: Vec::new(),
         oauth2_subject: None,
         oauth2_scope: None,
     };
@@ -455,6 +476,40 @@ mod tests {
         .await
         .expect("http3 server");
         (server, cert_der)
+    }
+
+    static SEEN_1939: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_handler(
+        _request: SbiRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SbiResponse> + Send>> {
+        SEEN_1939.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { SbiResponse::ok() })
+    }
+
+    /// #1939 item 2: the HTTP/3 transport refuses the malformed paths the HTTP/2
+    /// server refuses (#1934), 400 before the handler runs, and serves a
+    /// well-formed one.
+    #[tokio::test]
+    async fn http3_refuses_a_malformed_path_before_the_handler_1939() {
+        let (server, cert_der) = start_http3(counting_handler).await;
+        let client = Http3Client::connect(server.local_addr(), &cert_der)
+            .await
+            .expect("connect");
+        let before = SEEN_1939.load(std::sync::atomic::Ordering::SeqCst);
+        for bad in [
+            "/nbench/v1//fixed",
+            "/nbench/v1/fixed/",
+            "/nbench/v1/../fixed",
+        ] {
+            let (status, _, _) = client.get_raw(bad).await.expect("answered");
+            assert_eq!(status, 400, "{bad}");
+        }
+        assert_eq!(SEEN_1939.load(std::sync::atomic::Ordering::SeqCst), before);
+        let (status, _, _) = client.get_raw("/nbench/v1/fixed").await.expect("answered");
+        assert_eq!(status, 200);
+        client.close().await;
+        server.stop().await;
     }
 
     #[tokio::test]

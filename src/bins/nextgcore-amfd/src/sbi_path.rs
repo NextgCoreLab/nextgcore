@@ -862,6 +862,11 @@ pub fn amf_sbi_send_request(_nf_instance_id: &str, _xact: &SbiXact) -> SbiResult
 
 /// Discover NF endpoint for the given service type using SbiContext cache + env var fallback
 fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // #1974: the AUSF endpoint is process-global; see `test_support::AUSF_ENV_LOCK`.
+    #[cfg(test)]
+    if matches!(service_type, SbiServiceType::NausfAuth) {
+        crate::test_support::assert_ausf_env_lock_held();
+    }
     // Map AMF SbiServiceType to nextgcore_sbi SbiServiceType and env var names
     let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
@@ -2398,6 +2403,11 @@ pub async fn call_ausf_5g_aka_confirm(
 /// Unlike `resolve_nf_endpoint`, this is safe to call from async context
 /// (no `Handle::block_on`).
 pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // #1974: the AUSF endpoint is process-global; see `test_support::AUSF_ENV_LOCK`.
+    #[cfg(test)]
+    if matches!(service_type, SbiServiceType::NausfAuth) {
+        crate::test_support::assert_ausf_env_lock_held();
+    }
     let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
             nextgcore_sbi::types::SbiServiceType::NausfAuth,
@@ -4522,8 +4532,60 @@ pub async fn call_nsacf_ue_decrease(
     snssai_sd: Option<u32>,
     access_type: &str,
 ) -> crate::nsac::Outcome {
+    // #1945: bounded by the NSAC module's own timeouts, which an INCREASE's wait
+    // for this DECREASE covers, not by the SBI client's 30 s default.
+    let client = crate::attach_oauth2(
+        SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(nsacf_host, nsacf_port)
+                .with_max_response_body(max_response_body_for(nextgcore_sbi::types::NfType::Nsacf))
+                .with_connect_timeout(crate::nsac::DECREASE_CONNECT_TIMEOUT)
+                .with_request_timeout(crate::nsac::DECREASE_REQUEST_TIMEOUT),
+        ),
+        nextgcore_sbi::types::NfType::Nsacf,
+    );
+    nsacf_ue_decrease_bounded(&client, nf_id, supi, snssai_sst, snssai_sd, access_type).await
+}
+
+/// #2005 (R32 on #2002): one DECREASE on `client`, its OAuth2 token fetch
+/// included, within [`crate::nsac::DECREASE_BOUND`]. The client's connect and
+/// request timeouts bound only the NSACF exchange; a slow NRF answering the
+/// token request could push the DECREASE past an INCREASE's 10 s wait for it,
+/// so the whole call is bounded, and running out is `Failed` (parked).
+pub(crate) async fn nsacf_ue_decrease_bounded(
+    client: &SbiClient,
+    nf_id: &str,
+    supi: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<u32>,
+    access_type: &str,
+) -> crate::nsac::Outcome {
+    match tokio::time::timeout(
+        crate::nsac::DECREASE_BOUND,
+        nsacf_ue_decrease_on(client, nf_id, supi, snssai_sst, snssai_sd, access_type),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            log::warn!(
+                "[{supi}] NSACF DECREASE for SST={snssai_sst} not done within {:?} (token \
+                 fetch included)",
+                crate::nsac::DECREASE_BOUND
+            );
+            crate::nsac::Outcome::Failed
+        }
+    }
+}
+
+async fn nsacf_ue_decrease_on(
+    client: &SbiClient,
+    nf_id: &str,
+    supi: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<u32>,
+    access_type: &str,
+) -> crate::nsac::Outcome {
     use crate::nsac::Outcome;
-    let client = peer_client(nextgcore_sbi::types::NfType::Nsacf, nsacf_host, nsacf_port);
     let mut snssai = serde_json::json!({ "sst": snssai_sst });
     if let Some(sd) = snssai_sd {
         snssai["sd"] = serde_json::Value::String(format!("{sd:06X}"));
@@ -5223,6 +5285,53 @@ async fn update_sm_context_ho_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2005 (R32 on #2002): a DECREASE whose OAuth2 token request the NRF
+    /// never answers is given up within `DECREASE_BOUND` (connect + request,
+    /// 7 s), inside an INCREASE's 10 s wait for it, and parked (`Failed`). The
+    /// client's own connect/request timeouts bound only the NSACF exchange; the
+    /// token fetch has its own 5 s + 10 s.
+    /// REVERT-VERIFIED: without the bound around the whole call, the token fetch
+    /// runs its 10 s and the DECREASE overruns the INCREASE's wait.
+    #[tokio::test]
+    async fn a_decrease_waiting_on_its_token_is_bounded_2005() {
+        // An NRF (and an NSACF) that accept the connection and never answer.
+        let nrf = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let nsacf = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SbiClient::new(
+            nextgcore_sbi::client::SbiClientConfig::new(
+                "127.0.0.1",
+                nsacf.local_addr().unwrap().port(),
+            )
+            .with_connect_timeout(crate::nsac::DECREASE_CONNECT_TIMEOUT)
+            .with_request_timeout(crate::nsac::DECREASE_REQUEST_TIMEOUT),
+        )
+        .with_oauth2(
+            nextgcore_sbi::test_support::oauth2::oauth2_client_for(
+                nrf.local_addr().unwrap().port(),
+                nextgcore_sbi::types::NfType::Amf,
+            ),
+            nextgcore_sbi::types::NfType::Nsacf,
+        );
+        let started = std::time::Instant::now();
+        let outcome = nsacf_ue_decrease_bounded(
+            &client,
+            "amf-2005",
+            "imsi-001010000002005",
+            1,
+            None,
+            "3GPP_ACCESS",
+        )
+        .await;
+        let took = started.elapsed();
+        assert_eq!(outcome, crate::nsac::Outcome::Failed);
+        assert!(
+            took < crate::nsac::DECREASE_BOUND + std::time::Duration::from_millis(1500),
+            "the DECREASE took {took:?}, past its {:?} bound",
+            crate::nsac::DECREASE_BOUND
+        );
+        drop((nrf, nsacf));
+    }
 
     /// #1329 follow-up, review MINOR 1: which failed peer updates are tried again, and
     /// after how long. A definitive 4xx is not; a 5xx, a 429, a 503 and a transport

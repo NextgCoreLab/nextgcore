@@ -23,7 +23,11 @@
 //!   `abandoned`); a pass sends for at most [`MAX_PASS`]. A parked DECREASE whose
 //!   (SUPI, access type, S-NSSAI) has been admitted again since is `superseded` and
 //!   not sent: the NSACF counts a UE once, so it would count the live registration
-//!   out.
+//!   out. No NSACF starves the others (#1961, the #1954 / #1972 pattern): once a
+//!   DECREASE to an NSACF fails it backs off ([`BACKOFF_BASE`], doubling to
+//!   [`BACKOFF_MAX`]) and its other DECREASEs wait, in this pass and later ones; one
+//!   tried and failed goes to the BACK of the queue, one not reached keeps its place
+//!   at the front; one parked longer than [`MAX_AGE`] ends as `expired`.
 //!
 //! Ceiling: memory-only. amfd has no durable store for its UE contexts either, so a
 //! restart forgets both the registrations and the DECREASEs they owe; the NSACF's
@@ -102,6 +106,9 @@ struct Ops {
 struct Flight {
     done: std::sync::atomic::AtomicBool,
     changed: tokio::sync::Notify,
+    /// #1945: an INCREASE for the key stopped waiting for this DECREASE and was
+    /// sent anyway, so the NSACF may apply this DECREASE after it.
+    overtaken: std::sync::atomic::AtomicBool,
 }
 
 impl Flight {
@@ -110,6 +117,8 @@ impl Flight {
         self.changed.notify_waiters();
     }
 
+    /// Wait for this DECREASE until `until`. Gave up: marked overtaken, so the
+    /// DECREASE re-counts the key when it lands (#1945).
     async fn wait(&self, until: tokio::time::Instant) {
         loop {
             let notified = self.changed.notified();
@@ -119,6 +128,8 @@ impl Flight {
                 return;
             }
             if tokio::time::timeout_at(until, notified).await.is_err() {
+                self.overtaken
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
         }
@@ -130,14 +141,99 @@ fn ops() -> &'static Mutex<Ops> {
     &OPS
 }
 
-/// The longest an INCREASE waits for a DECREASE of its key on the wire: the SBI
-/// client's request timeout bounds the DECREASE, with room to spare.
+/// How long a DECREASE may take to connect, then to be answered (#1945): its own
+/// client is bounded by these, rather than by the SBI client's 30 s default, so
+/// the INCREASE's wait below covers it.
+pub const DECREASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DECREASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// #2005 (R32 on #2002): the whole DECREASE call, its OAuth2 token fetch
+/// included, finishes within this, so an INCREASE's [`DECREASE_WAIT`] covers it.
+pub const DECREASE_BOUND: Duration =
+    Duration::from_secs(DECREASE_CONNECT_TIMEOUT.as_secs() + DECREASE_REQUEST_TIMEOUT.as_secs());
+
+/// The longest an INCREASE waits for a DECREASE of its key on the wire. #1945: it
+/// covers the DECREASE's own bound (connect, then request), so in the ordinary
+/// case the DECREASE has landed or given up before the INCREASE goes. A DECREASE
+/// the NSACF still applies after that (it got the request and was slow) is caught
+/// by the overtaken re-count in [`decrease_once`].
+#[cfg(not(test))]
 const DECREASE_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const DECREASE_WAIT: Duration = Duration::from_secs(1);
+
+#[cfg(not(test))]
+const _: () = assert!(
+    DECREASE_WAIT.as_millis() > DECREASE_BOUND.as_millis(),
+    "an INCREASE's wait must cover a DECREASE's own timeout (#1945)"
+);
 
 /// The parked DECREASEs, oldest first.
-fn pending() -> &'static Mutex<VecDeque<Admission>> {
-    static PENDING: Mutex<VecDeque<Admission>> = Mutex::new(VecDeque::new());
+fn pending() -> &'static Mutex<VecDeque<Parked>> {
+    static PENDING: Mutex<VecDeque<Parked>> = Mutex::new(VecDeque::new());
     &PENDING
+}
+
+/// One parked DECREASE, and when it was first parked (#1961).
+#[derive(Debug, Clone)]
+struct Parked {
+    a: Admission,
+    /// Wall-clock, so a test can set it back past [`MAX_AGE`].
+    since: std::time::SystemTime,
+}
+
+/// #1961: how long an entry stays parked before it is given up (`expired`): a
+/// peer that has not answered for a day is gone (decommissioned), not
+/// restarting, so its entries end rather than wait to be evicted.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// #1961 (the #1954 / #1972 pattern): the first wait before a peer whose
+/// request failed is tried again, doubled after each further failure up to
+/// [`BACKOFF_MAX`], and cleared by a success. A peer that is backing off is
+/// skipped for the rest of the pass and for later passes until its wait ends,
+/// so a blackholed peer costs one request timeout per backoff period and
+/// cannot starve the entries for healthy peers behind it.
+#[cfg(not(test))]
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
+/// The longest a failing peer is left alone between attempts.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
+
+/// Per peer: when it may next be tried, and the current backoff.
+fn backoff() -> &'static Mutex<Backoff> {
+    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
+        std::sync::LazyLock::new(Default::default);
+    &BACKOFF
+}
+
+fn backing_off(peer: &str) -> bool {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
+}
+
+fn note_failure(peer: &str) {
+    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    let wait = map
+        .get(peer)
+        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
+    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
+}
+
+fn note_success(peer: &str) {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(peer);
+}
+
+/// The peer a DECREASE goes to: the NSACF that granted the admission.
+fn peer_of(a: &Admission) -> String {
+    format!("{}:{}", a.nsacf_host, a.nsacf_port)
 }
 
 /// Serialises the tests that touch [`admissions`] and [`pending`]: one test's
@@ -154,9 +250,14 @@ pub static DECREASES: nextgcore_metrics::nf::CounterFamily =
         &["result"],
     );
 
+/// `amf_nsac_ue_recounts_total`: INCREASEs re-sent because a DECREASE of the same
+/// key landed after a re-registration's INCREASE (#1945).
+pub static RECOUNTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `amf_nsac_ue_decreases_reconciled_total{result}`: parked DECREASEs the
 /// reconciler ended: `delivered`, `superseded` (admitted again since), `refused`
-/// (a 4xx a retry cannot change) or `abandoned` (evicted at the bound).
+/// (a 4xx a retry cannot change), `abandoned` (evicted at the bound) or `expired`
+/// (parked longer than [`MAX_AGE`], #1961).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "amf_nsac_ue_decreases_reconciled_total",
@@ -197,23 +298,34 @@ pub fn take(supi: &str, access_type: &str, keep: &[SNssai]) -> Vec<Admission> {
 /// What [`admit_registration`] decided.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Admitted {
-    /// The last answer's admission (`AmfUe::slice_admission_granted`).
+    /// Whether any S-NSSAI was admitted (`AmfUe::slice_admission_granted`).
     pub granted: bool,
-    /// The S-NSSAI the NSACF denied, if one was: the registration is rejected.
-    pub denied: Option<SNssai>,
+    /// #1942: the S-NSSAIs the NSACF denied (maximum number of UEs reached), or
+    /// whose admission could not be performed. They are rejected, the rest of the
+    /// registration goes on (TS 23.502 §4.2.11.2, TS 24.501 §5.5.1.2.4); only when
+    /// every one is rejected is the registration.
+    pub rejected: Vec<SNssai>,
 }
 
-/// Count a registering UE in at the NSACF on each S-NSSAI of `allowed`, in order,
-/// stopping at the first denial (TS 23.502 §4.2.11.2, TS 29.536 §5.2.2.2).
+impl Admitted {
+    /// Every S-NSSAI of `allowed` was rejected: the registration is.
+    pub fn all_rejected(&self, allowed: &[SNssai]) -> bool {
+        allowed.iter().all(|s| self.rejected.contains(s))
+    }
+}
+
+/// Count a registering UE in at the NSACF on each S-NSSAI of `allowed`, in order
+/// (TS 23.502 §4.2.11.2, TS 29.536 §5.2.2.2). #1942: a denial rejects that
+/// S-NSSAI only; the others are still asked for.
 ///
 /// #1876:
 /// - each count the NSACF took is [`record`]ed, so a deregistration undoes it;
 /// - an INCREASE that got no answer at all is reconciled with a precautionary
 ///   DECREASE, not parked (a DECREASE of a UE the NSACF does not hold is a no-op);
-/// - on a denial the UE is rejected, so EVERY admission it holds on this access is
-///   counted out again, the ones this request took included (they used to stay);
-/// - otherwise an S-NSSAI it held and no longer has in `allowed` is counted out
-///   ("removed from the Allowed NSSAI").
+/// - when every S-NSSAI is rejected the UE is, so EVERY admission it holds on this
+///   access is counted out again;
+/// - otherwise an S-NSSAI it held and no longer has in its Allowed NSSAI (`allowed`
+///   less the rejected ones) is counted out ("removed from the Allowed NSSAI").
 pub async fn admit_registration(
     supi: &str,
     access_type: &str,
@@ -223,7 +335,7 @@ pub async fn admit_registration(
     nf_id: &str,
 ) -> Admitted {
     let mut granted = false;
-    let mut denied = None;
+    let mut rejected = Vec::new();
     let mut unanswered = Vec::new();
     for snssai in allowed {
         let admission = Admission {
@@ -279,15 +391,14 @@ pub async fn admit_registration(
         spawn_decreases(owed);
         match answer {
             Ok(res) => {
-                granted = res.admitted;
+                granted |= res.admitted;
                 if res.counted {
                     record(admission);
                 } else if res.unanswered {
                     unanswered.push(admission);
                 }
                 if !res.admitted {
-                    denied = Some(snssai.clone());
-                    break;
+                    rejected.push(snssai.clone());
                 }
             }
             Err(e) => {
@@ -297,9 +408,7 @@ pub async fn admit_registration(
                     "[{supi}] NSACF UE admission query failed for SST={}: {e}",
                     snssai.sst
                 );
-                granted = false;
-                denied = Some(snssai.clone());
-                break;
+                rejected.push(snssai.clone());
             }
         }
     }
@@ -311,13 +420,13 @@ pub async fn admit_registration(
             let _ = decrease_once(a).await;
         });
     }
-    let gone = if denied.is_some() {
-        take(supi, access_type, &[])
-    } else {
-        take(supi, access_type, allowed)
-    };
-    spawn_decreases(gone);
-    Admitted { granted, denied }
+    let kept: Vec<SNssai> = allowed
+        .iter()
+        .filter(|s| !rejected.contains(s))
+        .cloned()
+        .collect();
+    spawn_decreases(take(supi, access_type, &kept));
+    Admitted { granted, rejected }
 }
 
 /// How a DECREASE ended.
@@ -367,7 +476,78 @@ async fn decrease_once(a: Admission) -> Outcome {
         }
     }
     flight.finish();
+    // #1945: an INCREASE for the key went before this DECREASE landed, so the NSACF
+    // may have applied this one last and counted the re-registered UE out. Once the
+    // INCREASE is settled, a key admitted again is counted in once more (an INCREASE
+    // of a UE the NSACF holds is idempotent).
+    if outcome != Outcome::Failed && flight.overtaken.load(std::sync::atomic::Ordering::SeqCst) {
+        spawn_recount(key);
+    }
     outcome
+}
+
+/// #1945: once no INCREASE for `key` is being decided (bounded), re-send the
+/// INCREASE for its live admission, if it has one.
+fn spawn_recount(key: Key) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let deadline = tokio::time::Instant::now() + DECREASE_WAIT + DECREASE_REQUEST_TIMEOUT;
+        while lock(ops()).admitting.contains_key(&key) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // #2005 (R32 on #2002): the re-count is an INCREASE like any other, so it
+        // registers as being admitted under the admissions lock, in the same step
+        // as reading the live admission. A deregistration in the window then
+        // finds it, and its DECREASE is handed to the re-count and sent once the
+        // re-count's INCREASE is settled, instead of possibly landing first and
+        // leaving the NSACF counting a UE the AMF has already dropped.
+        let (live, flights) = {
+            let admitted = lock(admissions());
+            let Some(live) = admitted.get(&key).cloned() else {
+                return;
+            };
+            let mut ops = lock(ops());
+            if ops.admitting.contains_key(&key) {
+                // Another INCREASE of the key is being decided: it counts the UE.
+                return;
+            }
+            ops.admitting.entry(key.clone()).or_default();
+            (live, ops.in_flight.get(&key).cloned().unwrap_or_default())
+        };
+        let until = tokio::time::Instant::now() + DECREASE_WAIT;
+        for f in flights {
+            f.wait(until).await;
+        }
+        log::warn!(
+            "[{}] NSACF DECREASE for SST={} SD={:?} may have landed after its \
+             re-registration's INCREASE; counting the UE in again",
+            live.supi,
+            live.snssai.sst,
+            live.snssai.sd
+        );
+        RECOUNTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = crate::sbi_path::call_nsacf_ue_admission(
+            &live.nsacf_host,
+            live.nsacf_port,
+            &live.nf_id,
+            &live.supi,
+            live.snssai.sst,
+            live.snssai.sd,
+            &live.access_type,
+            true,
+        )
+        .await;
+        // The DECREASEs superseded while the re-count was out (the UE
+        // deregistered, or its S-NSSAI was removed): the re-count does not own
+        // the admission, so every one is still owed and is sent now, after it.
+        let owed = {
+            let _admitted = lock(admissions());
+            lock(ops()).admitting.remove(&key).unwrap_or_default()
+        };
+        spawn_decreases(owed);
+    });
 }
 
 /// Count `admissions` out, off the caller's path; a failure is parked.
@@ -418,9 +598,9 @@ async fn send(a: &Admission) -> Outcome {
     .await
 }
 
-fn evict(set: &mut VecDeque<Admission>) {
+fn evict(set: &mut VecDeque<Parked>) {
     while set.len() > MAX_PENDING {
-        if let Some(old) = set.pop_front() {
+        if let Some(Parked { a: old, .. }) = set.pop_front() {
             log::error!(
                 "[{}] NSACF DECREASE for SST={} SD={:?} abandoned: {MAX_PENDING} are already \
                  pending; the UE stays counted at the NSACF",
@@ -436,7 +616,7 @@ fn evict(set: &mut VecDeque<Admission>) {
 /// Park a DECREASE that failed. One already parked is not parked twice.
 pub fn park(a: Admission) {
     let mut set = lock(pending());
-    if set.contains(&a) {
+    if set.iter().any(|p| p.a == a) {
         return;
     }
     log::warn!(
@@ -446,7 +626,10 @@ pub fn park(a: Admission) {
         a.snssai.sst,
         a.snssai.sd
     );
-    set.push_back(a);
+    set.push_back(Parked {
+        a,
+        since: std::time::SystemTime::now(),
+    });
     evict(&mut set);
 }
 
@@ -458,19 +641,38 @@ pub fn pending_count() -> usize {
 /// The parked DECREASEs, for tests.
 #[cfg(test)]
 pub fn parked() -> Vec<Admission> {
-    lock(pending()).iter().cloned().collect()
+    lock(pending()).iter().map(|p| p.a.clone()).collect()
 }
 
 /// One reconcile pass over the parked DECREASEs, oldest first, for at most
-/// [`MAX_PASS`]. Returns how many ended.
+/// [`MAX_PASS`]. One older than [`MAX_AGE`] ends as `expired`.
+///
+/// #1961: once a DECREASE to an NSACF fails, that NSACF backs off and its other
+/// DECREASEs are not tried this pass (nor until the backoff ends); one tried and
+/// failed goes to the BACK of the queue, one not reached keeps its place at the
+/// FRONT. Returns how many ended.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<Admission> = lock(pending()).drain(..).collect();
+    let batch: Vec<Parked> = lock(pending()).drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut still = Vec::new();
-    for a in batch {
-        if tokio::time::Instant::now() >= deadline {
-            still.push(a);
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for p in batch {
+        let a = &p.a;
+        if p.since.elapsed().unwrap_or_default() > MAX_AGE {
+            log::error!(
+                "[{}] parked NSACF DECREASE for SST={} SD={:?} expired after {MAX_AGE:?}",
+                a.supi,
+                a.snssai.sst,
+                a.snssai.sd
+            );
+            RECONCILED.inc(&["expired"]);
+            ended += 1;
+            continue;
+        }
+        let peer = peer_of(a);
+        if tokio::time::Instant::now() >= deadline || backing_off(&peer) {
+            untried.push(p);
             continue;
         }
         let result = match decrease_once(a.clone()).await {
@@ -478,10 +680,12 @@ pub async fn reconcile_once() -> usize {
             Outcome::Accepted => "delivered",
             Outcome::Refused => "refused",
             Outcome::Failed => {
-                still.push(a);
+                note_failure(&peer);
+                failed.push(p);
                 continue;
             }
         };
+        note_success(&peer);
         log::info!(
             "[{}] parked NSACF DECREASE for SST={} SD={:?}: {result}",
             a.supi,
@@ -492,9 +696,14 @@ pub async fn reconcile_once() -> usize {
         ended += 1;
     }
     let mut set = lock(pending());
-    for a in still.into_iter().rev() {
-        if !set.contains(&a) {
-            set.push_front(a);
+    for p in untried.into_iter().rev() {
+        if !set.iter().any(|q| q.a == p.a) {
+            set.push_front(p);
+        }
+    }
+    for p in failed {
+        if !set.iter().any(|q| q.a == p.a) {
+            set.push_back(p);
         }
     }
     evict(&mut set);
@@ -533,6 +742,14 @@ pub fn render(out: &mut String) {
     let _ = writeln!(out, "amf_nsac_ue_decreases_pending {}", pending_count());
     DECREASES.render(out);
     RECONCILED.render(out);
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "amf_nsac_ue_recounts_total",
+        "counter",
+        "NSAC INCREASEs re-sent because a DECREASE of the same UE and S-NSSAI may have landed \
+         after a re-registration's INCREASE",
+        RECOUNTS.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
 
 /// Forget every admission and parked DECREASE (a test's own, before and after it).
@@ -540,6 +757,7 @@ pub fn render(out: &mut String) {
 pub fn clear_for_test() {
     lock(admissions()).clear();
     lock(pending()).clear();
+    lock(backoff()).clear();
     let mut ops = lock(ops());
     ops.in_flight.clear();
     ops.admitting.clear();
@@ -617,42 +835,81 @@ pub(crate) mod tests {
         get()
     }
 
-    /// #1876: a registration denied on its second S-NSSAI counts the UE out of the
-    /// first again: the UE is rejected, so it holds no slice.
+    /// #1942: a registration denied on its second S-NSSAI rejects that S-NSSAI
+    /// only: the first stays admitted and counted, and the NSACF is asked about the
+    /// third as well (TS 23.502 §4.2.11.2).
     ///
-    /// REVERT-VERIFIED: with the denial taking nothing back, this fails: no
-    /// DECREASE for SST 1, which stays counted.
+    /// REVERT-VERIFIED: with the loop stopping at the first denial again, this
+    /// fails: SST 3 is never asked for.
     #[tokio::test]
-    async fn a_denied_later_snssai_counts_the_earlier_grant_out_1876() {
+    async fn a_denied_snssai_is_rejected_and_the_others_kept_1942() {
         let _g = NSAC_TEST_LOCK.lock().await;
         clear_for_test();
         let (srv, port, seen) = nsacf(&[2], Arc::new(AtomicU16::new(204))).await;
-        let supi = "imsi-001010000018761";
+        let supi = "imsi-001010000019421";
+        let allowed = [snssai(1), snssai(2), snssai(3)];
 
-        let out = admit_registration(
+        let out =
+            admit_registration(supi, "3GPP_ACCESS", &allowed, "127.0.0.1", port, "amf-1942").await;
+        let decreased = decreases(&seen, 0).await;
+        let asked: Vec<u8> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(f, _)| f == "INCREASE")
+            .map(|(_, s)| *s)
+            .collect();
+        let held = (
+            is_admitted(supi, "3GPP_ACCESS", &snssai(1)),
+            is_admitted(supi, "3GPP_ACCESS", &snssai(3)),
+        );
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(out.rejected, vec![snssai(2)], "only SST 2 is rejected");
+        assert!(!out.all_rejected(&allowed));
+        assert_eq!(asked, vec![1, 2, 3], "every S-NSSAI is asked for");
+        assert_eq!(held, (true, true), "SST 1 and 3 stay admitted");
+        assert!(
+            decreased.is_empty(),
+            "nothing is counted out: {decreased:?}"
+        );
+    }
+
+    /// #1876, #1942: a registration whose every S-NSSAI is rejected is rejected, so
+    /// whatever the UE was admitted to before is counted out.
+    ///
+    /// REVERT-VERIFIED: with nothing taken back when all are rejected, this fails:
+    /// no DECREASE for the earlier SST 3.
+    #[tokio::test]
+    async fn every_snssai_rejected_counts_the_ue_out_1876() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, seen) = nsacf(&[1, 2], Arc::new(AtomicU16::new(204))).await;
+        let supi = "imsi-001010000018761";
+        admit_registration(
             supi,
             "3GPP_ACCESS",
-            &[snssai(1), snssai(2)],
+            &[snssai(3)],
             "127.0.0.1",
             port,
             "amf-1876",
         )
         .await;
+        let allowed = [snssai(1), snssai(2)];
+
+        let out =
+            admit_registration(supi, "3GPP_ACCESS", &allowed, "127.0.0.1", port, "amf-1876").await;
         let decreased = decreases(&seen, 1).await;
-        let held = is_admitted(supi, "3GPP_ACCESS", &snssai(1));
+        let held = is_admitted(supi, "3GPP_ACCESS", &snssai(3));
         clear_for_test();
         srv.stop().await.ok();
 
-        assert_eq!(out.denied, Some(snssai(2)));
-        assert_eq!(decreased, vec![1], "SST 1 counted out again, and only it");
-        assert!(!held, "and no admission is held");
+        assert!(out.all_rejected(&allowed));
+        assert_eq!(decreased, vec![3], "the earlier SST 3 is counted out");
+        assert!(!held);
     }
 
-    /// #1876: a re-registration whose Allowed NSSAI drops an S-NSSAI counts the UE
-    /// out of it, and keeps the one still allowed.
-    ///
-    /// REVERT-VERIFIED: with `admit_registration` taking nothing back on success,
-    /// this fails: no DECREASE for SST 2.
     #[tokio::test]
     async fn an_snssai_removed_from_the_allowed_nssai_is_counted_out_1876() {
         let _g = NSAC_TEST_LOCK.lock().await;
@@ -708,7 +965,10 @@ pub(crate) mod tests {
         let parked_now = pending_count();
         clear_for_test();
 
-        assert!(out.granted && out.denied.is_none(), "degrade-open admits");
+        assert!(
+            out.granted && out.rejected.is_empty(),
+            "degrade-open admits"
+        );
         assert!(!held, "but counted nothing to undo");
         assert_eq!(
             parked_now, 0,
@@ -762,6 +1022,83 @@ pub(crate) mod tests {
             "two failures, then one delivered; none for `back`"
         );
         assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+    }
+
+    /// #1961: a peer that accepts the connection and never answers, so each
+    /// request to it costs the client's whole timeout. Returns its port; the
+    /// accepted sockets are held for the life of the test process.
+    fn blackhole_1961() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    fn admission_toward_1961(port: u16, supi: &str) -> Admission {
+        Admission {
+            supi: supi.to_string(),
+            access_type: "3GPP_ACCESS".to_string(),
+            snssai: snssai(1),
+            nf_id: "amf-1961".to_string(),
+            nsacf_host: "127.0.0.1".to_string(),
+            nsacf_port: port,
+        }
+    }
+
+    /// #1961: DECREASEs toward a blackholed NSACF ahead of one toward a healthy
+    /// NSACF no longer starve it: the healthy one is delivered within two passes,
+    /// and the blackholed ones stay parked.
+    /// REVERT-VERIFIED: with the old order restored (every not-ended DECREASE
+    /// re-parked at the front, no backoff), the healthy DECREASE is never reached
+    /// and "the healthy NSACF gets its DECREASE" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_nsacf_does_not_starve_a_healthy_one_1961() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let status = Arc::new(AtomicU16::new(204));
+        let (srv, port, seen) = nsacf(&[], status).await;
+        let dead = blackhole_1961();
+        for n in 0..3 {
+            park(admission_toward_1961(
+                dead,
+                &format!("imsi-00101000001961{n}"),
+            ));
+        }
+        park(admission_toward_1961(port, "imsi-001010000019619"));
+        let before = RECONCILED.get(&["delivered"]);
+        for _ in 0..2 {
+            reconcile_once().await;
+        }
+        let delivered = RECONCILED.get(&["delivered"]) - before;
+        let left = pending_count();
+        let hits = seen.lock().unwrap().len();
+        clear_for_test();
+        srv.stop().await.ok();
+        assert_eq!(delivered, 1, "the healthy NSACF gets its DECREASE");
+        assert_eq!(hits, 1);
+        assert_eq!(left, 3, "the blackholed ones stay parked");
+    }
+
+    /// #1961: a DECREASE parked longer than [`MAX_AGE`] ends as `expired`.
+    /// REVERT-VERIFIED: with the age check removed it is attempted and stays
+    /// parked.
+    #[tokio::test]
+    async fn a_decrease_older_than_max_age_expires_1961() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        park(admission_toward_1961(9, "imsi-001010000019618"));
+        lock(pending())[0].since = std::time::SystemTime::now() - MAX_AGE - Duration::from_secs(1);
+        let before = RECONCILED.get(&["expired"]);
+        reconcile_once().await;
+        let expired = RECONCILED.get(&["expired"]) - before;
+        let left = pending_count();
+        clear_for_test();
+        assert_eq!((expired, left), (1, 0));
     }
 
     /// A stand-in NSACF that APPLIES each request `delay` after it arrives, then
@@ -862,13 +1199,114 @@ pub(crate) mod tests {
         clear_for_test();
         srv.stop().await.ok();
 
-        assert!(out.denied.is_none());
+        assert!(out.rejected.is_empty());
         assert_eq!(
             order,
             ["DECREASE-applied", "INCREASE-applied"],
             "the DECREASE lands first"
         );
         assert!(held, "and the re-registered UE is counted");
+    }
+
+    /// #1945: a DECREASE the NSACF is slower to apply than the INCREASE's wait. The
+    /// re-registration's INCREASE goes after its wait and is applied first, then the
+    /// DECREASE counts the UE out; the AMF counts it in again once the DECREASE has
+    /// landed, so the UE ends counted.
+    ///
+    /// REVERT-VERIFIED: without the overtaken re-count, this fails: the NSACF's last
+    /// word is the DECREASE.
+    #[tokio::test]
+    async fn a_decrease_that_lands_after_the_increase_is_counted_in_again_1945() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, applied) =
+            slow_nsacf(Duration::ZERO, Duration::from_millis(1500), &[]).await;
+        let supi = "imsi-001010000019451";
+        record(admission_at(supi, 1, port));
+
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            port,
+            "amf-1945",
+        )
+        .await;
+        let order = applied_n(&applied, 3).await;
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert!(out.granted, "admitted");
+        assert_eq!(
+            order,
+            ["INCREASE-applied", "DECREASE-applied", "INCREASE-applied"],
+            "counted in again after the late DECREASE"
+        );
+    }
+
+    /// #2005 (R32 on #2002): a UE that deregisters while the late-DECREASE
+    /// re-count's INCREASE is on the wire ends counted OUT. Its deregistration's
+    /// DECREASE is handed to the re-count and sent after it, instead of being
+    /// sent at once and landing before the slower re-count INCREASE, which left
+    /// the NSACF counting a UE the AMF had dropped.
+    ///
+    /// Timeline (INCREASE 2 s, DECREASE 1.1 s): the first DECREASE lands at
+    /// 1.1 s, after the registration's 1 s wait, so it is overtaken; the
+    /// registration's INCREASE lands at 3 s; the re-count's INCREASE goes at 3 s
+    /// and lands at 5 s; the UE deregisters during it.
+    ///
+    /// REVERT-VERIFIED: without the re-count registering as being admitted, the
+    /// deregistration's DECREASE lands at about 4.3 s and the re-count INCREASE
+    /// at 5 s, so the NSACF's last word is an INCREASE and this fails.
+    #[tokio::test]
+    async fn a_deregistration_during_the_recount_is_counted_out_after_it_2005() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        clear_for_test();
+        let (srv, port, applied) = slow_nsacf(
+            Duration::from_millis(2000),
+            Duration::from_millis(1100),
+            &[],
+        )
+        .await;
+        let supi = "imsi-001010000020051";
+        record(admission_at(supi, 1, port));
+        let before = RECOUNTS.load(std::sync::atomic::Ordering::Relaxed);
+
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let out = admit_registration(
+            supi,
+            "3GPP_ACCESS",
+            &[snssai(1)],
+            "127.0.0.1",
+            port,
+            "amf-2005",
+        )
+        .await;
+        assert!(out.granted);
+        // The re-count's INCREASE is on the wire once the counter moves.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while RECOUNTS.load(std::sync::atomic::Ordering::Relaxed) == before
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The UE deregisters during the re-count.
+        spawn_decreases(take(supi, "3GPP_ACCESS", &[]));
+        let order = applied_n(&applied, 4).await;
+        clear_for_test();
+        srv.stop().await.ok();
+
+        assert_eq!(order.len(), 4, "{order:?}");
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("DECREASE-applied"),
+            "the NSACF's last word is the deregistration: {order:?}"
+        );
     }
 
     /// R27 #1940: a DECREASE that finds an INCREASE for its key being decided is
@@ -909,7 +1347,7 @@ pub(crate) mod tests {
             Outcome::Superseded,
             "not sent while the INCREASE is out"
         );
-        assert_eq!(out.denied, Some(snssai(1)));
+        assert_eq!(out.rejected, vec![snssai(1)]);
         assert_eq!(
             order,
             ["INCREASE-applied", "DECREASE-applied"],
