@@ -155,16 +155,19 @@ async fn main() -> Result<()> {
     // path, so an idle session reported nothing for as long as it stayed idle while
     // the SGW-C believed measurement was running (TS 29.244 §5.2.2.2).
     let usage_reports = tokio::spawn(pfcp.clone().usage_report_monitor(shutdown_rx));
+    let sgwu_metrics_addr = metrics_addr();
     match nextgcore_metrics::nes_energy::serve_metrics(
-        metrics_addr(),
+        sgwu_metrics_addr,
         std::sync::Arc::new(render_metrics),
     )
     .await
     {
         Ok((bound, _handle)) => log::info!("SGWU metrics endpoint on http://{bound}/metrics"),
-        // Non-fatal: an SGW-U that cannot expose metrics still carries traffic, and
-        // refusing to start would turn a busy port into a user-plane outage.
-        Err(e) => log::warn!("SGWU metrics endpoint not available: {e}"),
+        // #2056: fatal at start-up under the production profile, before the SGW-U
+        // carries anything; under dev it runs on without metrics.
+        Err(e) => {
+            nextgcore_metrics::nf::listener_bind_failed("SGWU", "metrics", sgwu_metrics_addr, &e)
+        }
     }
 
     log::info!(

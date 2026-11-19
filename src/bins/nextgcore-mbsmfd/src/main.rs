@@ -327,6 +327,7 @@ async fn main() -> Result<()> {
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
     let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    warn_ignored_debug_routes(sbi_profile);
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
         sbi_profile,
         require_oauth2,
@@ -555,7 +556,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             if debug_routes_enabled() =>
         {
             match method {
-                "DELETE" => handle_member_leave(session_id, supi).await,
+                "DELETE" => handle_member_leave(session_id, supi, &request).await,
                 _ => send_method_not_allowed(method, "mbs-sessions/{id}/members/{supi}"),
             }
         }
@@ -569,10 +570,33 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// Whether the non-spec debug routes (`/activate`, `/members*`) are exposed.
 /// Off by default so the SBI surface is exactly the TS 29.532 resource set;
 /// enabled by setting `MBSMF_DEBUG_ROUTES` (any non-empty value). [mbsmfd-10]
+///
+/// #1944 (R32 on #2057): never under the `production` SBI profile. The routes
+/// add any SUPI to a session and establish N4mb towards a `upfAddr` the body
+/// names, which no TS 29.532 operation lets a consumer do; the variable is
+/// ignored there (and [`warn_ignored_debug_routes`] says so at startup).
 fn debug_routes_enabled() -> bool {
-    std::env::var("MBSMF_DEBUG_ROUTES")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    debug_routes_allowed(
+        std::env::var("MBSMF_DEBUG_ROUTES").ok().as_deref(),
+        nextgcore_sbi::security::SbiProfile::resolve(),
+    )
+}
+
+/// [`debug_routes_enabled`] for a given variable value and SBI profile.
+fn debug_routes_allowed(value: Option<&str>, profile: nextgcore_sbi::security::SbiProfile) -> bool {
+    value.is_some_and(|v| !v.is_empty()) && !profile.is_production()
+}
+
+/// #1944 (R32 on #2057): a WARN at startup when `MBSMF_DEBUG_ROUTES` is set
+/// under the production profile, where it is ignored.
+fn warn_ignored_debug_routes(profile: nextgcore_sbi::security::SbiProfile) {
+    let set = std::env::var("MBSMF_DEBUG_ROUTES").is_ok_and(|v| !v.is_empty());
+    if set && profile.is_production() {
+        log::warn!(
+            "MBSMF_DEBUG_ROUTES is set but ignored: the debug routes (/activate, /members) are \
+             never served under the production SBI profile (#1944)"
+        );
+    }
 }
 
 /// Parse session pool ID from string like "mbs-sess-123"
@@ -1087,6 +1111,36 @@ fn requested_snssai(body: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({ "sst": 1 }))
 }
 
+/// #2062: a ContextStatusNotify token minted for a ContextCreate, forgotten when
+/// dropped unless [`Self::commit`]ted to the context's record: a create that
+/// fails, or is dropped at any await, leaves no Live token behind.
+struct MintedNotifyToken(Option<String>);
+
+impl MintedNotifyToken {
+    fn new(token: String) -> Self {
+        Self(Some(token))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_deref().unwrap_or_default()
+    }
+
+    /// Hand the token to the record that now owns it; nothing is forgotten.
+    fn commit(mut self) -> String {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for MintedNotifyToken {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            if let Ok(c) = mbsmf_self().read() {
+                c.forget_amf_notify_token(&token);
+            }
+        }
+    }
+}
+
 /// #1758: Namf_MBSBroadcast ContextCreate on `amf` for session `session_id`, and
 /// its record, so the session's release can delete it. When the session was
 /// released while the create was in flight (the release found nothing to delete),
@@ -1095,7 +1149,7 @@ fn requested_snssai(body: &str) -> serde_json::Value {
 ///
 /// #1796: the request carries a `notifyUri` ending in a token minted here, so the
 /// AMF's ContextStatusNotify for this context is admitted; a create that did not
-/// produce a context forgets it.
+/// produce a context forgets it (#2062: as does one dropped mid-flight).
 async fn create_amf_mbs_context(
     session_id: u64,
     tmgi: Tmgi,
@@ -1113,44 +1167,85 @@ async fn create_amf_mbs_context(
         };
         (base, guard.mint_amf_notify_token(session_id)?)
     };
-    let forget = |token: &str| {
-        if let Ok(c) = mbsmf_self().read() {
-            c.forget_amf_notify_token(token);
-        }
-    };
+    // #2062: the token is Live until the create commits it to a record, and the
+    // mint cap never reclaims a Live token; so a create dropped mid-flight (its
+    // task aborted, the runtime shut down, a caller's timeout) must forget it, or
+    // enough of them wedge the cap and every later create is refused.
+    let token = MintedNotifyToken::new(token);
     // #1854: the create and its record run in the (AMF, TMGI) lane, so a delete of
     // the context a released session held on the same TMGI is either done before
     // this create (which then gets a fresh context) or sees this record and is
     // dropped. The AMF's ContextCreate is idempotent on the TMGI, so without the
     // lane this create could be handed a context an in-flight delete then removes.
     let lane = lane::enter(&amf.host, amf.port, Some(&tmgi)).await;
-    let Some(context_ref) = namf_client::context_create(&amf, &tmgi, &leg, &base, &token).await
-    else {
-        forget(&token);
-        return None;
-    };
+    // #2062: a create that fails drops `token`, which forgets it.
+    let context_ref = namf_client::context_create(&amf, &tmgi, &leg, &base, token.as_str()).await?;
     let record = AmfMbsContext {
         host: amf.host,
         port: amf.port,
         nf_instance_id: amf.nf_instance_id,
         context_ref: context_ref.clone(),
-        notify_token: token,
+        // #2062: the record owns the token from here: recorded, the session's
+        // release forgets it; not recorded, the delete below does.
+        notify_token: token.commit(),
         tmgi: Some(tmgi),
     };
+    // #2068: from the 201 on, the AMF holds this context. Until a session's
+    // record or a finished release accounts for it, dropping this create parks
+    // its ContextDelete for the reconciler, so an abort cannot leave the context
+    // at the AMF recorded nowhere.
+    let created = CreatedAmfContext::new(record.clone());
     let recorded = mbsmf_self()
         .read()
         .map(|c| c.record_amf_context(session_id, record.clone()))
         .unwrap_or(false);
     drop(lane);
     if recorded {
+        created.settle();
         return Some(context_ref);
     }
     log::warn!(
         "MBS session {session_id} was released while its ContextCreate was in flight; \
          deleting the AMF context {context_ref}"
     );
+    // #2068: an abort during this delete parks it (the guard); once it returns,
+    // the context is deleted, or its retries own it (and then the reconciler).
     release_amf_contexts(vec![record]).await;
+    created.settle();
     None
+}
+
+/// #2068: an AMF context a ContextCreate was answered with (201), not yet
+/// accounted for by a session's record or by a finished release. Dropped
+/// unsettled -- the create's task aborted between the 201 and either -- it parks
+/// the context's ContextDelete with [`reconcile`], which delivers it (or drops
+/// it, if a live session holds the context again by then).
+struct CreatedAmfContext(Option<AmfMbsContext>);
+
+impl CreatedAmfContext {
+    fn new(context: AmfMbsContext) -> Self {
+        Self(Some(context))
+    }
+
+    /// A record or a finished release accounts for the context now.
+    fn settle(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CreatedAmfContext {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            log::warn!(
+                "MBS: the ContextCreate that made AMF {}:{} MBS context {} was dropped \
+                 before the context was recorded or released; parking its ContextDelete",
+                c.host,
+                c.port,
+                c.context_ref
+            );
+            reconcile::park(vec![c]);
+        }
+    }
 }
 
 /// #1817: what `/metrics` serves: the families every NF shares and the reconciler's.
@@ -1232,25 +1327,36 @@ pub(crate) async fn delete_in_lane(c: &AmfMbsContext) -> Option<namf_client::Con
 
 /// The fast retries of [`release_amf_contexts`] (#1758), on a detached task; then
 /// (#1817) the reconciler.
-fn release_retries(mut failed: Vec<AmfMbsContext>) {
+///
+/// #2075: the contexts not yet delivered are held in an [`UndeliveredDeletes`]
+/// for the whole task, the one in flight included, so an abort (between retries
+/// or mid-delete) parks them with the reconciler instead of losing them.
+pub(crate) fn release_retries(failed: Vec<AmfMbsContext>) -> tokio::task::JoinHandle<()> {
     spawn_detached(async move {
+        let mut undelivered = UndeliveredDeletes(failed);
         for delay in AMF_RELEASE_RETRY_DELAYS {
             tokio::time::sleep(delay).await;
-            let mut still = Vec::new();
-            for c in failed {
+            let mut i = 0;
+            while let Some(c) = undelivered.0.get(i).cloned() {
                 // R24, #1854: in its lane, and not when a session reusing the TMGI
-                // got this same context back.
+                // got this same context back. #2075: it stays held until the
+                // outcome is known.
                 match delete_in_lane(&c).await {
-                    None => {}
-                    Some(namf_client::ContextDeleteOutcome::Failed) => still.push(c),
-                    Some(outcome) => retire_amf_notify_token(&c, outcome),
+                    Some(namf_client::ContextDeleteOutcome::Failed) => i += 1,
+                    None => {
+                        undelivered.0.remove(i);
+                    }
+                    Some(outcome) => {
+                        undelivered.0.remove(i);
+                        retire_amf_notify_token(&c, outcome);
+                    }
                 }
             }
-            failed = still;
-            if failed.is_empty() {
+            if undelivered.0.is_empty() {
                 return;
             }
         }
+        let failed = std::mem::take(&mut undelivered.0);
         for c in &failed {
             log::error!(
                 "MBS: AMF {}:{} MBS context {} could not be released after {} retries; \
@@ -1269,7 +1375,28 @@ fn release_retries(mut failed: Vec<AmfMbsContext>) {
         // pending-token bound; never the token cap's reclaim, which takes only
         // contexts the AMF released.
         reconcile::park(failed);
-    });
+    })
+}
+
+/// #2075: the ContextDeletes a [`release_retries`] task has not delivered yet.
+/// Dropped non-empty -- the task aborted -- they are parked with [`reconcile`]
+/// (which drops any a live session holds again), as the task would have done
+/// after its last retry. A delete in flight at the abort may have reached the
+/// AMF; the reconciler's resend is then a 404, which ends it.
+struct UndeliveredDeletes(Vec<AmfMbsContext>);
+
+impl Drop for UndeliveredDeletes {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        log::warn!(
+            "MBS: the ContextDelete retries for {} AMF MBS context(s) were dropped; \
+             parking them",
+            self.0.len()
+        );
+        reconcile::park(std::mem::take(&mut self.0));
+    }
 }
 
 /// #1796 (R29): how long a released AMF context's notify token is still admitted
@@ -1474,6 +1601,10 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
+    // #1944: only the session's creator, before the N4mb establishment.
+    if let Some(refused) = refuse_debug_route_non_owner(pool_id, request, "MBS Session Activate") {
+        return refused;
+    }
 
     // Parse UPF address from request body (defaults to the configured MB-UPF).
     let upf_addr: std::net::Ipv4Addr = if let Some(body) = &request.http.content {
@@ -1761,6 +1892,51 @@ async fn release_n4mb_transport(session_id: u64) -> bool {
     acknowledged
 }
 
+/// #2060: a ContextUpdate names its consumer in `nfcInstanceId`; a Start
+/// registers it and a Terminate deregisters it (the last one releases the
+/// shared N4mb transport, #295). That must be the calling NF itself, or any NF
+/// could tear down another SMF's multicast leg. The caller is its verified NF
+/// instance ID (`owner_binding::verified_consumer_id`: the client certificate's
+/// when direct, with or without NFTypes; the verified token `sub` behind an
+/// SCP or SEPP). A mismatch, or conflicting identities, is 403 before anything
+/// changes. A caller with no verified identity is refused under the production
+/// profile and, as for every `owner_binding` resource, admitted under dev.
+/// `Some` is the refusal.
+fn refuse_foreign_nfc_instance(
+    request: &SbiRequest,
+    nfc_instance_id: &str,
+    terminate: bool,
+) -> Option<SbiResponse> {
+    let operation = if terminate {
+        "ContextUpdate Terminate"
+    } else {
+        "ContextUpdate"
+    };
+    let forbidden = |detail: String| {
+        Some(nextgcore_sbi::server::send_error(
+            403,
+            "Forbidden",
+            &detail,
+            None,
+        ))
+    };
+    let caller = match owner_binding::verified_consumer_id(request) {
+        Ok(Some(caller)) => caller,
+        Ok(None) if !owner_binding::identity_required() => return None,
+        Ok(None) => return forbidden(format!("{operation}: the caller proved no NF identity")),
+        Err(why) => return forbidden(format!("{operation}: {why}")),
+    };
+    if owner_binding::same_nf_instance_id(&caller, nfc_instance_id) {
+        return None;
+    }
+    log::warn!(
+        "{operation} refused: nfcInstanceId {nfc_instance_id:?} is not the caller ({caller})"
+    );
+    forbidden(format!(
+        "{operation}: nfcInstanceId {nfc_instance_id:?} is not the calling NF"
+    ))
+}
+
 /// Handle ContextUpdate (TS 29.532 §5.3.2.5) - start/terminate MBS data
 /// reception. [mbsmfd-03] On an SMF multicast Start the MB-SMF allocates and
 /// returns a `cTeid` + `llSsm` and drives N4mb establishment; on Terminate /
@@ -1825,6 +2001,12 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
     let is_amf = req.ran_node_id.is_some() || req.n2_mbs_sm_info.is_some();
     let terminate =
         matches!(action, types::ContextUpdateAction::Terminate) || req.leave_ind == Some(true);
+
+    // #2060: the consumer a ContextUpdate joins or terminates is the body's
+    // `nfcInstanceId`, so it must be the caller's own; before any change.
+    if let Some(refused) = refuse_foreign_nfc_instance(request, &req.nfc_instance_id, terminate) {
+        return refused;
+    }
 
     let ctx = mbsmf_self();
 
@@ -2466,6 +2648,23 @@ async fn handle_tmgi_deallocate(request: &SbiRequest) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
+/// #1944: the caller check of the debug routes (`/activate`, `/members*`,
+/// [`debug_routes_enabled`]): only the consumer that created the session
+/// (`nextgcore_sbi::owner_binding`: its verified NF instance ID, the
+/// certificate's when direct, the token `sub` behind an SCP) may activate it
+/// or change its members, refused 403 before any change. These routes are
+/// not TS 29.532 resources; in the specified flows a UE joins through its
+/// serving SMF's ContextUpdate (TS 23.247 §7.2.1.3). `None` for an unknown
+/// session: the handler answers that as before.
+fn refuse_debug_route_non_owner(
+    pool_id: u64,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let session = mbsmf_self().read().ok()?.session_find_by_id(pool_id)?;
+    owner_binding::refuse_non_owner(session.owner.as_deref(), request, operation)
+}
+
 /// Handle member join (TMGI group membership)
 async fn handle_member_join(session_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Member Join: {session_id}");
@@ -2474,6 +2673,9 @@ async fn handle_member_join(session_id: &str, request: &SbiRequest) -> SbiRespon
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
+    if let Some(refused) = refuse_debug_route_non_owner(pool_id, request, "MBS Member Join") {
+        return refused;
+    }
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -2547,13 +2749,16 @@ async fn handle_member_list(session_id: &str) -> SbiResponse {
 }
 
 /// Handle member leave
-async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
+async fn handle_member_leave(session_id: &str, supi: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Member Leave: {session_id} / {supi}");
 
     let pool_id = match parse_session_id(session_id) {
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
+    if let Some(refused) = refuse_debug_route_non_owner(pool_id, request, "MBS Member Leave") {
+        return refused;
+    }
 
     let ctx = mbsmf_self();
     let left = if let Ok(context) = ctx.read() {
@@ -3159,7 +3364,26 @@ mod tests {
     /// test that needs another caller sets its identity, or calls
     /// `super::mbsmf_sbi_request_handler` for an anonymous one.
     async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
-        super::mbsmf_sbi_request_handler(as_test_consumer(request)).await
+        super::mbsmf_sbi_request_handler(as_test_consumer(as_its_nfc_instance(request))).await
+    }
+
+    /// #2060: a ContextUpdate is sent by the NF its `nfcInstanceId` names, so
+    /// one with no identity calls as that NF (`as_test_consumer` would make it
+    /// TEST_CONSUMER_1863, which the check refuses). A test of another caller
+    /// sets its identity itself.
+    fn as_its_nfc_instance(mut request: SbiRequest) -> SbiRequest {
+        let unidentified =
+            request.peer_cert_nf_instance_id.is_none() && request.oauth2_subject.is_none();
+        if unidentified && request.header.uri.contains("/contexts/update") {
+            let body = request.http.content.clone().unwrap_or_default();
+            let marker = "\"nfcInstanceId\":\"";
+            if let Some(start) = body.find(marker).map(|i| i + marker.len()) {
+                if let Some(len) = body[start..].find('"') {
+                    request.oauth2_subject = Some(body[start..start + len].to_string());
+                }
+            }
+        }
+        request
     }
     // #417: the Setup Response is read back by the generated codec's strict
     // decode and pinned whole against the hand-derived octets
@@ -3506,6 +3730,84 @@ mod tests {
             .unwrap()
             .session_find_by_tmgi(&tmgi)
             .expect("session exists")
+    }
+
+    /// #2060: a ContextUpdate joins or terminates only the caller's own
+    /// `nfcInstanceId`. Another SMF naming smf-a is refused 403, and smf-a stays
+    /// a consumer, whether it calls directly with an SMF certificate, with a
+    /// certificate naming no NF type, or through an SCP with its token; so is a
+    /// Start naming smf-a, and a caller whose token and certificate disagree.
+    /// smf-a's own Terminate is a 204.
+    ///
+    /// REVERT-VERIFIED: with `refuse_foreign_nfc_instance` returning `None`,
+    /// smf-b's Terminate naming smf-a is 204 and smf-a is gone.
+    #[tokio::test]
+    async fn a_context_update_names_only_the_calling_nf_2060() {
+        const SMF_A: &str = "aaaaaaaa-2060-4000-8000-0000000000a1";
+        const SMF_B: &str = "bbbbbbbb-2060-4000-8000-0000000000b2";
+        let svc_id = [0xC2, 0x06, 0x60];
+        let svc = seed_global_session(svc_id);
+        let update = |nfc: &str, action: &str| {
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(smf_ctx_update_body(&svc, nfc, action), "application/json")
+        };
+        let direct = |mut r: SbiRequest, id: &str, types: &[&str]| {
+            r.peer_cert_nf_instance_id = Some(id.to_string());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let via_scp = |mut r: SbiRequest, sub: &str| {
+            r.peer_cert_nf_instance_id = Some("cccccccc-2060-4000-8000-0000000000c3".into());
+            r.peer_cert_nf_types = vec!["SCP".into()];
+            r.oauth2_subject = Some(sub.to_string());
+            r
+        };
+        let rsp =
+            super::mbsmf_sbi_request_handler(direct(update(SMF_A, "START"), SMF_A, &["SMF"])).await;
+        assert_eq!(rsp.status, 200, "{:?}", rsp.http.content);
+        let consumers = || {
+            stored_session(svc_id)
+                .consumers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(consumers(), vec![SMF_A.to_string()]);
+
+        let mut mismatched = direct(update(SMF_A, "TERMINATE"), SMF_B, &["SMF"]);
+        mismatched.oauth2_subject = Some(SMF_A.to_string());
+        for (req, who) in [
+            (
+                direct(update(SMF_A, "TERMINATE"), SMF_B, &["SMF"]),
+                "smf-b, directly",
+            ),
+            (
+                direct(update(SMF_A, "TERMINATE"), SMF_B, &[]),
+                "smf-b, a typeless certificate",
+            ),
+            (
+                via_scp(update(SMF_A, "TERMINATE"), SMF_B),
+                "smf-b, through the SCP",
+            ),
+            (
+                direct(update(SMF_A, "START"), SMF_B, &["SMF"]),
+                "smf-b's Start naming smf-a",
+            ),
+            (mismatched, "a token naming smf-a on smf-b's certificate"),
+        ] {
+            let rsp = super::mbsmf_sbi_request_handler(req).await;
+            assert_eq!(rsp.status, 403, "{who}: {:?}", rsp.http.content);
+            assert_eq!(consumers(), vec![SMF_A.to_string()], "{who}");
+        }
+        assert!(
+            stored_session(svc_id).n4mb_session.is_some(),
+            "the transport is up"
+        );
+        // smf-a through the SCP, with its own token: its Terminate is served.
+        let rsp =
+            super::mbsmf_sbi_request_handler(via_scp(update(SMF_A, "TERMINATE"), SMF_A)).await;
+        assert_eq!(rsp.status, 204, "{:?}", rsp.http.content);
+        assert!(consumers().is_empty());
     }
 
     /// #295 criteria 1-3: two consumers share one transport, the first TERMINATE
@@ -4588,6 +4890,20 @@ mod tests {
         assert_eq!(rsp.status, 400, "/contexts/update exists (400, not 404)");
     }
 
+    /// #1944 (R32 on #2057): `MBSMF_DEBUG_ROUTES` turns the debug routes on
+    /// under the dev profile only; under production they are never served.
+    ///
+    /// REVERT-VERIFIED: with the profile not consulted, the production
+    /// assertion fails.
+    #[test]
+    fn debug_routes_are_never_served_under_production_1944() {
+        use nextgcore_sbi::security::SbiProfile;
+        assert!(debug_routes_allowed(Some("1"), SbiProfile::Dev));
+        assert!(!debug_routes_allowed(Some("1"), SbiProfile::Production));
+        assert!(!debug_routes_allowed(Some(""), SbiProfile::Dev));
+        assert!(!debug_routes_allowed(None, SbiProfile::Dev));
+    }
+
     #[test]
     fn test_debug_routes_disabled_by_default() {
         std::env::remove_var("MBSMF_DEBUG_ROUTES");
@@ -5363,6 +5679,95 @@ mod tmgi_session_owner_tests_1863 {
             .unwrap()
             .session_find_by_id(pool_id)
             .is_none());
+    }
+
+    /// #1944: the debug routes (`/activate`, `/members*`) are the session
+    /// creator's only. Another NF and an anonymous caller get 403, and the
+    /// membership is unchanged; the creator joins and removes a UE. The
+    /// handlers are called directly: the routes need `MBSMF_DEBUG_ROUTES`,
+    /// a process-wide variable other tests clear.
+    ///
+    /// REVERT-VERIFIED: without the check in `handle_member_join`, NEF-B's join
+    /// is 201; without it in `handle_member_leave`, NEF-B's leave removes
+    /// NEF-A's UE (204); without it in `handle_mbs_session_activate`, NEF-B's
+    /// activate is not refused 403.
+    #[tokio::test]
+    async fn debug_route_members_and_activate_are_the_creators_only_1944() {
+        mbsmf_context_init(256);
+        let tmgi = allocate(NEF_A, 1).await.remove(0);
+        let rsp = mbsmf_sbi_request_handler(as_nf(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions").with_body(
+                serde_json::json!({"mbsSession": {
+                    "mbsSessionId": {"tmgi": tmgi},
+                    "serviceType": "MULTICAST",
+                }})
+                .to_string(),
+                "application/json",
+            ),
+            NEF_A,
+        ))
+        .await;
+        assert_eq!(rsp.status, 201, "{:?}", rsp.http.content);
+        let id = rsp
+            .http
+            .get_header("location")
+            .and_then(|l| l.rsplit('/').next().map(str::to_string))
+            .unwrap();
+        let pool_id = parse_session_id(&id).unwrap();
+        let members = || {
+            mbsmf_self()
+                .read()
+                .unwrap()
+                .session_find_by_id(pool_id)
+                .map(|s| s.group_members.len())
+                .unwrap()
+        };
+        let join = |who: Option<&str>| {
+            let r = SbiRequest::post(format!("/nmbsmf-mbssession/v1/mbs-sessions/{id}/members"))
+                .with_body(r#"{"supi":"imsi-001010000019440"}"#, "application/json");
+            match who {
+                Some(w) => as_nf(r, w),
+                None => r,
+            }
+        };
+        let leave = |who: &str| {
+            as_nf(
+                SbiRequest::delete(format!(
+                    "/nmbsmf-mbssession/v1/mbs-sessions/{id}/members/imsi-001010000019440"
+                )),
+                who,
+            )
+        };
+
+        assert_eq!(
+            handle_member_join(&id, &join(Some(NEF_B))).await.status,
+            403
+        );
+        assert_eq!(
+            handle_member_join(&id, &join(None)).await.status,
+            403,
+            "anonymous"
+        );
+        assert_eq!(members(), 0);
+        assert_eq!(
+            handle_member_join(&id, &join(Some(NEF_A))).await.status,
+            201
+        );
+        assert_eq!(members(), 1);
+        let rsp = handle_member_leave(&id, "imsi-001010000019440", &leave(NEF_B)).await;
+        assert_eq!(rsp.status, 403, "{:?}", rsp.http.content);
+        assert_eq!(members(), 1, "NEF-B cannot remove NEF-A's UE");
+        let activate = as_nf(
+            SbiRequest::post(format!("/nmbsmf-mbssession/v1/mbs-sessions/{id}/activate")),
+            NEF_B,
+        );
+        assert_eq!(
+            handle_mbs_session_activate(&id, &activate).await.status,
+            403
+        );
+        let rsp = handle_member_leave(&id, "imsi-001010000019440", &leave(NEF_A)).await;
+        assert_eq!(rsp.status, 204, "{:?}", rsp.http.content);
+        assert_eq!(members(), 0);
     }
 }
 

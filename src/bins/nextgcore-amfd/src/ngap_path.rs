@@ -1787,6 +1787,10 @@ struct PendingEstablishment {
     /// establishment and the same on every attempt; recorded on the session once
     /// the SMF created it.
     status_nonce: String,
+    /// #2058: the SMF every attempt goes to, instead of a fresh selection: that of the
+    /// emergency PDU session's routing context, for an "existing emergency PDU session"
+    /// (TS 24.501 §5.4.5.2.5 a) vii)). `None` selects as usual.
+    smf: Option<(String, u16)>,
 }
 
 /// #774 review M1: the earlier registration's sessions are being released at
@@ -2075,6 +2079,19 @@ struct OutstandingRelease {
 const RELEASE_COMPLETE_GUARD: Duration = Duration::from_secs(5);
 /// Request type "initial request" (TS 24.501 §9.11.3.47).
 const REQUEST_TYPE_INITIAL_REQUEST: u8 = 0x01;
+/// TS 24.501 §9.11.3.47: "initial emergency request".
+const REQUEST_TYPE_INITIAL_EMERGENCY_REQUEST: u8 = 0x03;
+/// TS 24.501 §9.11.3.47: "existing emergency PDU session".
+const REQUEST_TYPE_EXISTING_EMERGENCY_PDU_SESSION: u8 = 0x04;
+
+/// #2041, TS 24.501 §3.1: an emergency PDU session is one "established with the request
+/// type 'initial emergency request' or 'existing emergency PDU session'".
+fn is_emergency_request_type(request_type: Option<u8>) -> bool {
+    matches!(
+        request_type,
+        Some(REQUEST_TYPE_INITIAL_EMERGENCY_REQUEST | REQUEST_TYPE_EXISTING_EMERGENCY_PDU_SESSION)
+    )
+}
 /// The spacing of the re-selection attempts within the window.
 const ESTABLISHMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// At most this many establishments wait at once. Beyond it, one is answered
@@ -11070,6 +11087,35 @@ impl NgapServer {
             // PDU Session Establishment Request
             0xC1 => {
                 log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
+                // #2041: a UE registered for emergency services, authenticated or not,
+                // establishes emergency PDU sessions only (TS 23.501 §5.16.4.9a: "the network
+                // shall reject any PDU Session Establishment request for normal service";
+                // TS 24.501 §6.4.1.1). A request of any other type, or with none (the legacy
+                // raw-5GSM path carries none), is sent back before an SMF is selected:
+                // §5.4.5.2.5 a) 20) and §5.4.5.3.1 case e), a DL NAS TRANSPORT with the PDU
+                // session ID, the 5GSM message that was not forwarded and 5GMM cause #90
+                // "payload was not forwarded". It used to pass whenever it named no DNN or the
+                // emergency DNN, so an emergency-registered UE could open a normal session.
+                let request_type = self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied();
+                if self.emergency.emergency_context(amf_ue_ngap_id).is_some()
+                    && !is_emergency_request_type(request_type)
+                {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id} is registered for emergency services: its PDU \
+                         session establishment PSI={psi} with request type {request_type:?} is \
+                         not an emergency one (TS 23.501 §5.16.4.9a)"
+                    );
+                    return self
+                        .answer_payload_not_forwarded(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            sm_pdu,
+                            "for a UE registered for emergency services: not an emergency \
+                             request (TS 24.501 §5.4.5.2.5 a) 20))",
+                        )
+                        .await;
+                }
                 // #774 review M1: the registration this UE superseded is still having
                 // its sessions released at their SMFs. The new establishment waits for
                 // them (bounded), and goes out from `process_supersede_barriers`.
@@ -11109,7 +11155,7 @@ impl NgapServer {
                                 amf_ue_ngap_id,
                                 ran_ue_ngap_id,
                                 sm_pdu,
-                                "within the re-selection window",
+                                ": no SMF reachable within the re-selection window",
                             )
                             .await;
                     }
@@ -11134,60 +11180,23 @@ impl NgapServer {
                 // to a DNN named "internet" attached DNN-less sessions to the wrong
                 // data network, with the wrong UPF, policy, charging and slice --
                 // and silently, because the session established.
-                let dnn = dnn_override;
-
-                // #361: an EMERGENCY REGISTERED UE gets the emergency DNN and nothing else.
                 //
-                // TS 23.501 §5.16.4.9a: "the network shall reject any PDU Session
-                // Establishment request for normal service from the UE on this Access Type",
-                // and §5.16.4.9: "If the UE is Emergency Registered over a given access, it
-                // shall not request a PDU Session to any other DNN over this access."
-                //
-                // Both halves are needed and only one existed. The UE-side half is the
-                // "Emergency registered" bit in the Registration Accept, which #361 also adds;
-                // this is the NETWORK half, which §5.16.4.9a puts a `shall` on precisely
-                // because a UE may disregard its own. Before this the AMF only RECORDED
-                // whether a session matched the emergency DNN (see the
-                // `assign_emergency_pdu_session` block below) and forwarded every request
-                // regardless -- so an emergency-registered UE could obtain a general-purpose
-                // session, which for an UNAUTHENTICATED one means network access with no
-                // subscription, no policy and no charging. That is the admission surface #361
-                // names, and this is the fence §10.2.2 assumes is there.
-                //
-                // A DNN-LESS request is allowed through: TS 23.501 §5.16.4.2 has the network
-                // apply its configured emergency DNN when an emergency-registered UE asks for a
-                // session without naming one, which is the `dnn == None` case (#204). Same
-                // predicate the recording block below uses, so the two cannot drift.
-                //
-                // 5GSM #29 "user authentication or authorization failed" (TS 24.501 §9.11.4.2,
-                // wire value 0x1D): the UE is not authorized for this DNN in this registration.
-                // Not #27 "missing or unknown DNN" -- the DNN may exist and be perfectly valid
-                // for a normally registered UE, which is a different statement.
-                if self.emergency.emergency_context(amf_ue_ngap_id).is_some() {
-                    let emergency_dnn = self.emergency.emergency_dnn().to_string();
-                    // `is_some_and(!=)` rather than `!is_none_or(==)`: a DNN-less request is
-                    // NOT refused (§5.16.4.2 applies the configured emergency DNN), so the
-                    // refusal condition is "named a DNN, and it was not the emergency one".
-                    if dnn.is_some_and(|d| d != emergency_dnn) {
-                        log::warn!(
-                            "PDU session establishment REFUSED for emergency-registered UE \
-                             {amf_ue_ngap_id}: PSI={psi} requested DNN '{}' but only the \
-                             emergency DNN '{emergency_dnn}' is permitted over this access \
-                             (TS 23.501 §5.16.4.9a); 5GSM #29",
-                            dnn.unwrap_or("<none>")
-                        );
-                        let reject = vec![0x2E, psi, pti, 0xC3, 0x1D];
-                        self.send_n1_sm_to_ue(
-                            association_id,
-                            amf_ue_ngap_id,
-                            ran_ue_ngap_id,
-                            psi,
-                            &reject,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                }
+                // #2041, TS 24.501 §5.4.5.2.5 a) v), vii) and viii): for an emergency request
+                // ("initial emergency request" or "existing emergency PDU session") the AMF
+                // sends the DNN and the S-NSSAI of its emergency configuration data, whatever
+                // the UE named (it names none, §6.4.1.2): this DNN here, the S-NSSAI in
+                // `spawn_establishment_attempt`. A UE registered for emergency services reaches
+                // here only with one of those request types (the fence above), so its session
+                // is on the emergency DNN and S-NSSAI by construction: the #361 5GSM #29
+                // refusal of another DNN, a 5GSM message the AMF built itself, is superseded.
+                // R32 on #2051: type 4 forwarded the UE's DNN and S-NSSAI, so an
+                // emergency-registered UE could still reach "internet" through it.
+                let emergency_dnn = self.emergency.emergency_dnn().to_string();
+                let dnn = if is_emergency_request_type(request_type) {
+                    Some(emergency_dnn.as_str())
+                } else {
+                    dnn_override
+                };
 
                 // #922: the first CreateSMContext runs off the NGAP task too, as
                 // #796's re-selection attempts do. On the NGAP task, an SMF address
@@ -11212,7 +11221,7 @@ impl NgapServer {
                             amf_ue_ngap_id,
                             ran_ue_ngap_id,
                             sm_pdu,
-                            "with the establishment list full",
+                            ": no SMF reachable with the establishment list full",
                         )
                         .await;
                 }
@@ -11232,6 +11241,7 @@ impl NgapServer {
                     origination_timestamp: origination,
                     request_type: self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied(),
                     status_nonce: crate::sbi_path::new_callback_token(),
+                    smf: self.emergency_session_smf(amf_ue_ngap_id, psi, request_type),
                 };
                 self.spawn_establishment_attempt(amf_ue_ngap_id, &pending, &state);
                 self.pending_establishments
@@ -12634,6 +12644,14 @@ impl NgapServer {
                     )
                 },
             );
+        // #2058: a retry goes to the same pinned SMF, if the establishment has one.
+        let pinned_smf = self.pending_establishments.get(&key).map_or_else(
+            || {
+                let request_type = self.ul_request_types.get(&key).copied();
+                self.emergency_session_smf(amf_ue_ngap_id, psi, request_type)
+            },
+            |p| p.smf.clone(),
+        );
         let full = !self.pending_establishments.contains_key(&key)
             && self.pending_establishments.len() >= MAX_PENDING_ESTABLISHMENTS;
         if full || now.duration_since(first_failure) >= ESTABLISHMENT_RETRY_WINDOW {
@@ -12646,9 +12664,9 @@ impl NgapServer {
                     ran_ue_ngap_id,
                     sm_pdu,
                     if full {
-                        "and the retry list is full"
+                        ": no SMF reachable and the retry list is full"
                     } else {
-                        "within the re-selection window"
+                        ": no SMF reachable within the re-selection window"
                     },
                 )
                 .await;
@@ -12674,9 +12692,35 @@ impl NgapServer {
                 origination_timestamp,
                 request_type,
                 status_nonce,
+                smf: pinned_smf,
             },
         );
         Ok(())
+    }
+
+    /// #2058, TS 24.501 §5.4.5.2.5 a) vii): for an "existing emergency PDU session" whose
+    /// PSI has a routing context marked emergency (the UE's emergency context names the
+    /// PSI as its emergency PDU session), the SMF of that routing context. The AMF sends
+    /// the request there, rather than selecting one afresh, which could land the
+    /// session's transfer on an SMF that does not hold it. `None` otherwise: viii) (no
+    /// routing context) selects an SMF, on the emergency DNN.
+    fn emergency_session_smf(
+        &self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        request_type: Option<u8>,
+    ) -> Option<(String, u16)> {
+        if request_type != Some(REQUEST_TYPE_EXISTING_EMERGENCY_PDU_SESSION) {
+            return None;
+        }
+        let emergency_psi = self
+            .emergency
+            .emergency_context(amf_ue_ngap_id)
+            .and_then(|c| c.pdu_session_id);
+        if emergency_psi != Some(psi) {
+            return None;
+        }
+        self.sm_context_smfs.get(&(amf_ue_ngap_id, psi)).cloned()
     }
 
     /// The routing-failure answer (#796): a DL NAS TRANSPORT carrying the UE's own
@@ -12692,8 +12736,8 @@ impl NgapServer {
     ) -> Result<()> {
         let psi = sm_pdu[1];
         log::warn!(
-            "UE {amf_ue_ngap_id}: 5GSM message for PSI={psi} not forwarded: no SMF reachable \
-             {why}; 5GMM #90 (TS 24.501 §5.4.5.3.1 e))"
+            "UE {amf_ue_ngap_id}: 5GSM message for PSI={psi} not forwarded {why}; 5GMM #90 \
+             (TS 24.501 §5.4.5.3.1 e))"
         );
         let plain = gmm_build::build_dl_nas_transport(
             Some(psi),
@@ -12760,7 +12804,7 @@ impl NgapServer {
                         amf_ue_ngap_id,
                         ran_ue_ngap_id,
                         &p.sm_pdu,
-                        "within the re-selection window",
+                        ": no SMF reachable within the re-selection window",
                     )
                     .await
                 {
@@ -12804,11 +12848,23 @@ impl NgapServer {
         state: &UeNasContext,
     ) {
         let psi = p.sm_pdu[1];
-        let (sst, sd) = state
-            .amf_ue
-            .allowed_nssai
-            .first()
-            .map_or((1, None), |n| (n.sst, n.sd));
+        // #2041, TS 24.501 §5.4.5.2.5 a) v), vii), viii): an emergency request ("initial
+        // emergency request" or "existing emergency PDU session") goes out on the S-NSSAI of
+        // the AMF's emergency configuration data. An unauthenticated emergency UE has no
+        // Allowed NSSAI, so this was SST 1 regardless of `amf.emergency.s_nssai`.
+        let (sst, sd) = if is_emergency_request_type(p.request_type) {
+            let emergency = crate::context::amf_self()
+                .read()
+                .map(|c| c.emergency_s_nssai())
+                .unwrap_or(crate::context::SNssai { sst: 1, sd: None });
+            (emergency.sst, emergency.sd)
+        } else {
+            state
+                .amf_ue
+                .allowed_nssai
+                .first()
+                .map_or((1, None), |n| (n.sst, n.sd))
+        };
         let redcap_indication = state.amf_ue.redcap_indication;
         let status_key = self.sm_context_status_key_for_new_session(amf_ue_ngap_id);
         let identity = {
@@ -12832,6 +12888,7 @@ impl NgapServer {
         let sm_pdu = p.sm_pdu.clone();
         let dnn = p.dnn_override.clone();
         let generation = p.generation;
+        let pinned_smf = p.smf.clone();
         log::info!(
             "UE {amf_ue_ngap_id}: CreateSMContext for PDU session establishment PSI={psi}, off \
              the NGAP task (#796, #922)"
@@ -12843,11 +12900,15 @@ impl NgapServer {
         // released rather than lost. The SBI client's own timeout bounds it.
         self.sbi_offload
             .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
-                let smf = crate::sbi_path::resolve_nf_endpoint_async(
-                    crate::sbi_path::SbiServiceType::NsmfPdusession,
-                )
-                .await
-                .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+                // #2058: the emergency session's own SMF, else a selection.
+                let smf = match pinned_smf {
+                    Some(smf) => smf,
+                    None => crate::sbi_path::resolve_nf_endpoint_async(
+                        crate::sbi_path::SbiServiceType::NsmfPdusession,
+                    )
+                    .await
+                    .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777)),
+                };
                 let result = crate::sbi_path::call_smf_create_sm_context(
                     &smf.0,
                     smf.1,
@@ -44723,6 +44784,8 @@ mod tests {
         //    sends no DNN IE.
         let implicit = 7_356_020u64;
         register_emergency_ue(&mut ngap, 1, implicit);
+        // #2041: an emergency-registered UE's session is an emergency one, by its type.
+        ngap.ul_request_types.insert((implicit, 3), 3);
         let _ = ngap
             .handle_5gsm_message(1, implicit, 72, &pdu_session_establishment_request(3), None)
             .await;
@@ -44741,6 +44804,7 @@ mod tests {
         // 2. The emergency DNN named explicitly.
         let explicit = 7_356_021u64;
         register_emergency_ue(&mut ngap, 1, explicit);
+        ngap.ul_request_types.insert((explicit, 7), 3);
         let emergency_dnn = ngap.emergency.emergency_dnn().to_string();
         let _ = ngap
             .handle_5gsm_message(
@@ -44769,8 +44833,9 @@ mod tests {
         //    network, so the request must not reach the SMF at all.
         //
         //    Covered by `an_emergency_registered_ue_is_refused_a_session_off_the_emergency_dnn`,
-        //    which asserts the refusal positively (the 5GSM #29 reject on the wire, and zero
-        //    SMF requests). Kept here as the third arm of the recording contract: the
+        //    which asserts the refusal positively (zero SMF requests), and by #2041's
+        //    end-to-end test of the 5GMM #90 DL NAS TRANSPORT. With no emergency request
+        //    type it is not an emergency request (#2041). Kept here as the third arm of the recording contract: the
         //    emergency context must survive the refusal with NO PDU session id, so a refused
         //    request cannot be mistaken for the emergency call.
         let other_dnn = 7_356_022u64;
@@ -44842,6 +44907,11 @@ mod tests {
         let permitted = 7_361_031u64;
 
         register_emergency_ue(&mut ngap, 1, refused);
+        // #2041: the #90 answer goes out NAS-protected, as on a real emergency registration,
+        // which has a (possibly NIA0/NEA0) security context.
+        ngap.ue_auth_state.with_mut(refused, |s| {
+            s.amf_ue.security_context_available = true;
+        });
         let outcome = ngap
             .handle_5gsm_message(
                 1,
@@ -44876,6 +44946,8 @@ mod tests {
         // CONTROL: the same UE shape on the EMERGENCY DNN is admitted and does reach the SMF,
         // so the zero above is the §5.16.4.9a fence and not a dead fixture.
         register_emergency_ue(&mut ngap, 1, permitted);
+        // #2041: as an emergency request, the one kind it may make.
+        ngap.ul_request_types.insert((permitted, 6), 3);
         let emergency_dnn = ngap.emergency.emergency_dnn().to_string();
         let _ = ngap
             .handle_5gsm_message(

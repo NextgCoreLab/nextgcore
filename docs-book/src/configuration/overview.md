@@ -138,6 +138,40 @@ Snapshots are written atomically (temporary file, fsync, rename, parent-director
 fsync) and created `0600` — the UDR's contains IMSI-keyed subscriber
 registrations.
 
+### Resources are bound to the NF that created them (#1809, #1865, #1937)
+
+Every NF that lets a consumer create a resource and then manage it binds the resource to the creator's **verified** identity. This covers subscriptions, policy associations, app sessions, bindings, configurations, registrations and contexts. A later read, update or delete from anyone else is refused before anything is read or changed. Knowing a resource's id proves nothing. Most NFs share one rule, `nextgcore_sbi::owner_binding`, described below. nrf and ausf follow their own rules, given after it.
+
+* **Identity.** The NF Instance ID of the verified client certificate, unless the certificate's RFC 9310 NFTypes name a relay (SCP or SEPP). Otherwise the `sub` of the verified access token, which survives an SCP hop. When both are present they must agree, or the caller is refused (`403`) at create (nothing is stored) and at every later operation.
+* **Production.** Under the `production` SBI profile, an anonymous create is refused. A resource restored ownerless from state written before its NF's binding is frozen: nobody can manage it. Such a resource lapses where it has a lifetime (NRF and UCMF subscriptions are capped at 24 h). Under `dev`, unauthenticated stacks keep working, unbound.
+* **Limit: no NF-set awareness.** A binding names one NF instance. A member of the same NF set or AMF set (TS 29.500 §6.5, TS 23.501 §5.21, TS 23.527) that takes over a failed member's resources gets `403` until the resource is re-created.
+* **Limit: issue relay certificates with NFTypes.** A relay is recognised only by the NFTypes extension of its certificate. An SCP certificate without one counts as the consumer. With an access token as well, the certificate and the token disagree and the request is refused. With no token, the certificate alone is taken as the identity, so the SCP itself would own everything relayed through it and any consumer behind it could manage all of it. #2065 closes this: under `production` a certificate without NFTypes and with no token is refused, because it cannot be told apart from a relay. Under `dev` it is still taken as the owner. Until #2065 lands, the no-token case is fail-open under both profiles.
+
+**nrf** binds NF status subscriptions (#1831) by its own registrant identity rule, not `owner_binding`. It has no SCP/SEPP relay exemption, a mismatch is a `400 invalid_client` rather than a `403`, and an identity is required when client-certificate verification or `trust_forwarded_client_cert` is on, not by the SBI profile.
+
+**ausf** binds authentication contexts by its own equivalent (token `sub` first; #1905, #1919, #1946). It exempts an SCP certificate only, not a SEPP one, and it does not freeze an ownerless context: one restored without an owner can be managed by anyone. #2065 brings ausf in line: the same no-token refusal under `production`, and ownerless contexts frozen.
+
+Coverage by NF, with the PR that bound each (all through `owner_binding` except nrf and ausf):
+
+| NF | Bound resources |
+|---|---|
+| nrf | NF status subscriptions, by nrf's own rule (#1831) |
+| amf, udm, smf, pcf, bsf, nwdaf, tsctsf, lmf, mbsmf, nsacf, eesd, dccf | event, status and exposure subscriptions and their kin (#1936) |
+| udr | subscriptions (#1903, moved onto `owner_binding` by #1936) |
+| smf | SM contexts, bound to the serving AMF (#1899) |
+| mbsmf | TMGIs and MBS sessions, bound to the consumer that allocated or created them (#1943) |
+| nssf | availability subscriptions (#1936); `nssai-availability/{nfId}`: the document belongs to the NF it names (#1955) |
+| bsf | PDU, UE and MBS PCF bindings (#1959) |
+| tsctsf | time-sync configurations, ASTI configurations and QoS/TSC sessions (#1969). The admin trigger is on a loopback listener only (#1980) |
+| ucmf | subscriptions and provisionings (#1910, #1938); ownerless restored subscriptions lapse within 24 h (#1975) |
+| pcf | AM, UE and SM policy associations, app sessions and their events subscription (#1988) |
+| ees | EAS and EEC registrations and subscriptions (#1936); collection GETs list only the caller's own records, and ECS EES registrations are bound to their EES (#2049) |
+| easdf | DNS contexts and baseline DNS patterns (#1936) |
+| nwdaf | MLModelMonitor subscriptions (#2047) |
+| ausf | authentication contexts, by ausf's own rule (#1905, #1919, #1946) |
+
+nsacf's `slice-quotas` are operator resources, served only on the loopback admin listener (#1912). They have no NF owner to bind to.
+
 ### SBI security profile (issue #63)
 
 Every NF that serves SBI resolves `NEXTGCORE_SBI_PROFILE` at startup (#1795;
@@ -235,6 +269,10 @@ rather than running a plaintext listener that reports itself as mutually
 authenticated. GPSI resolution needs the UDM's `id-translation-result`, which
 this repo's `udmd` serves from the UDR's identity data (it answered `501` before
 #85 was fixed); a GPSI the UDR has no mapping for is still refused with `404`.
+
+### A listener that cannot be bound (#2056)
+
+Under the production SBI profile, an NF that cannot bind a listener it is configured with exits at start-up with status `78` (`EX_CONFIG`), logging the NF, the listener and the address. This covers its `/metrics` endpoint and the udmd NES and nsacfd SLA-observe metrics listeners. It does so before serving anything, so the orchestrator reports a crash loop rather than an NF that runs on silently without metrics. Under `dev` the NF logs a warning and runs on without the listener, which was the behaviour of every profile before #2056.
 
 ### Request paths every SBI server refuses (#1934, #1939)
 

@@ -579,6 +579,8 @@ fn registered(m: &Monitor, id: &str, model_id: u64) {
             last_seen: unix_now(),
             auditing: false,
             owner: None,
+            create_key: None,
+            subscribe_key: "k".into(),
         },
     );
     lock(&m.feedback).register_model_with(id.into(), FEEDBACK_WINDOW, 0.70);
@@ -1658,4 +1660,609 @@ async fn ownerless_records_are_frozen_under_production_1937() {
         .status,
         204
     );
+}
+
+// ── #2048: duplicate detection of creates (TS 29.500 §5.2.8) ────────────────
+
+/// `request` carrying `3gpp-Sbi-Request-Info: idempotency-key=<key>`.
+fn keyed_2048(request: SbiRequest, key: &str) -> SbiRequest {
+    request.with_header(
+        nextgcore_sbi::constants::custom_header::REQUEST_INFO,
+        request_info(key, false),
+    )
+}
+
+fn json_of(r: &SbiResponse) -> Value {
+    serde_json::from_str(r.http.content.as_deref().unwrap_or("null")).unwrap()
+}
+
+/// #2048, the AnLF as producer: a keyed `POST /subscriptions` retransmitted
+/// (its 201 lost) answers the subscription it created, 201 with the same
+/// Location and the resource as it is now, and creates nothing. The replay is
+/// scoped to the same owner (on either path), key and body, inside
+/// [`IDEMPOTENCY_WINDOW_SECS`]; a deleted subscription is not resurrected; a
+/// rejected create records nothing; a replay at the cap is answered, not
+/// refused, and the cap still holds for new keys.
+///
+/// REVERT-VERIFIED: the replay lookup skipped ("a retransmission answers the
+/// same Location"); the owner not compared ("another owner's retry creates
+/// its own"); the body not compared ("a different body creates its own"); the
+/// window not applied ("an expired key creates a new one"); the replay after
+/// the cap check ("a retry at the cap is answered"); a malformed key accepted
+/// ("a malformed key is 400"); the record not kept on update ("a retry after an
+/// update answers the updated resource").
+#[test]
+fn anlf_subscribe_replays_a_retransmitted_create_2048() {
+    let ctx = context("anlf-2048");
+    let m = leak(
+        Monitor::new("retrain", Role::Anlf, "http://a", "anlf-2048", "http://n")
+            .with_limits(8, NOTIFY_BUDGET),
+    );
+    let body = |uri: &str| {
+        json!({
+            "modelIds": [7], "notificationUri": uri, "notifCorrId": "reg-2048",
+            "eventReportReq": { "notifMethod": "PERIODIC", "repPeriod": 30 }
+        })
+    };
+    let subscribe =
+        |req: SbiRequest| route_with(Some(m), &ctx, "POST", &["subscriptions"], &req, true);
+    let as_owner = |b: Value, key: &str| direct_1937(keyed_2048(post("/", b), key), OWNER_1937);
+
+    let first = subscribe(as_owner(body("http://mtlf.example/cb"), "k-1"));
+    assert_eq!(first.status, 201);
+    let id = location_id(&first);
+    let minted = m.next_id.load(Ordering::SeqCst);
+    for (path, owner) in owner_paths_1937() {
+        let retry = subscribe(owner(
+            keyed_2048(post("/", body("http://mtlf.example/cb")), "k-1"),
+            OWNER_1937,
+        ));
+        assert_eq!(retry.status, 201, "{path}");
+        assert_eq!(
+            retry.http.get_header("Location"),
+            first.http.get_header("Location"),
+            "{path}: a retransmission answers the same Location"
+        );
+        assert_eq!(
+            json_of(&retry),
+            json_of(&first),
+            "{path}: and the same body"
+        );
+    }
+    // The same JSON with its members in another order is the same body.
+    let reordered = SbiRequest::post("/").with_body(
+        r#"{"eventReportReq":{"repPeriod":30,"notifMethod":"PERIODIC"},"notifCorrId":"reg-2048","notificationUri":"http://mtlf.example/cb","modelIds":[7]}"#,
+        "application/json",
+    );
+    assert_eq!(
+        location_id(&subscribe(direct_1937(
+            keyed_2048(reordered, "k-1"),
+            OWNER_1937
+        ))),
+        id
+    );
+    assert_eq!(m.subscription_count(), 1, "one subscription");
+    assert_eq!(m.next_id.load(Ordering::SeqCst), minted, "no id minted");
+
+    // Another owner, the same key and body: its own subscription.
+    let other = subscribe(direct_1937(
+        keyed_2048(post("/", body("http://mtlf.example/cb")), "k-1"),
+        OTHER_1937,
+    ));
+    assert_eq!(other.status, 201);
+    assert_ne!(
+        location_id(&other),
+        id,
+        "another owner's retry creates its own"
+    );
+    // The same owner and key, another body: its own subscription.
+    let changed = subscribe(as_owner(body("http://mtlf.example/other"), "k-1"));
+    assert_eq!(changed.status, 201);
+    assert_ne!(
+        location_id(&changed),
+        id,
+        "a different body creates its own"
+    );
+    // No key: the duplicate detection is optional (§5.2.8), nothing is merged.
+    let plain = || direct_1937(post("/", body("http://mtlf.example/cb")), OWNER_1937);
+    assert_ne!(
+        location_id(&subscribe(plain())),
+        location_id(&subscribe(plain()))
+    );
+    assert_eq!(m.subscription_count(), 5);
+
+    // A rejected create records nothing: a bad body, a malformed key, an
+    // anonymous caller under production (403). The key is still unused after.
+    let bad = subscribe(direct_1937(
+        keyed_2048(post("/", json!({ "modelIds": [] })), "k-2"),
+        OWNER_1937,
+    ));
+    assert_eq!(bad.status, 400);
+    let long = format!(
+        "idempotency-key={}",
+        "x".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1)
+    );
+    for malformed in ["idempotency-key=", long.as_str()] {
+        let r = subscribe(direct_1937(
+            post("/", body("http://mtlf.example/k2")).with_header(
+                nextgcore_sbi::constants::custom_header::REQUEST_INFO,
+                malformed,
+            ),
+            OWNER_1937,
+        ));
+        assert_eq!(r.status, 400, "a malformed key is 400");
+    }
+    let anonymous = subscribe(keyed_2048(post("/", body("http://mtlf.example/k2")), "k-2"));
+    assert_eq!(anonymous.status, 403);
+    assert_eq!(
+        m.subscription_count(),
+        5,
+        "a rejected create applies nothing"
+    );
+    let k2 = subscribe(as_owner(body("http://mtlf.example/k2"), "k-2"));
+    assert_eq!(k2.status, 201);
+    let k2_id = location_id(&k2);
+    assert!(![id.as_str(), &location_id(&other), &location_id(&changed)].contains(&k2_id.as_str()));
+
+    // An update keeps the record: a late retry answers the resource as it is.
+    let mut put = direct_1937(post("/", body("http://mtlf.example/moved")), OWNER_1937);
+    put.header.method = "PUT".into();
+    assert_eq!(
+        route_with(Some(m), &ctx, "PUT", &["subscriptions", &id], &put, true).status,
+        200
+    );
+    let late = subscribe(as_owner(body("http://mtlf.example/cb"), "k-1"));
+    assert_eq!(
+        location_id(&late),
+        id,
+        "a retry after an update answers the updated resource"
+    );
+    assert_eq!(
+        json_of(&late)["notificationUri"],
+        "http://mtlf.example/moved"
+    );
+
+    // At the cap: a replay is answered; a new key is refused and stores nothing.
+    for i in 0..2 {
+        assert_eq!(
+            subscribe(as_owner(
+                body(&format!("http://fill{i}.example/cb")),
+                &format!("f-{i}")
+            ))
+            .status,
+            201
+        );
+    }
+    assert_eq!(m.subscription_count(), 8);
+    let at_cap = subscribe(as_owner(body("http://mtlf.example/k2"), "k-2"));
+    assert_eq!(at_cap.status, 201, "a retry at the cap is answered");
+    assert_eq!(location_id(&at_cap), k2_id);
+    let full = subscribe(as_owner(body("http://mtlf.example/new"), "k-3"));
+    assert_eq!(full.status, 500);
+    assert_eq!(cause(&full).as_deref(), Some(INSUFFICIENT_RESOURCES));
+    assert_eq!(m.subscription_count(), 8);
+
+    // A deleted subscription is not resurrected by a retry of its create.
+    let del = direct_1937(SbiRequest::delete("/"), OWNER_1937);
+    assert_eq!(handle_unsubscribe(m, &k2_id, &del, true).status, 204);
+    let after = subscribe(as_owner(body("http://mtlf.example/k2"), "k-2"));
+    assert_eq!(after.status, 201);
+    assert_ne!(
+        location_id(&after),
+        k2_id,
+        "a deleted subscription stays deleted"
+    );
+    assert!(m.subscription(&k2_id).is_none());
+
+    // Past the window a key is expired: the retry creates a new subscription.
+    m.age_create_keys_for_test(IDEMPOTENCY_WINDOW_SECS - 1);
+    assert_eq!(
+        location_id(&subscribe(as_owner(body("http://mtlf.example/k2"), "k-2"))),
+        location_id(&after),
+        "inside the window it still replays"
+    );
+    // (Make room: the expired retry must be a create, not a 500.)
+    let theirs = direct_1937(SbiRequest::delete("/"), OTHER_1937);
+    assert_eq!(
+        handle_unsubscribe(m, &location_id(&other), &theirs, true).status,
+        204
+    );
+    m.age_create_keys_for_test(1);
+    let expired = subscribe(as_owner(body("http://mtlf.example/k2"), "k-2"));
+    assert_eq!(expired.status, 201);
+    assert_ne!(
+        location_id(&expired),
+        location_id(&after),
+        "an expired key creates a new one"
+    );
+}
+
+/// #2048: concurrent retransmissions of one keyed create make one subscription,
+/// and every one of them is answered its Location. The handler checks and
+/// inserts under one lock with no await in between, so there is no in-flight
+/// window at the AnLF.
+///
+/// REVERT-VERIFIED: the replay lookup skipped ("one subscription").
+#[test]
+fn concurrent_retransmissions_make_one_subscription_2048() {
+    let m = leak(Monitor::new(
+        "retrain",
+        Role::Anlf,
+        "http://a",
+        "a",
+        "http://n",
+    ));
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let req = keyed_2048(
+                    post(
+                        "/",
+                        json!({ "modelIds": [7], "notificationUri": "http://m.example/cb", "notifCorrId": "c" }),
+                    ),
+                    "k-concurrent",
+                );
+                barrier.wait();
+                let r = handle_subscribe(m, None, &req, false);
+                assert_eq!(r.status, 201);
+                location_id(&r)
+            })
+        })
+        .collect();
+    let ids: std::collections::HashSet<String> =
+        threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(m.subscription_count(), 1, "one subscription");
+    assert_eq!(ids.len(), 1, "one Location for all");
+}
+
+/// #2048, the MTLF as producer: a keyed Register retransmitted answers the
+/// registration it created (same Location and body) and replaces nothing,
+/// spawns nothing, adds no collector. Scoped to the owner, key and body inside
+/// the window; a deregistered registration is not resurrected; a rejected
+/// Register records nothing.
+///
+/// REVERT-VERIFIED: the replay lookup skipped ("the same registration").
+#[tokio::test]
+async fn mtlf_register_replays_a_retransmitted_create_2048() {
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (m, ctx, model) = mtlf_1937();
+    let guard = ctx.read().unwrap();
+    let reg = |req: SbiRequest| handle_register(m, &guard, &req, true);
+    let own = json!({ "modelId": model, "consumerId": OWNER_1937 });
+    let set = json!({ "modelId": model, "consumerSetId": "set-2048" });
+    let as_owner =
+        |b: &Value, key: &str| direct_1937(keyed_2048(post("/", b.clone()), key), OWNER_1937);
+
+    let first = reg(as_owner(&own, "r-1"));
+    assert_eq!(first.status, 201);
+    let id = location_id(&first);
+    let minted = m.next_id.load(Ordering::SeqCst);
+    for (path, owner) in owner_paths_1937() {
+        let retry = reg(owner(keyed_2048(post("/", own.clone()), "r-1"), OWNER_1937));
+        assert_eq!(location_id(&retry), id, "{path}: the same registration");
+        assert_eq!(json_of(&retry), json_of(&first), "{path}");
+    }
+    assert_eq!(m.registration_count(), 1);
+    assert_eq!(lock(&m.feedback).collector_count(), 1, "no collector added");
+    assert_eq!(
+        m.next_id.load(Ordering::SeqCst),
+        minted,
+        "nothing new created"
+    );
+    assert_eq!(m.counts(), (0, 0));
+
+    // Another owner (a consumerSetId body, so it may), or another body: new.
+    let theirs = reg(direct_1937(
+        keyed_2048(post("/", set.clone()), "r-1"),
+        OTHER_1937,
+    ));
+    let mine = reg(as_owner(&set, "r-1"));
+    assert_eq!((theirs.status, mine.status), (201, 201));
+    assert_ne!(location_id(&theirs), location_id(&mine));
+    assert!(![location_id(&theirs), location_id(&mine)].contains(&id));
+    assert_eq!(m.registration_count(), 3);
+
+    // Rejected: an impersonating consumerId (403), a malformed key (400).
+    let other_id = json!({ "modelId": model, "consumerId": OTHER_1937 });
+    assert_eq!(reg(as_owner(&other_id, "r-2")).status, 403);
+    let bad_key = direct_1937(
+        post("/", set.clone()).with_header(
+            nextgcore_sbi::constants::custom_header::REQUEST_INFO,
+            "idempotency-key=",
+        ),
+        OWNER_1937,
+    );
+    assert_eq!(reg(bad_key).status, 400);
+    assert_eq!(
+        m.registration_count(),
+        3,
+        "a rejected Register applies nothing"
+    );
+
+    // A deregistered registration is not resurrected.
+    let del = direct_1937(SbiRequest::delete("/"), OWNER_1937);
+    assert_eq!(
+        handle_deregister(m, &location_id(&mine), &del, true).status,
+        204
+    );
+    let again = reg(as_owner(&set, "r-1"));
+    assert_eq!(again.status, 201);
+    assert_ne!(
+        location_id(&again),
+        location_id(&mine),
+        "stays deregistered"
+    );
+    assert!(m.registration(&location_id(&mine)).is_none());
+
+    // Past the window: a new registration (which replaces the same consumer's).
+    m.age_create_keys_for_test(IDEMPOTENCY_WINDOW_SECS);
+    let expired = reg(as_owner(&own, "r-1"));
+    assert_eq!(expired.status, 201);
+    assert_ne!(location_id(&expired), id, "an expired key registers anew");
+    assert!(m.registration(&id).is_none(), "and replaces the old one");
+}
+
+/// #2048: a stand-in peer in front of a real NWDAF's MLModelMonitor routes.
+/// It records the `3gpp-Sbi-Request-Info` of every `POST /<collection>`; with
+/// `hold` it holds the first one until `release`, and with `lose_first` it
+/// processes the first one and then answers 500, as if its 201 were lost.
+struct Creates {
+    infos: Arc<Mutex<Vec<String>>>,
+    arrived: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Creates {
+    fn infos(&self) -> Vec<String> {
+        self.infos.lock().unwrap().clone()
+    }
+}
+
+async fn creates_peer(
+    m: &'static Monitor,
+    ctx: Ctx,
+    collection: &'static str,
+    hold: bool,
+    lose_first: bool,
+) -> (nextgcore_sbi::SbiServer, u16, Creates) {
+    let creates = Creates {
+        infos: Arc::default(),
+        arrived: Arc::default(),
+        release: Arc::default(),
+    };
+    let (infos, arrived, release) = (
+        creates.infos.clone(),
+        creates.arrived.clone(),
+        creates.release.clone(),
+    );
+    let (srv, port) = serve(move |req: SbiRequest| {
+        let (ctx, infos, arrived, release) =
+            (ctx.clone(), infos.clone(), arrived.clone(), release.clone());
+        async move {
+            let p = parts(&req);
+            let p: Vec<&str> = p.iter().map(String::as_str).collect();
+            let method = req.header.method.clone();
+            let ["nnwdaf-mlmodelmonitor", "v1", rest @ ..] = p.as_slice() else {
+                return SbiResponse::with_status(404);
+            };
+            if method != "POST" || rest != [collection] {
+                return route(Some(m), &ctx, &method, rest, &req);
+            }
+            let n = {
+                let mut infos = infos.lock().unwrap();
+                infos.push(
+                    req.http
+                        .get_header(nextgcore_sbi::constants::custom_header::REQUEST_INFO)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                infos.len()
+            };
+            arrived.notify_one();
+            if hold && n == 1 {
+                release.notified().await;
+            }
+            let r = route(Some(m), &ctx, &method, rest, &req);
+            if lose_first && n == 1 {
+                return SbiResponse::with_status(500);
+            }
+            r
+        }
+    })
+    .await;
+    (srv, port, creates)
+}
+
+/// #2048, cancellation and both peers: an AnLF retries its Register while the
+/// MTLF's Subscribe for it is still in flight at the AnLF (held by the seam).
+/// The retry is answered the same registration and the counting AnLF sees one
+/// Subscribe, before and after the first one completes, carrying the
+/// registration's key; the MTLF records that one subscription.
+///
+/// REVERT-VERIFIED: the MTLF replay lookup skipped ("one Subscribe at the
+/// AnLF", the retry's replacement and second Subscribe); the Subscribe's key
+/// header not sent ("carries the registration's key").
+#[tokio::test]
+async fn a_register_retried_during_its_subscribe_makes_one_subscribe_2048() {
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let anlf = leak(Monitor::new(
+        "retrain",
+        Role::Anlf,
+        "http://unused",
+        OWNER_1937,
+        "http://unused",
+    ));
+    let (anlf_srv, anlf_port, subscribes) =
+        creates_peer(anlf, context(OWNER_1937), "subscriptions", true, false).await;
+    let (nrf_srv, nrf_port) = nrf(OWNER_1937, anlf_port).await;
+    let ctx = context("mtlf-2048");
+    let mtlf = leak(Monitor::new(
+        "retrain",
+        Role::Mtlf,
+        "http://127.0.0.1:1",
+        "mtlf-2048",
+        &format!("http://127.0.0.1:{nrf_port}"),
+    ));
+    let model = ctx
+        .read()
+        .unwrap()
+        .current_model_version()
+        .unwrap()
+        .unique_id();
+    let register = || {
+        let req = direct_1937(
+            keyed_2048(
+                post("/", json!({ "modelId": model, "consumerId": OWNER_1937 })),
+                "r-flight",
+            ),
+            OWNER_1937,
+        );
+        handle_register(mtlf, &ctx.read().unwrap(), &req, true)
+    };
+    let first = register();
+    assert_eq!(first.status, 201);
+    let id = location_id(&first);
+    tokio::time::timeout(Duration::from_secs(10), subscribes.arrived.notified())
+        .await
+        .expect("the Subscribe reached the AnLF");
+
+    // The Subscribe is in flight: the retry finds the registration.
+    let retry = register();
+    assert_eq!(
+        location_id(&retry),
+        id,
+        "the retry finds the in-flight registration"
+    );
+    assert_eq!(json_of(&retry), json_of(&first));
+    assert_eq!(mtlf.registration_count(), 1);
+    assert!(mtlf.registration(&id).unwrap().anlf_subscription.is_none());
+
+    subscribes.release.notify_one();
+    until("the MTLF recorded the subscription", || {
+        mtlf.registration(&id)
+            .is_some_and(|r| r.anlf_subscription.is_some())
+    })
+    .await;
+    assert_eq!(subscribes.infos().len(), 1, "one Subscribe at the AnLF");
+    assert_eq!(anlf.subscription_count(), 1);
+    let reg = mtlf.registration(&id).unwrap();
+    assert_eq!(
+        subscribes.infos()[0],
+        request_info(&reg.subscribe_key, false),
+        "carries the registration's key"
+    );
+    let (_, _, sub) = reg.anlf_subscription.unwrap();
+    assert_eq!(anlf.subscription(&sub).unwrap().notif_corr_id, id);
+    anlf_srv.stop().await.unwrap();
+    nrf_srv.stop().await.unwrap();
+}
+
+/// #2048, the MTLF as client: its Subscribe is processed by the AnLF but the
+/// 201 is lost (the seam answers 500). The retry carries the same key with
+/// `retrans=true`, the AnLF answers the subscription it created, and the AnLF
+/// holds one subscription, the one the MTLF records.
+///
+/// REVERT-VERIFIED: the AnLF replay lookup skipped, or a new key per attempt
+/// ("one subscription at the AnLF").
+#[tokio::test]
+async fn a_subscribe_retried_after_a_lost_201_is_one_subscription_2048() {
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    const ANLF: &str = "cccccccc-2048-4000-8000-00000000000c";
+    let anlf = leak(Monitor::new(
+        "retrain",
+        Role::Anlf,
+        "http://unused",
+        ANLF,
+        "http://unused",
+    ));
+    let (anlf_srv, anlf_port, subscribes) =
+        creates_peer(anlf, context(ANLF), "subscriptions", false, true).await;
+    let (nrf_srv, nrf_port) = nrf(ANLF, anlf_port).await;
+    let ctx = context("mtlf-2048l");
+    let mtlf = leak(Monitor::new(
+        "retrain",
+        Role::Mtlf,
+        "http://127.0.0.1:1",
+        "mtlf-2048l",
+        &format!("http://127.0.0.1:{nrf_port}"),
+    ));
+    let model = ctx
+        .read()
+        .unwrap()
+        .current_model_version()
+        .unwrap()
+        .unique_id();
+    let r = handle_register(
+        mtlf,
+        &ctx.read().unwrap(),
+        &post("/", json!({ "modelId": model, "consumerId": ANLF })),
+        false,
+    );
+    let id = location_id(&r);
+    until("the MTLF recorded the subscription", || {
+        mtlf.registration(&id)
+            .is_some_and(|r| r.anlf_subscription.is_some())
+    })
+    .await;
+    let key = mtlf.registration(&id).unwrap().subscribe_key;
+    assert_eq!(
+        subscribes.infos(),
+        vec![request_info(&key, false), request_info(&key, true)],
+        "the retry carries the same key, marked retransmitted"
+    );
+    assert_eq!(anlf.subscription_count(), 1, "one subscription at the AnLF");
+    let (_, _, sub) = mtlf.registration(&id).unwrap().anlf_subscription.unwrap();
+    assert!(
+        anlf.subscription(&sub).is_some(),
+        "the one the MTLF records"
+    );
+    anlf_srv.stop().await.unwrap();
+    nrf_srv.stop().await.unwrap();
+}
+
+/// #2048, the AnLF as client: its Register is processed by the MTLF but the
+/// 201 is lost. The next Register carries the same key with `retrans=true`
+/// and gets the registration already created, so the MTLF holds one and the
+/// AnLF holds that one. Once answered, a later Register uses a fresh key.
+///
+/// REVERT-VERIFIED: the key not reused ("the same registration"); the pending
+/// key not cleared on a 201 ("a later Register uses a fresh key").
+#[tokio::test]
+async fn a_register_retried_after_a_lost_201_is_one_registration_2048() {
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (mtlf, ctx, model) = mtlf_1937();
+    let (mtlf_srv, mtlf_port, registers) =
+        creates_peer(mtlf, ctx, "registrations", false, true).await;
+    let anlf = leak(Monitor::new(
+        "retrain",
+        Role::Anlf,
+        "http://unused",
+        "anlf-2048r",
+        "http://unused",
+    ));
+    let at = ("127.0.0.1".to_string(), mtlf_port);
+    assert!(register_at_mtlf(anlf, at.clone(), model).await.is_err());
+    assert_eq!(mtlf.registration_count(), 1, "the lost 201's registration");
+    let created = lock(&mtlf.registrations).keys().next().unwrap().clone();
+    let held = register_at_mtlf(anlf, at.clone(), model).await.unwrap();
+    assert_eq!(held.id, created, "the same registration");
+    assert_eq!(mtlf.registration_count(), 1);
+    let infos = registers.infos();
+    let key = infos[0].trim_start_matches("idempotency-key=").to_string();
+    assert_eq!(
+        infos,
+        vec![request_info(&key, false), request_info(&key, true)]
+    );
+
+    // The registration is lost later: registering again is a new request.
+    *lock(&anlf.held) = None;
+    register_at_mtlf(anlf, at, model).await.unwrap();
+    let third = registers.infos()[2].clone();
+    assert!(
+        !third.contains(&key) && !third.contains("retrans"),
+        "a later Register uses a fresh key: {third}"
+    );
+    mtlf_srv.stop().await.unwrap();
 }

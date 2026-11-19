@@ -1049,6 +1049,20 @@ impl MbSmfContext {
         before - tokens.len()
     }
 
+    /// #2062: the notify tokens minted for session `id`, for tests.
+    #[cfg(test)]
+    pub fn amf_notify_tokens_of(&self, id: u64) -> Vec<String> {
+        self.amf_notify_tokens.lock().map_or_else(
+            |_| Vec::new(),
+            |t| {
+                t.iter()
+                    .filter(|(_, v)| v.session_id == id)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            },
+        )
+    }
+
     /// #1930: how many notify tokens are held.
     pub fn amf_notify_token_count(&self) -> usize {
         self.amf_notify_tokens.lock().map_or(0, |t| t.len())
@@ -2145,8 +2159,33 @@ mod tests {
     /// the snapshot (the #1985 code), the record lands in the window, K's tokens
     /// -- B's own among them -- are forgotten, and "B keeps the token it was just
     /// handed" fails.
+    ///
+    /// #2062: that revert deadlocks rather than fails (the seam's record takes
+    /// `amf_notify_tokens`, which the mint holds), so the body runs on its own
+    /// thread (the seam is thread-local) under a timeout, and a hang fails as
+    /// "the mint and the racing record finish". REVERT-VERIFIED: with that
+    /// revert, the test fails on that message after the timeout instead of
+    /// hanging.
     #[test]
     fn a_record_racing_the_mint_keeps_its_token_2015() {
+        let (done, finished) = std::sync::mpsc::channel();
+        let body = std::thread::spawn(move || {
+            a_record_racing_the_mint_body_2015();
+            let _ = done.send(());
+        });
+        match finished.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(()) => body.join().expect("the body passes"),
+            // The body panicked: re-raise its failure.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(body.join().expect_err("the body panicked"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the mint and the racing record finish (deadlocked?)")
+            }
+        }
+    }
+
+    fn a_record_racing_the_mint_body_2015() {
         let mut ctx = MbSmfContext::new();
         ctx.init(8);
         // One under both caps, from two released sessions (each held up to the cap).

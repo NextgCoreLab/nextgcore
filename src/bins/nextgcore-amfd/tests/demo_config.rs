@@ -11,28 +11,77 @@ use std::net::{TcpListener, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-struct Killed(Child);
+/// A spawned amfd, killed on drop, whose stderr is drained as it is written
+/// (#1963): a test reads it while amfd runs, and amfd can never block on a full
+/// pipe.
+struct Killed {
+    child: Child,
+    err: std::sync::Arc<std::sync::Mutex<String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Killed {
+    /// What amfd has written to stderr so far.
+    fn stderr_so_far(&self) -> String {
+        self.err.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Wait for the stderr reader (the pipe closes when amfd exits) and return
+    /// everything amfd wrote.
+    fn collect(mut self) -> String {
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.stderr_so_far()
+    }
+}
+
 impl Drop for Killed {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// #1963: every port this test binary hands out, so two of its tests (which
+/// run concurrently, each spawning an amfd) are never given the same one. The
+/// kernel is free to return a just-released ephemeral port to the next bind(0),
+/// and two amfds then fight over it: one fails to start, or a scrape reads the
+/// other's listener.
+static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn unique_port(probe: impl Fn() -> u16) -> u16 {
+    loop {
+        let port = probe();
+        if HANDED_OUT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(port)
+        {
+            return port;
+        }
     }
 }
 
 fn free_tcp() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    unique_port(|| {
+        TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    })
 }
 
 fn free_udp() -> u16 {
-    UdpSocket::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    unique_port(|| {
+        UdpSocket::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    })
 }
 
 fn config(tag: &str, demo: &str) -> std::path::PathBuf {
@@ -55,22 +104,39 @@ fn config(tag: &str, demo: &str) -> std::path::PathBuf {
 }
 
 fn spawn(config: &std::path::Path, metrics_port: u16) -> Killed {
-    Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-amfd"))
-            .arg("-c")
-            .arg(config)
-            .env_remove("AMF_SBI_ADDR")
-            .env_remove("AMF_SBI_PORT")
-            .env_remove("NEXTGCORE_SBI_ADVERTISE")
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env("RUST_LOG", "info")
-            .env("AMF_METRICS_PORT", metrics_port.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn amfd"),
-    )
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nextgcore-amfd"))
+        .arg("-c")
+        .arg(config)
+        .env_remove("AMF_SBI_ADDR")
+        .env_remove("AMF_SBI_PORT")
+        .env_remove("NEXTGCORE_SBI_ADVERTISE")
+        .env("NEXTGCORE_SBI_PROFILE", "dev")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+        .env("RUST_LOG", "info")
+        .env("AMF_METRICS_PORT", metrics_port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn amfd");
+    let mut pipe = child.stderr.take().expect("stderr piped");
+    let err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = std::sync::Arc::clone(&err);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+    });
+    Killed {
+        child,
+        err,
+        reader: Some(reader),
+    }
 }
 
 /// Run to exit (start-up failure), returning (success, stderr).
@@ -78,54 +144,96 @@ fn run_to_exit(config: &std::path::Path) -> (bool, String) {
     let mut child = spawn(config, free_tcp());
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            let mut err = String::new();
-            child
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut err)
-                .unwrap();
-            return (status.success(), err);
+        if let Some(status) = child.child.try_wait().unwrap() {
+            return (status.success(), child.collect());
         }
         assert!(Instant::now() < deadline, "amfd did not exit");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// The `/metrics` body once it answers.
+/// amfd's log line for a listener it could not bind: it then runs on without
+/// that listener (the metrics endpoint is best-effort), so it does not exit.
 #[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
-fn scrape(port: u16, within: Duration) -> Option<String> {
+const IN_USE: &str = "Address already in use";
+
+/// The `/metrics` body once `child` answers it with a 200, or `None` when it
+/// will not: `within` passed, or `child` logged that a port it was given is
+/// taken.
+///
+/// #1963: every failed attempt is retried until then. A listener that accepts
+/// and then resets, or that answers something other than a 200 metrics page,
+/// used to end the scrape at once with `None`, failing the test 0.1 s in.
+#[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
+fn scrape(child: &Killed, port: u16, within: Duration) -> Option<String> {
     use std::io::Write;
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
+        if child.stderr_so_far().contains(IN_USE) {
+            return None;
+        }
         if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            s.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .ok()?;
+            // A listener that accepts and never answers (one that only holds the
+            // port) must not hang the scrape: bounded reads and writes.
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
             let mut body = String::new();
-            s.read_to_string(&mut body).ok()?;
-            return Some(body);
+            let answered = s
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .and_then(|()| s.read_to_string(&mut body));
+            if answered.is_ok() && body.starts_with("HTTP/1.1 200") {
+                return Some(body);
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     None
 }
 
+/// Start amfd with a fresh config for `tag` / `demo` and return it with its
+/// `/metrics` body (#1963).
+///
+/// Root cause: a port probed free with bind(0) and released is free to be taken
+/// before amfd binds it, by any socket on the machine (another test's amfd, or
+/// its outbound connections, which draw from the same ephemeral range). The
+/// ports are reserved within this binary ([`unique_port`]), which closes the
+/// in-binary case; for the rest, when amfd logs that a port it was given is in
+/// use (it runs on without its metrics endpoint, so it does not exit), it is
+/// started again on new ports, up to five times. Any other failure panics with
+/// amfd's stderr, so a failure says why rather than only "/metrics".
+#[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
+fn start_and_scrape(tag: &str, demo: &str) -> (Killed, String) {
+    start_and_scrape_with(tag, demo, free_tcp)
+}
+
+/// [`start_and_scrape`] with the metrics port of each attempt from `next_port`.
+#[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
+fn start_and_scrape_with(
+    tag: &str,
+    demo: &str,
+    mut next_port: impl FnMut() -> u16,
+) -> (Killed, String) {
+    let mut last = String::new();
+    for _attempt in 0..5 {
+        let port = next_port();
+        let child = spawn(&config(tag, demo), port);
+        if let Some(body) = scrape(&child, port, Duration::from_secs(30)) {
+            return (child, body);
+        }
+        last = stop(child);
+        if !last.contains(IN_USE) {
+            break;
+        }
+    }
+    panic!("{tag}: amfd never served /metrics; its stderr:\n{last}");
+}
+
 /// Kill a running amfd and return its stderr.
 #[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
 fn stop(mut child: Killed) -> String {
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    let mut err = String::new();
-    child
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    err
+    let _ = child.child.kill();
+    let _ = child.child.wait();
+    child.collect()
 }
 
 fn block(mode: &str) -> String {
@@ -174,9 +282,7 @@ fn an_unknown_mode_fails_startup_with_unknown_mode() {
 #[cfg(feature = "demo-d440c-nwdaf-paging")]
 #[test]
 fn mode_nwdaf_mobility_logs_the_banner_and_the_strategy_and_exports_the_metric() {
-    let port = free_tcp();
-    let child = spawn(&config("on", &block("nwdaf-mobility")), port);
-    let body = scrape(port, Duration::from_secs(30)).expect("/metrics");
+    let (child, body) = start_and_scrape("on", &block("nwdaf-mobility"));
     assert!(
         body.contains(r#"nextg_demo_enabled{demo="d440c-nwdaf-paging",mode="nwdaf-mobility"} 1"#),
         "{body}"
@@ -199,6 +305,37 @@ fn mode_nwdaf_mobility_logs_the_banner_and_the_strategy_and_exports_the_metric()
     );
 }
 
+/// #1963: the flake, made deterministic. The metrics port amfd is given is
+/// already taken when it binds (here by this test's own listener; in CI by
+/// another socket that drew the same released ephemeral port). amfd logs it
+/// and runs on without metrics, and the scrape used to wait out its 30 s and
+/// fail with "/metrics". It is now started again on a fresh port and served.
+#[cfg(feature = "demo-d440c-nwdaf-paging")]
+#[test]
+fn a_taken_metrics_port_is_retried_on_a_fresh_one_1963() {
+    let taken = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let taken_port = taken.local_addr().unwrap().port();
+    let mut first = true;
+    let started = Instant::now();
+    let (child, body) = start_and_scrape_with("taken", &block("nwdaf-mobility"), || {
+        if std::mem::take(&mut first) {
+            taken_port
+        } else {
+            free_tcp()
+        }
+    });
+    assert!(
+        body.contains(r#"nextg_demo_enabled{demo="d440c-nwdaf-paging",mode="nwdaf-mobility"} 1"#),
+        "{body}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the taken port is noticed from amfd's log, not by waiting out the scrape"
+    );
+    drop(child);
+    drop(taken);
+}
+
 /// The demo-off arms: the kill switch off with the key enabled, and no block at
 /// all. No banner, no `[demo:` line, no `nextg_demo_enabled`, and the default
 /// strategy.
@@ -212,9 +349,7 @@ fn the_kill_switch_and_an_absent_block_are_demo_off() {
         ),
         ("absent", ""),
     ] {
-        let port = free_tcp();
-        let child = spawn(&config(tag, demo), port);
-        let body = scrape(port, Duration::from_secs(30)).expect("/metrics");
+        let (child, body) = start_and_scrape(tag, demo);
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
         assert!(!body.contains("amf_paging_nwdaf_hints_total"), "{tag}: {body}");
         let err = stop(child);
@@ -260,12 +395,7 @@ fn a_d440a_mode_the_gnb_does_not_have_fails_startup_with_unknown_mode() {
 #[test]
 fn a_d440a_mode_logs_the_banner_and_the_forced_strategy_and_exports_the_metrics() {
     for mode in ["ct", "page-all"] {
-        let port = free_tcp();
-        let child = spawn(
-            &config(&format!("d440a-on-{mode}"), &d440a_block(mode)),
-            port,
-        );
-        let body = scrape(port, Duration::from_secs(30)).expect("/metrics");
+        let (child, body) = start_and_scrape(&format!("d440a-on-{mode}"), &d440a_block(mode));
         assert!(
             body.contains(&format!(
                 r#"nextg_demo_enabled{{demo="d440a-ai-paging",mode="{mode}"}} 1"#
@@ -308,9 +438,7 @@ fn d440a_demo_off_exports_nothing_of_the_demo() {
             "  paging:\n    strategy: recommended-first\n",
         ),
     ] {
-        let port = free_tcp();
-        let child = spawn(&config(tag, demo), port);
-        let body = scrape(port, Duration::from_secs(30)).expect("/metrics");
+        let (child, body) = start_and_scrape(tag, demo);
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
         assert!(!body.contains("amf_paging_attempts_total"), "{tag}: {body}");
         let err = stop(child);
