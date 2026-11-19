@@ -136,6 +136,12 @@ spec:
               value: /etc/nextgcore/certs/ees.key
             - name: NEXTGCORE_NRF_TLS_SERVER_NAME
               value: nrf
+            # #1795: eesd's listener follows the SBI profile, and the default
+            # production profile serves TLS from /etc/nextgcore/tls, which this pod
+            # does not mount. h2c like the base NFs (k8s/manifests), as the oauth2
+            # arm of scenario.sh already sets.
+            - name: NEXTGCORE_SBI_PROFILE
+              value: "dev"
             # Pinned to the urn:uuid of ees.crt (docker/rust/certs/nf-identities.txt).
             - name: NEXTGCORE_NF_INSTANCE_ID
               value: "6b1d7e3c-0000-4000-8000-0000000000e5"

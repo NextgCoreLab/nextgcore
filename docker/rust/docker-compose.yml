@@ -24,13 +24,14 @@ x-common: &common
     TLS_ENABLED: "${TLS_ENABLED:-false}"
     SBI_SCHEME: "${SBI_SCHEME:-http}"
     # ------------------------------------------------------------------------
-    # SBI security profile (issue #63). amfd/smfd/ausfd/udmd default to the
-    # PRODUCTION profile: mutually-authenticated TLS plus a required OAuth2
-    # access token on every SBI request. This compose file is the local
+    # SBI security profile (issue #63). Every SBI NF's listener (since #1795,
+    # not only amfd/smfd/ausfd/udmd) defaults to the PRODUCTION profile:
+    # mutually-authenticated TLS plus a required OAuth2 access token on every
+    # SBI request, and the NRF refuses to start without TLS. This compose file is the local
     # development / matched-simulator E2E stack, which serves cleartext h2c and
     # whose NFs do not all present tokens, so it opts out EXPLICITLY.
     #
-    # Without this line those four NFs refuse to start, naming the missing
+    # Without this line those NFs refuse to start, naming the missing
     # certificate path -- deliberately, because a security posture that falls
     # back to cleartext when a file is absent is not a posture.
     #
@@ -188,11 +189,15 @@ services:
       UDR_SBI_PORT: "7777"
       NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/udm.crt
       NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/udm.key
+      # #1836: SDM subscriptions, the UDR am-data subscriptions and the am-data
+      # changes waiting for the AMF survive a UDM restart, on the udm_state volume.
+      NEXTGCORE_UDM_STATE_FILE: /var/lib/nextgcore/udm-state.json
     command: ["-c", "/etc/nextgcore/udm.yaml"]
     volumes:
       - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
       - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
       - tls-udm:/etc/nextgcore/certs:ro
+      - udm_state:/var/lib/nextgcore
     networks:
       core:
         ipv4_address: 172.23.0.12
@@ -856,6 +861,8 @@ volumes:
   # is owned by the image's `nextgcore` user -- the NF processes run non-root, and
   # a bind mount would arrive owned by the host user.
   udr_state:
+  # Durable UDM state snapshot (#1836), named for the same reason.
+  udm_state:
   mongodb_data:
   prometheus_data:
   grafana_data:

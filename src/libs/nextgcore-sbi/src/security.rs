@@ -125,6 +125,24 @@ impl SbiSecurityPolicy {
         }
     }
 
+    /// #1795: this policy narrowed to server-side TLS: no client certificate
+    /// demanded or presented, and no access token required. For the
+    /// application-enablement servers (PIN, EES) that share the SBI stack but
+    /// whose callers are UEs and application servers, which hold neither an
+    /// operator client certificate nor an NRF-issued token (TS 23.542,
+    /// TS 23.558, TS 33.558). Under `production` such a server still serves
+    /// TLS from these paths and never falls back to cleartext.
+    pub fn server_tls_only(&self) -> Self {
+        let mut policy = Self {
+            mtls_required: false,
+            oauth2_required: false,
+            ..self.clone()
+        };
+        policy.tls_paths.client_cert = None;
+        policy.tls_paths.client_key = None;
+        policy
+    }
+
     /// Development security policy: TLS optional, no mTLS/OAuth2
     pub fn development() -> Self {
         Self {
@@ -304,8 +322,9 @@ impl SbiProfile {
 /// different site, and a posture expressed as four copies of the same twenty
 /// lines is a posture that will disagree with itself — the same failure shape as
 /// the `--kill` flag that was duplicated across twelve daemons and wrong in all
-/// twelve. Peripheral NFs that already hand-roll `with_tls` can migrate onto
-/// this later.
+/// twelve. Since #1795 every SBI NF's listener goes through it, or
+/// through [`apply_sbi_security_policy`] with a narrowed policy (SCP/SEPP:
+/// no token of their own; EES/PIN: [`SbiSecurityPolicy::server_tls_only`]).
 ///
 /// # Errors
 ///
@@ -368,8 +387,12 @@ pub fn apply_sbi_security_policy(
     let mut required: Vec<(&str, &str)> = vec![
         ("certificate", paths.cert.as_str()),
         ("private key", paths.key.as_str()),
-        ("client CA certificate", paths.ca_cert.as_str()),
     ];
+    // The CA is what client certificates are verified against, so only a
+    // policy that verifies them needs it (#1848: `server_tls_only` does not).
+    if policy.mtls_required {
+        required.push(("client CA certificate", paths.ca_cert.as_str()));
+    }
     if let Some(cc) = paths.client_cert.as_deref() {
         required.push(("client certificate (for outbound peer calls)", cc));
     }
@@ -2243,13 +2266,23 @@ mod audience_binding_guards {
             let path = bins.join(rel);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let call =
-                "outbound_oauth2_client(\n        nextgcore_sbi::security::SbiProfile::resolve(),";
+            // #1795: `main` resolves the profile once into `sbi_profile`, which
+            // both this client and the listener (`sbi_listener_config`) take.
+            let resolved = "let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();";
             assert_eq!(
-                text.matches(call).count(),
+                text.matches(resolved).count(),
                 1,
-                "{rel} must install its outbound OAuth2 client exactly once, with \
-                 SbiProfile::resolve(): under the production profile the AMF, AUSF, SMF \
+                "{rel} must resolve the SBI profile once, into `sbi_profile` (#1665, #1795)"
+            );
+            // Whitespace-insensitive: rustfmt folds the call onto one line or not.
+            let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert_eq!(
+                compact
+                    .matches("outbound_oauth2_client(sbi_profile,")
+                    .count(),
+                1,
+                "{rel} must install its outbound OAuth2 client exactly once, with the \
+                 resolved `sbi_profile`: under the production profile the AMF, AUSF, SMF \
                  and UDM refuse a token-less service request (#1665)"
             );
             assert!(

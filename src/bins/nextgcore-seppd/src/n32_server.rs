@@ -1264,13 +1264,21 @@ pub async fn forward_via_n32f(
 // the peer's /n32f-process, and relay the response back to the NF.
 // ============================================================================
 
-/// Start the consumer-facing SBI server on `host:port`. Returns the handle
-/// the caller stops on shutdown.
-pub async fn start_sbi_server(
+/// #1795: the consumer-facing SBI listener's configuration under the SBI
+/// security profile. Under `production`: TLS from `policy`'s certificate paths
+/// (whatever `--tls` said) and the client certificate verified against its CA
+/// (TS 33.501 §13.1.0, §13.3). No access token is required OF the SEPP: the
+/// token a home NF sends with a roaming request is for the remote producer,
+/// which verifies it (TS 33.501 §13.4.1.2), so a SEPP that demanded one for
+/// itself would refuse every request. A missing certificate is an error naming
+/// it, never cleartext. Under `dev` the SEPP's own `--tls` applies, as before.
+pub fn sbi_server_config(
     host: &str,
     port: u16,
     tls: Option<&N32TlsConfig>,
-) -> Result<SbiServer, String> {
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+) -> Result<SbiServerConfig, String> {
     let mut config = SbiServerConfig::with_host_port(host, port).map_err(|e| e.to_string())?;
     config = config.with_interface("sbi");
     if let Some(tls_cfg) = tls {
@@ -1278,6 +1286,44 @@ pub async fn start_sbi_server(
             config = config.with_tls(key.clone(), cert.clone());
         }
     }
+    let policy = nextgcore_sbi::security::SbiSecurityPolicy {
+        oauth2_required: false,
+        ..policy.clone()
+    };
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        &policy,
+        nextgcore_sbi::types::NfType::Sepp,
+        // Only read for a token requirement, which the SEPP does not have.
+        "",
+    )
+    .map_err(|e| format!("SBI security profile: {e}"))
+}
+
+/// #1795: N32 is never cleartext under the `production` profile: N32-c is a
+/// TLS connection between the SEPPs (TS 33.501 §13.2.1), so starting an N32
+/// listener without `--tls` there is a startup error, not a cleartext N32.
+pub fn check_n32_transport(
+    profile: nextgcore_sbi::security::SbiProfile,
+    tls: Option<&N32TlsConfig>,
+) -> Result<(), String> {
+    let has_tls = tls.is_some_and(|t| t.key.is_some() && t.cert.is_some());
+    if profile.is_production() && !has_tls {
+        return Err(
+            "the SBI profile is production and N32 has no TLS: N32-c is TLS between the SEPPs \
+             (TS 33.501 §13.2.1). Start with --tls, --tls-cert and --tls-key, or select \
+             NEXTGCORE_SBI_PROFILE=dev explicitly"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Start the consumer-facing SBI server on `host:port` with `config` from
+/// [`sbi_server_config`]. Returns the handle the caller stops on shutdown.
+pub async fn start_sbi_server(config: SbiServerConfig) -> Result<SbiServer, String> {
+    let (host, port) = (config.addr.ip(), config.addr.port());
     let server = SbiServer::new(config);
     server
         .start(sbi_consumer_handler)
@@ -1977,5 +2023,102 @@ mod tests {
         assert!(select_peer_for_target("nf.local.example.com").is_err());
         // A VPLMN with no peer SEPP errors.
         assert!(select_peer_for_target("nrf.5gc.mnc999.mcc999.3gppnetwork.org").is_err());
+    }
+}
+
+/// #1795: the SEPP's listeners follow the SBI security profile.
+#[cfg(test)]
+mod sbi_profile_tests_1795 {
+    use super::{check_n32_transport, sbi_server_config, N32TlsConfig};
+    use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+    use nextgcore_sbi::types::UriScheme;
+
+    fn own_tls() -> N32TlsConfig {
+        N32TlsConfig {
+            cert: Some("/own.crt".into()),
+            key: Some("/own.key".into()),
+            verify_client_cacert: None,
+            client_cert: None,
+            client_key: None,
+            ca_cert: None,
+            allow_insecure_no_mtls: false,
+        }
+    }
+
+    /// REVERT-VERIFIED: with `sbi_server_config` not applying the profile, the
+    /// production case serves cleartext and the first assertion fails.
+    #[test]
+    fn the_sbi_listener_follows_the_sbi_profile_1795() {
+        let dir = std::env::temp_dir().join(format!(
+            "seppd-1795-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("sepp.crt"),
+                key: file("sepp.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let tls = own_tls();
+        for given in [None, Some(&tls)] {
+            let prod = sbi_server_config("127.0.0.1", 7777, given, SbiProfile::Production, &policy)
+                .expect("production applies");
+            assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
+            assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+            assert!(prod.verify_client, "and verifies the client certificate");
+            assert_eq!(
+                prod.verify_client_cacert.as_deref(),
+                Some(policy.tls_paths.ca_cert.as_str())
+            );
+            assert!(
+                !prod.require_oauth2,
+                "a roaming request carries the remote producer's token, not one for the SEPP"
+            );
+        }
+
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: dir.join("absent.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = sbi_server_config("127.0.0.1", 7777, None, SbiProfile::Production, &missing)
+            .expect_err("no cleartext fallback");
+        assert!(err.contains("absent.crt"), "{err}");
+
+        let dev = sbi_server_config("127.0.0.1", 7777, None, SbiProfile::Dev, &policy).unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http, "dev stays cleartext");
+        let dev_tls =
+            sbi_server_config("127.0.0.1", 7777, Some(&tls), SbiProfile::Dev, &policy).unwrap();
+        assert_eq!(dev_tls.cert.as_deref(), Some("/own.crt"), "dev keeps --tls");
+        assert!(!dev_tls.verify_client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REVERT-VERIFIED: with the production arm of `check_n32_transport`
+    /// removed, a cleartext N32 is admitted under production and this fails.
+    #[test]
+    fn n32_is_never_cleartext_under_production_1795() {
+        let err = check_n32_transport(SbiProfile::Production, None)
+            .expect_err("a cleartext N32 is refused under production");
+        assert!(err.contains("TS 33.501 §13.2.1"), "{err}");
+        check_n32_transport(SbiProfile::Production, Some(&own_tls()))
+            .expect("N32 with TLS is admitted");
+        check_n32_transport(SbiProfile::Dev, None).expect("dev keeps its cleartext N32");
     }
 }
