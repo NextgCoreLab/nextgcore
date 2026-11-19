@@ -209,6 +209,16 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:7777")]
     nrf_uri: String,
 
+    /// #1971: address of the admin listener (`admin/capability-change`).
+    /// Loopback only; anything else refuses to start.
+    #[arg(long, default_value = "127.0.0.1")]
+    admin_addr: String,
+
+    /// #1971: port of the admin listener. Unset (the default) serves no admin
+    /// listener, so no CapsNotify can be pushed by hand.
+    #[arg(long)]
+    admin_port: Option<u16>,
+
     /// NF instance ID
     #[arg(long)]
     nf_instance_id: Option<String>,
@@ -386,6 +396,22 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
+    // #1971: the admin trigger, on its own loopback listener, only when asked
+    // (the nsacfd #1864/#1912 pattern).
+    let _admin_server = match args.admin_port {
+        Some(port) => {
+            let admin_addr = admin_listen_addr(&args.admin_addr, port)?;
+            let server = SbiServer::new(SbiServerConfig::new(admin_addr));
+            server
+                .start(tsctsf_admin_request_handler)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start the admin listener: {e}"))?;
+            log::info!("TSCTSF admin listener (capability-change) on {admin_addr}");
+            Some(server)
+        }
+        None => None,
+    };
+
     // Register with NRF as nfType TSCTSF advertising
     // ntsctsf-time-synchronization (non-fatal on failure, nwdafd pattern).
     let sbi_ctx = nextgcore_sbi::context::global_context();
@@ -469,6 +495,63 @@ async fn main() -> Result<()> {
 }
 
 /// TSCTSF SBI request handler
+/// #1971: the TSCTSF administration extension (NOT a TS 29.565 resource).
+fn is_admin_path(parts: &[&str]) -> bool {
+    matches!(
+        parts,
+        [
+            "ntsctsf-time-synchronization",
+            "v1",
+            "admin",
+            "capability-change"
+        ]
+    )
+}
+
+/// #1971: the admin listener's bind, refused unless it is loopback. The admin
+/// extension has no credential of its own, so who can reach the socket is the
+/// whole access control: an operator on the host (or in the pod), never a peer
+/// NF on the SBI network.
+fn admin_listen_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let addr =
+        nextgcore_core::sockaddr::parse_listen_addr(host, port).context("Invalid admin address")?;
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "--admin-addr {host} is not a loopback address: the TSCTSF admin listener \
+             (capability-change) has no credential, so it binds loopback only (#1971)"
+        );
+    }
+    Ok(addr)
+}
+
+/// #1971: the TSCTSF admin listener's handler: the admin extension only.
+///
+/// #113: the administrative trigger for CapsNotify (§5.2.27.2.8). NOT a 3GPP
+/// service operation. The 5GS capability change that would trigger CapsNotify
+/// has no in-tree source of its own beyond the derivation, so this route is a
+/// producer kept for tests and operations, named `admin` so nobody mistakes it
+/// for part of the Ntsctsf API.
+async fn tsctsf_admin_request_handler(request: SbiRequest) -> SbiResponse {
+    let method = request.header.method.as_str();
+    let uri = &request.header.uri;
+    log::debug!(
+        "TSCTSF admin: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
+    let path = uri.split('?').next().unwrap_or(uri);
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["ntsctsf-time-synchronization", "v1", "admin", "capability-change"] => match method {
+            "POST" => handle_admin_capability_change(&request).await,
+            _ => send_method_not_allowed(method, "admin/capability-change"),
+        },
+        _ => send_not_found(
+            &format!("{path} is not a TSCTSF administration resource"),
+            None,
+        ),
+    }
+}
+
 async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
@@ -543,19 +626,15 @@ async fn tsctsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
 
-        // #113: administrative trigger for CapsNotify (§5.2.27.2.8).
-        //
-        // NOT a 3GPP service operation. The 5GS capability change that would
-        // trigger CapsNotify has NO in-tree source -- reporting one needs the
-        // UPF/NW-TT capability leg, which is split out as its own issue. Without a
-        // trigger the notify path would be unreachable in principle, which is this
-        // repo's recorded "grep the SINK before implementing an emit-side feature"
-        // hazard in reverse. This route is the producer, and it is named `admin` so
-        // nobody mistakes it for part of the Ntsctsf API.
-        ["ntsctsf-time-synchronization", "v1", "admin", "capability-change"] => match method {
-            "POST" => handle_admin_capability_change(&request).await,
-            _ => send_method_not_allowed(method, "admin/capability-change"),
-        },
+        // #1971: the administrative CapsNotify trigger is not on this listener.
+        // Any NF that passed the server gate could otherwise push a CapsNotify
+        // with arbitrary content to every subscriber. It is served by
+        // `tsctsf_admin_request_handler` on the loopback admin listener
+        // (`--admin-port`).
+        parts if is_admin_path(parts) => send_not_found(
+            &format!("{path} is a TSCTSF administration resource, not served on the SBI (#1971)"),
+            None,
+        ),
 
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
@@ -1885,6 +1964,52 @@ mod tests {
             ("anonymous", request()),
             ("certificate/token mismatch", mismatch),
         ]
+    }
+
+    /// #1971: `admin/capability-change` is not served on the SBI listener:
+    /// a request there is 404 and pushes no CapsNotify, while the admin
+    /// listener's handler still serves it. The admin listener binds loopback
+    /// only.
+    ///
+    /// REVERT-VERIFIED: with the SBI router dispatching the admin path to
+    /// `handle_admin_capability_change` again, the SBI request is not 404 and
+    /// the first assertion fails; with the loopback check removed from
+    /// `admin_listen_addr`, `0.0.0.0` is accepted.
+    #[test]
+    fn the_admin_capability_change_is_not_on_the_sbi_1971() {
+        let _g = lock_globals();
+        reset_context();
+        let body = serde_json::json!({});
+        let sbi = block_on(super::tsctsf_sbi_request_handler(owned_1865(post(
+            "/ntsctsf-time-synchronization/v1/admin/capability-change",
+            body.clone(),
+        ))));
+        assert_eq!(sbi.status, 404, "not on the SBI: {:?}", sbi.http.content);
+        assert!(
+            sbi.http
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not served on the SBI"),
+            "{:?}",
+            sbi.http.content
+        );
+        let admin = block_on(super::tsctsf_admin_request_handler(post(
+            "/ntsctsf-time-synchronization/v1/admin/capability-change",
+            body,
+        )));
+        assert_ne!(admin.status, 404, "served on the admin listener");
+        let other = block_on(super::tsctsf_admin_request_handler(SbiRequest::get(
+            "/ntsctsf-time-synchronization/v1/configuration/x",
+        )));
+        assert_eq!(other.status, 404, "the admin listener serves nothing else");
+
+        assert!(admin_listen_addr("127.0.0.1", 7791).is_ok());
+        assert!(admin_listen_addr("::1", 7791).is_ok());
+        for host in ["0.0.0.0", "10.0.0.5", "::"] {
+            let err = admin_listen_addr(host, 7791).expect_err(host).to_string();
+            assert!(err.contains("loopback"), "{host}: {err}");
+        }
     }
 
     /// #1937: a time-sync configuration, an ASTI configuration and a QoS/TSC
@@ -3443,7 +3568,7 @@ mod tests {
         assert_eq!(fetched.status, 200);
 
         // A capability change reaches it.
-        let triggered = tsctsf_sbi_request_handler(post(
+        let triggered = super::tsctsf_admin_request_handler(post(
             "/ntsctsf-time-synchronization/v1/admin/capability-change",
             serde_json::json!({ "gmCapable": true, "asTimeSource": "GNSS" }),
         ))
@@ -3476,7 +3601,7 @@ mod tests {
         assert_eq!(removed.status, 204);
         seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-        let triggered = tsctsf_sbi_request_handler(post(
+        let triggered = super::tsctsf_admin_request_handler(post(
             "/ntsctsf-time-synchronization/v1/admin/capability-change",
             serde_json::json!({ "gmCapable": false }),
         ))
