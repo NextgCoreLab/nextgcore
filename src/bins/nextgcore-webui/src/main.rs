@@ -2087,6 +2087,27 @@ mod shipped_artefact_guards {
     /// (TS 33.117 §4.2.5.1). `httpOnly` used to sit on the session options object
     /// rather than inside `cookie`, where express-session reads it, so it had no
     /// effect; `secure` was absent entirely.
+    /// #1970: mongoose query logging writes subscriber documents (K, OPc) to the
+    /// log. index.js must decide it through lib/mongoose-debug, which is off
+    /// under the production SBI profile and redacts key fields (pinned by
+    /// webui/server/lib/mongoose-debug.check.js, run in CI), never turn it on
+    /// directly.
+    ///
+    /// REVERT-VERIFIED: with index.js back to `mongoose.set('debug', true)`,
+    /// this fails.
+    #[test]
+    fn mongoose_debug_goes_through_the_redacting_helper_1970() {
+        let server = read_code("webui/server/index.js");
+        assert!(
+            !server.contains("mongoose.set('debug', true)"),
+            "index.js must not enable raw mongoose debug logging"
+        );
+        assert!(
+            server.contains("require('./lib/mongoose-debug').mongooseDebug(process.env)"),
+            "index.js must decide mongoose debug through lib/mongoose-debug"
+        );
+    }
+
     #[test]
     fn the_session_cookie_is_hardened() {
         let server = read_code("webui/server/index.js");
@@ -2104,10 +2125,23 @@ mod shipped_artefact_guards {
                 "the session cookie must set {attribute} -- block was: {cookie_block}"
             );
         }
-        // Secure must be the default, with only an explicit opt-out.
+        // Secure must be the default, with only an explicit opt-out, and (#1913)
+        // the opt-out is decided by the profile-aware helper, which refuses it
+        // under the production SBI profile. Its behaviour is pinned by
+        // webui/server/lib/insecure-dev.check.js (run in CI).
         assert!(
-            cookie_block.contains("WEBUI_INSECURE_DEV !== '1'"),
-            "`secure` must default to true and require an explicit opt-out"
+            cookie_block.contains("secure: !insecureDev"),
+            "`secure` must come from the profile-aware insecure-dev decision -- block was: \
+             {cookie_block}"
+        );
+        assert!(
+            server.contains("require('./lib/insecure-dev').insecureDev(process.env)"),
+            "index.js must decide WEBUI_INSECURE_DEV through lib/insecure-dev (#1913)"
+        );
+        let helper = read_code("webui/server/lib/insecure-dev.js");
+        assert!(
+            helper.contains("sbiProfile(env) !== 'dev'") && helper.contains("throw new Error("),
+            "the helper must refuse WEBUI_INSECURE_DEV outside the dev profile"
         );
     }
 }

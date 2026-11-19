@@ -85,7 +85,38 @@ pub mod test_support {
     /// before the environment, and sibling tests seed SMFs there, so a call made while
     /// they run would reach their SMF (#1034, #1064). `SmfEnvGuard` takes
     /// `sbi_path::nf_cache_test_lock` first, then this lock.
+    ///
+    /// #1933: it guards the PCF endpoint variables (`PCF_SBI_ADDR` / `PCF_SBI_PORT`)
+    /// too. The tests that point them at a recording stand-in already set them under
+    /// `SmfEnvGuard`, so this is that global's one lock, not a second. Every test that
+    /// RESOLVES the PCF takes it as well -- a registration that reaches the Accept
+    /// (the UE policy create, and the AM policy create before it), a deregistration
+    /// of a UE holding a policy association, a PCF termination callback -- or its
+    /// Npcf call lands on whichever stand-in a sibling has pointed the variables at
+    /// (an unexpected `POST /npcf-ue-policy-control/v1/policies`, #1933).
+    /// `assert_pcf_env_lock_held` (test builds) enforces that at each resolution
+    /// site. A test holding other locks takes this one AFTER `CONTEXT_GUARD`,
+    /// [`CONNECTED_DOWNLINK_LOCK`] and `sbi_path::nf_cache_test_lock`, and BEFORE
+    /// [`AUSF_ENV_LOCK`], `context::PAGING_MAP_TEST_LOCK`, the Namf
+    /// `dereg_queue_test_lock` and [`PAGING_STRATEGY_LOCK`] -- the order the existing
+    /// `SmfEnvGuard` tests already use, so no two tests can deadlock.
     pub static SMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Test-only enforcement of [`SMF_ENV_LOCK`] for the PCF endpoint (#1933): every
+    /// site that resolves the PCF calls this first, and it panics when nobody holds
+    /// the lock. As with [`assert_paging_strategy_lock_held`], a test that resolves
+    /// the PCF without the lock then fails deterministically whenever it runs alone,
+    /// and in most parallel runs too.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn assert_pcf_env_lock_held() {
+        if SMF_ENV_LOCK.try_lock().is_ok() {
+            panic!(
+                "the PCF endpoint was resolved with SMF_ENV_LOCK free: take it in this \
+                 test (#1933)"
+            );
+        }
+    }
 
     /// Serialises tests that drain the process-global connected-UE downlink queue
     /// (`AmfContext::connected_downlink_queue`, drained by

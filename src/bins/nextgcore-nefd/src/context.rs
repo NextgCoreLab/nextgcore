@@ -46,6 +46,12 @@ pub struct SouthboundRef {
     pub subscription_id: String,
     /// Path to DELETE on the producer to tear the subscription down.
     pub delete_path: String,
+    /// #1877 (R27): the producer base URI the subscription was made at, so a
+    /// retried DELETE goes there even after the configured URI changes (to a new
+    /// producer, which would answer 404 while the old one kept the subscription).
+    /// `None` for one recorded before this existed: the configured URI is used.
+    #[serde(default)]
+    pub producer_base: Option<String>,
 }
 
 /// UNIX seconds. Saturates rather than panicking on a clock before the epoch.
@@ -743,6 +749,7 @@ mod tests {
                 producer: SouthboundProducer::Amf,
                 subscription_id: "amf-sub-7".to_string(),
                 delete_path: "/namf-evts/v1/subscriptions/amf-sub-7".to_string(),
+                producer_base: None,
             });
             sub_id = sub.id.clone();
             ctx.subscription_insert(sub).expect("insert");
