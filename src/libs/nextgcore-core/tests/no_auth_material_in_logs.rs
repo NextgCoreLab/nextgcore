@@ -1038,6 +1038,94 @@ fn is_callback_key(literal: &str) -> bool {
     named && (k.ends_with("uri") || k.ends_with("destination"))
 }
 
+/// Where a `let` initialiser that starts at `value` (just at its `=`) ends: the
+/// first `;`, `{` or ` else ` at bracket depth 0 that is not inside a string,
+/// raw string or char literal (#1927). `(`/`[` nest, and so does a `{` opened
+/// inside them (a closure body in an argument); a `{` at depth 0 is the body of
+/// an `if let` / `while let`, as before.
+fn let_value_end(value: &str) -> usize {
+    let b = value.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => i = skip_string(b, i),
+            b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#'))
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+            {
+                i = skip_raw_string(b, i)
+            }
+            // A char literal ('x', '\n', '{'), not a lifetime ('a).
+            b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+            b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'(' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'{' if depth > 0 => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' if depth > 0 => {
+                depth -= 1;
+                i += 1;
+            }
+            b';' | b'{' if depth == 0 => return i,
+            b' ' if depth == 0 && value[i..].starts_with(" else ") => return i,
+            _ => i += 1,
+        }
+    }
+    value.len()
+}
+
+/// The index just past the string literal opening at `b[open]` (`"`).
+fn skip_string(b: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// The index just past the raw string literal opening at `b[open]` (`r`,
+/// then `#`* and `"`).
+fn skip_raw_string(b: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    let mut hashes = 0;
+    while b.get(i) == Some(&b'#') {
+        hashes += 1;
+        i += 1;
+    }
+    if b.get(i) != Some(&b'"') {
+        return open + 1;
+    }
+    i += 1;
+    while i < b.len() {
+        if b[i] == b'"'
+            && b[i + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|&&c| c == b'#')
+                .count()
+                == hashes
+        {
+            return i + 1 + hashes;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
 /// Locals bound from a callback URI (#1047 review: a bare `uri` that holds one),
 /// as `(name, scope start, scope end)` byte offsets in `text`: the binding to the
 /// next `fn` item. A `let` whose value names a callback identifier
@@ -1072,12 +1160,10 @@ fn tainted_bindings(text: &str) -> Vec<(String, usize, usize)> {
             continue;
         }
         // The value ends at `;`, at the `{` of an `if let` / `while let` body,
-        // or at a `let ... else`.
-        let value_end = [";", "{", " else "]
-            .iter()
-            .filter_map(|t| rest[eq..].find(t))
-            .min()
-            .map_or(rest.len(), |i| eq + i);
+        // or at a `let ... else`, each only OUTSIDE string and char literals and
+        // brackets (#1927): `let m = format!("{}", request.header.uri);` used to
+        // end at the `{` of its format string, so the URI was never read.
+        let value_end = eq + let_value_end(&rest[eq..]);
         let value = &rest[eq + 1..value_end];
         if value.contains("redact_") {
             continue;
@@ -1289,6 +1375,24 @@ fn the_callback_uri_scan_sees_its_shapes() {
         .map(|(n, _, _)| n)
         .collect();
     assert_eq!(names, vec!["uri", "cb"]);
+    // #1927: a URI laundered through `format!` into a local. The initialiser no
+    // longer ends at the `{` of its format string, so the URI is read, and the
+    // local is a taint. The same for a raw string and a `{` char literal, and
+    // with the URI after a closure body inside the call.
+    //
+    // REVERT-VERIFIED: with `let_value_end` back to the first `;`/`{`/` else `
+    // anywhere, `m` is not tainted and this assertion fails.
+    let src = "fn d() {\n    let m = format!(\"{}\", request.header.uri);\n    let r = format!(r#\"{x}\"#, request.header.uri);\n    let c = (if '{' == k { a } else { b }, request.header.uri.clone());\n    let f = opt.map(|x| { x + 1 }).and(Some(&request.header.uri));\n}\n";
+    let names: Vec<String> = tainted_bindings(src)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, vec!["m", "r", "c", "f"]);
+    // ... and the log line printing it is flagged as a whole callback URI.
+    assert_eq!(
+        unredacted_callback_uris_with("\"probe {m}\"", &["m"]),
+        vec!["m"]
+    );
     // Not taints: a count, an authority, and an `if let` whose body names one.
     let src = "fn c() {\n    let n = subs.iter().filter_map(|s| s.notify_uri.as_deref()).count();\n    let a = uri_authority(&notification_uri);\n    if let Some(id) = &ctx_id {\n        let uri = c.dns_context_notify_uri(id);\n    }\n}\n";
     let names: Vec<String> = tainted_bindings(src)
