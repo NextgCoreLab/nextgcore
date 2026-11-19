@@ -3958,12 +3958,60 @@ fn producer_eligible(
 /// token minted while the producer was down outlive a restrictive
 /// `allowedNfTypes` the producer registered with afterwards.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn authorize_access_token(
     consumer: &NfProfile,
     req_nf_type: &str,
     target_nf_type: &str,
     requested_scopes: &[String],
     producers: &[NfProfile],
+    requester_plmns: &[serde_json::Value],
+    requester_snssais: &[serde_json::Value],
+) -> Result<Vec<String>, (&'static str, String)> {
+    authorize_access_token_for(
+        consumer,
+        req_nf_type,
+        target_nf_type,
+        requested_scopes,
+        producers,
+        producers,
+        requester_plmns,
+        requester_snssais,
+    )
+}
+
+/// #1828 (R26 on #1922): the producers that will ACCEPT the token being
+/// minted, which a resource scope must be allowed by. A type-targeted token's
+/// audience is the NF type (TS 29.510 §6.3.5.2.4), and every producer of that
+/// type accepts it (TS 33.501 §13.4.1.2), whatever its status, PLMN or slice.
+/// So the set is every registered producer of the type: SUSPENDED included
+/// (it can resume and accept the token while it is still valid), and never
+/// narrowed by the requester's own `requesterPlmnList` / `requesterSnssaiList`,
+/// which the requester chooses. An instance-targeted token's audience is that
+/// instance alone.
+fn token_acceptors(
+    registered: &[NfProfile],
+    target_nf_type: &str,
+    target_instance: Option<&NfProfile>,
+) -> Vec<NfProfile> {
+    match target_instance {
+        Some(p) => vec![p.clone()],
+        None => registered
+            .iter()
+            .filter(|p| p.nf_type.eq_ignore_ascii_case(target_nf_type))
+            .cloned()
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authorize_access_token_for(
+    consumer: &NfProfile,
+    req_nf_type: &str,
+    target_nf_type: &str,
+    requested_scopes: &[String],
+    producers: &[NfProfile],
+    acceptors: &[NfProfile],
     requester_plmns: &[serde_json::Value],
     requester_snssais: &[serde_json::Value],
 ) -> Result<Vec<String>, (&'static str, String)> {
@@ -4014,12 +4062,20 @@ fn authorize_access_token(
             // #1828: TS 29.510 Table 6.1.6.2.3-1 NOTE 11 is per producer, and a
             // token whose audience is the target TYPE is accepted by every
             // producer of it. A resource scope is therefore granted only when
-            // EVERY candidate producer (each eligible one offering the
-            // service) allows it for this consumer: one UDR registered with a
+            // an eligible producer allows it AND every ACCEPTOR of the token
+            // offering the service allows it too ([`token_acceptors`]: every
+            // registered producer of the type, whatever its status, and not
+            // the requester-filtered eligible set). One UDR registered with a
             // wider map must not put the K-read scope into a token all UDRs
-            // accept. An instance-targeted request has one candidate, so it
-            // keeps that producer's own rule.
-            offered && decisions.iter().filter(|(o, _)| *o).all(|(_, perm)| *perm)
+            // accept. An instance-targeted token has one acceptor.
+            decisions.iter().any(|(_, perm)| *perm)
+                && acceptors
+                    .iter()
+                    .map(|p| {
+                        p.authorizes_scope(&consumer.nf_type, &consumer.nf_instance_id, service)
+                    })
+                    .filter(|(o, _)| *o)
+                    .all(|(_, perm)| perm)
         } else {
             decisions.iter().any(|(_, perm)| *perm)
         };
@@ -5247,8 +5303,11 @@ async fn handle_access_token_request_with_policy(
     // already bound to it must be able to refresh its token); SUSPENDED is "not
     // operative" (e.g. heartbeat failure), so it cannot vouch for a token. An
     // unknown status is treated as not operative.
-    let mut all: Vec<NfProfile> = manager
-        .list()
+    // #1828: every registered producer, whatever its status: the set a
+    // type-targeted token's resource scopes are checked against.
+    let registered: Vec<NfProfile> = manager.list();
+    let mut all: Vec<NfProfile> = registered
+        .clone()
         .into_iter()
         .filter(|p| {
             ["REGISTERED", "UNDISCOVERABLE", "CANARY_RELEASE"]
@@ -5329,12 +5388,14 @@ async fn handle_access_token_request_with_policy(
     // requested scope is permitted by the target producer set BEFORE minting a
     // token. Without this, the endpoint is an OAuth2 authorization bypass.
     let requested_scopes: Vec<String> = req.scope.split_whitespace().map(String::from).collect();
-    let granted_scopes = match authorize_access_token(
+    let acceptors = token_acceptors(&registered, &target_nf_type, target_instance.as_ref());
+    let granted_scopes = match authorize_access_token_for(
         &consumer,
         &nf_type,
         &target_nf_type,
         &requested_scopes,
         &producers,
+        &acceptors,
         &req.requester_plmns,
         &req.requester_snssais,
     ) {
@@ -6080,6 +6141,113 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pinned, requested, "the pinned UDR allows it");
+    }
+
+    /// R26 on #1922: a permissive UDR on a slice of its own, and a PCF naming
+    /// that slice in its token request. The eligible set is then the permissive
+    /// UDR alone, but the token's audience is still "UDR", so the standard UDR
+    /// accepts it too: the K-read scope must not be granted.
+    ///
+    /// REVERT-VERIFIED: with the acceptor check reading `decisions` (the
+    /// requester-filtered set) instead of `acceptors`, the PCF gets the scope.
+    #[test]
+    fn a_requester_chosen_slice_does_not_narrow_the_acceptors_1828() {
+        let udr = |id: &str, pcf_scopes: serde_json::Value, sst: Option<u64>| {
+            let mut attrs = udr_with_resource_scopes().attributes;
+            attrs["nfInstanceId"] = id.into();
+            attrs["nfServices"][0]["allowedOperationsPerNfType"]["PCF"] = pcf_scopes;
+            if let Some(sst) = sst {
+                attrs["sNssais"] = serde_json::json!([{ "sst": sst }]);
+            }
+            NfProfile::from_json(&attrs).expect("profile")
+        };
+        let standard = udr(
+            "udr-standard-1828b",
+            serde_json::json!(["nudr-dr"]),
+            Some(1),
+        );
+        let permissive = udr(
+            "udr-permissive-1828b",
+            serde_json::json!(["nudr-dr", AUTH_SUBS_READ]),
+            Some(99),
+        );
+        let all = [standard, permissive];
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        let slice = [serde_json::json!({ "sst": 99 })];
+        let granted = authorize_access_token_for(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            &all,
+            &token_acceptors(&all, "UDR", None),
+            &[],
+            &slice,
+        )
+        .expect("the service scope is granted");
+        assert_eq!(
+            granted,
+            vec!["nudr-dr".to_string()],
+            "the standard UDR accepts the token too, so no K-read scope"
+        );
+    }
+
+    /// R26 on #1922: a SUSPENDED UDR still accepts a type-targeted token once
+    /// it resumes, so it is an acceptor; the eligible set skips it.
+    ///
+    /// REVERT-VERIFIED: with `token_acceptors` filtering out non-operative
+    /// producers, the suspended standard UDR is ignored and the PCF gets the
+    /// scope; the first assertion fails.
+    #[test]
+    fn a_suspended_udr_still_counts_as_an_acceptor_1828() {
+        let udr = |id: &str, pcf_scopes: serde_json::Value, status: &str| {
+            let mut attrs = udr_with_resource_scopes().attributes;
+            attrs["nfInstanceId"] = id.into();
+            attrs["nfStatus"] = status.into();
+            attrs["nfServices"][0]["allowedOperationsPerNfType"]["PCF"] = pcf_scopes;
+            NfProfile::from_json(&attrs).expect("profile")
+        };
+        let suspended = udr(
+            "udr-suspended-1828c",
+            serde_json::json!(["nudr-dr"]),
+            "SUSPENDED",
+        );
+        let permissive = udr(
+            "udr-permissive-1828c",
+            serde_json::json!(["nudr-dr", AUTH_SUBS_READ]),
+            "REGISTERED",
+        );
+        let registered = [suspended.clone(), permissive.clone()];
+        let acceptors = token_acceptors(&registered, "UDR", None);
+        assert_eq!(acceptors.len(), 2, "the suspended UDR is an acceptor");
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        // The handler's operative set: the suspended UDR is not in it.
+        let granted = authorize_access_token_for(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&permissive),
+            &acceptors,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(granted, vec!["nudr-dr".to_string()]);
+        // Pinned to the permissive UDR, its own map decides.
+        let pinned = token_acceptors(&registered, "UDR", Some(&permissive));
+        let granted = authorize_access_token_for(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&permissive),
+            &pinned,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(granted, requested);
     }
 
     /// #1811, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: with neither
