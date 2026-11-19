@@ -71,6 +71,11 @@ subscriber that named none asked for everything.
 
 `POST /ntsctsf-time-synchronization/v1/admin/capability-change` fans a capability
 change out to every `CapsSubscribe` subscriber and answers `200 {"notified": N}`.
+Since #1971 it is served **only on the loopback admin listener** (`--admin-port`,
+`--admin-addr`, which must be a loopback address or startup fails), never on the SBI,
+where it answers 404. Any NF that passed the SBI gate could otherwise push a
+CapsNotify with arbitrary content to every subscriber. With no `--admin-port` there
+is no admin listener at all.
 
 It exists because the 5GS capability change that would trigger `CapsNotify` has **no
 in-tree source** — reporting one needs the capability leg tracked in #284 — and
@@ -114,6 +119,8 @@ From the clap `Args` struct in `src/bins/nextgcore-tsctsf/src/main.rs`:
 | `--sbi-port` | `7819` | SBI port. |
 | `--tls`, `--tls-cert`, `--tls-key` | off / unset | TLS for the SBI server. |
 | `--nrf-uri` | `http://127.0.0.1:7777` | NRF location for registration and the OAuth2 JWKS. |
+| `--admin-port` | unset | Port of the admin listener serving `admin/capability-change` (#1971). Unset: no admin listener. |
+| `--admin-addr` | `127.0.0.1` | Address of the admin listener; anything but loopback refuses to start (#1971). |
 | `--nf-instance-id` | generated UUID | NF Instance ID. |
 | `--max-configs` | `4096` | Capacity cap, applied **per collection** (configurations, capability subscriptions, ASTI configurations, QoS/TSC sessions and their subscriptions). Exhaustion answers `507`. |
 
