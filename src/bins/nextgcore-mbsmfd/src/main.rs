@@ -327,6 +327,7 @@ async fn main() -> Result<()> {
     // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
     // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
     let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    warn_ignored_debug_routes(sbi_profile);
     let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
         sbi_profile,
         require_oauth2,
@@ -555,7 +556,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             if debug_routes_enabled() =>
         {
             match method {
-                "DELETE" => handle_member_leave(session_id, supi).await,
+                "DELETE" => handle_member_leave(session_id, supi, &request).await,
                 _ => send_method_not_allowed(method, "mbs-sessions/{id}/members/{supi}"),
             }
         }
@@ -569,10 +570,33 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// Whether the non-spec debug routes (`/activate`, `/members*`) are exposed.
 /// Off by default so the SBI surface is exactly the TS 29.532 resource set;
 /// enabled by setting `MBSMF_DEBUG_ROUTES` (any non-empty value). [mbsmfd-10]
+///
+/// #1944 (R32 on #2057): never under the `production` SBI profile. The routes
+/// add any SUPI to a session and establish N4mb towards a `upfAddr` the body
+/// names, which no TS 29.532 operation lets a consumer do; the variable is
+/// ignored there (and [`warn_ignored_debug_routes`] says so at startup).
 fn debug_routes_enabled() -> bool {
-    std::env::var("MBSMF_DEBUG_ROUTES")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    debug_routes_allowed(
+        std::env::var("MBSMF_DEBUG_ROUTES").ok().as_deref(),
+        nextgcore_sbi::security::SbiProfile::resolve(),
+    )
+}
+
+/// [`debug_routes_enabled`] for a given variable value and SBI profile.
+fn debug_routes_allowed(value: Option<&str>, profile: nextgcore_sbi::security::SbiProfile) -> bool {
+    value.is_some_and(|v| !v.is_empty()) && !profile.is_production()
+}
+
+/// #1944 (R32 on #2057): a WARN at startup when `MBSMF_DEBUG_ROUTES` is set
+/// under the production profile, where it is ignored.
+fn warn_ignored_debug_routes(profile: nextgcore_sbi::security::SbiProfile) {
+    let set = std::env::var("MBSMF_DEBUG_ROUTES").is_ok_and(|v| !v.is_empty());
+    if set && profile.is_production() {
+        log::warn!(
+            "MBSMF_DEBUG_ROUTES is set but ignored: the debug routes (/activate, /members) are \
+             never served under the production SBI profile (#1944)"
+        );
+    }
 }
 
 /// Parse session pool ID from string like "mbs-sess-123"
@@ -1474,6 +1498,10 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
+    // #1944: only the session's creator, before the N4mb establishment.
+    if let Some(refused) = refuse_debug_route_non_owner(pool_id, request, "MBS Session Activate") {
+        return refused;
+    }
 
     // Parse UPF address from request body (defaults to the configured MB-UPF).
     let upf_addr: std::net::Ipv4Addr = if let Some(body) = &request.http.content {
@@ -2466,6 +2494,23 @@ async fn handle_tmgi_deallocate(request: &SbiRequest) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
+/// #1944: the caller check of the debug routes (`/activate`, `/members*`,
+/// [`debug_routes_enabled`]): only the consumer that created the session
+/// (`nextgcore_sbi::owner_binding`: its verified NF instance ID, the
+/// certificate's when direct, the token `sub` behind an SCP) may activate it
+/// or change its members, refused 403 before any change. These routes are
+/// not TS 29.532 resources; in the specified flows a UE joins through its
+/// serving SMF's ContextUpdate (TS 23.247 §7.2.1.3). `None` for an unknown
+/// session: the handler answers that as before.
+fn refuse_debug_route_non_owner(
+    pool_id: u64,
+    request: &SbiRequest,
+    operation: &str,
+) -> Option<SbiResponse> {
+    let session = mbsmf_self().read().ok()?.session_find_by_id(pool_id)?;
+    owner_binding::refuse_non_owner(session.owner.as_deref(), request, operation)
+}
+
 /// Handle member join (TMGI group membership)
 async fn handle_member_join(session_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Member Join: {session_id}");
@@ -2474,6 +2519,9 @@ async fn handle_member_join(session_id: &str, request: &SbiRequest) -> SbiRespon
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
+    if let Some(refused) = refuse_debug_route_non_owner(pool_id, request, "MBS Member Join") {
+        return refused;
+    }
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -2547,13 +2595,16 @@ async fn handle_member_list(session_id: &str) -> SbiResponse {
 }
 
 /// Handle member leave
-async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
+async fn handle_member_leave(session_id: &str, supi: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Member Leave: {session_id} / {supi}");
 
     let pool_id = match parse_session_id(session_id) {
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
+    if let Some(refused) = refuse_debug_route_non_owner(pool_id, request, "MBS Member Leave") {
+        return refused;
+    }
 
     let ctx = mbsmf_self();
     let left = if let Ok(context) = ctx.read() {
@@ -4588,6 +4639,20 @@ mod tests {
         assert_eq!(rsp.status, 400, "/contexts/update exists (400, not 404)");
     }
 
+    /// #1944 (R32 on #2057): `MBSMF_DEBUG_ROUTES` turns the debug routes on
+    /// under the dev profile only; under production they are never served.
+    ///
+    /// REVERT-VERIFIED: with the profile not consulted, the production
+    /// assertion fails.
+    #[test]
+    fn debug_routes_are_never_served_under_production_1944() {
+        use nextgcore_sbi::security::SbiProfile;
+        assert!(debug_routes_allowed(Some("1"), SbiProfile::Dev));
+        assert!(!debug_routes_allowed(Some("1"), SbiProfile::Production));
+        assert!(!debug_routes_allowed(Some(""), SbiProfile::Dev));
+        assert!(!debug_routes_allowed(None, SbiProfile::Dev));
+    }
+
     #[test]
     fn test_debug_routes_disabled_by_default() {
         std::env::remove_var("MBSMF_DEBUG_ROUTES");
@@ -5363,6 +5428,95 @@ mod tmgi_session_owner_tests_1863 {
             .unwrap()
             .session_find_by_id(pool_id)
             .is_none());
+    }
+
+    /// #1944: the debug routes (`/activate`, `/members*`) are the session
+    /// creator's only. Another NF and an anonymous caller get 403, and the
+    /// membership is unchanged; the creator joins and removes a UE. The
+    /// handlers are called directly: the routes need `MBSMF_DEBUG_ROUTES`,
+    /// a process-wide variable other tests clear.
+    ///
+    /// REVERT-VERIFIED: without the check in `handle_member_join`, NEF-B's join
+    /// is 201; without it in `handle_member_leave`, NEF-B's leave removes
+    /// NEF-A's UE (204); without it in `handle_mbs_session_activate`, NEF-B's
+    /// activate is not refused 403.
+    #[tokio::test]
+    async fn debug_route_members_and_activate_are_the_creators_only_1944() {
+        mbsmf_context_init(256);
+        let tmgi = allocate(NEF_A, 1).await.remove(0);
+        let rsp = mbsmf_sbi_request_handler(as_nf(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions").with_body(
+                serde_json::json!({"mbsSession": {
+                    "mbsSessionId": {"tmgi": tmgi},
+                    "serviceType": "MULTICAST",
+                }})
+                .to_string(),
+                "application/json",
+            ),
+            NEF_A,
+        ))
+        .await;
+        assert_eq!(rsp.status, 201, "{:?}", rsp.http.content);
+        let id = rsp
+            .http
+            .get_header("location")
+            .and_then(|l| l.rsplit('/').next().map(str::to_string))
+            .unwrap();
+        let pool_id = parse_session_id(&id).unwrap();
+        let members = || {
+            mbsmf_self()
+                .read()
+                .unwrap()
+                .session_find_by_id(pool_id)
+                .map(|s| s.group_members.len())
+                .unwrap()
+        };
+        let join = |who: Option<&str>| {
+            let r = SbiRequest::post(format!("/nmbsmf-mbssession/v1/mbs-sessions/{id}/members"))
+                .with_body(r#"{"supi":"imsi-001010000019440"}"#, "application/json");
+            match who {
+                Some(w) => as_nf(r, w),
+                None => r,
+            }
+        };
+        let leave = |who: &str| {
+            as_nf(
+                SbiRequest::delete(format!(
+                    "/nmbsmf-mbssession/v1/mbs-sessions/{id}/members/imsi-001010000019440"
+                )),
+                who,
+            )
+        };
+
+        assert_eq!(
+            handle_member_join(&id, &join(Some(NEF_B))).await.status,
+            403
+        );
+        assert_eq!(
+            handle_member_join(&id, &join(None)).await.status,
+            403,
+            "anonymous"
+        );
+        assert_eq!(members(), 0);
+        assert_eq!(
+            handle_member_join(&id, &join(Some(NEF_A))).await.status,
+            201
+        );
+        assert_eq!(members(), 1);
+        let rsp = handle_member_leave(&id, "imsi-001010000019440", &leave(NEF_B)).await;
+        assert_eq!(rsp.status, 403, "{:?}", rsp.http.content);
+        assert_eq!(members(), 1, "NEF-B cannot remove NEF-A's UE");
+        let activate = as_nf(
+            SbiRequest::post(format!("/nmbsmf-mbssession/v1/mbs-sessions/{id}/activate")),
+            NEF_B,
+        );
+        assert_eq!(
+            handle_mbs_session_activate(&id, &activate).await.status,
+            403
+        );
+        let rsp = handle_member_leave(&id, "imsi-001010000019440", &leave(NEF_A)).await;
+        assert_eq!(rsp.status, 204, "{:?}", rsp.http.content);
+        assert_eq!(members(), 0);
     }
 }
 
