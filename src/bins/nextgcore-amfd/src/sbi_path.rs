@@ -474,13 +474,15 @@ pub fn amf_nf_profile_json(
     // Omitted rather than faked when no GUAMI is configured: an `amfInfo` with an
     // empty `guamiList` would claim this AMF serves nothing, and a PCF would exclude
     // it from every GUAMI match instead of falling back to it.
-    let guami_list = served_guami_list_json();
-    if !guami_list.is_empty() {
+    //
+    // #2035: with the AMF Region and Set (`amfRegionId`, `amfSetId`, mandatory in
+    // `AmfInfo`), the ones the GUAMIs' AMF IDs encode. An NRF refuses a GUAMI that
+    // does not encode the profile's region and set (TS 23.003 §2.10.1), so GUAMIs
+    // of another set than the first are left out, with a WARN: one `AmfInfo`
+    // describes one AMF Set.
+    if let Some(amf_info) = amf_info_json() {
         if let Some(obj) = nf_profile.as_object_mut() {
-            obj.insert(
-                "amfInfo".to_string(),
-                serde_json::json!({ "guamiList": guami_list }),
-            );
+            obj.insert("amfInfo".to_string(), amf_info);
         }
     } else {
         log::warn!(
@@ -3744,6 +3746,40 @@ pub fn new_dereg_callback_token() -> String {
 /// still green. That is why both sides now go through [`guami_json`] instead of
 /// formatting independently — a divergence is invisible to any test that does not
 /// compare the two, which is how it stayed unnoticed.
+/// #2035: this AMF's TS 29.510 `AmfInfo`: the AMF Region and Set of its first
+/// served GUAMI, and the served GUAMIs of that region and set. `None` when no
+/// GUAMI is configured.
+pub(crate) fn amf_info_json() -> Option<serde_json::Value> {
+    let ctx_arc = crate::context::amf_self();
+    let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+    amf_info_of(&ctx.served_guami)
+}
+
+/// [`amf_info_json`] of `served`.
+fn amf_info_of(served: &[crate::context::Guami]) -> Option<serde_json::Value> {
+    let first = served.first()?;
+    let (region, set) = (first.amf_id.region, first.amf_id.set);
+    let mut guamis = Vec::new();
+    for g in served {
+        if (g.amf_id.region, g.amf_id.set) == (region, set) {
+            guamis.push(guami_json(g));
+        } else {
+            log::warn!(
+                "served GUAMI {} is of AMF Region {:02x} Set {:03x}, not this AMF's {region:02x} \
+                 {set:03x}; it is not published in amfInfo (one AmfInfo is one AMF Set)",
+                amf_id_hex(&g.amf_id),
+                g.amf_id.region,
+                g.amf_id.set
+            );
+        }
+    }
+    Some(serde_json::json!({
+        "amfRegionId": format!("{region:02x}"),
+        "amfSetId": format!("{set:03x}"),
+        "guamiList": guamis,
+    }))
+}
+
 pub(crate) fn served_guami_list_json() -> Vec<serde_json::Value> {
     let ctx_arc = crate::context::amf_self();
     // Read THROUGH the poison, the convention in this crate since the RwLock
@@ -7674,6 +7710,40 @@ mod tests_no_wildcard_uri_1322 {
         let before = advertised_sbi_host_port();
         set_advertised_sbi("0.0.0.0".into(), 7777);
         assert_eq!(advertised_sbi_host_port(), before);
+    }
+}
+
+/// #2035: the published `AmfInfo` names the AMF Region and Set its GUAMIs'
+/// AMF IDs encode (TS 23.003 §2.10.1), which an NRF now checks, and leaves out
+/// a served GUAMI of another set.
+///
+/// REVERT-VERIFIED: with `amfSetId` rendered from the region instead of the
+/// set, the set assertion fails.
+#[cfg(test)]
+mod tests_amf_info_2035 {
+    use super::*;
+
+    #[test]
+    fn amf_info_names_the_region_and_set_its_guamis_encode_2035() {
+        let guami = |set: u16, pointer: u8| crate::context::Guami {
+            amf_id: crate::context::AmfId {
+                region: 0x20,
+                set,
+                pointer,
+            },
+            ..Default::default()
+        };
+        assert!(amf_info_of(&[]).is_none());
+        let info = amf_info_of(&[guami(1, 1), guami(1, 2), guami(2, 1)]).unwrap();
+        assert_eq!(info["amfRegionId"], "20");
+        assert_eq!(info["amfSetId"], "001");
+        let ids: Vec<&str> = info["guamiList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["amfId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["200041", "200042"], "set 002's GUAMI is left out");
     }
 }
 
