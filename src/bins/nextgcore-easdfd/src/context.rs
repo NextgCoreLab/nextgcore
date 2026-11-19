@@ -193,6 +193,10 @@ pub struct EasdfDnsContext {
     /// makes the per-session handling rules #114 added unreachable over the one
     /// transport a resolver actually speaks.
     pub ue_addresses: Vec<IpAddr>,
+    /// #1865: the verified NF Instance ID of the SMF that created this context
+    /// (`nextgcore_sbi::owner_binding`), the only consumer that may update or
+    /// delete it. `None` when created with no verified identity (`dev`).
+    pub owner: Option<String>,
 }
 
 impl EasdfDnsContext {
@@ -205,7 +209,14 @@ impl EasdfDnsContext {
             handling_rules: Vec::new(),
             notify_uri: None,
             ue_addresses: Vec::new(),
+            owner: None,
         }
+    }
+
+    /// #1865: bind the context to the consumer that created it.
+    pub fn with_owner(mut self, owner: Option<String>) -> Self {
+        self.owner = owner;
+        self
     }
 
     /// Parse the handling rules and the notify URI out of a create/update body
@@ -345,6 +356,10 @@ pub struct EasdfContext {
     /// the fallback a query falls through to when no session context rule and no
     /// static EAS-map entry matched.
     baseline_patterns: RwLock<HashMap<String, DnsHandlingRule>>,
+    /// #1865: the verified consumer that created each baseline pattern, the
+    /// only one that may delete it. Entries live and die with
+    /// `baseline_patterns` (taken after it, in that order, at every write).
+    baseline_pattern_owners: RwLock<HashMap<String, String>>,
     /// UE IP → DNS-context id (#276), the index the UDP plane resolves through.
     ///
     /// Derived from `dns_contexts` and maintained by every mutation of it, never
@@ -365,6 +380,7 @@ impl EasdfContext {
             miss_behavior: DnsMissBehavior::default(),
             max_dns_contexts: 0,
             baseline_patterns: RwLock::new(HashMap::new()),
+            baseline_pattern_owners: RwLock::new(HashMap::new()),
             ue_ip_index: RwLock::new(HashMap::new()),
             initialized: AtomicBool::new(false),
         }
@@ -388,6 +404,9 @@ impl EasdfContext {
         }
         if let Ok(mut patterns) = self.baseline_patterns.write() {
             patterns.clear();
+        }
+        if let Ok(mut owners) = self.baseline_pattern_owners.write() {
+            owners.clear();
         }
         if let Ok(mut index) = self.ue_ip_index.write() {
             index.clear();
@@ -593,6 +612,8 @@ impl EasdfContext {
             return false;
         }
         ctx.id = id.to_string();
+        // #1865: a replace never rebinds the context; its creator still owns it.
+        ctx.owner = contexts.get(id).and_then(|c| c.owner.clone());
         let addresses = ctx.ue_addresses.clone();
         let superseded = contexts.insert(id.to_string(), ctx);
         // #276: an update that CHANGES the UE address must release the old claim,
@@ -637,8 +658,21 @@ impl EasdfContext {
         &self,
         rule: DnsHandlingRule,
     ) -> Result<String, EasdfContextError> {
+        self.baseline_pattern_insert_owned(rule, None)
+    }
+
+    /// [`Self::baseline_pattern_insert`] bound to `owner` (#1865).
+    pub fn baseline_pattern_insert_owned(
+        &self,
+        rule: DnsHandlingRule,
+        owner: Option<String>,
+    ) -> Result<String, EasdfContextError> {
         let mut patterns = self
             .baseline_patterns
+            .write()
+            .map_err(|_| EasdfContextError::LockPoisoned)?;
+        let mut owners = self
+            .baseline_pattern_owners
             .write()
             .map_err(|_| EasdfContextError::LockPoisoned)?;
         if patterns.len() >= self.max_dns_contexts {
@@ -646,7 +680,15 @@ impl EasdfContext {
         }
         let id = Uuid::new_v4().to_string();
         patterns.insert(id.clone(), rule);
+        if let Some(owner) = owner {
+            owners.insert(id.clone(), owner);
+        }
         Ok(id)
+    }
+
+    /// #1865: the verified consumer that created baseline pattern `id`.
+    pub fn baseline_pattern_owner(&self, id: &str) -> Option<String> {
+        self.baseline_pattern_owners.read().ok()?.get(id).cloned()
     }
 
     pub fn baseline_pattern_find(&self, id: &str) -> Option<DnsHandlingRule> {
@@ -661,7 +703,12 @@ impl EasdfContext {
     }
 
     pub fn baseline_pattern_remove(&self, id: &str) -> Option<DnsHandlingRule> {
-        self.baseline_patterns.write().ok()?.remove(id)
+        let mut patterns = self.baseline_patterns.write().ok()?;
+        let removed = patterns.remove(id)?;
+        if let Ok(mut owners) = self.baseline_pattern_owners.write() {
+            owners.remove(id);
+        }
+        Some(removed)
     }
 
     pub fn baseline_pattern_count(&self) -> usize {
