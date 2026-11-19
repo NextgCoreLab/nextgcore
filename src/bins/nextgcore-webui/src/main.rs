@@ -2094,26 +2094,37 @@ mod shipped_artefact_guards {
     /// directly.
     ///
     /// REVERT-VERIFIED: with index.js back to `mongoose.set('debug', true)`,
-    /// this fails.
+    /// this fails. #2006: so does a `set('debug', true)` in a subdirectory of
+    /// routes/, a `mongoose.set(D, true)`, and bin/create-admin.js without the
+    /// DEBUG sanitiser.
     #[test]
     fn mongoose_debug_goes_through_the_redacting_helper_1970() {
         let server = read_code("webui/server/index.js");
         // #1983: any spelling of turning debug on, in any server file, must hand
-        // mongoose the redacting logger and nothing else.
+        // mongoose the redacting logger and nothing else. #2006: in every
+        // subdirectory too (node_modules aside).
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../webui/server");
-        let mut files = vec![root.join("index.js")];
-        for dir in ["models", "lib", "routes", "bin"] {
-            if let Ok(rd) = std::fs::read_dir(root.join(dir)) {
-                files.extend(
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.extension().is_some_and(|x| x == "js")),
-                );
+        let mut files = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("webui/server").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "node_modules") {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|x| x == "js") {
+                    files.push(path);
+                }
             }
         }
-        for file in &files {
+        assert!(
+            files.iter().any(|f| f.ends_with("bin/create-admin.js")),
+            "the scan reaches the server's subdirectories"
+        );
+        let code = |file: &std::path::Path| -> String {
             // Comment lines may quote the old call (the helper's own doc does).
-            let text: String = std::fs::read_to_string(file)
+            std::fs::read_to_string(file)
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| {
@@ -2121,7 +2132,10 @@ mod shipped_artefact_guards {
                     !(t.starts_with("//") || t.starts_with('*') || t.starts_with("/*"))
                 })
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join("\n")
+        };
+        for file in &files {
+            let text = code(file);
             for (at, _) in text.match_indices("set(") {
                 let args: String = text[at + 4..]
                     .chars()
@@ -2136,19 +2150,40 @@ mod shipped_artefact_guards {
                     "{}: mongoose debug must be the redacting helper's value, got set({args})",
                     file.display()
                 );
+                // #2006: `mongoose.set(D, true)` with `const D = 'debug'` hides
+                // the option's name: mongoose options are named literally.
+                assert!(
+                    !text[..at].ends_with("mongoose.") || args.starts_with(['\'', '"', '`']),
+                    "{}: mongoose.set({args}) must name its option with a string literal",
+                    file.display()
+                );
             }
         }
-        // And `DEBUG` (mquery's raw query log) is sanitised before mongoose loads.
-        let sanitized = server
-            .find("sanitizeDebugEnv(process.env)")
-            .expect("DEBUG sanitised");
-        let mongoose = server
-            .find("require('mongoose')")
-            .expect("mongoose required");
-        assert!(
-            sanitized < mongoose,
-            "DEBUG must be sanitised before mongoose is required"
-        );
+        // And `DEBUG` (mquery's raw query log) is sanitised before mongoose
+        // loads, in the server and (#2006) in every script under bin/ that
+        // reaches mongoose, directly or through the models.
+        for file in files.iter().filter(|f| {
+            (f.ends_with("index.js") && f.parent() == Some(root.as_path()))
+                || f.components().any(|c| c.as_os_str() == "bin")
+        }) {
+            let text = code(file);
+            let Some(mongoose) = [
+                "require('mongoose')",
+                "require('../models",
+                "require('./models",
+            ]
+            .iter()
+            .filter_map(|r| text.find(r))
+            .min() else {
+                continue;
+            };
+            let sanitized = text.find("sanitizeDebugEnv(process.env)");
+            assert!(
+                sanitized.is_some_and(|s| s < mongoose),
+                "{}: DEBUG must be sanitised before mongoose is required",
+                file.display()
+            );
+        }
         assert!(
             server.contains("require('./lib/mongoose-debug').mongooseDebug(process.env)"),
             "index.js must decide mongoose debug through lib/mongoose-debug"

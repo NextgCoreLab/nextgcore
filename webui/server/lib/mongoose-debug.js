@@ -54,6 +54,11 @@ function redact(value, seen = new WeakSet()) {
     seen.add(value);
     const out = {};
     for (const [k, v] of Object.entries(value)) {
+      // #2006: a function is never data, and an own `toJSON` would run in
+      // JSON.stringify on the copy and could return K unredacted.
+      if (typeof v === 'function') {
+        continue;
+      }
       out[k] = isKeyField(k) ? REDACTED : redact(v, seen);
     }
     return out;
@@ -73,7 +78,9 @@ function mongooseDebug(env, log = console.log) {
   }
   return function debugQuery(collection, method, ...args) {
     // #1983: a BigInt (mongoose-long, an SQN) made JSON.stringify throw, and
-    // the logger with it.
+    // the logger with it. #2006: no toJSON runs on the redacted copy: `redact`
+    // rebuilds every object from its own data properties (so a prototype's
+    // toJSON is gone) and drops functions (so an own one is too).
     const shown = args.map((a) =>
       JSON.stringify(redact(a), (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
     log(`Mongoose: ${collection}.${method}(${shown.join(', ')})`);
