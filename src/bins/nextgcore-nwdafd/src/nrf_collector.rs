@@ -481,6 +481,83 @@ pub async fn handle_nf_status_notify_with_ctx(
     SbiResponse::with_status(204)
 }
 
+/// #2081: why an NFStatusNotify may not be ingested, or `None` to go on.
+///
+/// The NF load values in a notification feed NF_LOAD analytics, so only the NRF,
+/// about a subscription this NWDAF made, may deliver one. Under the production
+/// SBI profile:
+/// - `correlated` must hold: the request came in on the tokenised callback of
+///   [`callback_path`] (the subscription's correlation in the callback URI). The
+///   token-less route of subscriptions made before #1421 carries none, so it is
+///   refused;
+/// - the TLS peer must be the NRF: the verified client certificate names NF type
+///   NRF (RFC 9310). The NRF's notification carries no bearer (TS 33.501
+///   §13.4.1), so the certificate is the only proof of who sent it. A relay (SCP)
+///   or another NF is refused.
+///
+/// Under dev both are accepted as before (plaintext, nothing to verify).
+pub fn refuse_notifier(
+    request: &SbiRequest,
+    correlated: bool,
+    production: bool,
+) -> Option<SbiResponse> {
+    if !production {
+        return None;
+    }
+    let refuse = |why: &str| {
+        log::debug!("NFStatusNotify refused: {why}");
+        Some(nextgcore_sbi::server::send_forbidden(
+            &format!("NFStatusNotify: {why}"),
+            None,
+        ))
+    };
+    if !correlated {
+        return refuse(
+            "the notification names no subscription of this NWDAF (the callback carries no \
+             correlation token)",
+        );
+    }
+    let from_nrf = request
+        .peer_cert_nf_types
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("NRF"));
+    if !from_nrf {
+        return refuse(
+            "only the NRF delivers NF status notifications; the requester's \
+                       verified certificate does not name NF type NRF",
+        );
+    }
+    None
+}
+
+/// Handle an NFStatusNotify that arrived on the tokenised callback
+/// (`correlated`) or the legacy token-less one, after [`refuse_notifier`] under
+/// the process's SBI profile (#2081): refused before anything is parsed or
+/// ingested.
+pub async fn handle_nf_status_notify_from(request: &SbiRequest, correlated: bool) -> SbiResponse {
+    handle_nf_status_notify_gated_with_ctx(
+        &crate::context::nwdaf_self(),
+        request,
+        correlated,
+        nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+    )
+    .await
+}
+
+/// [`handle_nf_status_notify_from`] against `ctx` under the profile `production`
+/// says (#2081): the refusal comes before the body is read.
+pub async fn handle_nf_status_notify_gated_with_ctx(
+    ctx: &Arc<RwLock<NwdafContext>>,
+    request: &SbiRequest,
+    correlated: bool,
+    production: bool,
+) -> SbiResponse {
+    if let Some(refused) = refuse_notifier(request, correlated, production) {
+        return refused;
+    }
+    handle_nf_status_notify_with_ctx(ctx, request).await
+}
+
 /// Handle `POST /nnwdaf-nfstatus-notify/v1/notify` (TS 29.510 NFStatusNotify
 /// callback) against the global context.
 pub async fn handle_nf_status_notify(request: &SbiRequest) -> SbiResponse {
@@ -528,6 +605,73 @@ mod tests {
 
     // ── golden TS 29.510 NotificationData bodies (typed from the yaml /
     //    nrfd's serializer, NOT produced by any encoder in this crate) ────────
+
+    /// #2081 (probe): under production a forged NFStatusNotify cannot poison NF_LOAD.
+    /// From an AMF's certificate, an SCP's, or no certificate, on the right
+    /// callback; or from the NRF on the token-less legacy callback: 403 and no
+    /// load ingested. From the NRF on the tokenised callback: 204 and ingested.
+    /// Under dev, as before. REVERT-VERIFIED: with the NRF check removed the AMF
+    /// probe is ingested; with the correlation check removed the legacy one is.
+    #[tokio::test]
+    async fn only_the_nrf_on_a_correlated_callback_feeds_nf_load_2081() {
+        let body = json!({
+            "event": "NF_REGISTERED",
+            "nfInstanceUri": "http://nrf.example:7777/nnrf-nfm/v1/nf-instances/amf-2081",
+            "nfProfile": {
+                "nfInstanceId": "amf-2081",
+                "nfType": "AMF",
+                "nfStatus": "REGISTERED",
+                "load": 99
+            }
+        });
+        let from = |types: &[&str]| {
+            let mut r = notify_req(&body);
+            if !types.is_empty() {
+                r.peer_cert_nf_instance_id = Some("cccccccc-2081-4000-8000-00000000000c".into());
+            }
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        for (req, correlated, what) in [
+            (from(&["AMF"]), true, "an AMF's certificate"),
+            (from(&["SCP"]), true, "an SCP's certificate"),
+            (from(&[]), true, "no certificate"),
+            (from(&["NRF"]), false, "the NRF on the legacy callback"),
+        ] {
+            let ctx = isolated_ctx();
+            let resp = handle_nf_status_notify_gated_with_ctx(&ctx, &req, correlated, true).await;
+            assert_eq!(resp.status, 403, "{what}");
+            assert!(
+                nf_load_infos(&ctx, "amf-2081").is_empty(),
+                "{what} poisoned NF_LOAD"
+            );
+        }
+        let ctx = isolated_ctx();
+        let resp = handle_nf_status_notify_gated_with_ctx(&ctx, &from(&["NRF"]), true, true).await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(nf_load_infos(&ctx, "amf-2081").len(), 1);
+        // Dev: as before.
+        let ctx = isolated_ctx();
+        let resp = handle_nf_status_notify_gated_with_ctx(&ctx, &from(&[]), false, false).await;
+        assert_eq!(resp.status, 204);
+    }
+
+    /// #2081: both routes go through the gate under the real profile.
+    #[test]
+    fn both_nf_status_routes_go_through_the_gate_2081() {
+        let main = include_str!("main.rs");
+        assert_eq!(
+            main.matches("nrf_collector::handle_nf_status_notify_from(&request, true)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            main.matches("nrf_collector::handle_nf_status_notify_from(&request, false)")
+                .count(),
+            1
+        );
+        assert!(!main.contains("nrf_collector::handle_nf_status_notify(&request)"));
+    }
 
     /// NF_REGISTERED with a full `nfProfile` carrying `load` ingests one
     /// sample with `cpu = load/100` and caches the profile metadata.
