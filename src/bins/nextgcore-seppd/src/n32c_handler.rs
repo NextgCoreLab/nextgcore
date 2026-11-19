@@ -767,6 +767,10 @@ pub fn handle_exchange_params_request(
     let (sel_policy, enc_profiles) =
         negotiate_protection_policy(req.protection_policy_info.as_ref());
 
+    // #2087: the context this one replaces leaves no SEQ or replay state.
+    if let Some(old) = node.n32f_security.as_ref() {
+        crate::prins::forget_context(&old.kid);
+    }
     node.n32f_security = Some(crate::context::N32fSecurityInfo {
         local_context_id: local_context_id.clone(),
         peer_context_id: req.n32f_context_id.clone(),
@@ -861,6 +865,10 @@ pub fn handle_exchange_params_response(
         None => negotiate_protection_policy(None).1,
     };
 
+    // #2087: the context this one replaces leaves no SEQ or replay state.
+    if let Some(old) = node.n32f_security.as_ref() {
+        crate::prins::forget_context(&old.kid);
+    }
     node.n32f_security = Some(crate::context::N32fSecurityInfo {
         local_context_id: sent_req.n32f_context_id.clone(),
         peer_context_id: rsp.n32f_context_id.clone(),

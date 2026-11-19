@@ -107,6 +107,35 @@ pub fn uri_sans_from_der(der: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// #2076: every dNSName SubjectAltName of a DER-encoded certificate,
+/// lowercased, trimmed and without a trailing dot, in order. A SEPP's
+/// certificate names its FQDN there (TS 33.310 §6.1.4a, TS 33.210), which is
+/// how an N32 peer is identified. Empty when the certificate cannot be parsed
+/// or names no DNS name.
+pub fn dns_sans_from_der(der: &[u8]) -> Vec<String> {
+    let Ok(cert) = Certificate::from_der(der) else {
+        return Vec::new();
+    };
+    let Some(san) = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|exts| exts.iter().find(|e| e.extn_id == SubjectAltName::OID))
+        .and_then(|e| SubjectAltName::from_der(e.extn_value.as_bytes()).ok())
+    else {
+        return Vec::new();
+    };
+    san.0
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DnsName(dns) => Some(dns.as_str().trim().trim_end_matches('.')),
+            _ => None,
+        })
+        .filter(|dns| !dns.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// The RFC 9310 NFTypes certificate extension, `id-pe-nftype`
 /// (1.3.6.1.5.5.7.1.34). TS 33.310 §6.1.3c.3: "nfTypes shall contain NF type for
 /// the Network Function instance formatted according to RFC 9310".
@@ -311,6 +340,36 @@ pub(crate) mod tests {
             nf_instance_id_from_der(&der).as_deref(),
             Some("https://amf.example.org:443")
         );
+    }
+
+    /// #2076: every dNSName SAN, lowercased and without a trailing dot, URIs
+    /// excluded.
+    ///
+    /// REVERT-VERIFIED: matching `UniformResourceIdentifier` instead of
+    /// `DnsName`, the list is the URI and the assertion fails.
+    #[test]
+    fn lists_every_dns_san_2076() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        let mut params = CertificateParams::new(Vec::new()).expect("params");
+        params.subject_alt_names = vec![
+            SanType::DnsName(
+                "SEPP.5gc.mnc001.mcc001.3gppnetwork.org."
+                    .try_into()
+                    .expect("ia5"),
+            ),
+            SanType::URI("https://sepp.example.org".try_into().expect("ia5")),
+            SanType::DnsName("sepp2.example.org".try_into().expect("ia5")),
+        ];
+        let key = KeyPair::generate().expect("key");
+        let der = params.self_signed(&key).expect("cert").der().to_vec();
+        assert_eq!(
+            dns_sans_from_der(&der),
+            vec![
+                "sepp.5gc.mnc001.mcc001.3gppnetwork.org".to_string(),
+                "sepp2.example.org".to_string()
+            ]
+        );
+        assert!(dns_sans_from_der(b"not a certificate").is_empty());
     }
 
     /// #2000: every URI SAN, in order and verbatim, DNS-IDs excluded.

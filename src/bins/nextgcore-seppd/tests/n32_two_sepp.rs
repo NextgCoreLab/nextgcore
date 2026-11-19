@@ -127,6 +127,10 @@ fn configure_local_sepp(tls: bool, prins: bool) {
     // sepp-10: the in-process SEPP-A also runs over plaintext HTTP here, so
     // permit the no-TLS N32-f key-derivation fallback (off by default).
     nextgcore_seppd::n32c_handler::set_allow_insecure_no_tls(true);
+    // #2076: and, like the spawned peers, under the dev profile (#1795): with no
+    // client certificate on a cleartext N32-c, production refuses a peer's
+    // claims because nothing binds them to the peer.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let ctx = sepp_self();
     let mut context = ctx.write().expect("context lock");
     if !context.is_initialized() {
