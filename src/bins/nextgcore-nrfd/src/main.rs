@@ -4003,19 +4003,26 @@ fn authorize_access_token(
     let mut granted = Vec::new();
     let mut any_offered = false;
     for service in requested_scopes {
-        let mut offered = false;
-        let mut permitted = false;
-        for p in &eligible {
-            // #1811: a resource/operation-level scope is granted only to the
-            // consumers the producer's allowedOperationsPerNf* name.
-            let (o, perm) =
-                p.authorizes_scope(&consumer.nf_type, &consumer.nf_instance_id, service);
-            offered |= o;
-            permitted |= perm;
-            if perm {
-                break;
-            }
-        }
+        // #1811: a resource/operation-level scope is granted only to the
+        // consumers the producer's allowedOperationsPerNf* name.
+        let decisions: Vec<(bool, bool)> = eligible
+            .iter()
+            .map(|p| p.authorizes_scope(&consumer.nf_type, &consumer.nf_instance_id, service))
+            .collect();
+        let offered = decisions.iter().any(|(o, _)| *o);
+        let permitted = if service.contains(':') {
+            // #1828: TS 29.510 Table 6.1.6.2.3-1 NOTE 11 is per producer, and a
+            // token whose audience is the target TYPE is accepted by every
+            // producer of it. A resource scope is therefore granted only when
+            // EVERY candidate producer (each eligible one offering the
+            // service) allows it for this consumer: one UDR registered with a
+            // wider map must not put the K-read scope into a token all UDRs
+            // accept. An instance-targeted request has one candidate, so it
+            // keeps that producer's own rule.
+            offered && decisions.iter().filter(|(o, _)| *o).all(|(_, perm)| *perm)
+        } else {
+            decisions.iter().any(|(_, perm)| *perm)
+        };
         any_offered |= offered;
         if permitted {
             granted.push(service.clone());
@@ -5991,6 +5998,88 @@ mod tests {
             .expect_err("the resource scope alone is refused");
             assert_eq!(err.0, "unauthorized_client", "{nf_type}");
         }
+    }
+
+    /// #1828: two UDRs whose `allowedOperationsPerNfType` maps disagree. One
+    /// grants the PCF the AuthenticationSubscription read scope; the standard
+    /// one grants it to the UDM alone. A type-targeted token (aud=UDR, accepted
+    /// by both) carries the resource scope only for a consumer EVERY candidate
+    /// allows, so the PCF gets the service scope alone while the UDM, allowed
+    /// by both, keeps the resource scope. Pinned to the wider UDR by instance,
+    /// the PCF's token names that UDR alone and is granted.
+    ///
+    /// REVERT-VERIFIED: with the any-producer rule restored for resource
+    /// scopes, the PCF's type-targeted token carries the K-read scope and the
+    /// first assertion fails.
+    #[test]
+    fn a_resource_scope_needs_every_candidate_udr_to_allow_it_1828() {
+        let udr = |id: &str, pcf_scopes: serde_json::Value| {
+            let mut attrs = udr_with_resource_scopes().attributes;
+            attrs["nfInstanceId"] = id.into();
+            attrs["nfServices"][0]["allowedOperationsPerNfType"]["PCF"] = pcf_scopes;
+            NfProfile::from_json(&attrs).expect("profile")
+        };
+        let standard = udr("udr-standard-1828", serde_json::json!(["nudr-dr"]));
+        let wider = udr(
+            "udr-wider-1828",
+            serde_json::json!(["nudr-dr", AUTH_SUBS_READ]),
+        );
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        let both = [standard.clone(), wider.clone()];
+
+        let pcf = authorize_access_token(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            &both,
+            &[],
+            &[],
+        )
+        .expect("the service scope is still granted");
+        assert_eq!(
+            pcf,
+            vec!["nudr-dr".to_string()],
+            "one UDR's wider map does not grant the resource scope to every UDR"
+        );
+        // Either order of the candidates.
+        let reversed = [wider.clone(), standard.clone()];
+        let pcf = authorize_access_token(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            &reversed,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pcf, vec!["nudr-dr".to_string()]);
+
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "UDR",
+            &requested,
+            &both,
+            &[],
+            &[],
+        )
+        .expect("the UDM is allowed by both");
+        assert_eq!(udm, requested, "allowed by every candidate");
+
+        // Instance-targeted: the one candidate's own map decides.
+        let pinned = authorize_access_token(
+            &auth_consumer("PCF"),
+            "PCF",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&wider),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pinned, requested, "the pinned UDR allows it");
     }
 
     /// #1811, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: with neither
