@@ -10,6 +10,12 @@
 // already corrected for exactly this reason; this was the last holdout.
 process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
 
+// #1983: no `debug` namespace may print mquery/mongoose queries (K, OPc) past
+// the redacting logger. Set before anything requires mongoose (or `debug`).
+if (process.env.DEBUG) {
+  process.env.DEBUG = require('./lib/mongoose-debug').sanitizeDebugEnv(process.env);
+}
+
 // Loopback unless WEBUI_BIND_ADDR is set; never the container's HOSTNAME (#850).
 const _hostname = require('./lib/bind-address').bindAddress(process.env);
 const port = process.env.PORT || 9999;

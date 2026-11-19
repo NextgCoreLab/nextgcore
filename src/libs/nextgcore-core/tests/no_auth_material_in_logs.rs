@@ -1041,9 +1041,16 @@ fn is_callback_key(literal: &str) -> bool {
 /// Where a `let` initialiser that starts at `value` (just at its `=`) ends: the
 /// first `;`, `{` or ` else ` at bracket depth 0 that is not inside a string,
 /// raw string or char literal (#1927). `(`/`[` nest, and so does a `{` opened
-/// inside them (a closure body in an argument); a `{` at depth 0 is the body of
-/// an `if let` / `while let`, as before.
-fn let_value_end(value: &str) -> usize {
+/// inside them (a closure body in an argument).
+///
+/// #1966: a `{` at depth 0 ends the value only for a `conditional` let (`if
+/// let`, `while let`, `&& let`), where it opens the body. Elsewhere it opens a
+/// struct literal, a block or an `if`/`match` arm and nests, so `S { u: uri }`,
+/// `{ uri.to_string() }` and `if c { uri } else { .. }` are read whole. An
+/// ` else ` at depth 0 ends a `let ... else` only when the value so far does
+/// not end in `}`: Rust forbids a let-else initialiser ending in `}`, so one
+/// that does is an `if` expression continuing.
+fn let_value_end(value: &str, conditional: bool) -> usize {
     let b = value.as_bytes();
     let mut depth = 0usize;
     let mut i = 0;
@@ -1068,7 +1075,7 @@ fn let_value_end(value: &str) -> usize {
                 depth += 1;
                 i += 1;
             }
-            b'{' if depth > 0 => {
+            b'{' if depth > 0 || !conditional => {
                 depth += 1;
                 i += 1;
             }
@@ -1077,7 +1084,12 @@ fn let_value_end(value: &str) -> usize {
                 i += 1;
             }
             b';' | b'{' if depth == 0 => return i,
-            b' ' if depth == 0 && value[i..].starts_with(" else ") => return i,
+            b' ' if depth == 0
+                && value[i..].starts_with(" else ")
+                && !value[..i].trim_end().ends_with('}') =>
+            {
+                return i
+            }
             _ => i += 1,
         }
     }
@@ -1163,7 +1175,17 @@ fn tainted_bindings(text: &str) -> Vec<(String, usize, usize)> {
         // or at a `let ... else`, each only OUTSIDE string and char literals and
         // brackets (#1927): `let m = format!("{}", request.header.uri);` used to
         // end at the `{` of its format string, so the URI was never read.
-        let value_end = eq + let_value_end(&rest[eq..]);
+        // #1966: an `if let` / `while let` / `&& let` binds for a body.
+        let before = text[..start].trim_end();
+        let conditional = before.ends_with("&&")
+            || ["if", "while"].iter().any(|kw| {
+                before.ends_with(kw)
+                    && !before[..before.len() - kw.len()]
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            });
+        let value_end = eq + let_value_end(&rest[eq..], conditional);
         let value = &rest[eq + 1..value_end];
         if value.contains("redact_") {
             continue;
@@ -1388,6 +1410,22 @@ fn the_callback_uri_scan_sees_its_shapes() {
         .map(|(n, _, _)| n)
         .collect();
     assert_eq!(names, vec!["m", "r", "c", "f"]);
+    // #1966: a struct-literal, block and if-expression initialiser are read
+    // whole; a `match` too. An `if let` still ends at its body, and a real
+    // `let ... else` at its `else`.
+    //
+    // REVERT-VERIFIED: with a depth-0 `{` ending every initialiser again, none
+    // of `s`, `b`, `i`, `m2` is tainted and this assertion fails; with every
+    // depth-0 ` else ` ending one, `i` (the URI in its else arm) is not.
+    let src = "fn g() {\n    let s = S { u: req.header.uri.clone() };\n    let b = { req.header.uri.to_string() };\n    let i = if c { String::new() } else { req.header.uri.clone() };\n    let m2 = match k { _ => req.header.uri.clone() };\n    if let Some(x) = opt {\n        let n = x.len();\n    }\n    let Some(v) = opt.map(|o| o + 1) else { return };\n    let w = req.header.uri.len();\n}\n";
+    let names: Vec<String> = tainted_bindings(src)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, vec!["s", "b", "i", "m2"]);
+    // A let-else whose body names a URI does not taint its binding.
+    let src = "fn h() {\n    let Some(v) = opt else { log(req.header.uri.clone()); return };\n}\n";
+    assert!(tainted_bindings(src).is_empty());
     // ... and the log line printing it is flagged as a whole callback URI.
     assert_eq!(
         unredacted_callback_uris_with("\"probe {m}\"", &["m"]),

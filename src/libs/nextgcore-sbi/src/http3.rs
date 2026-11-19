@@ -261,6 +261,7 @@ where
         peer_cert_nf_instance_id: None,
         peer_cert_nf_types: Vec::new(),
         peer_cert_present: false,
+        peer_cert_uri_sans: Vec::new(),
         oauth2_subject: None,
         oauth2_scope: None,
     };

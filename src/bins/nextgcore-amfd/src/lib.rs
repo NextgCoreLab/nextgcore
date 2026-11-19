@@ -169,7 +169,29 @@ pub mod test_support {
     /// Serialises tests that set the AUSF endpoint environment variables
     /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
+    ///
+    /// #1974: and every test that RESOLVES the AUSF (a registration reaching
+    /// `start_authentication`), including the ones that rely on NO AUSF being
+    /// reachable: while a sibling's stand-in AUSF is pointed at, their
+    /// Nausf_UEAuthentication call reaches it and succeeds, so the failure arm they
+    /// assert never runs (`an_ausf_failure_whose_reject_cannot_be_sent_still_releases_the_ue`),
+    /// and the sibling's stand-in sees a request it did not expect
+    /// (`a_callback_while_the_ausf_confirms_is_kept_1774`'s "the UE").
+    /// [`assert_ausf_env_lock_held`] enforces it at the resolution sites.
     pub static AUSF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Test-only enforcement of [`AUSF_ENV_LOCK`] (#1974), as
+    /// [`assert_pcf_env_lock_held`] is for the PCF.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn assert_ausf_env_lock_held() {
+        if AUSF_ENV_LOCK.try_lock().is_ok() {
+            panic!(
+                "the AUSF endpoint was resolved with AUSF_ENV_LOCK free: take it in this \
+                 test (#1974)"
+            );
+        }
+    }
 
     /// Serialises tests that set the UCMF endpoint environment variables
     /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as

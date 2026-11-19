@@ -17,6 +17,11 @@
 // script and the server disagreed, the account would be created in a database the
 // server never reads and login would fail with no visible reason.
 process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
+// #2006: as in server/index.js, no `debug` namespace may print mquery/mongoose
+// queries (here the Account's passport hash and salt). Before mongoose loads.
+if (process.env.DEBUG) {
+  process.env.DEBUG = require('../lib/mongoose-debug').sanitizeDebugEnv(process.env);
+}
 
 const mongoose = require('mongoose');
 const readline = require('readline');

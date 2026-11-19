@@ -19,14 +19,27 @@
 const { sbiProfile } = require('./insecure-dev');
 
 const REDACTED = '<redacted>';
-// The long-term key, the operator variant and its derived OPc, and the
-// encrypted spellings the UDR uses.
-const KEY_FIELDS = new Set(['k', 'op', 'opc', 'encpermanentkey', 'encopckey']);
+// The long-term key, the operator variant and its derived OPc, and common
+// spellings of them (#1983): `ki` (2G/3G), and any name that says it holds a
+// permanent key, an OP(c) key, an encrypted key or a secret.
+const KEY_FIELDS = new Set(['k', 'ki', 'op', 'opc', 'encpermanentkey', 'encopckey']);
+const KEY_WORDS = ['permanentkey', 'opckey', 'opkey', 'enckey', 'secret'];
 
-/** Whether `key` (a field name or a dotted path) names key material. */
+/** Whether a single field name names key material. */
+function isKeyName(name) {
+  const n = String(name).toLowerCase();
+  return KEY_FIELDS.has(n) || KEY_WORDS.some((w) => n.includes(w));
+}
+
+/**
+ * Whether `key` (a field name or a dotted path) names key material. #1983: an
+ * array index (`security.k.0`) or a positional operator (`$`, `$[]`,
+ * `$[elem]`) after the field still names it, so each path segment is checked.
+ */
 function isKeyField(key) {
-  const last = String(key).split('.').pop().toLowerCase();
-  return KEY_FIELDS.has(last);
+  return String(key)
+    .split('.')
+    .some((seg) => !/^(\d+|\$|\$\[[^\]]*\])$/.test(seg) && isKeyName(seg));
 }
 
 /** A copy of `value` with every key field's value replaced by REDACTED. */
@@ -41,6 +54,11 @@ function redact(value, seen = new WeakSet()) {
     seen.add(value);
     const out = {};
     for (const [k, v] of Object.entries(value)) {
+      // #2006: a function is never data, and an own `toJSON` would run in
+      // JSON.stringify on the copy and could return K unredacted.
+      if (typeof v === 'function') {
+        continue;
+      }
       out[k] = isKeyField(k) ? REDACTED : redact(v, seen);
     }
     return out;
@@ -59,9 +77,33 @@ function mongooseDebug(env, log = console.log) {
     return false;
   }
   return function debugQuery(collection, method, ...args) {
-    const shown = args.map((a) => JSON.stringify(redact(a)));
+    // #1983: a BigInt (mongoose-long, an SQN) made JSON.stringify throw, and
+    // the logger with it. #2006: no toJSON runs on the redacted copy: `redact`
+    // rebuilds every object from its own data properties (so a prototype's
+    // toJSON is gone) and drops functions (so an own one is too).
+    const shown = args.map((a) =>
+      JSON.stringify(redact(a), (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
     log(`Mongoose: ${collection}.${method}(${shown.join(', ')})`);
   };
 }
 
-module.exports = { mongooseDebug, redact, REDACTED };
+/**
+ * #1983: the `debug` package's namespaces with mquery's (and mongoose's own)
+ * query logging excluded. `DEBUG=mquery` (or `*`) made mquery print every query
+ * with its documents, K and OPc included, past the redacting logger. `debug`
+ * reads DEBUG when first required, so this runs before mongoose is loaded.
+ * Exclusions (`-ns`) win over inclusions in `debug`, so they are appended.
+ */
+function sanitizeDebugEnv(env) {
+  const e = env || {};
+  const raw = e.DEBUG;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return raw;
+  }
+  const kept = String(raw)
+    .split(/[\s,]+/)
+    .filter((ns) => ns !== '' && !/^(mquery|mongoose)(:|\*|$)/i.test(ns));
+  return [...kept, '-mquery*', '-mongoose*'].join(',');
+}
+
+module.exports = { mongooseDebug, redact, REDACTED, sanitizeDebugEnv, isKeyField };
