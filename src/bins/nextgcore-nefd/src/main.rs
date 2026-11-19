@@ -3695,6 +3695,73 @@ mod tests {
         reset_context();
     }
 
+    /// #1877 (R27 #1972): several unsubscribes toward one failing producer cost one
+    /// attempt per pass, not one each (the rest of that producer's are skipped for
+    /// the pass), and a healthy producer behind them is still served in that pass.
+    /// A second pass inside the producer's backoff tries it not at all.
+    ///
+    /// REVERT-VERIFIED: with the backoff disabled, this fails: three attempts at the
+    /// failing producer in one pass.
+    #[test]
+    fn a_failing_producer_costs_one_attempt_per_pass_and_backs_off_1877() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let (dead, dead_uri, dead_seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(503)),
+            )
+            .await;
+            let (live, live_uri, live_seen) = amf_1877(
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            let at = |base: &str, id: &str| SouthboundRef {
+                producer: SouthboundProducer::Amf,
+                subscription_id: id.to_string(),
+                delete_path: format!("/namf-evts/v1/subscriptions/{id}"),
+                producer_base: Some(base.to_string()),
+            };
+            for n in 0..3 {
+                southbound_reconcile::park(at(&dead_uri, &format!("dead-{n}")));
+            }
+            southbound_reconcile::park(at(&live_uri, "s-1877"));
+            let attempts = |seen: &Seen1877| {
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(m, _)| m == "DELETE")
+                    .count()
+            };
+
+            southbound_reconcile::reconcile_once().await;
+            let first = (attempts(&dead_seen), deletes_1877(&live_seen));
+            southbound_reconcile::reconcile_once().await;
+            let second = attempts(&dead_seen);
+            tokio::time::sleep(southbound_reconcile::BACKOFF_BASE + Duration::from_millis(100))
+                .await;
+            southbound_reconcile::reconcile_once().await;
+            let third = attempts(&dead_seen);
+            dead.stop().await.ok();
+            live.stop().await.ok();
+
+            assert_eq!(
+                first,
+                (1, 1),
+                "one attempt at the failing producer, the healthy one served"
+            );
+            assert_eq!(second, 1, "none inside its backoff");
+            assert_eq!(third, 2, "one again once the backoff ran out");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
     /// #1877: an AF delete whose AMF unsubscribe fails is parked and retried until
     /// the AMF takes it; the record is gone at once.
     ///

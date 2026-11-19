@@ -66,6 +66,53 @@ fn pending() -> &'static Mutex<VecDeque<Parked>> {
 /// producer that has not answered for a day is gone, not restarting.
 pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 
+/// R27 #1972: the first wait before a producer whose DELETE failed is tried again,
+/// doubled after each further failure up to [`BACKOFF_MAX`], and cleared by a
+/// delivery. So a dead producer costs one request timeout per backoff period, not
+/// one per pass.
+#[cfg(not(test))]
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
+/// The longest a failing producer is left alone between attempts.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// Per producer (target base URI): when it may next be tried, and the current
+/// backoff. Guarded like [`pending`].
+fn backoff() -> &'static Mutex<std::collections::HashMap<String, (tokio::time::Instant, Duration)>>
+{
+    static BACKOFF: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<String, (tokio::time::Instant, Duration)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &BACKOFF
+}
+
+fn backing_off(target: &str) -> bool {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(target)
+        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
+}
+
+fn note_failure(target: &str) {
+    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    let wait = map
+        .get(target)
+        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
+    map.insert(
+        target.to_string(),
+        (tokio::time::Instant::now() + wait, wait),
+    );
+}
+
+fn note_success(target: &str) {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(target);
+}
+
 /// One parked unsubscribe, and when it was first parked.
 #[derive(Debug, Clone)]
 struct Parked {
@@ -139,6 +186,7 @@ pub fn parked() -> Vec<SouthboundRef> {
 #[cfg(test)]
 pub fn clear_for_test() {
     lock().clear();
+    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// One pass: retry the parked unsubscribes in turn order, for at most
@@ -146,18 +194,18 @@ pub fn clear_for_test() {
 /// URI configured now, for one recorded before that was kept). Returns how many
 /// ended.
 ///
-/// No producer can starve the others (R30 #1954): once a DELETE to a producer fails
-/// in a pass, its other unsubscribes wait for the next pass instead of each costing
-/// a timeout, and a tried one goes to the BACK of the queue while one this pass did
-/// not reach keeps its place at the front. One parked longer than [`MAX_AGE`] is
-/// given up as `expired`.
+/// No producer can starve the others (R30 #1954, R27 #1972): once a DELETE to a
+/// producer fails it backs off ([`BACKOFF_BASE`], doubling to [`BACKOFF_MAX`]), so
+/// its other unsubscribes wait, in this pass and the next ones, instead of each
+/// costing a timeout; and a tried one goes to the BACK of the queue while one this
+/// pass did not reach keeps its place at the front. One parked longer than
+/// [`MAX_AGE`] is given up as `expired`.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<Parked> = lock().drain(..).collect();
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
     let mut untried = Vec::new();
     let mut failed = Vec::new();
-    let mut failing: std::collections::HashSet<String> = std::collections::HashSet::new();
     for parked in batch {
         let southbound = &parked.southbound;
         if parked.since.elapsed() > MAX_AGE {
@@ -175,11 +223,14 @@ pub async fn reconcile_once() -> usize {
             .clone()
             .or_else(|| crate::producer_uri(southbound.producer));
         let target = uri.clone().unwrap_or_default();
-        if tokio::time::Instant::now() >= deadline || failing.contains(&target) {
+        // A producer that failed (in this pass or an earlier one) is backing off:
+        // its unsubscribes wait, so it costs one attempt per backoff period.
+        if tokio::time::Instant::now() >= deadline || backing_off(&target) {
             untried.push(parked);
             continue;
         }
         if crate::try_southbound_unsubscribe(uri, southbound).await {
+            note_success(&target);
             log::info!(
                 "{} unsubscribe of {}: reconciled",
                 southbound.producer.as_str(),
@@ -188,7 +239,7 @@ pub async fn reconcile_once() -> usize {
             RECONCILED.inc(&["delivered"]);
             ended += 1;
         } else {
-            failing.insert(target);
+            note_failure(&target);
             failed.push(parked);
         }
     }
