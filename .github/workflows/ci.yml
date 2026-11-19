@@ -379,13 +379,15 @@ jobs:
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
 
-      - name: webui session key fails closed; bind defaults to loopback
+      - name: webui session key fails closed; bind defaults to loopback; insecure dev only under dev
         # #913: the provisioning UI refuses to start without a real SECRET_KEY;
-        # #850: it listens on 127.0.0.1 unless WEBUI_BIND_ADDR says otherwise.
+        # #850: it listens on 127.0.0.1 unless WEBUI_BIND_ADDR says otherwise;
+        # #1913: WEBUI_INSECURE_DEV=1 refuses to start under the production profile.
         # These pin both checks without installing the UI's dependencies.
         run: |
           node webui/server/lib/session-key.check.js
           node webui/server/lib/bind-address.check.js
+          node webui/server/lib/insecure-dev.check.js
 
   helm:
     # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits

@@ -36,6 +36,9 @@ const LocalStrategy = require('passport-local').Strategy;
 const csrf = require('lusca').csrf();
 // No fallback key (#913): refuse to start without a real SECRET_KEY.
 const secret = require('./lib/session-key').sessionKey(process.env);
+// #1913: WEBUI_INSECURE_DEV=1 is honoured under the dev SBI profile only; under
+// production this throws and the UI refuses to start.
+const insecureDev = require('./lib/insecure-dev').insecureDev(process.env);
 
 const api = require('./routes');
 
@@ -96,9 +99,9 @@ co(function* () {
       // absent entirely, so the session cookie was sent over plaintext HTTP.
       httpOnly: true,
       sameSite: 'strict',
-      // Secure by default; only a deliberate insecure-dev run may send the
-      // session cookie over plaintext.
-      secure: process.env.WEBUI_INSECURE_DEV !== '1'
+      // Secure by default; only a deliberate insecure-dev run under the dev SBI
+      // profile may send the session cookie over plaintext (#1913).
+      secure: !insecureDev
     }
   }));
 
