@@ -23,6 +23,7 @@ pub mod sdm_udr; // #1775 TS 23.502 §4.5.1: the UDR's am-data change, notified 
 /// Wave-6 F-04: Steering-of-Roaming injection into Nudm_SDM am-data via the
 /// real Nausf_SoRProtection producer (TS 33.501 §6.14.2.1, TS 29.503/29.509).
 pub mod sor;
+pub mod state_log; // #1896 the durable state as an append-only log
 pub mod timer;
 /// UDM lifecycle + timer FSM. Its request-routing half, the per-UE / per-session
 /// child FSMs (`ue_sm`, `sess_sm`), the `nudr_handler` behind them and the

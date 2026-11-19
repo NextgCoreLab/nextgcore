@@ -76,6 +76,13 @@
 //! subscription is still served. Without a state file all of it is memory-only, as
 //! before.
 //!
+//! The file is an append-only log (#1896, [`crate::state_log`]): a write appends
+//! only the records it names ([`Rec`]: one SDM subscription, one SUPI's leg, queue
+//! or told am-data) as one checksummed line, `fdatasync`ed before the answer, and
+//! the log is compacted once it outgrows twice its live size. A write therefore
+//! costs the same at 10 000 subscribers as at 100. A #1836 snapshot file is
+//! migrated at the first start.
+//!
 //! The UDR drops a leg on its own: on its `expiry` (TS 29.504 §5.2.2.6.2, which
 //! this UDM suggests and refreshes by PATCH, §5.2.2.6.2 last paragraph), or after an
 //! hour of failed notifications. [`refresh_legs`] PATCHes each leg periodically; a
@@ -188,8 +195,8 @@ static TOLD: Mutex<Option<HashMap<String, Told>>> = Mutex::new(None);
 /// Test lock: `crate::test_support::CONTEXT_GUARD`.
 static STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The state file, `None` for memory-only.
-static STATE_STORE: Mutex<Option<Arc<nextgcore_core::state_store::StateStore>>> = Mutex::new(None);
+/// The state log (#1896, [`crate::state_log`]), `None` for memory-only.
+static STATE_LOG: Mutex<Option<Arc<Mutex<crate::state_log::StateLog>>>> = Mutex::new(None);
 
 /// Bumped by a (simulated) restart: a worker of an older generation stops without
 /// touching state.
@@ -286,7 +293,8 @@ struct SavedSdmSubscription {
     monitored_resource_uris: Vec<String>,
 }
 
-/// The state file's document.
+/// The state as restored: #1836's snapshot document, and what a replay of the
+/// log (#1896) builds.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
@@ -300,31 +308,140 @@ struct Snapshot {
     told: HashMap<String, Told>,
 }
 
-/// The current state as a [`Snapshot`] document.
-fn snapshot() -> Value {
-    let sdm_subscriptions = {
+/// One record of the persisted state (#1896): what a write names, so it writes
+/// only these, never the whole state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Rec<'a> {
+    /// The SDM subscription with this id.
+    Sub(&'a str),
+    /// This SUPI's UDR leg.
+    Leg(&'a str),
+    /// This SUPI's queue.
+    Queue(&'a str),
+    /// This SUPI's [`Told`] am-data.
+    Told(&'a str),
+}
+
+fn saved(s: UdmSdmSubscription) -> SavedSdmSubscription {
+    SavedSdmSubscription {
+        id: s.id,
+        supi: s.supi,
+        nf_instance_id: s.nf_instance_id,
+        callback_reference: s.callback_reference,
+        monitored_resource_uris: s.monitored_resource_uris,
+    }
+}
+
+/// The log operation putting `rec` as it is now in memory, or deleting it when it
+/// is not there.
+fn record_op(rec: Rec<'_>) -> Value {
+    let (t, k, v) = match rec {
+        Rec::Sub(id) => {
+            let ctx = udm_self();
+            let found = ctx
+                .read()
+                .ok()
+                .and_then(|c| c.sdm_subscription_find_by_id(id));
+            ("sub", id, found.map(|s| serde_json::to_value(saved(s))))
+        }
+        Rec::Leg(supi) => ("leg", supi, leg(supi).map(serde_json::to_value)),
+        Rec::Queue(supi) => {
+            let q = lock(&QUEUES)
+                .as_ref()
+                .and_then(|m| m.get(supi).cloned())
+                .filter(|q| !q.is_empty());
+            ("queue", supi, q.map(serde_json::to_value))
+        }
+        Rec::Told(supi) => ("told", supi, told(supi).map(serde_json::to_value)),
+    };
+    match v.and_then(Result::ok) {
+        Some(v) => json!({"t": t, "k": k, "v": v}),
+        None => json!({"t": t, "k": k}),
+    }
+}
+
+/// One put per live record: what a compaction writes.
+fn all_ops() -> Vec<Value> {
+    let subs: Vec<String> = {
         let ctx = udm_self();
         let guard = ctx.read().ok();
         guard
             .map(|c| c.sdm_subscriptions_all())
             .unwrap_or_default()
             .into_iter()
-            .map(|s| SavedSdmSubscription {
-                id: s.id,
-                supi: s.supi,
-                nf_instance_id: s.nf_instance_id,
-                callback_reference: s.callback_reference,
-                monitored_resource_uris: s.monitored_resource_uris,
-            })
+            .map(|s| s.id)
             .collect()
     };
-    let snap = Snapshot {
-        sdm_subscriptions,
-        legs: lock(&LEGS).clone().unwrap_or_default(),
-        queues: lock(&QUEUES).clone().unwrap_or_default(),
-        told: lock(&TOLD).clone().unwrap_or_default(),
-    };
-    serde_json::to_value(snap).unwrap_or(Value::Null)
+    let legs: Vec<String> = keys_of(&LEGS);
+    let queues: Vec<String> = keys_of(&QUEUES);
+    let told: Vec<String> = keys_of(&TOLD);
+    let mut ops: Vec<Value> = subs.iter().map(|id| record_op(Rec::Sub(id))).collect();
+    ops.extend(legs.iter().map(|s| record_op(Rec::Leg(s))));
+    ops.extend(queues.iter().map(|s| record_op(Rec::Queue(s))));
+    ops.extend(told.iter().map(|s| record_op(Rec::Told(s))));
+    ops.retain(|op| op.get("v").is_some());
+    ops
+}
+
+fn keys_of<T>(m: &'static Mutex<Option<HashMap<String, T>>>) -> Vec<String> {
+    let mut k: Vec<String> = lock(m)
+        .as_ref()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    k.sort();
+    k
+}
+
+/// The state the log's operations build, in order; an operation that is not one
+/// of this UDM's records is corruption.
+fn replay(ops: Vec<Value>) -> Result<Snapshot, String> {
+    let mut subs: std::collections::BTreeMap<String, SavedSdmSubscription> = Default::default();
+    let mut snap = Snapshot::default();
+    for (n, op) in ops.into_iter().enumerate() {
+        let bad = |why: &str| format!("state log operation {n}: {why}");
+        let t = op
+            .get("t")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("no kind"))?;
+        let k = op
+            .get("k")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("no key"))?
+            .to_string();
+        let v = op.get("v").cloned();
+        fn de<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, String> {
+            serde_json::from_value(v).map_err(|e| e.to_string())
+        }
+        match (t, v) {
+            ("sub", Some(v)) => {
+                subs.insert(k, de(v).map_err(|e| bad(&e))?);
+            }
+            ("sub", None) => {
+                subs.remove(&k);
+            }
+            ("leg", Some(v)) => {
+                snap.legs.insert(k, de(v).map_err(|e| bad(&e))?);
+            }
+            ("leg", None) => {
+                snap.legs.remove(&k);
+            }
+            ("queue", Some(v)) => {
+                snap.queues.insert(k, de(v).map_err(|e| bad(&e))?);
+            }
+            ("queue", None) => {
+                snap.queues.remove(&k);
+            }
+            ("told", Some(v)) => {
+                snap.told.insert(k, de(v).map_err(|e| bad(&e))?);
+            }
+            ("told", None) => {
+                snap.told.remove(&k);
+            }
+            (other, _) => return Err(bad(&format!("unknown kind {other}"))),
+        }
+    }
+    snap.sdm_subscriptions = subs.into_values().collect();
+    Ok(snap)
 }
 
 /// Take [`STATE_LOCK`]: hold it across a change to the persisted state and its
@@ -333,35 +450,79 @@ pub(crate) async fn state_lock() -> tokio::sync::MutexGuard<'static, ()> {
     STATE_LOCK.lock().await
 }
 
-/// Write the current state to the state file (a no-op without one). The caller
-/// holds [`STATE_LOCK`] (`_held`) across the change and this write.
+/// Write `recs` as they are now in memory to the state log (a no-op without
+/// one), durably, before the caller answers: one appended line, so the cost is
+/// the size of these records, whatever the size of the state (#1896). When the
+/// log is due, it is compacted after the write. A compaction that fails is
+/// logged: the write itself is already durable. The caller holds [`STATE_LOCK`]
+/// (`_held`) across the change and this write.
 pub(crate) async fn persist_locked(
     _held: &tokio::sync::MutexGuard<'static, ()>,
+    recs: &[Rec<'_>],
 ) -> Result<(), String> {
-    let Some(store) = lock(&STATE_STORE).clone() else {
+    let Some(log) = lock(&STATE_LOG).clone() else {
         return Ok(());
     };
-    let doc = snapshot();
-    tokio::task::spawn_blocking(move || store.persist(&doc))
+    let ops: Vec<Value> = recs.iter().map(|r| record_op(*r)).collect();
+    let writer = log.clone();
+    let due = tokio::task::spawn_blocking(move || {
+        writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(&ops)
+    })
+    .await
+    .map_err(|e| format!("state write task: {e}"))??;
+    if due {
+        let all = all_ops();
+        let compacted = tokio::task::spawn_blocking(move || {
+            log.lock().unwrap_or_else(|e| e.into_inner()).compact(&all)
+        })
         .await
-        .map_err(|e| format!("state write task: {e}"))?
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("compaction task: {e}"))
+        .and_then(|r| r);
+        if let Err(e) = compacted {
+            log::warn!("UDM state log not compacted: {e}");
+        }
+    }
+    Ok(())
 }
 
-/// Open the state file `path` (`None`: memory-only) and restore what it holds:
+/// Open the state log `path` (`None`: memory-only) and restore what it holds:
 /// the SDM subscriptions, the legs, the queues and the [`Told`] am-data. Each
-/// restored queue's worker is started. An unreadable or malformed file is an error
-/// and nothing is restored (the caller fails the start: the file is kept for a
-/// human, `nextgcore_core::state_store`). Call after `udm_context_init`.
+/// restored queue's worker is started. A damaged log is an error and nothing is
+/// restored (the caller fails the start, and the file is kept); a torn last write
+/// is cut off ([`crate::state_log`]). A #1836 snapshot at `path` is restored and
+/// migrated: the file is rewritten as a log. A log holding more operations than
+/// twice its live records is compacted, so the next load stays bounded. Call after
+/// `udm_context_init`.
 pub async fn init_state(path: Option<std::path::PathBuf>) -> Result<usize, String> {
     let _held = STATE_LOCK.lock().await;
-    let mut store = nextgcore_core::state_store::StateStore::new(path);
-    let loaded = store.load().map_err(|e| e.to_string())?;
-    let enabled = store.is_enabled();
-    let snap = match loaded {
-        nextgcore_core::state_store::Loaded::Absent => Snapshot::default(),
-        nextgcore_core::state_store::Loaded::Snapshot(doc) => serde_json::from_value(doc)
-            .map_err(|e| format!("state file does not hold a UDM snapshot: {e}"))?,
+    let (log, snap, compact) = match path {
+        None => (None, Snapshot::default(), false),
+        Some(path) => {
+            let (log, opened) =
+                tokio::task::spawn_blocking(move || crate::state_log::StateLog::open(&path))
+                    .await
+                    .map_err(|e| format!("state log open task: {e}"))??;
+            match opened {
+                crate::state_log::Opened::Legacy(doc) => {
+                    let snap: Snapshot = serde_json::from_value(doc)
+                        .map_err(|e| format!("state file does not hold a UDM snapshot: {e}"))?;
+                    log::info!("UDM state file holds a #1836 snapshot: migrated to the log");
+                    (Some(log), snap, true)
+                }
+                crate::state_log::Opened::Log { ops, .. } => {
+                    let count = ops.len();
+                    let snap = replay(ops)?;
+                    let live = snap.sdm_subscriptions.len()
+                        + snap.legs.len()
+                        + snap.queues.len()
+                        + snap.told.len();
+                    (Some(log), snap, count > 2 * live.max(1))
+                }
+            }
+        }
     };
     // Validated whole above; applied below.
     let restored = snap.sdm_subscriptions.len();
@@ -395,7 +556,18 @@ pub async fn init_state(path: Option<std::path::PathBuf>) -> Result<usize, Strin
         .collect();
     let workers: Vec<String> = queues.keys().cloned().collect();
     *lock(&QUEUES) = Some(queues);
-    *lock(&STATE_STORE) = enabled.then(|| Arc::new(store));
+    let enabled = log.is_some();
+    if let Some(mut log) = log {
+        if compact {
+            let all = all_ops();
+            log = tokio::task::spawn_blocking(move || log.compact(&all).map(|()| log))
+                .await
+                .map_err(|e| format!("state log compaction task: {e}"))??;
+        }
+        *lock(&STATE_LOG) = Some(Arc::new(Mutex::new(log)));
+    } else {
+        *lock(&STATE_LOG) = None;
+    }
     for supi in workers {
         spawn_worker(supi);
     }
@@ -635,7 +807,9 @@ pub async fn reconcile(supi: &str) -> bool {
                         let mut t = told(supi).unwrap_or_default();
                         t.resync = true;
                         set_told(supi, Some(t));
-                        if let Err(e) = persist_locked(&held).await {
+                        if let Err(e) =
+                            persist_locked(&held, &[Rec::Leg(supi), Rec::Told(supi)]).await
+                        {
                             log::error!("[{supi}] UDR leg not written to the state file: {e}");
                         }
                     }
@@ -655,7 +829,8 @@ pub async fn reconcile(supi: &str) -> bool {
                     let held = STATE_LOCK.lock().await;
                     set_leg(supi, None);
                     set_told(supi, None);
-                    if let Err(e) = persist_locked(&held).await {
+                    if let Err(e) = persist_locked(&held, &[Rec::Leg(supi), Rec::Told(supi)]).await
+                    {
                         log::error!("[{supi}] UDR leg removal not written: {e}");
                     }
                 }
@@ -664,7 +839,7 @@ pub async fn reconcile(supi: &str) -> bool {
             (false, None, _) if told(supi).is_some() => {
                 let held = STATE_LOCK.lock().await;
                 set_told(supi, None);
-                let _ = persist_locked(&held).await;
+                let _ = persist_locked(&held, &[Rec::Told(supi)]).await;
             }
             _ => {}
         }
@@ -829,7 +1004,7 @@ async fn resync(supi: &str) {
         now.doc = Some(fresh);
         now.resync = false;
         set_told(supi, Some(now));
-        if let Err(e) = persist_locked(&held).await {
+        if let Err(e) = persist_locked(&held, &[Rec::Queue(supi), Rec::Told(supi)]).await {
             log::error!("[{supi}] re-derived am-data changes not written: {e}");
             // Undo: the resync stays due, and nothing unwritten is delivered.
             set_told(
@@ -918,7 +1093,7 @@ async fn refresh_leg(supi: &str, held_leg: UdrLeg) -> Refreshed {
                 l.callback_reference = cb;
             }
             set_leg(supi, Some(l));
-            if let Err(e) = persist_locked(&held).await {
+            if let Err(e) = persist_locked(&held, &[Rec::Leg(supi)]).await {
                 log::error!("[{supi}] refreshed UDR leg not written: {e}");
             }
             Refreshed::Kept
@@ -929,7 +1104,7 @@ async fn refresh_leg(supi: &str, held_leg: UdrLeg) -> Refreshed {
                 held_leg.subscription_path
             );
             set_leg(supi, None);
-            if let Err(e) = persist_locked(&held).await {
+            if let Err(e) = persist_locked(&held, &[Rec::Leg(supi)]).await {
                 log::error!("[{supi}] UDR leg removal not written: {e}");
             }
             drop(held);
@@ -1097,7 +1272,7 @@ async fn deliver(supi: &str, sub: &UdmSdmSubscription, changes: &[Value]) -> Del
                 if let Ok(context) = ctx.read() {
                     context.sdm_subscription_remove(&sub.id);
                 }
-                if let Err(e) = persist_locked(&held).await {
+                if let Err(e) = persist_locked(&held, &[Rec::Sub(&sub.id)]).await {
                     log::error!("[{supi}] SDM subscription removal not written: {e}");
                 }
             }
@@ -1192,7 +1367,7 @@ pub async fn handle_udr_data_change(supi: &str, token: &str, request: &SbiReques
         t.resync = true;
     }
     set_told(supi, Some(t));
-    if let Err(e) = persist_locked(&held).await {
+    if let Err(e) = persist_locked(&held, &[Rec::Queue(supi), Rec::Told(supi)]).await {
         // Nothing kept: the UDR keeps its baseline and resends.
         log::error!("[{supi}] am-data change not written to the state file: {e}; 503");
         restore_queue(supi, saved_queue);
@@ -1343,7 +1518,7 @@ async fn drain(supi: &str, generation: u64) {
                 front.pending = Some(again.clone());
             }
         }
-        if let Err(e) = persist_locked(&held).await {
+        if let Err(e) = persist_locked(&held, &[Rec::Queue(supi)]).await {
             log::error!("[{supi}] am-data delivery progress not written: {e}");
         }
         drop(held);
@@ -2073,9 +2248,18 @@ mod tests {
     }
 
     /// A UDM crash: every worker stops, and everything in memory is gone.
+    ///
+    /// Under [`STATE_LOCK`], as a real crash cannot land between a change and its
+    /// write (#1896 R30): `clear_legs` takes no lock of its own, so a worker that
+    /// had passed its generation check could otherwise persist its SUPI's queue
+    /// from the emptied maps, as a delete, and the "restarted" UDM would find it
+    /// gone (`a_1836_snapshot_is_migrated_to_the_log_1896`, 4 in 6 parallel runs).
     async fn crash() {
-        clear_legs();
-        udm_self().read().expect("ctx").ue_remove_all();
+        {
+            let _held = STATE_LOCK.lock().await;
+            clear_legs();
+            udm_self().read().expect("ctx").ue_remove_all();
+        }
         wait_idle().await;
     }
 
@@ -2626,5 +2810,153 @@ mod tests {
         clear_legs();
         init_state(None).await.expect("memory-only");
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// **#1896, the core claim.** With a state log holding 120 SDM subscriptions
+    /// (and their legs and told am-data), one more SDM subscribe appends about as
+    /// many bytes as the second one did, under 2 KiB: the write names its records
+    /// and writes only those, not the state.
+    ///
+    /// REVERT-VERIFIED: with `persist_locked` writing every record (`all_ops`), the
+    /// 121st subscribe appends the whole state ("only the changed record").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_write_appends_only_the_changed_record_1896() {
+        let (_udr, udr_base, _udr_state) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        let path = temp_state_path("1896-flat");
+        init_state(Some(path.clone())).await.expect("state log");
+        // No callback address: no leg is made, so the log holds the SDM
+        // subscriptions alone and the measure is of one subscribe's write.
+        set_notify_base(None);
+        let size = || std::fs::metadata(&path).map_or(0, |m| m.len());
+        let subscribe = |n: usize| {
+            try_sdm_subscribe_owned(
+                format!("imsi-0010100018{n:05}"),
+                format!("http://127.0.0.1:9/cb/sdm-notify/{n:05}"),
+            )
+        };
+        assert_eq!(subscribe(0).await.0, 201);
+        let first = size();
+        assert_eq!(subscribe(1).await.0, 201);
+        let second = size() - first;
+        for n in 2..120 {
+            assert_eq!(subscribe(n).await.0, 201);
+        }
+        let before = size();
+        assert_eq!(subscribe(120).await.0, 201);
+        let last = size() - before;
+        assert!(
+            last < 2048 && last <= second + 16,
+            "only the changed record: {last} B after 120, {second} B after 1"
+        );
+        clear_legs();
+        init_state(None).await.expect("memory-only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    async fn try_sdm_subscribe_owned(supi: String, callback: String) -> (u16, Value) {
+        try_sdm_subscribe(&supi, &callback).await
+    }
+
+    /// **#1896, migration (UDM restart).** A state file #1836 wrote (one snapshot
+    /// document) is restored at the first start and rewritten as a log: the SDM
+    /// subscription, the leg (its token admitted again) and the queued change are
+    /// all there, and so they are after a second restart from the log, with a
+    /// change made in between. A damaged log fails the start.
+    ///
+    /// REVERT-VERIFIED: with the migration's compaction skipped, the file is still
+    /// the snapshot ("rewritten as a log"), and the change appended to it then makes
+    /// the second start fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_1836_snapshot_is_migrated_to_the_log_1896() {
+        let (_udr, udr_base, _udr_state) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        let supi = "imsi-001010000018961";
+        let sub = SavedSdmSubscription {
+            id: "sdm-1896".to_string(),
+            supi: supi.to_string(),
+            nf_instance_id: Some("amf-1896".to_string()),
+            // Nothing listens there: the queued change stays queued.
+            callback_reference: Some("http://127.0.0.1:9/cb/sdm-notify/m".to_string()),
+            monitored_resource_uris: vec![format!("/nudm-sdm/v2/{supi}/am-data")],
+        };
+        let token = "0123456789abcdef0123456789a18961";
+        let snapshot = Snapshot {
+            sdm_subscriptions: vec![sub],
+            legs: HashMap::from([(
+                supi.to_string(),
+                UdrLeg {
+                    subscription_path: "/nudr-dr/v2/subscription-data/subs-to-notify/77"
+                        .to_string(),
+                    token: token.to_string(),
+                    callback_reference: String::new(),
+                    expiry: None,
+                },
+            )]),
+            queues: HashMap::from([(
+                supi.to_string(),
+                VecDeque::from([Queued {
+                    changes: vec![json!({"op": "REPLACE", "path": "/gpsis",
+                                         "newValue": ["msisdn-2"]})],
+                    pending: None,
+                }]),
+            )]),
+            told: HashMap::from([(supi.to_string(), Told::default())]),
+        };
+        let path = temp_state_path("1896-migrate");
+        nextgcore_core::state_store::write_snapshot(
+            &path,
+            &serde_json::to_value(&snapshot).expect("doc"),
+        )
+        .expect("a #1836 file");
+
+        assert_eq!(init_state(Some(path.clone())).await, Ok(1));
+        let first = std::fs::read(&path).expect("read");
+        assert!(
+            first.first().is_some_and(u8::is_ascii_hexdigit),
+            "rewritten as a log: {}",
+            String::from_utf8_lossy(&first[..first.len().min(40)])
+        );
+        assert!(token_matches(supi, token), "the leg");
+        assert_eq!(held_ids(supi), vec!["sdm-1896".to_string()]);
+        // A change after the migration is appended to the log.
+        assert_eq!(
+            try_sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/m2")
+                .await
+                .0,
+            201
+        );
+
+        crash().await;
+        // What the log holds, as the next start replays it.
+        let persisted = match crate::state_log::StateLog::open(&path).expect("opens").1 {
+            crate::state_log::Opened::Log { ops, .. } => replay(ops).expect("replays"),
+            crate::state_log::Opened::Legacy(_) => panic!("rewritten as a log"),
+        };
+        assert!(persisted.queues.contains_key(supi), "the queue");
+        assert_eq!(
+            persisted.legs.get(supi).map(|l| l.token.as_str()),
+            Some(token)
+        );
+        assert_eq!(
+            init_state(Some(path.clone())).await,
+            Ok(2),
+            "both, from the log"
+        );
+        assert!(token_matches(supi, token));
+
+        crash().await;
+        let mut damaged = std::fs::read(&path).expect("read");
+        damaged[0] = if damaged[0] == b'0' { b'1' } else { b'0' };
+        std::fs::write(&path, &damaged).expect("write");
+        assert!(
+            init_state(Some(path.clone())).await.is_err(),
+            "a damaged log fails the start"
+        );
+        clear_legs();
+        init_state(None).await.expect("memory-only");
+        let _ = std::fs::remove_file(&path);
     }
 }
