@@ -37363,7 +37363,10 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the entry dropped before the Remove is awaited (the
     /// round-1 settle), Y's Create reuses X's SRR ID; with `last` / `stop`
-    /// counting only installed SRRs, a `stop` goes out while Y is installed.
+    /// counting only installed SRRs, a `stop` goes out while Y is being installed.
+    /// #1997: the order is fixed by `qos_mon::N4Hold`s, so both reverts bite on
+    /// every run, and a loaded scheduler cannot fail the test for an order in
+    /// which the SMF was right.
     // The event-store lock is held across awaits, as the other event tests do
     // (event_exposure::STORE_LOCK).
     #[allow(clippy::await_holding_lock)]
@@ -37381,13 +37384,44 @@ mod tests {
         qos_mon::subscribed(&x).await;
         let x_srr = qos_mon::srr_ids(&reference)[0];
         await_n1n2_1385(&posts, 1).await;
+        // X's `both` has been answered: the NG-RAN is measuring before the
+        // interleaving starts.
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+        assert!(qos_mon::ran_idle_for_test(&reference), "X's `both` settled");
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         let from = upf.modification_bodies().len();
         let posted = posts.lock().unwrap().len();
 
+        // #1997: the interleaving is ordered by holds, not left to `join!`'s
+        // scheduling. Under load Y's install yielded before reserving its SRR ID,
+        // X's Remove returned first, and ID 1 was then legitimately free, so the
+        // test failed without the SMF doing anything wrong. Now X's Remove waits,
+        // X Removing, until Y has reserved; Y's Create waits until X's Remove has
+        // returned and the RAN leg has decided on it, so that decision is taken
+        // while Y is being installed.
         let y = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/y");
+        let remove = qos_mon::N4Hold::arm(qos_mon::SrrOp::Remove);
+        let create = qos_mon::N4Hold::arm(qos_mon::SrrOp::Create);
         event_exposure::remove(&x.id);
-        tokio::join!(qos_mon::unsubscribed(&x.id), qos_mon::subscribed(&y));
+        tokio::join!(
+            async {
+                qos_mon::unsubscribed(&x.id).await;
+                wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+                assert!(
+                    qos_mon::ran_idle_for_test(&reference),
+                    "the RAN leg settled X's removal"
+                );
+                create.release();
+            },
+            async {
+                remove.reached().await;
+                qos_mon::subscribed(&y).await;
+            },
+            async {
+                create.reached().await;
+                remove.release();
+            },
+        );
 
         let ops = srr_history_1390(&upf, from);
         let held = qos_mon::srr_ids(&reference);
