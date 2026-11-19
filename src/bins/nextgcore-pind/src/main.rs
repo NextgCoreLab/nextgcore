@@ -475,7 +475,7 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // PIN Management (PIN-6)
         ["pinapp", "v1", "pins"] => match method {
             "POST" => handle_pin_create(&request).await,
-            "GET" => handle_pin_list().await,
+            "GET" => handle_pin_list(&request).await,
             _ => send_method_not_allowed(method, "pins"),
         },
         ["pinapp", "v1", "pins", pin_id] => match method {
@@ -615,12 +615,21 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_pin_list() -> SbiResponse {
+/// #1953 (R32 on #1967): the caller's own PINs only: those it owns or is a
+/// PEMC of (the same rule as PIN GET). The list used to return every PIN and
+/// its owner's SUPI to any caller; an anonymous caller now gets an empty list.
+async fn handle_pin_list(request: &SbiRequest) -> SbiResponse {
+    let caller = caller_supi(request);
     let ctx = pin_self();
     let pins: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
         context
             .pin_list()
             .iter()
+            .filter(|p| {
+                context
+                    .authorize_pin_reader(&p.pin_id, caller.as_deref())
+                    .is_ok()
+            })
             .map(|p| {
                 serde_json::json!({
                     "pinId": p.pin_id,
@@ -1474,8 +1483,8 @@ mod tests {
     }
 
     /// #1953 (R32 on #1967 M1): a PIN (with its owner's SUPI) and its element
-    /// list (with addresses and ports) are read only by the owner, a PEMC or a
-    /// member's host; a stranger or anonymous caller gets 403 on both.
+    /// list (with addresses and ports) are read only by the owner or a PEMC; a
+    /// stranger, an anonymous caller or a self-registered element gets 403.
     /// REVERT-VERIFIED: with the `authorize_pin_reader` guard removed from
     /// either handler, the stranger's request on it answers 200.
     #[test]
@@ -1508,7 +1517,10 @@ mod tests {
             );
             assert_eq!(read(path.clone(), None), 403, "{path}");
             assert_eq!(read(path.clone(), Some("imsi-owner-r1953")), 200, "{path}");
-            assert_eq!(read(path.clone(), Some("imsi-member-r1953")), 200, "{path}");
+            // R32 on #1967: a self-registered (Regular) element's host is not a
+            // reader. REVERT-VERIFIED: with hosting counted as membership
+            // again, this answers 200.
+            assert_eq!(read(path.clone(), Some("imsi-member-r1953")), 403, "{path}");
         }
         assert_eq!(
             read(
@@ -1517,6 +1529,45 @@ mod tests {
             ),
             404
         );
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+    }
+
+    /// #1953 (R32 on #1967): `GET /pins` lists only the caller's own PINs (owned
+    /// or PEMC), never every PIN and its owner's SUPI.
+    /// REVERT-VERIFIED: with the filter removed, the stranger's list holds both
+    /// PINs.
+    #[test]
+    fn the_pin_list_holds_only_the_callers_own_pins_1953() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let mine = seed_pin("imsi-lister-l1953");
+        let theirs = seed_pin("imsi-other-l1953");
+        let list = |who: Option<&str>| -> Vec<String> {
+            let mut r = SbiRequest::get("/pinapp/v1/pins");
+            if let Some(w) = who {
+                r = r.with_header("x-caller-supi", w);
+            }
+            let resp = block_on(pin_sbi_request_handler(r));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            body["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["pinId"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let own = list(Some("imsi-lister-l1953"));
+        assert!(own.contains(&mine) && !own.contains(&theirs), "{own:?}");
+        let stranger = list(Some("imsi-stranger-l1953"));
+        assert!(
+            !stranger.contains(&mine) && !stranger.contains(&theirs),
+            "{stranger:?}"
+        );
+        assert!(list(None).is_empty());
         TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
     }
 

@@ -510,10 +510,10 @@ impl PinContext {
         format!("{prefix}-{random}-{id}")
     }
 
-    /// #1953 (R32 on #1967 M1): whether `caller` may read PIN `pin_id` (its
-    /// owner and membership) or discover its elements: the owner, a PEMC of
-    /// the PIN, or the host of one of its member elements (TS 23.542 §8.5:
-    /// PIN information is for the PIN's own clients). `NotFound` for an
+    /// #1953 (R32 on #1967): whether `caller` may read PIN `pin_id` (its owner
+    /// and membership), list it, or discover its elements: the owner or a PEMC
+    /// of the PIN (TS 23.542 §8.5: PIN management is the owner's and the
+    /// PEMC's). `NotFound` for an
     /// unknown PIN, `PemcRequiresOwner` for anyone else, anonymous included.
     pub fn authorize_pin_reader(
         &self,
@@ -530,13 +530,12 @@ impl PinContext {
             .map_err(|_| PinContextError::NotFound)?;
         let pin = pins.get(pin_id).ok_or(PinContextError::NotFound)?;
         let caller = caller.unwrap_or("");
-        let member = !caller.is_empty()
-            && pin.member_ids.iter().any(|id| {
-                elements
-                    .get(id)
-                    .is_some_and(|e| e.host_supi.as_deref() == Some(caller))
-            });
-        if member || caller_is_owner_or_pemc(pin, caller, &elements) {
+        // R32 on #1967: hosting an element is NOT read membership. Anyone who
+        // learns a pinId can self-register a Regular element (201), so that
+        // would let a stranger read the PIN. Only the owner and PEMCs read it,
+        // and a PEMC role is granted only with owner/PEMC approval (PIND-06).
+        // An element still reads its own record (element GET).
+        if caller_is_owner_or_pemc(pin, caller, &elements) {
             Ok(())
         } else {
             Err(PinContextError::PemcRequiresOwner)
