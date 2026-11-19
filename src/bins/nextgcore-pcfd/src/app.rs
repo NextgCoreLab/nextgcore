@@ -5592,6 +5592,35 @@ fn identify_pcscf_restoration_session(
 /// A request that identifies no single session is a `500` with cause
 /// `PDU_SESSION_NOT_AVAILABLE` (§4.2.2.27, Table 5.7.3-1); it was a `404
 /// SESSION_NOT_FOUND`.
+/// #1991: the 403 for a P-CSCF restoration caller that owns neither the
+/// session's SM policy nor any app session on it, or `None` to proceed.
+///
+/// A session whose SM policy and app sessions all lack an owner (a `dev`
+/// stack, or state restored from before #1991) follows `owner_binding`'s rule:
+/// open under `dev`, frozen under `production`.
+fn refuse_pcscf_restoration_caller(sess: &PcfSess, request: &SbiRequest) -> Option<SbiResponse> {
+    let mut owners: Vec<String> = sess.owner.iter().cloned().collect();
+    if let Ok(context) = pcf_self().read() {
+        owners.extend(
+            sess.app_ids
+                .iter()
+                .filter_map(|id| context.app_find_by_id(*id))
+                .filter_map(|app| app.owner),
+        );
+    }
+    let op = "P-CSCF Restoration";
+    if owners.is_empty() {
+        return nextgcore_sbi::owner_binding::refuse_non_owner(None, request, op);
+    }
+    if owners
+        .iter()
+        .any(|o| nextgcore_sbi::owner_binding::non_owner_refusal(Some(o), request).is_none())
+    {
+        return None;
+    }
+    nextgcore_sbi::owner_binding::refuse_non_owner(owners.first().map(String::as_str), request, op)
+}
+
 pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
     log::info!("P-CSCF Restoration");
     let Some(content) = request.http.content.as_deref() else {
@@ -5605,6 +5634,12 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         Ok(sess) => sess,
         Err(resp) => return *resp,
     };
+    // #1991: only the SMF that owns the SM policy, or an AF/NEF that owns an app
+    // session on this PDU session, may restore it (TS 29.514 §4.2.2.27, TS
+    // 29.512 §4.2.3.18), refused before any notify is sent.
+    if let Some(refused) = refuse_pcscf_restoration_caller(&sess, request) {
+        return refused;
+    }
     let address = format!(
         "ipv4={:?} ipv6={:?} dnn={:?}",
         sess.ipv4addr_string, sess.ipv6prefix_string, sess.dnn
@@ -14567,6 +14602,107 @@ mod tests {
                 "smPolicyDecision": { "pcscfRestIndication": true },
             }),
             "the restoration request, and no re-sent policy"
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1991: P-CSCF restoration is asked only by the SMF that owns the SM
+    /// policy or an AF/NEF that owns an app session on the PDU session; a
+    /// foreign NF, a mismatched certificate/token pair or an anonymous caller
+    /// gets 403 and no notify reaches the SMF.
+    /// REVERT-VERIFIED: with the `refuse_pcscf_restoration_caller` call removed,
+    /// the foreign caller answers 204 and a notify is sent; with the app-owner
+    /// arm dropped, the AF's restoration is refused 403.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_is_asked_by_the_sessions_smf_or_af_only_1991() {
+        const SMF: &str = "aaaaaaaa-1991-4000-8000-0000000000a1";
+        const AF: &str = "cccccccc-1991-4000-8000-0000000000c3";
+        const OTHER: &str = "bbbbbbbb-1991-4000-8000-0000000000b2";
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let (supi, psi, ipv4) = ("imsi-001010000001991", 12, "10.45.19.91");
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+        obj.insert("suppFeat".to_string(), serde_json::json!("100"));
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                peers.smf_port
+            )),
+        );
+        let as_nf = |mut r: SbiRequest, cert: Option<&str>, token: Option<&str>| {
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+        let resp = pcf_sbi_request_handler(as_nf(
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(create)),
+            None,
+            Some(SMF),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let restore = |cert: Option<&str>, token: Option<&str>| {
+            as_nf(
+                make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4 })),
+                ),
+                cert,
+                token,
+            )
+        };
+        for (who, cert, token) in [
+            ("foreign token", None, Some(OTHER)),
+            ("foreign certificate", Some(OTHER), None),
+            ("mismatched pair", Some(SMF), Some(OTHER)),
+            ("anonymous", None, None),
+        ] {
+            let resp = pcf_sbi_request_handler(restore(cert, token)).await;
+            assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
+        }
+        assert!(
+            drain_notifications(&peers, 1).await.is_empty(),
+            "a refused restoration sends nothing"
+        );
+        // The SMF that owns the SM policy restores it.
+        assert_eq!(
+            pcf_sbi_request_handler(restore(None, Some(SMF)))
+                .await
+                .status,
+            204
+        );
+        assert_eq!(await_notifications(&peers, 1).await.len(), 1);
+        // An AF that owns an app session on the PDU session may too.
+        let af_body = serde_json::json!({
+            "notifUri": "http://127.0.0.1:9/af-notif/1991",
+            "suppFeat": "0",
+            "ueIpv4": ipv4,
+        });
+        let resp = pcf_sbi_request_handler(as_nf(
+            make_request(
+                "POST",
+                "/npcf-policyauthorization/v1/app-sessions",
+                Some(af_body),
+            ),
+            Some(AF),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(
+            pcf_sbi_request_handler(restore(Some(AF), None))
+                .await
+                .status,
+            204
         );
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
