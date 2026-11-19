@@ -14,6 +14,13 @@
 //! counted as `abandoned`, so a permanently unreachable PCF cannot grow the set (or
 //! the `appSessionId` map) without limit.
 //!
+//! No pass is spent on a dead PCF (#1961, the #1954 / #1972 pattern): tsctsf sends
+//! every Delete to the one PCF it resolves, so once a Delete fails that PCF backs
+//! off ([`BACKOFF_BASE`], doubling to [`BACKOFF_MAX`]) and the rest wait, in this
+//! pass and later ones, instead of each costing a timeout. A resource tried and
+//! failed goes to the BACK of the queue; one not reached keeps its place at the
+//! front. One parked longer than [`MAX_AGE`] ends as `expired`.
+//!
 //! Ceiling: the set is in memory, like the configurations it serves. tsctsf has no
 //! durable store, so a restart forgets both; the PCF's own app-session lifetime is
 //! what covers that case.
@@ -35,8 +42,8 @@ pub const RECONCILE_PERIOD: Duration = Duration::from_secs(30);
 pub const RECONCILE_PERIOD: Duration = Duration::from_millis(20);
 
 /// `nextgcore_tsctsf_pcf_app_session_delete_reconciled_total{result}`: parked
-/// Deletes the reconciler delivered (`deleted`) or evicted at the bound
-/// (`abandoned`).
+/// Deletes the reconciler delivered (`deleted`), evicted at the bound
+/// (`abandoned`), or gave up after [`MAX_AGE`] (`expired`, #1961).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "nextgcore_tsctsf_pcf_app_session_delete_reconciled_total",
@@ -47,10 +54,71 @@ pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
 
 /// The parked resource ids, oldest first. Their `appSessionId`s stay in
 /// `actuation`'s map, which is what a retried Delete sends.
-fn pending() -> &'static Mutex<VecDeque<String>> {
-    static PENDING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+fn pending() -> &'static Mutex<VecDeque<Parked>> {
+    static PENDING: Mutex<VecDeque<Parked>> = Mutex::new(VecDeque::new());
     &PENDING
 }
+
+/// One parked resource, and when it was first parked (#1961).
+#[derive(Debug, Clone)]
+struct Parked {
+    resource_id: String,
+    /// Wall-clock, so a test can set it back past [`MAX_AGE`].
+    since: std::time::SystemTime,
+}
+
+/// #1961: how long an entry stays parked before it is given up (`expired`): a
+/// peer that has not answered for a day is gone (decommissioned), not
+/// restarting, so its entries end rather than wait to be evicted.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// #1961 (the #1954 / #1972 pattern): the first wait before a peer whose
+/// request failed is tried again, doubled after each further failure up to
+/// [`BACKOFF_MAX`], and cleared by a success. A peer that is backing off is
+/// skipped for the rest of the pass and for later passes until its wait ends,
+/// so a blackholed peer costs one request timeout per backoff period and
+/// cannot starve the entries for healthy peers behind it.
+#[cfg(not(test))]
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const BACKOFF_BASE: Duration = Duration::from_millis(300);
+/// The longest a failing peer is left alone between attempts.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+type Backoff = std::collections::HashMap<String, (tokio::time::Instant, Duration)>;
+
+/// Per peer: when it may next be tried, and the current backoff.
+fn backoff() -> &'static Mutex<Backoff> {
+    static BACKOFF: std::sync::LazyLock<Mutex<Backoff>> =
+        std::sync::LazyLock::new(Default::default);
+    &BACKOFF
+}
+
+fn backing_off(peer: &str) -> bool {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .is_some_and(|(next, _)| tokio::time::Instant::now() < *next)
+}
+
+fn note_failure(peer: &str) {
+    let mut map = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    let wait = map
+        .get(peer)
+        .map_or(BACKOFF_BASE, |(_, current)| (*current * 2).min(BACKOFF_MAX));
+    map.insert(peer.to_string(), (tokio::time::Instant::now() + wait, wait));
+}
+
+fn note_success(peer: &str) {
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(peer);
+}
+
+/// The peer every Delete goes to: the one resolved PCF.
+const PCF_PEER: &str = "pcf";
 
 /// Park `resource_id` for the reconciler; a resource already parked is not added
 /// twice.
@@ -59,11 +127,11 @@ pub fn park(resource_id: String) {
         let Ok(mut set) = pending().lock() else {
             return;
         };
-        if set.contains(&resource_id) {
+        if set.iter().any(|p| p.resource_id == resource_id) {
             return;
         }
         let evicted = if set.len() >= MAX_PENDING {
-            set.pop_front()
+            set.pop_front().map(|p| p.resource_id)
         } else {
             None
         };
@@ -71,7 +139,10 @@ pub fn park(resource_id: String) {
             "Npcf_PolicyAuthorization_Delete for {resource_id} is parked; it is retried every \
              {RECONCILE_PERIOD:?}"
         );
-        set.push_back(resource_id);
+        set.push_back(Parked {
+            resource_id,
+            since: std::time::SystemTime::now(),
+        });
         evicted
     };
     if let Some(old) = evicted {
@@ -102,50 +173,78 @@ pub const MAX_PASS: Duration = Duration::from_secs(30);
 pub const MAX_PASS: Duration = Duration::from_millis(500);
 
 /// One reconcile pass: retry parked Deletes, oldest first, for at most
-/// [`MAX_PASS`]. A 2xx or 404 (or no `appSessionId` left to send) ends one; a
-/// failure, or not reaching it within the pass, re-parks it, ahead of anything
-/// parked meanwhile. Returns how many the PCF accepted.
+/// [`MAX_PASS`]. A 2xx or 404 (or no `appSessionId` left to send) ends one; one
+/// older than [`MAX_AGE`] ends as `expired`.
+///
+/// #1961: once a Delete fails the PCF backs off and the rest are not tried this
+/// pass (nor until the backoff ends); a resource tried and failed goes to the
+/// BACK of the queue, one not reached keeps its place at the FRONT. Returns how
+/// many the PCF accepted.
 ///
 /// Unlike mbsmfd's, a parked id cannot come back into use: resource ids are
 /// UUIDs, never reissued.
 pub async fn reconcile_once() -> usize {
-    let batch: Vec<String> = match pending().lock() {
+    let batch: Vec<Parked> = match pending().lock() {
         Ok(mut set) => set.drain(..).collect(),
         Err(_) => return 0,
     };
     let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut deleted = 0;
-    let mut still = Vec::new();
-    for resource_id in batch {
-        if tokio::time::Instant::now() >= deadline {
-            still.push(resource_id);
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    let mut expired = Vec::new();
+    for p in batch {
+        if p.since.elapsed().unwrap_or_default() > MAX_AGE {
+            expired.push(p.resource_id);
             continue;
         }
-        match crate::actuation::delete_once_for_reconciler(&resource_id).await {
+        if tokio::time::Instant::now() >= deadline || backing_off(PCF_PEER) {
+            untried.push(p);
+            continue;
+        }
+        match crate::actuation::delete_once_for_reconciler(&p.resource_id).await {
             crate::actuation::DeleteOutcome::Deleted => {
-                log::info!("reconciler deleted the PCF app session of {resource_id}");
+                note_success(PCF_PEER);
+                log::info!(
+                    "reconciler deleted the PCF app session of {}",
+                    p.resource_id
+                );
                 RECONCILED.inc(&["deleted"]);
                 deleted += 1;
             }
             crate::actuation::DeleteOutcome::NothingRecorded => {}
-            crate::actuation::DeleteOutcome::Failed => still.push(resource_id),
+            crate::actuation::DeleteOutcome::Failed => {
+                note_failure(PCF_PEER);
+                failed.push(p);
+            }
         }
     }
     let mut evicted = Vec::new();
-    if !still.is_empty() {
-        if let Ok(mut set) = pending().lock() {
-            for resource_id in still.into_iter().rev() {
-                if !set.contains(&resource_id) {
-                    set.push_front(resource_id);
-                }
+    if let Ok(mut set) = pending().lock() {
+        for p in untried.into_iter().rev() {
+            if !set.iter().any(|q| q.resource_id == p.resource_id) {
+                set.push_front(p);
             }
-            while set.len() > MAX_PENDING {
-                evicted.extend(set.pop_front());
+        }
+        for p in failed {
+            if !set.iter().any(|q| q.resource_id == p.resource_id) {
+                set.push_back(p);
             }
+        }
+        while set.len() > MAX_PENDING {
+            evicted.extend(set.pop_front().map(|p| p.resource_id));
         }
     }
     for old in evicted {
         abandon(&old);
+    }
+    for resource_id in expired {
+        let app_session_id = crate::actuation::forget_app_session(&resource_id);
+        log::error!(
+            "the Npcf_PolicyAuthorization_Delete for {resource_id} \
+             (appSessionId={app_session_id:?}) expired after {MAX_AGE:?}"
+        );
+        RECONCILED.inc(&["expired"]);
     }
     deleted
 }
@@ -186,6 +285,7 @@ pub fn clear_for_test() {
     if let Ok(mut set) = pending().lock() {
         set.clear();
     }
+    backoff().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 #[cfg(test)]
@@ -222,7 +322,12 @@ mod tests {
         assert_eq!(pending_count(), MAX_PENDING);
         assert_eq!(RECONCILED.get(&["abandoned"]), before + 1);
         assert_eq!(
-            pending().lock().unwrap().front().map(String::as_str),
+            pending()
+                .lock()
+                .unwrap()
+                .front()
+                .map(|p| p.resource_id.clone())
+                .as_deref(),
             Some("r-1")
         );
         assert_eq!(
@@ -231,6 +336,68 @@ mod tests {
             "the evicted resource's appSessionId is forgotten with it"
         );
         clear_for_test();
+    }
+
+    /// #1961: tsctsf sends every Delete to its one PCF, so once one fails the
+    /// rest are not tried in that pass (nor while the PCF backs off): a dead PCF
+    /// costs one attempt per backoff period, not one timeout per resource. The
+    /// tried one goes to the BACK; the others keep their order at the front.
+    /// REVERT-VERIFIED: with the old order restored (no backoff, everything back
+    /// at the front), every parked Delete is attempted each pass and the
+    /// one-attempt assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the crate's std test lock, held across the pass
+    async fn a_failing_pcf_costs_one_attempt_per_pass_1961() {
+        let _g = lock();
+        clear_for_test();
+        crate::actuation::clear_app_sessions_for_test();
+        for n in 0..3 {
+            crate::actuation::record_app_session_for_test(&format!("r1961-{n}"), "asc");
+            park(format!("r1961-{n}"));
+        }
+        // A PCF on a port nothing listens on: every Delete fails.
+        std::env::set_var("PCF_URI", "http://127.0.0.1:9");
+        reconcile_once().await;
+        std::env::remove_var("PCF_URI");
+        let order: Vec<String> = pending()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.resource_id.clone())
+            .collect();
+        let attempts = (0..3)
+            .filter(|n| crate::actuation::app_session_for(&format!("r1961-{n}")).is_some())
+            .count();
+        clear_for_test();
+        crate::actuation::clear_app_sessions_for_test();
+        assert_eq!(attempts, 3, "a failed Delete keeps its appSessionId");
+        assert_eq!(
+            order,
+            ["r1961-1", "r1961-2", "r1961-0"],
+            "one attempt: the tried one goes to the back, the rest keep their place"
+        );
+    }
+
+    /// #1961: a Delete parked longer than [`MAX_AGE`] ends as `expired` and its
+    /// `appSessionId` is forgotten. REVERT-VERIFIED: with the age check removed
+    /// it stays parked.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the crate's std test lock, held across the pass
+    async fn a_delete_older_than_max_age_expires_1961() {
+        let _g = lock();
+        clear_for_test();
+        crate::actuation::clear_app_sessions_for_test();
+        crate::actuation::record_app_session_for_test("r1961-old", "asc-old");
+        park("r1961-old".to_string());
+        pending().lock().unwrap()[0].since =
+            std::time::SystemTime::now() - MAX_AGE - Duration::from_secs(1);
+        let before = RECONCILED.get(&["expired"]);
+        reconcile_once().await;
+        let expired = RECONCILED.get(&["expired"]) - before;
+        let left = pending_count();
+        let forgotten = crate::actuation::app_session_for("r1961-old").is_none();
+        clear_for_test();
+        assert_eq!((expired, left, forgotten), (1, 0, true));
     }
 
     /// The gauge and the counter are on `/metrics`.

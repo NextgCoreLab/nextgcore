@@ -2834,6 +2834,8 @@ mod tests {
 
             assert_eq!(reconcile::reconcile_once().await, 0, "still refused");
             assert_eq!(reconcile::pending_count(), 1, "kept, not dropped");
+            // #1961: the PCF that refused is backing off; the next pass is after it.
+            tokio::time::sleep(reconcile::BACKOFF_BASE + Duration::from_millis(50)).await;
 
             assert_eq!(reconcile::reconcile_once().await, 1, "the PCF accepts");
             assert_eq!(pcf.deletes(), budget + 2);
