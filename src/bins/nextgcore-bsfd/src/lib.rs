@@ -459,7 +459,10 @@ async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("BSF SBI request: {method} {uri}");
+    log::debug!(
+        "BSF SBI request: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -564,7 +567,10 @@ async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown BSF request: {method} {uri}");
+            log::warn!(
+                "Unknown BSF request: {method} {uri}",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_method_not_allowed(method, uri)
         }
     }

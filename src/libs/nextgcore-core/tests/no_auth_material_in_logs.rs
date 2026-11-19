@@ -39,6 +39,11 @@ const MACROS: &[&str] = &[
     "eprintln!(",
     "print!(",
     "eprint!(",
+    // #1867 review: the level-parameterised and tracing forms, and a panic
+    // message, which reaches the same log.
+    "log!(",
+    "event!(",
+    "panic!(",
 ];
 
 /// Whether an identifier chain names authentication material.
@@ -884,8 +889,17 @@ fn is_callback_uri(ident: &str) -> bool {
     // #1867: a request's own URI (`request.header.uri`) IS a callback URI when
     // the request is a notification (`.../dereg-notify/{token}`), and the code
     // logging it rarely knows which, so it is judged like one.
-    if ident == "header.uri" || ident.ends_with(".header.uri") {
-        return true;
+    //
+    // Matched anywhere in the chain on a segment boundary (#1867 review), so a
+    // method chain (`request.header.uri.as_str()`) counts too. A projection that
+    // is not the URI's text (`.len()`, `.is_empty()`) does not.
+    let segments: Vec<&str> = ident.split('.').collect();
+    if let Some(at) = segments.windows(2).position(|w| w == ["header", "uri"]) {
+        let rest = &segments[at + 2..];
+        let projection = rest.first().is_some_and(|m| {
+            ["len", "is_empty", "starts_with", "ends_with", "contains"].contains(m)
+        });
+        return !projection;
     }
     let last = ident.rsplit('.').next().unwrap_or(ident);
     if !last.chars().any(|c| c.is_ascii_lowercase()) {
@@ -1084,14 +1098,18 @@ fn tainted_bindings(text: &str) -> Vec<(String, usize, usize)> {
                 .iter()
                 .any(|f| value.contains(&format!("{f}(")))
             // ucmfd: `nf:{id}` or `uri:{authority}`, never a path.
-            || value.contains("consumer_of(");
+            || value.contains("consumer_of(")
+            // The OAuth2 scope is the URI's service name (#1867), never a path.
+            || value.contains("derive_scope_from_uri(");
         if projection {
             continue;
         }
         // Any segment of a chain: `sub.notif_uri.clone()` reads one.
+        // The whole chain as well (#1867 review): `request.header.uri` names a
+        // callback only as a whole, never segment by segment.
         let from_ident = identifiers(value)
             .into_iter()
-            .any(|chain| chain.split('.').any(is_callback_uri));
+            .any(|chain| is_callback_uri(chain) || chain.split('.').any(is_callback_uri));
         let from_key = value.split('"').skip(1).step_by(2).any(is_callback_key);
         if from_ident || from_key {
             let scope_end = text[from..]
@@ -1228,6 +1246,8 @@ fn the_callback_uri_scan_sees_its_shapes() {
         // #1867: a request URI, which may be a callback's.
         "request.header.uri",
         "resend.header.uri",
+        "request.header.uri.as_str",
+        "req.header.uri.clone",
     ] {
         assert!(is_callback_uri(flagged), "{flagged}");
     }
@@ -1241,6 +1261,8 @@ fn the_callback_uri_scan_sees_its_shapes() {
         "custom_header::CALLBACK",
         "CALLBACK",
         "logged_uri",
+        "request.header.uri.len",
+        "request.header.method",
     ] {
         assert!(!is_callback_uri(fine), "{fine}");
     }
@@ -1279,6 +1301,22 @@ fn the_callback_uri_scan_sees_its_shapes() {
         vec!["uri"]
     );
     assert!(is_callback_key("smContextStatusUri") && is_callback_key("notificationDestination"));
+    // #1867 review: a local bound from the request URI is tainted, borrowed or
+    // cloned, and a method chain on it is judged like the URI.
+    let src = "fn e() {\n    let uri = &request.header.uri;\n    let path = request.header.uri.clone();\n    let n = request.header.uri.len();\n}\n";
+    let names: Vec<String> = tainted_bindings(src)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, vec!["uri", "path"]);
+    assert_eq!(
+        unredacted_callback_uris("\"planted {}\", request.header.uri.as_str()"),
+        vec!["request.header.uri.as_str"]
+    );
+    assert!(unredacted_callback_uris(
+        "\"ok {}\", redact_callback_tokens(request.header.uri.as_str())"
+    )
+    .is_empty());
     // #1047 review, eesd: a plain `uri` field in a notification struct is refused,
     // and a local copied from the renamed field is tracked.
     let src = "pub struct QueuedNotification {\n    pub uri: String,\n    pub kind: &'static str,\n}\npub struct QueuedOk {\n    pub callback_uri: String,\n}\n";

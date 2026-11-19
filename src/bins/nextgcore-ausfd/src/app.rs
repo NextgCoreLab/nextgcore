@@ -477,7 +477,10 @@ async fn ausf_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("AUSF SBI request: {method} {uri}");
+    log::debug!(
+        "AUSF SBI request: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -556,7 +559,10 @@ async fn ausf_sbi_route(request: SbiRequest) -> SbiResponse {
         // exists but rejects the method, which is false and misleads a consumer
         // into retrying with another verb.
         ("nausf-auth", "rg-authentications", _) | ("nausf-auth", "prose-authentications", _) => {
-            log::info!("AUSF: {method} {uri} is a declared but unimplemented Nausf resource");
+            log::info!(
+                "AUSF: {method} {uri} is a declared but unimplemented Nausf resource",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_problem(
                 501,
                 "NOT_IMPLEMENTED",
@@ -565,7 +571,10 @@ async fn ausf_sbi_route(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown AUSF request: {method} {uri}");
+            log::warn!(
+                "Unknown AUSF request: {method} {uri}",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_method_not_allowed(method, uri)
         }
     }

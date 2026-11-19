@@ -643,7 +643,10 @@ async fn udr_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("UDR SBI request: {method} {uri}");
+    log::debug!(
+        "UDR SBI request: {method} {uri}",
+        uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -684,7 +687,10 @@ async fn udr_sbi_route(request: SbiRequest) -> SbiResponse {
         "exposure-data" => handle_exposure_data(&parts, method, &request).await,
         "application-data" => handle_application_data(&parts, method, &request).await,
         _ => {
-            log::warn!("Unknown UDR resource: {method} {uri}");
+            log::warn!(
+                "Unknown UDR resource: {method} {uri}",
+                uri = nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_not_found(&format!("Unknown resource: {resource_type}"), None)
         }
     }
