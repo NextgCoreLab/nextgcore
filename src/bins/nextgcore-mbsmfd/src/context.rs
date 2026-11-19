@@ -537,6 +537,18 @@ pub struct TmgiPool {
     owners: HashMap<Tmgi, String>,
 }
 
+/// #1863 (R32 on #1943 M1): the first 24-bit TMGI service id of this process,
+/// random, so the TMGIs a previous process allocated (in memory only) are not
+/// handed out again from 000001 after a restart. A collision with a TMGI still
+/// held from before the restart needs the new run of allocations to reach the
+/// old run: with n held and m newly allocated, the odds are about
+/// (n + m) / 2^24 per restart (about 6e-6 for 50 each).
+fn boot_tmgi_seed() -> u32 {
+    let b = uuid::Uuid::new_v4();
+    let b = b.as_bytes();
+    (u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2])).max(1)
+}
+
 /// #1863: why a TMGI operation was refused; nothing was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmgiRefusal {
@@ -559,7 +571,7 @@ impl TmgiPool {
         ttl_secs: u64,
         now: u64,
     ) -> (Vec<Tmgi>, u64) {
-        self.allocate_owned(plmn, count, ttl_secs, now, None)
+        self.allocate_owned(plmn, count, ttl_secs, now, None, |_| false)
     }
 
     /// [`Self::allocate`] for `owner` (#1863). A TMGI still allocated (an
@@ -572,10 +584,17 @@ impl TmgiPool {
         ttl_secs: u64,
         now: u64,
         owner: Option<&str>,
+        in_use: impl Fn(&Tmgi) -> bool,
     ) -> (Vec<Tmgi>, u64) {
         let expiry = now.saturating_add(ttl_secs);
         let mut out = Vec::with_capacity(count as usize);
-        let next = self.next_id.entry(plmn.clone()).or_insert(1);
+        // #1863 (R32 on #1943 M1): the counter starts at a per-boot random
+        // point, not at 1, so a restart does not hand out the TMGIs the previous
+        // process allocated (which other consumers may still hold).
+        let next = self
+            .next_id
+            .entry(plmn.clone())
+            .or_insert_with(boot_tmgi_seed);
         let mut tries = 0u32;
         while out.len() < count as usize && tries < 1 << 24 {
             tries += 1;
@@ -585,7 +604,9 @@ impl TmgiPool {
                 mbs_service_id: [(id >> 16) as u8, (id >> 8) as u8, id as u8],
                 plmn_id: plmn.clone(),
             };
-            if self.allocated.contains_key(&tmgi) {
+            // Skip one still allocated, and one a live MBS session names
+            // (R32 on #1943: a session created on an unallocated TMGI).
+            if self.allocated.contains_key(&tmgi) || in_use(&tmgi) {
                 continue;
             }
             self.allocated.insert(tmgi.clone(), expiry);
@@ -644,6 +665,34 @@ impl TmgiPool {
                 self.allocated.remove(t).is_some()
             })
             .count())
+    }
+
+    /// #1863: allocate `tmgi` to `owner` when it is not allocated (a session
+    /// created on a TMGI this MB-SMF did not allocate, or one that expired), so
+    /// it is recorded as the creator's and no later Allocate hands it out. An
+    /// allocated one is left as it is, and `Err` when `may_use` refuses its
+    /// owner.
+    pub fn claim(
+        &mut self,
+        tmgi: &Tmgi,
+        owner: Option<&str>,
+        ttl_secs: u64,
+        now: u64,
+        may_use: impl Fn(Option<&str>) -> bool,
+    ) -> Result<(), TmgiRefusal> {
+        if self.allocated.contains_key(tmgi) {
+            return if may_use(self.owner_of(tmgi)) {
+                Ok(())
+            } else {
+                Err(TmgiRefusal::NotOwned(tmgi.clone()))
+            };
+        }
+        self.allocated
+            .insert(tmgi.clone(), now.saturating_add(ttl_secs));
+        if let Some(owner) = owner {
+            self.owners.insert(tmgi.clone(), owner.to_string());
+        }
+        Ok(())
     }
 
     /// The consumer `tmgi` is allocated to, if it was bound to one (#1863).
@@ -888,15 +937,37 @@ impl MbSmfContext {
         session_type: MbsSessionType,
         owner: Option<String>,
     ) -> Option<MbsSession> {
-        let mut session_list = self.session_list.write().ok()?;
-        let mut tmgi_hash = self.tmgi_hash.write().ok()?;
+        self.session_add_claiming(tmgi, session_type, owner, |_| true)
+            .ok()
+            .flatten()
+    }
+
+    /// [`Self::session_add_owned`], also claiming the TMGI for `owner` in the
+    /// pool (#1863, R32 on #1943) under the same locks as the add, so no
+    /// Allocate can hand it out between the check and the add: an unallocated
+    /// or expired TMGI becomes the creator's, and one allocated to a consumer
+    /// `may_use` refuses is `Err`, adding nothing. `Ok(None)` is the existing
+    /// refusals (cap, duplicate TMGI).
+    pub fn session_add_claiming(
+        &self,
+        tmgi: Tmgi,
+        session_type: MbsSessionType,
+        owner: Option<String>,
+        may_use: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Option<MbsSession>, TmgiRefusal> {
+        let Ok(mut session_list) = self.session_list.write() else {
+            return Ok(None);
+        };
+        let Ok(mut tmgi_hash) = self.tmgi_hash.write() else {
+            return Ok(None);
+        };
 
         if session_list.len() >= self.max_sessions {
             log::error!(
                 "Maximum number of MBS sessions [{}] reached",
                 self.max_sessions
             );
-            return None;
+            return Ok(None);
         }
 
         // #76: a duplicate TMGI used to overwrite `tmgi_hash` silently, so the
@@ -910,7 +981,13 @@ impl MbSmfContext {
                 "MBS session create refused: TMGI {tmgi:?} already identifies session {:?}",
                 tmgi_hash.get(&tmgi)
             );
-            return None;
+            return Ok(None);
+        }
+        {
+            let now = now_unix();
+            let mut pool = self.tmgi_pool.lock().expect("tmgi pool poisoned");
+            pool.purge_expired(now);
+            pool.claim(&tmgi, owner.as_deref(), TMGI_DEFAULT_TTL_SECS, now, may_use)?;
         }
 
         let id = self.next_session_id.fetch_add(1, Ordering::SeqCst) as u64;
@@ -926,7 +1003,7 @@ impl MbSmfContext {
             "MBS session added (id={id}, type={session_type:?}, teid={:#x})",
             session.gtp_teid
         );
-        Some(session)
+        Ok(Some(session))
     }
 
     /// Remove a session's LOCAL state.
@@ -1167,9 +1244,17 @@ impl MbSmfContext {
         owner: Option<&str>,
     ) -> (Vec<Tmgi>, u64) {
         let now = now_unix();
+        // The TMGIs live sessions name, read BEFORE the pool lock:
+        // `session_add_owned` takes `tmgi_hash` then the pool, so this order
+        // never inverts it.
+        let in_use: std::collections::HashSet<Tmgi> = self
+            .tmgi_hash
+            .read()
+            .map(|h| h.keys().cloned().collect())
+            .unwrap_or_default();
         let mut pool = self.tmgi_pool.lock().expect("tmgi pool poisoned");
         pool.purge_expired(now);
-        pool.allocate_owned(plmn, count, ttl_secs, now, owner)
+        pool.allocate_owned(plmn, count, ttl_secs, now, owner, |t| in_use.contains(t))
     }
 
     /// Refresh the supplied TMGIs' expiry (TS 29.532 §5.2.2.2). Returns the new
@@ -1952,8 +2037,8 @@ mod tests {
             "bbbbbbbb-1863-4000-8000-0000000000b2",
         );
         let is = |who: &'static str| move |o: Option<&str>| o == Some(who);
-        let (mine, _) = pool.allocate_owned(&plmn(), 2, 60, 0, Some(a));
-        let (theirs, _) = pool.allocate_owned(&plmn(), 1, 60, 0, Some(b));
+        let (mine, _) = pool.allocate_owned(&plmn(), 2, 60, 0, Some(a), |_| false);
+        let (theirs, _) = pool.allocate_owned(&plmn(), 1, 60, 0, Some(b), |_| false);
         assert_eq!(pool.owner_of(&mine[0]), Some(a));
         // B lists one of A's beside its own: refused, nothing freed.
         let mixed = vec![theirs[0].clone(), mine[0].clone()];
@@ -1981,12 +2066,100 @@ mod tests {
         assert_eq!(pool.deallocate(&[mine[0].clone(), unknown], is(a)), Ok(1));
         // A wrapped counter skips a TMGI still allocated.
         pool.next_id.insert(plmn(), service_id(&mine[1]));
-        let (fresh, _) = pool.allocate_owned(&plmn(), 1, 60, 0, Some(b));
+        let (fresh, _) = pool.allocate_owned(&plmn(), 1, 60, 0, Some(b), |_| false);
         assert_ne!(
             fresh[0], mine[1],
             "an allocated TMGI is never handed out twice"
         );
         assert_eq!(pool.owner_of(&mine[1]), Some(a));
+    }
+
+    /// #1863 (R32 on #1943 M1): a restarted pool does not start again at
+    /// 000001, so it does not hand another consumer the TMGIs the previous
+    /// process allocated. Seeds are random: two lifetimes collide with odds
+    /// about 2^-24 for one TMGI each.
+    /// REVERT-VERIFIED: with the counter seeded at 1 again both lifetimes
+    /// return 000001 and the first assertion fails.
+    #[test]
+    fn a_restarted_pool_does_not_reissue_the_previous_tmgis_1863() {
+        let (a, b) = (
+            "aaaaaaaa-1863-4000-8000-0000000000a1",
+            "bbbbbbbb-1863-4000-8000-0000000000b2",
+        );
+        let before = TmgiPool::new()
+            .allocate_owned(&plmn(), 1, 60, 0, Some(a), |_| false)
+            .0;
+        let after = TmgiPool::new()
+            .allocate_owned(&plmn(), 1, 60, 0, Some(b), |_| false)
+            .0;
+        assert_ne!(before, after, "a restart re-issued a live TMGI");
+        assert_ne!(before[0].mbs_service_id, [0, 0, 1]);
+    }
+
+    /// #1863 (R32 on #1943): a session created on a TMGI this MB-SMF never
+    /// allocated (or one that expired) claims it for its creator, so a later
+    /// Allocate cannot hand it out; and Allocate skips a TMGI a live session
+    /// names even when the pool no longer holds it.
+    /// REVERT-VERIFIED: with `claim` not inserting, the pool owner assertion
+    /// fails; with the `in_use` skip removed, the wrapped allocation returns
+    /// the session's TMGI.
+    #[test]
+    fn a_session_claims_its_tmgi_and_allocate_skips_live_sessions_1863() {
+        let a = "aaaaaaaa-1863-4000-8000-0000000000a1";
+        let mut ctx = MbSmfContext::new();
+        ctx.init(8);
+        let tmgi = Tmgi {
+            mbs_service_id: [0x12, 0x34, 0x56],
+            plmn_id: plmn(),
+        };
+        ctx.session_add_claiming(
+            tmgi.clone(),
+            MbsSessionType::Broadcast,
+            Some(a.into()),
+            |_| true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ctx.tmgi_allocation(&tmgi), Some(Some(a.to_string())));
+        // Another consumer cannot open a session on it either.
+        let other = Tmgi {
+            mbs_service_id: [0x12, 0x34, 0x57],
+            plmn_id: plmn(),
+        };
+        ctx.session_add_claiming(
+            other.clone(),
+            MbsSessionType::Broadcast,
+            Some(a.into()),
+            |_| true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ctx
+            .session_add_claiming(
+                Tmgi {
+                    mbs_service_id: [0x12, 0x34, 0x56],
+                    plmn_id: plmn()
+                },
+                MbsSessionType::Broadcast,
+                Some("b".into()),
+                |o| o == Some("b"),
+            )
+            .map(|s| s.is_none())
+            .unwrap_or(true));
+        // The pool forgets the TMGI (expired), but the session still names it.
+        ctx.tmgi_pool
+            .lock()
+            .unwrap()
+            .deallocate(std::slice::from_ref(&tmgi), |_| true)
+            .unwrap();
+        ctx.tmgi_pool
+            .lock()
+            .unwrap()
+            .next_id
+            .insert(plmn(), service_id(&tmgi));
+        let (fresh, _) = ctx.tmgi_allocate_owned(&plmn(), 1, 60, Some("b"));
+        assert_ne!(fresh[0], tmgi, "a live session's TMGI is never allocated");
+        assert_ne!(fresh[0], other);
     }
 
     fn service_id(t: &Tmgi) -> u32 {

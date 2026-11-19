@@ -715,10 +715,19 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    let session = if let Ok(context) = ctx.read() {
-        context.session_add_owned(tmgi, session_type, owner)
-    } else {
-        None
+    let session = match ctx.read() {
+        // #1863 (R32 on #1943): the TMGI is claimed for this consumer under the
+        // same locks as the add; one allocated to another consumer in the
+        // meantime is refused here too.
+        Ok(context) => match context.session_add_claiming(tmgi.clone(), session_type, owner, |o| {
+            may_manage(o, request)
+        }) {
+            Ok(session) => session,
+            Err(context::TmgiRefusal::NotOwned(t)) => {
+                return tmgi_not_owned("MBS Session Create", &t);
+            }
+        },
+        Err(_) => None,
     };
 
     match session {
