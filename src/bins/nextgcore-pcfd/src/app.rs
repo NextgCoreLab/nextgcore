@@ -5449,7 +5449,16 @@ struct BindingKeys<'a> {
 ///   reported domain, so an SMF that never sends `ipDomain` is not refused.
 ///
 /// `Err` names why nothing can match (a SUPI with no SM association here).
-fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
+///
+/// #2016 (R31): only sessions `visible` admits are candidates, and they are
+/// filtered BEFORE the `ipDomain` narrowing, which looks at the candidates as
+/// a set: narrowed over every tenant's sessions, another tenant's session in
+/// the asked domain would flip the caller's own (domain-less) match away, an
+/// oracle for other tenants' domains.
+fn binding_candidates(
+    keys: &BindingKeys,
+    visible: impl Fn(&PcfSess) -> bool,
+) -> Result<Vec<PcfSess>, String> {
     let ctx = pcf_self();
     let Ok(context) = ctx.read() else {
         return Err("the PCF context is unavailable".to_string());
@@ -5457,7 +5466,7 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
     let ue_sm_id = match keys.supi {
         Some(supi) => match context.ue_sm_find_by_supi(supi) {
             Some(ue_sm) => Some(ue_sm.id),
-            None => return Err(format!("no SM policy association for supi {supi}")),
+            None => return Err(format!("{NO_SM_ASSOCIATION_FOR_SUPI} {supi}")),
         },
         None => None,
     };
@@ -5480,6 +5489,14 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
             })
     });
     drop(context);
+    let found = candidates.len();
+    candidates.retain(|sess| visible(sess));
+    if candidates.len() < found {
+        log::debug!(
+            "PDU session binding: {} of {found} matching session(s) not the caller's",
+            found - candidates.len()
+        );
+    }
     if let (BindingAddress::V4(_), Some(domain)) = (keys.address, keys.ip_domain) {
         if candidates
             .iter()
@@ -5493,9 +5510,28 @@ fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
     Ok(candidates)
 }
 
+/// #1583: why [`binding_candidates`] found nothing for a SUPI it does not know.
+const NO_SM_ASSOCIATION_FOR_SUPI: &str = "no SM policy association for supi";
+
 /// #1583: exactly one session for `keys`, else why not (none, or several).
 fn bind_one_session(keys: &BindingKeys) -> Result<PcfSess, String> {
-    let mut candidates = binding_candidates(keys)?;
+    bind_one_visible_session(keys, |_| true)
+}
+
+/// #2016: exactly one session for `keys` among those `visible` admits, else
+/// why not. A session `visible` rejects is treated as absent, and so is an
+/// unknown SUPI's: the answer (and the detail sent back) for a session the
+/// caller may not see is the one for no session at all, so a caller cannot
+/// probe which sessions exist. Several visible sessions remain an ambiguity.
+fn bind_one_visible_session(
+    keys: &BindingKeys,
+    visible: impl Fn(&PcfSess) -> bool,
+) -> Result<PcfSess, String> {
+    let mut candidates = match binding_candidates(keys, visible) {
+        Ok(found) => found,
+        Err(why) if why.starts_with(NO_SM_ASSOCIATION_FOR_SUPI) => Vec::new(),
+        Err(why) => return Err(why),
+    };
     let asked = format!(
         "address={:?} ipDomain={:?} sliceInfo={:?} supi={:?} dnn={:?}",
         keys.address, keys.ip_domain, keys.slice, keys.supi, keys.dnn
@@ -5519,8 +5555,14 @@ fn bind_one_session(keys: &BindingKeys) -> Result<PcfSess, String> {
 ///
 /// No session, or more than one, is a failure to identify it: `Err` holds the
 /// `500 PDU_SESSION_NOT_AVAILABLE`, or a `400` for a request that names nothing.
+///
+/// #2016: only sessions `may_restore` admits (the caller's, see
+/// [`refuse_pcscf_restoration_caller`]) are identified, so a session the
+/// caller may not restore is answered exactly as no session is: the same
+/// `500 PDU_SESSION_NOT_AVAILABLE`, with the same detail.
 fn identify_pcscf_restoration_session(
     body: &serde_json::Value,
+    may_restore: impl Fn(&PcfSess) -> bool,
 ) -> Result<PcfSess, Box<SbiResponse>> {
     let text = |key: &str| {
         body.get(key)
@@ -5569,13 +5611,16 @@ fn identify_pcscf_restoration_session(
             )))
         }
     };
-    bind_one_session(&BindingKeys {
-        address,
-        ip_domain,
-        slice,
-        supi,
-        dnn,
-    })
+    bind_one_visible_session(
+        &BindingKeys {
+            address,
+            ip_domain,
+            slice,
+            supi,
+            dnn,
+        },
+        may_restore,
+    )
     .map_err(|why| Box::new(pcscf_restoration_session_not_available(&why)))
 }
 
@@ -5630,16 +5675,23 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         Ok(v) => v,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
-    let sess = match identify_pcscf_restoration_session(&body) {
+    // A certificate and a token naming different NFs prove no identity at all;
+    // that is known without looking any session up, so it can be said (403).
+    if let Err(why) = nextgcore_sbi::owner_binding::verified_consumer_id(request) {
+        log::debug!("P-CSCF Restoration refused: {why}");
+        return nextgcore_sbi::server::send_forbidden(&why, None);
+    }
+    // #1991: only the SMF that owns the SM policy, or an AF/NEF that owns an app
+    // session on this PDU session, may restore it (TS 29.514 §4.2.2.27, TS
+    // 29.512 §4.2.3.18), refused before any notify is sent. #2016: by
+    // identifying only such sessions, so another caller's session answers as no
+    // session does (500 PDU_SESSION_NOT_AVAILABLE), never a revealing 403.
+    let sess = match identify_pcscf_restoration_session(&body, |sess| {
+        refuse_pcscf_restoration_caller(sess, request).is_none()
+    }) {
         Ok(sess) => sess,
         Err(resp) => return *resp,
     };
-    // #1991: only the SMF that owns the SM policy, or an AF/NEF that owns an app
-    // session on this PDU session, may restore it (TS 29.514 §4.2.2.27, TS
-    // 29.512 §4.2.3.18), refused before any notify is sent.
-    if let Some(refused) = refuse_pcscf_restoration_caller(&sess, request) {
-        return refused;
-    }
     let address = format!(
         "ipv4={:?} ipv6={:?} dnn={:?}",
         sess.ipv4addr_string, sess.ipv6prefix_string, sess.dnn
@@ -12084,7 +12136,7 @@ mod tests {
     /// #1527: what `handle_pcscf_restoration` identifies for `body`: `Ok(smPolicyId)`,
     /// or `Err((status, cause))`.
     fn pcscf_identify_1527(body: serde_json::Value) -> Result<String, (u16, String)> {
-        identify_pcscf_restoration_session(&body)
+        identify_pcscf_restoration_session(&body, |_| true)
             .map(|sess| sess.sm_policy_id)
             .map_err(|resp| {
                 let cause = resp
@@ -14609,11 +14661,14 @@ mod tests {
 
     /// #1991: P-CSCF restoration is asked only by the SMF that owns the SM
     /// policy or an AF/NEF that owns an app session on the PDU session; a
-    /// foreign NF, a mismatched certificate/token pair or an anonymous caller
-    /// gets 403 and no notify reaches the SMF.
-    /// REVERT-VERIFIED: with the `refuse_pcscf_restoration_caller` call removed,
-    /// the foreign caller answers 204 and a notify is sent; with the app-owner
-    /// arm dropped, the AF's restoration is refused 403.
+    /// foreign NF or an anonymous caller is answered as for no session (#2016:
+    /// 500 PDU_SESSION_NOT_AVAILABLE, byte for byte the unknown-IP answer), a
+    /// mismatched certificate/token pair 403, and no notify reaches the SMF.
+    /// REVERT-VERIFIED: with the visibility filter (`refuse_pcscf_restoration_caller`
+    /// in `identify_pcscf_restoration_session`) removed, the foreign caller
+    /// answers 204 and a notify is sent; with the app-owner arm dropped, the
+    /// AF's restoration is refused. #2016: with the 403 path back after
+    /// identification, the foreign answer differs from the unknown-IP one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn pcscf_restoration_is_asked_by_the_sessions_smf_or_af_only_1991() {
@@ -14660,15 +14715,42 @@ mod tests {
                 token,
             )
         };
+        // #2016: what no session at all gets, for the same request shape.
+        let unknown = pcf_sbi_request_handler(as_nf(
+            make_request(
+                "POST",
+                "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                Some(serde_json::json!({ "ueIpv4": "10.45.19.92" })),
+            ),
+            None,
+            Some(OTHER),
+        ))
+        .await;
+        assert_eq!(unknown.status, 500);
+        // The body with the asked address left out (it differs by request).
+        let without_ip = |resp: &SbiResponse| {
+            let body = resp.http.content.as_deref().unwrap_or_default();
+            match (body.find("address="), body.find(" ipDomain=")) {
+                (Some(a), Some(b)) if a < b => format!("{}{}", &body[..a], &body[b..]),
+                _ => body.to_string(),
+            }
+        };
         for (who, cert, token) in [
             ("foreign token", None, Some(OTHER)),
             ("foreign certificate", Some(OTHER), None),
-            ("mismatched pair", Some(SMF), Some(OTHER)),
             ("anonymous", None, None),
         ] {
             let resp = pcf_sbi_request_handler(restore(cert, token)).await;
-            assert_eq!(resp.status, 403, "{who}: {:?}", resp.http.content);
+            assert_eq!(
+                (resp.status, without_ip(&resp)),
+                (500, without_ip(&unknown)),
+                "{who}: answered exactly as an unknown UE IP is"
+            );
         }
+        // A certificate/token pair that disagree proves no identity: said up
+        // front, whatever the session.
+        let resp = pcf_sbi_request_handler(restore(Some(SMF), Some(OTHER))).await;
+        assert_eq!(resp.status, 403, "mismatched pair: {:?}", resp.http.content);
         assert!(
             drain_notifications(&peers, 1).await.is_empty(),
             "a refused restoration sends nothing"
@@ -14703,6 +14785,158 @@ mod tests {
                 .await
                 .status,
             204
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #2016: identification is among the caller's own sessions. A private
+    /// IPv4 shared by two SMFs' sessions resolves to the asking SMF's (it was
+    /// an ambiguity 500, or a 403 that confirmed the other one existed), and
+    /// two sessions of the SAME caller on that address remain the real
+    /// ambiguity: 500 PDU_SESSION_NOT_AVAILABLE naming two sessions.
+    ///
+    /// REVERT-VERIFIED: with identification over every session again
+    /// (`|_| true` in `handle_pcscf_restoration`), SMF A's request is a 500
+    /// for two matching sessions and the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_identifies_among_the_callers_sessions_2016() {
+        const SMF_A: &str = "aaaaaaaa-2016-4000-8000-0000000000a1";
+        const SMF_B: &str = "bbbbbbbb-2016-4000-8000-0000000000b2";
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ipv4 = "10.45.20.16";
+        let as_smf = |mut r: SbiRequest, smf: &str| {
+            r.oauth2_subject = Some(smf.to_string());
+            r
+        };
+        let create = |supi: &str, psi: u8| {
+            let mut body = full_create_body(supi, psi);
+            let obj = body.as_object_mut().unwrap();
+            obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+            obj.insert(
+                "notificationUri".to_string(),
+                serde_json::json!(format!(
+                    "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                    peers.smf_port
+                )),
+            );
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+        };
+        for (supi, psi, smf) in [
+            ("imsi-001010000002016", 1, SMF_A),
+            ("imsi-001010000002017", 2, SMF_B),
+        ] {
+            let resp = pcf_sbi_request_handler(as_smf(create(supi, psi), smf)).await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        }
+        let restore = |smf: &str| {
+            as_smf(
+                make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4 })),
+                ),
+                smf,
+            )
+        };
+        let resp = pcf_sbi_request_handler(restore(SMF_A)).await;
+        assert_eq!(
+            resp.status, 204,
+            "SMF A's own session: {:?}",
+            resp.http.content
+        );
+        assert_eq!(await_notifications(&peers, 1).await.len(), 1);
+
+        // A second session of SMF A's on the same address: now it is ambiguous.
+        let resp = pcf_sbi_request_handler(as_smf(create("imsi-001010000002018", 3), SMF_A)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let resp = pcf_sbi_request_handler(restore(SMF_A)).await;
+        assert_eq!(resp.status, 500);
+        assert!(
+            resp.http
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("2 PDU sessions match")
+                    && c.contains("PDU_SESSION_NOT_AVAILABLE")),
+            "{:?}",
+            resp.http.content
+        );
+        // SMF B still has exactly one there.
+        assert_eq!(pcf_sbi_request_handler(restore(SMF_B)).await.status, 204);
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #2016 (R31 M): the `ipDomain` narrowing runs over the caller's sessions
+    /// only. SMF A restores its domain-less session with `ipDomain=dom-secret`
+    /// (the fallback to the session with no reported domain); SMF B then holds
+    /// a session on the same IPv4 IN dom-secret. A's answer must not change:
+    /// narrowed over every tenant, B's session would flip it to 500, telling A
+    /// that someone has a session in that domain.
+    ///
+    /// REVERT-VERIFIED: with the visibility filter after the narrowing again,
+    /// A's second restoration is a 500 and the assertion on it fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn another_tenants_ip_domain_does_not_change_the_answer_2016() {
+        const SMF_A: &str = "aaaaaaaa-2016-4000-8000-0000000000d1";
+        const SMF_B: &str = "bbbbbbbb-2016-4000-8000-0000000000d2";
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ipv4 = "10.45.20.26";
+        let as_smf = |mut r: SbiRequest, smf: &str| {
+            r.oauth2_subject = Some(smf.to_string());
+            r
+        };
+        let create = |supi: &str, psi: u8, domain: Option<&str>| {
+            let mut body = full_create_body(supi, psi);
+            let obj = body.as_object_mut().unwrap();
+            obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+            if let Some(d) = domain {
+                obj.insert("ipDomain".to_string(), serde_json::json!(d));
+            }
+            obj.insert(
+                "notificationUri".to_string(),
+                serde_json::json!(format!(
+                    "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                    peers.smf_port
+                )),
+            );
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+        };
+        let restore = || {
+            as_smf(
+                make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4, "ipDomain": "dom-secret" })),
+                ),
+                SMF_A,
+            )
+        };
+        let resp =
+            pcf_sbi_request_handler(as_smf(create("imsi-001010000002026", 1, None), SMF_A)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(pcf_sbi_request_handler(restore()).await.status, 204);
+        let resp = pcf_sbi_request_handler(as_smf(
+            create("imsi-001010000002027", 2, Some("dom-secret")),
+            SMF_B,
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let resp = pcf_sbi_request_handler(restore()).await;
+        assert_eq!(
+            resp.status, 204,
+            "another SMF's session in the asked domain changes nothing: {:?}",
+            resp.http.content
         );
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
