@@ -3469,6 +3469,192 @@ pub fn build_ue_context_release_command_ids_asn1(
     }
 }
 
+/// Build a UE CONTEXT MODIFICATION REQUEST (AMF -> NG-RAN, TS 38.413 §9.2.2.7)
+/// carrying a new UE Aggregate Maximum Bit Rate (§9.3.1.58), with the generated
+/// codec (#1776).
+///
+/// `ue_ambr` is `(downlink, uplink)` in bit/s. The IEs and criticalities are as
+/// §9.2.2.7 lists them: AMF UE NGAP ID and RAN UE NGAP ID reject, UE Aggregate
+/// Maximum Bit Rate ignore; the procedure is reject. On receipt the NG-RAN node
+/// replaces the UE-AMBR it holds and applies it to every non-GBR QoS flow of the
+/// UE (§8.3.4.2). `None` for a rate past the BitRate root (§9.3.1.4), which the
+/// Initial Context Setup builder refuses too.
+pub fn build_ue_context_modification_request_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    ue_ambr: (u64, u64),
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        ProtocolIE_ID, UEContextModificationRequest, UEContextModificationRequestProtocolIEs,
+        UEContextModificationRequestProtocolIEs_Entry as Entry,
+        UEContextModificationRequestProtocolIEs_EntryValue as Ie, NGAP_PDU,
+    };
+
+    let (dl, ul) = ue_ambr;
+    if dl > MAX_BIT_RATE || ul > MAX_BIT_RATE {
+        log::error!(
+            "Failed to encode UEContextModificationRequest: UE AMBR {dl}/{ul} past {MAX_BIT_RATE}"
+        );
+        return None;
+    }
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let entry = |id: u16, criticality: &ngap_gen::Criticality, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: criticality.clone(),
+        value,
+    };
+    let ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            &reject,
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            &reject,
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
+            &ignore,
+            Ie::Id_UEAggregateMaximumBitRate(ngap_gen::UEAggregateMaximumBitRate {
+                ue_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(dl),
+                ue_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(ul),
+                ie_extensions: None,
+            }),
+        ),
+    ];
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_UE_CONTEXT_MODIFICATION),
+        criticality: reject.clone(),
+        value: ngap_gen::InitiatingMessageValue::Id_UEContextModification(
+            UEContextModificationRequest {
+                protocol_i_es: UEContextModificationRequestProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode UEContextModificationRequest: {e:?}");
+            None
+        }
+    }
+}
+
+/// The NG-RAN node's answer to a UE CONTEXT MODIFICATION REQUEST (#1776).
+#[derive(Debug, Clone, PartialEq)]
+pub enum UeContextModificationOutcomeDecode {
+    /// A UE CONTEXT MODIFICATION RESPONSE (§9.2.2.8, `cause: None`) or FAILURE
+    /// (§9.2.2.9, `cause` its Cause as `(group, value)`).
+    Decoded {
+        /// The AMF UE NGAP ID it names.
+        amf_ue_ngap_id: Option<u64>,
+        /// The RAN UE NGAP ID it names.
+        ran_ue_ngap_id: Option<u32>,
+        /// `None` for the Response; the Failure's Cause.
+        cause: Option<(u8, i64)>,
+        /// The Error Indication reporting not-comprehended IEs marked "ignore IE
+        /// and notify sender", if any (§10.3.4.2).
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// A not-comprehended IE was marked "reject": the procedure is unsuccessfully
+    /// terminated and handled locally (§10.3.4.2).
+    Failed(Vec<IeDiagnostic>),
+    /// Not decodable, or neither a Response nor a Failure of this procedure.
+    Undecodable,
+}
+
+/// Decode a UE CONTEXT MODIFICATION RESPONSE or FAILURE (NG-RAN -> AMF, TS 38.413
+/// §9.2.2.8 / §9.2.2.9) with the generated codec, applying §10.3.4.2 for a
+/// response message (#1776).
+pub fn decode_ue_context_modification_outcome_asn1(
+    data: &[u8],
+) -> UeContextModificationOutcomeDecode {
+    use ngap_gen::{
+        SuccessfulOutcomeValue, UEContextModificationFailureProtocolIEs_EntryValue as FailIe,
+        UEContextModificationResponseProtocolIEs_EntryValue as RspIe, UnsuccessfulOutcomeValue,
+    };
+    use UeContextModificationOutcomeDecode::{Decoded, Failed, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode a UE Context Modification outcome: {e:?}");
+            return Undecodable;
+        }
+    };
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut cause = None;
+    let (criticality, triggering_message) = match pdu {
+        ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+            criticality,
+            value: SuccessfulOutcomeValue::Id_UEContextModification(response),
+            ..
+        }) => {
+            for entry in response.protocol_i_es.0 {
+                match entry.value {
+                    RspIe::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+                    RspIe::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+                    // Comprehended, and not used here.
+                    RspIe::Id_RRCState(_)
+                    | RspIe::Id_UserLocationInformation(_)
+                    | RspIe::Id_CriticalityDiagnostics(_) => {}
+                }
+            }
+            (criticality, ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME)
+        }
+        ngap_gen::NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+            criticality,
+            value: UnsuccessfulOutcomeValue::Id_UEContextModification(failure),
+            ..
+        }) => {
+            for entry in failure.protocol_i_es.0 {
+                match entry.value {
+                    FailIe::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+                    FailIe::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+                    FailIe::Id_Cause(c) => cause = cause_pair(&c),
+                    FailIe::Id_CriticalityDiagnostics(_) => {}
+                }
+            }
+            (
+                criticality,
+                ngap_gen::TriggeringMessage::UNSUCCESSFUL_OUTCOME,
+            )
+        }
+        _ => {
+            log::warn!("Expected a UEContextModificationResponse or Failure");
+            return Undecodable;
+        }
+    };
+    let Some((reject, notify)) = classify_unknown_ies(&unknown, "UE Context Modification outcome")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+    let error_indication = (!notify.is_empty()).then_some(CriticalityErrorIndication {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+        procedure: ReportedProcedure {
+            procedure_code: ngap_gen::ID_UE_CONTEXT_MODIFICATION,
+            triggering_message,
+            procedure_criticality: criticality.0,
+        },
+        diagnostics: notify,
+    });
+    Decoded {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause,
+        error_indication,
+    }
+}
+
 /// The procedure a criticality report is about, as an Error Indication's
 /// Criticality Diagnostics names it (TS 38.413 §9.3.1.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

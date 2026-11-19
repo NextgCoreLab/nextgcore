@@ -338,6 +338,31 @@ fn outbound_oauth2_client(
     )
 }
 
+/// The OAuth2 posture of the UDR's listener when `require_oauth2` is on: every
+/// request needs a valid NRF-issued bearer whose `aud` names the UDR and whose
+/// scope covers what it invokes. The verification keys are the caller's to set.
+fn udr_oauth2_listener(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    let mut config = config;
+    config.require_oauth2 = true;
+    // Issue #64 gap 3: assert the token's `aud` names the UDR.
+    //
+    // Without this `oauth2_expected_audience` stays None, the server calls
+    // `authorize_bearer_aud(.., None)` and the audience check is SKIPPED -- so a
+    // token the NRF minted for any other producer was accepted here, on the NF
+    // that holds subscriber data. TS 33.501 13.4.1.2 requires the producer to
+    // verify it is the intended audience. Every other OAuth2-enforcing NF
+    // already did this; the UDR was the one that did not.
+    //
+    // #1811: and the AuthenticationSubscription resource (K, OPc, SQN) needs its
+    // TS 29.505 resource scope as well as `nudr-dr`, which the NRF grants only to
+    // a UDM (UDR_RESOURCE_SCOPES). The server refuses a token without it, 403
+    // insufficient_scope, before the router runs, so a refused request reads
+    // nothing.
+    config
+        .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr)
+        .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -507,20 +532,10 @@ async fn main() -> Result<()> {
     if require_oauth2 {
         // Verify bearer tokens against the NRF's published keys (auth stage
         // 4b). With no NRF URI configured the server fails closed.
-        sbi_server_config.require_oauth2 = true;
+        sbi_server_config = udr_oauth2_listener(sbi_server_config);
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
-        // Issue #64 gap 3: assert the token's `aud` names the UDR.
-        //
-        // Without this `oauth2_expected_audience` stays None, the server calls
-        // `authorize_bearer_aud(.., None)` and the audience check is SKIPPED -- so a
-        // token the NRF minted for any other producer was accepted here, on the NF
-        // that holds subscriber data. TS 33.501 13.4.1.2 requires the producer to
-        // verify it is the intended audience. Every other OAuth2-enforcing NF
-        // already did this; the UDR was the one that did not.
-        sbi_server_config =
-            sbi_server_config.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr);
         log::info!(
             "OAuth2 enforcement enabled (JWKS: {})",
             sbi_server_config
@@ -3158,18 +3173,18 @@ async fn handle_subscription_data_subs(
         },
         // Document: /subscription-data/subs-to-notify/{subsId}
         Some(subs_id) => match method {
-            "GET" => match ds.sub_get(subs_id) {
-                Some(sub) if sub.kind == SubKind::SubscriptionData => SbiResponse::with_status(200)
+            "GET" => match live_subscription_data_sub(subs_id) {
+                Some(sub) => SbiResponse::with_status(200)
                     .with_body(sub.body.to_string(), "application/json"),
-                _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+                None => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
             },
             "PATCH" => {
-                let Some(sub) = ds.sub_get(subs_id) else {
+                // #1836: an expired subscription is gone (TS 29.504 §5.2.2.6.2:
+                // "after which the subscription becomes invalid"), so the UDM's
+                // refresh learns it must subscribe again.
+                let Some(sub) = live_subscription_data_sub(subs_id) else {
                     return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
                 };
-                if sub.kind != SubKind::SubscriptionData {
-                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
-                }
                 let patch_body = match parse_json_body(request) {
                     Ok(v) => v,
                     Err(resp) => return *resp,
@@ -3180,6 +3195,7 @@ async fn handle_subscription_data_subs(
                         Some("INVALID_MSG_FORMAT"),
                     );
                 };
+                // Every item is checked before any is applied (#1836).
                 let mut body = sub.body;
                 for patch in items {
                     let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or("");
@@ -3191,7 +3207,16 @@ async fn handle_subscription_data_subs(
                             Some("INVALID_MSG_FORMAT"),
                         );
                     }
-                    if let (Some(obj), Some(value)) = (body.as_object_mut(), patch.get("value")) {
+                    let Some(value) = patch.get("value") else {
+                        return send_bad_request(
+                            &format!("{op} {path} without a value"),
+                            Some("INVALID_MSG_FORMAT"),
+                        );
+                    };
+                    if let Err(resp) = check_subscription_data_member(key, value) {
+                        return *resp;
+                    }
+                    if let Some(obj) = body.as_object_mut() {
                         obj.insert(key.to_string(), value.clone());
                     }
                 }
@@ -3211,6 +3236,59 @@ async fn handle_subscription_data_subs(
             }
             _ => send_method_not_allowed(method, "subscription-data/subs-to-notify/{subsId}"),
         },
+    }
+}
+
+/// Subscription-data subscription `id`, unless it is not one or has expired
+/// (TS 29.504 §5.2.2.6.2). An expired one is removed on the way (#1836).
+fn live_subscription_data_sub(id: &str) -> Option<data_store::StoredSub> {
+    let ds = data_store::store();
+    let sub = ds
+        .sub_get(id)
+        .filter(|s| s.kind == SubKind::SubscriptionData)?;
+    if data_store::sub_expired(&sub, nextgcore_sbi::datetime::now_epoch_secs() as i64) {
+        log::info!("subscription-data subscription {id} expired: removed");
+        ds.sub_remove(id);
+        return None;
+    }
+    Some(sub)
+}
+
+/// Whether a PATCH may set member `key` of a `SubscriptionDataSubscriptions`
+/// (TS 29.505) to `value` (#1836): an `expiry` must be a future DateTime, as at the
+/// subscribe; `callbackReference` a string; `monitoredResourceUris` a non-empty
+/// array of strings (mandatory members, so not unset by a PATCH either).
+fn check_subscription_data_member(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), Box<SbiResponse>> {
+    let bad = |what: &str, cause: &str| Err(Box::new(send_bad_request(what, Some(cause))));
+    match key {
+        "expiry" => match value
+            .as_str()
+            .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
+        {
+            None => bad("expiry is not a DateTime (RFC 3339)", "INVALID_MSG_FORMAT"),
+            Some(at) if at <= nextgcore_sbi::datetime::now_epoch_secs() as i64 => {
+                bad("expiry has passed already", "MANDATORY_IE_INCORRECT")
+            }
+            Some(_) => Ok(()),
+        },
+        "callbackReference" if !value.is_string() => {
+            bad("callbackReference is not a URI", "MANDATORY_IE_INCORRECT")
+        }
+        "monitoredResourceUris"
+            if !value
+                .as_array()
+                .is_some_and(|a| !a.is_empty() && a.iter().all(serde_json::Value::is_string)) =>
+        {
+            bad(
+                "monitoredResourceUris is not a non-empty array of URIs",
+                "MANDATORY_IE_INCORRECT",
+            )
+        }
+        "subscriptionId" => bad("subscriptionId is not modifiable", "MANDATORY_IE_INCORRECT"),
+        _ => Ok(()),
     }
 }
 
@@ -4564,6 +4642,56 @@ const UDR_SERVICES: &[(&str, &str, &[&str])] = &[
     ("nudr-group-id-map", "v1", &["UDM", "AUSF", "NRF", "SCP"]),
 ];
 
+/// #1811: the resource/operation-level scopes of a UDR service, and the ONE NF
+/// type each is registered for in `allowedOperationsPerNfType` (TS 29.510
+/// Table 6.1.6.2.3-1 NOTE 11), so the NRF grants it to that type only.
+///
+/// The AuthenticationSubscription resource holds K, OPc/TOPc and SQN. TS 33.501
+/// §6.1.1 keeps the long-term key in the ARPF, which TS 23.501 §6.2.7 co-locates
+/// with the UDM: the UDM is its only legitimate reader (Nudm_UEAU) and writer
+/// (the SQN PATCH after a resynchronisation, TS 33.102 Annex C.3). Spellings are
+/// TS 29.505's (`nextgcore_sbi::resource_scope`).
+const UDR_RESOURCE_SCOPES: &[(&str, &str, &str)] = &[
+    (
+        "nudr-dr",
+        nextgcore_sbi::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_READ,
+        "UDM",
+    ),
+    (
+        "nudr-dr",
+        nextgcore_sbi::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_MODIFY,
+        "UDM",
+    ),
+];
+
+/// The `allowedOperationsPerNfType` of UDR service `name`, or `None` when the
+/// service has no resource-level scope (#1811).
+///
+/// NOTE 11: once the map is present it must name EVERY NF type allowed the
+/// service, with all its scopes, the service-level one included -- a type left
+/// out is barred from the whole service. So each of `allowed` gets the
+/// service-level scope, and only the type [`UDR_RESOURCE_SCOPES`] names gets a
+/// resource scope.
+fn udr_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::Value> {
+    if !UDR_RESOURCE_SCOPES.iter().any(|(svc, _, _)| *svc == name) {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = allowed
+        .iter()
+        .map(|nf_type| {
+            let mut scopes = vec![name.to_string()];
+            scopes.extend(
+                UDR_RESOURCE_SCOPES
+                    .iter()
+                    .filter(|(svc, _, t)| *svc == name && t == nf_type)
+                    .map(|(_, scope, _)| scope.to_string()),
+            );
+            (nf_type.to_string(), serde_json::json!(scopes))
+        })
+        .collect();
+    Some(serde_json::Value::Object(map))
+}
+
 /// Build the UDR's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
 ///
 /// Split out of `register_with_nrf` so the advertised service list and API
@@ -4581,7 +4709,7 @@ fn build_udr_nf_profile(
     let services: Vec<serde_json::Value> = UDR_SERVICES
         .iter()
         .map(|(name, version, allowed)| {
-            serde_json::json!({
+            let mut service = serde_json::json!({
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 // apiFullVersion must agree with the URI version, not lag it.
@@ -4593,7 +4721,11 @@ fn build_udr_nf_profile(
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
-            })
+            });
+            if let Some(ops) = udr_allowed_operations(name, allowed) {
+                service["allowedOperationsPerNfType"] = ops;
+            }
+            service
         })
         .collect();
 
@@ -4700,6 +4832,190 @@ mod tests {
         assert_eq!(pct_decode("%+1"), "%+1");
         assert_eq!(pct_decode("imsi%2D001010000000001"), "imsi-001010000000001");
         assert_eq!(pct_decode("x%41"), "xA");
+    }
+
+    /// #1811: the registered nudr-dr service names, in
+    /// `allowedOperationsPerNfType`, every NF type `allowedNfTypes` admits with
+    /// the service-level scope (TS 29.510 Table 6.1.6.2.3-1 NOTE 11: a type left
+    /// out would be barred from the whole service), and grants the
+    /// AuthenticationSubscription scopes to the UDM alone.
+    #[test]
+    fn the_profile_grants_the_auth_subscription_scopes_to_the_udm_only_1811() {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_AUTH_SUBSCRIPTION_MODIFY as MODIFY, NUDR_DR_AUTH_SUBSCRIPTION_READ as READ,
+        };
+        let profile = build_udr_nf_profile(
+            "udr-1811",
+            "10.45.0.11",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
+        let service = |name: &str| {
+            profile["nfServices"]
+                .as_array()
+                .expect("nfServices")
+                .iter()
+                .find(|s| s["serviceName"] == name)
+                .cloned()
+                .expect("service registered")
+        };
+        let dr = service("nudr-dr");
+        let ops = dr["allowedOperationsPerNfType"]
+            .as_object()
+            .expect("nudr-dr registers allowedOperationsPerNfType");
+        assert_eq!(ops["UDM"], json!(["nudr-dr", READ, MODIFY]));
+        let allowed: Vec<&str> = dr["allowedNfTypes"]
+            .as_array()
+            .expect("allowedNfTypes")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ops.len(), allowed.len(), "one entry per allowed NF type");
+        for nf_type in allowed.iter().filter(|t| **t != "UDM") {
+            assert_eq!(ops[*nf_type], json!(["nudr-dr"]), "{nf_type}");
+        }
+        assert!(
+            service("nudr-group-id-map")
+                .get("allowedOperationsPerNfType")
+                .is_none(),
+            "Nudr_GroupIDmap defines no resource scope (TS 29.504 §6.2.7)"
+        );
+    }
+
+    /// #1811: the REAL router behind the UDR's OAuth2 listener
+    /// (`udr_oauth2_listener`, the one `main` builds). The AuthenticationSubscription
+    /// resource holds K and OPc, so a token scoped for `nudr-dr` alone -- all a
+    /// PCF or NEF is granted -- is refused 403 `insufficient_scope` naming the
+    /// TS 29.505 resource scope, and nothing is read or written; the UDM's token,
+    /// carrying the resource scope too, reads the key. Resources outside it still
+    /// need only the service scope.
+    ///
+    /// REVERT-VERIFIED: with `.with_oauth2_resource_scopes(..)` removed from
+    /// `udr_oauth2_listener`, the service-scope-only GET answers 200 with the key
+    /// and this test fails on its first assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_auth_subscription_is_served_only_with_its_resource_scope_1811() {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_AUTH_SUBSCRIPTION_MODIFY as MODIFY, NUDR_DR_AUTH_SUBSCRIPTION_READ as READ,
+        };
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _store = DbiTestStore::enable().await;
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = udr_oauth2_listener(NextgcoreSbiServerConfig::new(udr_addr));
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = SbiServer::on_listener(cfg, udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let bearer = |scope: &str| {
+            format!(
+                "Bearer {}",
+                stand_in::es256_access_token(&sk, stand_in::TEST_NRF_KID, "UDR", scope)
+            )
+        };
+        let service_only = bearer("nudr-dr");
+        let udm = bearer(&format!("nudr-dr {READ} {MODIFY}"));
+        let read_only = bearer(&format!("nudr-dr {READ}"));
+        let supi = "imsi-001010000018110";
+        let path = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+        let k = "465b5ce8b199b49faa5f0a2ee238a6bc";
+        let send = |req: SbiRequest, auth: &str| {
+            let req = req.with_header("authorization", auth.to_string());
+            let client = &client;
+            async move { client.send_request(req).await.expect("response") }
+        };
+        let put = |key: &str| {
+            SbiRequest::put(&path)
+                .with_json_body(&json!({
+                    "authenticationMethod": "5G_AKA",
+                    "encPermanentKey": key,
+                    "encOpcKey": "e8ed289deba952e4283b54e88e6183ca",
+                    "authenticationManagementField": "8000",
+                    "sequenceNumber": {"sqnScheme": "NON_TIME_BASED", "sqn": "000000000020"}
+                }))
+                .expect("json")
+        };
+
+        let provisioned = send(put(k), &udm).await;
+        let refused_get = send(SbiRequest::get(&path), &service_only).await;
+        let refused_put = send(put("00000000000000000000000000000000"), &service_only).await;
+        let patch = SbiRequest::patch(&path)
+            .with_json_body(
+                &json!([{"op": "replace", "path": "/sequenceNumber/sqn", "value": "000000000040"}]),
+            )
+            .expect("json");
+        let refused_patch = send(patch, &read_only).await;
+        let sqn_after_refusals = nextgcore_dbi::test_store::stored_sqn(supi);
+        let served = send(SbiRequest::get(&path), &udm).await;
+        let other = send(
+            SbiRequest::get(format!(
+                "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
+            )),
+            &service_only,
+        )
+        .await;
+        udr.stop().await.expect("stop");
+
+        let body = |r: &SbiResponse| -> serde_json::Value {
+            serde_json::from_str(r.http.content.as_deref().unwrap_or("{}")).unwrap_or_default()
+        };
+        let challenge = |r: &SbiResponse| {
+            r.http
+                .get_header("www-authenticate")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            refused_get.status, 403,
+            "a service-scope-only token must not read K: {:?}",
+            refused_get.http.content
+        );
+        assert_eq!(
+            challenge(&refused_get),
+            format!("Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\", scope=\"{READ}\"")
+        );
+        assert_eq!(
+            body(&refused_get)["status"],
+            403,
+            "TS 29.500 ProblemDetails"
+        );
+        assert!(
+            !refused_get
+                .http
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains(k),
+            "a refusal carries no key material"
+        );
+        assert_eq!(provisioned.status, 201, "{:?}", provisioned.http.content);
+        assert_eq!(refused_put.status, 403);
+        assert!(challenge(&refused_put).contains(&format!("scope=\"{MODIFY}\"")));
+        assert_eq!(refused_patch.status, 403, "a read scope does not modify");
+        assert!(challenge(&refused_patch).contains(&format!("scope=\"{MODIFY}\"")));
+        assert_eq!(
+            sqn_after_refusals,
+            Some(0x20),
+            "neither refused write reached the store"
+        );
+        assert_eq!(served.status, 200, "{:?}", served.http.content);
+        assert_eq!(
+            body(&served)["encPermanentKey"]
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some(k),
+            "the UDM's token reads the key the provisioning PUT stored"
+        );
+        assert_ne!(
+            other.status, 403,
+            "authentication-status needs only the service scope: {:?}",
+            other.http.content
+        );
     }
 
     #[test]
@@ -8342,6 +8658,145 @@ udr:
         remove_watchers_of(supi);
         udm.stop().await.expect("stop");
         udr.stop().await.expect("stop");
+    }
+
+    /// **#1836, TS 29.504 §5.2.2.6.2, the UDR peer of the UDM's leg refresh.** A
+    /// PATCH of `/expiry` extends the subscription's life: a pass after the first
+    /// expiry keeps it. A PATCH whose expiry has passed or cannot be read is refused
+    /// 400 and changes nothing, with a valid item beside it (validate before
+    /// mutating). Once the expiry passes, the subscription is gone: the refresh is
+    /// answered 404 (so the UDM subscribes again), also before a pass removed it.
+    ///
+    /// REVERT-VERIFIED: with `check_subscription_data_member` not checking `expiry`,
+    /// the past one is answered 204 ("a past expiry is refused"); with
+    /// `live_subscription_data_sub` not checking the expiry, the refresh of an
+    /// expired subscription is answered 204 ("an expired leg answers 404").
+    #[tokio::test]
+    async fn a_leg_refresh_extends_it_and_a_gone_leg_answers_404_1836() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let (supi, imsi) = ("imsi-001019900018361", "001019900018361");
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let at = |secs: u64| nextgcore_sbi::datetime::epoch_to_rfc3339(secs);
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &json!({
+                    "callbackReference": "http://127.0.0.1:9/cb/1836",
+                    "monitoredResourceUris": [data_store::am_data_path(supi)],
+                    "expiry": at(now + 60),
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let id = json_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let path = format!("/nudr-dr/v2/subscription-data/subs-to-notify/{id}");
+        let patch = |items: serde_json::Value| {
+            let mut req = SbiRequest::patch(&path);
+            req.http.content = Some(items.to_string());
+            req
+        };
+        let refresh = |secs: u64| json!([{"op": "replace", "path": "/expiry", "value": at(secs)}]);
+        let send = |req: SbiRequest| {
+            let client = &client;
+            async move { client.send_request(req).await.expect("answered").status }
+        };
+
+        assert_eq!(send(patch(refresh(now + 600))).await, 204, "refreshed");
+        am_data_watch_pass_at(std::time::Instant::now(), now as i64 + 61).await;
+        assert!(
+            data_store::store().sub_get(&id).is_some(),
+            "kept past its first expiry"
+        );
+
+        for bad in [
+            json!([
+                {"op": "replace", "path": "/callbackReference", "value": "http://127.0.0.1:9/x"},
+                {"op": "replace", "path": "/expiry", "value": at(now - 1)},
+            ]),
+            json!([{"op": "replace", "path": "/expiry", "value": "soon"}]),
+        ] {
+            assert_eq!(
+                send(patch(bad.clone())).await,
+                400,
+                "a past expiry is refused: {bad}"
+            );
+        }
+        let held = data_store::store().sub_get(&id).expect("held");
+        assert_eq!(held.body["expiry"], at(now + 600), "nothing applied");
+        assert_eq!(held.body["callbackReference"], "http://127.0.0.1:9/cb/1836");
+
+        // The expiry passes (set back, as time would), with no pass since.
+        let mut body = held.body;
+        body["expiry"] = json!(at(now - 5));
+        data_store::store().sub_set_body(&id, body, None);
+        assert_eq!(
+            send(patch(refresh(now + 900))).await,
+            404,
+            "an expired leg answers 404"
+        );
+        assert!(data_store::store().sub_get(&id).is_none(), "and is removed");
+        assert_eq!(send(patch(refresh(now + 900))).await, 404, "gone");
+        remove_watchers_of(supi);
+        udr.stop().await.expect("stop");
+    }
+
+    /// **#1836, UDR restart.** A leg's refreshed expiry and its am-data baseline are
+    /// in the UDR's state file: a UDR started on that file still holds the
+    /// subscription with the refreshed expiry, so the UDM's leg outlives the UDR
+    /// restart and its refreshes go on being answered.
+    ///
+    /// REVERT-VERIFIED: with `sub_set_body` not persisting, the reloaded
+    /// subscription has its first expiry ("the refreshed expiry").
+    #[test]
+    fn a_refreshed_leg_survives_a_udr_restart_1836() {
+        let path = std::env::temp_dir().join(format!(
+            "udr-1836-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let at = nextgcore_sbi::datetime::epoch_to_rfc3339;
+        let id = {
+            let ds = data_store::UdrDataStore::with_state_path(&path);
+            let sub = ds.sub_create(SubKind::SubscriptionData, "http://udm/cb", json!({}));
+            let body = json!({
+                "callbackReference": "http://udm/cb",
+                "monitoredResourceUris": ["/nudr-dr/v2/subscription-data/imsi-1/provisioned-data/am-data"],
+                "expiry": at(now + 60),
+                "subscriptionId": sub.id,
+            });
+            ds.sub_set_body(&sub.id, body.clone(), None);
+            ds.doc_put(
+                data_store::AM_DATA_NOTIFIED_COLLECTION,
+                &sub.id,
+                json!({"gpsis": ["1"]}),
+            );
+            let mut refreshed = body;
+            refreshed["expiry"] = json!(at(now + 900));
+            ds.sub_set_body(&sub.id, refreshed, None);
+            sub.id
+        };
+        let restarted = data_store::UdrDataStore::with_state_path(&path);
+        let sub = restarted
+            .sub_get(&id)
+            .expect("the leg survives the restart");
+        assert_eq!(sub.body["expiry"], at(now + 900), "the refreshed expiry");
+        assert_eq!(
+            restarted.doc_get(data_store::AM_DATA_NOTIFIED_COLLECTION, &id),
+            Some(json!({"gpsis": ["1"]})),
+            "and its baseline"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// **#1775 review MAJOR-2**: one pass serves at most its bound of subscriptions,

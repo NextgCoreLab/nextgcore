@@ -406,6 +406,7 @@ impl UrrAccountingSnapshot {
             },
             time_of_first_packet: self.time_of_first_packet,
             time_of_last_packet: self.time_of_last_packet,
+            query_urr_reference: None,
         }
     }
 }

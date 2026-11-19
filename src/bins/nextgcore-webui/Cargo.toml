@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 nextgcore-dbi = { workspace = true }
 nextgcore-core = { workspace = true }
+# #1871: `--insecure-dev` is refused under the production SBI profile, read the
+# same way every NF reads it.
+nextgcore-sbi = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
