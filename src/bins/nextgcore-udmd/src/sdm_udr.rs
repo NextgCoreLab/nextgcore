@@ -1478,6 +1478,7 @@ mod tests {
             kind: udr::SubKind::SubscriptionData,
             notify_uri: callback.to_string(),
             body: json!({ "callbackReference": callback }),
+            owner: None,
         };
         udr::data_change_notify(
             &sub,
