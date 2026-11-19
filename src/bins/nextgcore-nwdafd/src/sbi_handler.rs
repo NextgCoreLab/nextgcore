@@ -9,6 +9,7 @@ use crate::analytics::ObservationWindow;
 use crate::context::*;
 use crate::notification_dispatcher::{compute_event_infos, EventInfoFilter};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::owner_binding;
 use nextgcore_sbi::server::{send_bad_request, send_error, send_not_found};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -1565,11 +1566,18 @@ fn events_subscription_echo(sub: &AnalyticsSubscription) -> serde_json::Value {
 pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     log::info!("Analytics Subscription Create");
 
+    // #1865: bound to the verified identity of its creator, checked before the
+    // body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
-    let subscription = match parse_events_subscription(request, subscription_id) {
+    let mut subscription = match parse_events_subscription(request, subscription_id) {
         Ok(s) => s,
         Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
     };
+    subscription.owner = owner;
     let echo = events_subscription_echo(&subscription);
 
     let ctx = nwdaf_self();
@@ -1601,10 +1609,17 @@ pub async fn handle_subscription_update(
 ) -> SbiResponse {
     log::info!("Analytics Subscription Update: {subscription_id}");
 
-    let subscription = match parse_events_subscription(request, subscription_id.to_string()) {
+    // #1865: only the consumer that created the subscription may replace it,
+    // checked before the body is read; the replacement keeps that owner.
+    let owner = match analytics_subscription_owner(subscription_id, request, "Update") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
+    let mut subscription = match parse_events_subscription(request, subscription_id.to_string()) {
         Ok(s) => s,
         Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
     };
+    subscription.owner = owner;
     let echo = events_subscription_echo(&subscription);
 
     let ctx = nwdaf_self();
@@ -1626,9 +1641,58 @@ pub async fn handle_subscription_update(
     }
 }
 
-/// Handle subscription retrieval
-pub async fn handle_subscription_get(subscription_id: &str) -> SbiResponse {
+/// #1865: the owner of analytics subscription `subscription_id` when
+/// `request` may act on it; `Err` is the 404 (unknown, checked first) or the
+/// 403 (not its creator) to send instead.
+fn analytics_subscription_owner(
+    subscription_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    let existing = nwdaf_self()
+        .read()
+        .ok()
+        .and_then(|context| context.get_subscription(subscription_id));
+    let Some(existing) = existing else {
+        return Err(Box::new(send_not_found(
+            &format!("Subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )));
+    };
+    match owner_binding::refuse_non_owner(existing.owner.as_deref(), request, operation) {
+        Some(refused) => Err(Box::new(refused)),
+        None => Ok(existing.owner),
+    }
+}
+
+/// #1865: [`analytics_subscription_owner`] for an ML-provision subscription.
+fn ml_prov_subscription_owner(
+    subscription_id: &str,
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    let existing = nwdaf_self()
+        .read()
+        .ok()
+        .and_then(|context| context.get_ml_prov_subscription(subscription_id));
+    let Some(existing) = existing else {
+        return Err(Box::new(send_not_found(
+            &format!("ML-provision subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )));
+    };
+    match owner_binding::refuse_non_owner(existing.owner.as_deref(), request, operation) {
+        Some(refused) => Err(Box::new(refused)),
+        None => Ok(existing.owner),
+    }
+}
+
+/// Handle subscription retrieval, by the consumer that created it (#1865).
+pub async fn handle_subscription_get(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::debug!("Get subscription: {subscription_id}");
+    if let Err(refused) = analytics_subscription_owner(subscription_id, request, "Get") {
+        return *refused;
+    }
 
     let ctx = nwdaf_self();
     let subscription = if let Ok(context) = ctx.read() {
@@ -1650,9 +1714,15 @@ pub async fn handle_subscription_get(subscription_id: &str) -> SbiResponse {
     }
 }
 
-/// Handle subscription deletion
-pub async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
+/// Handle subscription deletion, by the consumer that created it (#1865).
+pub async fn handle_subscription_delete(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("Delete subscription: {subscription_id}");
+    if let Err(refused) = analytics_subscription_owner(subscription_id, request, "Unsubscribe") {
+        return *refused;
+    }
 
     let ctx = nwdaf_self();
     let removed = if let Ok(context) = ctx.read() {
@@ -1718,6 +1788,12 @@ pub fn handle_ml_prov_subscription_create_with_ctx(
 ) -> SbiResponse {
     log::info!("ML Model Provision subscribe");
 
+    // #1865: bound to the verified identity of its creator, checked before the
+    // body is read or anything is stored.
+    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let data = match ml_prov_request_json(request) {
         Ok(d) => d,
         Err((detail, cause)) => return send_bad_request(detail, Some(cause)),
@@ -1735,6 +1811,7 @@ pub fn handle_ml_prov_subscription_create_with_ctx(
     let subscription_id = format!("mlsub-{}", uuid::Uuid::new_v4());
     let mut sub = MlProvSubscription::from_parsed(subscription_id.clone(), parsed);
     sub.consumer_id = nwdaf_consumer_of(request);
+    sub.owner = owner;
 
     match context.add_ml_prov_subscription(sub.clone()) {
         Some(sub_id) => SbiResponse::with_status(201)
@@ -1760,6 +1837,12 @@ pub async fn handle_ml_prov_subscription_update(
 ) -> SbiResponse {
     log::info!("ML Model Provision update: {subscription_id}");
 
+    // #1865: only the consumer that created the subscription may replace it,
+    // checked before the body is read; the replacement keeps that owner.
+    let owner = match ml_prov_subscription_owner(subscription_id, request, "Update") {
+        Ok(owner) => owner,
+        Err(refused) => return *refused,
+    };
     let data = match ml_prov_request_json(request) {
         Ok(d) => d,
         Err((detail, cause)) => return send_bad_request(detail, Some(cause)),
@@ -1776,6 +1859,7 @@ pub async fn handle_ml_prov_subscription_update(
 
     let mut sub = MlProvSubscription::from_parsed(subscription_id.to_string(), parsed);
     sub.consumer_id = nwdaf_consumer_of(request);
+    sub.owner = owner;
 
     let ctx = nwdaf_self();
     let updated = if let Ok(context) = ctx.read() {
@@ -1841,9 +1925,16 @@ fn ml_prov_representation(
     body
 }
 
-/// Handle `DELETE /nnwdaf-mlmodelprovision/v1/subscriptions/{id}`.
-pub async fn handle_ml_prov_subscription_delete(subscription_id: &str) -> SbiResponse {
+/// Handle `DELETE /nnwdaf-mlmodelprovision/v1/subscriptions/{id}`, by the
+/// consumer that created it (#1865).
+pub async fn handle_ml_prov_subscription_delete(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("ML Model Provision delete: {subscription_id}");
+    if let Err(refused) = ml_prov_subscription_owner(subscription_id, request, "Unsubscribe") {
+        return *refused;
+    }
 
     let ctx = nwdaf_self();
     let removed = if let Ok(context) = ctx.read() {
@@ -1941,6 +2032,296 @@ pub fn handle_ml_model_download_with_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #1865: these tests act as ONE verified consumer ─────────────────────
+    //
+    // Under the default (production) SBI profile an anonymous create is
+    // refused, and whether a sibling test has already set the `dev` override is
+    // a matter of test order. So every handler call below goes through these
+    // wrappers, which shadow the glob-imported handlers and give a request with
+    // no identity the verified token of [`TEST_CONSUMER_1865`]: the tests pass
+    // under either profile. The #1865 tests call `super::` directly.
+
+    const TEST_CONSUMER_1865: &str = "cccccccc-1865-4000-8000-00000000000c";
+
+    fn as_consumer(request: &SbiRequest) -> SbiRequest {
+        let mut request = request.clone();
+        if request.oauth2_subject.is_none() && request.peer_cert_nf_instance_id.is_none() {
+            request.oauth2_subject = Some(TEST_CONSUMER_1865.to_string());
+        }
+        request
+    }
+
+    async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+        super::handle_subscription_create(&as_consumer(request)).await
+    }
+
+    async fn handle_subscription_update(id: &str, request: &SbiRequest) -> SbiResponse {
+        super::handle_subscription_update(id, &as_consumer(request)).await
+    }
+
+    async fn handle_subscription_get(id: &str) -> SbiResponse {
+        super::handle_subscription_get(id, &as_consumer(&SbiRequest::get("/"))).await
+    }
+
+    async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResponse {
+        super::handle_ml_prov_subscription_create(&as_consumer(request)).await
+    }
+
+    fn handle_ml_prov_subscription_create_with_ctx(
+        context: &NwdafContext,
+        request: &SbiRequest,
+    ) -> SbiResponse {
+        super::handle_ml_prov_subscription_create_with_ctx(context, &as_consumer(request))
+    }
+
+    async fn handle_ml_prov_subscription_update(id: &str, request: &SbiRequest) -> SbiResponse {
+        super::handle_ml_prov_subscription_update(id, &as_consumer(request)).await
+    }
+
+    async fn handle_ml_prov_subscription_delete(id: &str) -> SbiResponse {
+        super::handle_ml_prov_subscription_delete(id, &as_consumer(&SbiRequest::delete("/"))).await
+    }
+
+    const OWNER_1865: &str = "aaaaaaaa-1865-4000-8000-00000000000a";
+    const OTHER_1865: &str = "bbbbbbbb-1865-4000-8000-00000000000b";
+
+    fn owned_1865(mut request: SbiRequest) -> SbiRequest {
+        request.oauth2_subject = Some(OWNER_1865.to_string());
+        request
+    }
+
+    /// Every caller that is not [`OWNER_1865`], each labelled.
+    fn strangers_1865(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
+        let mut foreign_cert = request();
+        foreign_cert.peer_cert_nf_instance_id = Some(OTHER_1865.to_string());
+        let mut foreign_token = request();
+        foreign_token.oauth2_subject = Some(OTHER_1865.to_string());
+        let mut mismatch = request();
+        mismatch.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        mismatch.oauth2_subject = Some(OTHER_1865.to_string());
+        vec![
+            ("foreign certificate", foreign_cert),
+            ("foreign token", foreign_token),
+            ("anonymous", request()),
+            ("certificate/token mismatch", mismatch),
+        ]
+    }
+
+    /// #1865: an analytics (events) subscription is read, replaced and deleted
+    /// only by the consumer that created it; every other caller gets 403 and
+    /// nothing changes, the owner then succeeds, and the replacement keeps the
+    /// owner. REVERT-VERIFIED separately: the update check removed (a stranger's
+    /// PUT returns 200 and rewrites notificationURI); the delete check removed
+    /// (a stranger's DELETE returns 204); the get check removed (200); the owner
+    /// not carried into the replacement (`subscription.owner = owner` dropped:
+    /// the stored owner assertion after the PUT fails); the create binding
+    /// dropped (the stored owner is `None`).
+    #[tokio::test]
+    async fn analytics_subscriptions_are_managed_by_their_creator_1865() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let body = |uri: &str| {
+            json!({
+                "eventSubscriptions": [{ "event": "NF_LOAD" }],
+                "notificationURI": uri,
+            })
+        };
+        let create = super::handle_subscription_create(&owned_1865(
+            SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+                .with_json_body(&body("http://owner.example/cb"))
+                .unwrap(),
+        ))
+        .await;
+        assert_eq!(create.status, 201, "{:?}", create.http.content);
+        let id = create
+            .http
+            .get_header("Location")
+            .and_then(|l| l.rsplit('/').next().map(str::to_string))
+            .expect("Location");
+        let stored = || nwdaf_self().read().unwrap().get_subscription(&id);
+        assert_eq!(stored().unwrap().owner.as_deref(), Some(OWNER_1865));
+
+        let put = || {
+            SbiRequest::put(format!("/nnwdaf-eventssubscription/v1/subscriptions/{id}"))
+                .with_json_body(&body("http://attacker.example/cb"))
+                .unwrap()
+        };
+        for (who, req) in strangers_1865(put) {
+            let resp = super::handle_subscription_update(&id, &req).await;
+            assert_eq!(resp.status, 403, "{who} PUT");
+            assert_eq!(
+                stored().unwrap().notification_uri,
+                "http://owner.example/cb",
+                "{who}: the PUT applied nothing"
+            );
+        }
+        for (who, req) in strangers_1865(|| SbiRequest::get("/")) {
+            assert_eq!(
+                super::handle_subscription_get(&id, &req).await.status,
+                403,
+                "{who} GET"
+            );
+        }
+        for (who, req) in strangers_1865(|| SbiRequest::delete("/")) {
+            assert_eq!(
+                super::handle_subscription_delete(&id, &req).await.status,
+                403,
+                "{who}"
+            );
+            assert!(
+                stored().is_some(),
+                "{who}: the subscription is still stored"
+            );
+        }
+        // The owner: replace (proven by certificate), read, then delete.
+        let mut by_cert = put();
+        by_cert.peer_cert_nf_instance_id = Some(OWNER_1865.to_uppercase());
+        assert_eq!(
+            super::handle_subscription_update(&id, &by_cert)
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            stored().unwrap().notification_uri,
+            "http://attacker.example/cb"
+        );
+        assert_eq!(
+            stored().unwrap().owner.as_deref(),
+            Some(OWNER_1865),
+            "the replacement keeps the owner"
+        );
+        let get = super::handle_subscription_get(&id, &owned_1865(SbiRequest::get("/"))).await;
+        assert_eq!(get.status, 200);
+        let owner_delete = owned_1865(SbiRequest::delete("/"));
+        let del = super::handle_subscription_delete(&id, &owner_delete).await;
+        assert_eq!(del.status, 204);
+        assert!(stored().is_none());
+        // Unknown stays 404, for anyone.
+        let gone = super::handle_subscription_delete(&id, &owner_delete).await;
+        assert_eq!(gone.status, 404);
+    }
+
+    /// #1865: a create whose certificate and token disagree is refused and
+    /// stores nothing, for both subscription kinds. REVERT-VERIFIED: with the
+    /// create binding removed from either handler, that create returns 201.
+    #[tokio::test]
+    async fn a_mismatched_creator_is_refused_and_nothing_is_stored_1865() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let mismatch = |mut r: SbiRequest| {
+            r.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+            r.oauth2_subject = Some(OTHER_1865.to_string());
+            r
+        };
+        let events = mismatch(
+            SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+                .with_json_body(&json!({
+                    "eventSubscriptions": [{ "event": "NF_LOAD" }],
+                    "notificationURI": "http://mixed-1865.example/cb",
+                }))
+                .unwrap(),
+        );
+        assert_eq!(super::handle_subscription_create(&events).await.status, 403);
+        let ml = mismatch(
+            SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+                .with_json_body(&json!({
+                    "notifUri": "http://mixed-1865.example/ml",
+                    "mLEventSubscs": [{ "mLEvent": "NF_LOAD" }],
+                }))
+                .unwrap(),
+        );
+        assert_eq!(
+            super::handle_ml_prov_subscription_create(&ml).await.status,
+            403
+        );
+        let ctx = nwdaf_self();
+        let ctx = ctx.read().unwrap();
+        assert!(
+            ctx.get_all_active_subscriptions()
+                .iter()
+                .all(|s| s.notification_uri != "http://mixed-1865.example/cb"),
+            "no events subscription was stored"
+        );
+    }
+
+    /// #1865: an ML-model-provision subscription is replaced and deleted only by
+    /// the consumer that created it. REVERT-VERIFIED separately: the update check
+    /// removed (a stranger's PUT returns 200); the delete check
+    /// removed (204); the owner not carried into the replacement (the stored
+    /// owner assertion fails).
+    #[tokio::test]
+    async fn ml_provision_subscriptions_are_managed_by_their_creator_1865() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let body =
+            |uri: &str| json!({ "notifUri": uri, "mLEventSubscs": [{ "mLEvent": "NF_LOAD" }] });
+        let created = super::handle_ml_prov_subscription_create(&owned_1865(
+            SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+                .with_json_body(&body("http://anlf-1865.example/ml"))
+                .unwrap(),
+        ))
+        .await;
+        assert_eq!(created.status, 201, "{:?}", created.http.content);
+        let id = body_json(&created)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+        let stored = || nwdaf_self().read().unwrap().get_ml_prov_subscription(&id);
+        assert_eq!(stored().unwrap().owner.as_deref(), Some(OWNER_1865));
+        let put = || {
+            SbiRequest::put("/")
+                .with_json_body(&body("http://attacker.example/ml"))
+                .unwrap()
+        };
+        for (who, req) in strangers_1865(put) {
+            let resp = super::handle_ml_prov_subscription_update(&id, &req).await;
+            assert_eq!(resp.status, 403, "{who} PUT");
+            assert_eq!(stored().unwrap().notif_uri, "http://anlf-1865.example/ml");
+        }
+        for (who, req) in strangers_1865(|| SbiRequest::delete("/")) {
+            let resp = super::handle_ml_prov_subscription_delete(&id, &req).await;
+            assert_eq!(resp.status, 403, "{who}");
+            assert!(stored().is_some(), "{who}: still stored");
+        }
+        let resp = super::handle_ml_prov_subscription_update(&id, &owned_1865(put())).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(stored().unwrap().notif_uri, "http://attacker.example/ml");
+        assert_eq!(stored().unwrap().owner.as_deref(), Some(OWNER_1865));
+        let resp =
+            super::handle_ml_prov_subscription_delete(&id, &owned_1865(SbiRequest::delete("/")))
+                .await;
+        assert_eq!(resp.status, 204);
+        assert!(stored().is_none());
+    }
+
+    /// #1865: the owner survives a snapshot round-trip, and a record written
+    /// before #1865 (no `owner` member) restores ownerless.
+    #[test]
+    fn the_subscription_owner_is_persisted_1865() {
+        let mut sub = AnalyticsSubscription::new(
+            "sub-1865".into(),
+            AnalyticsId::NfLoad,
+            "http://x/cb".into(),
+            u64::MAX,
+        );
+        sub.owner = Some(OWNER_1865.into());
+        let doc = serde_json::to_value(&sub).unwrap();
+        let back: AnalyticsSubscription = serde_json::from_value(doc.clone()).unwrap();
+        assert_eq!(back.owner.as_deref(), Some(OWNER_1865));
+        let mut old = doc;
+        old.as_object_mut().unwrap().remove("owner");
+        let back: AnalyticsSubscription = serde_json::from_value(old).unwrap();
+        assert_eq!(back.owner, None);
+
+        let mut ml = MlProvSubscription::new("ml-1865".into(), "http://x".into(), None, vec![]);
+        ml.owner = Some(OWNER_1865.into());
+        let doc = serde_json::to_value(&ml).unwrap();
+        let back: MlProvSubscription = serde_json::from_value(doc.clone()).unwrap();
+        assert_eq!(back.owner.as_deref(), Some(OWNER_1865));
+        let mut old = doc;
+        old.as_object_mut().unwrap().remove("owner");
+        let back: MlProvSubscription = serde_json::from_value(old).unwrap();
+        assert_eq!(back.owner, None);
+    }
     use serde_json::{json, Value};
 
     fn body_json(resp: &SbiResponse) -> Value {

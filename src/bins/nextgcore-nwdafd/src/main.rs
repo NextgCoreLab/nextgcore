@@ -795,9 +795,9 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["nnwdaf-eventssubscription", "v1", "subscriptions", subscription_id] => match method {
-            "GET" => handle_subscription_get(subscription_id).await,
+            "GET" => handle_subscription_get(subscription_id, &request).await,
             "PUT" => handle_subscription_update(subscription_id, &request).await,
-            "DELETE" => handle_subscription_delete(subscription_id).await,
+            "DELETE" => handle_subscription_delete(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
@@ -825,7 +825,7 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["nnwdaf-mlmodelprovision", "v1", "subscriptions", subscription_id] => match method {
             "PUT" => handle_ml_prov_subscription_update(subscription_id, &request).await,
-            "DELETE" => handle_ml_prov_subscription_delete(subscription_id).await,
+            "DELETE" => handle_ml_prov_subscription_delete(subscription_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
