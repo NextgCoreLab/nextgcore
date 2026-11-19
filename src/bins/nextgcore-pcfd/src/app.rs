@@ -1085,6 +1085,12 @@ fn with_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServer
 pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
+    // #1992: a restored ownerless record past its lapse is gone before this
+    // request is routed, so managing it answers 404, not 403 (O(1) until one
+    // can lapse).
+    if let Ok(context) = pcf_self().read() {
+        context.sweep_lapsed_ownerless(crate::context::unix_now_secs());
+    }
 
     log::debug!(
         "PCF SBI request: {method} {}",
