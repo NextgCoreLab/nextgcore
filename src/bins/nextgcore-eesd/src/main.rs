@@ -634,7 +634,7 @@ async fn ees_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "POST" => handle_eas_register(&request).await,
-                "GET" => handle_eas_list().await,
+                "GET" => handle_eas_list(&request).await,
                 _ => send_method_not_allowed(method, "registrations"),
             }
         }
@@ -668,7 +668,7 @@ async fn ees_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "POST" => handle_disc_sub_create(&request).await,
-                "GET" => handle_disc_sub_list().await,
+                "GET" => handle_disc_sub_list(&request).await,
                 _ => send_method_not_allowed(method, "subscriptions"),
             }
         }
@@ -692,7 +692,7 @@ async fn ees_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "POST" => handle_eec_register(&request).await,
-                "GET" => handle_eec_list().await,
+                "GET" => handle_eec_list(&request).await,
                 _ => send_method_not_allowed(method, "registrations"),
             }
         }
@@ -755,7 +755,7 @@ async fn ees_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "POST" => handle_act_status_sub_create(&request).await,
-                "GET" => handle_act_status_sub_list().await,
+                "GET" => handle_act_status_sub_list(&request).await,
                 _ => send_method_not_allowed(method, "subscriptions"),
             }
         }
@@ -829,7 +829,7 @@ async fn ees_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "POST" => handle_acrmgnt_sub_create(&request).await,
-                "GET" => handle_acrmgnt_sub_list().await,
+                "GET" => handle_acrmgnt_sub_list(&request).await,
                 _ => send_method_not_allowed(method, "subscriptions"),
             }
         }
@@ -1268,9 +1268,13 @@ async fn handle_eas_modify(registration_id: &str, request: &SbiRequest) -> SbiRe
 }
 
 /// List all stored EAS registrations.
-async fn handle_eas_list() -> SbiResponse {
+/// #1937: only the records the caller created (see [`visible_to`]).
+async fn handle_eas_list(request: &SbiRequest) -> SbiResponse {
     let ctx = ees_self();
-    let registrations = ctx.read().map(|c| c.eas_list()).unwrap_or_default();
+    let registrations = ctx
+        .read()
+        .map(|c| c.eas_list_visible(&visible_to(request)))
+        .unwrap_or_default();
 
     SbiResponse::with_status(200)
         .with_json_body(&registrations)
@@ -1381,6 +1385,13 @@ async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
 /// `kind`/`id` (`nextgcore_sbi::owner_binding`), checked before anything is
 /// read or changed. `None` lets the handler run, which includes an unknown id
 /// (`exists` false): it answers its own 404 first, as before.
+/// #1937: whether `request` may see a resource bound to `owner`: exactly the
+/// callers its by-id GET admits (`owner_binding`), so a list never shows a
+/// record its caller could not read on its own.
+fn visible_to(request: &SbiRequest) -> impl Fn(Option<&str>) -> bool + '_ {
+    move |owner| owner_binding::non_owner_refusal(owner, request).is_none()
+}
+
 fn refuse_unless_owner(
     kind: Owned,
     id: &str,
@@ -1465,10 +1476,11 @@ async fn handle_disc_sub_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_disc_sub_list() -> SbiResponse {
+/// #1937: only the records the caller created (see [`visible_to`]).
+async fn handle_disc_sub_list(request: &SbiRequest) -> SbiResponse {
     let subs = ees_self()
         .read()
-        .map(|c| c.disc_sub_list())
+        .map(|c| c.disc_sub_list_visible(&visible_to(request)))
         .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&subs)
@@ -1865,8 +1877,12 @@ async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_eec_list() -> SbiResponse {
-    let regs = ees_self().read().map(|c| c.eec_list()).unwrap_or_default();
+/// #1937: only the records the caller created (see [`visible_to`]).
+async fn handle_eec_list(request: &SbiRequest) -> SbiResponse {
+    let regs = ees_self()
+        .read()
+        .map(|c| c.eec_list_visible(&visible_to(request)))
+        .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&regs)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -2386,10 +2402,11 @@ async fn handle_act_status_sub_create(request: &SbiRequest) -> SbiResponse {
 
 /// `GetACTStatusSubscriptions` (`GET {apiRoot}/eees-eel-acr/v1/subscriptions`).
 /// The yaml's 200 body is the array itself, not a wrapper object.
-async fn handle_act_status_sub_list() -> SbiResponse {
+/// #1937: only the records the caller created (see [`visible_to`]).
+async fn handle_act_status_sub_list(request: &SbiRequest) -> SbiResponse {
     let subs = ees_self()
         .read()
-        .map(|c| c.act_status_sub_list())
+        .map(|c| c.act_status_sub_list_visible(&visible_to(request)))
         .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&subs)
@@ -3122,10 +3139,11 @@ async fn handle_acrmgnt_sub_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_acrmgnt_sub_list() -> SbiResponse {
+/// #1937: only the records the caller created (see [`visible_to`]).
+async fn handle_acrmgnt_sub_list(request: &SbiRequest) -> SbiResponse {
     let subs = ees_self()
         .read()
-        .map(|c| c.acrmgnt_sub_list())
+        .map(|c| c.acrmgnt_sub_list_visible(&visible_to(request)))
         .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&subs)
@@ -3583,6 +3601,81 @@ mod tests {
         let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
         let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
         format!("Bearer {h}.{p}.{s}")
+    }
+
+    /// #1937: a collection GET lists only what its caller created, the same
+    /// callers each item's GET admits. Two consumers each create one resource
+    /// in every listable family; each consumer's list holds its own and never
+    /// the other's.
+    ///
+    /// REVERT-VERIFIED: with `visible_to` admitting every owner, A's list
+    /// includes B's resource and the first assertion fails.
+    #[test]
+    fn a_collection_lists_only_what_its_caller_created_1937() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_final();
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        const A: &str = "eec-a-1937";
+        const B: &str = "eec-b-1937";
+        let families = [
+            (
+                EASREG_REGISTRATIONS_PATH,
+                auth::SCOPE_EASREGISTRATION,
+                r#"{"easProf":{"easId":"eas-SUB.example.com","endPt":{"fqdn":"eas-SUB.example.com"}}}"#,
+            ),
+            (
+                EASDISC_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_EASDISCOVERY,
+                r#"{"eecId":"eec-SUB","easEventType":"EAS_AVAILABLE","notificationDestination":"http://eec/SUB"}"#,
+            ),
+            (
+                EECREG_REGISTRATIONS_PATH,
+                auth::SCOPE_EECREGISTRATION,
+                r#"{"eecId":"eec-SUB.example.com","ueId":"gpsi-SUB","acProfs":[{"acId":"ac1"}]}"#,
+            ),
+            (
+                EEL_ACR_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_EEL_ACR,
+                r#"{"easId":"eas1.example.com","notificationUri":"http://eas/SUB"}"#,
+            ),
+            (
+                ACRMGNTEVENT_SUBSCRIPTIONS_PATH,
+                auth::SCOPE_ACRMGNTEVENT,
+                r#"{"easId":"eas1.example.com","eventSubscs":[{"event":"UP_PATH_CHG","appGrpId":"grp-1"}],"notificationDestination":"http://eec/SUB"}"#,
+            ),
+        ];
+        for (collection, scope, body) in families {
+            for who in [A, B] {
+                let create = SbiRequest::post(collection)
+                    .with_body(body.replace("SUB", who), "application/json")
+                    .with_header("Authorization", bearer_sub(&sk, "k1", scope, who));
+                let resp = block_on(ees_sbi_request_handler(create));
+                assert_eq!(
+                    resp.status, 201,
+                    "{collection} by {who}: {:?}",
+                    resp.http.content
+                );
+            }
+            for (me, other) in [(A, B), (B, A)] {
+                let list = SbiRequest::get(collection)
+                    .with_header("Authorization", bearer_sub(&sk, "k1", scope, me));
+                let resp = block_on(ees_sbi_request_handler(list));
+                assert_eq!(resp.status, 200, "{collection}: {:?}", resp.http.content);
+                let text = resp.http.content.clone().unwrap_or_default();
+                assert!(
+                    !text.contains(other),
+                    "{collection}: {me}'s list must not show {other}'s resource: {text}"
+                );
+                assert!(
+                    text.contains(me),
+                    "{collection}: {me}'s list shows its own: {text}"
+                );
+            }
+        }
     }
 
     /// #1865: every EES resource a consumer creates (EAS and EEC
