@@ -2314,20 +2314,7 @@ impl NgapServer {
         // A no-op unless the posture just changed, and the posture is off by default.
         self.sync_ngap_overload().await?;
 
-        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
-        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
-        self.process_positioning_downlinks().await;
-
-        // Execute any network-initiated deregistrations the Namf_Callback
-        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
-        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
-        // Dormant when none pending.
-        self.process_network_deregs().await;
-
-        // Deliver every N1N2MessageTransfer the Namf handler queued for a
-        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
-        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
-        self.process_connected_downlinks().await;
+        self.process_ue_associated_handoffs().await;
 
         self.process_racs_reassignments();
         self.process_sbi_outcomes().await;
@@ -2393,6 +2380,32 @@ impl NgapServer {
 
         let outcome = self.receive_n2_or_sbi_report().await?;
         Ok(poll_again_at_once(outcome))
+    }
+
+    /// The step of [`Self::poll`] that sends the UE-associated work the Namf SBI
+    /// handlers queued, in this order. #1776 review: one step, so that a test can
+    /// drive the production wiring of each queue. The rest of `poll` drains
+    /// process-global queues that sibling tests fill and wait on, so tests do not
+    /// call `poll` itself (see `poll_wake_tests`).
+    pub(crate) async fn process_ue_associated_handoffs(&mut self) {
+        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
+        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
+        self.process_positioning_downlinks().await;
+
+        // Execute any network-initiated deregistrations the Namf_Callback
+        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
+        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
+        // Dormant when none pending.
+        self.process_network_deregs().await;
+
+        // Deliver every N1N2MessageTransfer the Namf handler queued for a
+        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
+        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
+        self.process_connected_downlinks().await;
+
+        // Send the UE Context Modifications the Nudm_SDM notify handler queued for
+        // a changed subscribed UE-AMBR (#1776, TS 23.502 §4.5.1). Dormant when none.
+        self.process_ue_ambr_modifications().await;
     }
 
     /// Wait for N2 for up to [`SCTP_RECV_TIMEOUT`], ended early by an off-task SBI
@@ -2623,6 +2636,29 @@ impl NgapServer {
                     log::warn!("Initial Context Setup Failure from gNB");
                     self.handle_initial_context_setup_failure(association_id, data)
                         .await?;
+                }
+            }
+            Some(40) => {
+                // UE Context Modification (procedure code 40, TS 38.413 §8.3.4, #1776):
+                // the Request is AMF->gNB, so what arrives is its Response or Failure.
+                if data[0] == 0x20 || data[0] == 0x40 {
+                    Box::pin(self.handle_ue_context_modification_outcome(association_id, data))
+                        .await?;
+                } else {
+                    // Answered as before this arm (the `_` arm's Error Indication).
+                    log::warn!(
+                        "UEContextModificationRequest is AMF->gNB; unexpected from association \
+                         {association_id}"
+                    );
+                    let (amf_ue_ngap_id, ran_ue_ngap_id, cause) =
+                        Self::unhandled_procedure_error_indication(procedure_code, data);
+                    self.send_error_indication(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        cause,
+                    )
+                    .await?;
                 }
             }
             Some(29) => {
@@ -4881,12 +4917,7 @@ impl NgapServer {
                 // the N11 SM Context Create so the session-AMBR is reduced too.
                 if req.redcap_indication {
                     state.amf_ue.redcap_indication = true;
-                    if state.amf_ue.ue_ambr.downlink > 150_000_000 {
-                        state.amf_ue.ue_ambr.downlink = 150_000_000; // 150 Mbps DL
-                    }
-                    if state.amf_ue.ue_ambr.uplink > 50_000_000 {
-                        state.amf_ue.ue_ambr.uplink = 50_000_000; // 50 Mbps UL
-                    }
+                    state.amf_ue.cap_ue_ambr_for_redcap();
                     log::info!("UE indicates RedCap (Reduced Capability) device");
                 }
 
@@ -6853,6 +6884,9 @@ impl NgapServer {
         {
             state.amf_ue.ue_ambr.uplink = ul;
         }
+        // #1776 review: the subscribed value replaced the RedCap cap the Registration
+        // Request set; a RedCap UE stays capped.
+        state.amf_ue.cap_ue_ambr_for_redcap();
 
         // GPSI (UDM am-data `gpsis`, TS 29.503 §5.2.2.2.1) — the UE's external
         // identity, conveyed onward on N11 (issue #205). Assigned unconditionally
@@ -11715,6 +11749,122 @@ impl NgapServer {
         }
     }
 
+    /// #1776, TS 23.502 §4.5.1: drain the UEs whose subscribed UE-AMBR a Nudm_SDM
+    /// data change notification changed, and send each CM-CONNECTED one's NG-RAN
+    /// node a UE CONTEXT MODIFICATION REQUEST (TS 38.413 §8.3.4) with the UE-AMBR it
+    /// holds NOW: several changes queued before this drain go out as one request
+    /// with the latest. A UE CM-IDLE or gone by now is sent nothing and leaves
+    /// nothing behind: the UE-AMBR is held in its context, and the Initial Context
+    /// Setup of its next NG connection carries it.
+    pub(crate) async fn process_ue_ambr_modifications(&mut self) {
+        let pending = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.ue_ambr_modification_drain()
+        };
+        for amf_ue_ngap_id in pending {
+            if let Err(e) = self.send_ue_ambr_modification(amf_ue_ngap_id).await {
+                log::warn!("UE {amf_ue_ngap_id}: UE Context Modification (UE-AMBR) not sent: {e}");
+            }
+        }
+    }
+
+    /// One queued UE-AMBR modification ([`Self::process_ue_ambr_modifications`]).
+    async fn send_ue_ambr_modification(&mut self, amf_ue_ngap_id: u64) -> Result<()> {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            log::debug!(
+                "UE {amf_ue_ngap_id}: no NG context any more; its UE-AMBR modification is dropped"
+            );
+            return Ok(());
+        };
+        if state.is_cm_idle() || !state.is_bound() {
+            log::info!(
+                "UE {amf_ue_ngap_id}: CM-IDLE; the changed UE-AMBR goes in its next Initial \
+                 Context Setup"
+            );
+            return Ok(());
+        }
+        let ue_ambr = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+        let pdu = crate::ngap_asn1::build_ue_context_modification_request_asn1(
+            amf_ue_ngap_id,
+            state.ran_ue_ngap_id,
+            ue_ambr,
+        )
+        .ok_or_else(|| anyhow::anyhow!("the UE Context Modification Request did not encode"))?;
+        self.send_to_association(state.association_id, &pdu).await?;
+        log::info!(
+            "UE {amf_ue_ngap_id}: UE Context Modification Request sent with UE-AMBR \
+             DL {} / UL {} bps (TS 38.413 §8.3.4)",
+            ue_ambr.0,
+            ue_ambr.1
+        );
+        Ok(())
+    }
+
+    /// #1776: the NG-RAN node's UE CONTEXT MODIFICATION RESPONSE or FAILURE
+    /// (TS 38.413 §8.3.4.2 / §8.3.4.3) to a UE-AMBR modification.
+    ///
+    /// Either way the AMF keeps the subscribed UE-AMBR it holds (DECISIONS: the
+    /// subscription is the UDM's, TS 23.502 §4.5.1 "the AMF adds or modifies the user
+    /// profile", and was answered 204; the AN update is the action taken on it). On a
+    /// Failure the node keeps the UE-AMBR it had (§8.3.4.3 "the UE context update
+    /// cannot be performed"), so the failure is logged with its cause, and the next
+    /// procedure that hands the UE-AMBR to NG-RAN (an Initial Context Setup, a
+    /// Handover Request) carries the held one. No UE state changes on either answer.
+    async fn handle_ue_context_modification_outcome(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        use crate::ngap_asn1::UeContextModificationOutcomeDecode::{Decoded, Failed, Undecodable};
+        match crate::ngap_asn1::decode_ue_context_modification_outcome_asn1(data) {
+            Decoded {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Err(e) = self
+                        .send_criticality_error_indication(association_id, &report)
+                        .await
+                    {
+                        log::warn!("Failed to send ErrorIndication: {e}");
+                    }
+                }
+                let held = amf_ue_ngap_id
+                    .and_then(|id| self.ue_auth_state.get(id))
+                    .map(|s| (s.amf_ue.ue_ambr.downlink, s.amf_ue.ue_ambr.uplink));
+                match cause {
+                    None => log::info!(
+                        "UE Context Modification Response: amf_ue_ngap_id={amf_ue_ngap_id:?}, \
+                         ran_ue_ngap_id={ran_ue_ngap_id:?} (association {association_id}); \
+                         NG-RAN enforces the UE-AMBR (DL, UL) {held:?}"
+                    ),
+                    Some(cause) => log::warn!(
+                        "UE Context Modification Failure: amf_ue_ngap_id={amf_ue_ngap_id:?}, \
+                         ran_ue_ngap_id={ran_ue_ngap_id:?}, cause={cause:?} (association \
+                         {association_id}); NG-RAN keeps its previous UE-AMBR, the AMF keeps \
+                         the subscribed {held:?} for the next Initial Context Setup"
+                    ),
+                }
+                Ok(())
+            }
+            Failed(diagnostics) => {
+                log::warn!(
+                    "UE Context Modification outcome carries not-comprehended IEs marked \
+                     reject ({diagnostics:?}); unsuccessfully terminated (TS 38.413 \
+                     §10.3.4.2), handled locally"
+                );
+                Ok(())
+            }
+            Undecodable => {
+                self.report_transfer_syntax_error(association_id, "UE Context Modification outcome")
+                    .await
+            }
+        }
+    }
+
     /// Deliver one queued N1N2MessageTransfer to its UE (#666, #757).
     ///
     /// The UE's NG connection is read NOW, not when the transfer was queued. A UE
@@ -11867,12 +12017,34 @@ impl NgapServer {
     ) {
         use crate::context::ConnectedN2;
         use crate::namf_handler::PagedN2;
+        let (n2, paged) = match &item.n2 {
+            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
+            _ if item.n1_only => (None, PagedN2::N1Only),
+            ConnectedN2::None => (None, PagedN2::Setup),
+            ConnectedN2::Release => (None, PagedN2::Release),
+            ConnectedN2::Setup(t) => (t.clone(), PagedN2::Setup),
+            ConnectedN2::Modify(t) => (Some(t.clone()), PagedN2::Modify),
+        };
+        let mut sess = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
+        };
         // #749: the UE is already being paged for another transfer. Its paging
         // context holds that one, and this transfer was already answered 200, so
         // it can neither overwrite it nor be refused. It waits in the queue: once
         // the UE answers it is CM-CONNECTED and delivered as such, and if the page
-        // fails it pages for itself.
-        if crate::namf_handler::paging_ongoing(item.amf_ue_ngap_id) {
+        // fails it pages for itself. #1837: checked and queued as one step, so an
+        // SBI transfer racing this one is never overwritten.
+        if !crate::namf_handler::initiate_paging_for_idle_ue(
+            amf_ue,
+            sess.as_mut(),
+            item.n1.clone(),
+            n2,
+            paged,
+            Some(item.pdu_session_id),
+            item.failure_notify_uri.as_deref(),
+        ) {
             log::info!(
                 "UE {}: N1N2 transfer for PSI {} waits for the paging already ongoing",
                 item.amf_ue_ngap_id,
@@ -11883,28 +12055,6 @@ impl NgapServer {
             guard.connected_downlink_add(item);
             return;
         }
-        let (n2, paged) = match item.n2 {
-            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
-            _ if item.n1_only => (None, PagedN2::N1Only),
-            ConnectedN2::None => (None, PagedN2::Setup),
-            ConnectedN2::Release => (None, PagedN2::Release),
-            ConnectedN2::Setup(t) => (t, PagedN2::Setup),
-            ConnectedN2::Modify(t) => (Some(t), PagedN2::Modify),
-        };
-        let mut sess = {
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
-        };
-        crate::namf_handler::initiate_paging_for_idle_ue(
-            amf_ue,
-            sess.as_mut(),
-            item.n1,
-            n2,
-            paged,
-            Some(item.pdu_session_id),
-            item.failure_notify_uri.as_deref(),
-        );
         if let Some(sess) = &sess {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -21251,6 +21401,7 @@ impl NgapServer {
     ///   cleared.
     /// - Its queued connected downlinks are dropped; one carrying a failure-notify URI
     ///   is notified the same way (#1689 review).
+    /// - Its queued UE-AMBR modification is dropped (#1776).
     fn stop_paging_on_deregistration(&self, amf_ue_ngap_id: u64) {
         let supi = self
             .ue_auth_state
@@ -21262,6 +21413,8 @@ impl NgapServer {
             let pages = guard.paging_take_for_ue(amf_ue_ngap_id);
             let mut ids = vec![amf_ue_ngap_id];
             ids.extend(pages.iter().map(|p| p.amf_ue_ngap_id));
+            // #1776: and no UE Context Modification goes to a deregistering UE.
+            guard.ue_ambr_modification_remove_for(&ids);
             (pages, guard.connected_downlink_remove_for(&ids))
         };
         for paging in &pages {
@@ -21269,7 +21422,7 @@ impl NgapServer {
             log::info!(
                 "Paging stopped for UE {} on its deregistration{}",
                 paging.amf_ue_ngap_id,
-                if paging.failure_notify_uri.is_some() {
+                if !paging.failure_notify_targets().is_empty() {
                     ", requester notified (FAILURE_CAUSE_UNSPECIFIED)"
                 } else {
                     ""
@@ -21302,15 +21455,15 @@ impl NgapServer {
     /// A page ended without its UE answering: notify the requester with `cause` and
     /// clear the session's paging state, so a later transfer is not refused as
     /// "paging ongoing".
+    ///
+    /// #1837: every requester the page holds is notified, each at its own URI: the
+    /// page's own transfer and each transfer that joined it
+    /// (`PagingContext::failure_notify_targets`, TS 29.518 §5.2.2.3.1).
     fn paging_ended(&self, paging: &crate::context::PagingContext, cause: &str) {
         // #1760: the UE did not answer; its last known location is reported.
         crate::namf_server::first_locations_after_page(paging, None);
-        if let Some(uri) = &paging.failure_notify_uri {
-            crate::namf_server::send_n1n2_failure_notification(
-                uri.clone(),
-                cause,
-                paging.n1n2_msg_data_uri.clone(),
-            );
+        for (uri, n1n2_msg_data_uri) in paging.failure_notify_targets() {
+            crate::namf_server::send_n1n2_failure_notification(uri, cause, n1n2_msg_data_uri);
         }
         clear_session_paging(paging);
     }
@@ -21323,7 +21476,7 @@ impl NgapServer {
             "Paging abandoned for UE {}: no response after {} attempt(s){}",
             paging.amf_ue_ngap_id,
             u32::from(paging.retransmit_count) + 1,
-            if paging.failure_notify_uri.is_some() {
+            if !paging.failure_notify_targets().is_empty() {
                 ", requester notified (UE_NOT_RESPONDING)"
             } else {
                 ""
@@ -23665,6 +23818,7 @@ mod tests {
     mod racs_handler_tests;
     mod racs_mapping_tests;
     mod reject_path_tests;
+    mod ue_context_modification_tests;
     /// #686: UE contexts survive an AMF restart.
     mod ue_context_store_tests;
     /// #999: every handler's undecodable arm answers TS 38.413 §10.2.
@@ -27675,7 +27829,7 @@ mod tests {
     /// builder, so the copy from the UE context is the one under test.
     fn queue_paging(ngap: &NgapServer, ue: u64) {
         let amf_ue = ngap.ue_auth_state.get(ue).expect("UE").amf_ue;
-        crate::namf_handler::initiate_paging_for_idle_ue(
+        assert!(crate::namf_handler::initiate_paging_for_idle_ue(
             &amf_ue,
             None,
             None,
@@ -27683,7 +27837,7 @@ mod tests {
             crate::namf_handler::PagedN2::Setup,
             None,
             None,
-        );
+        ));
     }
 
     /// The associations the PAGINGs for 5G-TMSI `tmsi` went out on, in send order.
@@ -39361,7 +39515,8 @@ mod tests {
     /// session 5, and the subscription is told the UE's current location.
     ///
     /// REVERT-VERIFIED: with `paging_ongoing` counting a location-only page again
-    /// (`paging_holds_transfer` ignoring `location_only`), the transfer is refused
+    /// (`paging_holds_transfer` ignoring `location_only`; since #1837 the same
+    /// check is `paging_add`'s refusal), the transfer is refused
     /// ("not refused for a location-only page"); with `paging_add` not carrying the
     /// waiting subscriptions over, nothing is reported ("a LOCATION_REPORT must be
     /// delivered" via "the subscription still waits on the page").

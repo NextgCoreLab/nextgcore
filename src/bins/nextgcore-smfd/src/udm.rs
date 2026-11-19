@@ -167,11 +167,33 @@ pub fn parse_bit_rate(raw: &str) -> Option<u64> {
     Some(bps as u64)
 }
 
+/// #1878: whether two S-NSSAI SDs name the same slice differentiator. An SD is 6 hex
+/// digits in either case (TS 29.571 §5.4.4.2: "pattern '^[A-Fa-f0-9]{6}$'"), and the
+/// value FFFFFF means no SD is associated with the SST (TS 23.003 §28.4.2), the same
+/// as an absent one.
+pub fn same_sd(a: Option<&str>, b: Option<&str>) -> bool {
+    fn norm(sd: Option<&str>) -> Option<String> {
+        sd.map(str::to_ascii_lowercase).filter(|s| s != "ffffff")
+    }
+    norm(a) == norm(b)
+}
+
+/// #1878: the UDM holds Session Management Subscription data for the DNN, and none
+/// of it is for the session's S-NSSAI: the subscriber has no subscription for the
+/// DNN on this slice (TS 29.502 `SNSSAI_DENIED`, 5GSM cause #70).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceNotSubscribed;
+
 /// Extract the enforceable subscription values for `dnn` out of an `sm-data` body.
 ///
 /// The response is either one `SessionManagementSubscriptionData` or an array of
-/// them (one per S-NSSAI); both are accepted, and when an S-NSSAI is supplied the
-/// matching entry is preferred over the first. Inside it, `dnnConfigurations` is a
+/// them (one per S-NSSAI); both are accepted, and only the entry for the session's
+/// own S-NSSAI is used (#1878: the SD compared in either case). None for it, among
+/// entries that name one, is [`SliceNotSubscribed`]: this used to fall back to the
+/// FIRST entry, giving the session another slice's Session-AMBR and default 5QI.
+/// Entries without a `singleNssai` (required by TS 29.503) are malformed and
+/// ignored; a body with no well-formed entry at all states no values, as before.
+/// Inside the entry, `dnnConfigurations` is a
 /// map keyed by DNN, and TS 29.503 allows the **wildcard DNN** as a key, so an
 /// exact match is tried first and the wildcard second.
 ///
@@ -184,27 +206,25 @@ pub fn parse_sm_data(
     dnn: &str,
     sst: u8,
     sd: Option<&str>,
-) -> SubscribedSmData {
+) -> Result<SubscribedSmData, SliceNotSubscribed> {
     let entries: Vec<&serde_json::Value> = match json {
         serde_json::Value::Array(items) => items.iter().collect(),
         other => vec![other],
     };
-    // Prefer the entry whose singleNssai matches; fall back to the first.
-    let entry = entries
-        .iter()
+    let well_formed: Vec<&serde_json::Value> = entries
+        .into_iter()
+        .filter(|e| e["singleNssai"]["sst"].as_u64().is_some())
+        .collect();
+    if well_formed.is_empty() {
+        return Ok(SubscribedSmData::default());
+    }
+    let entry = well_formed
+        .into_iter()
         .find(|e| {
             let nssai = &e["singleNssai"];
-            nssai["sst"].as_u64() == Some(sst as u64)
-                && match sd {
-                    Some(sd) => nssai["sd"].as_str() == Some(sd),
-                    None => nssai.get("sd").is_none() || nssai["sd"].is_null(),
-                }
+            nssai["sst"].as_u64() == Some(u64::from(sst)) && same_sd(nssai["sd"].as_str(), sd)
         })
-        .or(entries.first())
-        .copied();
-    let Some(entry) = entry else {
-        return SubscribedSmData::default();
-    };
+        .ok_or(SliceNotSubscribed)?;
 
     let configs = &entry["dnnConfigurations"];
     // TS 29.503: the wildcard DNN is a permitted key. Exact match wins.
@@ -215,7 +235,7 @@ pub fn parse_sm_data(
 
     let ambr = &config["sessionAmbr"];
     let qos = &config["5gQosProfile"];
-    SubscribedSmData {
+    Ok(SubscribedSmData {
         sess_ambr_ul_bps: ambr["uplink"].as_str().and_then(parse_bit_rate),
         sess_ambr_dl_bps: ambr["downlink"].as_str().and_then(parse_bit_rate),
         // 5Qi is 0..=255 in TS 29.571.
@@ -224,7 +244,7 @@ pub fn parse_sm_data(
             .as_u64()
             .filter(|p| (1..=15).contains(p))
             .map(|p| p as u8),
-    }
+    })
 }
 
 /// #1648: the client for a Nudm service operation (UECM registration, SDM get and
@@ -260,16 +280,22 @@ pub(crate) async fn udm_client(
 /// server stores query values without percent-decoding them (issue #65), so a
 /// conformantly-encoded value cannot round-trip in-tree. The S-NSSAI is instead
 /// matched inside [`parse_sm_data`], which needs no wire support.
+///
+/// `Ok(None)` when no values could be read (leg off, UDM unreachable or failing, a
+/// body that is not JSON): the session runs on the configured default. `Err` when
+/// the UDM answered and has no subscription for the DNN on this S-NSSAI (#1878).
 pub async fn fetch_sm_data(
     supi: &str,
     dnn: &str,
     sst: u8,
     sd: Option<&str>,
-) -> Option<SubscribedSmData> {
+) -> Result<Option<SubscribedSmData>, SliceNotSubscribed> {
     if !enabled() {
-        return None;
+        return Ok(None);
     }
-    let (host, port) = crate::discover_udm_sdm_endpoint().await?;
+    let Some((host, port)) = crate::discover_udm_sdm_endpoint().await else {
+        return Ok(None);
+    };
     let client = udm_client(&host, port).await;
     let path = format!("/nudm-sdm/v2/{supi}/sm-data?dnn={dnn}");
     let response = match client.get(&path).await {
@@ -279,7 +305,7 @@ pub async fn fetch_sm_data(
                 "[{supi}] Nudm_SDM_Get sm-data failed: {e}. QoS falls back to the \
                  configured default for DNN {dnn}."
             );
-            return None;
+            return Ok(None);
         }
     };
     if !response.is_success() {
@@ -288,17 +314,26 @@ pub async fn fetch_sm_data(
              configured default for DNN {dnn}.",
             response.status
         );
-        return None;
+        return Ok(None);
     }
     let body = response.http.content.as_deref().unwrap_or_default();
     let json: serde_json::Value = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
             log::warn!("[{supi}] sm-data is not valid JSON: {e}");
-            return None;
+            return Ok(None);
         }
     };
-    let data = parse_sm_data(&json, dnn, sst, sd);
+    let data = match parse_sm_data(&json, dnn, sst, sd) {
+        Ok(data) => data,
+        Err(e) => {
+            log::warn!(
+                "[{supi}] sm-data for DNN {dnn} has no entry for S-NSSAI[SST:{sst} SD:{sd:?}]: \
+                 the subscriber is not subscribed to this DNN on this slice"
+            );
+            return Err(e);
+        }
+    };
     if data.is_empty() {
         log::info!(
             "[{supi}] sm-data carried no enforceable values for DNN {dnn}: the \
@@ -307,7 +342,7 @@ pub async fn fetch_sm_data(
     } else {
         log::info!("[{supi}] subscribed SM data for DNN {dnn}: {data:?}");
     }
-    Some(data)
+    Ok(Some(data))
 }
 
 /// `EpsInterworkingIndication` (TS 29.502 `SmContextCreateData.epsInterworkingInd`).
@@ -807,7 +842,7 @@ mod tests {
 
     #[test]
     fn sm_data_yields_the_subscribed_ambr_and_default_5qi_for_the_right_dnn() {
-        let data = parse_sm_data(&sm_data_body(), "internet", 1, Some("010203"));
+        let data = parse_sm_data(&sm_data_body(), "internet", 1, Some("010203")).unwrap();
         assert_eq!(data.sess_ambr_ul_bps, Some(100_000_000));
         assert_eq!(data.sess_ambr_dl_bps, Some(500_000_000));
         assert_eq!(data.default_5qi, Some(7));
@@ -817,7 +852,7 @@ mod tests {
         // A DNN the subscription does not configure yields nothing enforceable --
         // NOT another DNN's values, which is what a "take the first entry" lookup
         // over a map would do.
-        let other = parse_sm_data(&sm_data_body(), "ims", 1, Some("010203"));
+        let other = parse_sm_data(&sm_data_body(), "ims", 1, Some("010203")).unwrap();
         assert!(
             other.is_empty(),
             "an unconfigured DNN must not inherit another DNN's subscription, got {other:?}"
@@ -836,12 +871,16 @@ mod tests {
             }
         });
         assert_eq!(
-            parse_sm_data(&body, "internet", 1, None).sess_ambr_ul_bps,
+            parse_sm_data(&body, "internet", 1, None)
+                .unwrap()
+                .sess_ambr_ul_bps,
             Some(100_000_000),
             "the exact DNN entry must win"
         );
         assert_eq!(
-            parse_sm_data(&body, "anything-else", 1, None).sess_ambr_ul_bps,
+            parse_sm_data(&body, "anything-else", 1, None)
+                .unwrap()
+                .sess_ambr_ul_bps,
             Some(1_000_000),
             "an unlisted DNN falls back to the wildcard"
         );
@@ -864,14 +903,85 @@ mod tests {
             }
         ]);
         assert_eq!(
-            parse_sm_data(&body, "internet", 1, Some("010203")).sess_ambr_ul_bps,
+            parse_sm_data(&body, "internet", 1, Some("010203"))
+                .unwrap()
+                .sess_ambr_ul_bps,
             Some(100_000_000),
             "the entry for the session's own S-NSSAI must be chosen, not the first"
         );
         assert_eq!(
-            parse_sm_data(&body, "internet", 2, None).sess_ambr_ul_bps,
+            parse_sm_data(&body, "internet", 2, None)
+                .unwrap()
+                .sess_ambr_ul_bps,
             Some(1_000_000)
         );
+    }
+
+    /// #1878: an SD is hex in either case (TS 29.571 §5.4.4.2), so an entry the UDM
+    /// spells in upper case is the session's own; and FFFFFF is no SD (TS 23.003
+    /// §28.4.2).
+    ///
+    /// REVERT-VERIFIED: with the case-sensitive compare back, this fails: the
+    /// upper-case entry is not the session's slice.
+    #[test]
+    fn the_sd_is_matched_in_either_case_1878() {
+        let body = serde_json::json!([{
+            "singleNssai": { "sst": 1, "sd": "0A0B0C" },
+            "dnnConfigurations": { "internet": {
+                "sessionAmbr": { "uplink": "100 Mbps", "downlink": "500 Mbps" } } }
+        }]);
+        assert_eq!(
+            parse_sm_data(&body, "internet", 1, Some("0a0b0c")).map(|d| d.sess_ambr_ul_bps),
+            Ok(Some(100_000_000))
+        );
+        assert!(same_sd(Some("FFFFFF"), None), "FFFFFF is no SD");
+        assert!(same_sd(Some("ffffff"), None));
+        assert!(!same_sd(Some("010203"), None), "an SD is not no SD");
+        assert!(!same_sd(Some("010203"), Some("010204")));
+    }
+
+    /// #1878: with entries for other slices only, the session's slice is not
+    /// subscribed. It used to take the FIRST entry: another slice's AMBR and 5QI.
+    ///
+    /// REVERT-VERIFIED: with the fall-back to the first entry restored, this fails:
+    /// SST 1 SD 010203 is given SST 2's 1 Mbps.
+    #[test]
+    fn no_entry_for_the_sessions_slice_is_not_subscribed_1878() {
+        let other = serde_json::json!([{
+            "singleNssai": { "sst": 2 },
+            "dnnConfigurations": { "internet": {
+                "sessionAmbr": { "uplink": "1 Mbps", "downlink": "1 Mbps" },
+                "5gQosProfile": { "5qi": 8 } } }
+        }]);
+        assert_eq!(
+            parse_sm_data(&other, "internet", 1, Some("010203")),
+            Err(SliceNotSubscribed)
+        );
+        // Same SST, another SD; and an SD where the entry has none.
+        let other_sd = serde_json::json!({ "singleNssai": { "sst": 1, "sd": "010204" },
+            "dnnConfigurations": { "internet": {} } });
+        assert_eq!(
+            parse_sm_data(&other_sd, "internet", 1, Some("010203")),
+            Err(SliceNotSubscribed)
+        );
+        let no_sd = serde_json::json!({ "singleNssai": { "sst": 1 },
+            "dnnConfigurations": { "internet": {} } });
+        assert_eq!(
+            parse_sm_data(&no_sd, "internet", 1, Some("010203")),
+            Err(SliceNotSubscribed)
+        );
+        // No entries at all (or only malformed ones) states nothing, as before.
+        for nothing in [
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!([{}]),
+        ] {
+            assert_eq!(
+                parse_sm_data(&nothing, "internet", 1, Some("010203")),
+                Ok(SubscribedSmData::default()),
+                "{nothing}"
+            );
+        }
     }
 
     #[test]
@@ -886,7 +996,7 @@ mod tests {
                                 "dnnConfigurations": { "internet": {
                                     "sessionAmbr": { "uplink": "lots", "downlink": "more" } } } }),
         ] {
-            let data = parse_sm_data(&body, "internet", 1, None);
+            let data = parse_sm_data(&body, "internet", 1, None).unwrap();
             assert!(data.is_empty(), "expected nothing enforceable from {body}");
             assert_ne!(
                 data.sess_ambr_ul_bps,
@@ -900,7 +1010,7 @@ mod tests {
         let body = serde_json::json!({ "singleNssai": { "sst": 1 },
             "dnnConfigurations": { "internet": {
                 "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 0 } } } } });
-        let data = parse_sm_data(&body, "internet", 1, None);
+        let data = parse_sm_data(&body, "internet", 1, None).unwrap();
         assert_eq!(data.default_5qi, Some(9));
         assert_eq!(data.arp_priority_level, None);
     }
@@ -909,7 +1019,7 @@ mod tests {
     async fn a_disabled_leg_neither_fetches_nor_registers() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         set_for_test(false);
-        assert!(fetch_sm_data("imsi-1", "internet", 1, None).await.is_none());
+        assert_eq!(fetch_sm_data("imsi-1", "internet", 1, None).await, Ok(None));
         assert!(
             !register_as_serving_smf(
                 "imsi-1",
@@ -1003,6 +1113,7 @@ mod tests {
         );
         let data = fetch_sm_data(supi, "internet", 1, Some("010203"))
             .await
+            .expect("the session's slice is subscribed")
             .expect("sm-data must be fetched");
         assert_eq!(data.sess_ambr_ul_bps, Some(100_000_000));
         assert_eq!(data.default_5qi, Some(7));

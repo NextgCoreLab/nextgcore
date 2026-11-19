@@ -513,6 +513,29 @@ Remove the patch before re-running `deploy-eks.sh`. `kubectl apply` keeps fields
 that `kubectl patch` added, so delete them with a JSON patch that removes the env
 entry, the volume mount and the volume.
 
+## UDM durable state (optional, off by default)
+
+By default udmd keeps its SDM subscriptions, its am-data subscriptions at the UDR
+(the "legs") and the am-data changes waiting for an AMF in memory (#1836). A udmd
+restart then loses them. The AMF's SDM subscription is gone without the AMF
+knowing, and provisioning changes stop reaching it until the UE registers again.
+The leg refresh and the AMF retry still work without a state file. Only the
+restart is not survived.
+
+With a state file (`NEXTGCORE_UDM_STATE_FILE` or `--state-file`), udmd writes all
+of them before it answers, and restores them at start. Its first leg refresh then
+re-points the UDR to the pod's new address.
+
+The profiles and the helm chart leave it **off**: they mount no UDM state volume.
+udmd logs `no UDM state file ... lost on restart` at start. The shipped Docker
+compose sets it on the `udm_state` volume. To enable it here, add a volume at
+`/var/lib/nextgcore` (owned by the image's `nextgcore` user) and
+`NEXTGCORE_UDM_STATE_FILE=/var/lib/nextgcore/udm-state.json` to the udm
+Deployment, as for smfd above. The same caveats apply: an `emptyDir` survives a
+container restart only, and pod re-creation needs a PersistentVolume. With more
+than one udm replica, each replica needs its own file, because the state is per
+instance. The chart-side volume is tracked separately.
+
 ## Known limitations
 
 Infrastructure (see `Outputs.Caveats` in the template):
