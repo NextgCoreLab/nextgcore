@@ -342,8 +342,14 @@ impl NefTriggerTransaction {
 
     /// Whether the verified `caller` owns this transaction under `scs_as_id`
     /// (#2276): it is the identity that created it, through the same
-    /// `{scsAsId}`. A transaction with no recorded owner (persisted before
-    /// #2276) is nobody's.
+    /// `{scsAsId}`.
+    ///
+    /// A transaction with no recorded owner (persisted before #2276) is
+    /// nobody's, and is denied to every caller, its `{scsAsId}` included (R48
+    /// on #2279). Its creator was never verified, so adopting it on the first
+    /// verified access would hand it to whoever claims that `{scsAsId}` first.
+    /// The operator removes such transactions from the state file; the NEF
+    /// names how many there are when it loads them.
     pub fn is_owned_by(&self, caller: &str, scs_as_id: &str) -> bool {
         self.owner_id.as_deref() == Some(caller) && self.scs_as_id == scs_as_id
     }
@@ -592,11 +598,13 @@ impl NefContext {
                 }
             }
         }
+        let mut ownerless = 0usize;
         if let Some(arr) = doc.get("transactions").and_then(|v| v.as_array()) {
             if let Ok(mut txns) = self.transactions.write() {
                 for v in arr {
                     match serde_json::from_value::<NefTriggerTransaction>(v.clone()) {
                         Ok(txn) => {
+                            ownerless += usize::from(txn.owner_id.is_none());
                             txns.insert(txn.id.clone(), txn);
                             restored += 1;
                         }
@@ -617,6 +625,14 @@ impl NefContext {
                     }
                 }
             }
+        }
+        if ownerless > 0 {
+            // R48 on #2279: denied to every caller (`is_owned_by`), so said.
+            log::warn!(
+                "{ownerless} device triggering transaction(s) in the state file predate #2276 \
+                 and have no verified owner: no SCS/AS can read, change or delete them; remove \
+                 them from the state file"
+            );
         }
         // #2086: and the unsubscribes still owed, so a restart retries them.
         if let Some(arr) = doc.get("parkedUnsubscribes").and_then(|v| v.as_array()) {
