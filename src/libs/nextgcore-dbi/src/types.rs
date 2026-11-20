@@ -91,6 +91,9 @@ pub const NEXTGCORE_AMBR_STRING: &str = "ambr";
 /// Subscribed 3GPP-Charging-Characteristics field, subscriber and per-APN
 /// (nextgcore #56).
 pub const NEXTGCORE_CHARGING_CHARACTERISTICS_STRING: &str = "charging_characteristics";
+/// #2260: the subscriber's Ranging and Sidelink Positioning privacy profile, a
+/// TS 29.503 `RangingSlPrivacyData` document (or its JSON text).
+pub const NEXTGCORE_RANGING_SL_PRIVACY_STRING: &str = "ranging_sl_privacy";
 /// Dynamically allocated PDN-GW identity, per APN (nextgcore #56).
 pub const NEXTGCORE_PGW_ID_STRING: &str = "pgw_id";
 pub const NEXTGCORE_DOWNLINK_STRING: &str = "downlink";
@@ -344,6 +347,10 @@ pub struct NextgcoreSubscriptionData {
     /// the operator wrote. `None` means the subscriber has none provisioned, which
     /// is what the AVP being absent means.
     pub charging_characteristics: Option<String>,
+    /// #2260: the Ranging and Sidelink Positioning privacy profile (TS 29.503
+    /// `RangingSlPrivacyData`, TS 23.586 §4.3.4) as provisioned, as JSON text.
+    /// `None` when none is provisioned.
+    pub ranging_sl_privacy: Option<String>,
 }
 
 impl NextgcoreSubscriptionData {

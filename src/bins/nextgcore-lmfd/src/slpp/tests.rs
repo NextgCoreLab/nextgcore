@@ -656,20 +656,35 @@ fn live_sessions_are_capped() {
     assert!(!s.begin_live("ue", "one-more"));
 }
 
-/// R45 M1 on #2254: an applicationLayerID is its first claimer's. Another UE
-/// cannot take it while that binding is in use, and an idle binding expires.
+/// #2260: an applicationLayerID is bound to the UE the 5GC maps it to, and
+/// only that one. A re-read mapping replaces the UE's set: an ID moved to
+/// another UE follows it, an ID no longer mapped is unbound, and an unused
+/// binding expires.
 #[test]
-fn an_application_layer_id_is_bound_to_its_first_ue() {
+fn an_application_layer_id_is_bound_to_the_ue_the_network_maps_it_to_2260() {
     let b = AppIdBindings::default();
     let t0 = Instant::now();
-    assert!(b.claim_at(&UE_A, "imsi-a", t0));
-    assert!(b.claim_at(&UE_A, "imsi-a", t0), "its own again");
-    assert!(!b.claim_at(&UE_A, "imsi-mallory", t0), "not another UE's");
-    assert!(b.is_bound_to(&UE_A, "imsi-a"));
-    assert!(!b.is_bound_to(&UE_A, "imsi-mallory"));
     assert!(
-        b.claim_at(&UE_A, "imsi-other", t0 + APP_ID_BINDING_IDLE),
-        "free again once idle"
+        !b.is_bound_at(&UE_A, "imsi-a", t0),
+        "nothing before the network says so"
+    );
+    b.authorise_at("imsi-a", &[UE_A.to_vec()], t0);
+    assert!(b.is_bound_at(&UE_A, "imsi-a", t0));
+    assert!(!b.is_bound_at(&UE_A, "imsi-mallory", t0));
+    // Mallory's own mapping leaves A's ID alone.
+    b.authorise_at("imsi-mallory", &[UE_B.to_vec()], t0);
+    assert!(b.is_bound_at(&UE_A, "imsi-a", t0));
+    // The mapping moves to another UE.
+    b.authorise_at("imsi-other", &[UE_A.to_vec()], t0);
+    assert!(b.is_bound_at(&UE_A, "imsi-other", t0));
+    assert!(!b.is_bound_at(&UE_A, "imsi-a", t0));
+    // No longer mapped to it: unbound.
+    b.authorise_at("imsi-other", &[], t0);
+    assert!(!b.is_bound_at(&UE_A, "imsi-other", t0));
+    b.authorise_at("imsi-a", &[UE_A.to_vec()], t0);
+    assert!(
+        !b.is_bound_at(&UE_A, "imsi-a", t0 + APP_ID_BINDING_IDLE),
+        "expired once idle"
     );
 }
 
@@ -683,6 +698,9 @@ fn located(seq: u8) -> Vec<u8> {
 /// R45 M1 on #2254 at the handler, R45's probe: a UE that forges A5A5A5's report
 /// gets nothing held, solicited or not. The honest UE's answer to an exchange
 /// is held, and an unsolicited one is not.
+///
+/// #2260: the honest UE's ID is the one the network mapped to it before its
+/// run, so its answer is held; Mallory's ID is another one.
 #[tokio::test]
 async fn only_solicited_halves_under_the_ue_s_own_id_are_held() {
     let _g = SLPP_GLOBALS_TEST_LOCK.lock().await;
@@ -709,7 +727,9 @@ async fn only_solicited_halves_under_the_ue_s_own_id_are_held() {
         "unsolicited"
     );
 
-    // The honest UE answers its exchange: held, and A5A5A5 is now its.
+    // The honest UE answers its exchange: held under the ID mapped to it.
+    app_id_bindings().authorise(honest, &[UE_A.to_vec()]);
+    app_id_bindings().authorise(mallory, &[b"mallory".to_vec()]);
     let (_g1, rx) = exchanges().begin(honest, 2).expect("begins");
     crate::slpp_uplink_answers(honest, Some("h-1"), &located(1));
     assert!(rx.await.is_ok());
@@ -772,4 +792,64 @@ async fn only_solicited_halves_under_the_ue_s_own_id_are_held() {
         sequences().end_session(honest, Some(s));
         sequences().end_session(mallory, Some(s));
     }
+}
+
+/// **#2260, the residual of R45 M1 on #2254.** A UE that answers with another
+/// UE's applicationLayerID is never given it, however often it is ranged and
+/// even when it answers before the owner ever has. Before #2260 the first
+/// solicited claim bound the ID to the claimer and every later claim refreshed
+/// it, so the squatter held it for as long as it kept being ranged. Now only
+/// the ID the network maps to a UE (TS 23.586 §4.3.5) is that UE's: the
+/// squatter's reports under A5A5A5 are not held, and the owner's are, once the
+/// network has mapped A5A5A5 to it.
+///
+/// REVERT-VERIFIED: with the first-claimer binding restored (the uplink binds
+/// an unbound ID to the UE that answers with it), the squatter's first forged
+/// half is held and A5A5A5 stays bound to the squatter through every round.
+#[tokio::test]
+async fn a_ue_ranged_repeatedly_under_another_ue_s_id_is_never_given_it_2260() {
+    let _g = SLPP_GLOBALS_TEST_LOCK.lock().await;
+    let owner = "imsi-001010000226001";
+    let squatter = "imsi-001010000226002";
+    app_id_bindings().forget(&UE_A);
+    app_id_bindings().authorise(owner, &[]);
+    sl_rtt_store().clear();
+    // The network maps the squatter's own ID to it; A5A5A5 is mapped to no one
+    // yet (the owner has not been ranged).
+    app_id_bindings().authorise(squatter, &[b"squatter".to_vec()]);
+    for round in 0..5u8 {
+        let session = format!("sq-{round}");
+        let (_g1, rx) = exchanges().begin(squatter, 2).expect("begins");
+        crate::slpp_uplink_answers(squatter, Some(&session), &located(round + 1));
+        assert!(rx.await.is_ok(), "round {round}: its exchange is answered");
+        assert!(
+            !app_id_bindings().is_bound_to(&UE_A, squatter),
+            "round {round}: A5A5A5 is not the squatter's"
+        );
+        assert!(
+            sl_rtt_store().range_between(&UE_A, &UE_B).is_none(),
+            "round {round}: no half held under A5A5A5"
+        );
+        assert_eq!(range_for(squatter, &UE_A, &UE_B), None);
+        sequences().end_session(squatter, Some(&session));
+    }
+    // The owner, once the network maps A5A5A5 to it, is held.
+    sl_rtt_store().note(
+        &UE_B,
+        &[SlRttHalf {
+            peer: UE_A.to_vec(),
+            rx_tx_tc: 330.0,
+        }],
+    );
+    app_id_bindings().authorise(owner, &[UE_A.to_vec()]);
+    let (_g2, rx) = exchanges().begin(owner, 2).expect("begins");
+    crate::slpp_uplink_answers(owner, Some("ow-1"), &located(1));
+    assert!(rx.await.is_ok());
+    assert!(
+        range_for(owner, &UE_A, &UE_B).is_some(),
+        "the owner's range"
+    );
+    app_id_bindings().forget(&UE_A);
+    app_id_bindings().authorise(squatter, &[]);
+    sequences().end_session(owner, Some("ow-1"));
 }

@@ -1066,6 +1066,11 @@ async fn handle_subscription_data(
     if parts.get(4).copied() == Some("identity-data") {
         return handle_identity_data(supi_or_suci, method, request).await;
     }
+    // #2260: lcs-privacy-data is also keyed by any VarUeId (TS 29.505
+    // `/subscription-data/{ueId}/lcs-privacy-data`); the NEF reads it by GPSI.
+    if parts.get(4).copied() == Some("lcs-privacy-data") && parts.len() == 5 {
+        return handle_lcs_privacy_data(supi_or_suci, method).await;
+    }
 
     // Convert SUCI to IMSI if needed
     // SUCI format: suci-{type}-{mcc}-{mnc}-{routing}-{scheme}-{msin}
@@ -1155,6 +1160,34 @@ async fn handle_subscription_data(
                 send_not_found("Unknown sub-resource", None)
             }
         }
+    }
+}
+
+/// #2260: `GET /subscription-data/{ueId}/lcs-privacy-data` (TS 29.505), as far
+/// as this UDR holds it: the Ranging and Sidelink Positioning privacy profile
+/// (TS 29.503 `LcsPrivacyData.rangingSlPrivacyData`), provisioned in the
+/// subscriber record (`ranging_sl_privacy`). `{ueId}` may be a SUPI or a GPSI.
+/// A subscriber with no profile is DATA_NOT_FOUND, not an empty document.
+async fn handle_lcs_privacy_data(ue_id: &str, method: &str) -> SbiResponse {
+    if method != "GET" {
+        return send_method_not_allowed(method, "lcs-privacy-data");
+    }
+    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(ue_id.to_string())
+        .await
+    {
+        Ok(data) => match data
+            .ranging_sl_privacy
+            .as_deref()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+            .filter(serde_json::Value::is_object)
+        {
+            Some(ranging) => SbiResponse::with_status(200).with_body(
+                serde_json::json!({ "rangingSlPrivacyData": ranging }).to_string(),
+                "application/json",
+            ),
+            None => send_not_found("No LCS privacy data for this UE", Some("DATA_NOT_FOUND")),
+        },
+        Err(e) => store_read_failure(ue_id, "lcs-privacy-data", &e),
     }
 }
 
@@ -4504,7 +4537,140 @@ async fn handle_application_data(
             collection @ ("bdtPolicyData" | "iptvConfigData" | "serviceParamData"
             | "am-influence-data" | "af-qos-data-sets" | "eas-deploy-data"),
         ) => handle_application_dataset(collection, parts.get(4).copied(), method, request),
+        // #2260: the Ranging/SL UE ID mappings (TS 29.519 §6.2.26, §6.2.27).
+        Some("ueid-mappings") => handle_ueid_mappings(parts.get(4).copied(), method, request),
         _ => send_not_found("Unknown application-data resource", None),
+    }
+}
+
+/// #2260: serialises the 1:1 check and the write of a UE ID mapping
+/// ([`handle_ueid_mappings`]), so two writers cannot both find the ID free.
+static UEID_MAPPINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Tests only: a pause between the 1:1 check and the write, so a test can
+/// show two writers do not both pass it.
+#[cfg(test)]
+static UEID_WRITE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2260: `/application-data/ueid-mappings[/{ueMappingId}]` (TS 29.519
+/// §6.2.26, §6.2.27; TS 23.586 §4.3.5): the UDR stores the mapping between a
+/// Ranging/Sidelink Positioning Application Layer ID and a GPSI, provisioned by
+/// an AF through the NEF or pre-provisioned by the operator (Table 5.2.x NOTE 2).
+///
+/// - The collection GET filters by `gpsis` or `app-layer-ids`, which are
+///   mutually exclusive (Table 6.2.26.3.1-1 NOTE), and answers an array of
+///   `UeIdMappingInfo`, empty when nothing matches (Table 6.2.26.3.1-3).
+/// - The individual resource supports GET, PUT (create or update) and DELETE
+///   (§6.2.27.3). A `rsUeIdMappingInfo` must carry both `appLayerId` and `gpsi`
+///   (TS 29.522 `RangSlUeIdMappInfo`, both required).
+fn handle_ueid_mappings(id: Option<&str>, method: &str, request: &SbiRequest) -> SbiResponse {
+    const STORE: &str = "app-ueid-mappings";
+    let ds = data_store::store();
+    let member = |doc: &serde_json::Value, name: &str| {
+        doc.get("rsUeIdMappingInfo")
+            .and_then(|m| m.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    match (id, method) {
+        (None, "GET") => {
+            let gpsis = csv_param(request, "gpsis");
+            let app_ids = csv_param(request, "app-layer-ids");
+            if gpsis.is_some() && app_ids.is_some() {
+                return send_bad_request(
+                    "gpsis and app-layer-ids are mutually exclusive",
+                    Some("INVALID_QUERY_PARAM"),
+                );
+            }
+            let keep = |doc: &serde_json::Value| match (&gpsis, &app_ids) {
+                (Some(g), _) => member(doc, "gpsi").is_some_and(|v| g.contains(&v)),
+                (_, Some(a)) => member(doc, "appLayerId").is_some_and(|v| a.contains(&v)),
+                _ => true,
+            };
+            let list: Vec<serde_json::Value> = ds
+                .doc_list(STORE)
+                .into_iter()
+                .map(|(_, v)| v)
+                .filter(keep)
+                .collect();
+            SbiResponse::with_status(200).with_body(
+                serde_json::Value::Array(list).to_string(),
+                "application/json",
+            )
+        }
+        (Some(id), "GET") => match ds.doc_get(STORE, id) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("UE ID Mapping not found", Some("DATA_NOT_FOUND")),
+        },
+        (Some(id), "PUT") => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            if body.get("rsUeIdMappingInfo").is_some() {
+                for attr in ["appLayerId", "gpsi"] {
+                    if member(&body, attr).is_none() {
+                        return missing_mandatory(&format!("rsUeIdMappingInfo.{attr}"));
+                    }
+                }
+            }
+            // #2260 (R48 on #2265): the mapping is 1:1 (TS 29.522 §4.4.32.1
+            // NOTE), and the UDR is where every writer meets, so it holds that
+            // here: an Application Layer ID or a GPSI that another mapping
+            // already has is refused, whoever writes. The check and the write
+            // are one step under one lock, so two concurrent writers cannot
+            // both pass it.
+            let _one_writer = UEID_MAPPINGS_WRITE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (app, gpsi) = (member(&body, "appLayerId"), member(&body, "gpsi"));
+            let taken = ds.doc_list(STORE).into_iter().any(|(other, doc)| {
+                other != id
+                    && ((app.is_some() && member(&doc, "appLayerId") == app)
+                        || (gpsi.is_some() && member(&doc, "gpsi") == gpsi))
+            });
+            #[cfg(test)]
+            {
+                // A test widens the window between the check and the write.
+                let ms = UEID_WRITE_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+            if taken {
+                return send_error(
+                    403,
+                    "Forbidden",
+                    "the Application Layer ID or the GPSI is already in another UE ID mapping; \
+                     only 1:1 mappings are supported (TS 29.522 §4.4.32.1)",
+                    None,
+                );
+            }
+            let path = format!("/nudr-dr/v2/application-data/ueid-mappings/{id}");
+            if ds.doc_put(STORE, id, body.clone()) {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+            }
+        }
+        (Some(id), "DELETE") => {
+            if ds.doc_remove(STORE, id).is_some() {
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found("UE ID Mapping not found", Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, "application-data/ueid-mappings"),
     }
 }
 
@@ -9407,6 +9573,194 @@ udr:
             .await
             .expect("PUT iptv without multiAccCtrls");
         assert_eq!(resp.status, 400);
+        udr.stop().await.expect("stop");
+    }
+
+    /// #2260: the Ranging/SL UE ID mappings (TS 29.519 §6.2.26, §6.2.27): an
+    /// operator-provisioned mapping is found by its GPSI and by its Application
+    /// Layer ID, the two filters are mutually exclusive, a mapping without its
+    /// GPSI is refused, and a DELETE removes it.
+    ///
+    /// REVERT-VERIFIED: with the route removed, every request is "Unknown
+    /// application-data resource" (404).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_ueid_mappings_2260() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let base = "/nudr-dr/v2/application-data/ueid-mappings";
+        let a = json!({"rsUeIdMappingInfo": {"appLayerId": "ue-a-2260", "gpsi": "msisdn-12260"}});
+        let b = json!({"rsUeIdMappingInfo": {"appLayerId": "ue-b-2260", "gpsi": "msisdn-22260"}});
+        let resp = client
+            .put_json(&format!("{base}/m-a"), &a)
+            .await
+            .expect("PUT a");
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(
+            resp.http.headers.get("location").map(String::as_str),
+            Some("/nudr-dr/v2/application-data/ueid-mappings/m-a")
+        );
+        let resp = client
+            .put_json(&format!("{base}/m-b"), &b)
+            .await
+            .expect("PUT b");
+        assert_eq!(resp.status, 201);
+        let resp = client
+            .put_json(&format!("{base}/m-b"), &b)
+            .await
+            .expect("PUT b again");
+        assert_eq!(resp.status, 200, "an update");
+
+        let get = |q: String| {
+            let client = &client;
+            async move { client.get(&format!("{base}{q}")).await.expect("GET") }
+        };
+        let resp = get("?gpsis=msisdn-12260".into()).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_of(&resp), json!([a]), "by GPSI");
+        let resp = get("?app-layer-ids=ue-b-2260".into()).await;
+        assert_eq!(json_of(&resp), json!([b]), "by Application Layer ID");
+        let resp = get("?gpsis=msisdn-99999".into()).await;
+        assert_eq!(
+            (resp.status, json_of(&resp)),
+            (200, json!([])),
+            "none: empty"
+        );
+        let resp = get("?gpsis=msisdn-12260&app-layer-ids=ue-a-2260".into()).await;
+        assert_eq!(resp.status, 400, "mutually exclusive");
+        assert_eq!(json_of(&resp)["cause"], "INVALID_QUERY_PARAM");
+        let resp = get("/m-a".into()).await;
+        assert_eq!((resp.status, json_of(&resp)), (200, a.clone()));
+
+        let resp = client
+            .put_json(
+                &format!("{base}/m-c"),
+                &json!({"rsUeIdMappingInfo": {"appLayerId": "ue-c"}}),
+            )
+            .await
+            .expect("PUT without gpsi");
+        assert_eq!(resp.status, 400);
+        assert_eq!(json_of(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // 1:1, whoever writes (R48 on #2265): another document cannot take
+        // m-a's ID or GPSI, not even as an exact copy; m-a itself may be
+        // rewritten.
+        for (what, doc) in [
+            ("an exact copy", a.clone()),
+            (
+                "the ID to another GPSI",
+                json!({"rsUeIdMappingInfo": {"appLayerId": "ue-a-2260", "gpsi": "msisdn-92260"}}),
+            ),
+            (
+                "the GPSI to another ID",
+                json!({"rsUeIdMappingInfo": {"appLayerId": "ue-z-2260", "gpsi": "msisdn-12260"}}),
+            ),
+        ] {
+            let resp = client
+                .put_json(&format!("{base}/m-x"), &doc)
+                .await
+                .expect("PUT m-x");
+            assert_eq!(resp.status, 403, "{what}");
+        }
+        let resp = client
+            .put_json(&format!("{base}/m-a"), &a)
+            .await
+            .expect("PUT a again");
+        assert_eq!(resp.status, 200, "its own document");
+        assert_eq!(get("/m-x".into()).await.status, 404, "nothing stored");
+
+        let resp = client.delete(&format!("{base}/m-a")).await.expect("DELETE");
+        assert_eq!(resp.status, 204);
+        assert_eq!(json_of(&get("?gpsis=msisdn-12260".into()).await), json!([]));
+        assert_eq!(get("/m-a".into()).await.status, 404);
+        let _ = client.delete(&format!("{base}/m-b")).await;
+        udr.stop().await.expect("stop");
+    }
+
+    /// #2260 (R48 MAJOR 2 on #2265): two writers mapping one Application Layer
+    /// ID to two GPSIs at the same moment cannot both succeed. The 1:1 check
+    /// and the write are one step.
+    ///
+    /// The test widens the window between the check and the write (50 ms).
+    ///
+    /// REVERT-VERIFIED: with `UEID_MAPPINGS_WRITE` not taken, both PUTs of a
+    /// round are answered 201.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ueid_mappings_stay_one_to_one_2260() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let base = "/nudr-dr/v2/application-data/ueid-mappings";
+        UEID_WRITE_DELAY_MS.store(50, std::sync::atomic::Ordering::Relaxed);
+        for round in 0..5 {
+            let app = format!("race-{round}-2260");
+            let (one, two) = (
+                json!({"rsUeIdMappingInfo": {"appLayerId": app, "gpsi": format!("msisdn-1{round:04}2260")}}),
+                json!({"rsUeIdMappingInfo": {"appLayerId": app, "gpsi": format!("msisdn-2{round:04}2260")}}),
+            );
+            let (p1, p2) = (
+                format!("{base}/race-{round}-a"),
+                format!("{base}/race-{round}-b"),
+            );
+            let (r1, r2) = tokio::join!(client.put_json(&p1, &one), client.put_json(&p2, &two));
+            let mut codes = [r1.expect("PUT 1").status, r2.expect("PUT 2").status];
+            codes.sort_unstable();
+            assert_eq!(codes, [201, 403], "round {round}: exactly one wins");
+            let resp = client
+                .get(&format!("{base}?app-layer-ids={app}"))
+                .await
+                .expect("GET");
+            assert_eq!(
+                json_of(&resp).as_array().map(Vec::len),
+                Some(1),
+                "round {round}"
+            );
+            let _ = client.delete(&p1).await;
+            let _ = client.delete(&p2).await;
+        }
+        UEID_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        udr.stop().await.expect("stop");
+    }
+
+    /// #2260: the Ranging/SL privacy profile is served from the subscriber
+    /// record at `subscription-data/{ueId}/lcs-privacy-data` (TS 29.505), by
+    /// SUPI and by GPSI. A subscriber with no profile gets DATA_NOT_FOUND.
+    ///
+    /// REVERT-VERIFIED: with the dispatch removed, the GPSI read is refused
+    /// as no SUPI (400).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_lcs_privacy_data_ranging_sl_2260() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let profile = json!({
+            "rangingSlUnrelatedClass": {"rangingSlDefaultUnrelatedClass": {},
+                "rangingSlExternalUnrelatedClass": {"rangingSlAfExternals": [{"afId": "af-2260"}]}}
+        });
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            "imsi-001019900002260",
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": "001019900002260",
+                "ranging_sl_privacy": profile.to_string(),
+            },
+        );
+        nextgcore_dbi::test_store::provision_subscriber("imsi-001019900002260", &["4912260"]);
+        nextgcore_dbi::test_store::provision_subscriber("imsi-001019900002261", &["4912261"]);
+        for ue in ["imsi-001019900002260", "msisdn-4912260"] {
+            let resp = client
+                .get(&format!(
+                    "/nudr-dr/v2/subscription-data/{ue}/lcs-privacy-data"
+                ))
+                .await
+                .expect("GET");
+            assert_eq!(resp.status, 200, "{ue}: {:?}", resp.http.content);
+            assert_eq!(
+                json_of(&resp),
+                json!({"rangingSlPrivacyData": profile}),
+                "{ue}"
+            );
+        }
+        let resp = client
+            .get("/nudr-dr/v2/subscription-data/msisdn-4912261/lcs-privacy-data")
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 404);
+        assert_eq!(json_of(&resp)["cause"], "DATA_NOT_FOUND");
         udr.stop().await.expect("stop");
     }
 

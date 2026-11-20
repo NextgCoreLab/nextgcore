@@ -47,9 +47,14 @@
 //! # Whose half it is (R45 M1 on #2254)
 //!
 //! A UE names itself by the applicationLayerID in its own SLPP-Message, and
-//! nothing on the wire ties that to its SUPI. The LMF therefore binds an ID to
-//! the SUPI of the first UE whose solicited answer carries it ([`AppIdBindings`],
-//! bounded, idle entries expire). A half is held only when:
+//! nothing on the wire ties that to its SUPI. #2260: the binding comes from the
+//! 5GC, not from the UE. Before an SL-RTT run, the LMF reads the Application
+//! Layer IDs the UDR maps to the target's GPSI (TS 23.586 §4.3.5, TS 29.519
+//! §6.2.26, [`crate::nudr_client`]) and binds those to the target
+//! ([`AppIdBindings`], bounded, idle entries expire). Before #2260 the first UE
+//! to claim an ID in a solicited answer kept it, and every later claim
+//! refreshed it, so a UE ranged often enough held another UE's ID for good.
+//! A half is held only when:
 //! - it comes from a ProvideLocationInformation that answers an exchange this
 //!   LMF started, and
 //! - its reporter ID is bound to the UE it arrived from.
@@ -661,8 +666,8 @@ impl SlRttStore {
 pub fn range_for(target: &str, reporter: &[u8], peer: &[u8]) -> Option<f64> {
     if !app_id_bindings().is_bound_to(reporter, target) {
         log::warn!(
-            "SLPP ranging for {target}: its report names an applicationLayerID bound to \
-             another UE; no range"
+            "SLPP ranging for {target}: its report names an applicationLayerID the network \
+             does not map to it; no range"
         );
         return None;
     }
@@ -966,47 +971,53 @@ pub const APP_ID_BINDING_IDLE: Duration = Duration::from_secs(10 * 60);
 /// unused longest goes first.
 pub const APP_ID_BINDING_CAP: usize = 4096;
 
-/// Which UE (SUPI or other UE context id) each applicationLayerID belongs to
-/// (R45 M1 on #2254): the first UE whose solicited answer carried it. A UE
-/// cannot then write halves, or be ranged, under another UE's ID.
+/// Which UE (SUPI or other UE context id) each applicationLayerID belongs to:
+/// the IDs the 5GC maps to that UE's GPSI (#2260, [`AppIdBindings::authorise`]).
+/// A UE cannot then write halves, or be ranged, under an ID the network has not
+/// given it, however often it answers.
 #[derive(Debug, Default)]
 pub struct AppIdBindings {
     inner: Mutex<HashMap<Vec<u8>, (String, Instant)>>,
 }
 
 impl AppIdBindings {
-    /// Whether `app_id` is `ue`'s: bound to it already, or free and now bound.
-    pub fn claim(&self, app_id: &[u8], ue: &str) -> bool {
-        self.claim_at(app_id, ue, Instant::now())
+    /// #2260: `ue`'s authorised IDs are exactly `ids`, as the 5GC maps them now.
+    /// An ID the network maps to `ue` is bound to it, even one bound to another
+    /// UE before (the mapping moved). An ID bound to `ue` that the network no
+    /// longer maps to it is unbound.
+    pub fn authorise(&self, ue: &str, ids: &[Vec<u8>]) {
+        self.authorise_at(ue, ids, Instant::now());
     }
 
-    fn claim_at(&self, app_id: &[u8], ue: &str, now: Instant) -> bool {
+    fn authorise_at(&self, ue: &str, ids: &[Vec<u8>], now: Instant) {
         let Ok(mut m) = self.inner.lock() else {
-            return false;
+            return;
         };
-        if let Some((owner, at)) = m.get_mut(app_id) {
-            if now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE {
-                if owner != ue {
-                    return false;
-                }
-                *at = now;
-                return true;
-            }
-        }
-        if !m.contains_key(app_id) && m.len() >= APP_ID_BINDING_CAP {
-            m.retain(|_, (_, at)| now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE);
-            if m.len() >= APP_ID_BINDING_CAP {
-                if let Some(oldest) = m
-                    .iter()
-                    .min_by_key(|(_, (_, at))| *at)
-                    .map(|(k, _)| k.clone())
-                {
-                    m.remove(&oldest);
+        m.retain(|id, (owner, _)| owner != ue || ids.contains(id));
+        for id in ids {
+            if !m.contains_key(id) && m.len() >= APP_ID_BINDING_CAP {
+                m.retain(|_, (_, at)| now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE);
+                if m.len() >= APP_ID_BINDING_CAP {
+                    if let Some(oldest) = m
+                        .iter()
+                        .min_by_key(|(_, (_, at))| *at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        m.remove(&oldest);
+                    }
                 }
             }
+            m.insert(id.clone(), (ue.to_string(), now));
         }
-        m.insert(app_id.to_vec(), (ue.to_string(), now));
-        true
+    }
+
+    #[cfg(test)]
+    fn is_bound_at(&self, app_id: &[u8], ue: &str, now: Instant) -> bool {
+        self.inner.lock().is_ok_and(|m| {
+            m.get(app_id).is_some_and(|(owner, at)| {
+                owner == ue && now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE
+            })
+        })
     }
 
     /// Whether `app_id` is bound to `ue` now.

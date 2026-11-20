@@ -60,6 +60,7 @@ mod southbound_reconcile; // #1877: failed southbound unsubscribes, retried unti
 /// nextgsim#480 (demo d445a-fl-t8): TS 29.522 UE ID retrieval for an AF.
 #[cfg(feature = "demo-d445a-fl-t8")]
 mod ueid;
+mod ueid_mapping; // #2260: TS 29.522 §5.25 UE ID Mapping Information Provisioning
 
 pub use context::*;
 
@@ -181,6 +182,12 @@ struct Args {
     /// southbound subscribe is deferred.
     #[arg(long)]
     udm_uri: Option<String>,
+
+    /// #2260: UDR SBI base URI for Nudr_DataRepository application data, where
+    /// AF-provisioned UE ID mappings are stored (TS 29.522 §4.4.32.4, TS 29.519
+    /// §6.2.27). When unset, UE ID mapping provisioning is answered 503.
+    #[arg(long)]
+    udr_uri: Option<String>,
 
     /// Externally routable base URI of this NEF's SBI server, used as the
     /// prefix of the notification callback handed to AMF/UDM. Defaults to
@@ -562,6 +569,8 @@ async fn main() -> Result<()> {
             );
             // Issue #110: GPSI→SUPI resolution target; defaults to --udm-uri.
             context.set_udm_sdm_uri(args.udm_sdm_uri.clone());
+            // #2260: where AF-provisioned UE ID mappings are stored.
+            context.set_udr_uri(args.udr_uri.clone());
             if context.udm_sdm_uri().is_none() {
                 log::warn!(
                     "no --udm-sdm-uri or --udm-uri configured: AF monitoring requests that target \
@@ -828,6 +837,13 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "POST" => handle_producer_notification(nef_sub_id, None, &request).await,
             _ => send_method_not_allowed(method, "notify/{subscriptionId}"),
         },
+        // #2260: TS 29.522 §5.25 UE ID Mapping Information Provisioning.
+        ["3gpp-ueid", "v1", af_id, "pp"] => {
+            ueid_mapping::route(method, af_id, None, &request).await
+        }
+        ["3gpp-ueid", "v1", af_id, "pp", pp_id] => {
+            ueid_mapping::route(method, af_id, Some(pp_id), &request).await
+        }
         // nextgsim#480: TS 29.522 UE ID retrieval. The router's own 404 unless
         // demo d445a-fl-t8 is active.
         #[cfg(feature = "demo-d445a-fl-t8")]
@@ -3524,6 +3540,7 @@ mod tests {
         if let Ok(mut c) = nef_self().write() {
             c.set_endpoints(None, None, None, None);
             c.set_udm_sdm_uri(None);
+            c.set_udr_uri(None);
         }
     }
 

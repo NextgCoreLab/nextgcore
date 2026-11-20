@@ -279,6 +279,34 @@ impl NefMonitoringSubscription {
     }
 }
 
+/// #2260: one "Individual UE ID Mapping Information Provisioning" (TS 29.522
+/// §5.25.2.3), held by the NEF so the AF that made it can read, change and
+/// delete it. The mapping itself is in the UDR, under the same id
+/// (`/application-data/ueid-mappings/{id}`, TS 29.519 §6.2.27).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NefUeIdProvisioning {
+    /// The ppId, which is also the UDR's ueMappingId.
+    pub id: String,
+    /// The `{afId}` path segment it was created under.
+    pub af_id: String,
+    /// The verified identity of the AF that created it (issue #110), if any.
+    pub owner_id: Option<String>,
+    /// The `UeIdMappingInfo` as provisioned.
+    pub info: serde_json::Value,
+}
+
+impl NefUeIdProvisioning {
+    /// Same rule as a monitoring subscription's (`is_owned_by`): a verified
+    /// owner must be the caller; without one, the `{afId}` must match.
+    pub fn is_owned_by(&self, caller_id: Option<&str>, af_id: &str) -> bool {
+        match (&self.owner_id, caller_id) {
+            (Some(owner), Some(caller)) => owner == caller && self.af_id == af_id,
+            (Some(_), None) => false,
+            (None, _) => self.af_id == af_id,
+        }
+    }
+}
+
 /// A TS 29.122 §5.10 Device Triggering transaction stored by the NEF.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NefTriggerTransaction {
@@ -342,6 +370,11 @@ pub struct NefContext {
     subscriptions: RwLock<HashMap<String, NefMonitoringSubscription>>,
     /// Device triggering transactions (by transaction ID).
     transactions: RwLock<HashMap<String, NefTriggerTransaction>>,
+    /// #2260: UE ID Mapping Information Provisionings (TS 29.522 §5.25), by ppId.
+    ueid_provisionings: RwLock<HashMap<String, NefUeIdProvisioning>>,
+    /// #2260: UDR SBI base URI for Nudr_DataRepository application data (the
+    /// UE ID mappings, TS 29.519 §6.2.27). None = provisioning refused.
+    udr_uri: Option<String>,
     /// AMF SBI base URI for southbound Namf_EventExposure. None = southbound
     /// deferred (subscriptions are stored northbound-only).
     amf_uri: Option<String>,
@@ -382,6 +415,8 @@ impl NefContext {
         Self {
             subscriptions: RwLock::new(HashMap::new()),
             transactions: RwLock::new(HashMap::new()),
+            ueid_provisionings: RwLock::new(HashMap::new()),
+            udr_uri: None,
             state: nextgcore_core::state_store::StateStore::disabled(),
             amf_uri: None,
             udm_uri: None,
@@ -416,6 +451,9 @@ impl NefContext {
         if let Ok(mut txns) = self.transactions.write() {
             txns.clear();
         }
+        if let Ok(mut pps) = self.ueid_provisionings.write() {
+            pps.clear();
+        }
         self.initialized.store(false, Ordering::SeqCst);
     }
 
@@ -442,6 +480,15 @@ impl NefContext {
     /// [`udm_uri`](Self::udm_uri) when `None` is passed, since it is the same UDM.
     pub fn set_udm_sdm_uri(&mut self, udm_sdm_uri: Option<String>) {
         self.udm_sdm_uri = udm_sdm_uri.or_else(|| self.udm_uri.clone());
+    }
+
+    /// #2260: point UE ID mapping provisioning at a UDR (`--udr-uri`).
+    pub fn set_udr_uri(&mut self, udr_uri: Option<String>) {
+        self.udr_uri = udr_uri;
+    }
+
+    pub fn udr_uri(&self) -> Option<String> {
+        self.udr_uri.clone()
     }
 
     pub fn amf_uri(&self) -> Option<String> {
@@ -504,6 +551,12 @@ impl NefContext {
             "transactions": txns,
             // #2086: the producer-side subscriptions still owed a DELETE.
             "parkedUnsubscribes": crate::southbound_reconcile::snapshot(),
+            // #2260: the AFs' UE ID mapping provisionings.
+            "ueIdProvisionings": self
+                .ueid_provisionings
+                .read()
+                .map(|m| m.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
         })
     }
 
@@ -535,6 +588,19 @@ impl NefContext {
                             restored += 1;
                         }
                         Err(e) => log::warn!("skipping unreadable NEF transaction record: {e}"),
+                    }
+                }
+            }
+        }
+        if let Some(arr) = doc.get("ueIdProvisionings").and_then(|v| v.as_array()) {
+            if let Ok(mut pps) = self.ueid_provisionings.write() {
+                for v in arr {
+                    match serde_json::from_value::<NefUeIdProvisioning>(v.clone()) {
+                        Ok(pp) => {
+                            pps.insert(pp.id.clone(), pp);
+                            restored += 1;
+                        }
+                        Err(e) => log::warn!("skipping unreadable UE ID provisioning record: {e}"),
                     }
                 }
             }
@@ -584,6 +650,45 @@ impl NefContext {
             // was answered successfully and will not survive a restart.
             log::error!("NEF state was NOT persisted: {e}");
         }
+    }
+
+    /// #2260: store or replace a UE ID mapping provisioning, and persist. A new
+    /// one beyond the subscription cap is refused.
+    pub fn ueid_provisioning_put(&self, pp: NefUeIdProvisioning) -> Result<(), NefContextError> {
+        {
+            let mut pps = self
+                .ueid_provisionings
+                .write()
+                .map_err(|_| NefContextError::LockPoisoned)?;
+            if !pps.contains_key(&pp.id) && pps.len() >= self.max_subscriptions {
+                return Err(NefContextError::MaxSubscriptionsReached);
+            }
+            pps.insert(pp.id.clone(), pp);
+        }
+        self.persist();
+        Ok(())
+    }
+
+    /// #2260: one provisioning.
+    pub fn ueid_provisioning_find(&self, id: &str) -> Option<NefUeIdProvisioning> {
+        self.ueid_provisionings.read().ok()?.get(id).cloned()
+    }
+
+    /// #2260: every provisioning made for `af_id`.
+    pub fn ueid_provisionings_of(&self, af_id: &str) -> Vec<NefUeIdProvisioning> {
+        self.ueid_provisionings
+            .read()
+            .map(|m| m.values().filter(|p| p.af_id == af_id).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// #2260: remove one provisioning, and persist.
+    pub fn ueid_provisioning_remove(&self, id: &str) -> Option<NefUeIdProvisioning> {
+        let removed = self.ueid_provisionings.write().ok()?.remove(id);
+        if removed.is_some() {
+            self.persist();
+        }
+        removed
     }
 
     /// Insert a monitoring subscription, enforcing the capacity cap.
