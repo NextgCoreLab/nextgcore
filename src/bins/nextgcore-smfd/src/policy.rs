@@ -1327,11 +1327,25 @@ fn pdu_session_type_name(t: u8) -> &'static str {
 }
 
 /// The Npcf_SMPolicyControl features this SMF supports (TS 29.512 §5.8, TS 29.571
-/// §5.2.2 SupportedFeatures): feature 9, PCSCF-Restoration-Enhancement (#1398);
-/// feature 24, QosMonitoring (#2208: `qosMonDecs`, `refQosMon` and the
-/// QOS_MONITORING report, §4.2.3.25 and §4.2.4.24); feature 73,
-/// PacketDelayFailureReport (#2208: `pdmf`, which requires QosMonitoring).
-pub const SMF_SM_POLICY_SUPPORTED_FEATURES: &str = "1000000000000800100";
+/// §5.2.2 SupportedFeatures) by default: feature 9, PCSCF-Restoration-Enhancement
+/// (#1398). The same string as before #2208, so a default SMF's N7 is unchanged.
+pub const SMF_SM_POLICY_SUPPORTED_FEATURES: &str = "100";
+
+/// [`SMF_SM_POLICY_SUPPORTED_FEATURES`] with the PCF's QoS monitoring policy
+/// enabled (#2208, `smf.qos_monitoring.pcc: true`): also feature 24, QosMonitoring
+/// (`qosMonDecs`, `refQosMon` and the QOS_MONITORING report, §4.2.3.25 and
+/// §4.2.4.24), and feature 73, PacketDelayFailureReport (`pdmf`, which requires
+/// QosMonitoring).
+pub const SMF_SM_POLICY_SUPPORTED_FEATURES_QOS_MON: &str = "1000000000000800100";
+
+/// The features this SMF offers in an SM policy create.
+pub fn sm_policy_supported_features() -> &'static str {
+    if crate::pcc_qos_mon::enabled() {
+        SMF_SM_POLICY_SUPPORTED_FEATURES_QOS_MON
+    } else {
+        SMF_SM_POLICY_SUPPORTED_FEATURES
+    }
+}
 
 /// TS 29.512 Table 5.8-1 feature 24, QosMonitoring.
 pub const FEATURE_QOS_MONITORING: u32 = 24;
@@ -1359,7 +1373,7 @@ pub async fn sm_policy_create(
         "servingNetwork": { "mcc": "001", "mnc": "01" },
         // #1398: PCSCF-Restoration-Enhancement (TS 29.512 Table 5.8-1 feature 9,
         // bit 8), acted on in `handle_sm_policy_notify`. Nothing else.
-        "suppFeat": SMF_SM_POLICY_SUPPORTED_FEATURES,
+        "suppFeat": sm_policy_supported_features(),
     });
     // #310: the subscribed session-AMBR, the input the PCF authorises the
     // Session-AMBR from (TS 29.512 §4.2.2.5). Absent when the UDM leg is off or the
@@ -3292,6 +3306,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_sm_policy_create_body_carries_the_subscribed_session_ambr() {
+        // #2208: `suppFeat` reads `smf.qos_monitoring.pcc`, guarded by this lock.
+        let _q = crate::qos_mon::TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3366,8 +3382,8 @@ mod tests {
             assert_eq!(body["subsSessAmbr"]["downlink"], "80 Mbps");
             // #1398: the SMF offers PCSCF-Restoration-Enhancement (feature 9), so a
             // PCF can ask it to restore a P-CSCF (TS 29.512 §4.2.3.18).
-            // #2208: and QosMonitoring (24) with PacketDelayFailureReport (73).
-            assert_eq!(body["suppFeat"], "1000000000000800100", "body was {body}");
+            // #2208 review M1: byte for byte what it was before, by default.
+            assert_eq!(body["suppFeat"], "100", "body was {body}");
 
             // Only one direction stated: nothing is reported, because `Ambr` cannot
             // express half a pair and a defaulted zero would bound the subscriber to
@@ -3777,9 +3793,17 @@ mod tests {
     /// PCSCF-Restoration-Enhancement, 24 QosMonitoring, 73 PacketDelayFailureReport.
     #[test]
     fn supported_features_are_read_by_bit_2208() {
-        let ours = SMF_SM_POLICY_SUPPORTED_FEATURES;
+        let ours = SMF_SM_POLICY_SUPPORTED_FEATURES_QOS_MON;
         let set: Vec<u32> = (1..=80).filter(|n| supports_feature(ours, *n)).collect();
         assert_eq!(set, vec![9, 24, FEATURE_PACKET_DELAY_FAILURE_REPORT]);
+        let default: Vec<u32> = (1..=80)
+            .filter(|n| supports_feature(SMF_SM_POLICY_SUPPORTED_FEATURES, *n))
+            .collect();
+        assert_eq!(
+            default,
+            vec![9],
+            "the default offers what it did before #2208"
+        );
         assert_eq!(FEATURE_QOS_MONITORING, 24);
         assert_eq!(FEATURE_PACKET_DELAY_FAILURE_REPORT, 73);
         assert!(supports_feature("1", 1) && !supports_feature("1", 2));

@@ -100,6 +100,7 @@ fn an_instance_the_smf_cannot_act_on_is_refused_2208() {
 #[test]
 fn decisions_are_applied_as_deltas_2208() {
     let _q = crate::qos_mon::TEST_LOCK.blocking_lock();
+    let _pcc = PccForTest::on();
     clear_for_test();
     let r = "ref-2208-delta";
     let first = json!({
@@ -177,6 +178,7 @@ fn decisions_are_applied_as_deltas_2208() {
 #[test]
 fn a_report_goes_to_the_notify_uri_else_the_pcf_else_nowhere_2208() {
     let _q = crate::qos_mon::TEST_LOCK.blocking_lock();
+    let _pcc = PccForTest::on();
     clear_for_test();
     let r = "ref-2208-target";
     apply(
@@ -221,6 +223,7 @@ fn a_report_goes_to_the_notify_uri_else_the_pcf_else_nowhere_2208() {
 #[test]
 fn the_reports_carry_one_delay_each_and_pdmf_only_when_negotiated_2208() {
     let _q = crate::qos_mon::TEST_LOCK.blocking_lock();
+    let _pcc = PccForTest::on();
     clear_for_test();
     let r = "ref-2208-report";
     apply(
@@ -278,4 +281,58 @@ fn the_method_is_configured_and_per_qos_flow_by_default_2208() {
     assert_eq!(y.method, Method::GtpuPath);
     assert!(serde_yaml::from_str::<QosMonitoringYaml>("method: per_path").is_err());
     assert!(serde_yaml::from_str::<QosMonitoringYaml>("methd: gtpu_path").is_err());
+}
+
+/// #2208 review M1: with `smf.qos_monitoring.pcc` off (the default) a decision's
+/// QoS monitoring members are not acted on, so nothing is requested on N4 or N2;
+/// and the SM policy create offers what it did before (feature 9 only).
+#[test]
+fn the_pcf_policy_is_off_by_default_2208() {
+    let _q = crate::qos_mon::TEST_LOCK.blocking_lock();
+    clear_for_test();
+    assert!(!enabled(), "off by default");
+    assert_eq!(crate::policy::sm_policy_supported_features(), "100");
+    let r = "ref-2208-off";
+    let d = parse_qos_mon_delta(&json!({
+        "pccRules": { "r1": { "refQosMon": ["qm1"] } },
+        "qosMonDecs": { "qm1": periodic() },
+        "policyCtrlReqTriggers": ["QOS_MONITORING"],
+    }));
+    assert!(!apply(r, &d), "not acted on");
+    assert!(requesters(r).is_empty());
+    let _pcc = PccForTest::on();
+    assert_eq!(
+        crate::policy::sm_policy_supported_features(),
+        crate::policy::SMF_SM_POLICY_SUPPORTED_FEATURES_QOS_MON
+    );
+    assert!(apply(r, &d));
+    assert_eq!(requesters(r), vec!["pcc:qm1".to_string()]);
+    forget(r);
+}
+
+/// #2208 review minor 1, TS 29.244 Table 7.5.2.9-3 and §5.24.4.2: with EVETT the
+/// Minimum Wait Time and the Measurement Period are present whatever the PCF
+/// left out: `waitTime` else 0, `repPeriod` else the default period.
+#[test]
+fn an_event_triggered_ie_242_always_has_its_c_ies_2208() {
+    let p = parse_policy(&json!({
+        "reqQosMonParams": ["ROUND_TRIP"],
+        "repFreqs": ["EVENT_TRIGGERED"],
+        "repThreshRp": 30,
+    }))
+    .unwrap();
+    let c = p.control(9, false);
+    assert_eq!(c.minimum_wait_time, Some(0));
+    assert_eq!(c.measurement_period, Some(DEFAULT_PERIOD_SECS));
+    let p = parse_policy(&json!({
+        "reqQosMonParams": ["ROUND_TRIP"],
+        "repFreqs": ["EVENT_TRIGGERED"],
+        "repThreshRp": 30, "waitTime": 5, "repPeriod": 20,
+    }))
+    .unwrap();
+    let c = p.control(9, false);
+    assert_eq!(
+        (c.minimum_wait_time, c.measurement_period),
+        (Some(5), Some(20))
+    );
 }

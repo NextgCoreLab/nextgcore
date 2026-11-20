@@ -70,11 +70,29 @@ pub enum Method {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QosMonitoringYaml {
+    /// Act on the PCF's QoS monitoring policy (#2208 review M1): offer
+    /// QosMonitoring (24) and PacketDelayFailureReport (73) in the SM policy
+    /// create, and provision the decisions. Off by default, so a default SMF's
+    /// N7 and N4 are what they were.
+    #[serde(default)]
+    pub pcc: bool,
     #[serde(default)]
     pub method: Method,
 }
 
 static METHOD: AtomicU8 = AtomicU8::new(0);
+
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable the PCF's QoS monitoring policy (startup: `smf.qos_monitoring.pcc`).
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::SeqCst);
+}
+
+/// Whether the PCF's QoS monitoring policy is acted on.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::SeqCst)
+}
 
 /// Configure the measurement method (startup).
 pub fn set_method(m: Method) {
@@ -196,15 +214,14 @@ impl QosMonPolicy {
             },
             // C: with EVETT (Table 7.5.2.9-3).
             packet_delay_thresholds: self.event_triggered.then_some(self.thresholds),
-            minimum_wait_time: self.wait_time.filter(|_| self.event_triggered),
-            // C: with PERIO the reporting period; with EVETT alone the period after
-            // which a silent flow is reported as a measurement failure (TS 29.512
-            // §4.2.3.25.1 item f), when the PCF gave one.
-            measurement_period: if self.periodic {
-                Some(self.rep_period.unwrap_or(DEFAULT_PERIOD_SECS))
-            } else {
-                self.rep_period
-            },
+            // C: "shall be present if event triggered QoS monitoring reporting is
+            // required" (Table 7.5.2.9-3). `waitTime`, else 0 (review minor 1).
+            minimum_wait_time: self.event_triggered.then_some(self.wait_time.unwrap_or(0)),
+            // C: with PERIO the reporting period, and with EVETT the period that
+            // detects a measurement failure (TS 29.244 §5.24.4.2): present either
+            // way, `repPeriod` else the SMF's default (TS 23.501 §5.33.3.1, "local
+            // configuration"; review minor 1).
+            measurement_period: Some(self.rep_period.unwrap_or(DEFAULT_PERIOD_SECS)),
             extra: Vec::new(),
         }
     }
@@ -254,6 +271,26 @@ impl Drop for MethodForTest {
     }
 }
 
+/// Turns `smf.qos_monitoring.pcc` on for a test and off again when dropped.
+/// Held under `qos_mon::TEST_LOCK`, like [`MethodForTest`].
+#[cfg(test)]
+pub(crate) struct PccForTest;
+
+#[cfg(test)]
+impl PccForTest {
+    pub(crate) fn on() -> Self {
+        set_enabled(true);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PccForTest {
+    fn drop(&mut self) {
+        set_enabled(false);
+    }
+}
+
 fn with<T>(f: impl FnOnce(&mut HashMap<String, Session>) -> T) -> T {
     let mut g = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(HashMap::new))
@@ -289,6 +326,14 @@ fn merge_patch(target: &mut Value, patch: &Value) {
 /// instances the session's PCC rules reference changed.
 pub fn apply(r: &str, d: &QosMonDelta) -> bool {
     if d.is_empty() {
+        return false;
+    }
+    if !enabled() {
+        // QosMonitoring was not offered (review M1): a PCF that sends its members
+        // anyway is not acted on.
+        log::debug!(
+            "ref={r}: QoS monitoring members in a decision, but smf.qos_monitoring.pcc is off"
+        );
         return false;
     }
     let (changed, invalid) = with(|m| {

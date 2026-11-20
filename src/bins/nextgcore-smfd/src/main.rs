@@ -865,6 +865,8 @@ struct SmfConfig {
     n6_delay: Option<n6_delay::N6DelayConfig>,
     /// #2208: `smf.qos_monitoring.method`, per QoS flow unless configured.
     qos_monitoring_method: pcc_qos_mon::Method,
+    /// #2208 review M1: `smf.qos_monitoring.pcc`, off unless configured.
+    qos_monitoring_pcc: bool,
 }
 
 impl Default for SmfConfig {
@@ -885,6 +887,7 @@ impl Default for SmfConfig {
             pcc_rules: Vec::new(),
             n6_delay: None,
             qos_monitoring_method: pcc_qos_mon::Method::PerQosFlow,
+            qos_monitoring_pcc: false,
         }
     }
 }
@@ -961,6 +964,7 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
         }
         if let Some(qm) = smf.qos_monitoring {
             config.qos_monitoring_method = qm.method;
+            config.qos_monitoring_pcc = qm.pcc;
         }
 
         // S5/S8 bind address (#52). Only the first entry is bound; a second is named
@@ -1114,9 +1118,15 @@ async fn main() -> Result<()> {
     // #1502: before the association loop can associate a UPF.
     n6_delay::set_config(config.n6_delay.take());
     pcc_qos_mon::set_method(config.qos_monitoring_method);
+    pcc_qos_mon::set_enabled(config.qos_monitoring_pcc);
     log::info!(
-        "QoS monitoring of the PCF's policy: {:?} (smf.qos_monitoring.method, TS 23.501 \
-         §5.33.3.1)",
+        "QoS monitoring of the PCF's policy: {} (smf.qos_monitoring.pcc), measured {:?} \
+         (smf.qos_monitoring.method, TS 23.501 §5.33.3.1)",
+        if config.qos_monitoring_pcc {
+            "on"
+        } else {
+            "off"
+        },
         config.qos_monitoring_method
     );
     // nextgsim#458: the demo: block, checked against the demos this build was
@@ -37144,6 +37154,7 @@ mod tests {
         event_exposure::clear_for_test();
         qos_mon::clear_for_test();
         pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
         let _method = pcc_qos_mon::MethodForTest::set(pcc_qos_mon::Method::GtpuPath);
         let supi = "imsi-001010000022081";
         let (upf, reference, amf, posts) = pcc_qos_mon_session_2208(supi, 5, true).await;
@@ -37280,6 +37291,7 @@ mod tests {
             ),
             (pcc_qos_mon::Method::GtpuPath, false, "imsi-001010000022083"),
         ] {
+            let _pcc = pcc_qos_mon::PccForTest::on();
             let _method = pcc_qos_mon::MethodForTest::set(method);
             let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, gpqm).await;
             upf.clear_seen();
@@ -37334,6 +37346,7 @@ mod tests {
         event_exposure::clear_for_test();
         qos_mon::clear_for_test();
         pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
         let supi = "imsi-001010000022084";
         let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, false).await;
         // The PCF (and the NEF), recording what they are sent.
@@ -37448,6 +37461,7 @@ mod tests {
         event_exposure::clear_for_test();
         qos_mon::clear_for_test();
         pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let upf = pfcp_path::stand_in::associated_upf_with_features(
             nextgcore_pfcp::types::UpFunctionFeatures {
