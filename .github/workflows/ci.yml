@@ -83,7 +83,7 @@ jobs:
       NEXTGCORE_DOCKER_REQUIRED: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           # Pinned, not `latest` (#1617 d3 R15): the chart checks and the
           # shipped-config tests render with a known helm.
@@ -438,7 +438,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           # Pinned, not `latest` (#1617 d3 R15): the chart checks and the
           # shipped-config tests render with a known helm.
@@ -660,7 +660,7 @@ jobs:
           # (the deploy breaks the same way), but the fix may be in nextgsim.
           ref: main
           path: nextgsim
-      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
       # deploy-eks.sh and check_service_ports.py import PyYAML. Installed
       # explicitly rather than relying on what the runner image ships.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -745,7 +745,7 @@ jobs:
           kubectl kustomize deploy/eks/profiles/5g > "$RUNNER_TEMP/eks-5g.yaml"
           python3 deploy/eks/lib/check_service_ports.py \
             "$RUNNER_TEMP/base.yaml" "$RUNNER_TEMP/eks-5g.yaml" deploy/eks/profiles/5g/patches/*.yaml
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           # Pinned, not `latest` (#1617 d3 R15): the chart checks and the
           # shipped-config tests render with a known helm.

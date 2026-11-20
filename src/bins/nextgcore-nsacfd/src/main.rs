@@ -688,7 +688,7 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         //    central/primary HPLMN NSACF.
         // ------------------------------------------------------------------
         ["nnsacf-nsac", "v1", "slices", "local-configs", "update"] => match method {
-            "POST" => match refuse_non_nsacf_certificate(&request) {
+            "POST" => match refuse_non_nsacf_certificate(&request).await {
                 Some(refusal) => refusal,
                 None => handle_local_configs_update(&request).await,
             },
@@ -1731,29 +1731,24 @@ fn nsacf_oauth2_claims(config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerCo
         .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope)
 }
 
-/// The `403` for a `local-configs/update` from a caller whose verified client
-/// certificate names an NF type other than NSACF (#1892). TS 29.536 Table
-/// 6.1.9-1: the update comes "from a primary NSACF". A relay certificate (SCP,
-/// SEPP) says nothing about the consumer and is left to the token's
-/// `nnsacf-nsac:local-configs-update` scope; no certificate (`dev`) changes
-/// nothing.
+/// The `403` for a `local-configs/update` from a caller that is not a verified
+/// NSACF (#1892, #2082). TS 29.536 Table 6.1.9-1: the update comes "from a
+/// primary NSACF".
 ///
-/// #1934 review m1: an empty type list (a certificate without RFC 9310 NF types,
-/// or none at all under `dev`) is left to the token. Under production the token's
-/// `nnsacf-nsac:local-configs-update` scope is then the whole decision, and the
-/// NRF grants that scope to an NSACF only.
-fn refuse_non_nsacf_certificate(request: &SbiRequest) -> Option<SbiResponse> {
-    let types = &request.peer_cert_nf_types;
-    let is = |t: &str| types.iter().any(|c| c.eq_ignore_ascii_case(t));
-    if types.is_empty() || is("NSACF") || is("SCP") || is("SEPP") {
-        return None;
-    }
-    let why = format!(
-        "slices/local-configs/update is for a primary NSACF only (TS 29.536 Table 6.1.9-1); \
-         the requester's certificate names {types:?}"
-    );
-    log::debug!("{why}");
-    Some(nextgcore_sbi::server::send_forbidden(&why, None))
+/// #2082: the shared `owner_binding::nf_type_refusal` (CONVENTIONS), not a local
+/// reading of the certificate's NF types: a typed certificate must name NSACF; a
+/// token, alone or through an SCP or SEPP, must belong to an instance the NRF
+/// lists as an NSACF; under production a certificate without NF types, or a
+/// relay's, alone is refused. The listener's `nnsacf-nsac:local-configs-update`
+/// scope check still runs first. Under dev an unidentified plaintext caller is
+/// admitted as before.
+async fn refuse_non_nsacf_certificate(request: &SbiRequest) -> Option<SbiResponse> {
+    nextgcore_sbi::owner_binding::nf_type_refusal(
+        request,
+        NfType::Nsacf,
+        "slices/local-configs/update (TS 29.536 Table 6.1.9-1: a primary NSACF only)",
+    )
+    .await
 }
 
 /// POST /nnsacf-nsac/v1/slices/local-configs/update  (TS 29.536 §6.1.3.4)
@@ -2961,6 +2956,10 @@ nsacf:
 
     async fn start_nsacf_server() -> (SbiServer, u16, tokio::sync::MutexGuard<'static, ()>) {
         let guard = GLOBAL_CTX_TEST_LOCK.lock().await;
+        // #2082: a plaintext loopback listener is a dev-profile deployment, and
+        // the local-configs gate reads the profile: set Dev and leave it set
+        // (CONVENTIONS), so its callers do not depend on a sibling having done so.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         nsacf_context_init(64);
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = port_addr.port();
@@ -3049,6 +3048,17 @@ nsacf:
         aud: &str,
         scope: &str,
     ) -> String {
+        build_es256_token_for(sk, kid, aud, scope, "amf-1")
+    }
+
+    /// [`build_es256_token_scoped`] for the consumer `sub` (#2082).
+    fn build_es256_token_for(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+        sub: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -3060,7 +3070,7 @@ nsacf:
             + 3600;
         let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
         let claims = serde_json::json!({
-            "iss": "NRF", "sub": "amf-1", "aud": aud,
+            "iss": "NRF", "sub": sub, "aud": aud,
             "scope": scope, "exp": exp, "iat": 0
         })
         .to_string();
@@ -3117,8 +3127,12 @@ nsacf:
         let (server, port, _ctx_guard) =
             start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
+        // #2082: the update is a verified NSACF's: the NRF lists this token's
+        // subject as one (seeded here, as the NRF's answer).
+        const PRIMARY: &str = "cccccccc-2082-4000-8000-00000000000c";
+        nextgcore_sbi::owner_binding::seed_nf_type_for_test(PRIMARY, NfType::Nsacf);
         let send = |scope: &str, path: &str, body: serde_json::Value| {
-            let token = build_es256_token_scoped(&sk, "nrf-es256", "NSACF", scope);
+            let token = build_es256_token_for(&sk, "nrf-es256", "NSACF", scope, PRIMARY);
             let req = SbiRequest::post(path)
                 .with_body(body.to_string(), "application/json")
                 .with_header("Authorization", format!("Bearer {token}"));
@@ -3217,9 +3231,16 @@ nsacf:
     /// #1892: a verified client certificate that names a type other than NSACF
     /// (an AMF holding an nnsacf-nsac token) cannot update local configuration;
     /// an NSACF, a relay (SCP) or no certificate (`dev`) passes to the handler.
+    ///
+    /// #2082: the gate is the shared `owner_binding::nf_type_refusal`, so the
+    /// certificates carry an NF Instance ID as a verified one does; the router
+    /// reads the process profile, so this asserts the dev routing (Dev set and
+    /// left set); `local_configs_update_refuses_what_proves_no_nsacf_2082`
+    /// pins production.
     #[tokio::test]
     async fn local_configs_update_refuses_a_non_nsacf_certificate_1892() {
         let _guard = GLOBAL_CTX_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         nsacf_context_init(64);
         let update = |types: &[&str], max_ues: u64| {
             let mut req = SbiRequest::post("/nnsacf-nsac/v1/slices/local-configs/update")
@@ -3228,6 +3249,10 @@ nsacf:
                     "application/json",
                 );
             req.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            if !types.is_empty() {
+                req.peer_cert_nf_instance_id =
+                    Some("dddddddd-1892-4000-8000-00000000000d".to_string());
+            }
             req
         };
         let resp = nsacf_sbi_request_handler(update(&["AMF"], 1000)).await;
@@ -3245,6 +3270,51 @@ nsacf:
             let resp = nsacf_sbi_request_handler(update(types, n)).await;
             assert_eq!(resp.status, 204, "{types:?}: {:?}", resp.http.content);
         }
+    }
+
+    /// #2082: under production the local-configs update is refused, before the
+    /// quota is touched, to every caller that is not a verified NSACF: a
+    /// certificate without NF types alone, a relay's certificate alone, an
+    /// anonymous caller, and a token the NRF does not list as an NSACF. A typed
+    /// NSACF certificate is admitted. Run through the gate with the profile
+    /// given, so no process-wide override is read.
+    ///
+    /// REVERT-VERIFIED: with the gate back to the pre-#2082 local rule (an
+    /// empty NF-type list passes), the untyped-certificate case is admitted.
+    #[tokio::test]
+    async fn local_configs_update_refuses_what_proves_no_nsacf_2082() {
+        let req = |cert: Option<&str>, types: &[&str], sub: Option<&str>| {
+            let mut r = SbiRequest::post("/nnsacf-nsac/v1/slices/local-configs/update");
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r.oauth2_subject = sub.map(str::to_string);
+            r
+        };
+        const ID: &str = "eeeeeeee-2082-4000-8000-00000000000e";
+        const NOT_LISTED: &str = "ffffffff-2082-4000-8000-00000000000f";
+        let gate = |r: SbiRequest| async move {
+            nextgcore_sbi::owner_binding::nf_type_refusal_with(
+                &r,
+                NfType::Nsacf,
+                "slices/local-configs/update",
+                true,
+            )
+            .await
+            .map(|resp| resp.status)
+        };
+        for (what, r) in [
+            ("an untyped certificate alone", req(Some(ID), &[], None)),
+            ("a relay's certificate alone", req(Some(ID), &["SCP"], None)),
+            ("an anonymous caller", req(None, &[], None)),
+            (
+                "a token the NRF does not list",
+                req(None, &[], Some(NOT_LISTED)),
+            ),
+            ("an AMF certificate", req(Some(ID), &["AMF"], None)),
+        ] {
+            assert_eq!(gate(r).await, Some(403), "{what}");
+        }
+        assert_eq!(gate(req(Some(ID), &["NSACF"], None)).await, None);
     }
 
     /// #1892, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: the profile lets the NRF grant
