@@ -191,6 +191,11 @@ pub struct NefMonitoringSubscription {
     /// first refresh sweep bounds.
     #[serde(default)]
     pub southbound_expiry: Option<u64>,
+    /// #2154: the northbound API the subscription was made on, which decides
+    /// the shape of what its consumer is sent (TS 29.122 MonitoringNotification
+    /// or TS 29.591 NefEventExposureNotif). T8 for a record from before #2154.
+    #[serde(default)]
+    pub northbound_api: crate::NorthboundApi,
 }
 
 impl NefMonitoringSubscription {
@@ -232,7 +237,14 @@ impl NefMonitoringSubscription {
             raw: raw.into(),
             notify_token: Some(nextgcore_sbi::callback_auth::CallbackToken::mint()),
             southbound_expiry: None,
+            northbound_api: crate::NorthboundApi::default(),
         }
+    }
+
+    /// Record the northbound API it was made on (#2154).
+    pub fn with_northbound_api(mut self, api: crate::NorthboundApi) -> Self {
+        self.northbound_api = api;
+        self
     }
 
     /// Record the external identity the AF used (issue #110).

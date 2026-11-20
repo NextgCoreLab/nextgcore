@@ -2996,7 +2996,7 @@ fn apply_ee_patch(stored: &mut serde_json::Value, patch: &serde_json::Value) -> 
         for t in parents {
             parent = match parent {
                 serde_json::Value::Object(m) => m.get_mut(t),
-                serde_json::Value::Array(a) => t.parse::<usize>().ok().and_then(|i| a.get_mut(i)),
+                serde_json::Value::Array(a) => json_pointer_index(t).and_then(|i| a.get_mut(i)),
                 _ => None,
             }
             .ok_or_else(|| format!("path {path:?}: no member {t:?} to descend into"))?;
@@ -3025,17 +3025,14 @@ fn apply_ee_patch(stored: &mut serde_json::Value, patch: &serde_json::Value) -> 
                 let at = if last == "-" {
                     a.len()
                 } else {
-                    last.parse::<usize>()
-                        .ok()
+                    json_pointer_index(last)
                         .filter(|i| *i <= a.len())
                         .ok_or_else(|| format!("path {path:?}: index out of range"))?
                 };
                 a.insert(at, value()?);
             }
             ("replace" | "remove", serde_json::Value::Array(a)) => {
-                let at = last
-                    .parse::<usize>()
-                    .ok()
+                let at = json_pointer_index(last)
                     .filter(|i| *i < a.len())
                     .ok_or_else(|| format!("path {path:?}: index out of range"))?;
                 if op_name == "replace" {
@@ -3054,6 +3051,19 @@ fn apply_ee_patch(stored: &mut serde_json::Value, patch: &serde_json::Value) -> 
     }
     *stored = working;
     Ok(())
+}
+
+/// #2154 (R42 on #2152): a JSON Pointer array index, RFC 6901 §4: `0`, or a
+/// digit 1-9 followed by digits. A leading zero (`01`) or a sign (`+1`, which
+/// `str::parse` would take) is no index.
+fn json_pointer_index(token: &str) -> Option<usize> {
+    let well_formed = token == "0"
+        || (token
+            .as_bytes()
+            .first()
+            .is_some_and(|b| (b'1'..=b'9').contains(b))
+            && token.bytes().all(|b| b.is_ascii_digit()));
+    well_formed.then(|| token.parse().ok()).flatten()
 }
 
 /// The reference tokens of RFC 6901 JSON Pointer `path`, unescaped (`~1` is
@@ -6359,6 +6369,39 @@ mod tests {
             assert!(apply_ee_patch(&mut stored, &bad).is_err(), "{bad}");
             assert_eq!(stored, before, "{bad}: nothing applied");
         }
+    }
+
+    /// **#2154** (R42 on #2152): an array index is `0` or has no leading zero
+    /// (RFC 6901 §4), and has no sign: `01`, `00` and `+1` are refused and
+    /// change nothing; `0` and `10` are indices.
+    ///
+    /// REVERT-VERIFIED: with the index parsed by `str::parse` again, `/list/01`
+    /// and `/list/+1` apply and the `is_err` assertion fails.
+    #[test]
+    fn ee_patch_refuses_an_array_index_with_a_leading_zero_2154() {
+        let mut stored = serde_json::json!({ "list": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] });
+        let before = stored.clone();
+        for bad in ["/list/01", "/list/00", "/list/+1", "/list/1a"] {
+            assert!(
+                apply_ee_patch(
+                    &mut stored,
+                    &serde_json::json!([{ "op": "replace", "path": bad, "value": "x" }])
+                )
+                .is_err(),
+                "{bad}"
+            );
+            assert_eq!(stored, before, "{bad}: nothing applied");
+        }
+        apply_ee_patch(
+            &mut stored,
+            &serde_json::json!([
+                { "op": "replace", "path": "/list/0", "value": "zero" },
+                { "op": "replace", "path": "/list/10", "value": "ten" }
+            ]),
+        )
+        .expect("well-formed indices");
+        assert_eq!(stored["list"][0], "zero");
+        assert_eq!(stored["list"][10], "ten");
     }
 
     #[test]

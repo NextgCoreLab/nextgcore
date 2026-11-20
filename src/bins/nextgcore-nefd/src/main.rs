@@ -813,9 +813,12 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// request and the resource path of the created subscription. Parameterising the
 /// one handler is what keeps them from drifting: a fix to the failure semantics or
 /// the target resolution applies to both by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NorthboundApi {
-    /// TS 29.122 §5.3 T8 Monitoring Event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum NorthboundApi {
+    /// TS 29.122 §5.3 T8 Monitoring Event. The default, so a subscription
+    /// recorded before #2154 (every one of them made on either API) reads as
+    /// T8, the shape it was notified in.
+    #[default]
     T8MonitoringEvent,
     /// TS 29.591 `Nnef_EventExposure`, the service the NF profile advertises.
     NnefEventExposure,
@@ -1278,7 +1281,9 @@ async fn handle_monitoring_subscription_create_inner(
         body.clone(),
     )
     .with_af_target(af_target)
-    .with_owner_id(owner_id);
+    .with_owner_id(owner_id)
+    // #2154: notifications go out in the shape of the API it was made on.
+    .with_northbound_api(api);
 
     let notify_base = notify_base.unwrap_or_else(|| "http://127.0.0.1:7817".to_string());
     let nf_instance_id = nf_instance_id.unwrap_or_else(|| "nef-unregistered".to_string());
@@ -1946,6 +1951,17 @@ fn remove_and_tell_af(sub_id: &str) {
     let Some(sub) = removed else {
         return;
     };
+    // #2154: TS 29.591 defines no cancellation indication for a
+    // Nnef_EventExposure subscriber (NefEventExposureNotif carries notifId and
+    // eventNotifs only), so none is invented: the ceiling is in nef.md.
+    if sub.northbound_api == NorthboundApi::NnefEventExposure {
+        log::info!(
+            "Nnef_EventExposure subscription {} removed; TS 29.591 has no cancellation \
+             indication to send its consumer",
+            sub.id
+        );
+        return;
+    }
     let notification = cancellation_notification(&sub);
     if tokio::runtime::Handle::try_current().is_err() {
         log::warn!(
@@ -2116,7 +2132,24 @@ async fn refresh_producer_legs(
             requested,
             sub.southbound_expiry.is_some(),
         );
-        match client.patch_json(&southbound.delete_path, &patch).await {
+        let mut answer = client.patch_json(&southbound.delete_path, &patch).await;
+        // #2154 (R42 on #2152): a UDM from before #2133 accepts only top-level
+        // patch paths and answers the member form 400. Fall back, once, to the
+        // whole-object form it does accept, so its legs are refreshed rather than
+        // left to lapse during a rolling upgrade (nef.md: upgrade udmd first).
+        if southbound.producer == SouthboundProducer::Udm
+            && sub.southbound_expiry.is_some()
+            && matches!(&answer, Ok(resp) if resp.status == 400)
+        {
+            log::warn!(
+                "monitoring subscription {}: the UDM refused `add /reportingOptions/expiry` \
+                 (400; a udmd older than #2133?); retrying with the whole reportingOptions",
+                sub.id
+            );
+            let whole = refresh_patch(southbound.producer, requested, false);
+            answer = client.patch_json(&southbound.delete_path, &whole).await;
+        }
+        match answer {
             Ok(resp) if resp.is_success() => {
                 let expiry = confirmed_expiry(southbound.producer, &resp).unwrap_or(requested);
                 let recorded = nef_self()
@@ -2727,6 +2760,8 @@ fn build_monitoring_notification(
         .map(|t| (t.member(), serde_json::json!(t.value())));
 
     let mut reports = Vec::new();
+    // #2154: each forwarded report's producer timestamp, for the TS 29.591 shape.
+    let mut times = Vec::new();
     let report_list = producer_body
         .get("reportList")
         .and_then(|v| v.as_array())
@@ -2809,14 +2844,57 @@ fn build_monitoring_notification(
             out[*member] = value.clone();
         }
         reports.push(out);
+        times.push(
+            report
+                .get("timeStamp")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+        );
     }
     if reports.is_empty() {
         return None;
+    }
+    if sub.northbound_api == NorthboundApi::NnefEventExposure {
+        return Some(nnef_event_exposure_notif(sub, &times));
     }
     Some(serde_json::json!({
         "subscription": self_link,
         "monitoringEventReports": reports,
     }))
+}
+
+/// #2154 (R42 on #2152): the TS 29.591 `NefEventExposureNotif` for a
+/// Nnef_EventExposure subscriber: `notifId` (the consumer's, stored as the
+/// subscription's `scs_as_id`) and one `NefEventNotification` per forwarded
+/// report, each its `event` and `timeStamp` (both mandatory). The `event` is
+/// the eventId the consumer subscribed to, the T8 MonitoringType mapped back
+/// ([`NNEF_EVENT_TO_MONITORING_TYPE`]); `NefEvent` admits it through its
+/// free-form string branch.
+///
+/// Ceiling, documented in nef.md: TS 29.591 defines no member for a location,
+/// a reachability or a loss-of-connectivity report, so the notification says
+/// which event occurred and when, and nothing more. The T8 API carries the
+/// report itself.
+fn nnef_event_exposure_notif(
+    sub: &NefMonitoringSubscription,
+    times: &[Option<String>],
+) -> serde_json::Value {
+    let event = NNEF_EVENT_TO_MONITORING_TYPE
+        .iter()
+        .find(|(_, t8)| *t8 == sub.monitoring_type)
+        .map(|(id, _)| *id)
+        .unwrap_or(sub.monitoring_type.as_str());
+    let now = nextgcore_sbi::datetime::epoch_to_rfc3339(now_unix_secs());
+    let notifs: Vec<serde_json::Value> = times
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "event": event,
+                "timeStamp": t.clone().unwrap_or_else(|| now.clone()),
+            })
+        })
+        .collect();
+    serde_json::json!({ "notifId": sub.scs_as_id, "eventNotifs": notifs })
 }
 
 /// POST a MonitoringNotification to the AF's notificationDestination
@@ -4174,6 +4252,165 @@ mod tests {
         reset_context();
     }
 
+    /// **#2154** (R42 on #2152): TS 29.591 defines no cancellation indication,
+    /// so a Nnef_EventExposure subscriber whose subscription the NEF removes is
+    /// sent nothing, while a T8 one in the same sweep gets its `cancelInd`.
+    /// Then the upgrade fallback: a UDM answering the member-form refresh 400 (a
+    /// udmd from before #2133) is sent the whole-object form once, and the leg
+    /// is refreshed.
+    ///
+    /// REVERT-VERIFIED: with the Nnef branch of `remove_and_tell_af` removed,
+    /// the Nnef consumer is POSTed a T8 cancellation and "nothing for the Nnef
+    /// consumer" fails; with the 400 fallback removed, the old UDM's leg is not
+    /// refreshed and "the old UDM's leg is refreshed" fails.
+    #[test]
+    fn nnef_removals_send_nothing_and_an_old_udm_is_refreshed_2154() {
+        let _guard = lock_globals();
+        // Loopback plaintext stand-ins (the default profile is production).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let af_seen: Seen2102 = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = af_seen.clone();
+            let (af, af_addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let sink = sink.clone();
+                    async move {
+                        let body = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|c| serde_json::from_str(c).ok())
+                            .unwrap_or_default();
+                        sink.lock().unwrap().push((
+                            req.header.method.clone(),
+                            req.header.uri.clone(),
+                            body,
+                        ));
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            // A producer that answers every PATCH 404 at `/gone/...`, and at
+            // `/old/...` behaves as a pre-#2133 udmd: 400 for a nested path,
+            // 204 for the whole object.
+            let patches: Seen2102 = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let psink = patches.clone();
+            let (producer, paddr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let psink = psink.clone();
+                    async move {
+                        let body: serde_json::Value = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|c| serde_json::from_str(c).ok())
+                            .unwrap_or_default();
+                        psink.lock().unwrap().push((
+                            req.header.method.clone(),
+                            req.header.uri.clone(),
+                            body.clone(),
+                        ));
+                        if req.header.uri.contains("/gone/") {
+                            return SbiResponse::with_status(404);
+                        }
+                        if body[0]["path"] == "/reportingOptions/expiry" {
+                            return SbiResponse::with_status(400);
+                        }
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            let uri = format!("http://127.0.0.1:{}", paddr.port());
+            set_producers(None, Some(&uri));
+            let now = now_unix_secs();
+            let leg = |api: NorthboundApi, scs: &str, path: &str| {
+                let mut sub = NefMonitoringSubscription::new(
+                    scs,
+                    "LOSS_OF_CONNECTIVITY",
+                    format!("http://127.0.0.1:{}/af-2154", af_addr.port()),
+                    "{}",
+                )
+                .with_northbound_api(api);
+                sub.southbound = Some(SouthboundRef {
+                    producer: SouthboundProducer::Udm,
+                    subscription_id: path.rsplit('/').next().unwrap().to_string(),
+                    delete_path: path.to_string(),
+                    producer_base: Some(uri.clone()),
+                });
+                sub.southbound_expiry = Some(now + 10);
+                let id = sub.id.clone();
+                nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_insert(sub)
+                    .expect("insert");
+                id
+            };
+            let nnef_gone = leg(NorthboundApi::NnefEventExposure, "notif-2154", "/gone/n");
+            let t8_gone = leg(NorthboundApi::T8MonitoringEvent, "af1", "/gone/t");
+            let old = leg(NorthboundApi::T8MonitoringEvent, "af1", "/old/o");
+
+            let report = refresh_live_subscriptions_at(now).await;
+            assert_eq!((report.lapsed, report.refreshed), (2, 1), "{report:?}");
+            let want_t8 = serde_json::json!({
+                "subscription": format!("/3gpp-monitoring-event/v1/af1/subscriptions/{t8_gone}"),
+                "cancelInd": true,
+            });
+            let mut t8_told = false;
+            for _ in 0..200 {
+                if af_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, _, b)| *b == want_t8)
+                {
+                    t8_told = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(t8_told, "the T8 consumer gets its cancelInd");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // One guard at a time: the message must not lock it again.
+            let delivered = af_seen.lock().unwrap().clone();
+            assert_eq!(
+                delivered.len(),
+                1,
+                "nothing for the Nnef consumer ({nnef_gone}): {delivered:?}"
+            );
+            let old_patches: Vec<serde_json::Value> = patches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, u, _)| m == "PATCH" && u.contains("/old/"))
+                .map(|(_, _, b)| b[0]["path"].clone())
+                .collect();
+            assert_eq!(
+                old_patches,
+                [
+                    serde_json::json!("/reportingOptions/expiry"),
+                    serde_json::json!("/reportingOptions")
+                ],
+                "the member form, then the whole object once"
+            );
+            assert!(
+                nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_find(&old)
+                    .and_then(|s| s.southbound_expiry)
+                    .is_some_and(|e| e > now + 10),
+                "the old UDM's leg is refreshed"
+            );
+            af.stop().await.ok();
+            producer.stop().await.ok();
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
     /// #2133 (R42 on #2128): the UDM refresh names `reportingOptions/expiry`
     /// for a leg made with reportingOptions, so RFC 6902 `add` does not
     /// replace the object's other members; a leg made before #2102 (none
@@ -5256,6 +5493,16 @@ mod tests {
 
         // The subscription really exists and is DELETE-able through the same API.
         let sub_id = location.rsplit('/').next().unwrap().to_string();
+        // #2154: and it is recorded as made on Nnef_EventExposure, which decides
+        // the shape of its notifications.
+        assert_eq!(
+            nef_self()
+                .read()
+                .unwrap()
+                .subscription_find(&sub_id)
+                .map(|s| s.northbound_api),
+            Some(NorthboundApi::NnefEventExposure)
+        );
         let delete = SbiRequest::delete(format!("/nnef-eventexposure/v1/subscriptions/{sub_id}"));
         assert_eq!(block_on(nef_sbi_request_handler(delete)).status, 204);
 
@@ -5747,6 +5994,62 @@ mod tests {
             report.get("externalId").is_none(),
             "only the member the AF actually used is echoed"
         );
+    }
+
+    /// **#2154** (R42 on #2152): a Nnef_EventExposure subscriber is notified in
+    /// the TS 29.591 NefEventExposureNotif shape (notifId, eventNotifs[{event,
+    /// timeStamp}]), with the eventId it subscribed to, not the T8
+    /// MonitoringNotification; a T8 subscriber still gets T8.
+    ///
+    /// REVERT-VERIFIED: with the API branch removed, the Nnef subscriber gets the
+    /// T8 body and the `notifId` assertion fails.
+    #[test]
+    fn a_nnef_subscriber_is_notified_in_the_ts_29_591_shape_2154() {
+        let producer_body = serde_json::json!({
+            "reportList": [{
+                "type": "REACHABILITY_REPORT",
+                "reachability": "REACHABLE",
+                "timeStamp": "2026-11-20T03:00:00Z",
+            }]
+        });
+        let nnef = NefMonitoringSubscription::new(
+            "consumer-notif-2154",
+            "UE_REACHABILITY",
+            "http://consumer.example.com/cb",
+            "{}",
+        )
+        .with_northbound_api(NorthboundApi::NnefEventExposure);
+        assert_eq!(
+            build_monitoring_notification(&nnef, &producer_body),
+            Some(serde_json::json!({
+                "notifId": "consumer-notif-2154",
+                "eventNotifs": [{ "event": "UE_REACHABILITY", "timeStamp": "2026-11-20T03:00:00Z" }],
+            }))
+        );
+        let t8 = NefMonitoringSubscription::new(
+            "af1",
+            "UE_REACHABILITY",
+            "http://af.example.com/cb",
+            "{}",
+        );
+        let body = build_monitoring_notification(&t8, &producer_body).expect("T8");
+        assert_eq!(
+            body["monitoringEventReports"][0]["monitoringType"],
+            "UE_REACHABILITY"
+        );
+        assert!(body.get("notifId").is_none());
+        // LOCATION_REPORTING maps back to the eventId LOCATION_REPORT.
+        let loc = NefMonitoringSubscription {
+            monitoring_type: "LOCATION_REPORTING".to_string(),
+            ..nnef.clone()
+        };
+        let body = build_monitoring_notification(
+            &loc,
+            &serde_json::json!({ "reportList": [{ "type": "LOCATION_REPORT", "location": {} }] }),
+        )
+        .expect("a location report");
+        assert_eq!(body["eventNotifs"][0]["event"], "LOCATION_REPORT");
+        assert!(body["eventNotifs"][0]["timeStamp"].is_string(), "{body}");
     }
 
     #[test]
