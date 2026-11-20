@@ -1106,7 +1106,10 @@ impl MbSmfContext {
         // #2274: one critical section, `amf_contexts` then `amf_notify_tokens`
         // (the order of [`Self::record_amf_context`]), so no one sees the record
         // gone while its tokens are still admitted. Before, the records went
-        // under `amf_contexts` and the tokens after it was released.
+        // under `amf_contexts` and the tokens after it was released, and the two
+        // tests that wait for the record to go and then check its token
+        // (`..._1796` and `an_expiry_racing_a_reuse_leaves_b_notified_by_amfd_2015`)
+        // caught that window on a loaded host.
         let Ok(mut map) = self.amf_contexts.lock() else {
             return false;
         };

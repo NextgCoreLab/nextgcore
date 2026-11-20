@@ -1634,6 +1634,11 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the callback exemption not installed, the notify is
     /// refused 401 and the record stays.
+    ///
+    /// #2274: "nor is the token admitted any more" is checked once the record is
+    /// gone, so it needs `drop_amf_context_by_token` to drop the record and its
+    /// tokens in one critical section. REVERT-VERIFIED: with the two steps apart
+    /// again and 200 ms between them, that assertion fails every run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_amfs_status_notify_passes_the_mbsmf_gate_on_its_token_1796() {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
@@ -2181,6 +2186,11 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with `forget_abandoned` forgetting without the held check,
     /// "A's token is B's" fails (amfd's notify on it would then be answered 404).
+    ///
+    /// #2274: "releasedInd ends the context's tokens" is checked once B's record
+    /// is gone, so it needs `drop_amf_context_by_token` to drop the record and
+    /// its tokens in one critical section. REVERT-VERIFIED: with the two steps
+    /// apart again and 200 ms between them, that assertion fails every run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_expiry_racing_a_reuse_leaves_b_notified_by_amfd_2015() {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
