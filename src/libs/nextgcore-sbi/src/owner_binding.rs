@@ -122,6 +122,40 @@ pub fn verified_consumer_id(request: &SbiRequest) -> Result<Option<String>, Stri
     verified_consumer_id_with(request, identity_required())
 }
 
+/// How often [`warn_untyped_certificate`] may log (R32 on #2089, #2082).
+pub const UNTYPED_CERTIFICATE_WARN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// R32 on #2089 (#2082): under production a client certificate without RFC 9310
+/// NFTypes is no identity, so a consumer issued one is refused or treated as
+/// its token alone with nothing in the logs. Say so at WARN, at most once per
+/// [`UNTYPED_CERTIFICATE_WARN_INTERVAL`] process-wide, with how many were seen
+/// meanwhile, so an operator can find relays and consumers whose certificates
+/// were issued without NFTypes. Rate-limited because a peer can present one on
+/// every request. Returns whether it logged (for the test).
+fn warn_untyped_certificate(nf_instance_id: &str) -> bool {
+    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> =
+        std::sync::Mutex::new((None, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if last
+        .0
+        .is_some_and(|at| now.duration_since(at) < UNTYPED_CERTIFICATE_WARN_INTERVAL)
+    {
+        last.1 += 1;
+        return false;
+    }
+    let suppressed = std::mem::take(&mut last.1);
+    last.0 = Some(now);
+    log::warn!(
+        "a client certificate without RFC 9310 NFTypes (NF instance {nf_instance_id}) is no \
+         identity under the production SBI profile: it cannot be told from a relay's. Reissue \
+         it with the NF's type ({suppressed} more such certificates seen in the last {}s)",
+        UNTYPED_CERTIFICATE_WARN_INTERVAL.as_secs()
+    );
+    true
+}
+
 /// [`verified_consumer_id`] with an explicit `required` (the production rule of
 /// #2065 for an untyped certificate).
 pub fn verified_consumer_id_with(
@@ -135,6 +169,7 @@ pub fn verified_consumer_id_with(
             .is_some_and(|s| !s.trim().is_empty());
     if required && untyped {
         // #2065: an untyped certificate is not an identity under production.
+        warn_untyped_certificate(request.peer_cert_nf_instance_id.as_deref().unwrap_or(""));
         return match request
             .oauth2_subject
             .as_deref()
@@ -545,6 +580,52 @@ pub async fn verified_nf_type_with(
     }
 }
 
+/// The `403` for a caller that may not use `operation` because it is not a
+/// verified `expected` NF, or `None` to go on (#2082): the gate an NF-type-only
+/// route (Nudm_UEAU's AUSF, the NSACF's local-configs update) runs before it
+/// reads or changes anything.
+///
+/// The rule is [`verified_nf_type_with`]'s: a typed non-relay certificate
+/// decides by its own NF types; a token alone, a token through a relay, or an
+/// untyped certificate with a token is the NRF's to vouch for; an untyped
+/// certificate alone, a relay's certificate alone and an anonymous caller are
+/// refused. Under `production` nothing else is admitted. Under dev a caller
+/// that presents no typed certificate and no token (plaintext, nothing to
+/// verify) is admitted as before; a typed certificate or a token is still
+/// checked.
+pub async fn nf_type_refusal_with(
+    request: &SbiRequest,
+    expected: crate::types::NfType,
+    operation: &str,
+    production: bool,
+) -> Option<SbiResponse> {
+    if let Err(why) = verified_consumer_id_with(request, production) {
+        return Some(forbidden(operation, &why));
+    }
+    let types = &request.peer_cert_nf_types;
+    let typed_certificate = !types.is_empty() && !is_relay_certificate(types);
+    let token = request
+        .oauth2_subject
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !production && !token && !typed_certificate {
+        return None;
+    }
+    match verified_nf_type_with(request, expected, production).await {
+        Ok(()) => None,
+        Err(why) => Some(forbidden(operation, &why)),
+    }
+}
+
+/// [`nf_type_refusal_with`] under the process's SBI profile.
+pub async fn nf_type_refusal(
+    request: &SbiRequest,
+    expected: crate::types::NfType,
+    operation: &str,
+) -> Option<SbiResponse> {
+    nf_type_refusal_with(request, expected, operation, identity_required()).await
+}
+
 fn forbidden(operation: &str, why: &str) -> SbiResponse {
     // debug, not warn: a peer can send these at will (#1620 review m7).
     log::debug!("{operation} refused: {why}");
@@ -825,6 +906,41 @@ mod tests {
         assert_eq!(new_seen.lock().unwrap().len(), 1, "the new NRF was asked");
     }
 
+    /// **#2162** (R42 on #2173): the two rules that refuse a certificate naming
+    /// no NF types with no token, each pinned by its exact sentence with the
+    /// profile passed explicitly, so both run on every run whatever the
+    /// process-wide profile: under production #2065's (no identity at all),
+    /// under dev #2099's typeless check. The lmfd/smfd tests assert dev's
+    /// through their handlers.
+    ///
+    /// REVERT-VERIFIED: with `verified_consumer_id_with`'s untyped rule applied
+    /// under dev too (`if untyped` without `required`), the dev case yields
+    /// production's sentence and the `dev` assertion fails.
+    #[tokio::test]
+    async fn a_typeless_certificate_is_refused_by_the_profiles_rule_2162() {
+        let typeless = caller(Some(A), None, &[]);
+        let production = verified_nf_type_with(&typeless, NfType::Lmf, true).await;
+        let dev = verified_nf_type_with(&typeless, NfType::Lmf, false).await;
+        assert_eq!(
+            production,
+            Err::<(), String>(
+                "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it \
+                 cannot be told from a relay's, and it presented no access token"
+                    .to_string()
+            ),
+            "production"
+        );
+        assert_eq!(
+            dev,
+            Err::<(), String>(
+                "the requester's certificate names no NF types and it sent no access token, so it \
+                 cannot be shown to be an LMF"
+                    .to_string()
+            ),
+            "dev"
+        );
+    }
+
     /// **#2099**: the caller-side rule. A certificate of the consumer naming NF
     /// types decides alone (no NRF); a certificate without NF types and no
     /// token, an anonymous caller and a certificate/token mismatch refuse; a
@@ -948,6 +1064,94 @@ mod tests {
             Ok(()),
             "a mixed certificate naming AMF is an AMF"
         );
+    }
+
+    /// R32 on #2089 (#2082): an untyped certificate under production is logged
+    /// at WARN at most once per interval; the ones in between are counted, not
+    /// logged.
+    ///
+    /// REVERT-VERIFIED: with the interval check dropped, the second call logs
+    /// and the `!` assertion fails.
+    #[test]
+    fn an_untyped_certificate_warns_at_most_once_per_interval_2082() {
+        // The limiter is process-wide; another test may have just logged, so
+        // the first call here is not asserted, only the one right after it.
+        let _ = warn_untyped_certificate("aaaaaaaa-2082-4000-8000-0000000000f1");
+        assert!(
+            !warn_untyped_certificate("aaaaaaaa-2082-4000-8000-0000000000f2"),
+            "a second untyped certificate within the interval is not logged again"
+        );
+    }
+
+    /// **#2082**: the NF-type gate. Under production only a verified `expected`
+    /// passes (its own typed certificate, or a token the NRF lists as one); an
+    /// untyped certificate alone, a relay's alone, a wrong type, a token the NRF
+    /// does not list and an anonymous caller are refused 403. Under dev an
+    /// unidentified plaintext caller passes, but a typed certificate or a token
+    /// is still checked.
+    ///
+    /// REVERT-VERIFIED: with the gate reduced to the pre-#2082 rule (an empty
+    /// type list passes), the production untyped-certificate case passes and
+    /// its `is_some` fails.
+    #[tokio::test]
+    async fn the_nf_type_gate_admits_only_a_verified_type_2082() {
+        const AUSF: &str = "aaaaaaaa-2082-4000-8000-0000000000a1";
+        const OTHER: &str = "bbbbbbbb-2082-4000-8000-0000000000b1";
+        const SCP: &str = "55555555-2082-4000-8000-000000000005";
+        seed_nf_type_for_test(AUSF, NfType::Ausf);
+        let gate = |r: SbiRequest, production: bool| async move {
+            nf_type_refusal_with(&r, NfType::Ausf, "Op", production)
+                .await
+                .map(|resp| resp.status)
+        };
+        for production in [true, false] {
+            assert_eq!(
+                gate(caller(Some(AUSF), None, &["AUSF"]), production).await,
+                None
+            );
+            assert_eq!(
+                gate(caller(None, Some(AUSF), &[]), production).await,
+                None,
+                "a token the NRF lists as an AUSF"
+            );
+            assert_eq!(
+                gate(caller(Some(SCP), Some(AUSF), &["SCP"]), production).await,
+                None,
+                "an AUSF's token through an SCP"
+            );
+            assert_eq!(
+                gate(caller(Some(OTHER), None, &["SMF"]), production).await,
+                Some(403),
+                "another type's certificate (production={production})"
+            );
+            assert_eq!(
+                gate(caller(Some(SCP), Some(OTHER), &["SCP"]), production).await,
+                Some(403),
+                "a token the NRF does not list as an AUSF"
+            );
+            assert_eq!(
+                gate(caller(Some(AUSF), Some(OTHER), &["AUSF"]), production).await,
+                Some(403),
+                "a certificate and token that disagree"
+            );
+        }
+        // Production refuses what proves no AUSF at all.
+        for (what, r) in [
+            (
+                "an untyped certificate alone",
+                caller(Some(AUSF), None, &[]),
+            ),
+            (
+                "a relay's certificate alone",
+                caller(Some(SCP), None, &["SCP"]),
+            ),
+            ("an anonymous caller", caller(None, None, &[])),
+        ] {
+            assert_eq!(gate(r, true).await, Some(403), "production: {what}");
+        }
+        // Dev: an unidentified plaintext caller is admitted as before.
+        assert_eq!(gate(caller(None, None, &[]), false).await, None);
+        assert_eq!(gate(caller(Some(SCP), None, &["SCP"]), false).await, None);
     }
 
     const A: &str = "aaaaaaaa-1865-4000-8000-000000000001";

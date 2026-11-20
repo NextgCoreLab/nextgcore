@@ -57,6 +57,8 @@ pub mod multipart;
 pub mod nes; // NES idle/sleep state machine (issue #22, non-normative)
 pub mod nf_addressing; // the NF host in ipv4Addresses / ipv6Addresses / fqdn by type (#1324)
 pub mod nf_instance_id; // This NF's own pinnable nfInstanceId (issue #187)
+pub mod nf_profiles; // #2178: NFProfiles shared by the NF that registers them and nrfd's tests
+pub mod nf_status_notify; // the NFStatusNotify sender rule and per-subscription tokens (#2172)
 pub mod nrf_tls; // how this NF dials its NRF: https + client certificate (#1617)
 pub mod oauth;
 pub mod overload;

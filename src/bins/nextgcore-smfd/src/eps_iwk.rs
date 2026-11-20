@@ -1120,7 +1120,6 @@ mod tests {
     /// out of ArpPriorityLevel's 1..=15 is the same clamped value on both.
     #[test]
     fn the_ebi_assignment_arp_is_the_n2_default_flows() {
-        use nextgcore_ngap::transfer::{PreEmptionCapability, PreEmptionVulnerability};
         let n2_arp = |level: u8| {
             let n2 =
                 crate::n2_transfer::setup_request_transfer(&crate::n2_transfer::SetupRequest {
@@ -1131,11 +1130,8 @@ mod tests {
                     flows: crate::default_flow(1, 9, level),
                 })
                 .expect("encode");
-            let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&n2)
-                .expect("decode");
-            t.qos_flow_setup_request_list[0]
-                .qos_flow_level_qos_parameters
-                .allocation_and_retention_priority
+            crate::n2_transfer::test_view::setup_request(&n2).flows[0]
+                .1
                 .clone()
         };
         for (level, clamped) in [(0u8, 1u8), (20, 15)] {
@@ -1158,12 +1154,9 @@ mod tests {
         );
         assert_eq!(
             sbi["preemptCap"] == "MAY_PREEMPT",
-            arp.pre_emption_capability == PreEmptionCapability::MayTriggerPreEmption
+            arp.may_trigger_pre_emption
         );
-        assert_eq!(
-            sbi["preemptVuln"] == "PREEMPTABLE",
-            arp.pre_emption_vulnerability == PreEmptionVulnerability::PreEmptable
-        );
+        assert_eq!(sbi["preemptVuln"] == "PREEMPTABLE", arp.pre_emptable);
         assert_eq!(sbi["preemptCap"], "NOT_PREEMPT");
         assert_eq!(sbi["preemptVuln"], "NOT_PREEMPTABLE");
     }

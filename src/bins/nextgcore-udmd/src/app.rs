@@ -1131,12 +1131,16 @@ async fn route_nudm_ueau(
     uri: &str,
 ) -> SbiResponse {
     // #1866: KAUSF goes to the AUSF only. Refused before the SUPI is parsed or
-    // the UDR is read, so a refusal has no side effect.
-    if let Some(refused) = crate::consumer_gate::refuse_consumer_type(
+    // the UDR is read, so a refusal has no side effect. #2082: by the shared
+    // verified-NF-type rule (CONVENTIONS), so a certificate without NF types,
+    // or a relay's alone, is no AUSF under production.
+    if let Some(refused) = nextgcore_sbi::owner_binding::nf_type_refusal(
         request,
+        nextgcore_sbi::types::NfType::Ausf,
         "nudm-ueau",
-        crate::consumer_gate::UEAU_CONSUMER_NF_TYPES,
-    ) {
+    )
+    .await
+    {
         return refused;
     }
     let supi = parts.get(2).copied().unwrap_or("");
@@ -4354,8 +4358,16 @@ mod tests {
     /// another NF type gets 403 on every Nudm_UEAU operation, before the body is
     /// read; the AUSF reaches the handler (its 400 names the missing IE, which
     /// only the handler produces).
+    ///
+    /// #2082: the gate is the shared `owner_binding::nf_type_refusal`, so the
+    /// certificates carry their NF Instance ID as a verified one does. The
+    /// router reads the process profile; this test asserts the dev routing
+    /// (Dev set and left set, CONVENTIONS), and the production refusals of an
+    /// untyped or relay-only certificate are pinned in sbi
+    /// `the_nf_type_gate_admits_only_a_verified_type_2082`.
     #[tokio::test]
     async fn nudm_ueau_is_refused_to_a_non_ausf_certificate_1866() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         const SUPI: &str = "imsi-001010000000001";
         let gen = format!("/nudm-ueau/v1/{SUPI}/security-information/generate-auth-data");
         let request = |method: &str, uri: &str, types: &[&str], body: serde_json::Value| {
@@ -4366,6 +4378,7 @@ mod tests {
             r.http.set_content(body.to_string());
             r.http.set_header("Content-Type", "application/json");
             r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r.peer_cert_nf_instance_id = Some("dddddddd-1866-4000-8000-00000000000d".to_string());
             r
         };
         let full = serde_json::json!({
@@ -4384,7 +4397,9 @@ mod tests {
                 let pd: serde_json::Value = serde_json::from_str(&body).expect("ProblemDetails");
                 let detail = pd["detail"].as_str().unwrap_or_default();
                 assert!(
-                    detail.contains("served to NF type(s) [\"AUSF\"] only") && detail.contains(t),
+                    detail.contains("nudm-ueau")
+                        && detail.contains(t)
+                        && detail.contains("not AUSF"),
                     "{body}"
                 );
                 assert!(
@@ -7352,8 +7367,14 @@ mod tests {
     /// A stub AUSF that counts the Nausf_SoRProtection / UPUProtection requests
     /// it receives. Registered in the shared SBI context under `instance_id` so
     /// udmd's AUSF selection can resolve it.
+    /// A stand-in AUSF serving SoR/UPU protection. It counts only the requests
+    /// for `supi`: the NF cache it registers in is process-wide, and a sibling
+    /// test that injects SoR/UPU for its own UE meanwhile can reach it through
+    /// the "any cached AUSF" fallback (#2082: seen as a stray hit on `ausf-a`
+    /// under shuffle seed 9001).
     async fn start_stub_ausf(
         instance_id: &str,
+        supi: &'static str,
     ) -> (SbiServer, Arc<std::sync::atomic::AtomicUsize>) {
         use nextgcore_sbi::context::{global_context, NfInstance, NfService};
         use nextgcore_sbi::types::{NfType, SbiServiceType};
@@ -7365,10 +7386,12 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
         server
-            .start(move |_req: SbiRequest| {
+            .start(move |req: SbiRequest| {
                 let counter = Arc::clone(&counter);
                 async move {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if req.header.uri.contains(&format!("/{supi}/")) {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     // 204 with no SorSecurityInfo: the injector then withholds
                     // (fail-closed). WHICH AUSF was asked is the whole question
                     // here, so a successful protection is not needed.
@@ -7533,14 +7556,17 @@ mod tests {
         std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
 
         let (udm_server, client) = start_real_udm().await;
-        let supi = "imsi-001010000000001";
+        // A SUPI of this test's own (#2082): the stand-in AUSFs count only its
+        // requests, so a sibling's SoR/UPU for another UE cannot be mistaken
+        // for the fallback firing here.
+        let supi = "imsi-001010000002082";
         let gen_path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
 
         // --- criterion 5a: the request's ausfInstanceId is PERSISTED ---------
         // Two AUSFs exist; "ausf-a" is registered first, so it is what the
         // "any cached AUSF" fallback would pick.
-        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a").await;
-        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b").await;
+        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a", supi).await;
+        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b", supi).await;
 
         let resp = client
             .post_json(

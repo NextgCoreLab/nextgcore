@@ -143,8 +143,13 @@ Triggers: `release: [published]` and `workflow_dispatch`. It does not redeploy o
 start other workflows (a GitHub Actions rule), so after a release run `pages.yml` by hand
 from the Actions tab.
 
-The mdBook sources live in `docs-book/`; `mdbook build docs-book` writes the book into
-`docs/book/`, which is committed and served under `/book/`.
+The mdBook sources live in `docs-book/`. `pages.yml` builds the book with mdBook **0.5.4**
+(`cargo install mdbook --version 0.5.4 --locked`, then `mdbook build docs-book`, which
+writes `docs/book/`) and publishes it with the rest of `docs/`, served under `/book/`.
+`docs/book/` is a build output and is not committed (#2168): the committed copy once drifted
+from its sources for 127 commits. The CI `book` job builds it on every PR with the same
+pinned version, and fails if `docs/book/` is committed again. To preview locally, install
+the same version and run `mdbook build docs-book` (or `mdbook serve docs-book`).
 
 ## Local pre-push gate (mirror of CI)
 

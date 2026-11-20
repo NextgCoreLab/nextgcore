@@ -110,11 +110,17 @@ fn per_type_pin(nf_type: NfType, env: impl Fn(&str) -> Option<String>) -> Option
 /// environment variable or an unset flag must fall through to the next source,
 /// not register this NF under the empty string.
 pub fn seed(id: &str) -> bool {
+    seed_in(&NF_INSTANCE_ID, id)
+}
+
+/// [`seed`] into `cell` (#2161: the tests pin a cell of their own, so no other
+/// test resolving the process-wide one can pre-empt them in any order).
+fn seed_in(cell: &OnceLock<String>, id: &str) -> bool {
     let id = id.trim();
     if id.is_empty() {
         return false;
     }
-    NF_INSTANCE_ID.set(id.to_string()).is_ok()
+    cell.set(id.to_string()).is_ok()
 }
 
 /// This NF's `nfInstanceId`, resolved on first call and stable thereafter.
@@ -124,7 +130,12 @@ pub fn seed(id: &str) -> bool {
 /// build for a `bins/` crate that does otherwise.
 pub fn nf_instance_id(nf_type: NfType) -> &'static str {
     let _ = OWN_NF_TYPE.set(nf_type);
-    NF_INSTANCE_ID.get_or_init(|| {
+    resolve_in(&NF_INSTANCE_ID, nf_type)
+}
+
+/// [`nf_instance_id`]'s resolution, memoized in `cell` (#2161).
+fn resolve_in(cell: &OnceLock<String>, nf_type: NfType) -> &str {
+    cell.get_or_init(|| {
         if let Some(id) = non_empty_env(ANY_NF_INSTANCE_ID_ENV) {
             log::info!(
                 "nfInstanceId {id} pinned by {ANY_NF_INSTANCE_ID_ENV} (NF type {})",
@@ -243,36 +254,47 @@ mod tests {
     /// The resolver is memoized, which is the property that dissolves the
     /// several-identities-per-process defect: two call sites cannot disagree.
     ///
-    /// This test seeds the process-wide lock, so it is the ONLY test in this
-    /// module permitted to resolve it — see the note on `seed` above. Other
-    /// properties are tested through pure helpers or from
-    /// `tests/nf_instance_id_resolution.rs`, which gets a fresh process per
-    /// integration-test binary.
+    /// #2161: run against a cell of its own. It used to seed the process-wide
+    /// cell, so any test that resolved it first (an `oauth` test building an
+    /// outbound client calls [`nf_instance_id`]) made `seed` fail under some
+    /// shuffle orders. The process-wide wiring is the one-line delegation in
+    /// [`seed`] / [`nf_instance_id`]; `tests/nf_instance_id_from_env.rs` covers
+    /// it in a process of its own.
+    ///
+    /// REVERT-VERIFIED: with `resolve_in` resolving into a fresh cell on every
+    /// call instead of memoizing in `cell`, "the seeded pin must win over
+    /// generation" fails.
     #[test]
     fn a_seeded_id_is_returned_to_every_caller_and_never_changes() {
+        let cell = OnceLock::new();
         // A distinct literal, not a UUID, so a failure names this test rather
         // than looking like a plausible generated value.
-        assert!(
-            seed("issue-187-memoization-probe"),
-            "nothing else in this test binary may resolve the ID before this runs"
-        );
-        assert!(is_resolved());
+        assert!(seed_in(&cell, "issue-187-memoization-probe"));
         // Both the type this was seeded "for" and a different one observe it:
         // there is one identity per process, not one per NF type.
         assert_eq!(
-            nf_instance_id(NfType::Amf),
+            resolve_in(&cell, NfType::Amf),
             "issue-187-memoization-probe",
             "the seeded pin must win over generation"
         );
         assert_eq!(
-            nf_instance_id(NfType::Udm),
+            resolve_in(&cell, NfType::Udm),
             "issue-187-memoization-probe",
             "a second call site must observe the SAME id -- this is the property that \
              makes a CCA subject equal the registered nfInstanceId"
         );
         // A later seed cannot move the identity out from under a party that has
         // already registered or verified against it.
-        assert!(!seed("issue-187-second-pin-must-lose"));
-        assert_eq!(nf_instance_id(NfType::Amf), "issue-187-memoization-probe");
+        assert!(!seed_in(&cell, "issue-187-second-pin-must-lose"));
+        assert_eq!(
+            resolve_in(&cell, NfType::Amf),
+            "issue-187-memoization-probe"
+        );
+
+        // Unseeded, the first resolution is generated once and then kept.
+        let fresh = OnceLock::new();
+        let first = resolve_in(&fresh, NfType::Smf).to_string();
+        assert_eq!(resolve_in(&fresh, NfType::Amf), first);
+        assert!(!seed_in(&fresh, "too-late"));
     }
 }
