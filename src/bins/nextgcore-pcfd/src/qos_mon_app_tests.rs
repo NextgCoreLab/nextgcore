@@ -6,21 +6,14 @@ use std::sync::{Arc, Mutex};
 
 type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
 
-fn request(method: &str, uri: &str, body: Option<serde_json::Value>) -> SbiRequest {
-    let req = match method {
-        "DELETE" => SbiRequest::delete(uri),
-        "PUT" => SbiRequest::put(uri),
-        "PATCH" => SbiRequest::patch(uri),
-        _ => SbiRequest::post(uri),
-    };
-    match body {
-        Some(b) => req.with_json_body(&b).expect("encode test body"),
-        None => req,
-    }
+/// `req` (a POST, or the one DELETE) with `body` as its JSON.
+fn with_body(req: SbiRequest, body: serde_json::Value) -> SbiRequest {
+    req.with_json_body(&body).expect("encode test body")
 }
 
-async fn route(method: &str, uri: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
-    let resp = pcf_sbi_request_handler(request(method, uri, Some(body))).await;
+/// POST `body` to `uri` through pcfd's router: the status and the JSON answered.
+async fn route(uri: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let resp = pcf_sbi_request_handler(with_body(SbiRequest::post(uri), body)).await;
     let json = resp
         .http
         .content
@@ -78,7 +71,6 @@ async fn next_post(
 /// recorder. Returns the smPolicyId and the answered suppFeat.
 async fn sm_policy(port: u16, supi: &str, ipv4: &str, supp_feat: &str) -> (String, String) {
     let (status, body) = route(
-        "POST",
         "/npcf-smpolicycontrol/v1/sm-policies",
         serde_json::json!({
             "supi": supi,
@@ -164,7 +156,6 @@ async fn an_af_qos_monitoring_subscription_is_the_smf_s_policy_and_its_reports_r
     assert_eq!(sm_feat, sm_24_73(), "24 and 73 negotiated");
 
     let (status, asc) = route(
-        "POST",
         "/npcf-policyauthorization/v1/app-sessions",
         af_body(port, "10.45.22.10", PA_16_44, qos_mon_subsc()),
     )
@@ -206,7 +197,6 @@ async fn an_af_qos_monitoring_subscription_is_the_smf_s_policy_and_its_reports_r
 
     // The SMF reports (TS 29.512 §4.2.4.24).
     let (status, answer) = route(
-        "POST",
         &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}/update"),
         serde_json::json!({
             "repPolicyCtrlReqTriggers": ["QOS_MONITORING"],
@@ -236,11 +226,9 @@ async fn an_af_qos_monitoring_subscription_is_the_smf_s_policy_and_its_reports_r
     );
 
     // Unsubscribed: withdrawn at the SMF.
-    let resp = pcf_sbi_request_handler(request(
-        "DELETE",
-        &format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/events-subscription"),
-        None,
-    ))
+    let resp = pcf_sbi_request_handler(SbiRequest::delete(format!(
+        "/npcf-policyauthorization/v1/app-sessions/{app_session_id}/events-subscription"
+    )))
     .await;
     assert_eq!(resp.status, 204);
     let n = next_post(&seen, "/update", |_| true).await;
@@ -279,7 +267,6 @@ async fn qos_monitoring_needs_the_features_negotiated_on_both_legs_2221() {
         let (_, sm_feat) = sm_policy(port, &format!("imsi-0010100000222{n}"), &ip, sm).await;
         assert_eq!(sm_feat, if sm == "100" { "100" } else { "800000" });
         let (status, _) = route(
-            "POST",
             "/npcf-policyauthorization/v1/app-sessions",
             af_body(port, &ip, pa, qos_mon_subsc()),
         )
@@ -311,7 +298,6 @@ async fn qos_monitoring_needs_the_features_negotiated_on_both_legs_2221() {
         "qosMon": { "repThreshUl": 10 },
     });
     let (status, _) = route(
-        "POST",
         "/npcf-policyauthorization/v1/app-sessions",
         af_body(port, ip, PA_16_44, subsc),
     )
@@ -358,7 +344,6 @@ fn rules_of(app_session_id: &str) -> Vec<String> {
 
 async fn af_session(port: u16, af: &str, ipv4: &str) -> String {
     let (status, asc) = route(
-        "POST",
         "/npcf-policyauthorization/v1/app-sessions",
         af_body_at(port, af, ipv4, PA_16_44, qos_mon_subsc()),
     )
@@ -408,7 +393,6 @@ async fn each_af_on_a_pdu_session_gets_only_its_own_qos_monitoring_reports_2221(
     );
 
     let (status, _) = route(
-        "POST",
         &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}/update"),
         serde_json::json!({
             "repPolicyCtrlReqTriggers": ["QOS_MONITORING"],
@@ -449,7 +433,6 @@ async fn an_app_session_delete_removes_its_rules_at_the_smf_2221() {
     let a = af_session(port, "afA", ip).await;
     let _ = next_post(&seen, "/update", |_| true).await;
     let (status, asc) = route(
-        "POST",
         "/npcf-policyauthorization/v1/app-sessions",
         af_body_at(
             port,
@@ -476,13 +459,12 @@ async fn an_app_session_delete_removes_its_rules_at_the_smf_2221() {
         .qos_id
         .clone();
 
-    let resp = pcf_sbi_request_handler(request(
-        "POST",
+    let (status, _) = route(
         &format!("/npcf-policyauthorization/v1/app-sessions/{a}/delete"),
-        Some(serde_json::json!({})),
-    ))
+        serde_json::json!({}),
+    )
     .await;
-    assert!((200..300).contains(&resp.status), "{}", resp.status);
+    assert!((200..300).contains(&status), "{status}");
     let n = next_post(&seen, "/update", |_| true).await;
     let d = &n["smPolicyDecision"];
     assert_eq!(
