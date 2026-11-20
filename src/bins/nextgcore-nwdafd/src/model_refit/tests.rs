@@ -318,7 +318,11 @@ async fn mtlf_server(
                 match p.as_slice() {
                     ["nnwdaf-mlmodelprovision", "v1", "subscriptions"] => {
                         let g = ctx.read().unwrap();
-                        crate::sbi_handler::handle_ml_prov_subscription_create_with_ctx(&g, &req)
+                        crate::sbi_handler::handle_ml_prov_subscription_create_with_ctx(
+                            &g,
+                            &req,
+                            nextgcore_sbi::owner_binding::identity_required(),
+                        )
                     }
                     ["nnwdaf-mlmodelprovision", "v1", "models", ev, art] => {
                         let g = ctx.read().unwrap();

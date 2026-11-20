@@ -1566,12 +1566,15 @@ fn events_subscription_echo(sub: &AnalyticsSubscription) -> serde_json::Value {
 }
 
 /// Handle analytics subscription creation (POST /subscriptions).
-pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+///
+/// `required` is the router's SBI profile (`true` = production: the creator must
+/// prove an identity), passed in, not read from the process (#2239).
+pub async fn handle_subscription_create(request: &SbiRequest, required: bool) -> SbiResponse {
     log::info!("Analytics Subscription Create");
 
     // #1865: bound to the verified identity of its creator, checked before the
     // body is read or anything is stored.
-    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+    let owner = match owner_binding::owner_for_new_resource_with(request, "Subscribe", required) {
         Ok(owner) => owner,
         Err(refused) => return *refused,
     };
@@ -1609,12 +1612,13 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 pub async fn handle_subscription_update(
     subscription_id: &str,
     request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     log::info!("Analytics Subscription Update: {subscription_id}");
 
     // #1865: only the consumer that created the subscription may replace it,
     // checked before the body is read; the replacement keeps that owner.
-    let owner = match analytics_subscription_owner(subscription_id, request, "Update") {
+    let owner = match analytics_subscription_owner(subscription_id, request, "Update", required) {
         Ok(owner) => owner,
         Err(refused) => return *refused,
     };
@@ -1651,6 +1655,7 @@ fn analytics_subscription_owner(
     subscription_id: &str,
     request: &SbiRequest,
     operation: &str,
+    required: bool,
 ) -> Result<Option<String>, Box<SbiResponse>> {
     let existing = nwdaf_self()
         .read()
@@ -1662,7 +1667,12 @@ fn analytics_subscription_owner(
             Some("SUBSCRIPTION_NOT_FOUND"),
         )));
     };
-    match owner_binding::refuse_non_owner(existing.owner.as_deref(), request, operation) {
+    match owner_binding::refuse_non_owner_with(
+        existing.owner.as_deref(),
+        request,
+        operation,
+        required,
+    ) {
         Some(refused) => Err(Box::new(refused)),
         None => Ok(existing.owner),
     }
@@ -1673,6 +1683,7 @@ fn ml_prov_subscription_owner(
     subscription_id: &str,
     request: &SbiRequest,
     operation: &str,
+    required: bool,
 ) -> Result<Option<String>, Box<SbiResponse>> {
     let existing = nwdaf_self()
         .read()
@@ -1684,16 +1695,25 @@ fn ml_prov_subscription_owner(
             Some("SUBSCRIPTION_NOT_FOUND"),
         )));
     };
-    match owner_binding::refuse_non_owner(existing.owner.as_deref(), request, operation) {
+    match owner_binding::refuse_non_owner_with(
+        existing.owner.as_deref(),
+        request,
+        operation,
+        required,
+    ) {
         Some(refused) => Err(Box::new(refused)),
         None => Ok(existing.owner),
     }
 }
 
 /// Handle subscription retrieval, by the consumer that created it (#1865).
-pub async fn handle_subscription_get(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+pub async fn handle_subscription_get(
+    subscription_id: &str,
+    request: &SbiRequest,
+    required: bool,
+) -> SbiResponse {
     log::debug!("Get subscription: {subscription_id}");
-    if let Err(refused) = analytics_subscription_owner(subscription_id, request, "Get") {
+    if let Err(refused) = analytics_subscription_owner(subscription_id, request, "Get", required) {
         return *refused;
     }
 
@@ -1721,9 +1741,12 @@ pub async fn handle_subscription_get(subscription_id: &str, request: &SbiRequest
 pub async fn handle_subscription_delete(
     subscription_id: &str,
     request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     log::info!("Delete subscription: {subscription_id}");
-    if let Err(refused) = analytics_subscription_owner(subscription_id, request, "Unsubscribe") {
+    if let Err(refused) =
+        analytics_subscription_owner(subscription_id, request, "Unsubscribe", required)
+    {
         return *refused;
     }
 
@@ -1773,7 +1796,10 @@ fn ml_prov_request_json(
 /// `mLEventSubscs[]`. On success returns 201 with a `Location` header pointing
 /// at `/nnwdaf-mlmodelprovision/v1/subscriptions/{subscriptionId}` and echoes
 /// the subscription representation. There is no `/models` resource.
-pub async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResponse {
+pub async fn handle_ml_prov_subscription_create(
+    request: &SbiRequest,
+    required: bool,
+) -> SbiResponse {
     let ctx = nwdaf_self();
     let Ok(context) = ctx.read() else {
         return send_bad_request(
@@ -1781,19 +1807,20 @@ pub async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResp
             Some("SUBSCRIPTION_FAILED"),
         );
     };
-    handle_ml_prov_subscription_create_with_ctx(&context, request)
+    handle_ml_prov_subscription_create_with_ctx(&context, request, required)
 }
 
 /// [`handle_ml_prov_subscription_create`] on a given context.
 pub fn handle_ml_prov_subscription_create_with_ctx(
     context: &NwdafContext,
     request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     log::info!("ML Model Provision subscribe");
 
     // #1865: bound to the verified identity of its creator, checked before the
     // body is read or anything is stored.
-    let owner = match owner_binding::owner_for_new_resource(request, "Subscribe") {
+    let owner = match owner_binding::owner_for_new_resource_with(request, "Subscribe", required) {
         Ok(owner) => owner,
         Err(refused) => return *refused,
     };
@@ -1837,12 +1864,13 @@ pub fn handle_ml_prov_subscription_create_with_ctx(
 pub async fn handle_ml_prov_subscription_update(
     subscription_id: &str,
     request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     log::info!("ML Model Provision update: {subscription_id}");
 
     // #1865: only the consumer that created the subscription may replace it,
     // checked before the body is read; the replacement keeps that owner.
-    let owner = match ml_prov_subscription_owner(subscription_id, request, "Update") {
+    let owner = match ml_prov_subscription_owner(subscription_id, request, "Update", required) {
         Ok(owner) => owner,
         Err(refused) => return *refused,
     };
@@ -1933,9 +1961,12 @@ fn ml_prov_representation(
 pub async fn handle_ml_prov_subscription_delete(
     subscription_id: &str,
     request: &SbiRequest,
+    required: bool,
 ) -> SbiResponse {
     log::info!("ML Model Provision delete: {subscription_id}");
-    if let Err(refused) = ml_prov_subscription_owner(subscription_id, request, "Unsubscribe") {
+    if let Err(refused) =
+        ml_prov_subscription_owner(subscription_id, request, "Unsubscribe", required)
+    {
         return *refused;
     }
 
@@ -2056,34 +2087,66 @@ mod tests {
     }
 
     async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
-        super::handle_subscription_create(&as_consumer(request)).await
+        super::handle_subscription_create(
+            &as_consumer(request),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await
     }
 
     async fn handle_subscription_update(id: &str, request: &SbiRequest) -> SbiResponse {
-        super::handle_subscription_update(id, &as_consumer(request)).await
+        super::handle_subscription_update(
+            id,
+            &as_consumer(request),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await
     }
 
     async fn handle_subscription_get(id: &str) -> SbiResponse {
-        super::handle_subscription_get(id, &as_consumer(&SbiRequest::get("/"))).await
+        super::handle_subscription_get(
+            id,
+            &as_consumer(&SbiRequest::get("/")),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await
     }
 
     async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResponse {
-        super::handle_ml_prov_subscription_create(&as_consumer(request)).await
+        super::handle_ml_prov_subscription_create(
+            &as_consumer(request),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await
     }
 
     fn handle_ml_prov_subscription_create_with_ctx(
         context: &NwdafContext,
         request: &SbiRequest,
     ) -> SbiResponse {
-        super::handle_ml_prov_subscription_create_with_ctx(context, &as_consumer(request))
+        super::handle_ml_prov_subscription_create_with_ctx(
+            context,
+            &as_consumer(request),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
     }
 
     async fn handle_ml_prov_subscription_update(id: &str, request: &SbiRequest) -> SbiResponse {
-        super::handle_ml_prov_subscription_update(id, &as_consumer(request)).await
+        super::handle_ml_prov_subscription_update(
+            id,
+            &as_consumer(request),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await
     }
 
     async fn handle_ml_prov_subscription_delete(id: &str) -> SbiResponse {
-        super::handle_ml_prov_subscription_delete(id, &as_consumer(&SbiRequest::delete("/"))).await
+        super::handle_ml_prov_subscription_delete(
+            id,
+            &as_consumer(&SbiRequest::delete("/")),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await
     }
 
     const OWNER_1865: &str = "aaaaaaaa-1865-4000-8000-00000000000a";
@@ -2133,11 +2196,14 @@ mod tests {
                 "notificationURI": uri,
             })
         };
-        let create = super::handle_subscription_create(&owned_1865(
-            SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
-                .with_json_body(&body("http://owner.example/cb"))
-                .unwrap(),
-        ))
+        let create = super::handle_subscription_create(
+            &owned_1865(
+                SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+                    .with_json_body(&body("http://owner.example/cb"))
+                    .unwrap(),
+            ),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
         .await;
         assert_eq!(create.status, 201, "{:?}", create.http.content);
         let id = create
@@ -2154,7 +2220,12 @@ mod tests {
                 .unwrap()
         };
         for (who, req) in strangers_1865(put) {
-            let resp = super::handle_subscription_update(&id, &req).await;
+            let resp = super::handle_subscription_update(
+                &id,
+                &req,
+                nextgcore_sbi::owner_binding::identity_required(),
+            )
+            .await;
             assert_eq!(resp.status, 403, "{who} PUT");
             assert_eq!(
                 stored().unwrap().notification_uri,
@@ -2164,14 +2235,26 @@ mod tests {
         }
         for (who, req) in strangers_1865(|| SbiRequest::get("/")) {
             assert_eq!(
-                super::handle_subscription_get(&id, &req).await.status,
+                super::handle_subscription_get(
+                    &id,
+                    &req,
+                    nextgcore_sbi::owner_binding::identity_required()
+                )
+                .await
+                .status,
                 403,
                 "{who} GET"
             );
         }
         for (who, req) in strangers_1865(|| SbiRequest::delete("/")) {
             assert_eq!(
-                super::handle_subscription_delete(&id, &req).await.status,
+                super::handle_subscription_delete(
+                    &id,
+                    &req,
+                    nextgcore_sbi::owner_binding::identity_required()
+                )
+                .await
+                .status,
                 403,
                 "{who}"
             );
@@ -2186,9 +2269,13 @@ mod tests {
         // #2065: typed, as a consumer's certificate is (RFC 9310).
         by_cert.peer_cert_nf_types = vec!["NEF".into()];
         assert_eq!(
-            super::handle_subscription_update(&id, &by_cert)
-                .await
-                .status,
+            super::handle_subscription_update(
+                &id,
+                &by_cert,
+                nextgcore_sbi::owner_binding::identity_required()
+            )
+            .await
+            .status,
             200
         );
         assert_eq!(
@@ -2200,14 +2287,29 @@ mod tests {
             Some(OWNER_1865),
             "the replacement keeps the owner"
         );
-        let get = super::handle_subscription_get(&id, &owned_1865(SbiRequest::get("/"))).await;
+        let get = super::handle_subscription_get(
+            &id,
+            &owned_1865(SbiRequest::get("/")),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await;
         assert_eq!(get.status, 200);
         let owner_delete = owned_1865(SbiRequest::delete("/"));
-        let del = super::handle_subscription_delete(&id, &owner_delete).await;
+        let del = super::handle_subscription_delete(
+            &id,
+            &owner_delete,
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await;
         assert_eq!(del.status, 204);
         assert!(stored().is_none());
         // Unknown stays 404, for anyone.
-        let gone = super::handle_subscription_delete(&id, &owner_delete).await;
+        let gone = super::handle_subscription_delete(
+            &id,
+            &owner_delete,
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await;
         assert_eq!(gone.status, 404);
     }
 
@@ -2232,7 +2334,15 @@ mod tests {
                 }))
                 .unwrap(),
         );
-        assert_eq!(super::handle_subscription_create(&events).await.status, 403);
+        assert_eq!(
+            super::handle_subscription_create(
+                &events,
+                nextgcore_sbi::owner_binding::identity_required()
+            )
+            .await
+            .status,
+            403
+        );
         let ml = mismatch(
             SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
                 .with_json_body(&json!({
@@ -2242,7 +2352,12 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            super::handle_ml_prov_subscription_create(&ml).await.status,
+            super::handle_ml_prov_subscription_create(
+                &ml,
+                nextgcore_sbi::owner_binding::identity_required()
+            )
+            .await
+            .status,
             403
         );
         let ctx = nwdaf_self();
@@ -2265,11 +2380,14 @@ mod tests {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
         let body =
             |uri: &str| json!({ "notifUri": uri, "mLEventSubscs": [{ "mLEvent": "NF_LOAD" }] });
-        let created = super::handle_ml_prov_subscription_create(&owned_1865(
-            SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
-                .with_json_body(&body("http://anlf-1865.example/ml"))
-                .unwrap(),
-        ))
+        let created = super::handle_ml_prov_subscription_create(
+            &owned_1865(
+                SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+                    .with_json_body(&body("http://anlf-1865.example/ml"))
+                    .unwrap(),
+            ),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
         .await;
         assert_eq!(created.status, 201, "{:?}", created.http.content);
         let id = body_json(&created)["subscriptionId"]
@@ -2284,22 +2402,40 @@ mod tests {
                 .unwrap()
         };
         for (who, req) in strangers_1865(put) {
-            let resp = super::handle_ml_prov_subscription_update(&id, &req).await;
+            let resp = super::handle_ml_prov_subscription_update(
+                &id,
+                &req,
+                nextgcore_sbi::owner_binding::identity_required(),
+            )
+            .await;
             assert_eq!(resp.status, 403, "{who} PUT");
             assert_eq!(stored().unwrap().notif_uri, "http://anlf-1865.example/ml");
         }
         for (who, req) in strangers_1865(|| SbiRequest::delete("/")) {
-            let resp = super::handle_ml_prov_subscription_delete(&id, &req).await;
+            let resp = super::handle_ml_prov_subscription_delete(
+                &id,
+                &req,
+                nextgcore_sbi::owner_binding::identity_required(),
+            )
+            .await;
             assert_eq!(resp.status, 403, "{who}");
             assert!(stored().is_some(), "{who}: still stored");
         }
-        let resp = super::handle_ml_prov_subscription_update(&id, &owned_1865(put())).await;
+        let resp = super::handle_ml_prov_subscription_update(
+            &id,
+            &owned_1865(put()),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await;
         assert_eq!(resp.status, 200);
         assert_eq!(stored().unwrap().notif_uri, "http://attacker.example/ml");
         assert_eq!(stored().unwrap().owner.as_deref(), Some(OWNER_1865));
-        let resp =
-            super::handle_ml_prov_subscription_delete(&id, &owned_1865(SbiRequest::delete("/")))
-                .await;
+        let resp = super::handle_ml_prov_subscription_delete(
+            &id,
+            &owned_1865(SbiRequest::delete("/")),
+            nextgcore_sbi::owner_binding::identity_required(),
+        )
+        .await;
         assert_eq!(resp.status, 204);
         assert!(stored().is_none());
     }
