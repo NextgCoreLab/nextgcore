@@ -60,8 +60,8 @@ All keys live under the top-level `amf:` section. Types and defaults below come 
 | `amf_name` | string | none | Human-readable AMF name, stored in the AMF context and logged at startup. |
 | `network_name.full` | string | empty (`NetworkName::default()`) | Full network name presented to UEs. |
 | `network_name.short` | string | empty | Short network name presented to UEs. |
-| `guami` | list | empty list | Served GUAMI list. Entries without a resolvable `plmn_id` are silently skipped. |
-| `guami[].plmn_id.mcc` / `.mnc` | string or int | required per entry | PLMN identity; accepts quoted strings (`"999"`) or bare integers — both are normalized. |
+| `guami` | list | empty list | Served GUAMI list. An entry with no `plmn_id`, or one leaving its `mcc` or `mnc` out, is skipped; a malformed `mcc` or `mnc` fails the load (#2115). |
+| `guami[].plmn_id.mcc` / `.mnc` | string | required per entry | PLMN identity, as quoted digit strings: an MCC is 3 digits and an MNC 2 or 3 (TS 23.003 §2.2). A YAML number (`mcc: 999`) or a string of the wrong length fails the load (#2115); see the PLMN note below. The same rule applies to `tai[]` and `plmn_support[]`. |
 | `guami[].amf_id.region` | u8 | `0` | AMF Region ID. |
 | `guami[].amf_id.set` | u16 | `0` | AMF Set ID. |
 | `guami[].amf_id.pointer` | u8 | `0` | AMF Pointer. |
@@ -134,10 +134,11 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 
 ## Behavior notes and caveats
 
-- **Lenient loading:** a missing config file, YAML parse error, or missing `amf:` section logs a warning and starts the AMF with defaults — it does not abort. Typos in key names are therefore silently ignored; check the startup log lines (`Configured GUAMI: ...`, `AMF configuration loaded: N GUAMI, N TAI, N PLMN support`) to confirm what was actually applied. Two exceptions abort start-up, and a refused file applies nothing:
+- **Lenient loading:** a missing config file, YAML parse error, or missing `amf:` section logs a warning and starts the AMF with defaults — it does not abort. Typos in key names are therefore silently ignored; check the startup log lines (`Configured GUAMI: ...`, `AMF configuration loaded: N GUAMI, N TAI, N PLMN support`) to confirm what was actually applied. Three exceptions abort start-up, and a refused file applies nothing:
   - a `plmn_support` entry left with no usable S-NSSAI (none listed, or every one SST 0, which is refused as no slice — TS 23.501 §5.15.2.2). The NG Setup Response's Slice Support List must hold at least one (TS 38.413 §9.3.1.17).
   - a `plmn_support` or `guami` list that resolves to nothing (empty, or no entry with a usable PLMN ID). The NG Setup Response's PLMN Support List and Served GUAMI List must each hold at least one (TS 38.413 §9.2.6.2). Each list the file names (`guami`, `tai`, `plmn_support`, `security.integrity_order`, `security.ciphering_order`) replaces the AMF's list; a list the file leaves out keeps its default.
-- **PLMN flexibility:** `mcc`/`mnc` accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.
+  - a malformed `mcc` or `mnc` in any `guami`, `tai` or `plmn_support` entry: a YAML number, or a string that is not 3 (MCC) or 2-3 (MNC) digits (#2115). The error names the entry, e.g. `amf.guami[0].plmn_id.mcc=1 reached the configuration as a number, not a string`.
+- **PLMN digits are strings (#2115):** write `mcc` and `mnc` quoted (`mcc: "001"`, `mnc: "070"`). A YAML number is refused at load, even one that lost nothing (`mcc: 999`): once a value is a number its leading zeros are gone (a YAML 1.1 re-dump turns `"001"` into `1`), the AMF cannot know which PLMN was meant, and MNC 70 and 070 are different PLMNs (TS 23.003 §2.2). The AMF used to accept the number and read its digits from the left, so `mcc: 1` configured MCC 100. A 2-digit MNC is encoded with the filler digit per standard PLMN encoding. The Helm chart refuses a numeric `global.plmn` on the deploy side with the same rule and renders it quoted (#2069).
 - **Empty security lists:** if `security` is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.
 - **Multiple NRF entries** in `sbi.client.nrf` are parsed but only the first is used — additional entries are currently inert.
 - `amf.ngap.server[0]` and `amf.sbi.server[0]` are the NGAP and SBI listen addresses (#1311). `--ngap-addr` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` override them; with neither, loopback (#1308). There is no `amf.metrics.server` (#1312); the metrics endpoint is `NEXTGCORE_METRICS_BIND`:`AMF_METRICS_PORT`.

@@ -15,8 +15,8 @@
 //!
 //! 1. the NF Instance ID in the URI SAN of the verified client certificate
 //!    ([`SbiRequest::peer_cert_nf_instance_id`], TS 33.310 §6.1.3c), unless that
-//!    certificate names a relay type ([`RELAY_NF_TYPES`]: an SCP or SEPP is not
-//!    the consumer), else
+//!    certificate names relay types only ([`is_relay_certificate`]: an SCP or
+//!    SEPP is not the consumer; one also naming a consumer type is, #2113), else
 //! 2. the `sub` of the verified OAuth2 access token
 //!    ([`SbiRequest::oauth2_subject`], TS 29.510 `AccessTokenClaims.sub`, the
 //!    consumer's NF Instance ID), which survives an SCP hop (TS 33.501 §13.3).
@@ -82,6 +82,22 @@ use crate::security::SbiProfile;
 /// Certificate NF types that identify a relay rather than the consumer.
 pub const RELAY_NF_TYPES: &[&str] = &["SCP", "SEPP"];
 
+/// #2113: whether a certificate naming `nf_types` (RFC 9310 NFTypes) is a
+/// relay's: it names at least one type and every one is a relay type
+/// ([`RELAY_NF_TYPES`]). A certificate that also names a consumer type -- say
+/// `[SCP, PCF]` -- is that consumer's, not a relay's: its holder is identified
+/// and typed by it, so it cannot borrow another NF's token by calling itself an
+/// SCP. A certificate naming no types is not a relay's either (see the module
+/// docs: it fails closed).
+pub fn is_relay_certificate<S: AsRef<str>>(nf_types: &[S]) -> bool {
+    !nf_types.is_empty()
+        && nf_types.iter().all(|t| {
+            RELAY_NF_TYPES
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(t.as_ref().trim()))
+        })
+}
+
 /// NF Instance IDs are UUIDs (TS 29.571 `NfInstanceId`), compared without case.
 pub fn same_nf_instance_id(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
@@ -97,10 +113,7 @@ pub fn identity_required() -> bool {
 /// The caller's verified NF Instance ID: `Ok(None)` when it proved none,
 /// `Err(detail)` when its certificate and token name different NF instances.
 pub fn verified_consumer_id(request: &SbiRequest) -> Result<Option<String>, String> {
-    let relay = request
-        .peer_cert_nf_types
-        .iter()
-        .any(|t| RELAY_NF_TYPES.iter().any(|r| r.eq_ignore_ascii_case(t)));
+    let relay = is_relay_certificate(&request.peer_cert_nf_types);
     let cert = request
         .peer_cert_nf_instance_id
         .as_deref()
@@ -216,13 +229,25 @@ pub fn unguessable_id() -> String {
 /// ausfd #1964 figure).
 pub const NF_TYPE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// #2123 (R41): how long an NRF answer that a caller is NOT of a type is
+/// reused. Short, so an NF the NRF has only just registered (its profile not
+/// yet visible when first looked up) is refused for seconds rather than for
+/// [`NF_TYPE_TTL`]. Not zero, because a refusal is free to provoke: a peer
+/// replaying refused requests would otherwise cost one NRF query each.
+pub const NF_TYPE_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// At most this many cached answers; a full cache drops the expired ones, then
 /// everything, rather than grow.
 const NF_TYPE_CACHE_MAX: usize = 1024;
 
-/// (NF type, NF instance ID) -> (the NRF lists that instance with that type,
-/// valid until). Both answers are cached; a lookup that fails is never cached:
-/// it refuses, and the next call asks again.
+/// (NRF URI, NF type, NF instance ID) -> (that NRF lists that instance with
+/// that type, valid until). Both answers are cached; a lookup that fails is
+/// never cached: it refuses, and the next call asks again.
+///
+/// The NRF URI is part of the key (#2120), so after the configured NRF changes
+/// the old NRF's answers are never reused: the new NRF is asked. The type is
+/// part of it too, so an instance's answer as one type is never its answer as
+/// another.
 type NfTypeCache = std::collections::HashMap<String, (bool, std::time::Instant)>;
 
 fn nf_type_cache() -> std::sync::MutexGuard<'static, NfTypeCache> {
@@ -233,22 +258,47 @@ fn nf_type_cache() -> std::sync::MutexGuard<'static, NfTypeCache> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn nf_type_key(nf_type: &str, id: &str) -> String {
+fn nf_type_key(nrf_uri: &str, nf_type: &str, id: &str) -> String {
+    // A space cannot occur in a URI, an NF type or a UUID, so the parts cannot
+    // run into each other.
     format!(
-        "{}:{}",
+        "{} {} {}",
+        nrf_uri.trim().trim_end_matches('/'),
         nf_type.to_ascii_uppercase(),
         id.trim().to_ascii_lowercase()
     )
 }
 
+/// The `seed_nf_type_for_test` answers: (NF type, NF instance ID) keys, valid
+/// whichever NRF is configured, or none.
+#[cfg(any(test, feature = "test-support"))]
+fn seeded_nf_types() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static SEEDED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEDED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Tests (of this crate and, through the `test-support` feature, of the NFs):
-/// record that the NRF lists `id` as an `nf_type`, for the whole test run, so a
-/// token-identified caller needs no NRF. Only ever adds a positive answer for
-/// that one type, so tests using their own ids cannot collide.
+/// record that the NRF lists `id` as an `nf_type`, for the whole test run and
+/// whichever NRF is configured (none included), so a token-identified caller
+/// needs no NRF. Only ever adds a positive answer for that one type, so tests
+/// using their own ids cannot collide.
 #[cfg(any(test, feature = "test-support"))]
 pub fn seed_nf_type_for_test(id: &str, nf_type: crate::types::NfType) {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(24 * 3600);
-    nf_type_cache().insert(nf_type_key(nf_type.to_str(), id), (true, until));
+    seeded_nf_types().insert(nf_type_key("", nf_type.to_str(), id));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn seeded_nf_type(id: &str, nf_type: crate::types::NfType) -> bool {
+    seeded_nf_types().contains(&nf_type_key("", nf_type.to_str(), id))
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn seeded_nf_type(_id: &str, _nf_type: crate::types::NfType) -> bool {
+    false
 }
 
 /// The one NRF client the lookups share, rebuilt only when the NRF URI changes.
@@ -313,37 +363,53 @@ pub async fn nrf_lists_nf_type_at(
 
 /// [`nrf_lists_nf_type_at`] at the configured NRF, through the cache.
 async fn nrf_lists_nf_type(id: &str, nf_type: crate::types::NfType) -> Result<bool, String> {
-    if let Some(listed) = cached_nf_type(id, nf_type) {
-        return Ok(listed);
+    if seeded_nf_type(id, nf_type) {
+        return Ok(true);
     }
     let ctx = crate::context::global_context();
     let nrf_uri = ctx
         .get_nrf_uri()
         .await
         .ok_or("no NRF is configured to look the caller up")?;
-    let requester = ctx.get_self_instance().await.map(|i| i.nf_type);
+    let requester = requester_nf_type(
+        ctx.get_self_instance().await.map(|i| i.nf_type),
+        crate::nf_instance_id::own_nf_type(),
+    );
     cached_nrf_lists_nf_type_at(&nrf_uri, id, nf_type, requester).await
 }
 
-fn cached_nf_type(id: &str, nf_type: crate::types::NfType) -> Option<bool> {
+/// #2123 (#2120 item 3): the `requester-nf-type` of the lookup, which TS 29.510
+/// makes mandatory (nrfd answers 400 without it): this NF's self instance's
+/// type, else the type it resolved its NF Instance ID as
+/// ([`crate::nf_instance_id::own_nf_type`]), so an NF that never registers a
+/// self instance (udrd before #2123) still names itself.
+fn requester_nf_type(
+    self_instance: Option<crate::types::NfType>,
+    own: Option<crate::types::NfType>,
+) -> Option<crate::types::NfType> {
+    self_instance.or(own)
+}
+
+fn cached_nf_type(nrf_uri: &str, id: &str, nf_type: crate::types::NfType) -> Option<bool> {
     let (listed, until) = nf_type_cache()
-        .get(&nf_type_key(nf_type.to_str(), id))
+        .get(&nf_type_key(nrf_uri, nf_type.to_str(), id))
         .copied()?;
     (std::time::Instant::now() < until).then_some(listed)
 }
 
-/// [`nrf_lists_nf_type_at`] through the cache: an answer is reused for
-/// [`NF_TYPE_TTL`]; a failed lookup is not cached.
+/// [`nrf_lists_nf_type_at`] through the cache: a positive answer is reused for
+/// [`NF_TYPE_TTL`], a negative one for [`NF_TYPE_NEGATIVE_TTL`]; a failed
+/// lookup is not cached.
 async fn cached_nrf_lists_nf_type_at(
     nrf_uri: &str,
     id: &str,
     nf_type: crate::types::NfType,
     requester: Option<crate::types::NfType>,
 ) -> Result<bool, String> {
-    if let Some(listed) = cached_nf_type(id, nf_type) {
+    if let Some(listed) = cached_nf_type(nrf_uri, id, nf_type) {
         return Ok(listed);
     }
-    let key = nf_type_key(nf_type.to_str(), id);
+    let key = nf_type_key(nrf_uri, nf_type.to_str(), id);
     let listed = nrf_lists_nf_type_at(nrf_uri, id, nf_type, requester).await?;
     let mut cache = nf_type_cache();
     if cache.len() >= NF_TYPE_CACHE_MAX {
@@ -353,7 +419,12 @@ async fn cached_nrf_lists_nf_type_at(
             cache.clear();
         }
     }
-    cache.insert(key, (listed, std::time::Instant::now() + NF_TYPE_TTL));
+    let ttl = if listed {
+        NF_TYPE_TTL
+    } else {
+        NF_TYPE_NEGATIVE_TTL
+    };
+    cache.insert(key, (listed, std::time::Instant::now() + ttl));
     Ok(listed)
 }
 
@@ -364,12 +435,15 @@ async fn cached_nrf_lists_nf_type_at(
 ///
 /// - the caller's identity is [`verified_consumer_id`]'s; none, or a
 ///   certificate/token mismatch, refuses;
-/// - the consumer's own client certificate (not a relay's, [`RELAY_NF_TYPES`])
-///   naming NF types (RFC 9310, TS 33.310 §6.1.3c) must name `expected`;
+/// - the consumer's own client certificate naming NF types (RFC 9310, TS
+///   33.310 §6.1.3c) must name `expected`. A relay's certificate (one naming
+///   relay types only, [`is_relay_certificate`]) is not the consumer's; one
+///   naming a relay type and a consumer type is (#2113);
 /// - otherwise -- a token alone, a token through an SCP or SEPP, or a
 ///   certificate without NF types plus a token -- the NRF must list the
 ///   token's verified subject as an `expected` ([`nrf_lists_nf_type_at`],
-///   cached for [`NF_TYPE_TTL`]), and a lookup that fails refuses. An access
+///   cached for [`NF_TYPE_TTL`], a negative answer for
+///   [`NF_TYPE_NEGATIVE_TTL`]), and a lookup that fails refuses. An access
 ///   token names no NF type of its consumer (TS 29.510 `AccessTokenClaims`), so
 ///   the NRF is the only verified source;
 /// - a certificate without NF types and no token refuses: it cannot be told
@@ -384,9 +458,7 @@ pub async fn verified_nf_type(
         None => return Err("the requester has no verified identity".to_string()),
     }
     let types = &request.peer_cert_nf_types;
-    let relay = types
-        .iter()
-        .any(|t| RELAY_NF_TYPES.iter().any(|r| r.eq_ignore_ascii_case(t)));
+    let relay = is_relay_certificate(types);
     let cert = request
         .peer_cert_nf_instance_id
         .as_deref()
@@ -520,6 +592,76 @@ mod tests {
         );
     }
 
+    /// **#2123 (R41)**: a negative answer is reused only for
+    /// [`NF_TYPE_NEGATIVE_TTL`], so an NF the NRF lists a moment later is
+    /// admitted within seconds; a positive one for [`NF_TYPE_TTL`].
+    ///
+    /// REVERT-VERIFIED: with a negative answer cached for `NF_TYPE_TTL`, the
+    /// `negative lifetime` assertion fails.
+    #[tokio::test]
+    async fn a_negative_answer_is_reused_for_seconds_only_2123() {
+        const AMF: &str = "aaaaaaaa-2123-4000-8000-0000000000a2";
+        const NOT: &str = "dddddddd-2123-4000-8000-0000000000d2";
+        let (_nrf, nrf, asked) = stand_in_nrf_2099(AMF, "-", "-").await;
+        let n = || asked.load(std::sync::atomic::Ordering::SeqCst);
+        let until = |id: &str| {
+            nf_type_cache()
+                .get(&nf_type_key(&nrf, "AMF", id))
+                .map(|(_, until)| *until)
+                .expect("cached")
+        };
+        let before = std::time::Instant::now();
+        assert_eq!(
+            cached_nrf_lists_nf_type_at(&nrf, NOT, NfType::Amf, None).await,
+            Ok(false)
+        );
+        assert_eq!(
+            cached_nrf_lists_nf_type_at(&nrf, NOT, NfType::Amf, None).await,
+            Ok(false)
+        );
+        assert_eq!(n(), 1, "a negative answer is reused at once");
+        assert!(
+            until(NOT) <= std::time::Instant::now() + NF_TYPE_NEGATIVE_TTL,
+            "negative lifetime"
+        );
+        assert!(until(NOT) >= before + NF_TYPE_NEGATIVE_TTL);
+        assert_eq!(
+            cached_nrf_lists_nf_type_at(&nrf, AMF, NfType::Amf, None).await,
+            Ok(true)
+        );
+        assert!(until(AMF) >= before + NF_TYPE_TTL, "positive lifetime");
+        // Lapsed: asked again.
+        nf_type_cache()
+            .get_mut(&nf_type_key(&nrf, "AMF", NOT))
+            .expect("cached")
+            .1 = std::time::Instant::now();
+        assert_eq!(
+            cached_nrf_lists_nf_type_at(&nrf, NOT, NfType::Amf, None).await,
+            Ok(false)
+        );
+        assert_eq!(n(), 3, "a lapsed negative answer is asked again");
+    }
+
+    /// **#2123 (#2120 item 3)**: the lookup's `requester-nf-type` is the self
+    /// instance's type, else the type this process resolved its NF Instance ID
+    /// as, so an NF that registers no self instance still names itself.
+    ///
+    /// REVERT-VERIFIED: with the fallback dropped (`self_instance` alone), the
+    /// `no self instance` assertion fails.
+    #[test]
+    fn the_requester_falls_back_to_the_own_nf_type_2123() {
+        assert_eq!(
+            requester_nf_type(Some(NfType::Smf), Some(NfType::Udr)),
+            Some(NfType::Smf)
+        );
+        assert_eq!(
+            requester_nf_type(None, Some(NfType::Udr)),
+            Some(NfType::Udr),
+            "no self instance"
+        );
+        assert_eq!(requester_nf_type(None, None), None);
+    }
+
     /// **#2099**: an NRF answer is reused within [`NF_TYPE_TTL`] (one lookup for
     /// two asks), and a failed lookup is never cached (asked again each time).
     ///
@@ -548,6 +690,87 @@ mod tests {
             .await
             .is_err());
         assert_eq!(n(), 3, "a failure is not cached");
+    }
+
+    /// A stand-in NRF for #2120 that lists `listed` as an AMF and records each
+    /// lookup's `target-nf-type`.
+    async fn recording_nrf_2120(
+        listed: &'static str,
+    ) -> (
+        crate::server::SbiServer,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        crate::security::set_sbi_profile_override(crate::security::SbiProfile::Dev);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let s = s.clone();
+                async move {
+                    let param = |k: &str| req.http.params.get(k).cloned().unwrap_or_default();
+                    let target = param("target-nf-type");
+                    s.lock().unwrap().push(target.clone());
+                    let list = if param("target-nf-instance-id") == listed && target == "AMF" {
+                        vec![serde_json::json!({ "nfInstanceId": listed, "nfType": "AMF" })]
+                    } else {
+                        vec![]
+                    };
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({ "nfInstances": list }))
+                        .expect("json")
+                }
+            })
+            .await;
+        (server, format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// **#2120 (1)**: the cache keeps an instance's answer as one NF type apart
+    /// from its answer as another. An AMF the NRF lists, cached as an AMF, is
+    /// asked about again as an SMF, and is not one.
+    ///
+    /// REVERT-VERIFIED: with the type dropped from `nf_type_key`, the SMF ask is
+    /// answered `Ok(true)` from the AMF's cached answer and "is not an SMF"
+    /// fails.
+    #[tokio::test]
+    async fn the_cache_keeps_each_nf_type_apart_2120() {
+        const AMF: &str = "aaaaaaaa-2120-4000-8000-0000000000a1";
+        let (_nrf, nrf, seen) = recording_nrf_2120(AMF).await;
+        let ask = |nf_type| cached_nrf_lists_nf_type_at(&nrf, AMF, nf_type, Some(NfType::Lmf));
+        assert_eq!(ask(NfType::Amf).await, Ok(true), "a listed AMF is an AMF");
+        assert_eq!(ask(NfType::Smf).await, Ok(false), "is not an SMF");
+        assert_eq!(ask(NfType::Smf).await, Ok(false), "still not an SMF");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["AMF", "SMF"],
+            "the SMF ask went to the NRF once, then was cached"
+        );
+    }
+
+    /// **#2120 (2)**: the cache keeps each NRF's answers apart, so after the NRF
+    /// URI changes the new NRF is asked rather than the old one's answer reused.
+    /// The same NRF written with a trailing `/` is the same NRF.
+    ///
+    /// REVERT-VERIFIED: with the NRF URI dropped from `nf_type_key`, the new
+    /// NRF is never asked: the old NRF's `Ok(true)` is returned and "the new
+    /// NRF does not list it" fails.
+    #[tokio::test]
+    async fn the_cache_keeps_each_nrf_apart_2120() {
+        const AMF: &str = "aaaaaaaa-2120-4000-8000-0000000000a2";
+        let (_old, old_nrf, old_seen) = recording_nrf_2120(AMF).await;
+        let (_new, new_nrf, new_seen) = recording_nrf_2120("-").await;
+        let ask = |nrf: String| async move {
+            cached_nrf_lists_nf_type_at(&nrf, AMF, NfType::Amf, Some(NfType::Lmf)).await
+        };
+        assert_eq!(ask(old_nrf.clone()).await, Ok(true), "the old NRF lists it");
+        assert_eq!(ask(format!("{old_nrf}/")).await, Ok(true));
+        assert_eq!(old_seen.lock().unwrap().len(), 1, "one ask of the old NRF");
+        assert_eq!(
+            ask(new_nrf.clone()).await,
+            Ok(false),
+            "the new NRF does not list it"
+        );
+        assert_eq!(new_seen.lock().unwrap().len(), 1, "the new NRF was asked");
     }
 
     /// **#2099**: the caller-side rule. A certificate of the consumer naming NF
@@ -598,6 +821,59 @@ mod tests {
             ok(caller(Some(AMF), Some(AMF), &[])).await,
             Ok(()),
             "typeless certificate plus its token"
+        );
+    }
+
+    /// **#2113**: a certificate naming a relay type AND a consumer type is the
+    /// consumer's, not a relay's. `[SCP, PCF]` relaying an AMF's token (seeded
+    /// in the NRF as an AMF) is refused: its own id disagrees with the token's,
+    /// and carrying the AMF's own id it is still typed by its certificate, which
+    /// names no AMF. A relay-only certificate (`[SCP]`, `[SCP, SEPP]`) still
+    /// lets the token decide.
+    ///
+    /// REVERT-VERIFIED: with `is_relay_certificate` back to "any type is a
+    /// relay type", the `[SCP, PCF]` cases resolve to the AMF's token and the
+    /// `mixed certificate` assertions fail.
+    #[tokio::test]
+    async fn a_certificate_naming_a_relay_and_a_consumer_type_is_the_consumers_2113() {
+        const AMF: &str = "aaaaaaaa-2113-4000-8000-0000000000a3";
+        const MIXED: &str = "cccccccc-2113-4000-8000-0000000000c3";
+        seed_nf_type_for_test(AMF, NfType::Amf);
+        let ok = |r: SbiRequest| async move { verified_nf_type(&r, NfType::Amf).await };
+        assert!(is_relay_certificate(&["SCP"]));
+        assert!(is_relay_certificate(&["scp", "SEPP"]));
+        assert!(!is_relay_certificate(&["SCP", "PCF"]));
+        assert!(!is_relay_certificate::<&str>(&[]));
+        assert_eq!(
+            verified_consumer_id(&caller(Some(MIXED), None, &["SCP", "PCF"])),
+            Ok(Some(MIXED.into())),
+            "mixed certificate: its own id is the identity"
+        );
+        assert!(
+            verified_consumer_id(&caller(Some(MIXED), Some(AMF), &["SCP", "PCF"])).is_err(),
+            "mixed certificate: it cannot relay another NF's token"
+        );
+        let refused = ok(caller(Some(MIXED), Some(AMF), &["SCP", "PCF"])).await;
+        assert!(
+            refused.is_err(),
+            "mixed certificate + AMF token: {refused:?}"
+        );
+        let refused = ok(caller(Some(AMF), Some(AMF), &["PCF", "SCP"]))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("not AMF"),
+            "mixed certificate typed: {refused}"
+        );
+        assert_eq!(
+            ok(caller(Some(MIXED), Some(AMF), &["SCP", "SEPP"])).await,
+            Ok(()),
+            "relay-only certificate: the token decides"
+        );
+        assert_eq!(
+            ok(caller(Some(AMF), None, &["AMF", "SCP"])).await,
+            Ok(()),
+            "a mixed certificate naming AMF is an AMF"
         );
     }
 

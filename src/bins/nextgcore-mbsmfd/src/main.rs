@@ -279,6 +279,12 @@ async fn main() -> Result<()> {
     ));
     // #1004 review: an unset clock makes a wrong PFCP Recovery Time Stamp.
     nextgcore_pfcp::recovery_time::check_local_clock().map_err(|e| anyhow::anyhow!(e))?;
+    // #2115: the TMGI PLMN, refused at start-up rather than allocated from.
+    check_plmn_env(
+        std::env::var("MBSMF_PLMN_MCC").ok().as_deref(),
+        std::env::var("MBSMF_PLMN_MNC").ok().as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -1692,6 +1698,20 @@ fn configured_cp_addr() -> [u8; 4] {
         .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
         .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1))
         .octets()
+}
+
+/// #2115: `MBSMF_PLMN_MCC` / `MBSMF_PLMN_MNC`, when set, must be a 3-digit MCC
+/// and a 2-3 digit MNC (TS 23.003 §2.2). Checked once at start-up, so
+/// [`default_plmn`] never hands out a TMGI in a PLMN like "1".
+fn check_plmn_env(mcc: Option<&str>, mnc: Option<&str>) -> Result<(), String> {
+    use nextgcore_core::plmn::{check_digits, PlmnPart};
+    if let Some(mcc) = mcc {
+        check_digits("MBSMF_PLMN_MCC", PlmnPart::Mcc, mcc)?;
+    }
+    if let Some(mnc) = mnc {
+        check_digits("MBSMF_PLMN_MNC", PlmnPart::Mnc, mnc)?;
+    }
+    Ok(())
 }
 
 /// Configured serving PLMN for TMGI allocation (env `MBSMF_PLMN_MCC/MNC`).
@@ -3359,6 +3379,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// #2115: a malformed `MBSMF_PLMN_MCC` / `_MNC` fails start-up; unset (the
+    /// 001/01 default) or well-formed passes.
+    ///
+    /// REVERT-VERIFIED: with `check_plmn_env` always `Ok`, `expect_err` panics.
+    #[test]
+    fn a_malformed_plmn_env_fails_start_up_2115() {
+        assert_eq!(check_plmn_env(None, None), Ok(()));
+        assert_eq!(check_plmn_env(Some("999"), Some("070")), Ok(()));
+        let err = check_plmn_env(Some("1"), Some("01")).expect_err("short MCC");
+        assert!(
+            err.starts_with("MBSMF_PLMN_MCC=\"1\": an MCC is 3 digits"),
+            "{err}"
+        );
+        let err = check_plmn_env(Some("001"), Some("0700")).expect_err("long MNC");
+        assert!(
+            err.starts_with("MBSMF_PLMN_MNC=\"0700\": an MNC is 2 or 3 digits"),
+            "{err}"
+        );
+    }
 
     /// #1863: the router as [`TEST_CONSUMER_1863`]. Shadows the glob import; a
     /// test that needs another caller sets its identity, or calls

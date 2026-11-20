@@ -144,7 +144,7 @@ impl MmeApp {
         // #157). Until this landed the path was ignored entirely, which left
         // `served_gummei` empty and made the MME answer S1 Setup Failure to
         // every eNB.
-        if !context::mme_context_init_with_config(config_path) {
+        if !context::mme_context_init_with_config(config_path).map_err(anyhow::Error::msg)? {
             log::warn!(
                 "MME context was already initialised; configuration from '{config_path}' was \
                  not applied"

@@ -268,26 +268,31 @@ mod tests {
         scalars.len()
     }
 
-    /// #2069: the chart renders global.plmn as quoted strings, so every NF
-    /// config it renders carries the PLMN's exact digits, leading zeros and
-    /// all, for any YAML reader, in the dev and the production profile:
-    /// TS 23.003's test PLMN 001-01 and a 3-digit MNC 070 (TS 23.003 §2.2:
-    /// MNC 070 is not MNC 70). The derived nrf.nf_set_allowlist entry (#2052)
-    /// and the mongodb-init Job's seeded IMSI carry the same digits. amfd's and
-    /// nrfd's #2069 tests feed these renders to the NFs' own parsers.
-    ///
-    /// REVERT-VERIFIED: with configmap.yaml's `nextgcore.plmnId` include put
-    /// back to the unquoted `mcc: {{ .Values.global.plmn.mcc }}` (and mnc), the
-    /// "carries the exact digits ..., quoted" assertion fails (`mcc: 001`).
+    /// The `NEXTGCORE_SBI_PROFILE` of each of the chart's nine SBI NFs.
+    fn profiles_of(rendered: &str) -> Vec<Option<String>> {
+        [
+            "amf", "ausf", "bsf", "nrf", "nssf", "pcf", "smf", "udm", "udr",
+        ]
+        .iter()
+        .map(|nf| {
+            super::deployment_env_in(rendered, &format!("t-{nf}"), nf, "NEXTGCORE_SBI_PROFILE")
+        })
+        .collect()
+    }
+
     /// #2069 (R32's #2064 minors): `global.sbiProfile` is read as the NFs read
     /// it, so an alias of production (`prod`, any case) also drops the NSSF's
     /// OAuth2 opt-out and reaches every NF as `production`; an unknown value
     /// fails the render. Under production an `nrf.nfSetAllowlist` entry must
-    /// name its NF instances.
+    /// name its NF instances. R41 on #2114: an empty value, `false` and `0`,
+    /// which the NFs read as production, fail the render instead of rendering
+    /// dev; only an absent key is the chart's default, dev.
     ///
     /// REVERT-VERIFIED: with the NSSF branch on the raw value, "prod renders
-    /// the NSSF opt-out" fails; without the production id check, "an id-less
-    /// entry is refused under production" fails.
+    /// the NSSF opt-out" fails; without the production id check, the
+    /// "names no nf_instance_ids" case renders; with the empty-value check
+    /// removed, the `""` case renders, and with the string-kind check removed,
+    /// the `false` and `0` cases render (each a separate revert).
     #[test]
     fn profile_aliases_and_id_less_allowlist_entries_2069() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -304,15 +309,75 @@ mod tests {
                 serde_yaml::Value::Bool(true),
                 "{alias:?}: prod renders the NSSF opt-out"
             );
-            assert!(
-                !rendered.contains(&format!("value: {:?}", alias)),
-                "{alias:?} reaches an NF unnormalised"
+            assert_eq!(
+                profiles_of(&rendered),
+                vec![Some("production".to_string()); 9],
+                "{alias:?}: every NF's NEXTGCORE_SBI_PROFILE is production"
             );
+        }
+        // The key left out is the chart's default, dev. #2136: so is a null one
+        // (helm drops it before the chart sees it), as values.yaml documents.
+        for args in [vec![], vec!["--set", "global.sbiProfile=null"]] {
+            if let Some(r) = super::try_render_chart_with(&root, &args) {
+                let rendered = r.expect("the default values render");
+                assert_eq!(
+                    profiles_of(&rendered),
+                    vec![Some("dev".to_string()); 9],
+                    "{args:?}: an absent (or null) global.sbiProfile is dev"
+                );
+            }
+        }
+        // #2136 (R41 on #2130): every dev alias the NFs accept
+        // (`SbiProfile::from_env_value` reads `DEV_PROFILE_VALUES`), in any case
+        // and padded, renders dev and keeps the NSSF's OAuth2 opt-out, so the
+        // chart's alias set cannot drift from the NFs'.
+        for dev in crate::sbi_profile::DEV_PROFILE_VALUES {
+            for alias in [
+                dev.to_string(),
+                dev.to_ascii_uppercase(),
+                format!(" {dev} "),
+            ] {
+                let set = format!("global.sbiProfile={alias}");
+                let Some(r) = super::try_render_chart_with(&root, &["--set-string", &set]) else {
+                    return;
+                };
+                let rendered = r.unwrap_or_else(|e| panic!("{alias:?} renders: {e}"));
+                assert_eq!(
+                    profiles_of(&rendered),
+                    vec![Some("dev".to_string()); 9],
+                    "{alias:?}: every NF's NEXTGCORE_SBI_PROFILE is dev"
+                );
+                let nssf = super::config_in(&rendered, "nssf.yaml").expect("nssf.yaml");
+                let nssf: serde_yaml::Value = serde_yaml::from_str(&nssf).unwrap();
+                assert_eq!(
+                    nssf["nssf"]["sbi"]["oauth2"]["require"],
+                    serde_yaml::Value::Bool(false),
+                    "{alias:?}: dev keeps the NSSF opt-out"
+                );
+            }
         }
         for (args, want) in [
             (
                 vec!["--set-string", "global.sbiProfile=prd"],
                 "is not a profile",
+            ),
+            // R41 on #2114: `--set global.sbiProfile=$PROFILE` with the variable
+            // unset, and the two values helm's --set parses as non-strings.
+            (
+                vec!["--set", "global.sbiProfile="],
+                "global.sbiProfile is empty",
+            ),
+            (
+                vec!["--set-string", "global.sbiProfile= "],
+                "global.sbiProfile is empty",
+            ),
+            (
+                vec!["--set", "global.sbiProfile=false"],
+                "global.sbiProfile=false reached the chart as a bool, not a string",
+            ),
+            (
+                vec!["--set", "global.sbiProfile=0"],
+                "global.sbiProfile=0 reached the chart as a int64, not a string",
             ),
             (
                 vec![
@@ -328,7 +393,7 @@ mod tests {
                 return;
             };
             match r {
-                Ok(_) => panic!("{args:?}: an id-less entry is refused under production"),
+                Ok(_) => panic!("{args:?}: must fail the render with {want:?}"),
                 Err(e) => assert!(e.contains(want), "{args:?}: failed for another reason: {e}"),
             }
         }
@@ -345,6 +410,17 @@ mod tests {
         }
     }
 
+    /// #2069: the chart renders global.plmn as quoted strings, so every NF
+    /// config it renders carries the PLMN's exact digits, leading zeros and
+    /// all, for any YAML reader, in the dev and the production profile:
+    /// TS 23.003's test PLMN 001-01 and a 3-digit MNC 070 (TS 23.003 §2.2:
+    /// MNC 070 is not MNC 70). The derived nrf.nf_set_allowlist entry (#2052)
+    /// and the mongodb-init Job's seeded IMSI carry the same digits. amfd's and
+    /// nrfd's #2069 tests feed these renders to the NFs' own parsers.
+    ///
+    /// REVERT-VERIFIED: with configmap.yaml's `nextgcore.plmnId` include put
+    /// back to the unquoted `mcc: {{ .Values.global.plmn.mcc }}` (and mnc), the
+    /// "carries the exact digits ..., quoted" assertion fails (`mcc: 001`).
     #[test]
     fn every_rendered_config_carries_the_plmn_digits_quoted_2069() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");

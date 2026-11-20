@@ -1854,9 +1854,23 @@ mod tests {
 
     // --- G2-1: NFStatusNotify callback route ---
 
+    /// The legacy token-less NFStatusNotify route is routed, and what it answers
+    /// depends on the SBI profile (#2081): under dev it ingests (204); under
+    /// production it carries no subscription correlation, so it is refused 403
+    /// whatever the certificate.
+    ///
+    /// #2121 (R42 on #2140): the router reads the process profile, so the test
+    /// sets Dev and leaves it set (CONVENTIONS: nwdafd tests only ever set
+    /// Dev, and there is no profile lock to take), and asserts the production
+    /// refusal explicitly through the gate with `production = true`. It used
+    /// to set nothing and pass only after a sibling had set Dev.
+    ///
+    /// REVERT-VERIFIED: with the Dev override removed, the test fails alone at
+    /// the 204 assertion (403).
     #[tokio::test]
     async fn test_routing_nfstatus_notify_post_routed() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let req = SbiRequest::post("/nnwdaf-nfstatus-notify/v1/notify")
             .with_json_body(&serde_json::json!({
                 "event": "NF_REGISTERED",
@@ -1869,8 +1883,20 @@ mod tests {
                 }
             }))
             .expect("valid JSON body");
+        let mut from_nrf = req.clone();
+        from_nrf.peer_cert_nf_instance_id = Some("eeeeeeee-2121-4000-8000-00000000000e".into());
+        from_nrf.peer_cert_nf_types = vec!["NRF".into()];
         let resp = nwdaf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 204, "NFStatusNotify must route and return 204");
+        // Production: the token-less route is refused, even from the NRF.
+        let ctx = nwdaf_self();
+        let resp =
+            nrf_collector::handle_nf_status_notify_gated_with_ctx(&ctx, &from_nrf, false, true)
+                .await;
+        assert_eq!(
+            resp.status, 403,
+            "production refuses the uncorrelated route"
+        );
     }
 
     #[tokio::test]
@@ -3163,19 +3189,32 @@ mod callback_oauth2_1421_tests {
 
     /// The tokenised NFStatusNotify route checks its token itself too, so a
     /// forged one is 404 even where no listener enforces OAuth2.
+    ///
+    /// #2121: the request carries the NRF's verified certificate (RFC 9310
+    /// NFTypes `NRF`), as a real NFStatusNotify does, so the held token is
+    /// admitted under the production profile (#2081's `refuse_notifier`) as
+    /// well as under dev. The test therefore depends on no sibling having set
+    /// the Dev override: run alone, under the default production profile, it
+    /// used to get 403 for the held token.
+    ///
+    /// REVERT-VERIFIED: with the certificate removed, the test fails alone
+    /// (`left: 403, right: 204`).
     #[tokio::test]
     async fn the_tokenised_route_refuses_a_forged_token_itself() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
         let body =
             json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": "http://nrf/x/nwdaf-1421-r" });
         let req = |token: &str| {
-            SbiRequest::post(format!("/nnwdaf-callback/v1/nf-status-notify/{token}"))
-                .with_body(body.to_string(), "application/json")
+            let mut r = SbiRequest::post(format!("/nnwdaf-callback/v1/nf-status-notify/{token}"))
+                .with_body(body.to_string(), "application/json");
+            r.peer_cert_nf_instance_id = Some("eeeeeeee-2121-4000-8000-00000000000e".to_string());
+            r.peer_cert_nf_types = vec!["NRF".to_string()];
+            r
         };
         let forged = uuid::Uuid::new_v4().simple().to_string();
         assert_eq!(nwdaf_sbi_request_handler(req(&forged)).await.status, 404);
         let held = nrf_collector::callback_token();
-        assert_eq!(nwdaf_sbi_request_handler(req(held)).await.status, 204);
+        assert_eq!(nwdaf_sbi_request_handler(req(&held)).await.status, 204);
     }
 
     /// Every registered exemption refuses a token this NWDAF does not hold, so a

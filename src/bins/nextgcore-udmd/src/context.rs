@@ -478,6 +478,63 @@ pub struct UdmEeSubscription {
     /// modify or remove it. Never the self-declared `nfInstanceId`. `None` when
     /// created with no verified identity (`dev`) or internally.
     pub owner: Option<String>,
+    /// #2125: UNIX seconds this subscription lapses at: the granted
+    /// `reportingOptions.expiry` of `raw` (TS 29.503 §6.4.6.2.2 ReportingOptions),
+    /// derived with [`UdmEeSubscription::set_raw`]. `None`: none was asked for, and
+    /// the subscription lasts until it is deleted.
+    pub expiry: Option<u64>,
+}
+
+/// #2125: the longest EE subscription lifetime this UDM grants
+/// (`NEXTGCORE_UDM_EE_MAX_LIFETIME_SECS`, default one day, at least one
+/// minute). A consumer asking for a later `reportingOptions.expiry` is granted
+/// this far ahead instead (TS 29.503 §5.5.2.2.2: the UDM may shorten it).
+pub fn ee_max_lifetime_secs() -> u64 {
+    std::env::var("NEXTGCORE_UDM_EE_MAX_LIFETIME_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(86_400)
+        .max(60)
+}
+
+/// UNIX seconds now; 0 for a clock before the epoch.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The `reportingOptions.expiry` of an EeSubscription body, in UNIX seconds:
+/// `Ok(None)` when absent, `Err` when it is not an RFC 3339 DateTime.
+pub fn ee_requested_expiry(body: &serde_json::Value) -> Result<Option<u64>, String> {
+    match body.pointer("/reportingOptions/expiry") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch)
+            .map(Some)
+            .ok_or_else(|| "reportingOptions.expiry is not a DateTime".to_string()),
+    }
+}
+
+/// #2125: grant the expiry `body` asks for, as of `now`, writing the granted one
+/// back into `body`: at most [`ee_max_lifetime_secs`] ahead. `Ok(None)` when
+/// none is asked for. `Err` for an expiry that is not a DateTime or has already
+/// passed: such a subscription would never report.
+pub fn ee_grant_expiry(body: &mut serde_json::Value, now: u64) -> Result<Option<u64>, String> {
+    let Some(asked) = ee_requested_expiry(body)? else {
+        return Ok(None);
+    };
+    if asked <= now {
+        return Err("reportingOptions.expiry has already passed".to_string());
+    }
+    let granted = asked.min(now.saturating_add(ee_max_lifetime_secs()));
+    if granted != asked {
+        body["reportingOptions"]["expiry"] =
+            serde_json::json!(nextgcore_sbi::datetime::epoch_to_rfc3339(granted));
+    }
+    Ok(Some(granted))
 }
 
 /// The UDM's subscription at an AMF on behalf of one Nudm_EE subscription
@@ -516,6 +573,7 @@ impl UdmEeSubscription {
             monitoring_configurations: Vec::new(),
             amf_leg: None,
             owner: None,
+            expiry: None,
         };
         sub.set_raw(raw);
         sub
@@ -524,10 +582,21 @@ impl UdmEeSubscription {
     /// Replace the stored body and re-derive the monitored configurations.
     pub fn set_raw(&mut self, raw: impl Into<String>) {
         self.raw = raw.into();
-        self.monitoring_configurations = serde_json::from_str(&self.raw)
-            .ok()
-            .and_then(|v| ee_monitoring_configurations(&v).ok())
+        let body: Option<serde_json::Value> = serde_json::from_str(&self.raw).ok();
+        self.monitoring_configurations = body
+            .as_ref()
+            .and_then(|v| ee_monitoring_configurations(v).ok())
             .unwrap_or_default();
+        // #2125: the granted expiry (an unparsable one was refused before store).
+        self.expiry = body
+            .as_ref()
+            .and_then(|v| ee_requested_expiry(v).ok())
+            .flatten();
+    }
+
+    /// #2125: whether this subscription has lapsed at `now` (UNIX seconds).
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expiry.is_some_and(|e| e <= now)
     }
 
     /// The configurations of this subscription that monitor `event_type`.
@@ -754,10 +823,12 @@ pub struct NfProfileConfig {
 impl Default for NfProfileConfig {
     fn default() -> Self {
         // The historical literals, so an unconfigured deployment registers
-        // exactly as it did before #85.
+        // as it did before #85, plus the UDR (#2123, R41 M2): it discovers the
+        // UDM to verify a UDM caller's type, and nrfd hides a profile whose
+        // allowedNfTypes leaves the requester out.
         Self {
             heart_beat_timer: 10,
-            allowed_nf_types: ["AMF", "SMF", "AUSF", "PCF", "SCP"]
+            allowed_nf_types: ["AMF", "SMF", "AUSF", "PCF", "SCP", "UDR"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -1486,10 +1557,26 @@ impl UdmContext {
             Ok(list) => list
                 .values()
                 .filter(|s| s.ue_identity == supi || s.ue_identity == "anyUE")
+                // #2125: a lapsed subscription is reported nothing.
+                .filter(|s| !s.is_expired(now_unix_secs()))
                 .cloned()
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// #2125: remove and return every EE subscription lapsed at `now`, so its
+    /// AMF leg can be released.
+    pub fn ee_subscriptions_take_expired(&self, now: u64) -> Vec<UdmEeSubscription> {
+        let Ok(mut list) = self.ee_subscription_list.write() else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = list
+            .values()
+            .filter(|s| s.is_expired(now))
+            .map(|s| s.id.clone())
+            .collect();
+        ids.iter().filter_map(|id| list.remove(id)).collect()
     }
 
     /// Set only the AMF leg of EE subscription `id` (#1440), so a concurrent PATCH

@@ -3063,7 +3063,11 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
                 };
                 sub.event_types = event_types;
             }
-            ("replace", "/subscription/options/expiry") => {
+            // #2102: `/options/expiry` is TS 29.518's AmfUpdateEventOptionItem
+            // (§6.2.6.2.7), the form a consumer refreshing its subscription
+            // sends (nefd); the `/subscription/...` form is kept for the
+            // consumers that used it.
+            ("replace", "/options/expiry" | "/subscription/options/expiry") => {
                 let Some(expiry) = value
                     .and_then(Value::as_str)
                     .and_then(rfc3339_to_system_time)
@@ -9912,6 +9916,34 @@ mod tests {
             .event_subscription_find(&sub_id)
             .unwrap();
         assert_eq!(stored.notify_uri, "http://127.0.0.1:9/notify-new");
+
+        // #2102: AmfUpdateEventOptionItem (TS 29.518 §6.2.6.2.7) moves the
+        // expiry, and the answer confirms it.
+        let patch = json!([{
+            "op": "replace",
+            "path": "/options/expiry",
+            "value": "2099-01-01T00:00:00Z",
+        }]);
+        let req = SbiRequest::patch(format!("/namf-evts/v1/subscriptions/{sub_id}"))
+            .with_json_body(&patch)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(
+            body_json(&resp).pointer("/subscription/options/expiry"),
+            Some(&json!("2099-01-01T00:00:00Z")),
+            "the refreshed expiry is confirmed"
+        );
+        let stored = ctx
+            .read()
+            .unwrap()
+            .event_subscription_find(&sub_id)
+            .unwrap();
+        assert_eq!(
+            stored.expiry,
+            nextgcore_sbi::datetime::rfc3339_to_epoch("2099-01-01T00:00:00Z")
+                .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s))
+        );
 
         // Unsupported patch op rejected with 400
         let patch = json!([{ "op": "remove", "path": "/subscription/nfId" }]);

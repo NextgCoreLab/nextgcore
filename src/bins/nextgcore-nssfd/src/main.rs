@@ -306,10 +306,41 @@ struct SnssaiRestrictionYaml {
     restricted: Vec<SnssaiYaml>,
 }
 
+/// A `home_plmn` as the file writes it. Kept as YAML values so a number can be
+/// told from a string: serde_yaml reads `mcc: 1` into a `String` field as "1"
+/// without complaint (#2115).
 #[derive(Debug, Default, Deserialize)]
 struct PlmnYaml {
-    mcc: String,
-    mnc: String,
+    #[serde(default)]
+    mcc: serde_yaml::Value,
+    #[serde(default)]
+    mnc: serde_yaml::Value,
+}
+
+/// Resolve `nssf.snssai_restrictions` (#2115): every entry's `home_plmn` must
+/// be a 3-digit MCC and a 2-3 digit MNC, written as strings
+/// ([`nextgcore_core::plmn`]). One that is not fails the load, naming the
+/// field. A restriction keyed on a PLMN no UE carries (`mcc: 1` read as "1",
+/// or a YAML 1.1 re-dump of "001") never matches, so the S-NSSAIs it restricts
+/// would be granted: refusing it is the only fail-closed reading. A missing
+/// `home_plmn` member is refused for the same reason (it used to be skipped).
+fn snssai_restrictions_from_yaml(
+    list: &[SnssaiRestrictionYaml],
+) -> Result<Vec<(context::PlmnId, Vec<context::SNssai>)>, String> {
+    use nextgcore_core::plmn::{config_digits, PlmnPart};
+    list.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let field =
+                |part: PlmnPart| format!("nssf.snssai_restrictions[{i}].home_plmn.{}", part.key());
+            let mcc = config_digits(&field(PlmnPart::Mcc), PlmnPart::Mcc, &r.home_plmn.mcc)?;
+            let mnc = config_digits(&field(PlmnPart::Mnc), PlmnPart::Mnc, &r.home_plmn.mnc)?;
+            Ok((
+                context::PlmnId::new(&mcc, &mnc),
+                r.restricted.iter().map(snssai_from_yaml).collect(),
+            ))
+        })
+        .collect()
 }
 
 /// One VPLMN-to-HPLMN S-NSSAI mapping: `nssf.nssai_mapping[]`.
@@ -467,21 +498,12 @@ async fn main() -> Result<()> {
                         // #94: per-home-PLMN S-NSSAI restrictions. This is the
                         // production caller set_plmn_snssai_restrictions never had.
                         if let Some(list) = nssf.snssai_restrictions {
+                            // #2115: every entry is checked before any is installed.
+                            let restrictions = snssai_restrictions_from_yaml(&list)
+                                .map_err(|e| anyhow::anyhow!("{}: {e}", args.config))?;
                             let mut installed = 0usize;
                             if let Ok(ctx) = nssf_self().read() {
-                                for r in &list {
-                                    if r.home_plmn.mcc.is_empty() || r.home_plmn.mnc.is_empty() {
-                                        log::warn!(
-                                            "nssf.snssai_restrictions entry has an incomplete \
-                                             home_plmn; skipped (a restriction must name the \
-                                             PLMN it applies to)"
-                                        );
-                                        continue;
-                                    }
-                                    let plmn =
-                                        context::PlmnId::new(&r.home_plmn.mcc, &r.home_plmn.mnc);
-                                    let snssais: Vec<context::SNssai> =
-                                        r.restricted.iter().map(snssai_from_yaml).collect();
+                                for (plmn, snssais) in restrictions {
                                     ctx.set_plmn_snssai_restrictions(&plmn, snssais);
                                     installed += 1;
                                 }
@@ -6432,6 +6454,64 @@ nssf:
         }
     }
 
+    /// **#2115** (R41 on #2127): a restriction's `home_plmn` must be quoted
+    /// digits. A YAML number (serde_yaml would read `mcc: 1` into a String as
+    /// "1"), a string of the wrong length, or a missing member fails the load
+    /// naming the field: such a restriction matches no UE, so it would fail
+    /// open. Well-formed ones resolve to the PLMN as written.
+    ///
+    /// REVERT-VERIFIED: with `home_plmn` back to `String` fields and no check,
+    /// the numeric cases resolve (to PLMN "1"/"1" and "999"/"70") and
+    /// `expect_err` panics.
+    #[test]
+    fn a_restriction_s_home_plmn_must_be_quoted_digits_2115() {
+        let parse = |plmn: &str| {
+            let yaml = format!(
+                "nssf:\n  snssai_restrictions:\n    - home_plmn: {{ mcc: \"001\", mnc: \"01\" }}\n      \
+                 restricted: [ {{ sst: 2 }} ]\n    - home_plmn: {plmn}\n      restricted: [ {{ sst: 99 }} ]\n"
+            );
+            let doc: NssfYaml = serde_yaml::from_str(&yaml).expect("config shape parses");
+            snssai_restrictions_from_yaml(&doc.nssf.unwrap().snssai_restrictions.unwrap())
+        };
+        for (plmn, want) in [
+            (
+                "{ mcc: 1, mnc: 1 }",
+                "nssf.snssai_restrictions[1].home_plmn.mcc=1 reached the configuration as a number",
+            ),
+            (
+                "{ mcc: 999, mnc: 70 }",
+                "nssf.snssai_restrictions[1].home_plmn.mcc=999 reached the configuration as a number",
+            ),
+            (
+                "{ mcc: \"999\", mnc: 70 }",
+                "nssf.snssai_restrictions[1].home_plmn.mnc=70 reached the configuration as a number",
+            ),
+            (
+                "{ mcc: \"1\", mnc: \"01\" }",
+                "nssf.snssai_restrictions[1].home_plmn.mcc=\"1\": an MCC is 3 digits",
+            ),
+            (
+                "{ mcc: \"001\" }",
+                "nssf.snssai_restrictions[1].home_plmn.mnc is not a digit string",
+            ),
+        ] {
+            let err = parse(plmn).expect_err(plmn);
+            assert!(err.contains(want), "{plmn}: {err}");
+        }
+        let ok = parse("{ mcc: \"999\", mnc: \"070\" }").expect("quoted digits");
+        let plmns: Vec<(String, String)> = ok
+            .iter()
+            .map(|(p, _)| (p.mcc.clone(), p.mnc.clone()))
+            .collect();
+        assert_eq!(
+            plmns,
+            [
+                ("001".to_string(), "01".to_string()),
+                ("999".to_string(), "070".to_string())
+            ]
+        );
+    }
+
     /// #94 criterion 6: restrictions come from CONFIG, and serialize under
     /// `sNssaiList`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6458,13 +6538,10 @@ nssf:
             .and_then(|n| n.snssai_restrictions)
             .expect("the snssai_restrictions block must deserialise");
         assert_eq!(list.len(), 1);
+        let restrictions = snssai_restrictions_from_yaml(&list).expect("well-formed");
         with_nssf_context(|c| {
-            for r in &list {
-                let plmn = context::PlmnId::new(&r.home_plmn.mcc, &r.home_plmn.mnc);
-                c.set_plmn_snssai_restrictions(
-                    &plmn,
-                    r.restricted.iter().map(snssai_from_yaml).collect(),
-                );
+            for (plmn, snssais) in restrictions {
+                c.set_plmn_snssai_restrictions(&plmn, snssais);
             }
         });
 

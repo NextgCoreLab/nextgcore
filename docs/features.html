@@ -294,7 +294,7 @@
 <tr><td>PIN element management</td><td>PINE register, discover, get, deregister (mandatory-IE checks per Table 8.4.2.3.2-1)</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 <tr><td>PIN element heartbeat</td><td>Per-element keep-alive PUT .../heartbeat (liveness, §8.8)</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 <tr><td>PEGC relay path (PIN-7)</td><td>PUT elements/{id}/relay sets relayPath; relay-authorization-failed errors</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
-<tr><td>SBI security/auth layer</td><td>OAuth2/consumer-header (3gpp-Sbi-Consumer-Info) caller verification, SUPI-vs-ueId check</td><td>TS 29.500 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>SBI security/auth layer</td><td>Caller identity from the verified OAuth2 token subject only (plus the dev-only, opt-in x-caller-supi header), SUPI-vs-ueId check. 3gpp-Sbi-Consumer-Info is consumer information (TS 29.500 §5.2.3.3.7: supported services, API versions, features, encodings, callback roots) and is never read as an identity (#2103)</td><td>TS 29.500 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
 <p class="fm-notes">pind is deliberately application-layer only (no NRF registration; no PIN NfType in TS 29.510) — all routes use bespoke /pinapp/v1 binding for PIN-6/7/8, hence &quot;prototype&quot; (non-normative wire) though handlers are fully implemented. Files: nextgcore/src/bins/nextgcore-pind/src/main.rs (routes ~line 406), context.rs.</p>
 <h3 class="group-heading">NEF</h3>
