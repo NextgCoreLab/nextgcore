@@ -90,31 +90,68 @@ pub fn config_in(rendered: &str, file: &str) -> Option<String> {
     })
 }
 
-/// #2069: the configs of every rendered ConfigMap, as `(file, text)`: each
-/// `data` entry whose key ends in `.yaml`, in render order.
-pub fn configs_in(rendered: &str) -> Vec<(String, String)> {
+/// #2069: the configs of every ConfigMap in `rendered` (one or more YAML
+/// documents), as `(configmap, file, text)`: each `data` entry whose key ends
+/// in `.yaml`, in document order.
+pub fn configs_in(rendered: &str) -> Vec<(String, String, String)> {
     serde_yaml::Deserializer::from_str(rendered)
         .filter_map(|doc| {
             let doc = <serde_yaml::Value as serde::Deserialize>::deserialize(doc).ok()?;
-            (doc["kind"].as_str() == Some("ConfigMap"))
-                .then(|| doc["data"].as_mapping().cloned())
-                .flatten()
+            if doc["kind"].as_str() != Some("ConfigMap") {
+                return None;
+            }
+            let name = doc["metadata"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            Some((name, doc["data"].as_mapping()?.clone()))
         })
-        .flat_map(|data| {
-            data.into_iter().filter_map(|(k, v)| {
+        .flat_map(|(name, data)| {
+            data.into_iter().filter_map(move |(k, v)| {
                 let file = k.as_str()?.to_string();
-                file.ends_with(".yaml")
-                    .then(|| Some((file, v.as_str()?.to_string())))
-                    .flatten()
+                let text = v.as_str()?.to_string();
+                file.ends_with(".yaml").then(|| (name.clone(), file, text))
             })
         })
         .collect()
 }
 
-/// #2069: every PLMN ID in the YAML `config`, as the `(mcc, mnc)` values of
-/// each map that carries an `mcc` or `mnc` key, at any depth, exactly as YAML
-/// parses them (a `Null` for a missing one): an unquoted `mcc: 001` is the
-/// number 1 here, not the string `"001"`. Panics when `config` does not parse.
+/// #2069: every `mcc:` and `mnc:` value in the YAML text `config`, as it is
+/// WRITTEN: `("mcc", "\"001\"")` for `mcc: "001"`, `("mcc", "001")` for an
+/// unquoted `mcc: 001`, in block or flow style. A YAML 1.1 reader (PyYAML,
+/// helm's own values parser, the demo profile's post-render) takes the
+/// unquoted `001` for the integer 1 and `070` for octal 56, so only the quoted
+/// form names the PLMN for every reader.
+pub fn plmn_scalars_in(config: &str) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for line in config.lines() {
+        let code = line.split(" #").next().unwrap_or_default();
+        let mut found: Vec<(usize, &'static str)> = Vec::new();
+        for key in ["mcc", "mnc"] {
+            let tag = format!("{key}:");
+            let mut from = 0;
+            while let Some(i) = code[from..].find(&tag) {
+                let at = from + i;
+                let before = code[..at].chars().next_back();
+                if before.is_none_or(|c| c == ' ' || c == '{' || c == ',' || c == '-') {
+                    found.push((at, key));
+                }
+                from = at + tag.len();
+            }
+        }
+        found.sort();
+        for (at, key) in found {
+            let rest = &code[at + key.len() + 1..];
+            let end = rest.find([',', '}']).unwrap_or(rest.len());
+            out.push((key, rest[..end].trim().to_string()));
+        }
+    }
+    out
+}
+
+/// #2069: the `(mcc, mnc)` of every map in the YAML `config` that carries an
+/// `mcc` or `mnc` key, at any depth, as nextgcore's YAML parser (serde_yaml)
+/// types them (`Null` for a missing one). Panics when `config` does not parse.
 pub fn plmn_ids_in(config: &str) -> Vec<(serde_yaml::Value, serde_yaml::Value)> {
     fn walk(v: &serde_yaml::Value, out: &mut Vec<(serde_yaml::Value, serde_yaml::Value)>) {
         match v {
@@ -170,47 +207,73 @@ mod tests {
         assert_eq!(super::deployment_env_in(rendered, "z", "c", "X"), None);
     }
 
-    /// #2069: every `.yaml` entry of every ConfigMap; and the PLMN IDs of a
-    /// config at any depth, as YAML types them.
+    /// #2069: every `.yaml` entry of every ConfigMap; the PLMN values of a
+    /// config as written, block and flow style; and as serde_yaml types them.
     #[test]
-    fn the_configs_and_their_plmn_ids_as_yaml_types_them_2069() {
-        let rendered = "---\nkind: Service\ndata:\n  s.yaml: x\n---\nkind: ConfigMap\ndata:\n  \
-            a.yaml: \"a: 1\"\n  init.js: x\n---\nkind: ConfigMap\ndata:\n  b.yaml: \"b: 2\"\n";
+    fn the_configs_and_their_plmn_ids_as_written_and_parsed_2069() {
+        let rendered = "---\nkind: Service\ndata:\n  s.yaml: x\n---\nkind: ConfigMap\nmetadata: \
+            {name: c}\ndata:\n  a.yaml: \"a: 1\"\n  init.js: x\n---\nkind: ConfigMap\ndata:\n  \
+            b.yaml: \"b: 2\"\n";
+        let s = |x: &str| x.to_string();
         assert_eq!(
             super::configs_in(rendered),
             vec![
-                ("a.yaml".to_string(), "a: 1".to_string()),
-                ("b.yaml".to_string(), "b: 2".to_string())
+                (s("c"), s("a.yaml"), s("a: 1")),
+                (s(""), s("b.yaml"), s("b: 2"))
             ]
         );
-        let plmns = super::plmn_ids_in(
-            "x:\n  serving:\n    - plmn_id: {mcc: \"001\", mnc: \"01\"}\n  tai:\n    - plmn_id:\n        \
-             mcc: 001\n        mnc: 070\n  other: {mnc: \"070\"}\n",
+        let config = "x:\n  serving:\n    - plmn_id: {mcc: \"001\", mnc: '01'}\n  tai:\n    \
+            - plmn_id:\n        mcc: 001  # a comment\n        mnc: 070\n  other: {xmnc: 1, mnc: \"070\"}\n";
+        assert_eq!(
+            super::plmn_scalars_in(config),
+            vec![
+                ("mcc", s("\"001\"")),
+                ("mnc", s("'01'")),
+                ("mcc", s("001")),
+                ("mnc", s("070")),
+                ("mnc", s("\"070\"")),
+            ]
         );
         assert_eq!(
-            plmns,
+            super::plmn_ids_in(config),
             vec![
                 (Value::from("001"), Value::from("01")),
-                (Value::from(1), Value::from(70)),
+                (Value::from("001"), Value::from("070")),
                 (Value::Null, Value::from("070")),
             ],
-            "quoted digits stay strings; unquoted ones are YAML 1.2 integers"
+            "serde_yaml reads even an unquoted leading-zero scalar as a string; YAML 1.1 \
+             readers do not"
         );
+    }
+
+    /// #2069: the PLMN values of `config` (`what`, for the message), as written:
+    /// each a quoted string of exactly `mcc` or `mnc`; and how many.
+    fn assert_quoted_plmn(what: &str, config: &str, mcc: &str, mnc: &str) -> usize {
+        let scalars = super::plmn_scalars_in(config);
+        for (key, raw) in &scalars {
+            let want = if *key == "mcc" { mcc } else { mnc };
+            assert!(
+                [format!("\"{want}\""), format!("'{want}'")].contains(raw),
+                "{what}: {key}: {raw} carries the exact digits {want}, quoted, so every YAML \
+                 reader takes it for a string"
+            );
+        }
+        scalars.len()
     }
 
     /// #2069: the chart renders global.plmn as quoted strings, so every NF
     /// config it renders carries the PLMN's exact digits, leading zeros and
-    /// all, in the dev and the production profile: TS 23.003's test PLMN 001-01
-    /// and a 3-digit MNC 070 (TS 23.003 §2.2: MNC 070 is not MNC 70). The
-    /// derived nrf.nf_set_allowlist entry (#2052) and the mongodb-init Job's
-    /// seeded IMSI use the same digits. The NFs' own parsers read these
-    /// renders in amfd's and nrfd's #2069 tests.
+    /// all, for any YAML reader, in the dev and the production profile:
+    /// TS 23.003's test PLMN 001-01 and a 3-digit MNC 070 (TS 23.003 §2.2:
+    /// MNC 070 is not MNC 70). The derived nrf.nf_set_allowlist entry (#2052)
+    /// and the mongodb-init Job's seeded IMSI carry the same digits. amfd's and
+    /// nrfd's #2069 tests feed these renders to the NFs' own parsers.
     ///
     /// REVERT-VERIFIED: with configmap.yaml's `nextgcore.plmnId` include put
     /// back to the unquoted `mcc: {{ .Values.global.plmn.mcc }}` (and mnc), the
-    /// "carries the exact digits" assertion fails (`mcc` is the number 1).
+    /// "carries the exact digits ..., quoted" assertion fails (`mcc: 001`).
     #[test]
-    fn every_rendered_config_carries_the_plmn_digits_2069() {
+    fn every_rendered_config_carries_the_plmn_digits_quoted_2069() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         for profile in ["dev", "production"] {
             for (mcc, mnc, imsi) in [
@@ -232,26 +295,26 @@ mod tests {
                 };
                 let case = format!("{profile}, PLMN {mcc}-{mnc}");
                 let mut seen = Vec::new();
-                for (file, text) in super::configs_in(&rendered) {
+                for (_, file, text) in super::configs_in(&rendered) {
+                    let n = assert_quoted_plmn(&format!("{case}: {file}"), &text, mcc, mnc);
                     for (m, n) in super::plmn_ids_in(&text) {
                         assert_eq!(
                             (m, n),
                             (Value::from(mcc), Value::from(mnc)),
-                            "{case}: {file} carries the exact digits of global.plmn, as strings"
+                            "{case}: {file} parses to the exact digits"
                         );
-                        seen.push(file.clone());
                     }
-                }
-                for file in ["nrf.yaml", "amf.yaml"] {
-                    assert!(
-                        seen.iter().any(|f| f == file),
-                        "{case}: {file} carries a PLMN ID; got {seen:?}"
-                    );
+                    seen.extend(std::iter::repeat_n(file.clone(), n));
                 }
                 assert_eq!(
+                    seen.iter().filter(|f| *f == "nrf.yaml").count(),
+                    2,
+                    "{case}: nrf.yaml's serving PLMN; got {seen:?}"
+                );
+                assert_eq!(
                     seen.iter().filter(|f| *f == "amf.yaml").count(),
-                    3,
-                    "{case}: amf.yaml's guami, tai and plmn_support"
+                    6,
+                    "{case}: amf.yaml's guami, tai and plmn_support; got {seen:?}"
                 );
                 let nrf = super::config_in(&rendered, "nrf.yaml").expect("nrf.yaml");
                 let set_id = format!("set001.region02.amfset.5gc.mnc{mnc:0>3}.mcc{mcc}");
@@ -266,5 +329,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #2069: the static NF configs (the nextgcore-configs ConfigMaps of
+    /// k8s/manifests and every deploy/eks overlay) write the PLMN quoted too:
+    /// the demo profile's post-render (deploy/eks/profiles/demo/demo_toggles.py)
+    /// re-reads them with PyYAML, a YAML 1.1 reader, and re-dumps them.
+    ///
+    /// REVERT-VERIFIED: with k8s/manifests/configmap.yaml's amf.yaml back to
+    /// `mcc: 999`, the "carries the exact digits ..., quoted" assertion fails.
+    #[test]
+    fn the_static_nf_configs_write_the_plmn_quoted_2069() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut files = vec![root.join("k8s/manifests/configmap.yaml")];
+        let mut dirs = vec![root.join("deploy/eks")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "yaml") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut checked = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (cm, file, config) in super::configs_in(&text) {
+                if cm != "nextgcore-configs" {
+                    continue;
+                }
+                let what = format!("{}: {file}", path.display());
+                if assert_quoted_plmn(&what, &config, "999", "70") > 0 {
+                    checked.push(what);
+                }
+            }
+        }
+        assert!(
+            checked
+                .iter()
+                .any(|w| w.contains("k8s/manifests/configmap.yaml: amf.yaml")),
+            "k8s/manifests' amf.yaml is checked; got {checked:?}"
+        );
+        assert!(
+            checked.len() >= 5,
+            "k8s/manifests' nrf.yaml and amf.yaml, and the overlays' nrf.yaml: {checked:?}"
+        );
     }
 }

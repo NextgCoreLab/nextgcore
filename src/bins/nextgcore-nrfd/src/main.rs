@@ -15641,19 +15641,25 @@ mod tests_shipped_nf_set_allowlist_2052 {
     /// one the chart derived for nrf.nf_set_allowlist, digit for digit, so a
     /// production NRF admits the AMF ([`check`]).
     ///
-    /// REVERT-VERIFIED: with configmap.yaml's `nextgcore.plmnId` include put
-    /// back to the unquoted `mcc: {{ .Values.global.plmn.mcc }}` (and mnc), the
-    /// "the GUAMI's NF Set ID" assertion fails (the AMF's GUAMI reads mcc 1).
+    /// REVERT-VERIFIED: with `nextgcore.plmnId` rendering the digits through
+    /// `int` (the leading zeros dropped), the "the GUAMI's NF Set ID" assertion
+    /// fails (`...mnc001.mcc1` for 001-01). The template's unquoted form alone
+    /// does not: serde_yaml 0.9 reads an unquoted `001` as a string;
+    /// nextgcore-core's `every_rendered_config_carries_the_plmn_digits_quoted_2069`
+    /// covers that.
     #[test]
     fn a_leading_zero_plmn_reaches_the_nrf_and_its_allowlist_2069() {
         let root = repo_root();
         for profile in ["dev", "production"] {
-            for (mcc, mnc) in [("001", "01"), ("001", "070")] {
+            for (mcc, mnc, imsi) in [
+                ("001", "01", "001010000000001"),
+                ("001", "070", "001070000000001"),
+            ] {
                 let args = [
                     format!("global.sbiProfile={profile}"),
                     format!("global.plmn.mcc={mcc}"),
                     format!("global.plmn.mnc={mnc}"),
-                    format!("subscriber.imsi={mcc}{mnc}0000000001"),
+                    format!("subscriber.imsi={imsi}"),
                 ];
                 let mut extra = Vec::new();
                 for a in &args {
