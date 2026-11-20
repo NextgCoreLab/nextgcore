@@ -446,16 +446,37 @@ pub fn build_qos_mon_notification(
 
 /// POST `body` to `sub`'s `notifUri`; failures are logged and swallowed.
 pub async fn deliver(sub: &EventSubscription, body: &Value, event: &str, supi: &str, psi: u8) {
-    let Some((host, port)) = crate::policy::split_host_port(&sub.notif_uri) else {
+    post_notification(
+        &sub.notif_uri,
+        &format!("subscription {}", sub.id),
+        body,
+        event,
+        supi,
+        psi,
+    )
+    .await
+}
+
+/// POST an `NsmfEventExposureNotification` `body` to `uri` on behalf of `whom`
+/// (a subscription, or a PCF QoS monitoring decision's `notifyUri`, #2208);
+/// failures are logged and swallowed.
+pub async fn post_notification(
+    uri: &str,
+    whom: &str,
+    body: &Value,
+    event: &str,
+    supi: &str,
+    psi: u8,
+) {
+    let Some((host, port)) = crate::policy::split_host_port(uri) else {
         log::warn!(
-            "subscription {} has an unusable notifUri '{}': the {event} \
+            "{whom} has an unusable notification URI '{}': the {event} \
              notification for {supi} cannot be delivered",
-            sub.id,
-            nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
+            nextgcore_sbi::log_redact::redact_last_segment(uri)
         );
         return;
     };
-    let path = notify_path(&sub.notif_uri);
+    let path = notify_path(uri);
     let request = nextgcore_sbi::message::SbiRequest::post(path).with_body(
         body.to_string(),
         nextgcore_sbi::constants::content_type::APPLICATION_JSON,
@@ -468,14 +489,10 @@ pub async fn deliver(sub: &EventSubscription, body: &Value, event: &str, supi: &
     match client.send_request(request).await {
         Ok(resp) => log::info!(
             "Nsmf_EventExposure_Notify {event} (SUPI {supi}, PSI {psi}) → \
-             subscription {}: status={}",
-            sub.id,
+             {whom}: status={}",
             resp.status
         ),
-        Err(e) => log::warn!(
-            "Nsmf_EventExposure_Notify {event} to subscription {} failed: {e}",
-            sub.id
-        ),
+        Err(e) => log::warn!("Nsmf_EventExposure_Notify {event} to {whom} failed: {e}"),
     }
 }
 

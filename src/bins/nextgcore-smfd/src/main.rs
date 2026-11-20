@@ -55,6 +55,7 @@ mod n4_handler;
 mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod n6_delay; // #1502: N6 delay measurement, provisioned over N4 association (TS 29.244 §5.33.8)
 use nextgcore_sbi::owner_binding; // #1860, on the shared #1865 helper
+mod pcc_qos_mon; // #2208: the PCF's QoS monitoring policy (qosMonDecs / refQosMon) at the PSA
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
@@ -828,6 +829,8 @@ struct SmfSection {
     pcc_rules: Option<Vec<eps_bearer::LocalPccRule>>,
     /// #1502: N6 delay measurement provisioned at the UPFs (TS 29.244 §5.33.8.2).
     n6_delay_measurement: Option<n6_delay::N6DelayYaml>,
+    /// #2208: how the PCF's QoS monitoring policy is measured (TS 23.501 §5.33.3.1).
+    qos_monitoring: Option<pcc_qos_mon::QosMonitoringYaml>,
 }
 
 /// Root YAML document
@@ -860,6 +863,10 @@ struct SmfConfig {
     pcc_rules: Vec<eps_bearer::LocalPccRule>,
     /// #1502: `smf.n6_delay_measurement`, validated. `None` asks no UPF to measure.
     n6_delay: Option<n6_delay::N6DelayConfig>,
+    /// #2208: `smf.qos_monitoring.method`, per QoS flow unless configured.
+    qos_monitoring_method: pcc_qos_mon::Method,
+    /// #2208 review M1: `smf.qos_monitoring.pcc`, off unless configured.
+    qos_monitoring_pcc: bool,
 }
 
 impl Default for SmfConfig {
@@ -879,6 +886,8 @@ impl Default for SmfConfig {
             gtpc_port: 2123,
             pcc_rules: Vec::new(),
             n6_delay: None,
+            qos_monitoring_method: pcc_qos_mon::Method::PerQosFlow,
+            qos_monitoring_pcc: false,
         }
     }
 }
@@ -952,6 +961,10 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
         // silently unconfigured.
         if let Some(n6) = smf.n6_delay_measurement {
             config.n6_delay = Some(n6.validate().map_err(|e| anyhow::anyhow!(e))?);
+        }
+        if let Some(qm) = smf.qos_monitoring {
+            config.qos_monitoring_method = qm.method;
+            config.qos_monitoring_pcc = qm.pcc;
         }
 
         // S5/S8 bind address (#52). Only the first entry is bound; a second is named
@@ -1104,6 +1117,18 @@ async fn main() -> Result<()> {
     let _ = EPCO_CONFIG.set((config.dns_servers.clone(), config.mtu));
     // #1502: before the association loop can associate a UPF.
     n6_delay::set_config(config.n6_delay.take());
+    pcc_qos_mon::set_method(config.qos_monitoring_method);
+    pcc_qos_mon::set_enabled(config.qos_monitoring_pcc);
+    log::info!(
+        "QoS monitoring of the PCF's policy: {} (smf.qos_monitoring.pcc), measured {:?} \
+         (smf.qos_monitoring.method, TS 23.501 §5.33.3.1)",
+        if config.qos_monitoring_pcc {
+            "on"
+        } else {
+            "off"
+        },
+        config.qos_monitoring_method
+    );
     // nextgsim#458: the demo: block, checked against the demos this build was
     // compiled with, so an unknown key or mode, or a demo whose cargo feature is
     // not built, fails start-up. With no demo active nothing changes.
@@ -3203,6 +3228,11 @@ struct XrSessionFlow {
 /// reports and make "total" ambiguous.
 const SESSION_URR_ID: u32 = 1;
 
+/// The PDR ID of a session's uplink PDR at its PSA (`pfcp_session_establish`).
+pub(crate) const UL_PDR_ID: u16 = 1;
+/// The FAR ID of a session's access-side (downlink) FAR (`pfcp_session_establish`).
+pub(crate) const DL_FAR_ID: u32 = 2;
+
 /// The usage-reporting rule this SMF provisions for a new PDU session (#80,
 /// TS 29.244 §5.2.2, §7.5.2.4).
 ///
@@ -4833,6 +4863,7 @@ fn spawn_abandoned_create_release(sm_context_ref: String) {
         release_user_plane(&sm_context_ref).await;
         if let Some(Some(binding)) = take_sm_context(&sm_context_ref) {
             qos_mon::forget(&sm_context_ref);
+            pcc_qos_mon::forget(&sm_context_ref);
             // R27 #1890: the AMF's retry for the same (SUPI, PSI) is the normal
             // follow-up to the timeout that abandoned this create, so a newer
             // session may hold the pair by now. In flight FIRST, then the check, so
@@ -6204,6 +6235,11 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
         // Issue #191: after the write guard drops (see `SmfContext::persist`).
         context.persist();
     }
+    // #2208: the PCF's QoS monitoring policy for the session, installed at the PSA
+    // once the user plane is active (`qos_mon::on_user_plane_active`). Anything a
+    // previous holder of the reference left is dropped first.
+    pcc_qos_mon::forget(&sm_context_ref);
+    pcc_qos_mon::apply(&sm_context_ref, &decision.qos_mon);
 
     // #79: Nsmf_EventExposure_Notify for PDU_SES_EST (TS 29.508 §4.2.3.2). After
     // the binding is stored, so the session a consumer is told about exists by the
@@ -8088,6 +8124,7 @@ async fn handle_sm_context_update_inner(sm_context_ref: &str, request: &SbiReque
                         ),
                         None => enforced_policy_decision(&enforced),
                     };
+                    apply_qos_monitoring_policy(sm_context_ref, &decision);
                     (decision, Some(enforced))
                 }
                 None => {
@@ -9542,6 +9579,7 @@ fn spawn_release_side_effects_with(
     let reference = sm_context_ref.to_string();
     // #1390: the session's SRRs went with its N4 session.
     qos_mon::forget(sm_context_ref);
+    pcc_qos_mon::forget(sm_context_ref);
     let in_flight =
         ReleaseInFlight::begin_with(&binding.supi, binding.psi, nsac_release_of(&binding));
     RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
@@ -13177,6 +13215,55 @@ async fn send_n1_n2_modify_transfer(
     }
 }
 
+/// A PCF decision for session `r` (an UpdateNotify, or an Update answer) said
+/// something about QoS monitoring (#2208, TS 29.512 §4.2.3.25.1): it is applied to
+/// the policy the session holds, and the PSA's SRRs are brought in line with it.
+fn apply_qos_monitoring_policy(r: &str, dec: &policy::PolicyDecision) {
+    if pcc_qos_mon::apply(r, &dec.qos_mon) {
+        let r = r.to_string();
+        tokio::spawn(async move { qos_mon::on_policy_changed(&r).await });
+    }
+}
+
+/// Report a QoS monitoring result to the PCF (#2208, TS 29.512 §4.2.4.24): an
+/// Npcf_SMPolicyControl_Update with QOS_MONITORING and `report` in
+/// `qosMonReports`. The answer is a decision delta (§4.2.6.1): a non-empty one is
+/// applied through the same path as an UpdateNotify ([`handle_sm_policy_notify`]),
+/// so one function decides what a PCF decision does to a session.
+pub(crate) async fn report_qos_monitoring_to_pcf(r: &str, report: serde_json::Value) {
+    let Some(sm_policy_id) = lookup_policy_binding(r).and_then(|b| b.sm_policy_id) else {
+        log::info!("ref={r}: QoS monitoring report for the PCF, but no SM policy association");
+        return;
+    };
+    let Some(pcf) = policy::resolve_pcf_endpoint().await else {
+        log::warn!("ref={r}: QoS monitoring report for the PCF, but no PCF is resolvable");
+        return;
+    };
+    match policy::sm_policy_update_qos_mon_reports(&pcf, &sm_policy_id, vec![report]).await {
+        Ok(answer) => {
+            log::info!(
+                "ref={r}: QoS monitoring reported to the PCF (smPolicyId={sm_policy_id}, \
+                 QOS_MONITORING, TS 29.512 §4.2.4.24)"
+            );
+            if answer.as_object().is_some_and(|o| !o.is_empty()) {
+                let request = SbiRequest::post("/").with_body(
+                    serde_json::json!({ "smPolicyDecision": answer }).to_string(),
+                    nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+                );
+                let applied = handle_sm_policy_notify(r, &request).await;
+                if applied.status != 204 {
+                    log::warn!(
+                        "ref={r}: the PCF's answer to the QoS monitoring report was not \
+                         applied (status {})",
+                        applied.status
+                    );
+                }
+            }
+        }
+        Err(e) => log::warn!("ref={r}: QoS monitoring report to the PCF failed: {e}"),
+    }
+}
+
 /// The session-rule decision `binding` enforces, onto which a PCF delta (an
 /// UpdateNotify, #1387, or an Update response, #1399; TS 29.512 §4.2.6.1) is merged.
 fn enforced_policy_decision(binding: &context::PolicyBinding) -> policy::PolicyDecision {
@@ -13232,6 +13319,8 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
     // #1387: a delta over what the session ENFORCES (TS 29.512 §4.2.6.1), not a
     // replacement built from the config default -- see `merge_sm_policy_decision`.
     let dec = policy::merge_sm_policy_decision(enforced_policy_decision(&binding), decision_json);
+    // #2208: the decision's QoS monitoring delta, applied to the PSA's SRRs.
+    apply_qos_monitoring_policy(sm_context_ref, &dec);
 
     log::info!(
         "Applying PCF-updated policy to ref={sm_context_ref}: AMBR UL/DL={}/{} bps, 5QI={}",
@@ -13572,6 +13661,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     if let Some(json) = answer {
         let enforced = lookup_policy_binding(sm_context_ref).unwrap_or_else(|| binding.clone());
         decision = policy::merge_sm_policy_decision(enforced_policy_decision(&enforced), &json);
+        apply_qos_monitoring_policy(sm_context_ref, &decision);
         log::info!(
             "[{}] PCF re-authorised ref={sm_context_ref}: AMBR UL/DL {}/{} -> {}/{} bps, \
              5QI {} -> {}",
@@ -36894,6 +36984,517 @@ mod tests {
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
+    }
+
+    /// The Update PDRs of an N4 body that carry Transport Delay Reporting (#2208):
+    /// (PDR ID, the IE 271 decoded, or `None` for the empty deactivating IE).
+    fn tdr_updates_2208(
+        body: &[u8],
+    ) -> Vec<(
+        u16,
+        Option<nextgcore_pfcp::qos_monitoring::TransportDelayReporting>,
+    )> {
+        use nextgcore_pfcp::qos_monitoring::{TransportDelayReporting, TypedIe};
+        let ies = |d: &[u8]| {
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at + 4 <= d.len() {
+                let t = u16::from_be_bytes([d[at], d[at + 1]]);
+                let l = u16::from_be_bytes([d[at + 2], d[at + 3]]) as usize;
+                out.push((t, d[at + 4..at + 4 + l].to_vec()));
+                at += 4 + l;
+            }
+            out
+        };
+        let mut out = Vec::new();
+        for (t, v) in ies(body).into_iter().filter(|(t, _)| *t == 9) {
+            let _ = t;
+            let m = ies(&v);
+            let Some((_, tdr)) = m.iter().find(|(t, _)| *t == 271) else {
+                continue;
+            };
+            let pdr = m
+                .iter()
+                .find(|(t, _)| *t == 56)
+                .map(|(_, v)| u16::from_be_bytes([v[0], v[1]]))
+                .unwrap();
+            out.push((
+                pdr,
+                (!tdr.is_empty()).then(|| TransportDelayReporting::decode_value(tdr).unwrap()),
+            ));
+        }
+        out
+    }
+
+    /// A session whose PSA advertised QFQM and `gpqm` (#2208), toward gNB
+    /// 127.0.0.9 (QFI 9), with the recording AMF.
+    async fn pcc_qos_mon_session_2208(
+        supi: &str,
+        psi: u8,
+        gpqm: bool,
+    ) -> (
+        pfcp_path::stand_in::StandInUpf,
+        String,
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<N1n2Post>>>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let upf = pfcp_path::stand_in::associated_upf_with_features(
+            nextgcore_pfcp::types::UpFunctionFeatures {
+                ftup: true,
+                qfqm: true,
+                gpqm,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let reference = qos_mon_another_session_1390(&upf, supi, psi, amf_port).await;
+        (upf, reference, amf, posts)
+    }
+
+    /// The PCF's SmPolicyNotification `decision`, through the UpdateNotify handler.
+    async fn notify_2208(reference: &str, decision: serde_json::Value) {
+        let request = SbiRequest::post("/").with_body(
+            serde_json::json!({ "smPolicyDecision": decision }).to_string(),
+            nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+        );
+        let resp = handle_sm_policy_notify(reference, &request).await;
+        assert_eq!(resp.status, 204, "the UpdateNotify is applied");
+    }
+
+    /// The decision of a PCC rule `r1` with QoS monitoring `qm1` (TS 29.512
+    /// §4.2.3.25.1): DL, UL and round trip, Periodic every 4 s.
+    fn pcc_qos_mon_decision_2208() -> serde_json::Value {
+        serde_json::json!({
+            "pccRules": { "r1": { "pccRuleId": "r1", "precedence": 10, "refQosMon": ["qm1"] } },
+            "qosMonDecs": { "qm1": {
+                "qmId": "qm1",
+                "reqQosMonParams": ["DOWNLINK", "UPLINK", "ROUND_TRIP"],
+                "repFreqs": ["PERIODIC"],
+                "repPeriod": 4,
+            }},
+            "policyCtrlReqTriggers": ["QOS_MONITORING"],
+        })
+    }
+
+    /// #2208 steps 1 and 2: a PCC rule with an authorized QoS monitoring policy
+    /// (TS 29.512 §4.2.3.25.1, an UpdateNotify) has the SMF request QoS monitoring
+    /// from the PSA (Create SRR, IE 242) and the NG-RAN (id 181 `both`). With
+    /// `smf.qos_monitoring.method: gtpu_path` and a GPQM PSA (TS 23.501 §5.33.3.3,
+    /// TS 29.244 §5.24.5.3), the IE 242 sets GTPUPM, and the PSA's UL PDR first
+    /// gets Transport Delay Reporting (IE 271) naming its preceding UL GTP-U peer,
+    /// the gNB. A new gNB (a path switch) moves the IE 271 with it. `refQosMon: null`
+    /// removes the SRR and deactivates IE 271.
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcc_rule_s_qos_monitoring_policy_provisions_gtpupm_and_ie_271_at_the_psa_2208() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
+        let _method = pcc_qos_mon::MethodForTest::set(pcc_qos_mon::Method::GtpuPath);
+        let supi = "imsi-001010000022081";
+        let (upf, reference, amf, posts) = pcc_qos_mon_session_2208(supi, 5, true).await;
+        upf.clear_seen();
+
+        notify_2208(&reference, pcc_qos_mon_decision_2208()).await;
+        wait_until(|| {
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !srr_ops_1390(b).0.is_empty())
+        })
+        .await;
+        let bodies = upf.modification_bodies();
+        let tdr_at = bodies
+            .iter()
+            .position(|b| !tdr_updates_2208(b).is_empty())
+            .expect("an Update PDR with Transport Delay Reporting");
+        let create_at = bodies
+            .iter()
+            .position(|b| !srr_ops_1390(b).0.is_empty())
+            .expect("a Create SRR");
+        assert!(tdr_at < create_at, "IE 271 before the GTPUPM SRR");
+        let tdr = tdr_updates_2208(&bodies[tdr_at]);
+        assert_eq!(tdr.len(), 1);
+        assert_eq!(tdr[0].0, UL_PDR_ID, "the PSA's UL PDR");
+        assert_eq!(
+            tdr[0].1.as_ref().unwrap().preceding_ul_gtpu_peer.ipv4,
+            Some([127, 0, 0, 9]),
+            "the preceding UL GTP-U peer is the gNB"
+        );
+        let (creates, _) = srr_ops_1390(&bodies[create_at]);
+        assert_eq!(creates.len(), 1);
+        let srr_id = creates[0].0;
+        let c = &creates[0].1;
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].qfis, vec![9]);
+        let q = c[0].requested_qos_monitoring;
+        assert!(q.dlpd && q.ulpd && q.rppd, "DL, UL and round trip");
+        assert!(q.gtpupm, "GTP-U path measurement (TS 29.244 §8.2.167)");
+        assert!(c[0].reporting_frequency.perio);
+        assert_eq!(c[0].measurement_period, Some(4));
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert!(
+            got.iter().any(|p| n2_monitoring_1390(&p.3).contains(&(
+                9,
+                Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::BOTH)
+            ))),
+            "the NG-RAN is asked to measure"
+        );
+
+        // A path switch: the gNB changes, so does the PSA's preceding peer.
+        upf.clear_seen();
+        pfcp_session_modify(
+            smf_n4_seid_for(&reference),
+            upf.upf_seid,
+            0x98,
+            [127, 0, 0, 10],
+        )
+        .await
+        .expect("the new DL tunnel");
+        wait_until(|| {
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !tdr_updates_2208(b).is_empty())
+        })
+        .await;
+        let moved: Vec<_> = upf
+            .modification_bodies()
+            .iter()
+            .flat_map(|b| tdr_updates_2208(b))
+            .collect();
+        assert_eq!(moved.len(), 1, "one Update PDR: {moved:?}");
+        assert_eq!(
+            moved[0].1.as_ref().unwrap().preceding_ul_gtpu_peer.ipv4,
+            Some([127, 0, 0, 10])
+        );
+
+        // The PCF disables the rule's QoS monitoring.
+        upf.clear_seen();
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        notify_2208(
+            &reference,
+            serde_json::json!({ "pccRules": { "r1": { "refQosMon": null } } }),
+        )
+        .await;
+        wait_until(|| {
+            upf.modification_bodies()
+                .iter()
+                .any(|b| tdr_updates_2208(b).iter().any(|(_, t)| t.is_none()))
+        })
+        .await;
+        let bodies = upf.modification_bodies();
+        assert!(
+            bodies.iter().any(|b| srr_ops_1390(b).1 == vec![srr_id]),
+            "Remove SRR"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|b| tdr_updates_2208(b) == vec![(UL_PDR_ID, None)]),
+            "IE 271 deactivated"
+        );
+        assert!(!qos_mon::active_on(&reference));
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        pcc_qos_mon::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// #2208, off unless configured: with the default per QoS flow method (and
+    /// with `gtpu_path` toward a PSA that did not advertise GPQM) the PCF's policy
+    /// is a GTPUPM 0 SRR and no UL PDR is updated. And a decision with no
+    /// `refQosMon` requests nothing.
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_per_qos_flow_method_sends_no_gtpupm_and_no_ie_271_2208() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        for (method, gpqm, supi) in [
+            (
+                pcc_qos_mon::Method::PerQosFlow,
+                true,
+                "imsi-001010000022082",
+            ),
+            (pcc_qos_mon::Method::GtpuPath, false, "imsi-001010000022083"),
+        ] {
+            let _pcc = pcc_qos_mon::PccForTest::on();
+            let _method = pcc_qos_mon::MethodForTest::set(method);
+            let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, gpqm).await;
+            upf.clear_seen();
+            notify_2208(
+                &reference,
+                serde_json::json!({ "pccRules": { "r1": { "precedence": 10 } } }),
+            )
+            .await;
+            notify_2208(&reference, pcc_qos_mon_decision_2208()).await;
+            wait_until(|| {
+                upf.modification_bodies()
+                    .iter()
+                    .any(|b| !srr_ops_1390(b).0.is_empty())
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let bodies = upf.modification_bodies();
+            let creates: Vec<_> = bodies.iter().flat_map(|b| srr_ops_1390(b).0).collect();
+            assert_eq!(creates.len(), 1, "{method:?}/gpqm={gpqm}: one Create SRR");
+            assert!(
+                !creates[0].1[0].requested_qos_monitoring.gtpupm,
+                "{method:?}/gpqm={gpqm}: per QoS flow"
+            );
+            assert!(
+                bodies.iter().all(|b| tdr_updates_2208(b).is_empty()),
+                "{method:?}/gpqm={gpqm}: no Transport Delay Reporting"
+            );
+            cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+            qos_mon::quiesce_for_test().await;
+            cancel_gsm_timer_for_test(&reference);
+            qos_mon::forget(&reference);
+            forget_seeded_session(&reference);
+            pcc_qos_mon::clear_for_test();
+            amf.stop().await.ok();
+        }
+    }
+
+    /// #2208: a PSA report on an SRR of the PCF's policy goes to the PCF in an
+    /// Npcf_SMPolicyControl_Update with QOS_MONITORING and `qosMonReports`
+    /// naming the PCC rule (TS 29.512 §4.2.4.24), and, once the instance names a
+    /// `notifyUri`, there instead, as an Nsmf_EventExposure_Notify QOS_MON whose
+    /// `notifId` is the `notifyCorreId` (§4.2.3.25.1, TS 29.508).
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_psa_report_goes_to_the_pcf_or_to_the_notify_uri_2208() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
+        let supi = "imsi-001010000022084";
+        let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, false).await;
+        // The PCF (and the NEF), recording what they are sent.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        let sink = seen.clone();
+        let (pcf, pcf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    sink.lock().unwrap().push((req.header.uri.clone(), body));
+                    if req.header.uri.ends_with("/update") {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({}))
+                            .unwrap();
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", pcf_addr.port()));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.sm_policy_id = Some("pol-2208".into());
+            }
+        }
+        notify_2208(&reference, pcc_qos_mon_decision_2208()).await;
+        wait_until(|| !qos_mon::srr_ids(&reference).is_empty()).await;
+        let srr_id = qos_mon::srr_ids(&reference)[0];
+        let m = nextgcore_pfcp::qos_monitoring::QosMonitoringMeasurement {
+            downlink_packet_delay: Some(13),
+            uplink_packet_delay: Some(14),
+            round_trip_packet_delay: Some(27),
+            ..Default::default()
+        };
+        let seid = smf_n4_seid_for(&reference);
+        qos_mon::on_session_report(seid, &qos_mon::tests::sesr_body(srr_id, m)).await;
+        let posted = seen.lock().unwrap().clone();
+        let (uri, body) = posted
+            .iter()
+            .find(|(u, _)| u.ends_with("/sm-policies/pol-2208/update"))
+            .expect("an Npcf_SMPolicyControl_Update");
+        let _ = uri;
+        assert_eq!(
+            body["repPolicyCtrlReqTriggers"],
+            serde_json::json!(["QOS_MONITORING"])
+        );
+        assert_eq!(
+            body["qosMonReports"],
+            serde_json::json!([{ "refPccRuleIds": ["r1"], "dlDelays": [13], "ulDelays": [14], "rtDelays": [27] }])
+        );
+
+        // The instance now names a notifyUri: the SMF bypasses the PCF.
+        seen.lock().unwrap().clear();
+        notify_2208(
+            &reference,
+            serde_json::json!({ "qosMonDecs": { "qm1": {
+                "notifyUri": format!("http://127.0.0.1:{}/nef/qm", pcf_addr.port()),
+                "notifyCorreId": "corr-2208",
+            }}}),
+        )
+        .await;
+        qos_mon::on_session_report(seid, &qos_mon::tests::sesr_body(srr_id, m)).await;
+        let posted = seen.lock().unwrap().clone();
+        assert!(
+            posted.iter().all(|(u, _)| !u.ends_with("/update")),
+            "not to the PCF: {posted:?}"
+        );
+        let (_, n) = posted
+            .iter()
+            .find(|(u, _)| u == "/nef/qm")
+            .expect("the notifyUri is notified");
+        assert_eq!(n["notifId"], "corr-2208");
+        assert_eq!(n["eventNotifs"][0]["event"], "QOS_MON");
+        assert_eq!(n["eventNotifs"][0]["supi"], supi);
+        assert_eq!(n["eventNotifs"][0]["rtDelays"], serde_json::json!([27]));
+
+        std::env::remove_var("PCF_URI");
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        qos_mon::forget(&reference);
+        forget_seeded_session(&reference);
+        pcc_qos_mon::clear_for_test();
+        pcf.stop().await.ok();
+        amf.stop().await.ok();
+        drop(upf);
+    }
+
+    /// #2208: the PCF's QoS monitoring policy in the create answer (TS 29.512
+    /// §4.2.3.25.1: "together with the PCC rule") is held for the session, and the
+    /// SRR is installed at the PSA once the user plane is active, as a QOS_MON
+    /// subscription's is (`qos_mon::on_user_plane_active`). The create offers
+    /// QosMonitoring (feature 24) in `suppFeat`.
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_answer_s_qos_monitoring_policy_is_installed_on_activation_2208() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let upf = pfcp_path::stand_in::associated_upf_with_features(
+            nextgcore_pfcp::types::UpFunctionFeatures {
+                ftup: true,
+                qfqm: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        smf_context_init(64, 256, 512);
+        let feats: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = feats.clone();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let pcf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
+        pcf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                if req.header.uri.ends_with("/sm-policies") {
+                    let body: serde_json::Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    sink.lock()
+                        .unwrap()
+                        .push(body["suppFeat"].as_str().unwrap_or_default().to_string());
+                    let mut d = pcc_qos_mon_decision_2208();
+                    d["sessRules"] = serde_json::json!({});
+                    return SbiResponse::with_status(201)
+                        .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/pol-2208")
+                        .with_body(d.to_string(), "application/json");
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("stub PCF starts");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{port}"));
+        let psi = 13u8;
+        let n1_msg = n1(
+            psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let resp =
+            handle_sm_context_create(&create_request("imsi-001010000022085", psi, &n1_msg)).await;
+        std::env::remove_var("PCF_URI");
+        assert_eq!(resp.status, 201);
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let reference = root["smContextRef"].as_str().unwrap().to_string();
+        assert!(
+            policy::supports_feature(&feats.lock().unwrap()[0], policy::FEATURE_QOS_MONITORING),
+            "QosMonitoring offered"
+        );
+        assert_eq!(
+            pcc_qos_mon::requesters(&reference),
+            vec!["pcc:qm1".to_string()]
+        );
+        upf.clear_seen();
+
+        qos_mon::on_user_plane_active(&reference);
+        wait_until(|| {
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !srr_ops_1390(b).0.is_empty())
+        })
+        .await;
+        let creates: Vec<_> = upf
+            .modification_bodies()
+            .iter()
+            .flat_map(|b| srr_ops_1390(b).0)
+            .collect();
+        assert_eq!(creates.len(), 1, "the PSA gets the SRR of qm1");
+        assert_eq!(creates[0].1[0].measurement_period, Some(4));
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        qos_mon::forget(&reference);
+        pcc_qos_mon::clear_for_test();
+        forget_seeded_session(&reference);
+        pcf.stop().await.ok();
     }
 
     /// Criterion 3 (#1390): no QOS_MON subscription, no monitoring: another event's
