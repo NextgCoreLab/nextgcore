@@ -514,9 +514,25 @@ development, insecure, local or test; "production" for production or prod,
 any case, trimmed. Any other value fails the render: the NFs would run it as
 production while a chart branch on the raw value (the NSSF's OAuth2 opt-out)
 would take it as dev.
+
+Only an ABSENT key takes the chart's default, dev (R41 on #2114). An empty
+value (`--set global.sbiProfile=` with the variable unset), or one that is not
+a string (`false`, `0`), fails the render too: the NFs read each of them as
+production, so defaulting them to dev would fail open, rendering plaintext SBI
+and the NSSF's OAuth2 opt-out.
 */}}
 {{- define "nextgcore.sbiProfile" -}}
-{{- $raw := .Values.global.sbiProfile | default "dev" | toString | trim | lower -}}
+{{- $v := index (.Values.global | default dict) "sbiProfile" -}}
+{{- if kindIs "invalid" $v -}}
+{{- $v = "dev" -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "global.sbiProfile=%v reached the chart as a %s, not a string: the NFs would read it as production. Set it to production (or prod) or dev (or development, insecure, local, test), with --set-string if it comes from a variable (#2069)" $v (kindOf $v)) -}}
+{{- end -}}
+{{- $raw := $v | trim | lower -}}
+{{- if eq $raw "" -}}
+{{- fail "global.sbiProfile is empty: the NFs would read it as production. Set it to production (or prod) or dev (or development, insecure, local, test), or leave the key out for dev (#2069)" -}}
+{{- end -}}
 {{- if has $raw (list "dev" "development" "insecure" "local" "test") -}}
 dev
 {{- else if has $raw (list "production" "prod") -}}
