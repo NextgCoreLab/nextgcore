@@ -3763,6 +3763,11 @@ mod tests {
     /// SmPolicyNotification body (bounded timeouts both directions).
     #[tokio::test]
     async fn notification_post_round_trip() {
+        // #2157: the stub SMF is a loopback PLAINTEXT peer and the notification
+        // client follows the SBI profile, so this is a dev deployment. Declared
+        // rather than inherited: alone, under the default production profile, the
+        // POST failed on the missing client certificate before reaching the stub.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;

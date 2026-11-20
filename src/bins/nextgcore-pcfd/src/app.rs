@@ -6329,6 +6329,11 @@ mod tests {
         let assoc =
             ue_policy::ue_policy_add("imsi-001010000091004", "http://127.0.0.1:9/old-notify", "");
         let id = assoc.pol_asso_id.clone();
+        // #2157: owned by the consumer `make_request` speaks as, as the create
+        // handler records it (#1937). Seeded ownerless, the PATCH was refused 403
+        // under the default production profile and passed only after a sibling had
+        // set the Dev override.
+        ue_policy::ue_policy_set_owner(&id, Some(TEST_CONSUMER_1865.to_string()));
         ue_policy::ue_policy_set_delivery(
             &id,
             0x90,
