@@ -377,12 +377,12 @@ pub async fn run() -> Result<()> {
     // NRF registration succeeds: the shared verified-NF-type lookup names it
     // as `requester-nf-type` (mandatory; nrfd answers 400 without it), which
     // the old per-crate lookup hard-coded as AUSF. Registration sets it again.
-    register_self_instance(sbi.registration_host().ok(), sbi.port).await;
-
-    sbi_server
-        .start(ausf_sbi_request_handler)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+    let ctx = nextgcore_sbi::context::global_context();
+    start_serving(&ctx, sbi.registration_host().ok(), sbi.port, || {
+        sbi_server.start(ausf_sbi_request_handler)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
@@ -2323,9 +2323,31 @@ fn ausf_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::V
 }
 
 /// Build this AUSF's typed self NF instance from [`AUSF_SERVICES`].
-/// #2141: record this AUSF as the global context's self NF instance (its NF
-/// Instance ID, type AUSF), built from the same table as the registered profile.
-async fn register_self_instance(sbi_addr: Option<&str>, sbi_port: u16) {
+/// #2160: the startup step that brings the SBI listener up: the self instance
+/// in `ctx` first, then `start` (the listener). `run` calls it with the global
+/// context, so the shared lookup names AUSF as its requester from the first
+/// request the listener accepts.
+async fn start_serving<F, Fut, T>(
+    ctx: &nextgcore_sbi::context::SbiContext,
+    sbi_addr: Option<&str>,
+    sbi_port: u16,
+    start: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    register_self_instance_in(ctx, sbi_addr, sbi_port).await;
+    start().await
+}
+
+/// #2141: record this AUSF as `ctx`'s self NF instance (its NF Instance ID,
+/// type AUSF), built from the same table as the registered profile.
+async fn register_self_instance_in(
+    ctx: &nextgcore_sbi::context::SbiContext,
+    sbi_addr: Option<&str>,
+    sbi_port: u16,
+) {
     let id = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf);
     let instance = match sbi_addr {
         Some(addr) => build_ausf_nf_instance(id, addr, sbi_port),
@@ -2333,9 +2355,7 @@ async fn register_self_instance(sbi_addr: Option<&str>, sbi_port: u16) {
         // names itself as the requester.
         None => nextgcore_sbi::context::NfInstance::new(id, nextgcore_sbi::types::NfType::Ausf),
     };
-    nextgcore_sbi::context::global_context()
-        .set_self_instance(instance)
-        .await;
+    ctx.set_self_instance(instance).await;
 }
 
 fn build_ausf_nf_instance(
@@ -5681,34 +5701,35 @@ mod tests_advertised_scheme_1791 {
 // first `#[cfg(test)]`.
 #[cfg(test)]
 mod self_instance_tests_2141 {
-    /// #2141 (R40 M1): the self instance the shared lookup names as
-    /// `requester-nf-type` is registered before serving, with or without an
-    /// advertised host.
+    /// #2160 (R41 on #2141): behavioural, on the startup step `run` uses. The
+    /// listener is started only once the self instance is set: `start` (the
+    /// listener) observes it, in an isolated context that starts empty. A
+    /// source-order check would pass with the call commented out; this cannot.
     ///
-    /// REVERT-VERIFIED: with the startup call removed from `main`, the
-    /// `startup` test below fails; with `register_self_instance` empty, this
-    /// one does.
-    #[test]
-    fn startup_registers_the_self_instance_before_the_listener_serves_2141() {
-        let src = include_str!("app.rs");
-        let main = &src[src.find("pub async fn run(").expect("startup fn")..];
-        let main = &main[..main.find("\n}\n").expect("end of main")];
-        let register = main
-            .find("register_self_instance(")
-            .expect("startup: main registers the self instance");
-        let serve = main
-            .find(".start(ausf_sbi_request_handler)")
-            .expect("main starts the listener");
-        assert!(
-            register < serve,
-            "startup: registered before the listener serves"
-        );
+    /// REVERT-VERIFIED: with `start_serving` starting the listener before
+    /// registering, `start` observes no self instance and the `before the
+    /// listener` assertion fails.
+    #[tokio::test]
+    async fn the_listener_starts_only_once_the_self_instance_is_set_2160() {
+        let ctx = nextgcore_sbi::context::SbiContext::new_isolated();
+        assert!(ctx.get_self_instance().await.is_none());
+        let seen = super::start_serving(&ctx, Some("10.0.0.21"), 7777, || async {
+            ctx.get_self_instance().await
+        })
+        .await;
+        let me = seen.expect("the self instance is set before the listener starts");
+        assert_eq!(me.nf_type, nextgcore_sbi::types::NfType::Ausf);
     }
 
+    /// #2141 (R40 M1): the self instance the shared lookup names as
+    /// `requester-nf-type`, with or without an advertised host.
+    ///
+    /// REVERT-VERIFIED: with `register_self_instance_in` empty, this fails.
     #[tokio::test]
     async fn ausfd_registers_its_self_instance_before_serving_2141() {
         for host in [None, Some("10.0.0.21")] {
-            super::register_self_instance(host, 7777).await;
+            super::register_self_instance_in(&nextgcore_sbi::context::global_context(), host, 7777)
+                .await;
             let me = nextgcore_sbi::context::global_context()
                 .get_self_instance()
                 .await

@@ -7003,6 +7003,50 @@ mod tests {
         assert_eq!(scp, vec!["nausf-auth".to_string()]);
     }
 
+    /// #2160 (R41 on #2141): the NEF's profile admits the UCMF so the UCMF can
+    /// discover it, but its nnef-eventexposure service does not: the token grant
+    /// honours the service-level `allowedNfTypes` (TS 29.510 §6.1.6.2.3, ANDed
+    /// with the profile's), so the UCMF is refused a token for that service
+    /// while the AF is granted one. The profile is nefd's (`build_nf_profile`,
+    /// whose test pins the same two lists).
+    ///
+    /// REVERT-VERIFIED: with `authorizes_service` ignoring the service-level
+    /// list, the UCMF is granted the nnef-eventexposure scope and the `refused`
+    /// assertion fails.
+    #[test]
+    fn the_ucmf_gets_no_nef_service_token_2160() {
+        let nef = NfProfile::from_json(&serde_json::json!({
+            "nfInstanceId": "aaaaaaaa-2160-4000-8000-0000000000ef",
+            "nfType": "NEF",
+            "nfStatus": "REGISTERED",
+            "nfServices": [{
+                "serviceInstanceId": "nef-2160-nnef-eventexposure",
+                "serviceName": "nnef-eventexposure",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"]
+            }],
+            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP", "UCMF"]
+        }))
+        .expect("NEF profile");
+        let requested: Vec<String> = vec!["nnef-eventexposure".into()];
+        let ask = |nf_type: &str| {
+            authorize_access_token(
+                &auth_consumer(nf_type),
+                nf_type,
+                "NEF",
+                &requested,
+                std::slice::from_ref(&nef),
+                &[],
+                &[],
+            )
+        };
+        assert_eq!(ask("AF").ok(), Some(requested.clone()), "the AF is granted");
+        let refused = ask("UCMF").expect_err("refused: the UCMF consumes no NEF service");
+        assert_eq!(refused.0, "unauthorized_client");
+    }
+
     /// #1811: only the UDM is granted the AuthenticationSubscription scope.
     /// A PCF or NEF asking for it gets the service scope alone (RFC 6749 §3.3
     /// lets the server narrow the request), so its token cannot read K at the

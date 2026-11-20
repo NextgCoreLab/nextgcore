@@ -570,13 +570,12 @@ async fn main() -> Result<()> {
     // #2141 (R40 M1): the NRF the shared lookup asks, and (below) the
     // requester it names, are set before the listener serves.
     global_context().set_nrf_uri(&settings.nrf_uri).await;
-    register_self_instance(&nf_instance_id).await;
-
     let sbi_server = SbiServer::new(sbi_config);
-    sbi_server
-        .start(ucmf_sbi_request_handler)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+    start_serving(&global_context(), &nf_instance_id, || {
+        sbi_server.start(ucmf_sbi_request_handler)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
     log::info!("SBI server listening on {addr}");
     let ucmf_metrics_addr = metrics_addr(std::env::var("UCMF_METRICS_ADDR").ok().as_deref());
     match nextgcore_metrics::nes_energy::serve_metrics(
@@ -1449,17 +1448,32 @@ fn provisioning_update_response(
     }
 }
 
-/// #2099, #2141 (R40 M1): record this UCMF as the global context's self NF
+/// #2099, #2141 (R40 M1): record this UCMF as `ctx`'s self NF
 /// instance, before the listener serves. The shared verified-NF-type lookup
 /// names it as `requester-nf-type=UCMF` (mandatory; nrfd answers 400
 /// without), so the NRF also applies the NEF profile's allowedNfTypes (#1998).
-async fn register_self_instance(nf_instance_id: &str) {
-    global_context()
-        .set_self_instance(nextgcore_sbi::context::NfInstance::new(
-            nf_instance_id,
-            NfType::Ucmf,
-        ))
-        .await;
+async fn register_self_instance_in(ctx: &nextgcore_sbi::context::SbiContext, nf_instance_id: &str) {
+    ctx.set_self_instance(nextgcore_sbi::context::NfInstance::new(
+        nf_instance_id,
+        NfType::Ucmf,
+    ))
+    .await;
+}
+
+/// #2160: the startup step that brings the SBI listener up: the self instance
+/// in `ctx` first, then `start` (the listener). `main` calls it with the
+/// global context, after setting the NRF URI.
+async fn start_serving<F, Fut, T>(
+    ctx: &nextgcore_sbi::context::SbiContext,
+    nf_instance_id: &str,
+    start: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    register_self_instance_in(ctx, nf_instance_id).await;
+    start().await
 }
 
 /// TS 29.675 §4.1.3.2: the known Nucmf_Provisioning consumers.
@@ -3130,26 +3144,23 @@ mod tests {
     /// instance as at startup, so the NEF is admitted, an AF's token is refused,
     /// and every lookup names UCMF.
     ///
-    /// #2141 (R40): ucmfd's startup registers its self instance (and the NRF
-    /// URI the lookup asks) before the listener serves.
+    /// #2160 (R41 on #2141): behavioural, on the startup step `main` uses. The
+    /// listener is started only once the self instance is set: `start` (the
+    /// listener) observes it, in an isolated context that starts empty.
     ///
-    /// REVERT-VERIFIED: with the `register_self_instance` call removed from
-    /// `main`, this fails at "startup".
-    #[test]
-    fn startup_registers_the_self_instance_before_the_listener_serves_2141() {
-        let src = include_str!("main.rs");
-        let main = &src[src.find("async fn main(").expect("main")..];
-        let main = &main[..main.find("\n}\n").expect("end of main")];
-        let at = |needle: &str| {
-            main.find(needle)
-                .unwrap_or_else(|| panic!("startup: {needle}"))
-        };
-        let serve = at(".start(ucmf_sbi_request_handler)");
-        assert!(
-            at("register_self_instance(") < serve,
-            "startup: self instance first"
-        );
-        assert!(at("set_nrf_uri(") < serve, "startup: NRF URI first");
+    /// REVERT-VERIFIED: with `start_serving` starting the listener before
+    /// registering, `start` observes no self instance and the `before the
+    /// listener` assertion fails.
+    #[tokio::test]
+    async fn the_listener_starts_only_once_the_self_instance_is_set_2160() {
+        let ctx = nextgcore_sbi::context::SbiContext::new_isolated();
+        assert!(ctx.get_self_instance().await.is_none());
+        let seen = start_serving(&ctx, "21600000-0000-4000-8000-0000000000c1", || async {
+            ctx.get_self_instance().await
+        })
+        .await;
+        let me = seen.expect("the self instance is set before the listener starts");
+        assert_eq!(me.nf_type, NfType::Ucmf);
     }
 
     /// REVERT-VERIFIED: with UCMF dropped from the stand-in NEF profile (nefd's
@@ -3204,7 +3215,11 @@ mod tests {
         global_context()
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
-        register_self_instance(nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Ucmf)).await;
+        register_self_instance_in(
+            &global_context(),
+            nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Ucmf),
+        )
+        .await;
         let policy = context::ProvisioningPolicy {
             trusted_afs: Some(vec!["dddddddd-2141-4000-8000-00000000trust".to_string()]),
             vendor_ids: BTreeMap::new(),
