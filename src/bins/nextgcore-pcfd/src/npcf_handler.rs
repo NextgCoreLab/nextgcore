@@ -421,17 +421,6 @@ fn five_qi_for_component(mc: &MediaComponent) -> u8 {
         .unwrap_or_else(|| mc.med_type.default_5qi())
 }
 
-/// Convert AF media components to PCC rules (TS 29.514 §4.2.2.2). For each
-/// component the flowDescriptions become flowInfos, `medType`/`marBw{Ul,Dl}`
-/// and the resolved 5QI become a QosData (with `gbr` for GBR 5QIs), and
-/// `fStatus` becomes the rule flow status. PCC rule ids are stable per
-/// (session, app session, medCompN) so a modify replaces the same rule.
-///
-/// #2221 (R47 M1): the app session (`app_id`, its [`crate::context::PcfApp::id`])
-/// is part of the key. Every AF numbers its media components from 1, so keyed by
-/// (session, medCompN) alone two app sessions on one PDU session shared a rule:
-/// the second overwrote the first's flows, and a QoS monitoring report on it
-/// went to both AFs.
 /// #2269: the id an AF PCC rule for media component `med_comp_n` had before
 /// #2263 keyed rules by app session: `PccRule-af-<psi>-<medCompN>`. A session
 /// restored from a snapshot written before the upgrade can still hold one.
@@ -452,6 +441,17 @@ pub fn is_legacy_af_pcc_rule_id(id: &str) -> bool {
     })
 }
 
+/// Convert AF media components to PCC rules (TS 29.514 §4.2.2.2). For each
+/// component the flowDescriptions become flowInfos, `medType`/`marBw{Ul,Dl}`
+/// and the resolved 5QI become a QosData (with `gbr` for GBR 5QIs), and
+/// `fStatus` becomes the rule flow status. PCC rule ids are stable per
+/// (session, app session, medCompN) so a modify replaces the same rule.
+///
+/// #2221 (R47 M1): the app session (`app_id`, its [`crate::context::PcfApp::id`])
+/// is part of the key. Every AF numbers its media components from 1, so keyed by
+/// (session, medCompN) alone two app sessions on one PDU session shared a rule:
+/// the second overwrote the first's flows, and a QoS monitoring report on it
+/// went to both AFs.
 pub fn media_components_to_pcc(req: &AscReqData, sess: &PcfSess, app_id: u64) -> Vec<AfPccRule> {
     let mut rules = Vec::with_capacity(req.med_components.len());
 
@@ -660,9 +660,6 @@ mod tests {
         assert_eq!(fs, FlowStatus::Enabled);
     }
 
-    /// pcfd-02: TS 29.514 §4.2.2.2 — an AscReqData with one audio media
-    /// component (flowDescriptions + marBwDl/Ul) maps to a PccRule with matching
-    /// flowInfos and a QosData carrying the right maxbr and the mandatory qosId.
     /// #2269: a removal with no PCC rule to remove (only a QoS monitoring
     /// instance) leaves `pccRules` and `qosDecs` out: TS 29.512 gives both maps
     /// minProperties 1, so `{}` is not a valid value.
@@ -678,6 +675,9 @@ mod tests {
         assert_eq!(d["qosMonDecs"], serde_json::json!({ "qm-1": null }));
     }
 
+    /// pcfd-02: TS 29.514 §4.2.2.2 — an AscReqData with one audio media
+    /// component (flowDescriptions + marBwDl/Ul) maps to a PccRule with matching
+    /// flowInfos and a QosData carrying the right maxbr and the mandatory qosId.
     #[test]
     fn test_media_components_to_pcc_audio_component() {
         let sess = PcfSess::new(1, 1, 5);
