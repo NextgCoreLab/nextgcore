@@ -135,7 +135,17 @@ pub enum ServerAssignmentType {
 }
 
 /// SWx interface state
+///
+/// Test lock: `SWX_TEST_LOCK` (below).
 static SWX_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// #2259: held by every test that sets or clears [`SWX_INITIALIZED`]
+/// ([`hss_swx_init`], [`hss_swx_final`]). Without it, a sibling test's
+/// `hss_swx_init` landing between `test_swx_init_final`'s `hss_swx_final` and
+/// its assertion made the interface read as initialized (3 failures in 600
+/// full-suite runs under CPU load).
+#[cfg(test)]
+pub(crate) static SWX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Global SWx statistics
 static SWX_STATS: std::sync::OnceLock<SwxStats> = std::sync::OnceLock::new();
@@ -500,6 +510,7 @@ mod tests {
 
     #[test]
     fn test_swx_init_final() {
+        let _swx = SWX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Initialize
         assert!(hss_swx_init().is_ok());
         assert!(hss_swx_is_initialized());
@@ -568,6 +579,7 @@ mod tests {
     #[test]
     fn test_handle_mar() {
         // Initialize first
+        let _swx = SWX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = hss_swx_init();
 
         // MAR requires MongoDB for auth info lookup - verify graceful error without DB
@@ -577,6 +589,7 @@ mod tests {
 
     #[test]
     fn test_handle_mar_unsupported_scheme() {
+        let _swx = SWX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = hss_swx_init();
 
         let result = handle_mar("001010123456789", Some("DIGEST-MD5"), None);
@@ -585,6 +598,7 @@ mod tests {
 
     #[test]
     fn test_handle_sar_registration() {
+        let _swx = SWX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = hss_swx_init();
 
         // SAR Registration requires MongoDB for subscription data - verify graceful error without DB
@@ -594,6 +608,7 @@ mod tests {
 
     #[test]
     fn test_handle_sar_deregistration() {
+        let _swx = SWX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = hss_swx_init();
 
         let result = handle_sar("001010123456789", ServerAssignmentType::UserDeregistration);
