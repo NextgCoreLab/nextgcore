@@ -176,6 +176,10 @@ pub struct SessionScope {
     pub epc_sess_ids: std::collections::HashSet<u64>,
     /// The SMF-side N4 SEIDs of all of them, whose UPF bindings the teardown drops.
     pub seids: std::collections::HashSet<u64>,
+    /// #2225: the scope is the configured I-UPF's. Its `refs` and `seids` are the
+    /// PSA sessions with an I-UPF leg, and what the I-UPF reports concerns their
+    /// legs' FARs (`far_peers` under the leg SEID).
+    pub iupf: bool,
 }
 
 /// [`notify_sessions_unrecoverable`] for the sessions in `scope` only (#720).
