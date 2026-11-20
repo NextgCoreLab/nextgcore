@@ -30,8 +30,7 @@ data:
     nrf:
       serving:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
       sbi:
         server:
           - address: 0.0.0.0
@@ -51,6 +50,14 @@ data:
               client_auth: optional
               # Minimum TLS version per 3GPP TS 33.501 §13.2
               min_version: "1.2"
+      {{- with include "nextgcore.nfSetAllowlist" . }}
+      # #2052: who may claim which NF Set (#1719), and which AMF may list GUAMIs
+      # of which AMF Set (#2035, TS 23.003 §2.10.1, §28.12). Under the production
+      # profile an AMF with no entry for its AMF Set is refused. values.yaml
+      # nrf.nfSetAllowlist; unset, the chart's AMF only.
+      nf_set_allowlist:
+        {{- . | nindent 8 }}
+      {{- end }}
 
   amf.yaml: |
     logger:
@@ -75,20 +82,17 @@ data:
             port: {{ .Values.amf.service.ngapPort }}
       guami:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
           amf_id:
             region: {{ .Values.amf.config.amfId.region }}
             set: {{ .Values.amf.config.amfId.set }}
       tai:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
           tac: {{ .Values.amf.config.tai.tac }}
       plmn_support:
         - plmn_id:
-            mcc: {{ .Values.global.plmn.mcc }}
-            mnc: {{ .Values.global.plmn.mnc }}
+            {{- include "nextgcore.plmnId" . | nindent 12 }}
           s_nssai:
             {{- toYaml .Values.amf.config.nssai | nindent 12 }}
       security:
@@ -281,12 +285,14 @@ data:
             - uri: {{ include "nextgcore.nrfUri" . }}
               s_nssai:
                 sst: 1
-        # #94: SBI OAuth2 enforcement now defaults to ENABLED. This chart wires
-        # up no token issuance, so it opts out EXPLICITLY: requests are not
-        # authenticated and NSSAI-availability writes cannot be bound to the
-        # owning AMF.
+        # #94: SBI OAuth2 enforcement defaults to ENABLED. Under the dev profile
+        # this chart wires up no token issuance, so it opts out EXPLICITLY there:
+        # requests are not authenticated and NSSAI-availability writes cannot be
+        # bound to the owning AMF. Under global.sbiProfile=production the opt-out
+        # is not rendered, so the listener verifies Bearer tokens against the
+        # NRF's JWKS (TS 33.501 §13.4.1) like the production profile's other NFs.
         oauth2:
-          require: false
+          require: {{ ne (include "nextgcore.sbiProfile" .) "production" | ternary "false" "true" }}
 
   bsf.yaml: |
     logger:

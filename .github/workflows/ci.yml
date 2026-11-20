@@ -411,6 +411,84 @@ jobs:
         run: helm lint deploy/helm/nextgcore --set global.siteId=ci
       - name: helm template renders
         run: helm template t deploy/helm/nextgcore --set global.siteId=ci > /dev/null
+      - name: helm lint and template, production profile (#2052)
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/nextgcore --set global.siteId=ci --set global.sbiProfile=production
+          helm template t deploy/helm/nextgcore --set global.siteId=ci \
+            --set global.sbiProfile=production > "$RUNNER_TEMP/prod.yaml"
+          # The derived nrf.nf_set_allowlist entry for the chart's AMF. The
+          # nrfd test the_helm_chart_provisions_its_amf_for_its_amf_set_2052
+          # parses it and checks nrfd admits the AMF's guamiList.
+          grep -q 'nf_set_id: set001.region02.amfset.5gc.mnc070.mcc999' "$RUNNER_TEMP/prod.yaml" \
+            || { echo "no derived nf_set_allowlist entry for the AMF (#2052)"; exit 1; }
+          # The NSSF's dev-only OAuth2 opt-out is not rendered under production.
+          if grep -q 'require: false' "$RUNNER_TEMP/prod.yaml"; then
+            echo "production profile renders an oauth2 opt-out (#2052)"; exit 1
+          fi
+      - name: helm template refuses an nrf.nfSetAllowlist without the chart's AMF (#2052)
+        run: |
+          refuse() {
+            local want="$1"; shift
+            if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci "$@" 2>&1); then
+              echo "rendered with $*; it must fail (#2052)"; exit 1
+            fi
+            echo "$out" | grep -q "$want" || { echo "failed for another reason: $out"; exit 1; }
+          }
+          refuse 'admits no AMF' --set-json 'nrf.nfSetAllowlist=[]'
+          refuse 'admits no AMF' \
+            --set-json 'nrf.nfSetAllowlist=[{"nf_set_id":"set002.region02.amfset.5gc.mnc070.mcc999"}]'
+          refuse 'nf_set_id must be a non-empty' --set-json 'nrf.nfSetAllowlist=[{"nf_types":["AMF"]}]'
+          # #2069 (R32's #2064 minors): an id-less entry under production, and
+          # an unknown profile.
+          refuse 'names no nf_instance_ids' --set global.sbiProfile=production \
+            --set-json 'nrf.nfSetAllowlist=[{"nf_set_id":"set001.region02.amfset.5gc.mnc070.mcc999","nf_types":["AMF"]}]'
+          refuse 'is not a profile' --set global.sbiProfile=prd
+          # R41 on #2114: values the NFs read as production never render dev.
+          refuse 'global.sbiProfile is empty' --set global.sbiProfile=
+          refuse 'reached the chart as a bool' --set global.sbiProfile=false
+          refuse 'reached the chart as a int64' --set global.sbiProfile=0
+          # An alias of production drops the NSSF's opt-out too.
+          if helm template t deploy/helm/nextgcore --set global.siteId=ci --set global.sbiProfile=prod \
+              | grep -q 'require: false'; then
+            echo "global.sbiProfile=prod renders an oauth2 opt-out (#2069)"; exit 1
+          fi
+          refuse 'an AMF Set ID is an integer 0-1023' --set amf.config.amfId.set=1024
+      - name: helm template quotes global.plmn and refuses a numeric or malformed one (#2069)
+        run: |
+          set -euo pipefail
+          # Quoted, so an NF reads mcc 001 as "001", not the integer 1. The
+          # render tests (nextgcore-core, amfd and nrfd, *_2069) parse these.
+          helm template t deploy/helm/nextgcore --set global.siteId=ci \
+            --set-string global.plmn.mcc=001 --set-string global.plmn.mnc=070 \
+            --set-string subscriber.imsi=001070000000001 > "$RUNNER_TEMP/plmn.yaml"
+          [ "$(grep -c 'mcc: "001"' "$RUNNER_TEMP/plmn.yaml")" -eq 4 ] \
+            || { echo "global.plmn.mcc is not rendered quoted 4 times (#2069)"; exit 1; }
+          [ "$(grep -c 'mnc: "070"' "$RUNNER_TEMP/plmn.yaml")" -eq 4 ] \
+            || { echo "global.plmn.mnc is not rendered quoted 4 times (#2069)"; exit 1; }
+          if grep -nE '^\s+(mcc|mnc): [0-9]' "$RUNNER_TEMP/plmn.yaml"; then
+            echo "an unquoted mcc or mnc is rendered (#2069)"; exit 1
+          fi
+          grep -q 'nf_set_id: set001.region02.amfset.5gc.mnc070.mcc001' "$RUNNER_TEMP/plmn.yaml" \
+            || { echo "the derived NF Set ID lost the PLMN's digits (#2069)"; exit 1; }
+          refuse() {
+            local want="$1"; shift
+            if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci "$@" 2>&1); then
+              echo "rendered with $*; it must fail (#2069)"; exit 1
+            fi
+            echo "$out" | grep -q "$want" || { echo "failed for another reason: $out"; exit 1; }
+          }
+          # A number has lost any leading zeros: refused, never padded.
+          refuse 'global.plmn.mnc=70 reached the chart as a number' --set global.plmn.mnc=70
+          refuse 'global.plmn.mcc=999 reached the chart as a number' --set global.plmn.mcc=999
+          printf 'global:\n  plmn:\n    mcc: "999"\n    mnc: 070\n' > "$RUNNER_TEMP/octal.yaml"
+          refuse 'global.plmn.mnc=56 reached the chart as a number' -f "$RUNNER_TEMP/octal.yaml"
+          refuse 'an MCC is 3 digits' --set-string global.plmn.mcc=0011
+          refuse 'an MNC is 2 or 3 digits' --set-string global.plmn.mnc=7
+          refuse 'an MNC is 2 or 3 digits' --set-string global.plmn.mnc=0700
+          refuse 'subscriber.imsi reached the chart as a number' --set subscriber.imsi=999700000000001
+          refuse 'is not of global.plmn 999-70' --set-string subscriber.imsi=001010000000001
+          refuse 'an IMSI is 5 to 15 digits' --set-string subscriber.imsi=9997000000000012
       - name: helm template refuses amf.replicas=2
         run: |
           if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci \

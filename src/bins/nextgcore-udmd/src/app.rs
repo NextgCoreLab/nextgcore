@@ -6631,6 +6631,173 @@ mod tests {
         udr_server.stop().await.expect("stop udr");
     }
 
+    /// #2079: the UDM's real writes of its context data -- UECM registrations
+    /// (amf-3gpp-access, smf-registrations PUT and DELETE, smsf-3gpp-access,
+    /// ip-sm-gw) and the ConfirmAuth AuthEvent (authentication-status) -- against
+    /// a UDR whose listener is configured as udrd's: OAuth2 required, audience
+    /// UDR, and the TS 29.505 resource scopes enforced by nextgcore-sbi's gate
+    /// (`resource_scope::required_resource_scope`, which now covers these
+    /// writes). udmd's client asks the NRF for `nudr-dr` plus the scope each
+    /// write needs (`registrations:write` or `subscription-data`), so every
+    /// write is stored; with no token client the gate refuses them and nothing
+    /// is stored.
+    ///
+    /// REVERT-VERIFIED: with the client's `request_access_scope` returning the
+    /// service scope alone, the UDR refuses each write 403 insufficient_scope
+    /// and the `stored past the gate` assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn the_udm_context_writes_pass_a_udr_enforcing_their_scopes_2079() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_core::test_log::init();
+        udm_context_init(64, 64);
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        for inst in sbi_ctx
+            .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Udr)
+            .await
+        {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
+
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let store: CtxStore = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = NextgcoreSbiServerConfig::new(udr_addr)
+            .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr)
+            .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr_server = SbiServer::on_listener(cfg, udr_listener);
+        let handler_store = Arc::clone(&store);
+        udr_server
+            .start(move |req: SbiRequest| {
+                let store = Arc::clone(&handler_store);
+                async move { mock_udr_context_data(store, req).await }
+            })
+            .await
+            .expect("gated UDR starts");
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", udr_addr.port().to_string());
+
+        let (udm_server, client) = start_real_udm().await;
+        let smf = serde_json::json!({
+            "smfInstanceId": "smf-2079",
+            "pduSessionId": 5,
+            "singleNssai": { "sst": 1, "sd": "000001" },
+            "dnn": "internet",
+            "plmnId": { "mcc": "001", "mnc": "01" }
+        });
+        let smsf = serde_json::json!({
+            "smsfInstanceId": "smsf-2079",
+            "plmnId": { "mcc": "001", "mnc": "01" }
+        });
+        let ipsmgw = serde_json::json!({ "ipsmgwFqdn": "ipsmgw.example.org" });
+        let auth_event = serde_json::json!({
+            "nfInstanceId": "ausf-2079",
+            "success": true,
+            "timeStamp": "2026-11-19T00:00:00Z",
+            "authType": "5G_AKA",
+            "servingNetworkName": TEST_SNN
+        });
+        let drive = |supi: &'static str| {
+            let client = &client;
+            let (smf, smsf, ipsmgw, auth_event) = (
+                smf.clone(),
+                smsf.clone(),
+                ipsmgw.clone(),
+                auth_event.clone(),
+            );
+            async move {
+                let reg = |r: &str| format!("/nudm-uecm/v1/{supi}/registrations/{r}");
+                let mut statuses = Vec::new();
+                for (path, body) in [
+                    (reg("amf-3gpp-access"), amf_reg_body("amf-2079", "NR")),
+                    (reg("smf-registrations/5"), smf),
+                    (reg("smsf-3gpp-access"), smsf),
+                    (reg("ip-sm-gw"), ipsmgw),
+                ] {
+                    statuses.push(client.put_json(&path, &body).await.expect("PUT").status);
+                }
+                statuses.push(
+                    client
+                        .post_json(&format!("/nudm-ueau/v1/{supi}/auth-events"), &auth_event)
+                        .await
+                        .expect("auth-events")
+                        .status,
+                );
+                statuses
+            }
+        };
+        let key = |supi: &str, r: &str| format!("/nudr-dr/v2/subscription-data/{supi}/{r}");
+        let written = |supi: &str| {
+            let map = store.lock().unwrap_or_else(|e| e.into_inner());
+            [
+                "context-data/amf-3gpp-access",
+                "context-data/smf-registrations/5",
+                "context-data/smsf-3gpp-access",
+                "context-data/ip-sm-gw",
+                "authentication-data/authentication-status",
+            ]
+            .iter()
+            .filter(|r| map.contains_key(&key(supi, r)))
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+        };
+
+        let (bare, tokened) = ("imsi-001010000020794", "imsi-001010000020795");
+        drive(bare).await;
+        let bare_written = written(bare);
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            stand_in::oauth2_client_for(nrf_port, nextgcore_sbi::types::NfType::Udm),
+        );
+        let statuses = drive(tokened).await;
+        let tokened_written = written(tokened);
+        let delete = client
+            .delete(&format!(
+                "/nudm-uecm/v1/{tokened}/registrations/smf-registrations/5"
+            ))
+            .await
+            .expect("smf DELETE");
+        let smf_after_delete = written(tokened);
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        std::env::remove_var("UDR_SBI_ADDR");
+        std::env::remove_var("UDR_SBI_PORT");
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+
+        assert!(
+            bare_written.is_empty(),
+            "no token: the UDR's gate stores nothing: {bare_written:?}"
+        );
+        assert_eq!(
+            tokened_written,
+            vec![
+                "context-data/amf-3gpp-access",
+                "context-data/smf-registrations/5",
+                "context-data/smsf-3gpp-access",
+                "context-data/ip-sm-gw",
+                "authentication-data/authentication-status",
+            ],
+            "stored past the gate (UECM/UEAU answered {statuses:?})"
+        );
+        assert_eq!(statuses[..4], [201, 201, 201, 201], "{statuses:?}");
+        assert_eq!(delete.status, 204, "{:?}", delete.http.content);
+        assert!(
+            !smf_after_delete.contains(&"context-data/smf-registrations/5".to_string()),
+            "the UDM's smf-registrations DELETE passes the gate: {smf_after_delete:?}"
+        );
+    }
+
     // ========================================================================
     // #84: UEAU — the authenticating AUSF is pinned, DeleteAuth is routed, and
     // a failed SQN advance withholds the AV.

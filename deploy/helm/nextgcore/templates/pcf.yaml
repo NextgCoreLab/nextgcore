@@ -60,7 +60,7 @@ spec:
               # cannot load its client certificate, never registers, and is
               # undiscoverable. The chart mounts none by default, so it opts out
               # explicitly. Set global.sbiProfile=production once certs exist.
-              value: {{ .Values.global.sbiProfile | default "dev" | quote }}
+              value: {{ include "nextgcore.sbiProfile" . | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
             {{- if .Values.pcf.metrics.enabled }}

@@ -605,6 +605,54 @@ fn is_scp_consumed(name: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case(discovery_header::PREFIX))
 }
 
+/// #2080: request headers that assert who the caller is. A consumer can write
+/// anything in them, and the next hop (nrfd trusts this SCP as an XFCC
+/// terminator, #1990) would believe it as the SCP's word. They are never
+/// forwarded as received: `x-forwarded-client-cert` is set again from the
+/// certificate this SCP verified ([`forwarded_client_cert`]); `x-caller-supi`
+/// the SCP cannot vouch for, so it goes.
+///
+/// #2103 (R30 on #2095): `3gpp-Sbi-Consumer-Info` is not one of them. It is the
+/// consumer's TS 29.500 §5.2.3.3.7 consumer information (supported services, API
+/// versions and features, accepted encodings, callback roots) that a producer may
+/// use for the notifications it sends, not an identity claim, so it is forwarded.
+const CALLER_IDENTITY_HEADERS: &[&str] = &["x-forwarded-client-cert", "x-caller-supi"];
+
+fn is_caller_identity(name: &str) -> bool {
+    CALLER_IDENTITY_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// #2080: the Envoy-style `x-forwarded-client-cert` this SCP vouches for: the
+/// client certificate it verified on the inbound connection, as `Hash=` (the
+/// SHA-256 of its DER) and the URL-encoded PEM in `Cert=`, which is what nrfd
+/// believes from a declared terminator (#1990). `None` with no verified client
+/// certificate: then the next hop gets no XFCC at all.
+pub fn forwarded_client_cert(request: &SbiRequest) -> Option<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    let der = request.peer_cert_der.as_deref()?;
+    if der.is_empty() {
+        return None;
+    }
+    let hash: String = sha2::Sha256::digest(der)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    Some(format!(
+        "Hash={hash};Cert=\"{}\"",
+        nextgcore_sbi::uri_encode::encode_query_value(&pem)
+    ))
+}
+
 /// Copy request headers for forwarding: drops pseudo/hop-by-hop headers and
 /// the SCP-consumed routing headers; everything else (including
 /// `3gpp-Sbi-Oci`, `3gpp-Sbi-Lci`, `3gpp-Sbi-Binding`, `Authorization`, ...)
@@ -612,7 +660,7 @@ fn is_scp_consumed(name: &str) -> bool {
 pub fn forwardable_request_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
     headers
         .iter()
-        .filter(|(k, _)| !is_hop_by_hop(k) && !is_scp_consumed(k))
+        .filter(|(k, _)| !is_hop_by_hop(k) && !is_scp_consumed(k) && !is_caller_identity(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -1897,6 +1945,13 @@ impl ScpProxy {
         // query parameter to the producer (TS 29.500 §6.10.2.6).
         fwd.http.params.retain(|k, _| !is_scp_internal_param(k));
         fwd.http.headers = forwardable_request_headers(&request.http.headers);
+        // #2080: and the client certificate this SCP verified, in place of any
+        // the consumer sent.
+        if let Some(xfcc) = forwarded_client_cert(request) {
+            fwd.http
+                .headers
+                .insert("x-forwarded-client-cert".to_string(), xfcc);
+        }
         fwd.http.content = request.http.content.clone();
         fwd.http.parts = request.http.parts.clone();
 
@@ -2707,6 +2762,10 @@ mod tests {
                     "ck": request.http.get_param("ck"),
                     "via": request.http.get_header("Via"),
                     "maxHops": request.http.get_header("3gpp-Sbi-Max-Forward-Hops"),
+                    // #2080: the caller-identity headers the producer is handed.
+                    "xfcc": request.http.get_header("x-forwarded-client-cert"),
+                    "callerSupi": request.http.get_header("x-caller-supi"),
+                    "consumerInfo": request.http.get_header("3gpp-Sbi-Consumer-Info"),
                 });
                 SbiResponse::ok()
                     .with_body(echoed.to_string(), "application/json")
@@ -5549,6 +5608,97 @@ mod tests {
         assert_eq!(response.status, 502);
         let problem: ProblemDetails = response.json_body().unwrap();
         assert_eq!(problem.cause.as_deref(), Some("MAX_SCP_HOPS_REACHED"));
+    }
+
+    /// #2080 (R32's audit): the probe. A consumer forges
+    /// `x-forwarded-client-cert` and `x-caller-supi` (in any case) and sends them
+    /// through the SCP. The producer sees neither. #2103: the
+    /// `3gpp-Sbi-Consumer-Info` it also sends is consumer information, not an
+    /// identity claim, and reaches the producer as sent.
+    ///
+    /// REVERT-VERIFIED (#2103): with `3gpp-Sbi-Consumer-Info` back in
+    /// `CALLER_IDENTITY_HEADERS`, "forwarded as sent" fails. With a client certificate the SCP verified, the producer sees the
+    /// SCP's own XFCC for that certificate (its SHA-256 in `Hash=`, its PEM in
+    /// `Cert=`), not the forged one.
+    ///
+    /// REVERT-VERIFIED: with the identity headers forwarded, the forged XFCC
+    /// reaches the producer; without the SCP setting its own, the verified
+    /// certificate's XFCC is missing.
+    #[tokio::test]
+    async fn caller_identity_headers_are_the_scps_own_2080() {
+        use sha2::Digest;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let producer = start_mock_producer(producer_listener).await;
+        let proxy = ScpProxy::new(dev_config());
+        let forged = || {
+            SbiRequest::get("/nudm-uecm/v1/registrations")
+                .with_header(
+                    "3gpp-Sbi-Target-apiRoot",
+                    format!("http://127.0.0.1:{producer_port}"),
+                )
+                .with_header(
+                    "X-Forwarded-Client-Cert",
+                    "By=x;Cert=\"forged\";URI=urn:uuid:victim",
+                )
+                .with_header("x-caller-supi", "imsi-001010000002080")
+                .with_header("3GPP-SBI-CONSUMER-INFO", "forged")
+        };
+        let echoed = |r: SbiResponse| -> serde_json::Value {
+            assert_eq!(r.status, 200, "{:?}", r.http.content);
+            r.json_body().unwrap()
+        };
+
+        let seen = echoed(proxy.handle(forged()).await);
+        assert!(
+            seen["xfcc"].is_null(),
+            "a forged XFCC is not forwarded: {seen}"
+        );
+        assert!(seen["callerSupi"].is_null(), "{seen}");
+        // #2103: consumer information, not an identity claim: forwarded as sent.
+        assert_eq!(seen["consumerInfo"], "forged", "{seen}");
+
+        let der = b"a verified client certificate".to_vec();
+        let mut verified = forged();
+        verified.peer_cert_present = true;
+        verified.peer_cert_der = Some(Arc::new(der.clone()));
+        let seen = echoed(proxy.handle(verified).await);
+        let xfcc = seen["xfcc"].as_str().expect("the SCP's own XFCC");
+        let hash: String = sha2::Sha256::digest(&der)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(xfcc.starts_with(&format!("Hash={hash};Cert=")), "{xfcc}");
+        assert!(
+            !xfcc.contains("forged") && !xfcc.contains("victim"),
+            "{xfcc}"
+        );
+        assert!(seen["callerSupi"].is_null() && seen["consumerInfo"] == "forged");
+
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// #2080: the XFCC the SCP sets carries the verified certificate's PEM.
+    #[test]
+    fn forwarded_client_cert_carries_the_verified_pem_2080() {
+        use base64::Engine;
+        let mut request = SbiRequest::default();
+        assert!(
+            forwarded_client_cert(&request).is_none(),
+            "no certificate, no XFCC"
+        );
+        let der = vec![0x30u8; 100];
+        request.peer_cert_der = Some(Arc::new(der.clone()));
+        let xfcc = forwarded_client_cert(&request).unwrap();
+        let cert = xfcc.split("Cert=\"").nth(1).unwrap().trim_end_matches('"');
+        let pem = nextgcore_sbi::uri_encode::decode_query_value(cert);
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .unwrap(),
+            der
+        );
     }
 
     /// scpd-04: a normal forward decrements the scp-typed hop count and inserts

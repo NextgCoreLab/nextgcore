@@ -56,7 +56,7 @@ spec:
               # only https nfStatusNotificationUris, so it follows the same
               # global.sbiProfile as the NFs subscribing at it. Its TLS listener
               # is its own config (#1617) either way.
-              value: {{ .Values.global.sbiProfile | default "dev" | quote }}
+              value: {{ include "nextgcore.sbiProfile" . | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
             {{- if .Values.nrf.metrics.enabled }}

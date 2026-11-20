@@ -2988,7 +2988,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ("nsmf-pdusession", "sm-contexts", "POST") if parts.len() >= 5 && parts[4] == "modify" => {
             let sm_context_ref = parts[3];
             if let Some(refused) =
-                refuse_sm_context_caller(sm_context_ref, &request, "UpdateSMContext")
+                refuse_sm_context_caller(sm_context_ref, &request, "UpdateSMContext").await
             {
                 return refused;
             }
@@ -3000,7 +3000,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ("nsmf-pdusession", "sm-contexts", "POST") if parts.len() >= 5 && parts[4] == "release" => {
             let sm_context_ref = parts[3];
             if let Some(refused) =
-                refuse_sm_context_caller(sm_context_ref, &request, "ReleaseSMContext")
+                refuse_sm_context_caller(sm_context_ref, &request, "ReleaseSMContext").await
             {
                 return refused;
             }
@@ -3014,7 +3014,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         {
             let sm_context_ref = parts[3];
             if let Some(refused) =
-                refuse_sm_context_caller(sm_context_ref, &request, "RetrieveSMContext")
+                refuse_sm_context_caller(sm_context_ref, &request, "RetrieveSMContext").await
             {
                 return refused;
             }
@@ -12063,7 +12063,7 @@ fn sm_context_owner(sm_context_ref: &str) -> Option<String> {
 /// name AMF. That is the spec's AMF change, by an AMF that obtained the
 /// unguessable reference through the UE context transfer (TS 23.502 §4.2.2.2.2
 /// step 5). The owner itself may not hand the context to another AMF.
-fn refuse_sm_context_caller(
+async fn refuse_sm_context_caller(
     sm_context_ref: &str,
     request: &SbiRequest,
     operation: &str,
@@ -12078,7 +12078,8 @@ fn refuse_sm_context_caller(
             request,
             operation,
             nextgcore_sbi::security::SbiProfile::resolve().is_production(),
-        );
+        )
+        .await;
     };
     let new_serving = amf_change
         .then(|| {
@@ -12105,19 +12106,20 @@ fn refuse_sm_context_caller(
             ))
         }
     };
+    // #2078: and it must be shown to be an AMF (CONVENTIONS: the verified NF
+    // type), not assumed from a token or a certificate without NF types.
+    let not_amf = if owner_binding::same_nf_instance_id(&caller, &new_serving) {
+        match amf_type_refusal(request).await {
+            None => return None,
+            Some(why) => format!("; {why}"),
+        }
+    } else {
+        String::new()
+    };
     let types = &request.peer_cert_nf_types;
-    let amf_typed = types.is_empty()
-        || types.iter().any(|t| t.eq_ignore_ascii_case("AMF"))
-        || types.iter().any(|t| {
-            owner_binding::RELAY_NF_TYPES
-                .iter()
-                .any(|r| r.eq_ignore_ascii_case(t))
-        });
-    if owner_binding::same_nf_instance_id(&caller, &new_serving) && amf_typed {
-        return None;
-    }
     let why = format!(
-        "an AMF change to {new_serving} must come from that AMF; the requester is {caller}          (certificate NF types {types:?}) and the context belongs to {owner}"
+        "an AMF change to {new_serving} must come from that AMF; the requester is {caller} \
+         (certificate NF types {types:?}) and the context belongs to {owner}{not_amf}"
     );
     log::debug!("{operation} of SM context {sm_context_ref} refused: {why}");
     Some(nextgcore_sbi::server::send_forbidden(
@@ -12140,7 +12142,7 @@ fn refuse_sm_context_caller(
 /// - otherwise the caller is the serving AMF (TS 29.502 §5.2.2.3-§5.2.2.5: the
 ///   SM context has exactly one consumer) and is adopted as its owner before the
 ///   handler runs, so from then on the context is bound like a new one.
-fn refuse_ownerless_sm_context_caller(
+async fn refuse_ownerless_sm_context_caller(
     sm_context_ref: &str,
     request: &SbiRequest,
     operation: &str,
@@ -12176,19 +12178,9 @@ fn refuse_ownerless_sm_context_caller(
         }
         Err(why) => return refuse(why),
     };
-    let types = &request.peer_cert_nf_types;
-    let amf_typed = types.is_empty()
-        || types.iter().any(|t| {
-            t.eq_ignore_ascii_case("AMF")
-                || owner_binding::RELAY_NF_TYPES
-                    .iter()
-                    .any(|r| r.eq_ignore_ascii_case(t))
-        });
-    if !amf_typed {
-        return refuse(format!(
-            "only the serving AMF manages an SM context; the requester's certificate names \
-             {types:?}"
-        ));
+    // #2078: the verified NF type, not "no certificate NF types means AMF".
+    if let Some(why) = amf_type_refusal(request).await {
+        return refuse(format!("only the serving AMF manages an SM context; {why}"));
     }
     if !adopt_sm_context_owner(sm_context_ref, &caller) {
         // Another request adopted it first: judge this one against that owner.
@@ -12202,6 +12194,16 @@ fn refuse_ownerless_sm_context_caller(
         "SM context {sm_context_ref} had no serving-AMF binding; {caller} is adopted as its owner"
     );
     None
+}
+
+/// #2078 / #2099: why the requester is not shown to be an AMF, or `None` when
+/// it is: the shared verified-NF-type rule (`owner_binding::verified_nf_type`:
+/// the consumer certificate's NFTypes, else the NRF profile of the verified
+/// token subject, cached, failing closed).
+async fn amf_type_refusal(request: &SbiRequest) -> Option<String> {
+    owner_binding::verified_nf_type(request, nextgcore_sbi::types::NfType::Amf)
+        .await
+        .err()
 }
 
 /// Bind an ownerless SM context to `owner` (#1899 review M2). `false` when it
@@ -28706,6 +28708,8 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
+        // #2078: the NRF lists B as an AMF.
+        owner_binding::seed_nf_type_for_test(AMF_B_1860, nextgcore_sbi::types::NfType::Amf);
         let reference = create_as_1860("imsi-001010000011860", 6, Some(AMF_A_1860)).await;
         let change = serde_json::json!({
             "servingNfId": AMF_B_1860,
@@ -28771,6 +28775,8 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
+        // #2078: the NRF lists B as an AMF.
+        owner_binding::seed_nf_type_for_test(AMF_B_1860, nextgcore_sbi::types::NfType::Amf);
         let reference = create_as_1860("imsi-001010000001931", 5, Some(AMF_A_1860)).await;
         let uri_before = lookup_policy_binding(&reference)
             .expect("bound")
@@ -28833,6 +28839,8 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
+        // #2078: the NRF lists B as an AMF.
+        owner_binding::seed_nf_type_for_test(AMF_B_1860, nextgcore_sbi::types::NfType::Amf);
         let reference = create_as_1860("imsi-001010000002003", 5, Some(AMF_A_1860)).await;
         let status_b = "http://amf-b.example/nsmf-callback/status";
         upf.clear_seen();
@@ -28904,6 +28912,8 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
+        // #2078: the NRF lists B as an AMF.
+        owner_binding::seed_nf_type_for_test(AMF_B_1860, nextgcore_sbi::types::NfType::Amf);
         let reference = create_as_1860("imsi-001010000001899", 5, Some(AMF_A_1860)).await;
         let uri_before = lookup_policy_binding(&reference)
             .expect("bound")
@@ -28957,6 +28967,111 @@ mod tests {
         );
     }
 
+    /// **#2078**: an AMF change is admitted only from a caller shown to be an AMF
+    /// (CONVENTIONS: the verified NF type), never assumed from a token or a
+    /// certificate without NF types. On one context, owned by A:
+    /// - typeless: a certificate without NF types and no token is refused, even
+    ///   for an id the NRF lists as an AMF;
+    /// - token only: a token whose subject the NRF does not list as an AMF (any NF
+    ///   with an nsmf-pdusession token) is refused;
+    /// - SCP: a token through an SCP certificate, likewise refused for an unlisted
+    ///   subject;
+    /// and nothing moves. Then each verified form is admitted in turn: direct (a
+    /// certificate naming AMF, no NRF needed), SCP plus the token of a listed
+    /// AMF, and a listed AMF's token alone.
+    ///
+    /// #2097: and a direct certificate of the new AMF's own id that names
+    /// another NF type is refused.
+    ///
+    /// REVERT-VERIFIED: with the #1860 check restored (no certificate NF types,
+    /// or a relay's, counted as AMF), the token-only, SCP and typeless probes are
+    /// admitted and "refused: ..." fails. #2099: the same holds through the
+    /// shared `owner_binding::verified_nf_type`: with its typeless-certificate
+    /// refusal reverted, "refused: typeless" fails; with its certificate-type
+    /// check reverted, "refused: direct non-AMF" fails.
+    #[tokio::test]
+    async fn an_amf_change_needs_a_verified_amf_2078() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = create_as_1860("imsi-001010000002078", 5, Some(AMF_A_1860)).await;
+        let uri_before = lookup_policy_binding(&reference)
+            .expect("bound")
+            .sm_context_status_uri;
+        const DIRECT: &str = "dddddddd-2078-4000-8000-00000000000d";
+        const VIA_SCP: &str = "eeeeeeee-2078-4000-8000-00000000000e";
+        const TOKEN: &str = "ffffffff-2078-4000-8000-00000000000f";
+        const NOT_AMF: &str = "99999999-2078-4000-8000-000000000009";
+        const SCP: &str = "55555555-2078-4000-8000-000000000005";
+        owner_binding::seed_nf_type_for_test(VIA_SCP, nextgcore_sbi::types::NfType::Amf);
+        owner_binding::seed_nf_type_for_test(TOKEN, nextgcore_sbi::types::NfType::Amf);
+        owner_binding::seed_nf_type_for_test(DIRECT, nextgcore_sbi::types::NfType::Amf);
+        let change = |to: &str| {
+            sm_op_1860(
+                &reference,
+                "modify",
+                serde_json::json!({
+                    "servingNfId": to,
+                    "smContextStatusUri": format!("http://{to}.example/status"),
+                }),
+                None,
+            )
+        };
+        let with_cert = |mut req: SbiRequest, id: &str, types: &[&str]| {
+            req.peer_cert_nf_instance_id = Some(id.to_string());
+            req.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            req
+        };
+
+        let typeless = with_cert(change(DIRECT), DIRECT, &[]);
+        let token_only = as_nf_1860(change(NOT_AMF), Some(NOT_AMF));
+        let scp = with_cert(as_nf_1860(change(NOT_AMF), Some(NOT_AMF)), SCP, &["SCP"]);
+        // #2097: the new AMF's own id, but a certificate naming another type.
+        let direct_smf = with_cert(change(DIRECT), DIRECT, &["SMF"]);
+        for (what, req, expect) in [
+            ("direct non-AMF", direct_smf, "not AMF"),
+            ("typeless", typeless, "names no NF types"),
+            ("token only", token_only, "does not list"),
+            ("SCP", scp, "does not list"),
+        ] {
+            let resp = smf_sbi_request_handler(req).await;
+            assert_eq!(resp.status, 403, "refused: {what}");
+            assert!(
+                detail_1860(&resp).contains(expect),
+                "{what}: {}",
+                detail_1860(&resp)
+            );
+            let binding = lookup_policy_binding(&reference).expect("bound");
+            assert_eq!(binding.serving_amf.as_deref(), Some(AMF_A_1860), "{what}");
+            assert_eq!(binding.sm_context_status_uri, uri_before, "{what}");
+        }
+
+        for (what, req, to) in [
+            (
+                "direct",
+                with_cert(change(DIRECT), DIRECT, &["AMF"]),
+                DIRECT,
+            ),
+            (
+                "SCP",
+                with_cert(as_nf_1860(change(VIA_SCP), Some(VIA_SCP)), SCP, &["SCP"]),
+                VIA_SCP,
+            ),
+            ("token only", as_nf_1860(change(TOKEN), Some(TOKEN)), TOKEN),
+        ] {
+            let resp = smf_sbi_request_handler(req).await;
+            assert_eq!(resp.status, 204, "admitted: {what}: {}", detail_1860(&resp));
+            let binding = lookup_policy_binding(&reference).expect("bound");
+            assert_eq!(binding.serving_amf.as_deref(), Some(to), "{what}");
+            assert_eq!(
+                binding.sm_context_status_uri.as_deref(),
+                Some(format!("http://{to}.example/status").as_str()),
+                "{what}"
+            );
+        }
+    }
+
     /// #1899 review M2: under production an ownerless SM context (restored from
     /// before #1860, or created under `dev`) is frozen against a rebind, an
     /// anonymous caller and a non-AMF certificate, and the first verified AMF is
@@ -28978,7 +29093,11 @@ mod tests {
 
         // Dev: as before.
         let anon = sm_op_1860(&reference, "modify", serde_json::json!({}), None);
-        assert!(refuse_ownerless_sm_context_caller(&reference, &anon, op, false).is_none());
+        assert!(
+            refuse_ownerless_sm_context_caller(&reference, &anon, op, false)
+                .await
+                .is_none()
+        );
 
         // Production: refused, and still ownerless.
         let rebind = sm_op_1860(
@@ -28990,12 +29109,21 @@ mod tests {
         let mut smf_cert = sm_op_1860(&reference, "retrieve", serde_json::json!({}), None);
         smf_cert.peer_cert_nf_instance_id = Some(AMF_B_1860.to_string());
         smf_cert.peer_cert_nf_types = vec!["SMF".to_string()];
+        // #2078: a token the NRF does not list as an AMF's is not adopted either.
+        let stranger = sm_op_1860(
+            &reference,
+            "retrieve",
+            serde_json::json!({}),
+            Some("99999999-1899-4000-8000-000000000009"),
+        );
         for (req, expect) in [
             (&rebind, "may not be rebound"),
             (&anon, "no verified identity"),
             (&smf_cert, "only the serving AMF"),
+            (&stranger, "does not list"),
         ] {
             let resp = refuse_ownerless_sm_context_caller(&reference, req, op, true)
+                .await
                 .unwrap_or_else(|| panic!("{expect}: admitted"));
             assert_eq!(resp.status, 403);
             assert!(
@@ -29013,7 +29141,10 @@ mod tests {
             serde_json::json!({}),
             Some(AMF_A_1860),
         );
-        assert!(refuse_ownerless_sm_context_caller(&reference, &a, op, true).is_none());
+        owner_binding::seed_nf_type_for_test(AMF_A_1860, nextgcore_sbi::types::NfType::Amf);
+        assert!(refuse_ownerless_sm_context_caller(&reference, &a, op, true)
+            .await
+            .is_none());
         assert_eq!(
             lookup_policy_binding(&reference)
                 .unwrap()
@@ -29040,7 +29171,7 @@ mod tests {
         let src = include_str!("main.rs");
         let call = "refuse_ownerless_sm_context_caller(\n            sm_context_ref,\n            \
                     request,\n            operation,\n            \
-                    nextgcore_sbi::security::SbiProfile::resolve().is_production(),\n        );";
+                    nextgcore_sbi::security::SbiProfile::resolve().is_production(),\n        )\n        .await;";
         assert_eq!(src.matches(call).count(), 1);
     }
 

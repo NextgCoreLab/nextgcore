@@ -1465,6 +1465,12 @@ pub async fn run() -> Result<()> {
     // standalone 5GC, and taking the daemon down would turn an interworking misconfiguration
     // into a total 5G outage. `n26_open` forces the switch back off in that case, so
     // `iwk_n26_posture` cannot advertise an interface that has no socket.
+    //
+    // #2073: N26 is the explicit exception to the #2056 production rule that a configured
+    // listener that cannot be bound is fatal at start-up (docs-book configuration/overview.md,
+    // "The N26 exception"). Interworking without N26 is a specified mode (TS 23.501 §5.17.2.3),
+    // and the UE is told so (IWK N26 = 1), so the degraded AMF is a conformant one; a metrics
+    // listener has no such fallback.
     {
         let n26_bind: Option<SocketAddr> = std::env::var("AMF_N26_ADDR").ok().and_then(|addr| {
             let port: u16 = std::env::var("AMF_N26_PORT")
@@ -1793,6 +1799,73 @@ mod tests {
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "amf.yaml") {
             serde_yaml::from_str::<AmfYaml>(&text).expect("Helm amf.yaml");
+        }
+    }
+
+    /// #2069: the chart renders global.plmn quoted, so amfd's own parser
+    /// ([`AmfApp::resolve_lists`]) reads the exact digits of a leading-zero
+    /// PLMN into its GUAMI, TAI and PLMN support lists, in the dev and the
+    /// production profile: TS 23.003's test PLMN 001-01 and a 3-digit MNC 070
+    /// (TS 23.003 §2.2). A PLMN that lost its leading zeros on the way (an
+    /// unquoted `mcc: 001` in a values file reaches the chart as 1) would
+    /// configure MCC 100: `PlmnId::new` reads "1" as its first digit.
+    ///
+    /// REVERT-VERIFIED: with `nextgcore.plmnId` rendering the digits through
+    /// `int` (the leading zeros dropped, as a number keeps them), the "the
+    /// GUAMI's PLMN" assertion fails (("100", "10") for 001-01). The template's
+    /// unquoted form alone does not fail it: serde_yaml 0.9 reads an unquoted
+    /// `001` as a string; nextgcore-core's
+    /// `every_rendered_config_carries_the_plmn_digits_quoted_2069` covers that.
+    #[test]
+    fn the_helm_chart_s_leading_zero_plmn_reaches_the_amf_2069() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for profile in ["dev", "production"] {
+            for (mcc, mnc, imsi) in [
+                ("001", "01", "001010000000001"),
+                ("001", "070", "001070000000001"),
+            ] {
+                let args = [
+                    format!("global.sbiProfile={profile}"),
+                    format!("global.plmn.mcc={mcc}"),
+                    format!("global.plmn.mnc={mnc}"),
+                    format!("subscriber.imsi={imsi}"),
+                ];
+                let mut extra = Vec::new();
+                for a in &args {
+                    extra.extend(["--set-string", a.as_str()]);
+                }
+                let Some(rendered) = nextgcore_core::helm_render::render_chart_with(&root, &extra)
+                else {
+                    return;
+                };
+                let case = format!("{profile}, PLMN {mcc}-{mnc}");
+                let text = nextgcore_core::helm_render::config_in(&rendered, "amf.yaml")
+                    .expect("amf.yaml");
+                let mut section = serde_yaml::from_str::<AmfYaml>(&text)
+                    .expect("Helm amf.yaml")
+                    .amf
+                    .expect("amf:");
+                let lists = AmfApp::resolve_lists(&mut section).expect("the lists resolve");
+                let want = (mcc.to_string(), mnc.to_string());
+                let digits = |p: &context::PlmnId| (p.mcc(), p.mnc());
+                let guami = lists.guami.expect("amf.guami");
+                assert_eq!(guami.len(), 1, "{case}: one GUAMI");
+                assert_eq!(digits(&guami[0].plmn_id), want, "{case}: the GUAMI's PLMN");
+                let tai = lists.tai.expect("amf.tai");
+                assert_eq!(tai.len(), 1, "{case}: one TAI");
+                assert_eq!(
+                    digits(&tai[0].list0.plmn_id),
+                    want,
+                    "{case}: the TAI's PLMN"
+                );
+                let support = lists.plmn_support.expect("amf.plmn_support");
+                assert_eq!(support.len(), 1, "{case}: one supported PLMN");
+                assert_eq!(
+                    digits(&support[0].plmn_id),
+                    want,
+                    "{case}: the supported PLMN"
+                );
+            }
         }
     }
 

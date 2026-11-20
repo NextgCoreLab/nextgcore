@@ -295,6 +295,12 @@ fn main() -> Result<()> {
         &listen_addr,
         "--diameter-addr (or pcrf.diameter.addr in the config file)",
     );
+    // #2088 (R30 on #2073): the bind result comes back before start-up goes on, so a
+    // Gx/Rx listener that cannot be bound goes through `listener_bind_failed`: fatal
+    // under the production profile (exit 78), as every listener but N26 is (#2056).
+    // It used to be logged from the Diameter thread while the PCRF ran on with no
+    // Gx/Rx.
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     std::thread::Builder::new()
         .name("pcrf-diameter".to_string())
         .spawn(move || {
@@ -305,7 +311,7 @@ fn main() -> Result<()> {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    log::error!("Failed to build Diameter runtime: {e}");
+                    let _ = bound_tx.send(Err(format!("Diameter runtime: {e}")));
                     return;
                 }
             };
@@ -313,14 +319,29 @@ fn main() -> Result<()> {
                 match pcrf_fd_listen(identity, listen_addr).await {
                     Ok(addr) => {
                         log::info!("Diameter listener active on {addr}");
+                        let _ = bound_tx.send(Ok(()));
                         // Keep the runtime alive to serve peer connections
                         std::future::pending::<()>().await;
                     }
-                    Err(e) => log::error!("Failed to start Diameter listener: {e}"),
+                    Err(e) => {
+                        let _ = bound_tx.send(Err(e.to_string()));
+                    }
                 }
             });
         })
         .context("Failed to spawn Diameter thread")?;
+    match bound_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            nextgcore_metrics::nf::listener_bind_failed("PCRF", "Gx/Rx Diameter", listen_addr, &e)
+        }
+        Err(e) => nextgcore_metrics::nf::listener_bind_failed(
+            "PCRF",
+            "Gx/Rx Diameter",
+            listen_addr,
+            &format!("the listener did not start: {e}"),
+        ),
+    }
 
     // Initialize Gx interface (P-GW communication)
     if let Err(e) = pcrf_gx_init() {

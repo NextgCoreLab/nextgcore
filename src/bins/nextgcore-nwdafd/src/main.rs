@@ -866,7 +866,7 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         {
             match method {
                 "POST" if nrf_collector::holds_callback_token(token) => {
-                    nrf_collector::handle_nf_status_notify(&request).await
+                    nrf_collector::handle_nf_status_notify_from(&request, true).await
                 }
                 "POST" => send_not_found("no such NF status subscription callback", None),
                 _ => send_method_not_allowed(method, "nf-status-notify/{token}"),
@@ -877,8 +877,11 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // §5.2.2.6) — the NRF POSTs NotificationData here; NFProfile.load
         // becomes the NF_LOAD analytics data. The token-less URI subscriptions
         // made before #1421 named; bearer-protected on an OAuth2 listener.
+        //
+        // #2081: under production this carries no subscription correlation, so
+        // it is refused (`nrf_collector::refuse_notifier`); under dev as before.
         ["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {
-            "POST" => nrf_collector::handle_nf_status_notify(&request).await,
+            "POST" => nrf_collector::handle_nf_status_notify_from(&request, false).await,
             _ => send_method_not_allowed(method, "notify"),
         },
 
@@ -3172,7 +3175,7 @@ mod callback_oauth2_1421_tests {
         let forged = uuid::Uuid::new_v4().simple().to_string();
         assert_eq!(nwdaf_sbi_request_handler(req(&forged)).await.status, 404);
         let held = nrf_collector::callback_token();
-        assert_eq!(nwdaf_sbi_request_handler(req(held)).await.status, 204);
+        assert_eq!(nwdaf_sbi_request_handler(req(&held)).await.status, 204);
     }
 
     /// Every registered exemption refuses a token this NWDAF does not hold, so a

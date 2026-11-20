@@ -736,6 +736,14 @@ impl BsfSubscription {
         }
         true
     }
+
+    /// #2084: whether this subscription's `expiry` has passed. The same reading as
+    /// [`Self::wants`]: an unparseable one counts as passed (it is never matched).
+    pub fn is_expired(&self, now_secs: u64) -> bool {
+        self.expiry
+            .as_deref()
+            .is_some_and(|e| rfc3339_to_epoch(e).is_none_or(|deadline| now_secs as i64 >= deadline))
+    }
 }
 
 pub struct BsfContext {
@@ -759,7 +767,19 @@ pub struct BsfContext {
     mbs_binding_list: RwLock<HashMap<String, PcfMbsBinding>>,
     /// Nbsf_Management event subscriptions, keyed by subId (#98).
     subscription_list: RwLock<HashMap<String, BsfSubscription>>,
+    /// #2084: per subId, the BsfNotifications that failed in a row. Read and
+    /// written with [`Self::note_notification`].
+    notify_failures: RwLock<HashMap<String, u32>>,
 }
+
+/// #2084: the most Nbsf_Management subscriptions held. A new one past it is refused
+/// (500 INSUFFICIENT_RESOURCES, TS 29.500 Table 5.2.7.2-1); a replacement is not.
+pub const MAX_SUBSCRIPTIONS: usize = 4096;
+
+/// #2084: a subscription whose BsfNotifications fail this many times in a row (no
+/// answer, or not 2xx) is removed: its consumer is gone, and without an `expiry` the
+/// entry would otherwise stay for good.
+pub const MAX_NOTIFY_FAILURES: u32 = 5;
 
 impl BsfContext {
     // ── Nbsf_Management event subscriptions (TS 29.521 §4.2.6-4.2.8, #98) ────
@@ -767,10 +787,64 @@ impl BsfContext {
     /// Create or replace a subscription. `subscription_add` is used by both POST
     /// and PUT: a replace keeps the same `subId`, so the resource URI the consumer
     /// holds stays valid.
-    pub fn subscription_add(&self, sub: BsfSubscription) {
-        if let Ok(mut m) = self.subscription_list.write() {
-            m.insert(sub.sub_id.clone(), sub);
+    ///
+    /// #2084: bounded at [`MAX_SUBSCRIPTIONS`]. `false` when a NEW subscription would
+    /// pass it (nothing is stored); a replacement of a held one always succeeds.
+    pub fn subscription_add(&self, sub: BsfSubscription) -> bool {
+        let Ok(mut m) = self.subscription_list.write() else {
+            return false;
+        };
+        if !m.contains_key(&sub.sub_id) && m.len() >= MAX_SUBSCRIPTIONS {
+            return false;
         }
+        if let Ok(mut f) = self.notify_failures.write() {
+            f.remove(&sub.sub_id);
+        }
+        m.insert(sub.sub_id.clone(), sub);
+        true
+    }
+
+    /// #2084: record how a BsfNotification to `sub_id` ended. A success clears its
+    /// count; the [`MAX_NOTIFY_FAILURES`]th failure in a row removes the
+    /// subscription. Returns whether it was removed.
+    pub fn note_notification(&self, sub_id: &str, delivered: bool) -> bool {
+        let failures = {
+            let Ok(mut f) = self.notify_failures.write() else {
+                return false;
+            };
+            if delivered {
+                f.remove(sub_id);
+                return false;
+            }
+            let n = f.entry(sub_id.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        failures >= MAX_NOTIFY_FAILURES && self.subscription_remove(sub_id)
+    }
+
+    /// #2084: remove every subscription whose `expiry` has passed. They were only
+    /// skipped by [`Self::subscriptions_wanting`], so they stayed for good. Returns
+    /// the removed subIds.
+    pub fn subscriptions_sweep_expired(&self, now_secs: u64) -> Vec<String> {
+        let Ok(mut m) = self.subscription_list.write() else {
+            return Vec::new();
+        };
+        let expired: Vec<String> = m
+            .values()
+            .filter(|s| s.is_expired(now_secs))
+            .map(|s| s.sub_id.clone())
+            .collect();
+        for id in &expired {
+            m.remove(id);
+        }
+        drop(m);
+        if let Ok(mut f) = self.notify_failures.write() {
+            for id in &expired {
+                f.remove(id);
+            }
+        }
+        expired
     }
 
     pub fn subscription_get(&self, sub_id: &str) -> Option<BsfSubscription> {
@@ -778,6 +852,9 @@ impl BsfContext {
     }
 
     pub fn subscription_remove(&self, sub_id: &str) -> bool {
+        if let Ok(mut f) = self.notify_failures.write() {
+            f.remove(sub_id);
+        }
         self.subscription_list
             .write()
             .map(|mut m| m.remove(sub_id).is_some())
@@ -829,6 +906,7 @@ impl BsfContext {
             initialized: AtomicBool::new(false),
             ue_binding_list: RwLock::new(HashMap::new()),
             mbs_binding_list: RwLock::new(HashMap::new()),
+            notify_failures: RwLock::new(HashMap::new()),
             subscription_list: RwLock::new(HashMap::new()),
         }
     }
@@ -1426,7 +1504,15 @@ impl BsfContext {
     ///
     /// Re-populates every lookup hash (including MAC) and advances the
     /// session-id allocator past the loaded id to avoid collisions.
-    pub fn install_loaded_binding(&self, sess: BsfSess) {
+    pub fn install_loaded_binding(&self, mut sess: BsfSess) {
+        // #2084: a binding is installed with a deadline. One created with the default
+        // TTL had it only as an in-memory timer, which a restart does not restore, and
+        // `sweep_expired` reads `expiry_epoch` alone: such a binding lived for good and
+        // counted against `max_sess`. It gets the default TTL from now (its creation
+        // time is not stored).
+        sess.expiry_epoch.get_or_insert_with(|| {
+            now_epoch() + crate::timer::defaults::BINDING_EXPIRY.as_secs() as i64
+        });
         let id = sess.id;
         if let (Ok(mut ipv4_hash), Some(addr)) = (self.ipv4addr_hash.write(), sess.ipv4addr) {
             ipv4_hash.insert(addr, id);
@@ -2811,6 +2897,117 @@ mod tests {
         assert!(
             mbs_session_key(&serde_json::json!({"tmgi": {"mbsServiceId": "0a1b2c"}})).is_none()
         );
+    }
+
+    /// #2084: a binding loaded with no deadline (created with the default TTL, whose
+    /// timer a restart does not restore) gets one, the default TTL from now, and is
+    /// swept at it. A loaded deadline is kept.
+    ///
+    /// REVERT-VERIFIED: with `install_loaded_binding` not filling `expiry_epoch`, this
+    /// fails: the binding has no deadline and is never swept.
+    #[test]
+    fn a_loaded_binding_without_a_deadline_is_swept_at_the_default_ttl_2084() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let ttl = crate::timer::defaults::BINDING_EXPIRY.as_secs() as i64;
+        let mut timerless = BsfSess::new(11);
+        timerless.binding_id = "11".to_string();
+        timerless.set_ipv4addr("10.45.20.84");
+        let mut dated = BsfSess::new(12);
+        dated.binding_id = "12".to_string();
+        let dated_deadline = now_epoch() + 10 * ttl;
+        dated.expiry_epoch = Some(dated_deadline);
+        let before = now_epoch();
+        ctx.install_loaded_binding(timerless);
+        ctx.install_loaded_binding(dated);
+
+        let deadline = ctx.sess_find(11).and_then(|s| s.expiry_epoch);
+        assert!(
+            deadline.is_some_and(|d| d >= before + ttl && d <= now_epoch() + ttl),
+            "the default TTL from now: {deadline:?}"
+        );
+        assert_eq!(
+            ctx.sess_find(12).and_then(|s| s.expiry_epoch),
+            Some(dated_deadline),
+            "a loaded deadline is kept"
+        );
+        assert!(ctx.sweep_expired(before).is_empty(), "nothing is due yet");
+        assert_eq!(
+            ctx.sweep_expired(now_epoch() + ttl + 1),
+            vec!["11".to_string()],
+            "swept at its deadline, not kept for good"
+        );
+        assert!(ctx.sess_find(12).is_some());
+    }
+
+    fn subscription_2084(n: usize, expiry: Option<&str>) -> BsfSubscription {
+        BsfSubscription {
+            sub_id: format!("sub-2084-{n}"),
+            expiry: expiry.map(String::from),
+            ..subscription_with_expiry(None)
+        }
+    }
+
+    /// #2084: the subscription set is bounded. A new one past [`MAX_SUBSCRIPTIONS`]
+    /// is refused and not stored; a replacement of a held one is not refused.
+    ///
+    /// REVERT-VERIFIED: with the bound removed from `subscription_add`, this fails:
+    /// the one past the bound is stored.
+    #[test]
+    fn the_subscription_set_is_bounded_2084() {
+        let ctx = BsfContext::new();
+        for n in 0..MAX_SUBSCRIPTIONS {
+            assert!(ctx.subscription_add(subscription_2084(n, None)));
+        }
+        assert!(!ctx.subscription_add(subscription_2084(MAX_SUBSCRIPTIONS, None)));
+        assert_eq!(ctx.subscription_count(), MAX_SUBSCRIPTIONS);
+        assert!(ctx.subscription_get("sub-2084-4096").is_none());
+        assert!(
+            ctx.subscription_add(subscription_2084(0, None)),
+            "a replacement is not refused"
+        );
+    }
+
+    /// #2084: a subscription whose notifications fail [`MAX_NOTIFY_FAILURES`] times
+    /// in a row is removed; a delivery in between starts the count again.
+    ///
+    /// REVERT-VERIFIED: with `note_notification` never removing, this fails: the
+    /// dead consumer's subscription stays.
+    #[test]
+    fn a_dead_consumers_subscription_is_removed_2084() {
+        let ctx = BsfContext::new();
+        assert!(ctx.subscription_add(subscription_2084(1, None)));
+        for _ in 1..MAX_NOTIFY_FAILURES {
+            assert!(!ctx.note_notification("sub-2084-1", false));
+        }
+        assert!(
+            !ctx.note_notification("sub-2084-1", true),
+            "a delivery resets"
+        );
+        for _ in 1..MAX_NOTIFY_FAILURES {
+            assert!(!ctx.note_notification("sub-2084-1", false));
+        }
+        assert!(ctx.subscription_get("sub-2084-1").is_some(), "not yet");
+        assert!(ctx.note_notification("sub-2084-1", false));
+        assert!(ctx.subscription_get("sub-2084-1").is_none(), "removed");
+    }
+
+    /// #2084: subscriptions whose `expiry` has passed are removed by the sweep, not
+    /// only skipped; one without an expiry, or with a later one, stays.
+    ///
+    /// REVERT-VERIFIED: with the sweep removing nothing, this fails.
+    #[test]
+    fn expired_subscriptions_are_swept_2084() {
+        let ctx = BsfContext::new();
+        assert!(ctx.subscription_add(subscription_2084(1, Some("2026-01-01T00:00:00Z"))));
+        assert!(ctx.subscription_add(subscription_2084(2, Some("2099-01-01T00:00:00Z"))));
+        assert!(ctx.subscription_add(subscription_2084(3, None)));
+        let now = rfc3339_to_epoch("2026-06-01T00:00:00Z").unwrap() as u64;
+        assert_eq!(
+            ctx.subscriptions_sweep_expired(now),
+            vec!["sub-2084-1".to_string()]
+        );
+        assert_eq!(ctx.subscription_count(), 2);
     }
 
     #[test]

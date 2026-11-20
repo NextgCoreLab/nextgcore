@@ -562,6 +562,15 @@ pub struct SbiRequest {
     /// identities (the NRF's trusted XFCC terminators), where any SAN counts.
     /// Empty whenever `peer_cert_present` is false.
     pub peer_cert_uri_sans: Vec<String>,
+    /// #2076: every dNSName SubjectAltName of the same **verified** client
+    /// certificate, lowercased, without a trailing dot. A SEPP is identified by
+    /// its FQDN there (TS 33.310 §6.1.4a), so N32 binds a peer's claims to it.
+    /// Empty whenever `peer_cert_present` is false.
+    pub peer_cert_dns_sans: Vec<String>,
+    /// #2080: the DER of the same **verified** client certificate (the leaf).
+    /// `None` whenever `peer_cert_present` is false. For a relay that must vouch
+    /// for its client to the next hop (the SCP's `x-forwarded-client-cert`).
+    pub peer_cert_der: Option<std::sync::Arc<Vec<u8>>>,
     /// `sub` of the OAuth2 access token this process **verified** — the NF
     /// Instance ID of the service consumer (TS 33.501 §13.4.1.2, TS 29.510
     /// §5.4.2.2.2 `AccessTokenClaims.sub`).

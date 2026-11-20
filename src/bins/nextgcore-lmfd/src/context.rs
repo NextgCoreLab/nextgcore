@@ -252,6 +252,10 @@ pub struct LdrContext {
     /// A8: periodic-reporting parameters, present only for `ldrType == PERIODIC`
     /// with a `periodicEventInfo` IE. Drives the EventNotify trigger scheduler.
     pub periodic_event_info: Option<PeriodicReporting>,
+    /// #2077: the verified NF instance that created it (DetermineLocation) or
+    /// transferred it here (LocationContextTransfer); only it may replace or
+    /// cancel it. `None` when made without a verified identity (under `dev`).
+    pub owner: Option<String>,
 }
 
 /// Outcome of a pending network-induced positioning procedure (Wave-6 A2,
@@ -1103,6 +1107,56 @@ impl LmfContext {
         false
     }
 
+    /// #2077: register `ctx` unless an LDR with its reference exists and
+    /// `refuse` refuses its caller against that LDR's owner. The check and the
+    /// insert are one critical section, so two callers racing on one reference
+    /// cannot both pass a check made before either inserted. `Err` carries the
+    /// refusal and nothing changed.
+    pub fn register_ldr_unless<R>(
+        &self,
+        ctx: LdrContext,
+        refuse: impl FnOnce(Option<&str>) -> Option<R>,
+    ) -> Result<(), Option<R>> {
+        let Ok(mut l) = self.ldr_sessions.write() else {
+            return Err(None);
+        };
+        if let Some(existing) = l.get(&ctx.ldr_reference) {
+            if let Some(refused) = refuse(existing.owner.as_deref()) {
+                return Err(Some(refused));
+            }
+        }
+        l.insert(ctx.ldr_reference.clone(), ctx);
+        Ok(())
+    }
+
+    /// #2077: [`Self::cancel_ldr`] unless `refuse` refuses the caller against the
+    /// LDR's owner, checked under the same lock as the removal. `Ok(false)` when
+    /// there is no such LDR; `Err` carries the refusal and nothing changed.
+    pub fn cancel_ldr_unless<R>(
+        &self,
+        ldr_reference: &str,
+        refuse: impl FnOnce(Option<&str>) -> Option<R>,
+    ) -> Result<bool, R> {
+        {
+            let Ok(mut l) = self.ldr_sessions.write() else {
+                return Ok(false);
+            };
+            let Some(existing) = l.get(ldr_reference) else {
+                return Ok(false);
+            };
+            if let Some(refused) = refuse(existing.owner.as_deref()) {
+                return Err(refused);
+            }
+            l.remove(ldr_reference);
+        }
+        if let Ok(mut tasks) = self.ldr_tasks.write() {
+            if let Some(handle) = tasks.remove(ldr_reference) {
+                handle.abort();
+            }
+        }
+        Ok(true)
+    }
+
     /// Remove an LDR session by `ldrReference`.
     /// Returns `true` if the session existed (it was cancelled), `false` if not
     /// found (→ caller should return 403 LOCATION_SESSION_UNKNOWN).
@@ -1938,6 +1992,33 @@ impl LmfContext {
         self.amf_subscriptions
             .read()
             .is_ok_and(|s| s.contains_key(key))
+    }
+
+    /// #2085: forget every created AMF subscription and return each one's AMF
+    /// and resource path, so shutdown can unsubscribe them. Entries still in
+    /// flight are left alone (their create commits or abandons them).
+    pub fn amf_subscriptions_take_created(
+        &self,
+    ) -> Vec<(crate::namf_client::DiscoveredAmf, String)> {
+        let Ok(mut subs) = self.amf_subscriptions.write() else {
+            return Vec::new();
+        };
+        let created: Vec<String> = subs
+            .iter()
+            .filter(|(_, s)| s.subscription_id.is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        created
+            .into_iter()
+            .filter_map(|k| subs.remove(&k))
+            .filter_map(|s| {
+                let id = s.subscription_id?;
+                Some((
+                    s.amf,
+                    crate::amf_unsubscribe::subscription_path(s.ue_context_id.as_deref(), &id),
+                ))
+            })
+            .collect()
     }
 
     /// Number of held AMF subscriptions, created or in flight.
@@ -3156,6 +3237,7 @@ mod tests {
                 reporting_interval_secs: 60,
                 reporting_interval_ms: None,
             }),
+            owner: None,
         }));
         let found = ctx.ldr_find("aa10").unwrap();
         let pei = found.periodic_event_info.unwrap();
@@ -3202,6 +3284,7 @@ mod tests {
             hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
             supi: Some("imsi-2".to_string()),
             periodic_event_info: None,
+            owner: None,
         });
         let jh = tokio::spawn(async {
             loop {
@@ -3691,6 +3774,7 @@ mod tests_real_solve {
             hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
             supi: Some("imsi-001010000000099".to_string()),
             periodic_event_info: None,
+            owner: None,
         };
         // Register: find should return Some
         assert!(ctx.register_ldr(ldr));

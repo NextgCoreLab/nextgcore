@@ -36,8 +36,8 @@ data:
     // No WebUI account is seeded (#692, as #118 did for the compose stack):
     // TS 33.117 4.2.3.4.2.2 forbids shipping a predefined privileged credential.
     // Create the first admin with webui/server/bin/create-admin.js <username>.
-    db.subscribers.updateOne({ imsi: "{{ .Values.subscriber.imsi }}" }, { $setOnInsert: {
-        imsi: "{{ .Values.subscriber.imsi }}",
+    db.subscribers.updateOne({ imsi: "{{ include "nextgcore.subscriberImsi" . }}" }, { $setOnInsert: {
+        imsi: "{{ include "nextgcore.subscriberImsi" . }}",
         security: {
             k: "{{ .Values.subscriber.key }}",
             opc: "{{ .Values.subscriber.opc }}",

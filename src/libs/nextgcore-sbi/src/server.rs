@@ -428,7 +428,9 @@ impl OAuthVerifier {
         // claims, and refused only after it, so the refusal order is unchanged:
         // token, audience, service scope, then resource scope.
         let resource_refusal = match (&claims, resource_scope) {
-            (Ok(c), Some(scope)) if crate::oauth::check_token_scope(&c.scope, scope).is_err() => {
+            // #2079: with the yaml's alternatives (`subscription-data` grants
+            // `registrations:write`).
+            (Ok(c), Some(scope)) if !crate::resource_scope::token_grants(&c.scope, scope) => {
                 Some(BearerRefusal::InsufficientScope {
                     scope: scope.to_string(),
                     detail: format!(
@@ -630,6 +632,10 @@ struct SbiService<H: SbiRequestHandler> {
     peer_cert_present: bool,
     /// #2000: [`SbiRequest::peer_cert_uri_sans`] of that certificate.
     peer_cert_uri_sans: Vec<String>,
+    /// #2076: [`SbiRequest::peer_cert_dns_sans`] of that certificate.
+    peer_cert_dns_sans: Vec<String>,
+    /// #2080: [`SbiRequest::peer_cert_der`] of that certificate.
+    peer_cert_der: Option<Arc<Vec<u8>>>,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
@@ -648,6 +654,8 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             peer_cert_nf_types: self.peer_cert_nf_types.clone(),
             peer_cert_present: self.peer_cert_present,
             peer_cert_uri_sans: self.peer_cert_uri_sans.clone(),
+            peer_cert_dns_sans: self.peer_cert_dns_sans.clone(),
+            peer_cert_der: self.peer_cert_der.clone(),
             server_identity: self.server_identity.clone(),
             overload_reporter: self.overload_reporter.clone(),
         }
@@ -668,6 +676,8 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let peer_cert_nf_types = self.peer_cert_nf_types.clone();
         let peer_cert_present = self.peer_cert_present;
         let peer_cert_uri_sans = self.peer_cert_uri_sans.clone();
+        let peer_cert_dns_sans = self.peer_cert_dns_sans.clone();
+        let peer_cert_der = self.peer_cert_der.clone();
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
@@ -702,6 +712,8 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         request.peer_cert_nf_types = peer_cert_nf_types.clone();
                         request.peer_cert_present = peer_cert_present;
                         request.peer_cert_uri_sans = peer_cert_uri_sans.clone();
+                        request.peer_cert_dns_sans = peer_cert_dns_sans.clone();
+                        request.peer_cert_der = peer_cert_der.clone();
                         request
                     }
                     Err(ConvertRequestError::BodyTooLarge) => {
@@ -1212,6 +1224,8 @@ async fn convert_request(
         oauth2_scope: None,
         peer_cert_present: false,
         peer_cert_uri_sans: Vec::new(),
+        peer_cert_dns_sans: Vec::new(),
+        peer_cert_der: None,
     })
 }
 
@@ -1706,6 +1720,27 @@ impl SbiServer {
                                                         })
                                                         .unwrap_or_default()
                                                 };
+                                                // #2076: and its DNS SANs.
+                                                let peer_cert_dns_sans = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .map(|leaf| {
+                                                            crate::peer_cert::dns_sans_from_der(
+                                                                leaf.as_ref(),
+                                                            )
+                                                        })
+                                                        .unwrap_or_default()
+                                                };
+                                                // #2080: and the leaf itself.
+                                                let peer_cert_der = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .map(|leaf| Arc::new(leaf.as_ref().to_vec()))
+                                                };
                                                 let service = SbiService {
                                                     handler: handler_ref,
                                                     oauth: oauth_ref,
@@ -1715,6 +1750,8 @@ impl SbiServer {
                                                     peer_cert_nf_types,
                                                     peer_cert_present,
                                                     peer_cert_uri_sans,
+                                                    peer_cert_dns_sans,
+                                                    peer_cert_der,
                                                     server_identity: server_identity_ref,
                                                     overload_reporter:
                                                         overload_reporter_ref,
@@ -1751,6 +1788,8 @@ impl SbiServer {
                                         peer_cert_nf_types: Vec::new(),
                                         peer_cert_present: false,
                                         peer_cert_uri_sans: Vec::new(),
+                                        peer_cert_dns_sans: Vec::new(),
+                                        peer_cert_der: None,
                                         server_identity: server_identity_ref,
                                         overload_reporter: overload_reporter_ref,
                                     };
@@ -3075,6 +3114,48 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == "nudr-dr"),
+            "{err:?}"
+        );
+    }
+
+    /// #2079: the gate honours the TS 29.505 yaml's alternatives. An
+    /// NF-registration write needs `registrations:write`, and a token carrying
+    /// `nudr-dr:subscription-data` instead passes too; a service-scope-only
+    /// token is refused naming `registrations:write`.
+    ///
+    /// REVERT-VERIFIED: with the gate back on `check_token_scope` (no
+    /// alternatives), the `subscription-data` token is refused and the
+    /// `alternative` assertion fails.
+    #[tokio::test]
+    async fn subscription_data_satisfies_a_registration_write_2079() {
+        use crate::resource_scope::{
+            NUDR_DR_REGISTRATIONS_WRITE as WRITE, NUDR_DR_SUBSCRIPTION_DATA as DATA,
+        };
+        let verifier_for = |jwks: serde_json::Value| OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks),
+            expected_audience: None,
+            expected_audience_instance: None,
+            callback_exemptions: Vec::new(),
+            resource_scopes: Some(crate::resource_scope::required_resource_scope),
+        };
+        let check = |scope: String| async move {
+            let (token, jwks) = token_jwks_with_scope("UDR", &scope);
+            let header = format!("Bearer {token}");
+            verifier_for(jwks)
+                .authorize(Some(&header), Some("nudr-dr"), Some(WRITE))
+                .await
+        };
+        assert!(
+            check(format!("nudr-dr {WRITE}")).await.is_ok(),
+            "registrations:write"
+        );
+        assert!(
+            check(format!("nudr-dr {DATA}")).await.is_ok(),
+            "alternative: subscription-data grants a registration write"
+        );
+        let err = check("nudr-dr".to_string()).await.unwrap_err();
+        assert!(
+            matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == WRITE),
             "{err:?}"
         );
     }

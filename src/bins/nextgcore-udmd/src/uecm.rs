@@ -484,10 +484,24 @@ async fn notify_old_amf_if_changed(
     }
 }
 
-/// Map a UDR write response. Returns `Some(503)` when UDR replied 5xx (the
-/// handler should early-return it); otherwise `None`, degrading gracefully
-/// (best-effort) on transport errors and non-5xx statuses so the matched-sim
-/// happy path still completes when udrd lacks context-data support.
+/// Map a UDR write response: `None` when the UDR stored it (2xx), else the
+/// error the handler returns at once (TS 29.503 §6.2.7 / TS 29.500 §5.2.7),
+/// before anything local changes.
+///
+/// #2100: a write the UDR did not take is a registration that does not exist,
+/// so it is never answered 2xx. It used to degrade to success on any non-5xx
+/// status (a UDR refusing the write with 403) and on a transport error, and the
+/// AMF or SMF then believed itself registered with no record behind it.
+/// - UDR 404 (no such subscriber): 404 `USER_NOT_FOUND`.
+/// - Another 4xx (the UDR refused the UDM's write, e.g. 403 on its scope): 500
+///   `SYSTEM_FAILURE`, the UDM's own data path failing, not the consumer's
+///   request.
+/// - 5xx, or no answer: 503, the UDR unavailable.
+///
+/// #2109: a deregistration's UDR DELETE is a write too and maps the same way.
+/// A DELETE the UDR did not take leaves the registration stored, so the AMF or
+/// SMF must not be told it is gone: it would never retry, and the stale record
+/// would keep resolving the UE to it.
 fn udr_write_outcome(
     supi: &str,
     op: &str,
@@ -501,13 +515,33 @@ fn udr_write_outcome(
                 "UDR persistence failed",
             ))
         }
+        Ok(resp) if resp.status == 404 => {
+            log::warn!("[{supi}] UDR {op} returned 404: no such subscriber");
+            Some(
+                ProblemDetails {
+                    status: 404,
+                    cause: "USER_NOT_FOUND".to_string(),
+                    detail: format!("the UDR holds no subscriber {supi}"),
+                }
+                .into_response(),
+            )
+        }
         Ok(resp) => {
-            log::warn!("[{supi}] UDR {op} returned {} (degraded)", resp.status);
-            None
+            log::error!("[{supi}] UDR {op} refused with {}", resp.status);
+            Some(
+                ProblemDetails {
+                    status: 500,
+                    cause: "SYSTEM_FAILURE".to_string(),
+                    detail: format!("the UDR refused the write ({})", resp.status),
+                }
+                .into_response(),
+            )
         }
         Err(e) => {
-            log::warn!("[{supi}] UDR {op} failed: {e} (degraded)");
-            None
+            log::error!("[{supi}] UDR {op} failed: {e}");
+            Some(nextgcore_sbi::server::send_service_unavailable(
+                "UDR persistence failed",
+            ))
         }
     }
 }
@@ -836,6 +870,10 @@ pub async fn process_smf_registration(
 /// Process an AMF deregistration for `access` (udmd-01): purge the UDR
 /// context-data resource for that access, then return 204.
 ///
+/// #2109: only once the UDR took the DELETE ([`udr_write_outcome`]). A DELETE
+/// it did not take is answered with the mapped error, and nothing local
+/// changes: no cache slot cleared, no notification.
+///
 /// The local UE context is only dropped once **neither** access holds a
 /// registration: a UE deregistering from non-3GPP access while still registered
 /// over 3GPP must keep its cached 3GPP serving AMF, or the next 3GPP
@@ -845,8 +883,12 @@ pub async fn process_amf_deregistration(
     client: &UdrClient,
     access: UecmAccess,
 ) -> SbiResponse {
-    if let Err(e) = client.context_delete(supi, access.amf_resource()).await {
-        log::warn!("[{supi}] UDR AMF context DELETE failed: {e} (degraded)");
+    if let Some(resp) = udr_write_outcome(
+        supi,
+        "AMF context DELETE",
+        client.context_delete(supi, access.amf_resource()).await,
+    ) {
+        return resp;
     }
 
     // Local cache cleanup: clear this access's slot, and drop the UE entirely
@@ -874,15 +916,20 @@ pub async fn process_amf_deregistration(
 }
 
 /// Process an SMF deregistration DELETE (udmd-01): purge the per-PDU-session UDR
-/// context-data, then return 204.
+/// context-data, then return 204; a DELETE the UDR did not take is answered
+/// with the mapped error and notifies nobody (#2109, [`udr_write_outcome`]).
 pub async fn process_smf_deregistration(
     supi: &str,
     pdu_session_id: &str,
     client: &UdrClient,
 ) -> SbiResponse {
     let relative = smf_registration_resource(pdu_session_id);
-    if let Err(e) = client.context_delete(supi, &relative).await {
-        log::warn!("[{supi}] UDR SMF context DELETE failed: {e} (degraded)");
+    if let Some(resp) = udr_write_outcome(
+        supi,
+        "SMF context DELETE",
+        client.context_delete(supi, &relative).await,
+    ) {
+        return resp;
     }
 
     // #83: the SMF context data set changed; see the AMF sites above.
@@ -1090,8 +1137,13 @@ pub async fn process_smsf_deregistration(
     client: &UdrClient,
     access: UecmAccess,
 ) -> SbiResponse {
-    if let Err(e) = client.context_delete(supi, access.smsf_resource()).await {
-        log::warn!("[{supi}] UDR SMSF context DELETE failed: {e} (degraded)");
+    // #2109: as the AMF and SMF deregistrations.
+    if let Some(resp) = udr_write_outcome(
+        supi,
+        "SMSF context DELETE",
+        client.context_delete(supi, access.smsf_resource()).await,
+    ) {
+        return resp;
     }
     SbiResponse::with_status(204)
 }
@@ -1149,8 +1201,13 @@ pub async fn process_ip_sm_gw_registration_get(supi: &str, client: &UdrClient) -
 
 /// Process an IP-SM-GW deregistration DELETE (`IpSmGwDeregistration`).
 pub async fn process_ip_sm_gw_deregistration(supi: &str, client: &UdrClient) -> SbiResponse {
-    if let Err(e) = client.context_delete(supi, IP_SM_GW_RESOURCE).await {
-        log::warn!("[{supi}] UDR IP-SM-GW context DELETE failed: {e} (degraded)");
+    // #2109: as the AMF and SMF deregistrations.
+    if let Some(resp) = udr_write_outcome(
+        supi,
+        "IP-SM-GW context DELETE",
+        client.context_delete(supi, IP_SM_GW_RESOURCE).await,
+    ) {
+        return resp;
     }
     SbiResponse::with_status(204)
 }
@@ -1201,6 +1258,8 @@ pub struct MockUdr {
     stored: std::sync::Mutex<std::collections::HashMap<String, Value>>,
     put_status: u16,
     patch_status: u16,
+    /// #2109: the status every `context_delete` answers; a non-2xx removes nothing.
+    delete_status: u16,
     dereg_status: u16,
     /// When set, every `context_get` answers with this status instead of
     /// consulting `stored` — the UDR-fault case a read handler must not confuse
@@ -1216,10 +1275,25 @@ impl MockUdr {
             stored: std::sync::Mutex::new(std::collections::HashMap::new()),
             put_status: 201,
             patch_status: 204,
+            delete_status: 204,
             dereg_status: 204,
             get_status: None,
             calls: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// #2100: answer every `context_put` with `status`; a non-2xx stores nothing,
+    /// as a UDR that refused the write.
+    fn with_put_status(mut self, status: u16) -> Self {
+        self.put_status = status;
+        self
+    }
+
+    /// #2109: answer every `context_delete` with `status`; a non-2xx removes
+    /// nothing, as a UDR that refused the DELETE.
+    fn with_delete_status(mut self, status: u16) -> Self {
+        self.delete_status = status;
+        self
     }
 
     /// Make every `context_get` fail with `status`.
@@ -1278,10 +1352,12 @@ impl MockUdr {
             resource: resource.to_string(),
             body: body.clone(),
         });
-        self.stored
-            .lock()
-            .unwrap()
-            .insert(resource.to_string(), body.clone());
+        if (200..300).contains(&self.put_status) {
+            self.stored
+                .lock()
+                .unwrap()
+                .insert(resource.to_string(), body.clone());
+        }
         SbiResponse::with_status(self.put_status)
     }
 
@@ -1299,8 +1375,10 @@ impl MockUdr {
             supi: supi.to_string(),
             resource: resource.to_string(),
         });
-        self.stored.lock().unwrap().remove(resource);
-        SbiResponse::with_status(204)
+        if (200..300).contains(&self.delete_status) {
+            self.stored.lock().unwrap().remove(resource);
+        }
+        SbiResponse::with_status(self.delete_status)
     }
 
     fn send_dereg_notification(&self, callback_uri: &str, body: &Value) -> SbiResponse {
@@ -1449,6 +1527,181 @@ mod tests {
                     UdrCall::CtxPut { resource, .. } if resource == "amf-3gpp-access"
                 )),
                 "missing {path:?} must not persist to UDR"
+            );
+        }
+    }
+
+    /// #2100: a UECM registration PUT the UDR does not take is never answered
+    /// 2xx (TS 29.503 §6.2.7): a refusal (403) is 500 SYSTEM_FAILURE, an unknown
+    /// subscriber (404) is 404 USER_NOT_FOUND, a UDR fault (503) is 503, for
+    /// the AMF and the SMF registration. Nothing local changes: the AMF is not
+    /// cached as serving the UE, so no EE subscription or notification follows.
+    ///
+    /// #2109: a deregistration whose UDR DELETE the UDR does not take is never
+    /// answered 204 (TS 29.503 §6.2.7, the #2100 mapping): a refusal (403) is
+    /// 500 SYSTEM_FAILURE, an unknown subscriber (404) is 404 USER_NOT_FOUND, a
+    /// UDR fault (503) is 503. That holds for the AMF deregistration (the
+    /// purgeFlag PATCH and dereg-amf both end there), the SMF, the SMSF and the
+    /// IP-SM-GW one. Nothing local changes: the registration is still stored,
+    /// and the AMF is still cached as serving the UE. Once the UDR takes the
+    /// DELETE (the retry), each is 204 and the record is gone.
+    ///
+    /// REVERT-VERIFIED: with the AMF DELETE's outcome ignored again (`(degraded)`),
+    /// the refused AMF deregistration is 204 and the `AMF dereg` assertion fails;
+    /// with the SMF DELETE's ignored, the `SMF dereg` assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_deregistration_the_udr_refuses_is_not_answered_204_2109() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let smf = smf_registration_resource("5");
+        for (udr, status, cause) in [
+            (403u16, 500u16, Some("SYSTEM_FAILURE")),
+            (404, 404, Some("USER_NOT_FOUND")),
+            (503, 503, None),
+        ] {
+            let supi = format!("imsi-00101000002109{}", udr % 10);
+            let mock = Arc::new(MockUdr::new().with_delete_status(udr));
+            let client = UdrClient::Mock(mock.clone());
+            let access = UecmAccess::ThreeGpp;
+            let reg = process_amf_registration(&supi, &valid_amf_body(), &client, access).await;
+            assert_eq!(reg.status, 201, "{:?}", reg.http.content);
+            let reg = process_smf_registration(&supi, "5", &valid_smf_body(), &client).await;
+            assert_eq!(reg.status, 201, "{:?}", reg.http.content);
+            let smsf =
+                json!({ "smsfInstanceId": "smsf-0001", "plmnId": { "mcc": "001", "mnc": "01" } });
+            let reg = process_smsf_registration(&supi, &smsf, &client, access).await;
+            assert_eq!(reg.status, 201, "{:?}", reg.http.content);
+            let ipsmgw = json!({ "ipsmgwFqdn": "ipsmgw.example.org" });
+            let reg = process_ip_sm_gw_registration(&supi, &ipsmgw, &client).await;
+            assert_eq!(reg.status, 201, "{:?}", reg.http.content);
+
+            let purge = json!({ "purgeFlag": true });
+            let answers = [
+                (
+                    "AMF dereg",
+                    process_amf_deregistration(&supi, &client, access).await,
+                ),
+                (
+                    "AMF purgeFlag",
+                    process_amf_registration_update(&supi, &purge, &client, access).await,
+                ),
+                (
+                    "dereg-amf",
+                    process_dereg_amf(
+                        &supi,
+                        &json!({ "deregReason": "UE_INITIAL_REGISTRATION" }),
+                        &client,
+                    )
+                    .await,
+                ),
+                (
+                    "SMF dereg",
+                    process_smf_deregistration(&supi, "5", &client).await,
+                ),
+                (
+                    "SMSF dereg",
+                    process_smsf_deregistration(&supi, &client, access).await,
+                ),
+                (
+                    "IP-SM-GW dereg",
+                    process_ip_sm_gw_deregistration(&supi, &client).await,
+                ),
+            ];
+            for (what, resp) in &answers {
+                assert_eq!(
+                    resp.status, status,
+                    "{what}, UDR {udr}: {:?}",
+                    resp.http.content
+                );
+                if let Some(cause) = cause {
+                    assert_eq!(
+                        problem_cause(resp).as_deref(),
+                        Some(cause),
+                        "{what}, UDR {udr}"
+                    );
+                }
+            }
+            for resource in [
+                access.amf_resource(),
+                smf.as_str(),
+                access.smsf_resource(),
+                IP_SM_GW_RESOURCE,
+            ] {
+                assert!(
+                    mock.stored_doc(resource).is_some(),
+                    "UDR {udr}: {resource} is still stored"
+                );
+            }
+            let cached = udm_self()
+                .read()
+                .unwrap()
+                .ue_find_by_supi(&supi)
+                .and_then(|ue| ue.amf_instance_id);
+            assert_eq!(
+                cached.as_deref(),
+                Some("amf-a-0001"),
+                "UDR {udr}: the AMF is still cached as serving"
+            );
+
+            // The retry, once the UDR takes the DELETE.
+            let ok = Arc::new(MockUdr::new());
+            for resource in [access.amf_resource(), smf.as_str()] {
+                let doc = mock.stored_doc(resource).expect("stored");
+                ok.stored.lock().unwrap().insert(resource.to_string(), doc);
+            }
+            let client = UdrClient::Mock(ok.clone());
+            let resp = process_amf_deregistration(&supi, &client, access).await;
+            assert_eq!(resp.status, 204, "AMF retry, UDR {udr}");
+            let resp = process_smf_deregistration(&supi, "5", &client).await;
+            assert_eq!(resp.status, 204, "SMF retry, UDR {udr}");
+            assert!(ok.stored_doc(access.amf_resource()).is_none());
+            assert!(ok.stored_doc(&smf).is_none());
+        }
+    }
+
+    /// REVERT-VERIFIED: with a non-5xx UDR status degrading to success again,
+    /// the refused AMF registration is 201 and the first assertion fails.
+    #[tokio::test]
+    async fn a_registration_the_udr_refuses_is_not_answered_2xx_2100() {
+        for (udr, status, cause) in [
+            (403u16, 500u16, Some("SYSTEM_FAILURE")),
+            (404, 404, Some("USER_NOT_FOUND")),
+            (503, 503, None),
+        ] {
+            let supi = format!("imsi-00101000002100{}", udr % 10);
+            let mock = Arc::new(MockUdr::new().with_put_status(udr));
+            let client = UdrClient::Mock(mock.clone());
+            let resp =
+                process_amf_registration(&supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp)
+                    .await;
+            assert_eq!(
+                resp.status, status,
+                "AMF, UDR {udr}: {:?}",
+                resp.http.content
+            );
+            if let Some(cause) = cause {
+                assert_eq!(problem_cause(&resp).as_deref(), Some(cause), "UDR {udr}");
+            }
+            assert!(resp.http.get_header("Location").is_none());
+            let cached = udm_self()
+                .read()
+                .unwrap()
+                .ue_find_by_supi(&supi)
+                .and_then(|ue| ue.amf_instance_id);
+            assert!(
+                cached.is_none(),
+                "UDR {udr}: the AMF is not cached as serving"
+            );
+            assert!(mock.stored_doc("amf-3gpp-access").is_none());
+
+            let resp = process_smf_registration(&supi, "5", &valid_smf_body(), &client).await;
+            assert_eq!(
+                resp.status, status,
+                "SMF, UDR {udr}: {:?}",
+                resp.http.content
             );
         }
     }

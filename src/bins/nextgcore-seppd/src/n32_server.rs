@@ -155,16 +155,16 @@ async fn n32_request_handler(request: HttpRequest) -> HttpResponse {
 
     match (method.as_str(), path.as_str()) {
         ("POST", "/n32c-handshake/v1/exchange-capability") => {
-            handle_exchange_capability(&body, &cid)
+            handle_exchange_capability(&body, &cid, &request)
         }
         ("POST", "/n32c-handshake/v1/exchange-params") => {
-            handle_exchange_params(&body, tls_secret.as_deref(), &cid)
+            handle_exchange_params(&body, tls_secret.as_deref(), &cid, &request)
         }
         ("POST", "/n32c-handshake/v1/n32f-error") => handle_n32f_error_report(&body),
         // Issue #99: N32-f context termination (TS 29.573 5.2.4). Mandatory, and
         // previously absent -- a peer's terminate request fell through to the 404
         // below, so terminated contexts and their keys persisted indefinitely.
-        ("POST", "/n32c-handshake/v1/n32f-terminate") => handle_n32f_terminate(&body),
+        ("POST", "/n32c-handshake/v1/n32f-terminate") => handle_n32f_terminate(&body, &request),
         ("POST", "/n32f-forward/v1/n32f-process") => handle_n32f_process(&body).await,
         _ => send_error(
             404,
@@ -234,7 +234,50 @@ fn update_node(node: &SeppNode) {
     };
 }
 
-fn handle_exchange_capability(body: &str, cid: &str) -> HttpResponse {
+/// #2076: refuse an N32-c request whose claimed peer, the FQDN of the SEPP it
+/// says it is (a `sender`, or the peer an `n32fContextId` belongs to), is not
+/// the SEPP on the other end of this connection. A SEPP is identified by the
+/// FQDN its certificate names in a dNSName SubjectAltName (TS 33.310 §6.1.4a;
+/// TS 29.573 §5.2: N32-c runs over mutually authenticated TLS between the two
+/// SEPPs), so the claim must be one of the verified certificate's DNS SANs,
+/// compared without case or a trailing dot. With no verified client certificate
+/// (an N32-c listener with `allow_insecure_no_mtls`) nothing binds the claim:
+/// refused under the `production` SBI profile, admitted under `dev` (lab).
+/// 403 before anything is read or changed. `Some` is the refusal.
+fn refuse_unbound_peer(
+    request: &HttpRequest,
+    claimed: &str,
+    operation: &str,
+) -> Option<HttpResponse> {
+    let claimed = claimed.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !request.peer_cert_present {
+        if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+            log::warn!("{operation} from [{claimed}] refused: no verified peer SEPP certificate");
+            return Some(send_error(
+                403,
+                "Forbidden",
+                &format!("{operation}: no verified peer SEPP certificate binds [{claimed}]"),
+                None,
+            ));
+        }
+        return None;
+    }
+    if request.peer_cert_dns_sans.contains(&claimed) {
+        return None;
+    }
+    log::warn!(
+        "{operation} refused: it claims SEPP [{claimed}], but the peer certificate names {:?}",
+        request.peer_cert_dns_sans
+    );
+    Some(send_error(
+        403,
+        "Forbidden",
+        &format!("{operation}: the peer certificate does not name SEPP [{claimed}]"),
+        None,
+    ))
+}
+
+fn handle_exchange_capability(body: &str, cid: &str, request: &HttpRequest) -> HttpResponse {
     let json: SecurityCapabilityRequestJson = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
@@ -248,6 +291,10 @@ fn handle_exchange_capability(body: &str, cid: &str) -> HttpResponse {
         }
     };
     let req_data = req_data_from_json(&json);
+    // #2076: the sender is the SEPP that called, before a node is found or made.
+    if let Some(refused) = refuse_unbound_peer(request, &req_data.sender, "exchange-capability") {
+        return refused;
+    }
 
     let mut node = match find_or_add_node(&req_data.sender) {
         Some(n) => n,
@@ -371,7 +418,12 @@ fn single_pending_peer(nodes: &[crate::context::SeppNode]) -> Option<String> {
     Some(first.receiver.clone())
 }
 
-fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> HttpResponse {
+fn handle_exchange_params(
+    body: &str,
+    tls_secret: Option<&[u8]>,
+    cid: &str,
+    request: &HttpRequest,
+) -> HttpResponse {
     let req: SecParamExchReqData = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
@@ -390,16 +442,15 @@ fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> H
         return send_error(
             400,
             "Bad Request",
-            "sender omitted and the requesting peer could not be determined from the              association (no senderApiRoot, and not exactly one N32-c handshake in flight)",
+            "sender omitted and the requesting peer could not be determined from the \
+             association (no senderApiRoot, and not exactly one N32-c handshake in flight)",
             Some("MANDATORY_IE_INCORRECT"),
         );
     };
 
-    // T1.5b: deposit the real TLS exporter secret before the handler calls
-    // `resolve_exporter_secret`, replacing the deterministic fallback.
-    if let Some(secret) = tls_secret {
-        log::debug!("cid={cid} depositing N32-c TLS exporter secret for peer [{peer}] (T1.5b)");
-        n32c_handler::set_n32c_tls_exporter_secret(&peer, secret.to_vec());
+    // #2076: the peer is the SEPP that called, before its secret or node is touched.
+    if let Some(refused) = refuse_unbound_peer(request, &peer, "exchange-params") {
+        return refused;
     }
 
     let mut node = match find_or_add_node(&peer) {
@@ -414,6 +465,15 @@ fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> H
         }
     };
 
+    // #2096 (R30 on #2092): only once the peer is bound and its node exists, so a
+    // request that goes no further leaves no secret behind.
+    // T1.5b: deposit the real TLS exporter secret before the handler calls
+    // `resolve_exporter_secret`, replacing the deterministic fallback.
+    if let Some(secret) = tls_secret {
+        log::debug!("cid={cid} depositing N32-c TLS exporter secret for peer [{peer}] (T1.5b)");
+        n32c_handler::set_n32c_tls_exporter_secret(&peer, secret.to_vec());
+    }
+
     match n32c_handler::handle_exchange_params_request(&mut node, &req) {
         Ok(rsp) => {
             node.handshake_state = crate::handshake_sm::HandshakeState::Established;
@@ -426,21 +486,28 @@ fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> H
                 .unwrap_or_else(|_| HttpResponse::internal_error())
         }
         Err(e) => {
+            // #2087: a failed exchange-params leaves no exporter secret behind.
+            let _ = n32c_handler::take_n32c_tls_exporter_secret(&peer);
             log::warn!("cid={cid} peer=[{peer}] reason=NEGOTIATION_NOT_ALLOWED: {e}");
             send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }
 }
 
-/// Received n32f-error reports (consumed: logged, counted, and inspectable)
-static RECEIVED_N32F_ERRORS: LazyLock<Mutex<Vec<N32fErrorInfo>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+/// Received n32f-error reports (consumed: logged, counted, and inspectable).
+/// #2087: the latest [`MAX_RECEIVED_N32F_ERRORS`] only, oldest dropped first.
+/// Nothing in production drains it, so unbounded it grew at the peer's rate.
+static RECEIVED_N32F_ERRORS: LazyLock<Mutex<std::collections::VecDeque<N32fErrorInfo>>> =
+    LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+
+/// #2087: how many received n32f-error reports are kept for inspection.
+pub const MAX_RECEIVED_N32F_ERRORS: usize = 256;
 
 /// Drain the received n32f-error reports (used by operators/tests)
 pub fn take_received_n32f_errors() -> Vec<N32fErrorInfo> {
     RECEIVED_N32F_ERRORS
         .lock()
-        .map(|mut v| std::mem::take(&mut *v))
+        .map(|mut v| std::mem::take(&mut *v).into())
         .unwrap_or_default()
 }
 
@@ -465,7 +532,10 @@ fn handle_n32f_error_report(body: &str) -> HttpResponse {
     );
 
     if let Ok(mut v) = RECEIVED_N32F_ERRORS.lock() {
-        v.push(info);
+        if v.len() >= MAX_RECEIVED_N32F_ERRORS {
+            v.pop_front();
+        }
+        v.push_back(info);
     }
     HttpResponse::no_content()
 }
@@ -599,7 +669,7 @@ async fn handle_n32f_process(body: &str) -> HttpResponse {
 /// An unknown `n32fContextId` is 404 rather than a silent success — the peer
 /// asked us to destroy keys, and letting it believe we did when we never held
 /// them is exactly the wrong answer for a border function.
-fn handle_n32f_terminate(body: &str) -> HttpResponse {
+fn handle_n32f_terminate(body: &str, request: &HttpRequest) -> HttpResponse {
     let json: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
@@ -640,7 +710,12 @@ fn handle_n32f_terminate(body: &str) -> HttpResponse {
         };
         context.node_find_by_n32f_context_id(context_id)
     };
-    let Some(mut node) = found else {
+    // #2076: only the SEPP whose context it is tears it down, before its keys go.
+    // #2096 (R30 on #2092): and another peer's context is answered exactly as an
+    // unknown one, so the answer does not tell a peer which context ids exist.
+    let Some(mut node) = found
+        .filter(|node| refuse_unbound_peer(request, &node.receiver, "n32f-terminate").is_none())
+    else {
         return send_error(
             404,
             "Not Found",
@@ -649,8 +724,11 @@ fn handle_n32f_terminate(body: &str) -> HttpResponse {
         );
     };
 
-    // The keys are in here. Dropping it is the key deletion.
-    node.n32f_security = None;
+    // The keys are in here. Dropping it is the key deletion; #2087: and its SEQ
+    // counters and replay windows go with it.
+    if let Some(old) = node.n32f_security.take() {
+        crate::prins::forget_context(&old.kid);
+    }
     node.handshake_state = crate::handshake_sm::HandshakeState::Initial;
     let updated = match ctx.read() {
         Ok(context) => context.node_update(&node),
@@ -2199,6 +2277,13 @@ mod tests {
 
     /// Register a TLS-mode peer with an N32-f security context, and return its
     /// locally-allocated context id.
+    /// #2076: a request from the SEPP whose verified certificate names `fqdns`.
+    fn from_sepp(mut req: HttpRequest, fqdns: &[&str]) -> HttpRequest {
+        req.peer_cert_present = true;
+        req.peer_cert_dns_sans = fqdns.iter().map(|f| f.to_string()).collect();
+        req
+    }
+
     fn tls_peer_with_context(receiver: &str, context_id: &str) -> u64 {
         ensure_ctx_initialized();
         let ctx = sepp_self();
@@ -2286,6 +2371,7 @@ mod tests {
 
         let resp = handle_n32f_terminate(
             &serde_json::json!({ "n32fContextId": "ctx-to-terminate" }).to_string(),
+            &from_sepp(HttpRequest::default(), &["sepp-term.example.com"]),
         );
         assert_eq!(resp.status, 200, "TS 29.573 5.2.4 mandates 200");
         let body: serde_json::Value =
@@ -2339,13 +2425,169 @@ mod tests {
     #[test]
     fn n32f_terminate_unknown_context_is_404() {
         ensure_ctx_initialized();
+        let peer = from_sepp(HttpRequest::default(), &["sepp-term.example.com"]);
         let resp = handle_n32f_terminate(
             &serde_json::json!({ "n32fContextId": "ctx-never-existed" }).to_string(),
+            &peer,
         );
         assert_eq!(resp.status, 404);
         // And a missing mandatory IE is 400, not 404.
-        let resp = handle_n32f_terminate("{}");
+        let resp = handle_n32f_terminate("{}", &peer);
         assert_eq!(resp.status, 400);
+    }
+
+    /// #2087 (R30's audit): received n32f-error reports are bounded: past
+    /// `MAX_RECEIVED_N32F_ERRORS` the oldest are dropped.
+    ///
+    /// REVERT-VERIFIED: with the bound removed, all of them are kept and the
+    /// length assertion fails.
+    #[test]
+    fn received_n32f_errors_are_bounded_2087() {
+        let _ = take_received_n32f_errors();
+        let n = MAX_RECEIVED_N32F_ERRORS + 10;
+        for i in 0..n {
+            let body = serde_json::json!({
+                "n32fMessageId": format!("m-2087-{i}"),
+                "n32fErrorType": "INTEGRITY_CHECK_FAILED",
+            })
+            .to_string();
+            assert_eq!(handle_n32f_error_report(&body).status, 204);
+        }
+        let kept: Vec<String> = take_received_n32f_errors()
+            .into_iter()
+            .map(|e| e.n32f_message_id)
+            .filter(|id| id.starts_with("m-2087-"))
+            .collect();
+        assert_eq!(kept.len(), MAX_RECEIVED_N32F_ERRORS);
+        assert_eq!(
+            kept.last().map(String::as_str),
+            Some(format!("m-2087-{}", n - 1).as_str())
+        );
+        assert!(
+            !kept.contains(&"m-2087-0".to_string()),
+            "the oldest is dropped"
+        );
+    }
+
+    /// #2087 (R30's audit): a failed exchange-params leaves no TLS exporter
+    /// secret behind for its peer.
+    ///
+    /// REVERT-VERIFIED: without the removal on failure, the secret is still
+    /// there.
+    #[test]
+    fn a_failed_exchange_params_leaves_no_exporter_secret_2087() {
+        ensure_ctx_initialized();
+        let peer = "sepp-fail-2087.example.com";
+        let body = serde_json::json!({
+            "sender": peer, "n32fContextId": "ctx-fail-2087",
+            "jweCipherSuiteList": ["BOGUS"], "jwsCipherSuiteList": ["BOGUS"],
+        })
+        .to_string();
+        let rsp = handle_exchange_params(
+            &body,
+            Some(&[9u8; 64]),
+            "cid",
+            &from_sepp(HttpRequest::default(), &[peer]),
+        );
+        assert_eq!(rsp.status, 400, "{:?}", rsp.http.content);
+        assert!(n32c_handler::take_n32c_tls_exporter_secret(peer).is_none());
+    }
+
+    /// #2076 (R32's audit): N32-c claims are bound to the SEPP on the other end
+    /// (TS 29.573 §5.2, TS 33.310 §6.1.4a). The probe: SEPP B, holding a
+    /// certificate for `sepp-b.example.com`, (1) renegotiates capability as
+    /// `sepp-a.example.com`, (2) sends exchange-params as SEPP A, and (3)
+    /// terminates SEPP A's N32-f context. (1) and (2) are 403, (3) is the 404
+    /// of an unknown context (#2096), and none changes anything: A's
+    /// node keeps its negotiated scheme and its context and keys. A request
+    /// with no verified certificate is refused under production. SEPP A itself
+    /// (its FQDN in another case, with a trailing dot) terminates its context.
+    ///
+    /// REVERT-VERIFIED: with `refuse_unbound_peer` returning `None`, B's
+    /// terminate is 200 and A's keys are gone. #2096: B's terminate is
+    /// answered as an unknown context; with the 403 back, the body differs.
+    #[tokio::test]
+    async fn an_n32c_request_is_bound_to_the_peer_certificate_2076() {
+        let a = "sepp-a-2076.example.com";
+        let node_id = tls_peer_with_context(a, "ctx-2076");
+        let from_b = |r: HttpRequest| from_sepp(r, &["sepp-b-2076.example.com"]);
+        let held = || {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let node = c.node_find(node_id).unwrap();
+            (
+                node.n32f_security.is_some(),
+                node.negotiated_security_scheme,
+            )
+        };
+        let before = held();
+        assert!(before.0);
+        // #2087: the context has SEQ state, as after its first message.
+        crate::prins::seed_context_state("ctx-2076");
+        assert!(crate::prins::context_state_len("ctx-2076") > 0);
+
+        let capability = serde_json::json!({
+            "sender": a, "supportedSecCapabilityList": ["PRINS"],
+        })
+        .to_string();
+        let rsp = handle_exchange_capability(&capability, "cid", &from_b(HttpRequest::default()));
+        assert_eq!(rsp.status, 403, "(1) {:?}", rsp.http.content);
+        let params = serde_json::json!({ "sender": a, "n32fContextId": "evil" }).to_string();
+        let rsp = handle_exchange_params(&params, None, "cid", &from_b(HttpRequest::default()));
+        assert_eq!(rsp.status, 403, "(2) {:?}", rsp.http.content);
+        let terminate = serde_json::json!({ "n32fContextId": "ctx-2076" }).to_string();
+        let rsp = handle_n32f_terminate(&terminate, &from_b(HttpRequest::default()));
+        // #2096: answered exactly as an unknown context, so it reveals nothing.
+        let unknown = handle_n32f_terminate(
+            &serde_json::json!({ "n32fContextId": "ctx-2076" })
+                .to_string()
+                .replace("ctx-2076", "ctx-2096-none"),
+            &from_b(HttpRequest::default()),
+        );
+        assert_eq!(rsp.status, 404, "(3) {:?}", rsp.http.content);
+        assert_eq!(unknown.status, 404);
+        assert_eq!(
+            rsp.http
+                .content
+                .as_deref()
+                .map(|c| c.replace("ctx-2076", "ID")),
+            unknown
+                .http
+                .content
+                .as_deref()
+                .map(|c| c.replace("ctx-2096-none", "ID")),
+            "another peer's context is answered as an unknown one"
+        );
+        assert_eq!(held(), before, "nothing of A's changed");
+        assert!(crate::prins::context_state_len("ctx-2076") > 0);
+
+        // No verified certificate at all: refused under production (as unknown).
+        if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+            let rsp = handle_n32f_terminate(&terminate, &HttpRequest::default());
+            assert_eq!(rsp.status, 404, "{:?}", rsp.http.content);
+        }
+        assert!(
+            refuse_unbound_peer(&HttpRequest::default(), a, "probe").is_some()
+                || !nextgcore_sbi::security::SbiProfile::resolve().is_production()
+        );
+
+        let rsp = handle_n32f_terminate(
+            &terminate,
+            &from_sepp(HttpRequest::default(), &["other.example.com", a]),
+        );
+        assert_eq!(rsp.status, 200, "{:?}", rsp.http.content);
+        assert!(!held().0, "A's own terminate deletes its context");
+        assert_eq!(
+            crate::prins::context_state_len("ctx-2076"),
+            0,
+            "#2087: and its SEQ counters and replay windows"
+        );
+        assert!(refuse_unbound_peer(
+            &from_sepp(HttpRequest::default(), &[a]),
+            "SEPP-A-2076.example.com.",
+            "probe"
+        )
+        .is_none());
     }
 
     #[test]
