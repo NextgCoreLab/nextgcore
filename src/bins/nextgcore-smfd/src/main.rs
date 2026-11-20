@@ -31531,12 +31531,6 @@ mod tests {
         // writer (the #308 rule); `smf_context_init` checks that it is held.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
-        // #2157: the seeded context has no serving-AMF binding and the calls are
-        // anonymous, i.e. a context created under `dev`. Under production an
-        // ownerless context is frozen to an anonymous caller (#1899 review M2,
-        // `refuse_ownerless_sm_context_caller`), so alone, before any sibling had
-        // set the override, the retrieve was 403. Declared rather than inherited.
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve

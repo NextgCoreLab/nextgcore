@@ -16960,18 +16960,25 @@ mod tests {
     // ========================================================================
 
     /// A conformant WRITE-REPLACE WARNING REQUEST container as a CBCF would send
-    /// it: real APER bytes, derived by hand from TS 38.413 (`crate::gnb_pdus`,
-    /// #417), not a placeholder. Returns the PDU so a test can assert what the
-    /// gNB would receive.
+    /// it: real APER bytes from the NGAP builder, not a placeholder. Returns the
+    /// PDU so a test can assert what the gNB would receive.
     fn pws_warning_container(message_identifier: u16, serial_number: u16) -> Vec<u8> {
-        crate::gnb_pdus::write_replace_warning_request(
-            message_identifier,
-            serial_number,
-            32,
-            3,
-            0x01,
-            b"TSUNAMI",
+        nextgcore_ngap::builder::build_write_replace_warning_request(
+            &nextgcore_ngap::types::WriteReplaceWarningRequest {
+                message_identifier,
+                serial_number,
+                warning_area_list: None,
+                repetition_period: 32,
+                number_of_broadcasts_requested: 3,
+                warning_type: None,
+                warning_security_info: None,
+                data_coding_scheme: Some(0x01),
+                warning_message_contents: Some(b"TSUNAMI".to_vec()),
+                concurrent_warning_message_indicator: false,
+                warning_area_coordinates: None,
+            },
         )
+        .expect("build WRITE-REPLACE WARNING REQUEST")
     }
 
     /// A `NonUeN2MessageTransfer` request with the container in a multipart part,
@@ -17114,8 +17121,22 @@ mod tests {
         amf_context_init(64, 1024, 4096);
 
         // A PWS FAILURE INDICATION (procedure 33) -- gNB->AMF.
-        let wrong_direction =
-            crate::gnb_pdus::pws_failure_indication([0x00, 0xF1, 0x10], 0x396, 0x396, 32);
+        let wrong_direction = nextgcore_ngap::builder::build_pws_failure_indication(
+            &nextgcore_ngap::types::PwsFailureIndication {
+                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x396,
+                    },
+                ]),
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 0x396,
+                    gnb_id_len: 32,
+                },
+            },
+        )
+        .expect("build PWS FAILURE INDICATION");
         assert_eq!(wrong_direction[1], 33, "the fixture must be procedure 33");
 
         let resp = namf_request_handler(pws_transfer_request(
@@ -17345,7 +17366,15 @@ mod tests {
         amf_context_init(64, 1024, 4096);
 
         let (mid, sn) = (0xA396u16, 0xC396u16);
-        let cancel = crate::gnb_pdus::pws_cancel_request(mid, sn, true);
+        let cancel = nextgcore_ngap::builder::build_pws_cancel_request(
+            &nextgcore_ngap::types::PwsCancelRequest {
+                message_identifier: mid,
+                serial_number: sn,
+                warning_area_list: None,
+                cancel_all_warning_messages: true,
+            },
+        )
+        .expect("build PWS CANCEL REQUEST");
 
         let resp = namf_request_handler(pws_transfer_request(pws_body(mid, sn), cancel)).await;
         assert_eq!(resp.status, 200);
@@ -17999,7 +18028,15 @@ mod tests {
         }
 
         let (mid, sn) = (0xD396u16, 0xF396u16);
-        let cancel = crate::gnb_pdus::pws_cancel_request(mid, sn, false);
+        let cancel = nextgcore_ngap::builder::build_pws_cancel_request(
+            &nextgcore_ngap::types::PwsCancelRequest {
+                message_identifier: mid,
+                serial_number: sn,
+                warning_area_list: None,
+                cancel_all_warning_messages: false,
+            },
+        )
+        .expect("build PWS CANCEL REQUEST");
 
         // One served TAI (tac 000074 == 0x74) and one this AMF does not serve.
         let mut body = pws_body(mid, sn);
@@ -18059,11 +18096,22 @@ mod tests {
         let (mid, sn) = (0xE396u16, 0x1397u16);
         // A conformant response as the gNB would send it, with a real completed
         // area list.
-        let pdu = crate::gnb_pdus::write_replace_warning_response(
-            mid,
-            sn,
-            Some(([0x00, 0xF1, 0x10], &[0x399])),
-        );
+        let pdu = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid,
+                serial_number: sn,
+                broadcast_completed_area_list: Some(
+                    nextgcore_ngap::types::BroadcastCompletedAreaList::CellIdNr(vec![
+                        nextgcore_ngap::types::NrCgi {
+                            plmn_identity: [0x00, 0xF1, 0x10],
+                            nr_cell_identity: 0x399,
+                        },
+                    ]),
+                ),
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING RESPONSE");
         // Byte 0 is the PDU-type CHOICE index and byte 1 the procedure code: a
         // response is a SuccessfulOutcome (0x20) of procedure 51
         // (`38413-j30.txt:59115`). PR #379's MBS byte-writers were undecodable
@@ -18163,7 +18211,15 @@ mod tests {
     #[test]
     fn a_response_without_an_area_list_reports_bc_empty_area_list() {
         let (mid, sn) = (0xF396u16, 0x2397u16);
-        let pdu = crate::gnb_pdus::write_replace_warning_response(mid, sn, None);
+        let pdu = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid,
+                serial_number: sn,
+                broadcast_completed_area_list: None,
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING RESPONSE");
 
         let ran_node_id =
             super::global_ran_node_id_json(&crate::context::PlmnId::new("001", "01"), 0x1234, 28);

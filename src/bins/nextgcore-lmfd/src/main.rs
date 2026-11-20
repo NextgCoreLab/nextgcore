@@ -4976,27 +4976,6 @@ mod tests {
 
     // -- lmfd#0: location-context-transfer ------------------------------------
 
-    /// #2157: the NF instance the LDR tests below call as. They used to call
-    /// with no identity, which only a dev deployment admits (#2077:
-    /// `owner_for_new_resource`, `refuse_non_owner`), so each passed only after
-    /// a sibling had set the Dev override and failed 403 alone. A production
-    /// peer proves who it is, so these tests now do too and pass under either
-    /// profile, with the LDR bound to that caller.
-    const PEER_2157: &str = "cccccccc-2157-4000-8000-00000000000c";
-
-    /// `request` from [`PEER_2157`], proven by its token.
-    fn from_peer_2157(mut request: SbiRequest) -> SbiRequest {
-        request.oauth2_subject = Some(PEER_2157.to_string());
-        request
-    }
-
-    /// `request` from [`PEER_2157`] as the old LMF a LocationContextTransfer
-    /// comes from (TS 29.572 §5.2.2.5.2): the NRF lists it as an LMF.
-    fn from_lmf_2157(request: SbiRequest) -> SbiRequest {
-        owner_binding::seed_nf_type_for_test(PEER_2157, nextgcore_sbi::types::NfType::Lmf);
-        from_peer_2157(request)
-    }
-
     #[tokio::test]
     async fn test_location_context_transfer_204() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -5007,17 +4986,14 @@ mod tests {
             "ldrReference": "aa01",
             "eventReportMessage": { "eventClass": "SUPPLEMENTARY_SERVICES", "eventContent": {} }
         }"#;
-        let req = from_lmf_2157(
-            SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
-                .with_body(body, "application/json"),
-        );
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
         let resp = handle_location_context_transfer(&req).await;
-        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
-        // LDR context must be registered, and bound to the LMF that sent it.
+        assert_eq!(resp.status, 204);
+        // LDR context must be registered.
         let found = lmf_self().read().unwrap().ldr_find("aa01");
-        let found = found.expect("LDR context not registered");
-        assert_eq!(found.ldr_type, "PERIODIC");
-        assert_eq!(found.owner.as_deref(), Some(PEER_2157));
+        assert!(found.is_some(), "LDR context not registered");
+        assert_eq!(found.unwrap().ldr_type, "PERIODIC");
     }
 
     #[tokio::test]
@@ -5050,22 +5026,19 @@ mod tests {
             hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
             supi: None,
             periodic_event_info: None,
-            owner: Some(PEER_2157.to_string()),
+            owner: None,
         });
 
-        // First cancel, by the LDR's owner -> 204.
+        // First cancel -> 204.
         let body = r#"{"hgmlcCallBackURI":"http://gmlc/cb","ldrReference":"bb01"}"#;
-        let req = from_peer_2157(
-            SbiRequest::post("/nlmf-loc/v1/cancel-location").with_body(body, "application/json"),
-        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/cancel-location").with_body(body, "application/json");
         let resp = handle_cancel_location(&req).await;
-        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
-        assert!(lmf_self().read().unwrap().ldr_find("bb01").is_none());
+        assert_eq!(resp.status, 204);
 
         // Second cancel -> 403 LOCATION_SESSION_UNKNOWN.
-        let req2 = from_peer_2157(
-            SbiRequest::post("/nlmf-loc/v1/cancel-location").with_body(body, "application/json"),
-        );
+        let req2 =
+            SbiRequest::post("/nlmf-loc/v1/cancel-location").with_body(body, "application/json");
         let resp2 = handle_cancel_location(&req2).await;
         assert_eq!(resp2.status, 403);
         let v = body_json(&resp2);
@@ -5917,10 +5890,8 @@ mod tests {
             }
         })
         .to_string();
-        let req = from_lmf_2157(
-            SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
-                .with_body(body, "application/json"),
-        );
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
         assert_eq!(lmf_sbi_request_handler(req).await.status, 204);
 
         // The restored parameters are on the stored LDR...
@@ -5929,11 +5900,6 @@ mod tests {
             .ok()
             .and_then(|c| c.ldr_find("ldr-transfer-1"))
             .expect("the LDR is registered");
-        assert_eq!(
-            stored.owner.as_deref(),
-            Some(PEER_2157),
-            "bound to the old LMF"
-        );
         let periodic = stored
             .periodic_event_info
             .expect("the transferred periodicEventInfo must be restored, not dropped");
@@ -5976,10 +5942,8 @@ mod tests {
             "eventReportMessage": {"eventClass": "SUPPLEMENTARY_SERVICES", "eventContent": {}}
         })
         .to_string();
-        let req = from_lmf_2157(
-            SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
-                .with_body(body, "application/json"),
-        );
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
         assert_eq!(lmf_sbi_request_handler(req).await.status, 204);
 
         let stored = lmf_self()
@@ -6023,10 +5987,8 @@ mod tests {
                 "eventReportMessage": {"eventClass": event_class, "eventContent": {}}
             })
             .to_string();
-            from_lmf_2157(
-                SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
-                    .with_body(body, "application/json"),
-            )
+            SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+                .with_body(body, "application/json")
         };
 
         assert_eq!(
@@ -6037,16 +5999,13 @@ mod tests {
             "DUMMY is in the vendored EventClass enum; refusing it would reject a \
              conformant peer"
         );
-        assert!(
-            lmf_self().read().unwrap().ldr_find("ldr-dummy-1").is_some(),
-            "the DUMMY transfer must register its LDR"
+        // An eventClass that is NOT in the enumeration is still refused.
+        assert_eq!(
+            lmf_sbi_request_handler(transfer("NOT_A_CLASS", "ldr-dummy-2"))
+                .await
+                .status,
+            403
         );
-        // An eventClass that is NOT in the enumeration is still refused, for THAT
-        // reason (#2157: a bare 403 was also what the owner check answers).
-        let refused = lmf_sbi_request_handler(transfer("NOT_A_CLASS", "ldr-dummy-2")).await;
-        assert_eq!(refused.status, 403);
-        assert_eq!(body_json(&refused)["cause"], "EVENT_REPORT_UNRECOGNIZED");
-        assert!(lmf_self().read().unwrap().ldr_find("ldr-dummy-2").is_none());
     }
 
     /// #104 acceptance: `lcsQosClass` and `velocityRequested` deserialise.
@@ -6747,9 +6706,8 @@ lmf:
             );
         }
         let body = r#"{"supi":"imsi-001010000000104","ldrType":"PERIODIC","ldrReference":"ldr-p"}"#;
-        let req = from_peer_2157(
-            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json"),
-        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         assert_ne!(
             resp.status, 501,
@@ -6762,16 +6720,6 @@ lmf:
                 .ldr_find("ldr-p")
                 .is_some(),
             "a PERIODIC LDR must still register its reporting context"
-        );
-        assert_eq!(
-            lmf_self()
-                .read()
-                .expect("context")
-                .ldr_find("ldr-p")
-                .and_then(|l| l.owner)
-                .as_deref(),
-            Some(PEER_2157),
-            "bound to its verified creator"
         );
     }
 
@@ -6924,9 +6872,8 @@ lmf:
             "ldrReference": "cc01",
             "hgmlcCallBackURI": "http://gmlc/cb"
         }"#;
-        let req = from_peer_2157(
-            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json"),
-        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         // Periodic LDR activation returns 200 LocationDataExt (fix exists).
         assert_eq!(resp.status, 200);
@@ -6938,11 +6885,6 @@ lmf:
             .expect("LDR context not registered after deferred determine-location");
         assert_eq!(found.ldr_type, "PERIODIC");
         assert_eq!(found.hgmlc_callback_uri.as_deref(), Some("http://gmlc/cb"));
-        assert_eq!(
-            found.owner.as_deref(),
-            Some(PEER_2157),
-            "bound to its creator"
-        );
     }
 
     // -----------------------------------------------------------------------

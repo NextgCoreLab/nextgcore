@@ -7830,12 +7830,12 @@ udr:
     #[tokio::test]
     async fn wsb6_auth_status_put_delete_no_sqn_side_effect() {
         let _store = DbiTestStore::enable().await;
-        // #2157: through `start_udr`, which declares the dev profile. The
-        // auth-status PUT/DELETE is a write of the UDM's context data, admitted
-        // under production only from a verified UDM (#2079), and this loopback
-        // peer proves no identity; alone the PUT was 403, and it passed only
-        // after a sibling had set Dev.
-        let (udr, client) = start_udr().await;
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
         let supi = "imsi-999990000000602";
         let s0: u64 = 0x40;
         wsb6_provision(&client, supi, s0).await;
@@ -7890,12 +7890,12 @@ udr:
     #[tokio::test]
     async fn wsb6_udm_av_flow_advances_sqn_one_step_per_av() {
         let _store = DbiTestStore::enable().await;
-        // #2157: through `start_udr`, which declares the dev profile. The
-        // auth-status PUT/DELETE is a write of the UDM's context data, admitted
-        // under production only from a verified UDM (#2079), and this loopback
-        // peer proves no identity; alone the PUT was 403, and it passed only
-        // after a sibling had set Dev.
-        let (udr, client) = start_udr().await;
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
         let supi = "imsi-999990000000603";
         let s0: u64 = 0x20;
         let auth_path = wsb6_provision(&client, supi, s0).await;

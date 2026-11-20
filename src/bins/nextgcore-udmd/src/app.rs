@@ -2844,36 +2844,40 @@ pub async fn sweep_expired_ee_subscriptions(now: u64) -> usize {
             .unwrap_or_default()
     };
     let count = expired.len();
-    // #2149 (R42 on #2144), the #2128 shape: releases are grouped by the AMF
-    // holding each leg, up to EE_SWEEP_MAX_AMFS AMFs at once, each in turn. An
-    // AMF that fails one release (no answer, a 5xx) is not tried again this
-    // sweep: its remaining legs are parked for the unsubscribe reconciler at
-    // once. So a blackholed AMF costs one request timeout per sweep, and the
-    // other AMFs' legs are released regardless.
-    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<UdmEeSubscription>> =
-        std::collections::BTreeMap::new();
-    for sub in expired {
+    // #2149 (R42 on #2144), the #2128 shape, now the shared sweep (#2186):
+    // releases are grouped by the AMF holding each leg, one at a time per AMF, up
+    // to EE_SWEEP_MAX_AMFS AMFs at once. An AMF that fails one release (no
+    // answer, a 5xx) is parked for the rest of the pass, and so is anything the
+    // pass's budget does not reach: those legs go to the unsubscribe reconciler
+    // at once (the records are already gone, so nothing else would release them).
+    // So a blackholed AMF costs one request timeout per sweep, and the other
+    // AMFs' legs are released regardless.
+    let items = expired.into_iter().map(|sub| {
         log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
-        by_amf
-            .entry(crate::ee_amf::leg_authority(&sub))
-            .or_default()
-            .push(sub);
+        (crate::ee_amf::leg_authority(&sub), sub)
+    });
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: EE_SWEEP_MAX_AMFS,
+        budget: EE_EXPIRY_SWEEP,
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        items,
+        || (),
+        |_amf, sub: UdmEeSubscription, ()| async move {
+            let verdict = if crate::ee_amf::release_with(&sub, true).await {
+                nextgcore_sbi::sweep::Verdict::Answered
+            } else {
+                nextgcore_sbi::sweep::Verdict::PeerDown
+            };
+            (verdict, ())
+        },
+    )
+    .await;
+    for (_, sub, _) in report.skipped {
+        crate::ee_amf::release_with(&sub, false).await;
     }
-    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(EE_SWEEP_MAX_AMFS));
-    let mut workers = tokio::task::JoinSet::new();
-    for (_, subs) in by_amf {
-        let slots = slots.clone();
-        workers.spawn(async move {
-            let _slot = slots.acquire_owned().await;
-            let mut amf_failed = false;
-            for sub in &subs {
-                if !crate::ee_amf::release_with(sub, !amf_failed).await {
-                    amf_failed = true;
-                }
-            }
-        });
-    }
-    while workers.join_next().await.is_some() {}
     count
 }
 
