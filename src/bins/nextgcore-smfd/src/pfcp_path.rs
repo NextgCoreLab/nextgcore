@@ -1677,6 +1677,16 @@ impl PfcpClient {
         let psa_leg = client_for_session(smf_seid).map(|c| (c, smf_seid, upf_seid));
         // (first, first's undo, second's send): which UPF goes first.
         let toward_active = matches!(split.direction, Direction::TowardActive(_));
+        // Armed before the first half is sent (R43 on #2243, minor 2): a
+        // cancellation while it is in flight cannot know whether the UPF applied
+        // it, so it is undone either way. The undo restores the previous state,
+        // so an undo of a half never applied changes nothing.
+        let undo = if toward_active {
+            Some((iupf_leg, split.iupf_restore.clone()))
+        } else {
+            psa_leg.map(|l| (l, split.psa_restore.clone()))
+        };
+        let mut guard = UndoOnDrop(undo);
         let first = if toward_active {
             iupf.session_request_direct(msg, leg.smf_seid, Some(leg.upf_seid), &iupf_body)
                 .await
@@ -1685,15 +1695,10 @@ impl PfcpClient {
                 .await
         };
         if !accepted(&first) {
+            // Refused or failed: the UPF applied nothing (TS 29.244 §6.3.3).
+            guard.0 = None;
             return first;
         }
-        // The first half is applied: until the second is, a cancellation undoes it.
-        let undo = if toward_active {
-            Some((iupf_leg, split.iupf_restore.clone()))
-        } else {
-            psa_leg.map(|l| (l, split.psa_restore.clone()))
-        };
-        let mut guard = UndoOnDrop(undo);
         crate::iupf::test_hold_between_legs().await;
         let second = if toward_active {
             self.session_request_direct(msg, smf_seid, upf_seid, &split.psa)

@@ -23,6 +23,10 @@ path = "src/main.rs"
 ## Rel-19 "Compute-Aware Networking" has no frozen Stage-3 (research knob).
 ## Enable with: cargo build -p nextgcore-upfd --features compute-aware-upf
 compute-aware-upf = []
+## #2208 (R41 on #2231): test-only items of the library (`session_metrics::
+## MODE_TEST_LOCK`), for the binary's own tests and for other crates' in-process
+## tests. Off in every production build.
+test-support = []
 
 [dependencies]
 nextgcore-core = { workspace = true }
@@ -47,6 +51,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# The binary's tests compile against the library: they need its test-support items.
+nextgcore-upfd = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

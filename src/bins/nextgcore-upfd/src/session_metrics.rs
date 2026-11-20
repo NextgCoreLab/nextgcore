@@ -53,10 +53,10 @@ impl Mode {
 /// The process's mode, set once at startup. Test lock: [`MODE_TEST_LOCK`].
 static MODE: AtomicU8 = AtomicU8::new(0);
 
-/// Serialises the tests that set [`MODE`] (declared beside it). Not
-/// `#[cfg(test)]` (#2208): the binary's tests set the mode too, and they compile
-/// against this library built without `cfg(test)`.
-#[doc(hidden)]
+/// Serialises the tests that set [`MODE`] (declared beside it). Also under the
+/// `test-support` feature (#2208, R41 on #2231): the binary's tests set the mode
+/// too, and they compile against this library without `cfg(test)`.
+#[cfg(any(test, feature = "test-support"))]
 pub static MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn set_mode(mode: Mode) {

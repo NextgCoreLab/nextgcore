@@ -196,7 +196,7 @@ fn the_ie_names_the_peer_and_the_dscp() {
         TransportDelayPdr::from_ie(&ie),
         Some(TransportDelayPdr {
             peer: ip("10.45.0.7"),
-            dscp: Some(34)
+            dscp: Some(34),
         })
     );
     // An IPv4-mapped IPv6 peer is the IPv4 peer (the probe's answer comes from it).
@@ -383,4 +383,36 @@ fn each_dscp_is_probed_and_measured_on_its_own() {
     m.on_echo_response(probes[0].0, probes[0].2, t0 + Duration::from_millis(20));
     m.on_echo_response(probes[1].0, probes[1].2, t0 + Duration::from_millis(4));
     assert_eq!((m.delay_for(1, 1), m.delay_for(1, 2)), (Some(10), Some(2)));
+}
+
+/// #2208 (R43 M1 on #2249): a PDI's Source Interface Type (IE 160, TS 29.244
+/// §8.2.118) is parsed, its 6-bit value, so the data plane can tell an N3
+/// preceding peer from an N9 one.
+#[test]
+fn a_pdi_s_source_interface_type_is_parsed_2208() {
+    let tlv = |t: u16, v: &[u8]| {
+        let mut b = t.to_be_bytes().to_vec();
+        b.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        b.extend_from_slice(v);
+        b
+    };
+    let mut pdi = tlv(20, &[0]);
+    pdi.extend(tlv(160, &[0xcf])); // spare bits set: value 15 (N9)
+    let mut pdr = tlv(56, &1u16.to_be_bytes());
+    pdr.extend(tlv(29, &100u32.to_be_bytes()));
+    pdr.extend(tlv(2, &pdi));
+    pdr.extend(tlv(108, &1u32.to_be_bytes()));
+    let p = crate::n4_build::parse_create_pdr(&pdr).unwrap();
+    assert_eq!(p.pdi.source_interface_type, Some(15));
+    let mut bare = tlv(56, &1u16.to_be_bytes());
+    bare.extend(tlv(29, &100u32.to_be_bytes()));
+    bare.extend(tlv(2, &tlv(20, &[0])));
+    bare.extend(tlv(108, &1u32.to_be_bytes()));
+    assert_eq!(
+        crate::n4_build::parse_create_pdr(&bare)
+            .unwrap()
+            .pdi
+            .source_interface_type,
+        None
+    );
 }

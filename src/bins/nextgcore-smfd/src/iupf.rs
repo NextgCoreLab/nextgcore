@@ -95,6 +95,11 @@ pub struct IupfLeg {
     /// (R43 M1 on #2243): what a failed split restores.
     #[serde(default)]
     pub dl_tunnel: Option<(u32, [u8; 4])>,
+    /// FAR 2's last full Apply Action while it has no NG-RAN tunnel (BUFF, or
+    /// BUFF|NOCP at AN release), so a restore puts back exactly that, NOCP and
+    /// all, and an idle UE is still paged (R43 on #2243, minor 1). `None`: BUFF.
+    #[serde(default)]
+    pub idle_action: Option<u16>,
 }
 
 struct Config {
@@ -124,6 +129,17 @@ fn applies_to(dnn: &str) -> Option<Arc<PfcpClient>> {
     let g = CONFIG.read().unwrap_or_else(|e| e.into_inner());
     let c = g.as_ref()?;
     (c.dnns.is_empty() || c.dnns.iter().any(|d| d == dnn)).then(|| c.client.clone())
+}
+
+/// The 3GPP Interface Type N9 (TS 29.244 Table 8.2.118-1).
+pub const INTERFACE_TYPE_N9: u8 = 15;
+
+/// Whether a new session on `dnn` is about to get the I-UPF: one is configured
+/// for it and associated. Its PSA's UL PDR then says its Source Interface Type is
+/// N9 (IE 160, TS 29.244 §8.2.118), which is how the PSA knows an I-UPF, not the
+/// NG-RAN, precedes it (R43 M1 on #2249).
+pub fn will_insert(dnn: &str) -> bool {
+    applies_to(dnn).is_some_and(|c| c.is_associated_sync())
 }
 
 /// The I-UPF leg of the PSA session `psa_seid`, if it has one.
@@ -362,6 +378,7 @@ pub async fn insert(psa_seid: u64, dnn: &str, psa_ul: (u32, [u8; 4])) -> Option<
         n9: *n9,
         psa_ul,
         dl_tunnel: None,
+        idle_action: None,
     };
     store_leg(psa_seid, Some(leg));
     log::info!(
@@ -411,7 +428,7 @@ pub struct Split {
     pub psa_restore: Vec<u8>,
 }
 
-fn far2_to(tunnel: Option<(u32, [u8; 4])>) -> Vec<u8> {
+fn far2_to(tunnel: Option<(u32, [u8; 4])>, idle_action: Option<u16>) -> Vec<u8> {
     let far = match tunnel {
         Some((teid, ip)) => n4_build::build_update_far_activate(
             crate::DL_FAR_ID,
@@ -419,9 +436,10 @@ fn far2_to(tunnel: Option<(u32, [u8; 4])>) -> Vec<u8> {
             Some((0x0100, teid, Some(ip), None)),
             false,
         ),
-        None => {
-            n4_build::build_update_far_apply_action(crate::DL_FAR_ID, n4_build::apply_action::BUFF)
-        }
+        None => n4_build::build_update_far_apply_action(
+            crate::DL_FAR_ID,
+            idle_action.unwrap_or(n4_build::apply_action::BUFF),
+        ),
     };
     let mut b = PfcpMessageBuilder::new();
     b.add_tlv(pfcp_ie::UPDATE_FAR, &far);
@@ -529,8 +547,8 @@ pub fn split_modification(body: &[u8], leg: &IupfLeg) -> Split {
         psa,
         iupf,
         direction,
-        iupf_restore: far2_to(leg.dl_tunnel),
-        psa_restore: far2_to(leg.dl_tunnel.map(|_| leg.n9)),
+        iupf_restore: far2_to(leg.dl_tunnel, leg.idle_action),
+        psa_restore: far2_to(leg.dl_tunnel.map(|_| leg.n9), leg.idle_action),
     }
 }
 
@@ -541,7 +559,10 @@ pub fn note_applied(psa_seid: u64, direction: Direction) {
     };
     match direction {
         Direction::TowardActive(t) => leg.dl_tunnel = Some(t),
-        Direction::ApplyAction(a) if a & n4_build::apply_action::FORW == 0 => leg.dl_tunnel = None,
+        Direction::ApplyAction(a) if a & n4_build::apply_action::FORW == 0 => {
+            leg.dl_tunnel = None;
+            leg.idle_action = Some(a);
+        }
         _ => return,
     }
     store_leg(psa_seid, Some(leg));

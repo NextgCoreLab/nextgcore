@@ -345,7 +345,7 @@ async fn main() -> Result<()> {
     setup_signal_handlers(shutdown.clone())?;
 
     // Initialize UPF context
-    upf_context_init(args.max_sessions);
+    process::init(args.max_sessions);
     log::info!(
         "UPF context initialized (max_sessions={})",
         args.max_sessions
@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
                 nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
                     nf_instance_id,
                     5,
-                    || upf_self().get_load(),
+                    process::load,
                 );
             },
         )
@@ -527,7 +527,7 @@ async fn main() -> Result<()> {
     // The NRF heartbeat worker was spawned above with a closure that calls
     // `get_load()` per tick, so it picks this up on its next tick; the load reported
     // in the registration itself is 0, which is correct at start-up.
-    upf_self().set_session_gauge(pfcp_server.session_count_handle());
+    process::set_session_gauge(pfcp_server.session_count_handle());
 
     // #380: the Prometheus endpoint. Its sources (installed below, once the data plane
     // is shared) are the SAME handles the load gauge uses, so the metric and the NRF
@@ -617,7 +617,7 @@ async fn main() -> Result<()> {
     log::info!("UPF state machine finalized");
 
     // Cleanup context
-    upf_context_final();
+    process::finish();
     log::info!("UPF context finalized");
 
     log::info!("NextGCore UPF stopped");
@@ -691,8 +691,7 @@ async fn register_upf_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile =
-        build_upf_nf_profile(nf_instance_id, pfcp_addr, gtpu_addr, upf_self().get_load());
+    let nf_profile = build_upf_nf_profile(nf_instance_id, pfcp_addr, gtpu_addr, process::load());
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -839,8 +838,7 @@ async fn run_async_event_loop(
 
 /// Update session statistics, check URR thresholds, and trigger usage reports
 async fn update_session_stats() {
-    let ctx = upf_self();
-    let sess_count = ctx.sess_count();
+    let sess_count = process::session_count();
     if sess_count > 0 {
         log::debug!("Active sessions: {sess_count}");
     }

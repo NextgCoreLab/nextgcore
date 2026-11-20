@@ -66,5 +66,36 @@ mod property_tests;
 pub mod runtime;
 pub mod session_apply;
 
-pub use context::{upf_context_final, upf_context_init, upf_self};
+/// The process context, as far as the binary drives it (#2208, R41 on #2231):
+/// its lifecycle, its load and its session count. `context` itself stays
+/// private (#335), so its other items keep the `dead_code` coverage.
+pub mod process {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    /// Initialise the process context for `max_sessions` sessions.
+    pub fn init(max_sessions: usize) {
+        crate::context::upf_context_init(max_sessions);
+    }
+
+    /// Tear the process context down.
+    pub fn finish() {
+        crate::context::upf_context_final();
+    }
+
+    /// The load this UPF reports (NFProfile `load`, Load Control Information).
+    pub fn load() -> u8 {
+        crate::context::upf_self().get_load()
+    }
+
+    /// The N4 session census the load is computed from (#325).
+    pub fn set_session_gauge(gauge: Arc<AtomicUsize>) {
+        crate::context::upf_self().set_session_gauge(gauge);
+    }
+
+    /// The number of sessions the context counts.
+    pub fn session_count() -> usize {
+        crate::context::upf_self().sess_count()
+    }
+}
 pub use session_apply::handle_pfcp_session_event;

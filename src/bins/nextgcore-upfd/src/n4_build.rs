@@ -116,6 +116,8 @@ pub mod pfcp_ie {
     pub const QUERY_URR_REFERENCE: u16 = 125;
     pub const CAUSE: u16 = 19;
     pub const SOURCE_INTERFACE: u16 = 20;
+    /// 3GPP Interface Type (TS 29.244 §8.2.118): in a PDI, the Source Interface Type.
+    pub const TGPP_INTERFACE_TYPE: u16 = 160;
     pub const F_TEID: u16 = 21;
     pub const NETWORK_INSTANCE: u16 = 22;
     pub const SDF_FILTER: u16 = 23;
@@ -1551,6 +1553,9 @@ pub struct ParsedPdi {
     pub qfi: Option<u8>,
     /// Flow description from the first SDF Filter IE (3GPP TS 29.212 IPFilterRule)
     pub sdf_flow_description: Option<String>,
+    /// #2208: the Source Interface Type (3GPP Interface Type IE 160, TS 29.244
+    /// §8.2.118, Table 7.5.2.2-2), its 6-bit value: 11-14 N3, 15/21/23 N9.
+    pub source_interface_type: Option<u8>,
 }
 
 /// Parse PDI IE
@@ -1562,6 +1567,13 @@ fn parse_pdi(data: &[u8]) -> Result<ParsedPdi, &'static str> {
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::SOURCE_INTERFACE) {
         if !ie.value.is_empty() {
             pdi.source_interface = ie.value[0];
+        }
+    }
+
+    // #2208: Source Interface Type (3GPP Interface Type, §8.2.118).
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TGPP_INTERFACE_TYPE) {
+        if let Some(v) = ie.value.first() {
+            pdi.source_interface_type = Some(v & 0x3f);
         }
     }
 
