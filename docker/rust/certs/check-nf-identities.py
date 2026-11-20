@@ -432,9 +432,13 @@ def check_k8s(table, fname, docs):
                 nf_type, want = table[row]
                 if nf_type == 'NRF':
                     # #2052: the IDs its nf_set_allowlist names are other NFs'.
+                    # #2103 (R30 on #2064): exempt only where they are named, under
+                    # nrf.nf_set_allowlist. Subtracting them by ID hid an allowlisted
+                    # ID the NRF also configured anywhere else.
                     allowlist = nrf_allowlist(k8s_texts(c, pod, configmaps))
                     errors += check_nrf_allowlist(w, table, allowlist)
-                    ids = ids - {i for i, _ in allowlist if i != want}
+                    ids = {u.lower() for t in k8s_texts(c, pod, configmaps)
+                           for u in UUID.findall(without_nrf_allowlist(t))}
                 if not ids:
                     errors.append('%s pins no nfInstanceId; its certificate names urn:uuid:%s'
                                   % (w, want))
@@ -475,6 +479,23 @@ def nrf_allowlist(texts):
                     out.append((str(i).strip().lower(),
                                 [str(t).strip().upper() for t in types] if types else None))
     return out
+
+
+def without_nrf_allowlist(text):
+    """#2103: `text` with its `nrf.nf_set_allowlist` subtree removed, so the IDs only
+    the allowlist names are not read as the NRF's own, while the same ID anywhere
+    else still is. A text that is not YAML, or has no allowlist, is returned as is."""
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except yaml.YAMLError:
+        return text
+    changed = False
+    for doc in docs:
+        nrf = doc.get('nrf') if isinstance(doc, dict) else None
+        if isinstance(nrf, dict) and 'nf_set_allowlist' in nrf:
+            del nrf['nf_set_allowlist']
+            changed = True
+    return yaml.safe_dump_all(docs) if changed else text
 
 
 def check_nrf_allowlist(where, table, allowlist):
@@ -913,6 +934,14 @@ def self_test():
     # Outside the allowlist the NRF still may configure no other NF's ID.
     errs = broken6(lambda d: d[2]['spec']['template']['spec']['containers'][0]['env'].append(
         {'name': 'X', 'value': t6['amf'][1]}))
+    assert any('configures ' + t6['amf'][1] in e for e in errs), errs
+    # #2103 (R30 on #2064): even with that ID ALSO allowlisted. The exemption is the
+    # allowlist's key path, not the ID: subtracting by ID hid this one.
+    def allowlisted_and_elsewhere(d):
+        nrf_with([amf_entry])(d)
+        d[2]['spec']['template']['spec']['containers'][0]['env'].append(
+            {'name': 'X', 'value': t6['amf'][1]})
+    errs = broken6(allowlisted_and_elsewhere)
     assert any('configures ' + t6['amf'][1] in e for e in errs), errs
     # Rule 7: a Helm render, as rule 6 plus the rendered identity table.
     t7 = {'amf': t6['amf'], 'nrf': t6['nrf']}
