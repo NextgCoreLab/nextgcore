@@ -1,4 +1,5 @@
-# #2222: the SMF of the nightly I-UPF per-flow delay run (run.sh). The PSA is
+# #2222: the SMF of the nightly I-UPF per-flow delay run. run.sh rewrites
+# 172.29.22. to the run's own subnet. The PSA is
 # UPF_PFCP_ADDR (run.sh); the I-UPF is inserted on N9 for every DNN.
 logger:
   level: info

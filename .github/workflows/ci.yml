@@ -967,8 +967,9 @@ jobs:
     # (src/tests/e2e/iupf_delay_harness.rs). The PCF's PCC rule asks for QoS
     # monitoring under `smf.qos_monitoring.method: gtpu_path`; the per-flow delay
     # the SMF reports to it must be RAN + N3 (the gNB's held Echo) + N9 (tc
-    # netem between the UPFs). The negative control injects no N9 delay and must
-    # fail. What the per-PR in-process test does not prove, and what neither
+    # netem between the UPFs), within a band narrower than N3 and N9. The
+    # negative control injects no N9 delay and must fail, and the difference of
+    # the two arms' DL must be N9 (check-n9.sh, R43). What the per-PR in-process test does not prove, and what neither
     # does: docker/iupf-delay-e2e/run.sh's header.
     runs-on: ubuntu-latest
     needs: check
@@ -1013,6 +1014,10 @@ jobs:
             exit 1
           fi
           grep -q '^FAIL: DL' "$IUPF_DELAY_OUT/no-n9/results.txt"
+      - name: the N9 part, differentially (pass DL - no-N9 DL = N9)
+        run: |
+          bash docker/iupf-delay-e2e/check-n9.sh "$IUPF_DELAY_OUT/pass/results.txt" "$IUPF_DELAY_OUT/no-n9/results.txt" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: upload the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
