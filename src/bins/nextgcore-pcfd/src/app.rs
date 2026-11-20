@@ -5353,7 +5353,7 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         // AF media components → PCC rules persisted on the bound session and
         // pushed to the SMF in an SM policy update notify (TS 29.514 §4.2.2.2).
         if let Some(ref sess) = bound_sess {
-            let new_rules = media_components_to_pcc(&asc, sess);
+            let new_rules = media_components_to_pcc(&asc, sess, app.id);
             let installed = new_rules.len();
             let rule_ids: Vec<String> = new_rules.iter().map(|r| r.pcc_rule_id.clone()).collect();
             if let Ok(context) = ctx.read() {
@@ -5546,24 +5546,34 @@ fn refresh_af_qos_mon(app_id: u64) -> bool {
     changed
 }
 
-/// #2221: remove app session `app_session_id`'s QoS monitoring policy from PDU
-/// session `sess_id`. Returns whether it had one.
-fn withdraw_af_qos_mon(sess_id: u64, app_session_id: &str) -> bool {
+/// #2221 (R47): remove what app session `app` installed on its PDU session: its
+/// PCC rules (TS 29.514 §4.2.4.2) and its QoS monitoring policy. Returns the
+/// removed rules and the removed instance's `qmId`, for the SMF to be told.
+fn remove_app_policy(
+    app: &crate::context::PcfApp,
+) -> (Vec<npcf_handler::AfPccRule>, Option<String>) {
     let ctx = pcf_self();
     let Ok(context) = ctx.read() else {
-        return false;
+        return (Vec::new(), None);
     };
-    let Some(mut sess) = context.sess_find_by_id(sess_id) else {
-        return false;
+    let Some(mut sess) = context.sess_find_by_id(app.sess_id) else {
+        return (Vec::new(), None);
     };
-    let before = sess.af_qos_mon.len();
+    let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut sess.af_pcc_rules)
+        .into_iter()
+        .partition(|r| app.pcc_rule_ids.contains(&r.pcc_rule_id));
+    sess.af_pcc_rules = kept;
+    let qm_id = sess
+        .af_qos_mon
+        .iter()
+        .find(|q| q.app_session_id == app.app_session_id)
+        .map(|q| q.qm_id.clone());
     sess.af_qos_mon
-        .retain(|q| q.app_session_id != app_session_id);
-    let changed = sess.af_qos_mon.len() != before;
-    if changed {
+        .retain(|q| q.app_session_id != app.app_session_id);
+    if !removed.is_empty() || qm_id.is_some() {
         context.sess_update(&sess);
     }
-    changed
+    (removed, qm_id)
 }
 
 /// #2221: the SMF's QoS monitoring reports (TS 29.512 §4.2.4.24, `qosMonReports`
@@ -6117,10 +6127,11 @@ pub async fn handle_app_session_delete(app_session_id: &str, request: &SbiReques
         Some(app) => {
             // Removing AF media components revokes their PCC rules at the
             // SMF: push the SM policy delete/update notification.
-            pcf_sbi_send_smpolicycontrol_delete_notify(app.sess_id, app.id);
-            // #2221: its QoS monitoring policy goes with it.
-            if withdraw_af_qos_mon(app.sess_id, &app.app_session_id) {
-                pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
+            // #2221 (R47): its PCC rules and QoS monitoring policy are removed
+            // from the session and, in one decision, from the SMF.
+            let (removed, qm_id) = remove_app_policy(&app);
+            if !removed.is_empty() || qm_id.is_some() {
+                pcf_sbi_send_smpolicycontrol_delete_notify(app.sess_id, &removed, qm_id.as_deref());
             }
             if let Ok(context) = ctx.read() {
                 context.app_remove(app.id);
@@ -6219,7 +6230,7 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
                 let mut rule_ids = Vec::new();
                 if let Ok(context) = ctx.read() {
                     if let Some(mut sess) = context.sess_find_by_id(app.sess_id) {
-                        let new_rules = media_components_to_pcc(&asc, &sess);
+                        let new_rules = media_components_to_pcc(&asc, &sess, app.id);
                         installed = new_rules.len();
                         rule_ids = new_rules.iter().map(|r| r.pcc_rule_id.clone()).collect();
                         merge_af_pcc_rules(&mut sess, new_rules);

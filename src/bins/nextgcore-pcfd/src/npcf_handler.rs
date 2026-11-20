@@ -425,12 +425,18 @@ fn five_qi_for_component(mc: &MediaComponent) -> u8 {
 /// component the flowDescriptions become flowInfos, `medType`/`marBw{Ul,Dl}`
 /// and the resolved 5QI become a QosData (with `gbr` for GBR 5QIs), and
 /// `fStatus` becomes the rule flow status. PCC rule ids are stable per
-/// (session, medCompN) so a modify replaces the same rule.
-pub fn media_components_to_pcc(req: &AscReqData, sess: &PcfSess) -> Vec<AfPccRule> {
+/// (session, app session, medCompN) so a modify replaces the same rule.
+///
+/// #2221 (R47 M1): the app session (`app_id`, its [`crate::context::PcfApp::id`])
+/// is part of the key. Every AF numbers its media components from 1, so keyed by
+/// (session, medCompN) alone two app sessions on one PDU session shared a rule:
+/// the second overwrote the first's flows, and a QoS monitoring report on it
+/// went to both AFs.
+pub fn media_components_to_pcc(req: &AscReqData, sess: &PcfSess, app_id: u64) -> Vec<AfPccRule> {
     let mut rules = Vec::with_capacity(req.med_components.len());
 
     for mc in &req.med_components {
-        let rule_key = format!("af-{}-{}", sess.psi, mc.med_comp_n);
+        let rule_key = format!("af-{}-{app_id}-{}", sess.psi, mc.med_comp_n);
         let pcc_rule_id = format!("PccRule-{rule_key}");
         let qos_id = format!("QosData-{rule_key}");
 
@@ -540,21 +546,58 @@ pub fn build_af_sm_policy_notification(sess: &PcfSess) -> serde_json::Value {
         if !decs.is_empty() {
             decision.insert("qosMonDecs".to_string(), serde_json::Value::Object(decs));
         }
-        let mut triggers = sess.policy_triggers.clone();
-        triggers.retain(|t| t != "QOS_MONITORING");
-        if !sess.af_qos_mon.is_empty() {
-            triggers.push("QOS_MONITORING".to_string());
-        }
-        decision.insert(
-            "policyCtrlReqTriggers".to_string(),
-            serde_json::json!(triggers),
-        );
+        decision.insert("policyCtrlReqTriggers".to_string(), qos_mon_triggers(sess));
     }
     decision.insert("pccRules".to_string(), pcc_rules);
     decision.insert("qosDecs".to_string(), qos_decs);
     decision.extend(sess.tsc_containers.to_decision_fragment());
     serde_json::json!({
         "resourceUri": crate::sbi_path::pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
+        "smPolicyDecision": serde_json::Value::Object(decision),
+    })
+}
+
+/// #2221: the session's `policyCtrlReqTriggers` restated: the create answer's,
+/// plus QOS_MONITORING while a QoS monitoring policy is held. A decision carrying
+/// the list replaces the SMF's (TS 29.512 §4.2.6.2.1), so it is always whole.
+fn qos_mon_triggers(sess: &PcfSess) -> serde_json::Value {
+    let mut triggers = sess.policy_triggers.clone();
+    triggers.retain(|t| t != "QOS_MONITORING");
+    if !sess.af_qos_mon.is_empty() {
+        triggers.push("QOS_MONITORING".to_string());
+    }
+    serde_json::json!(triggers)
+}
+
+/// #2221 (R47): the SmPolicyNotification that removes a deleted app session's
+/// policy from the SMF (TS 29.514 §4.2.4.2; TS 29.512 §4.2.6.1, where a `null`
+/// map entry removes the resource): its PCC rules and their QosData, and, when it
+/// had one, its QoS monitoring instance, with the trigger list restated. `sess`
+/// is the session after the removal.
+pub fn build_af_removal_notification(
+    sess: &PcfSess,
+    removed: &[AfPccRule],
+    qm_id: Option<&str>,
+) -> serde_json::Value {
+    let pcc: serde_json::Map<String, serde_json::Value> = removed
+        .iter()
+        .map(|r| (r.pcc_rule_id.clone(), serde_json::Value::Null))
+        .collect();
+    let qos: serde_json::Map<String, serde_json::Value> = removed
+        .iter()
+        .map(|r| (r.qos_data.qos_id.clone(), serde_json::Value::Null))
+        .collect();
+    let mut decision = serde_json::Map::new();
+    decision.insert("pccRules".to_string(), serde_json::Value::Object(pcc));
+    decision.insert("qosDecs".to_string(), serde_json::Value::Object(qos));
+    if let Some(qm) = qm_id {
+        decision.insert("qosMonDecs".to_string(), serde_json::json!({ qm: null }));
+    }
+    if sess.qos_mon_provisioned {
+        decision.insert("policyCtrlReqTriggers".to_string(), qos_mon_triggers(sess));
+    }
+    serde_json::json!({
+        "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
         "smPolicyDecision": serde_json::Value::Object(decision),
     })
 }
@@ -619,10 +662,10 @@ mod tests {
             ..Default::default()
         };
 
-        let rules = media_components_to_pcc(&req, &sess);
+        let rules = media_components_to_pcc(&req, &sess, 7);
         assert_eq!(rules.len(), 1);
         let rule = &rules[0];
-        assert_eq!(rule.pcc_rule_id, "PccRule-af-5-1");
+        assert_eq!(rule.pcc_rule_id, "PccRule-af-5-7-1");
         assert_eq!(rule.precedence, 101);
         assert_eq!(rule.flow_status, FlowStatus::Enabled);
 
@@ -652,7 +695,7 @@ mod tests {
 
         // PccRule JSON references the QosData by its qosId.
         let pjson = rule.to_json();
-        assert_eq!(pjson["pccRuleId"], "PccRule-af-5-1");
+        assert_eq!(pjson["pccRuleId"], "PccRule-af-5-7-1");
         assert_eq!(pjson["refQosData"][0], qos.qos_id);
         assert_eq!(pjson["flowStatus"], "ENABLED");
     }
@@ -681,7 +724,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rules = media_components_to_pcc(&req, &sess);
+        let rules = media_components_to_pcc(&req, &sess, 7);
         let rule = &rules[0];
         assert_eq!(rule.qos_data.five_qi, 6); // numeric qosReference wins
         assert!(rule.qos_data.gbr_dl.is_none()); // 5QI 6 is non-GBR
@@ -713,14 +756,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        sess.af_pcc_rules = media_components_to_pcc(&req, &sess);
+        sess.af_pcc_rules = media_components_to_pcc(&req, &sess, 7);
 
         let body = build_af_sm_policy_notification(&sess);
         assert!(body["resourceUri"]
             .as_str()
             .unwrap()
             .contains(&sess.sm_policy_id));
-        let pcc = &body["smPolicyDecision"]["pccRules"]["PccRule-af-5-1"];
+        let pcc = &body["smPolicyDecision"]["pccRules"]["PccRule-af-5-7-1"];
         assert_eq!(pcc["precedence"], 101);
         assert_eq!(
             pcc["flowInfos"][0]["flowDescription"],

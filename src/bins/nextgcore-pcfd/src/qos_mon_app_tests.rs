@@ -332,3 +332,189 @@ async fn qos_monitoring_needs_the_features_negotiated_on_both_legs_2221() {
     assert!(dec.get("repPeriod").is_none(), "{dec}");
     server.stop().await.ok();
 }
+
+/// [`af_body`] for the AF at `/<af>`.
+fn af_body_at(
+    port: u16,
+    af: &str,
+    ipv4: &str,
+    supp_feat: &str,
+    ev_subsc: serde_json::Value,
+) -> serde_json::Value {
+    let mut body = af_body(port, ipv4, supp_feat, ev_subsc);
+    body["notifUri"] = serde_json::json!(format!("http://127.0.0.1:{port}/{af}"));
+    body
+}
+
+/// The PCC rules app session `app_session_id` installed.
+fn rules_of(app_session_id: &str) -> Vec<String> {
+    pcf_self()
+        .read()
+        .unwrap()
+        .app_find_by_app_session_id(app_session_id)
+        .expect("the app session")
+        .pcc_rule_ids
+}
+
+async fn af_session(port: u16, af: &str, ipv4: &str) -> String {
+    let (status, asc) = route(
+        "POST",
+        "/npcf-policyauthorization/v1/app-sessions",
+        af_body_at(port, af, ipv4, PA_16_44, qos_mon_subsc()),
+    )
+    .await;
+    assert_eq!(status, 201, "{asc}");
+    asc["appSessionId"].as_str().unwrap().to_string()
+}
+
+/// #2221 (R47 M1): two AFs on one PDU session, each numbering its media from 1,
+/// get a PCC rule each, each referencing only its own QoS monitoring instance,
+/// and a report on one AF's rule reaches only that AF (TS 29.514 §4.2.5.14).
+/// Keyed by (PDU session, medCompN) the second AF overwrote the first's rule,
+/// and the report went to both.
+///
+/// REVERT-VERIFIED: see the PR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+async fn each_af_on_a_pdu_session_gets_only_its_own_qos_monitoring_reports_2221() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    crate::test_support::init_context();
+    let (seen, port, server) = recorder().await;
+    let ip = "10.45.22.20";
+    let (pol, _) = sm_policy(port, "imsi-001010000022220", ip, &sm_24_73()).await;
+    let a = af_session(port, "afA", ip).await;
+    let _ = next_post(&seen, "/update", |_| true).await;
+    let b = af_session(port, "afB", ip).await;
+    let n = next_post(&seen, "/update", |d| {
+        d["smPolicyDecision"]["pccRules"]
+            .as_object()
+            .is_some_and(|r| r.len() == 2)
+    })
+    .await;
+    let (rule_a, rule_b) = (rules_of(&a), rules_of(&b));
+    assert_eq!((rule_a.len(), rule_b.len()), (1, 1));
+    assert_ne!(rule_a, rule_b, "a rule per app session");
+    let rules = &n["smPolicyDecision"]["pccRules"];
+    assert_eq!(
+        rules[&rule_a[0]]["refQosMon"],
+        serde_json::json!([format!("QosMon-{a}")])
+    );
+    assert_eq!(
+        rules[&rule_b[0]]["refQosMon"],
+        serde_json::json!([format!("QosMon-{b}")])
+    );
+
+    let (status, _) = route(
+        "POST",
+        &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}/update"),
+        serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["QOS_MONITORING"],
+            "qosMonReports": [{ "refPccRuleIds": [rule_b[0]], "dlDelays": [9] }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let to_b = next_post(&seen, "/afB/notify", |_| true).await;
+    assert_eq!(to_b["qosMonReports"][0]["dlDelays"], serde_json::json!([9]));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let posted = seen.lock().unwrap().clone();
+    assert!(
+        posted.iter().all(|(u, _)| !u.starts_with("/afA")),
+        "AF A is not sent B's report: {posted:?}"
+    );
+    server.stop().await.ok();
+}
+
+/// #2221 (R47): an app session delete removes its PCC rules from the session
+/// and, in one decision, from the SMF (TS 29.514 §4.2.4.2; TS 29.512 §4.2.6.1: a
+/// `null` entry removes): its rule and QosData, its QoS monitoring instance, and
+/// the trigger list restated without QOS_MONITORING. The other app session's
+/// rule stays. Before, a null went for `PccRule-app-<id>`, which nothing installs.
+///
+/// REVERT-VERIFIED: see the PR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+async fn an_app_session_delete_removes_its_rules_at_the_smf_2221() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    crate::test_support::init_context();
+    let (seen, port, server) = recorder().await;
+    let ip = "10.45.22.21";
+    let _ = sm_policy(port, "imsi-001010000022221", ip, &sm_24_73()).await;
+    let a = af_session(port, "afA", ip).await;
+    let _ = next_post(&seen, "/update", |_| true).await;
+    let (status, asc) = route(
+        "POST",
+        "/npcf-policyauthorization/v1/app-sessions",
+        af_body_at(
+            port,
+            "afB",
+            ip,
+            "0",
+            serde_json::json!({ "events": [{ "event": "USAGE_REPORT" }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{asc}");
+    let _ = next_post(&seen, "/update", |_| true).await;
+    let rule_a = rules_of(&a)[0].clone();
+    let qos_a = pcf_self()
+        .read()
+        .unwrap()
+        .sess_find_by_ipv4addr(ip)
+        .unwrap()
+        .af_pcc_rules
+        .iter()
+        .find(|r| r.pcc_rule_id == rule_a)
+        .unwrap()
+        .qos_data
+        .qos_id
+        .clone();
+
+    let resp = pcf_sbi_request_handler(request(
+        "POST",
+        &format!("/npcf-policyauthorization/v1/app-sessions/{a}/delete"),
+        Some(serde_json::json!({})),
+    ))
+    .await;
+    assert!((200..300).contains(&resp.status), "{}", resp.status);
+    let n = next_post(&seen, "/update", |_| true).await;
+    let d = &n["smPolicyDecision"];
+    assert_eq!(
+        d["pccRules"],
+        serde_json::json!({ rule_a.clone(): null }),
+        "{d}"
+    );
+    assert_eq!(d["qosDecs"], serde_json::json!({ qos_a: null }), "{d}");
+    assert_eq!(
+        d["qosMonDecs"],
+        serde_json::json!({ format!("QosMon-{a}"): null }),
+        "{d}"
+    );
+    let triggers = d["policyCtrlReqTriggers"].as_array().unwrap();
+    assert!(
+        !triggers.contains(&serde_json::json!("QOS_MONITORING")),
+        "{triggers:?}"
+    );
+    assert!(
+        triggers.contains(&serde_json::json!("SE_AMBR_CH")),
+        "{triggers:?}"
+    );
+    let left: Vec<String> = pcf_self()
+        .read()
+        .unwrap()
+        .sess_find_by_ipv4addr(ip)
+        .unwrap()
+        .af_pcc_rules
+        .iter()
+        .map(|r| r.pcc_rule_id.clone())
+        .collect();
+    assert_eq!(left.len(), 1, "B's rule stays: {left:?}");
+    assert_ne!(left[0], rule_a);
+    server.stop().await.ok();
+}

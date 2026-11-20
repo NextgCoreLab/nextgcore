@@ -156,7 +156,7 @@ pub fn policy_from_subscription(qm_id: &str, subsc: &Value, pdfr: bool) -> Optio
     Some(data)
 }
 
-/// The `medCompN` of an AF PCC rule (`PccRule-af-<psi>-<medCompN>`,
+/// The `medCompN` of an AF PCC rule (`PccRule-af-<psi>-<appId>-<medCompN>`,
 /// [`crate::npcf_handler::media_components_to_pcc`]).
 fn med_comp_n(pcc_rule_id: &str) -> Option<u64> {
     pcc_rule_id
@@ -328,11 +328,14 @@ mod tests {
     /// not passed on; `pdmf` only under PacketDelayFailureReport.
     #[test]
     fn an_smf_report_becomes_the_af_s_2221() {
-        let own = vec!["PccRule-af-5-1".to_string(), "PccRule-af-5-2".to_string()];
+        let own = vec![
+            "PccRule-af-5-3-1".to_string(),
+            "PccRule-af-5-3-2".to_string(),
+        ];
         let reports = vec![
-            json!({ "refPccRuleIds": ["PccRule-af-5-2", "PccRule-af-5-1", "PccRule-af-5-9"], "dlDelays": [13], "rtDelays": [27] }),
-            json!({ "refPccRuleIds": ["PccRule-af-5-9"], "ulDelays": [1] }),
-            json!({ "refPccRuleIds": ["PccRule-af-5-1"], "pdmf": true }),
+            json!({ "refPccRuleIds": ["PccRule-af-5-3-2", "PccRule-af-5-3-1", "PccRule-af-5-4-1"], "dlDelays": [13], "rtDelays": [27] }),
+            json!({ "refPccRuleIds": ["PccRule-af-5-4-1"], "ulDelays": [1] }),
+            json!({ "refPccRuleIds": ["PccRule-af-5-3-1"], "pdmf": true }),
         ];
         assert_eq!(
             af_reports(&reports, &own, false),
