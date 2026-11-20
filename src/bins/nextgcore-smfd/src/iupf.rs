@@ -422,6 +422,12 @@ impl Drop for BeforeRetry {
 /// names its session only within the association it was queued under; across an
 /// I-UPF restart and re-association it may name a new leg the restarted I-UPF
 /// gave the same SEID, and that leg would be deleted.
+///
+/// R45 M1 on #2283: a pass stopped that way starts a new one. The association
+/// that replaced it was set up with its own call here, which found this pass
+/// running and returned; and that setup bumped the generation and dropped or
+/// kept the queue in one step, so the new pass sends exactly what it kept, under
+/// it.
 pub fn retry_pending_deletions() {
     if pending_deletions() == 0 {
         return;
@@ -437,7 +443,7 @@ pub fn retry_pending_deletions() {
     #[cfg(test)]
     RETRY_PASSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     rt.spawn(async move {
-        let _guard = guard;
+        let guard = guard;
         let generation = client.association_generation().await;
         #[cfg(test)]
         {
@@ -456,6 +462,16 @@ pub fn retry_pending_deletions() {
             // a deletion refused as the association changed fails, and the pass
             // stops with it and the rest queued.
             if !delete_on_iupf_within(&client, Some(generation), smf_seid, upf_seid).await {
+                let now = client.association_generation().await;
+                if now != generation {
+                    log::info!(
+                        "I-UPF re-associated during the deletion resend (generation \
+                         {generation}, now {now}): resending under the new association"
+                    );
+                    drop(guard);
+                    retry_pending_deletions();
+                    return;
+                }
                 break;
             }
             with_pending(|p| {

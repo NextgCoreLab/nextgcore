@@ -1534,11 +1534,14 @@ impl PfcpClient {
         self.assoc.read().await.generation
     }
 
-    /// Test-only: a new association, as an Association Setup makes one.
+    /// Test-only: a new association, as an Association Setup makes one: the
+    /// generation bumped and `then` run under one hold of the association, as the
+    /// setup decides the I-UPF deletion queue (#2277).
     #[cfg(test)]
-    pub(crate) async fn bump_association_generation_for_test(&self) {
+    pub(crate) async fn reassociate_for_test(&self, then: impl FnOnce()) {
         let mut assoc = self.assoc.write().await;
         assoc.generation = assoc.generation.wrapping_add(1);
+        then();
     }
 
     /// A node-level request whose loss says nothing about the association (#1502
@@ -1617,8 +1620,10 @@ impl PfcpClient {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(seq, tx);
 
-            let now = self.assoc.read().await.generation;
+            let assoc = self.assoc.read().await;
+            let now = assoc.generation;
             if let Some(g) = only_on.filter(|g| *g != now) {
+                drop(assoc);
                 self.pending.lock().await.remove(&seq);
                 break Err(PfcpRequestError::Local(format!(
                     "the association changed (generation {g}, now {now}): type={msg_type} \
@@ -1626,7 +1631,13 @@ impl PfcpClient {
                 )));
             }
             *sent_on = now;
-            if let Err(e) = self.socket.send_to(&pkt, peer).await {
+            // #2277 (R45): a request bound to a generation holds the association
+            // across its send, so no Association Setup lands between the check and
+            // the datagram leaving. Others release it at once, as before.
+            let held = only_on.is_some().then_some(assoc);
+            let sent = self.socket.send_to(&pkt, peer).await;
+            drop(held);
+            if let Err(e) = sent {
                 self.pending.lock().await.remove(&seq);
                 break Err(PfcpRequestError::Local(format!("send failed: {e}")));
             }
