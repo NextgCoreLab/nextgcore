@@ -57,6 +57,24 @@ impl Drop for Upf {
     }
 }
 
+/// #2270: the process-wide state these tests set, put back when the test ends,
+/// passing or panicking: `PCF_URI`, the configured I-UPF and the global UPF.
+/// Restored only on success before, so a test that panicked left them set, and
+/// the next session create in the binary (under `PROCESS_STATE_TEST_LOCK`, so
+/// strictly after) met them: `PCF_URI` naming the stub PCF this test had
+/// stopped answered 504 PEER_NOT_RESPONDING to
+/// `only_the_serving_amf_modifies_releases_or_retrieves_its_sm_context_1860`.
+/// Declared after the locks, so it runs while they are still held.
+struct ProcessStateRestore;
+
+impl Drop for ProcessStateRestore {
+    fn drop(&mut self) {
+        std::env::remove_var("PCF_URI");
+        iupf::set(None);
+        pfcp_path::clear_global_upf_for_test();
+    }
+}
+
 /// A free `127.net.x.1` with UDP 2152 bound, the GTP-U port a UPF sends to.
 async fn bind_2152(net: u8) -> (tokio::net::UdpSocket, std::net::Ipv4Addr) {
     for x in 1..=254u8 {
@@ -218,6 +236,7 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     smf_context_init(64, 256, 512);
     std::env::remove_var("PCF_URI");
@@ -425,6 +444,7 @@ async fn the_per_flow_delay_through_an_i_upf_reaches_the_pcf_2208() {
     let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     let _e = event_exposure::lock_store();
     event_exposure::clear_for_test();
     qos_mon::clear_for_test();
@@ -708,6 +728,7 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     let iupf_upf = upf(28).await;
     let (psa, reference, seid, leg, listener) =
         session_with_refusing_psa(&iupf_upf, "imsi-001010000022087", 6).await;
@@ -843,6 +864,7 @@ async fn a_psa_teardown_deletes_the_i_upf_session_2208() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     let iupf_upf = upf(29).await;
     let (psa, reference, seid, _leg, listener) =
         session_with_refusing_psa(&iupf_upf, "imsi-001010000022086", 7).await;
@@ -890,6 +912,7 @@ async fn an_i_upf_loss_releases_its_sessions_at_the_psa_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let iupf_upf = upf(30).await;
     let (psa, reference, seid, _leg, listener) =
@@ -960,6 +983,7 @@ async fn an_i_upf_path_failure_deactivates_then_releases_its_sessions_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     up_path::reset_for_test();
     iupf::clear_pending_deletions();
     let iupf_upf = upf(31).await;
@@ -1037,6 +1061,7 @@ async fn an_i_upf_error_indication_report_is_its_psa_session_s_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     up_path::reset_for_test();
     let iupf_upf = upf(32).await;
     let (psa, reference, seid, leg, listener) =
@@ -1140,6 +1165,7 @@ async fn an_i_upf_downlink_data_report_pages_for_its_psa_session_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     let iupf_upf = upf(33).await;
     let (psa, reference, seid, leg, listener) =
         session_with_refusing_psa(&iupf_upf, "imsi-001010000022253", 5).await;
@@ -1219,6 +1245,7 @@ async fn a_restarted_i_upf_gets_no_stale_deletion_and_its_new_leg_survives_2225(
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let old = upf(34).await;
     let (psa, reference, _seid, leg, listener, _, client) =
@@ -1300,6 +1327,7 @@ async fn an_unanswered_leg_deletion_is_queued_and_resent_once_retained_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
+    let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let iupf_upf = upf(36).await;
     let (psa, reference, seid, leg, listener, sock, client) = session_with_refusing_psa_on(
@@ -1378,6 +1406,7 @@ async fn the_deletion_queue_is_bounded_and_drops_the_oldest_2225() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let silent_addr = silent.local_addr().unwrap();
@@ -1423,4 +1452,25 @@ async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
     ear.abort();
     iupf::clear_pending_deletions();
     iupf::set(None);
+}
+
+/// #2270: an I-UPF test that panics leaves no `PCF_URI` and no I-UPF behind for
+/// the next test in the binary.
+///
+/// REVERT-VERIFIED: with `ProcessStateRestore::drop` empty, this fails.
+#[tokio::test]
+async fn a_panicking_i_upf_test_leaves_no_process_state_behind_2270() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let panicked = tokio::spawn(async {
+        let _restore = ProcessStateRestore;
+        std::env::set_var("PCF_URI", "http://127.0.0.1:9");
+        panic!("an assertion of the end to end fails");
+    })
+    .await;
+    assert!(panicked.is_err(), "the test body panicked");
+    assert!(std::env::var("PCF_URI").is_err(), "PCF_URI is not left set");
+    assert!(
+        !iupf::will_insert("internet"),
+        "no I-UPF is left configured"
+    );
 }
