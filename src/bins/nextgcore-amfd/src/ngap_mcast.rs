@@ -504,7 +504,7 @@ pub(crate) fn encode_initiating(
         .ok()
 }
 
-/// Build Multicast Session Activation Request (AMF -> gNB), TS 38.413 §9.2.9.1,
+/// Build Multicast Session Activation Request (AMF -> gNB), TS 38.413 §9.2.17.6,
 /// with the GENERATED codec (#417). Both IEs and the procedure are criticality
 /// reject.
 ///
@@ -558,7 +558,7 @@ fn build_mcast_session_activation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
     )
 }
 
-/// Build Multicast Session Deactivation Request (AMF -> gNB), TS 38.413 §9.2.9.3,
+/// Build Multicast Session Deactivation Request (AMF -> gNB), TS 38.413 §9.2.17.9,
 /// with the GENERATED codec (#417): the activation request's shape
 /// (38413-j30.txt:42892) with the deactivation transfer, IE 305.
 fn build_mcast_session_deactivation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
@@ -603,7 +603,7 @@ fn build_mcast_session_deactivation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
     )
 }
 
-/// Build Multicast Group Paging (AMF -> gNBs in the MBS area), TS 38.413 §9.2.9.5,
+/// Build Multicast Group Paging (AMF -> gNBs in the MBS area), TS 38.413 §9.2.4.2,
 /// with the GENERATED codec (#417). The procedure and both IEs are criticality
 /// ignore (38413-j30.txt:43085): a peer that cannot parse the area list still
 /// pages.
@@ -1040,7 +1040,7 @@ pub(crate) mod tests {
     /// 68/69/70/71, so activation was labelled `id-BroadcastSessionSetup`.
     #[test]
     fn mbs_procedure_codes_are_distinct_from_the_broadcast_procedures() {
-        // #417 stage B: the generated constants (TS 38.413 V17.9 §9.4.7), in place
+        // #417 stage B: the generated constants (the V17.9 ASN.1 constant definitions, §9.4.7), in place
         // of the hand-written asn1c table.
         let codes = [
             ngap_gen::ID_MULTICAST_SESSION_ACTIVATION,
@@ -1072,7 +1072,7 @@ pub(crate) mod tests {
         o
     }
 
-    /// MBS-SessionID (§9.3.1.87) with no NID: extension `0`, nID `0`,
+    /// MBS-SessionID (§9.3.1.206) with no NID: extension `0`, nID `0`,
     /// iE-Extensions `0`, padded `00`, then TMGI `OCTET STRING (SIZE(6))` --
     /// fixed and longer than two octets, so aligned with no length (§17.6).
     fn derived_session_id(tmgi: &Tmgi) -> Vec<u8> {
@@ -1081,7 +1081,7 @@ pub(crate) mod tests {
         b.finish()
     }
 
-    /// MULTICAST SESSION ACTIVATION / DEACTIVATION REQUEST (§9.2.9.1, §9.2.9.3):
+    /// MULTICAST SESSION ACTIVATION / DEACTIVATION REQUEST (§9.2.17.6, §9.2.17.9):
     /// initiatingMessage, procedure 71 / 72, reject; MBS-SessionID (299,
     /// reject); the request transfer (304 / 305, reject), an unconstrained
     /// OCTET STRING holding the transfer: extension `0`, iE-Extensions `0`, then
@@ -1102,7 +1102,7 @@ pub(crate) mod tests {
         )
     }
 
-    /// MULTICAST GROUP PAGING (§9.2.9.5): initiatingMessage, procedure 74,
+    /// MULTICAST GROUP PAGING (§9.2.4.2): initiatingMessage, procedure 74,
     /// ignore; MBS-SessionID (299, ignore); MulticastGroupPagingAreaList (307,
     /// ignore): one area -- count-1 in six bits (SIZE(1..64)); the item's
     /// extension, uE-PagingList and iE-Extensions bits `000`; the area's
@@ -1183,7 +1183,7 @@ pub(crate) mod tests {
         assert_eq!(derived_group_paging(&test_tmgi(), &[7]), GROUP_PAGING);
     }
 
-    /// TS 38.413 §9.2.9.1, derived by hand (X.691 ALIGNED), for MBS Service ID
+    /// TS 38.413 §9.2.17.6, derived by hand (X.691 ALIGNED), for MBS Service ID
     /// 000101 under PLMN 00F110: initiatingMessage `00`, procedure 71 `47`,
     /// reject `00`, length 26; extension bit + 2 IEs `00 00 02`.
     /// MBS-SessionID 299 `01 2B`, reject, length 7: three preamble bits
@@ -1197,7 +1197,7 @@ pub(crate) mod tests {
         0x00, 0xF1, 0x10, 0x01, 0x30, 0x00, 0x08, 0x07, 0x00, 0x00, 0x01, 0x01, 0x00, 0xF1, 0x10,
     ];
 
-    /// TS 38.413 §9.2.9.5, by hand: procedure 74 `4A`, ignore `40`, length 27.
+    /// TS 38.413 §9.2.4.2, by hand: procedure 74 `4A`, ignore `40`, length 27.
     /// MBS-SessionID as above but ignore. Area list 307 `01 33`, ignore, length
     /// 9: list count-1 in 6 bits, the item's 3 preamble bits, the area's 2, the
     /// TAI list count-1 in 4 bits, the TAI's 2 -- 17 bits, padded to `00 00

@@ -48,6 +48,8 @@ pub mod xn_handover; // Rel-15: Xn path switch and N2 handover (TS 23.502 §4.9)
 mod property_tests;
 // #417 stage B: the X.691 sink the hand-derived NGAP goldens are written with.
 #[cfg(test)]
+pub(crate) mod amf_pdus;
+#[cfg(test)]
 pub(crate) mod aper_golden;
 #[cfg(test)]
 pub(crate) mod gnb_pdus;
