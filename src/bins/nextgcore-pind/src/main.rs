@@ -1236,8 +1236,11 @@ mod tests {
         assert_eq!(extract_caller_supi(&request, false, false), None);
     }
 
+    /// #2122 (R41 on #2118): a trusted `x-caller-supi` is the caller. A
+    /// `3gpp-Sbi-Consumer-Info` beside it plays no part; there is no precedence
+    /// between them, because Consumer-Info is never an identity (#2103).
     #[test]
-    fn extract_caller_supi_x_header_takes_precedence_over_consumer_info() {
+    fn a_trusted_x_caller_supi_is_the_caller_whatever_consumer_info_says_2122() {
         let request = SbiRequest::post("/pinapp/v1/pins")
             .with_header("x-caller-supi", "imsi-primary")
             .with_header("3gpp-Sbi-Consumer-Info", "imsi-secondary");
