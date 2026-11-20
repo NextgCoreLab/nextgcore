@@ -245,54 +245,64 @@ pub(crate) async fn reconcile_within(max_pass: Duration) -> usize {
         }
     }
 
-    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_LANES));
-    let mut sending = tokio::task::JoinSet::new();
+    // #2186: the shared bounded per-peer sweep. Each AMF is a lane (one in flight
+    // per AMF, up to MAX_LANES AMFs at once); a failed DELETE parks the AMF for the
+    // rest of the pass; nothing new starts after `max_pass`. An AMF that is backing
+    // off is not tried and takes no slot.
     let mut outcomes: Vec<(usize, Parked, Option<Outcome>)> = Vec::new();
+    let mut items = Vec::new();
     for (peer, lane) in lanes {
-        let slot = if BACKOFF.backing_off(&peer) {
-            None
-        } else {
-            tokio::time::timeout_at(deadline, gate.clone().acquire_owned())
-                .await
-                .ok()
-                .and_then(Result::ok)
-        };
-        let Some(slot) = slot else {
+        if BACKOFF.backing_off(&peer) {
             outcomes.extend(lane.into_iter().map(|(place, p)| (place, p, None)));
-            continue;
-        };
-        sending.spawn(async move {
-            let _slot = slot;
-            let mut failed = false;
-            let mut out = Vec::with_capacity(lane.len());
-            for (place, p) in lane {
-                let outcome = if failed || tokio::time::Instant::now() >= deadline {
-                    None
-                } else {
-                    let sent =
-                        tokio::time::timeout_at(deadline, try_unsubscribe(&p.amf, &p.path)).await;
-                    match sent {
-                        Ok(Outcome::Delivered) => Some(Outcome::Delivered),
-                        Ok(Outcome::Failed) | Err(_) => {
-                            failed = true;
-                            Some(Outcome::Failed)
-                        }
-                    }
-                };
-                out.push((place, p, outcome));
-            }
-            if failed {
-                BACKOFF.note_failure(&peer);
-            } else if out.iter().any(|(_, _, o)| *o == Some(Outcome::Delivered)) {
-                BACKOFF.note_success(&peer);
-            }
-            out
-        });
-    }
-    while let Some(done) = sending.join_next().await {
-        if let Ok(out) = done {
-            outcomes.extend(out);
+        } else {
+            items.extend(lane.into_iter().map(|e| (peer.clone(), e)));
         }
+    }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: MAX_LANES,
+        budget: max_pass,
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        items,
+        || (),
+        move |_peer, (place, p): (usize, Parked), ()| async move {
+            let sent = tokio::time::timeout_at(deadline, try_unsubscribe(&p.amf, &p.path)).await;
+            match sent {
+                Ok(Outcome::Delivered) => (
+                    nextgcore_sbi::sweep::Verdict::Answered,
+                    (place, p, Outcome::Delivered),
+                ),
+                Ok(Outcome::Failed) | Err(_) => (
+                    nextgcore_sbi::sweep::Verdict::PeerDown,
+                    (place, p, Outcome::Failed),
+                ),
+            }
+        },
+    )
+    .await;
+    let mut failed_peers: Vec<String> = Vec::new();
+    let mut answered_peers: Vec<String> = Vec::new();
+    for (peer, (place, p, outcome)) in report.done {
+        let list = if outcome == Outcome::Failed {
+            &mut failed_peers
+        } else {
+            &mut answered_peers
+        };
+        if !list.contains(&peer) {
+            list.push(peer);
+        }
+        outcomes.push((place, p, Some(outcome)));
+    }
+    for (_, (place, p), _) in report.skipped {
+        outcomes.push((place, p, None));
+    }
+    for peer in &failed_peers {
+        BACKOFF.note_failure(peer);
+    }
+    for peer in answered_peers.iter().filter(|p| !failed_peers.contains(p)) {
+        BACKOFF.note_success(peer);
     }
     outcomes.sort_by_key(|(place, _, _)| *place);
     let mut untried = Vec::new();

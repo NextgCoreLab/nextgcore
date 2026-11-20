@@ -545,6 +545,13 @@ fn require_verified_caller(
 ///   enumerates EASDF but no EES), so every token EES would be refused.
 /// - Anything else (no token and no typed certificate) is refused. In practice
 ///   `require_verified_caller` has refused it already; this does not rely on that.
+///
+/// #2226: `EES` as a certificate NFTypes value (RFC 9310) is a nextgcore
+/// convention, not a 3GPP one. TS 29.510 `NFType` has no EES (the EES is an
+/// Edge Enabler Layer entity, TS 23.558, and registers at an NRF as an AF), so
+/// no 3GPP profile tells a PKI to issue `[EES]`. An EES certificate for this
+/// ECS must name exactly `EES`, and an `[AF]` one is refused: the ECS cannot
+/// tell an EES's AF certificate from any other AF's.
 fn require_ees_type(request: &SbiRequest) -> Option<SbiResponse> {
     let refuse = |why: String| {
         Some(nextgcore_sbi::server::send_forbidden(

@@ -2846,37 +2846,93 @@ pub async fn sweep_expired_ee_subscriptions(now: u64) -> usize {
             .unwrap_or_default()
     };
     let count = expired.len();
-    // #2149 (R42 on #2144), the #2128 shape: releases are grouped by the AMF
-    // holding each leg, up to EE_SWEEP_MAX_AMFS AMFs at once, each in turn. An
-    // AMF that fails one release (no answer, a 5xx) is not tried again this
-    // sweep: its remaining legs are parked for the unsubscribe reconciler at
-    // once. So a blackholed AMF costs one request timeout per sweep, and the
-    // other AMFs' legs are released regardless.
-    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<UdmEeSubscription>> =
-        std::collections::BTreeMap::new();
-    for sub in expired {
-        log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
-        by_amf
-            .entry(crate::ee_amf::leg_authority(&sub))
-            .or_default()
-            .push(sub);
-    }
-    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(EE_SWEEP_MAX_AMFS));
-    let mut workers = tokio::task::JoinSet::new();
-    for (_, subs) in by_amf {
-        let slots = slots.clone();
-        workers.spawn(async move {
-            let _slot = slots.acquire_owned().await;
-            let mut amf_failed = false;
-            for sub in &subs {
-                if !crate::ee_amf::release_with(sub, !amf_failed).await {
-                    amf_failed = true;
-                }
+    // #2149 (R42 on #2144), the #2128 shape, now the shared sweep (#2186):
+    // releases are grouped by the AMF holding each leg, one at a time per AMF, up
+    // to EE_SWEEP_MAX_AMFS AMFs at once. An AMF that fails one release (no
+    // answer, a 5xx) is parked for the rest of the pass, and so is anything the
+    // pass's budget does not reach: those legs go to the unsubscribe reconciler
+    // at once (the records are already gone, so nothing else would release them).
+    // So a blackholed AMF costs one request timeout per sweep, and the other
+    // AMFs' legs are released regardless.
+    //
+    // #2186 (R44 minor 3): cancel-safe. The records are already gone, so a leg
+    // whose release had not finished (or not started) when the pass is dropped
+    // (shutdown) would be lost: `unsettled` holds every leg until its release
+    // settles it (delivered or parked), and its drop parks the rest for the
+    // reconciler.
+    let unsettled = std::sync::Arc::new(UnsettledLegs::default());
+    let items: Vec<_> = expired
+        .into_iter()
+        .map(|sub| {
+            log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
+            if let Some(leg) = &sub.amf_leg {
+                unsettled.hold(&sub.id, &leg.subscription_uri);
             }
-        });
+            (crate::ee_amf::leg_authority(&sub), sub)
+        })
+        .collect();
+    let settle = unsettled.clone();
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: EE_SWEEP_MAX_AMFS,
+        budget: EE_EXPIRY_SWEEP,
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        items,
+        || (),
+        move |_amf, sub: UdmEeSubscription, ()| {
+            let settle = settle.clone();
+            async move {
+                let delivered = crate::ee_amf::release_with(&sub, true).await;
+                settle.settled(&sub.id);
+                let verdict = if delivered {
+                    nextgcore_sbi::sweep::Verdict::Answered
+                } else {
+                    nextgcore_sbi::sweep::Verdict::PeerDown
+                };
+                (verdict, ())
+            }
+        },
+    )
+    .await;
+    for (_, sub, _) in report.skipped {
+        crate::ee_amf::release_with(&sub, false).await;
+        unsettled.settled(&sub.id);
     }
-    while workers.join_next().await.is_some() {}
     count
+}
+
+/// #2186: the AMF legs of a release sweep not yet settled (delivered or
+/// parked); dropped with any left, it parks them for the unsubscribe reconciler.
+#[derive(Default)]
+struct UnsettledLegs(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl UnsettledLegs {
+    fn hold(&self, id: &str, uri: &str) {
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(id.to_string(), uri.to_string());
+        }
+    }
+
+    fn settled(&self, id: &str) {
+        if let Ok(mut m) = self.0.lock() {
+            m.remove(id);
+        }
+    }
+}
+
+impl Drop for UnsettledLegs {
+    fn drop(&mut self) {
+        let left: Vec<String> = match self.0.lock() {
+            Ok(mut m) => m.drain().map(|(_, uri)| uri).collect(),
+            Err(_) => return,
+        };
+        for uri in left {
+            log::warn!("EE release sweep cancelled: {uri} parked for the unsubscribe reconciler");
+            crate::ee_amf::park_unsubscribe(&uri);
+        }
+    }
 }
 
 /// #2149: at most this many AMFs are released at once in one sweep.

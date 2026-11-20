@@ -1860,7 +1860,7 @@ fn refresh_timing(configured: Option<u64>, interval: u64) -> (u64, u64) {
 /// #2128 (R42): at most this many producers are refreshed at once in a pass.
 const REFRESH_MAX_PRODUCERS: usize = 8;
 
-/// #2128 (R42): one producer's refreshes in a pass stop after this long (one
+/// #2128 (R42), #2186: a refresh pass starts nothing new after this long (one
 /// tick); the rest wait for the next pass.
 fn refresh_pass_budget() -> Duration {
     Duration::from_secs(reconcile_interval_secs().max(1))
@@ -2093,7 +2093,8 @@ fn cancellation_notification(sub: &NefMonitoringSubscription) -> serde_json::Val
 /// #2128 (R42), the #1994 shape: legs are refreshed per producer, up to
 /// [`REFRESH_MAX_PRODUCERS`] producers at once, each in expiry order. A producer
 /// that fails a refresh (no answer, or a 5xx) is not tried again in this pass,
-/// and one producer's refreshes stop after [`refresh_pass_budget`]. So a
+/// and the pass starts nothing new after [`refresh_pass_budget`] (#2186: the
+/// shared `nextgcore_sbi::sweep`). So a
 /// blackholed producer costs one request timeout per pass, and other
 /// producers' legs are refreshed regardless.
 ///
@@ -2128,21 +2129,104 @@ pub async fn refresh_live_subscriptions_with(
             }
         }
     }
-    let slots = Arc::new(tokio::sync::Semaphore::new(REFRESH_MAX_PRODUCERS));
-    let mut workers = Vec::new();
+    // #2186: the shared bounded per-peer sweep: one refresh in flight per
+    // producer, REFRESH_MAX_PRODUCERS producers at once, a producer that fails
+    // (no answer, a 5xx) parked for the rest of the pass, nothing new after the
+    // pass budget, and the clock read afresh for each leg.
+    let margin = southbound_refresh_margin_secs();
+    let budget = refresh_pass_budget();
+    let mut due = Vec::new();
+    let mut lapsed: Vec<(String, SouthboundRef)> = Vec::new();
     for (base, legs) in by_producer {
-        let (slots, clock) = (slots.clone(), clock.clone());
-        workers.push(spawn_detached(async move {
-            let _slot = slots.acquire_owned().await;
-            refresh_producer_legs(base, legs, clock).await
-        }));
-    }
-    for worker in workers {
-        match worker.await {
-            Ok(r) => report.add(r),
-            Err(e) => log::error!("a refresh worker failed: {e}"),
+        for sub in legs {
+            let Some(southbound) = sub.southbound.clone() else {
+                continue;
+            };
+            let now = clock();
+            if sub
+                .southbound_expiry
+                .is_some_and(|e| e > now.saturating_add(margin))
+            {
+                continue;
+            }
+            // A leg already past its expiry needs no producer: lapsed now,
+            // whatever the producer's state.
+            if sub.southbound_expiry.is_some_and(|e| e <= now) {
+                lapse(&sub, &southbound, &mut report);
+                lapsed.push((base.clone(), southbound));
+                continue;
+            }
+            due.push((base.clone(), sub));
         }
     }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: REFRESH_MAX_PRODUCERS,
+        budget,
+    };
+    let work_clock = clock.clone();
+    let refreshed = nextgcore_sbi::sweep::sweep(
+        limits,
+        due,
+        move || work_clock(),
+        |base, sub, now| async move {
+            let (verdict, mut leg) = refresh_one_leg(base, sub, now).await;
+            leg.producer_down = verdict == nextgcore_sbi::sweep::Verdict::PeerDown;
+            (verdict, leg)
+        },
+    )
+    .await;
+    let mut parked_producers: std::collections::BTreeSet<String> = Default::default();
+    for (base, leg) in refreshed.done {
+        if leg.producer_down {
+            parked_producers.insert(base.clone());
+        }
+        report.add(leg.report);
+        if let Some(sb) = leg.lapsed {
+            lapsed.push((base, sb));
+        }
+    }
+    for (base, sub, _) in refreshed.skipped {
+        // Not tried: lapsed if its expiry passed meanwhile (as before the
+        // producer's failure stopped its refreshes), else the next pass's.
+        let now = clock();
+        match sub.southbound.clone() {
+            Some(sb) if sub.southbound_expiry.is_some_and(|e| e <= now) => {
+                lapse(&sub, &sb, &mut report);
+                lapsed.push((base, sb));
+            }
+            _ => report.skipped += 1,
+        }
+    }
+    // #2148: the lapsed legs' DELETEs, owed (and persisted) already by
+    // `remove_lapsed_leg`. Sent after the refreshes, per producer in the same
+    // bounded sweep with its own budget, and not to a producer parked in this
+    // pass: whatever is not sent stays owed, and the #1877 reconciler
+    // sends it with its backoff.
+    let deletes: Vec<(String, SouthboundRef)> = lapsed
+        .into_iter()
+        .filter(|(base, _)| !parked_producers.contains(base))
+        .collect();
+    // #2186 (R44): the DELETEs have a budget of their own (one more tick), not
+    // what the refreshes left: a refresh still in flight at the budget's end
+    // (up to a request timeout past it) would otherwise leave none, deferring
+    // every producer's lapse DELETEs to the reconciler.
+    let limits = nextgcore_sbi::sweep::SweepLimits { budget, ..limits };
+    nextgcore_sbi::sweep::sweep(
+        limits,
+        deletes,
+        || (),
+        |base: String, southbound: SouthboundRef, ()| async move {
+            southbound_unsubscribe(Some(base), southbound.clone()).await;
+            let verdict = if southbound_reconcile::is_owed(&southbound) {
+                nextgcore_sbi::sweep::Verdict::PeerDown
+            } else {
+                nextgcore_sbi::sweep::Verdict::Answered
+            };
+            (verdict, ())
+        },
+    )
+    .await;
     if report != RefreshReport::default() {
         log::info!(
             "refresh sweep: {} refreshed, {} lapsed, {} failed, {} skipped",
@@ -2155,139 +2239,138 @@ pub async fn refresh_live_subscriptions_with(
     report
 }
 
-/// #2128: one producer's part of a refresh pass (see
-/// [`refresh_live_subscriptions_with`]).
-async fn refresh_producer_legs(
+/// #2128: a leg past its expiry before a refresh got through is gone at a
+/// producer that honours expiry: removed, its DELETE owed.
+fn lapse(sub: &NefMonitoringSubscription, southbound: &SouthboundRef, report: &mut RefreshReport) {
+    log::warn!(
+        "monitoring subscription {}: its {} leg expired before a refresh got through; \
+         removing it",
+        sub.id,
+        southbound.producer.as_str()
+    );
+    remove_lapsed_leg(&sub.id, southbound);
+    report.lapsed += 1;
+}
+
+/// #2186: what one leg's refresh came to.
+struct LegRefresh {
+    report: RefreshReport,
+    /// A leg that lapsed while it waited: its DELETE is owed.
+    lapsed: Option<SouthboundRef>,
+    /// The producer failed this refresh: parked for the rest of the pass.
+    producer_down: bool,
+}
+
+/// #2128/#2186: refresh one due leg at producer `base`, at `now` (read when the
+/// sweep starts it). `PeerDown` for no answer or a 5xx: the producer is parked
+/// for the rest of the pass.
+async fn refresh_one_leg(
     base: String,
-    legs: Vec<NefMonitoringSubscription>,
-    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-) -> RefreshReport {
-    let margin = southbound_refresh_margin_secs();
-    let started = std::time::Instant::now();
-    let budget = refresh_pass_budget();
-    let mut producer_failed = false;
-    let mut report = RefreshReport::default();
-    // #2148: the DELETEs this pass owes for lapsed legs, sent below by this
-    // worker (so at most REFRESH_MAX_PRODUCERS at once), not one task each.
-    let mut lapsed = Vec::new();
-    for sub in legs {
-        let Some(southbound) = sub.southbound.clone() else {
-            continue;
-        };
-        let now = clock();
-        if sub
-            .southbound_expiry
-            .is_some_and(|e| e > now.saturating_add(margin))
-        {
-            continue;
-        }
-        let gone = |why: &str| {
-            log::warn!(
-                "monitoring subscription {}: its {} leg {why}; removing it",
-                sub.id,
-                southbound.producer.as_str()
-            );
-        };
-        if sub.southbound_expiry.is_some_and(|e| e <= now) {
-            gone("expired before a refresh got through");
-            remove_lapsed_leg(&sub.id, &southbound);
-            lapsed.push(southbound);
-            report.lapsed += 1;
-            continue;
-        }
-        if producer_failed || started.elapsed() >= budget {
-            report.skipped += 1;
-            continue;
-        }
-        let Some((host, port)) = parse_host_port(&base) else {
-            log::warn!(
-                "monitoring subscription {}: invalid {} URI {base:?} to refresh its leg at",
-                sub.id,
-                southbound.producer.as_str()
-            );
-            report.failed += 1;
-            continue;
-        };
-        let requested = now.saturating_add(southbound_lifetime_secs());
-        let client = service_client(&host, port, southbound.producer.nf_type());
-        // #2133: a leg that recorded an expiry was made with reportingOptions.
-        let patch = refresh_patch(
-            southbound.producer,
-            requested,
-            sub.southbound_expiry.is_some(),
+    sub: NefMonitoringSubscription,
+    now: u64,
+) -> (nextgcore_sbi::sweep::Verdict, LegRefresh) {
+    use nextgcore_sbi::sweep::Verdict;
+    let mut out = LegRefresh {
+        report: RefreshReport::default(),
+        lapsed: None,
+        producer_down: false,
+    };
+    let Some(southbound) = sub.southbound.clone() else {
+        return (Verdict::Answered, out);
+    };
+    if sub.southbound_expiry.is_some_and(|e| e <= now) {
+        lapse(&sub, &southbound, &mut out.report);
+        out.lapsed = Some(southbound);
+        return (Verdict::Answered, out);
+    }
+    let gone = |why: &str| {
+        log::warn!(
+            "monitoring subscription {}: its {} leg {why}; removing it",
+            sub.id,
+            southbound.producer.as_str()
         );
-        let mut answer = client.patch_json(&southbound.delete_path, &patch).await;
-        // #2154 (R42 on #2152): a UDM that refuses the member path itself with a
-        // 400 (one that takes only top-level patch paths, as udmd did before
-        // #2133, or a stored subscription with no `reportingOptions` to descend
-        // into) is sent the whole-object form once, so the leg is refreshed
-        // rather than left to lapse (nef.md: upgrade udmd before nefd).
-        if southbound.producer == SouthboundProducer::Udm
-            && sub.southbound_expiry.is_some()
-            && matches!(&answer, Ok(resp) if refuses_the_member_path(resp))
-        {
+    };
+    let Some((host, port)) = parse_host_port(&base) else {
+        log::warn!(
+            "monitoring subscription {}: invalid {} URI {base:?} to refresh its leg at",
+            sub.id,
+            southbound.producer.as_str()
+        );
+        out.report.failed += 1;
+        return (Verdict::Answered, out);
+    };
+    let requested = now.saturating_add(southbound_lifetime_secs());
+    let client = service_client(&host, port, southbound.producer.nf_type());
+    // #2133: a leg that recorded an expiry was made with reportingOptions.
+    let patch = refresh_patch(
+        southbound.producer,
+        requested,
+        sub.southbound_expiry.is_some(),
+    );
+    let mut answer = client.patch_json(&southbound.delete_path, &patch).await;
+    // #2154 (R42 on #2152): a UDM that refuses the member path itself with a
+    // 400 (one that takes only top-level patch paths, as udmd did before
+    // #2133, or a stored subscription with no `reportingOptions` to descend
+    // into) is sent the whole-object form once, so the leg is refreshed
+    // rather than left to lapse (nef.md: upgrade udmd before nefd).
+    if southbound.producer == SouthboundProducer::Udm
+        && sub.southbound_expiry.is_some()
+        && matches!(&answer, Ok(resp) if refuses_the_member_path(resp))
+    {
+        log::warn!(
+            "monitoring subscription {}: the UDM refused the path of `add \
+             /reportingOptions/expiry` (400); retrying with the whole reportingOptions",
+            sub.id
+        );
+        let whole = refresh_patch(southbound.producer, requested, false);
+        answer = client.patch_json(&southbound.delete_path, &whole).await;
+    }
+    match answer {
+        Ok(resp) if resp.is_success() => {
+            let expiry = confirmed_expiry(southbound.producer, &resp).unwrap_or(requested);
+            let recorded = nef_self()
+                .read()
+                .map(|c| c.subscription_refreshed(&sub.id, &southbound, expiry))
+                .unwrap_or(false);
+            if recorded {
+                out.report.refreshed += 1;
+            }
+            (Verdict::Answered, out)
+        }
+        Ok(resp) if resp.status == 404 => {
+            gone("is gone at the producer (404 on refresh)");
+            // #2133: and the AF is told (cancelInd).
+            remove_and_tell_af(&sub.id);
+            out.report.lapsed += 1;
+            (Verdict::Answered, out)
+        }
+        Ok(resp) => {
             log::warn!(
-                "monitoring subscription {}: the UDM refused the path of `add \
-                 /reportingOptions/expiry` (400); retrying with the whole reportingOptions",
-                sub.id
+                "monitoring subscription {}: {} refresh returned {}",
+                sub.id,
+                southbound.producer.as_str(),
+                resp.status
             );
-            let whole = refresh_patch(southbound.producer, requested, false);
-            answer = client.patch_json(&southbound.delete_path, &whole).await;
+            out.report.failed += 1;
+            // A 5xx is the producer failing; a 4xx is this one leg.
+            let verdict = if resp.status >= 500 {
+                Verdict::PeerDown
+            } else {
+                Verdict::Answered
+            };
+            (verdict, out)
         }
-        match answer {
-            Ok(resp) if resp.is_success() => {
-                let expiry = confirmed_expiry(southbound.producer, &resp).unwrap_or(requested);
-                let recorded = nef_self()
-                    .read()
-                    .map(|c| c.subscription_refreshed(&sub.id, &southbound, expiry))
-                    .unwrap_or(false);
-                if recorded {
-                    report.refreshed += 1;
-                }
-            }
-            Ok(resp) if resp.status == 404 => {
-                gone("is gone at the producer (404 on refresh)");
-                // #2133: and the AF is told (cancelInd).
-                remove_and_tell_af(&sub.id);
-                report.lapsed += 1;
-            }
-            Ok(resp) => {
-                log::warn!(
-                    "monitoring subscription {}: {} refresh returned {}",
-                    sub.id,
-                    southbound.producer.as_str(),
-                    resp.status
-                );
-                // A 5xx is the producer failing; a 4xx is this one leg.
-                producer_failed |= resp.status >= 500;
-                report.failed += 1;
-            }
-            Err(e) => {
-                log::warn!(
-                    "monitoring subscription {}: {} refresh failed: {e}; its other legs \
-                     wait for the next pass",
-                    sub.id,
-                    southbound.producer.as_str()
-                );
-                producer_failed = true;
-                report.failed += 1;
-            }
+        Err(e) => {
+            log::warn!(
+                "monitoring subscription {}: {} refresh failed: {e}; its other legs \
+                 wait for the next pass",
+                sub.id,
+                southbound.producer.as_str()
+            );
+            out.report.failed += 1;
+            (Verdict::PeerDown, out)
         }
     }
-    // #2148: the lapsed legs' DELETEs, owed (and persisted) already by
-    // `remove_lapsed_leg`. Sent one at a time, after the refreshes, and not
-    // once this producer has failed or the budget is spent: whatever is not
-    // sent stays owed, and the #1877 reconciler sends it with its backoff.
-    for southbound in lapsed {
-        if producer_failed || started.elapsed() >= budget {
-            break;
-        }
-        southbound_unsubscribe(Some(base.clone()), southbound.clone()).await;
-        if southbound_reconcile::is_owed(&southbound) {
-            producer_failed = true;
-        }
-    }
-    report
 }
 
 /// A fully built southbound subscribe request toward a 5GC event producer.
@@ -5045,6 +5128,55 @@ mod tests {
                 took < Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS * 2 + 1),
                 "about one request timeout: {took:?}"
             );
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2186: a producer that failed a refresh in this pass (a 503) is parked
+    /// for the rest of it, the lapsed legs' DELETEs included: they stay owed for
+    /// the #1877 reconciler rather than being sent to a failing producer.
+    ///
+    /// REVERT-VERIFIED: with the parked producers not filtered out of the DELETE
+    /// sweep, the AMF receives the DELETE.
+    #[test]
+    fn a_producer_parked_by_a_failed_refresh_gets_no_lapse_delete_2186() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = deletes.clone();
+            let (amf, amf_addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let count = count.clone();
+                    async move {
+                        if req.header.method == "DELETE" {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            return SbiResponse::with_status(204);
+                        }
+                        SbiResponse::with_status(503)
+                    }
+                })
+                .await;
+            let amf_uri = format!("http://127.0.0.1:{}", amf_addr.port());
+            let now = now_unix_secs();
+            live_leg_2128(SouthboundProducer::Amf, &amf_uri, "s-2186-due", now + 1);
+            live_leg_2128(SouthboundProducer::Amf, &amf_uri, "s-2186-gone", now - 1);
+            let report = refresh_live_subscriptions_at(now).await;
+            let sent = deletes.load(Ordering::SeqCst);
+            let owed = southbound_reconcile::parked()
+                .into_iter()
+                .filter(|r| r.subscription_id == "s-2186-gone")
+                .count();
+            amf.stop().await.ok();
+
+            assert_eq!((report.failed, report.lapsed), (1, 1), "{report:?}");
+            assert_eq!(sent, 0, "no DELETE to the producer that failed this pass");
+            assert_eq!(owed, 1, "the lapsed leg's DELETE stays owed");
         });
         southbound_reconcile::clear_for_test();
         reset_context();

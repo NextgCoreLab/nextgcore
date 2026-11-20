@@ -77,6 +77,8 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 
 **Every ECS route needs a verified caller (#2050).** The `eecs-eesregistration`, `eecs-serviceprovisioning` and `eecs-targeteesdiscovery` routes accept either a verified client certificate (mTLS) or an access token for that API's scope (`eecs-eesregistration`, …), checked by the same per-operation gate as the `eees-*` routes. Anything else gets 401, or 403 for a token without the scope. Under the `production` profile the EES listener verifies a client certificate whenever one is presented, against the policy CA, without demanding one: EECs and EASes hold none. The EES-side ECS client presents its own certificate through the shared profile-following client. Under `dev` nothing presents a credential, so the ECS role answers 401 unless a caller sends a token.
 
+**An EES's certificate names NFTypes `[EES]`, a nextgcore convention (#2210, #2226).** `eecs-eesregistration` admits a caller's own typed certificate only when its RFC 9310 NFTypes, relay types (SCP, SEPP) set aside, are exactly `EES`. `EES` is not a TS 29.510 `NFType`: the EES registers at an NRF as an AF, and no 3GPP certificate profile names an EES. So issue an EES that registers at this ECS a certificate with NFTypes `EES`, not `AF`. A certificate naming `EES` and another type, such as `[EES, AMF]` or `[EES, AF]`, is refused (TS 33.310 §6.1.3c.3: one NF type per instance). That certificate decides even when an access token is presented and agrees with it. An EES with no certificate of its own presents an `eecs-eesregistration` access token instead.
+
 Three things were silently brittle before #107, and one thing was missing entirely.
 
 **The EDGE-6 client.**
