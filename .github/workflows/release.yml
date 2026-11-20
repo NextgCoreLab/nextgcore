@@ -69,7 +69,7 @@ jobs:
       # evidence the commit it is about to tag was ever tested against a
       # nextgsim commit, which is the entire premise of a paired release.
       - name: Download the validated-pair manifest
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: validated-pair
           run-id: ${{ inputs.validated_run_id }}
@@ -505,7 +505,7 @@ jobs:
           ref: refs/tags/${{ needs.publish-gate.outputs.version }}
       - name: Download the NF binaries
         if: ${{ matrix.nf_name }}
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-binaries
           path: docker/rust/binaries
