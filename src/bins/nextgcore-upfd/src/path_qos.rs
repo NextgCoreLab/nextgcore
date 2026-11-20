@@ -43,8 +43,9 @@ pub const GTPU_PORT: u16 = 2152;
 pub const MAX_CONTROLS: usize = 16;
 pub const MAX_PEERS_PER_CONTROL: usize = 64;
 
-/// Probe sequence numbers live in 0x8000..=0xFFFF. The §7.2 path table counts
-/// from 1 upward; a response that matches both is credited to both.
+/// Probe sequence numbers live in 0x8000..=0xBFFF. The §7.2 path table uses
+/// 1..=0x7FFF and the Transport Delay Reporting probes (#1450) 0xC000..=0xFFFF,
+/// so an Echo Response names the one requester that sent it.
 const SEQ_BASE: u16 = 0x8000;
 
 /// An Echo Request unanswered after this long is forgotten.
@@ -259,7 +260,7 @@ impl PathQosMonitor {
     pub fn probe_sent(&mut self, peer: SocketAddr, now: Instant, n3: bool) -> u16 {
         self.pending
             .retain(|_, (sent, _)| now.duration_since(*sent) < PROBE_TIMEOUT);
-        let seq = SEQ_BASE | (self.next_seq & 0x7fff);
+        let seq = SEQ_BASE | (self.next_seq & 0x3fff);
         self.next_seq = self.next_seq.wrapping_add(1);
         self.pending.insert((peer, seq), (now, n3));
         seq

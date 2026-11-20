@@ -38,7 +38,7 @@ fn ie(
 }
 
 fn ctl(i: QosMonitoringPerQosFlowControlInformation) -> FlowControl {
-    FlowControl::from_ie(&i).expect("a packet delay control")
+    FlowControl::from_ie(&i, false).expect("a packet delay control")
 }
 
 /// An answer to `t1` from an NG-RAN whose clock is `offset_ms` ahead, `n3_ms`
@@ -147,14 +147,24 @@ fn ntp64_is_the_rfc_5905_era_0_layout() {
 fn only_packet_delay_by_time_stamps_is_acted_on() {
     let mut i = ie(&[1], true, false, false, false, true);
     i.requested_qos_monitoring.gtpupm = true;
-    assert!(FlowControl::from_ie(&i).is_none(), "GTPUPM needs an I-UPF");
+    assert!(
+        FlowControl::from_ie(&i, false).is_none(),
+        "GTPUPM needs GPQM (#1450)"
+    );
+    assert!(FlowControl::from_ie(&i, true).is_some_and(|c| c.gtpupm));
     let mut i = ie(&[1], false, false, false, false, true);
     i.requested_qos_monitoring.dlci = true;
-    assert!(FlowControl::from_ie(&i).is_none(), "congestion is not QFQM");
-    let i = ie(&[1], true, false, false, false, false);
-    assert!(FlowControl::from_ie(&i).is_none(), "no reporting frequency");
     assert!(
-        FlowControl::from_ie(&ie(&[1, 1, 2], true, false, false, false, true))
+        FlowControl::from_ie(&i, false).is_none(),
+        "congestion is not QFQM"
+    );
+    let i = ie(&[1], true, false, false, false, false);
+    assert!(
+        FlowControl::from_ie(&i, false).is_none(),
+        "no reporting frequency"
+    );
+    assert!(
+        FlowControl::from_ie(&ie(&[1, 1, 2], true, false, false, false, true), false)
             .is_some_and(|c| c.qfis == vec![1, 2])
     );
 }
@@ -628,4 +638,133 @@ fn after_a_clock_step_back_t1_is_the_clock_again() {
     assert_eq!(ahead, ntp64(wall + Duration::from_secs(10)));
     let after_step = m.round(now, wall).dummies[0].t1;
     assert_eq!(after_step, ntp64(wall));
+}
+
+/// #1450: a GTPUPM control (TS 29.244 §5.24.5.3-4).
+fn gtpupm_ctl(qfi: u8, event: bool, thr: Option<u32>) -> FlowControl {
+    let mut i = ie(&[qfi], true, true, true, event, !event);
+    i.requested_qos_monitoring.gtpupm = true;
+    i.packet_delay_thresholds = thr.map(|t| PacketDelayThresholds {
+        downlink: Some(t),
+        ..Default::default()
+    });
+    i.minimum_wait_time = Some(0);
+    FlowControl::from_ie(&i, true).expect("a GTPUPM control")
+}
+
+/// #1450 criterion 2: the PSA's delay for a GTPUPM flow is the accumulated
+/// transport delay plus the RAN part (§5.24.5.4); no QMP is sent for it.
+///
+/// REVERT-VERIFIED: with `TransportSample::delays` taking the RAN part alone, or
+/// with `sync_probes` probing GTPUPM flows too, this fails.
+#[test]
+fn a_gtpupm_flow_is_measured_from_the_transport_delay_and_never_probed() {
+    let mut m = QosFlowMonitor::new(false);
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    m.create_srr(SEID, 1, vec![gtpupm_ctl(9, true, Some(10))], now, wall);
+    assert_eq!(m.monitored_qfis(SEID), vec![9]);
+    // §5.24.5.4: "The UP function shall not insert time stamps": no dummy, and
+    // no QMP on the flow's downlink.
+    let round = m.round(now + ms(1), wall);
+    assert!(round.dummies.is_empty(), "no dummy G-PDU for a GTPUPM flow");
+    assert_eq!(m.on_downlink(SEID, 9, now + ms(2), wall), None);
+    let round = m.round(now + ms(3), wall);
+    assert!(round.dummies.is_empty());
+    // Transport 11 ms (I-UPF 7 + PSA 4), RAN DL 2 and UL 3.
+    let sample = TransportSample {
+        qfi: 9,
+        accumulated_ms: 11,
+        dl_ran_ms: Some(2),
+        ul_ran_ms: Some(3),
+    };
+    let (d, reports) = m
+        .on_transport_sample(SEID, &sample, now + ms(4), wall)
+        .expect("monitored");
+    assert_eq!((d.dl, d.ul, d.rp), (13, 14, 27));
+    assert_eq!(reports.len(), 1, "DL 13 >= threshold 10: Event Triggered");
+    let r = &reports[0].1;
+    assert_eq!(r.qfi, 9);
+    assert_eq!(r.qos_monitoring_measurement.downlink_packet_delay, Some(13));
+    assert_eq!(r.qos_monitoring_measurement.uplink_packet_delay, Some(14));
+    assert_eq!(
+        r.qos_monitoring_measurement.round_trip_packet_delay,
+        Some(27)
+    );
+    // Another QFI, or a session without GTPUPM: not a measurement.
+    let other = TransportSample { qfi: 5, ..sample };
+    assert!(m
+        .on_transport_sample(SEID, &other, now + ms(5), wall)
+        .is_none());
+    assert!(m
+        .on_transport_sample(SEID + 1, &sample, now + ms(5), wall)
+        .is_none());
+}
+
+/// #1450: the two methods never feed each other: a QMP answer does not measure a
+/// GTPUPM control, and a transport sample does not measure a time stamp control
+/// of the same QFI.
+///
+/// REVERT-VERIFIED: with `record` ignoring the method, the GTPUPM SRR reports the
+/// QMP measurement.
+#[test]
+fn qmp_answers_and_transport_samples_measure_their_own_controls() {
+    let mut m = QosFlowMonitor::new(true);
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    let mut stamp = ie(&[9], true, false, false, true, false);
+    stamp.packet_delay_thresholds = Some(PacketDelayThresholds {
+        downlink: Some(1),
+        ..Default::default()
+    });
+    stamp.minimum_wait_time = Some(0);
+    m.create_srr(SEID, 1, vec![ctl(stamp)], now, wall);
+    m.create_srr(SEID, 2, vec![gtpupm_ctl(9, true, Some(1))], now, wall);
+    let round = m.round(now + ms(1), wall);
+    assert_eq!(round.dummies.len(), 1, "the time stamp control is probed");
+    let t1 = round.dummies[0].t1;
+    let (_, _, reports) = m
+        .on_answer(SEID, &answer(t1, 5, 5, 0), now + ms(2), wall)
+        .expect("answers the probe");
+    let srrs: Vec<u8> = reports.iter().map(|(s, _)| *s).collect();
+    assert_eq!(srrs, vec![1], "only the time stamp SRR");
+    let sample = TransportSample {
+        qfi: 9,
+        accumulated_ms: 4,
+        dl_ran_ms: None,
+        ul_ran_ms: None,
+    };
+    let (_, reports) = m
+        .on_transport_sample(SEID, &sample, now + ms(3), wall)
+        .unwrap();
+    let srrs: Vec<u8> = reports.iter().map(|(s, _)| *s).collect();
+    assert_eq!(srrs, vec![2], "only the GTPUPM SRR");
+}
+
+/// #1450: a Periodic GTPUPM control averages its samples over the period, and a
+/// period with none is a packet delay measurement failure (§5.24.4.3 applies,
+/// §5.24.5.4).
+#[test]
+fn a_periodic_gtpupm_control_averages_and_reports_a_silent_period_as_a_failure() {
+    let mut m = QosFlowMonitor::new(false);
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    m.create_srr(SEID, 1, vec![gtpupm_ctl(9, false, None)], now, wall);
+    for (i, t) in [10u32, 20].iter().enumerate() {
+        let s = TransportSample {
+            qfi: 9,
+            accumulated_ms: *t,
+            dl_ran_ms: Some(0),
+            ul_ran_ms: Some(0),
+        };
+        m.on_transport_sample(SEID, &s, now + ms(10 * i as u64), wall);
+    }
+    // Measurement Period 2 s (`ie`).
+    let r = m.round(now + Duration::from_secs(2), wall);
+    let m1 = r.reports[0].1[0].1.qos_monitoring_measurement;
+    assert_eq!(m1.downlink_packet_delay, Some(15));
+    assert_eq!(m1.round_trip_packet_delay, Some(30));
+    let r = m.round(now + Duration::from_secs(4), wall);
+    let m2 = r.reports[0].1[0].1.qos_monitoring_measurement;
+    assert!(m2.packet_delay_measurement_failure);
 }

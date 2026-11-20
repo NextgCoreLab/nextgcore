@@ -91,7 +91,7 @@ fn monitor_dl(dp: &DataPlane, qfi: u8, dl_thr: u32) {
         m.create_srr(
             SEID,
             7,
-            controls_of(&[ie]),
+            controls_of(&[ie], false),
             std::time::Instant::now(),
             std::time::SystemTime::now(),
         )
