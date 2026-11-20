@@ -394,6 +394,26 @@ jobs:
           node webui/server/lib/insecure-dev.check.js
           node webui/server/lib/mongoose-debug.check.js
 
+  book:
+    # #2168: the book is built from docs-book/ at publish time (pages.yml), so a
+    # PR that breaks it is caught here, with the same pinned mdBook.
+    name: Book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install mdBook 0.5.4
+        run: cargo install mdbook --version 0.5.4 --locked
+      - name: mdbook build docs-book
+        run: |
+          mdbook build docs-book
+          test -f docs/book/index.html || { echo "mdbook wrote no docs/book/index.html"; exit 1; }
+      - name: docs/book is not committed
+        run: |
+          if git ls-files --error-unmatch docs/book >/dev/null 2>&1; then
+            echo "docs/book is built by pages.yml from docs-book/; do not commit it (#2168)"; exit 1
+          fi
+
   helm:
     # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits
     # 0, so it cannot catch the chart's refusal of amf.replicas > 1. The render

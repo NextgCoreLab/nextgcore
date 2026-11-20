@@ -27,6 +27,17 @@ jobs:
       - name: Update API index
         run: bash docs/scripts/update-api-docs.sh
 
+      # #2168: the book is built here from docs-book/ rather than committed, so
+      # the published book cannot drift from its sources (it once did for 127
+      # commits). mdBook is pinned: 0.5.4 reproduces the last committed build
+      # byte for byte (#2167). `--locked` takes its dependency versions from the
+      # crate's own lockfile, checked against crates.io's checksums.
+      - name: Install mdBook 0.5.4
+        run: cargo install mdbook --version 0.5.4 --locked
+
+      - name: Build the book
+        run: mdbook build docs-book
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
