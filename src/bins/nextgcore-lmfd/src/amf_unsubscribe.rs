@@ -41,7 +41,9 @@ pub const RECONCILE_PERIOD: Duration = Duration::from_millis(20);
 pub const MAX_PASS: Duration = Duration::from_secs(30);
 /// #2186 (R44 minor 4): 2 s in tests, not 500 ms. The pass budget gates when a
 /// DELETE may START (the shared sweep), and a loaded test host delayed the
-/// first one past 500 ms (2 of 12 suite runs).
+/// first one past 500 ms (2 of 12 suite runs). #2230 (the 2085 flake, also seen
+/// on main's pre-sweep code) is being reproduced at 500 ms: this bump can hide
+/// its latency variant, not its BACKOFF-writer or port-reuse candidates.
 #[cfg(test)]
 pub const MAX_PASS: Duration = Duration::from_millis(2000);
 

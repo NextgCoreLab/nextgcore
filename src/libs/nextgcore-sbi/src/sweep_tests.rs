@@ -252,263 +252,355 @@ const LOCAL: &str = "no remote call per peer in the loop";
 /// `PeerBackoff` but still one at a time: to move onto `sweep` (#2186 follow-up).
 const PENDING: &str = "a serial multi-peer reconciler still to move onto sweep: tracked in #2223";
 
-/// Every production fn the guard flags today, with the reason it is not (yet) a
-/// shared sweep. A NEW flagged fn fails `no_hand_rolled_sweeps_remain`.
-const ALLOWED: &[(&str, &str, &str)] = &[
+/// Every production fn the guard flags today: (file, fn name, how many fns of
+/// that name in the file the guard flags, the reason it is not (yet) a shared
+/// sweep). A NEW flagged fn fails `no_hand_rolled_sweeps_remain`, and so does a
+/// second one of an allowed name in the same file (#2216 R41 F1): the count is
+/// the one the entry was written for.
+const ALLOWED: &[(&str, &str, usize, &str)] = &[
+    ("nextgcore-smfd/src/main.rs", "gsm_expiry_permits", 1, LOCAL),
     (
         "nextgcore-amfd/src/nrf_subscription.rs",
         "unsubscribe_all",
+        1,
         CONCURRENT,
     ),
     (
         "nextgcore-amfd/src/nsac.rs",
         "a_cancelled_admission_leaves_its_slot_and_parks_what_it_owed_2036",
+        1,
         PROCEDURE,
     ),
-    ("nextgcore-amfd/src/nsac.rs", "reconcile_once", PENDING),
-    ("nextgcore-amfd/src/nsac.rs", "spawn_reconciler", TIMER),
+    ("nextgcore-amfd/src/nsac.rs", "reconcile_once", 1, PENDING),
+    ("nextgcore-amfd/src/nsac.rs", "spawn_reconciler", 1, TIMER),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "apply_release_complete",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "handle_ue_context_release",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "offload_release_held_sessions",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "offload_superseded_releases",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "process_pending_source_releases",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "process_release_guards",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "reconcile_update_sessions",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "release_all_pdu_sessions",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "release_ng_connections",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/ngap_path.rs",
         "send_registration_accept_reconciled",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-amfd/src/sbi_path.rs",
         "retry_peer_update",
+        1,
         ONE_PEER,
     ),
     (
         "nextgcore-eesd/src/ecs_registration.rs",
         "refresh_once",
+        1,
         ONE_PEER,
     ),
     (
         "nextgcore-eesd/src/ecs_registration.rs",
         "spawn_refresh",
+        1,
         TIMER,
     ),
-    ("nextgcore-eesd/src/main.rs", "spawn_lifecycle_sweep", TIMER),
+    (
+        "nextgcore-eesd/src/main.rs",
+        "spawn_lifecycle_sweep",
+        1,
+        TIMER,
+    ),
     (
         "nextgcore-hssd/src/s6a_path.rs",
         "sweep_pending_requests",
+        1,
         PENDING,
     ),
     (
         "nextgcore-lmfd/src/amf_unsubscribe.rs",
         "spawn_reconciler",
+        1,
         TIMER,
     ),
     (
         "nextgcore-lmfd/src/amf_unsubscribe.rs",
         "unsubscribe_all",
+        1,
         CONCURRENT,
     ),
     (
         "nextgcore-mbsmfd/src/main.rs",
         "handle_mbs_session_release",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-mbsmfd/src/main.rs",
         "release_amf_contexts",
+        1,
         PROCEDURE,
     ),
-    ("nextgcore-mbsmfd/src/main.rs", "release_retries", PROCEDURE),
+    (
+        "nextgcore-mbsmfd/src/main.rs",
+        "release_retries",
+        1,
+        PROCEDURE,
+    ),
     (
         "nextgcore-mbsmfd/src/reconcile.rs",
         "reconcile_once",
+        1,
         PENDING,
     ),
     (
         "nextgcore-mbsmfd/src/reconcile.rs",
         "spawn_reconciler",
+        1,
         TIMER,
     ),
     (
         "nextgcore-nefd/src/main.rs",
         "reconcile_pending_subscriptions",
+        1,
         PENDING,
     ),
     (
         "nextgcore-nefd/src/southbound_reconcile.rs",
         "reconcile_once",
+        1,
         PENDING,
     ),
     (
         "nextgcore-nefd/src/southbound_reconcile.rs",
         "spawn_reconciler",
+        1,
         TIMER,
     ),
     (
         "nextgcore-nwdafd/src/model_monitor.rs",
         "subscribe_at_anlf_retrying",
+        1,
         ONE_PEER,
     ),
     (
         "nextgcore-pcfd/src/bsf_reconcile.rs",
         "reconcile_once",
+        1,
         PENDING,
     ),
     (
         "nextgcore-pcfd/src/bsf_reconcile.rs",
         "spawn_reconciler",
+        1,
         TIMER,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "await_release_in_flight_on",
+        1,
         SHUTDOWN,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "drain_release_side_effects",
+        1,
         SHUTDOWN,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "drain_s5s8_requests",
+        1,
         SHUTDOWN,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "drain_sm_policy_deletes",
+        1,
         SHUTDOWN,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "handle_sm_context_release",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "nsac_count_out_unreleased",
+        1,
         SHUTDOWN,
     ),
-    ("nextgcore-smfd/src/main.rs", "nsac_release_permits", LOCAL),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "nsac_release_permits",
+        1,
+        LOCAL,
+    ),
     (
         "nextgcore-smfd/src/main.rs",
         "release_side_effect_permits",
+        1,
         LOCAL,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "release_side_effects",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "release_udm_cleanup",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "retry_n1n2_after_paging_conflict",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "spawn_release_side_effects_with",
+        1,
         PROCEDURE,
     ),
-    ("nextgcore-smfd/src/main.rs", "udm_release_permits", LOCAL),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "udm_release_permits",
+        1,
+        LOCAL,
+    ),
     (
         "nextgcore-smfd/src/pfcp_path.rs",
         "drain_restart_fanouts",
+        1,
         SHUTDOWN,
     ),
-    ("nextgcore-smfd/src/qos_mon.rs", "reconcile", LOCAL),
-    ("nextgcore-smfd/src/reconcile.rs", "reconcile_once", PENDING),
-    ("nextgcore-smfd/src/reconcile.rs", "spawn_reconciler", TIMER),
+    ("nextgcore-smfd/src/qos_mon.rs", "reconcile", 1, LOCAL),
+    (
+        "nextgcore-smfd/src/reconcile.rs",
+        "reconcile_once",
+        1,
+        PENDING,
+    ),
+    (
+        "nextgcore-smfd/src/reconcile.rs",
+        "spawn_reconciler",
+        1,
+        TIMER,
+    ),
     (
         "nextgcore-smfd/src/restoration.rs",
         "reconcile_session_not_found",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-smfd/src/restoration.rs",
         "release_epc_pdn_connections_scoped",
+        1,
         PROCEDURE,
     ),
     (
         "nextgcore-tsctsf/src/actuation.rs",
         "delete_with_retry",
+        1,
         ONE_PEER,
     ),
     (
         "nextgcore-tsctsf/src/reconcile.rs",
         "reconcile_once",
+        1,
         PENDING,
     ),
     (
         "nextgcore-tsctsf/src/reconcile.rs",
         "spawn_reconciler",
+        1,
         TIMER,
     ),
     (
         "nextgcore-udmd/src/app.rs",
         "handle_ee_unsubscribe",
+        1,
         PROCEDURE,
     ),
-    ("nextgcore-udmd/src/app.rs", "spawn_ee_expiry_sweep", TIMER),
-    ("nextgcore-udmd/src/ee_amf.rs", "reconcile", PROCEDURE),
+    (
+        "nextgcore-udmd/src/app.rs",
+        "spawn_ee_expiry_sweep",
+        1,
+        TIMER,
+    ),
+    ("nextgcore-udmd/src/ee_amf.rs", "reconcile", 1, PROCEDURE),
     (
         "nextgcore-udmd/src/ee_amf.rs",
         "spawn_unsubscribe_reconciler",
+        1,
         TIMER,
     ),
     (
         "nextgcore-udmd/src/ee_amf.rs",
         "spawn_amf_leg_renewal",
+        1,
         TIMER,
     ),
-    ("nextgcore-udmd/src/sdm_udr.rs", "drain", CONCURRENT),
-    ("nextgcore-udmd/src/sdm_udr.rs", "refresh_legs", ONE_PEER),
-    ("nextgcore-udmd/src/sdm_udr.rs", "spawn_leg_refresh", TIMER),
+    ("nextgcore-udmd/src/sdm_udr.rs", "drain", 1, CONCURRENT),
+    ("nextgcore-udmd/src/sdm_udr.rs", "refresh_legs", 1, ONE_PEER),
+    (
+        "nextgcore-udmd/src/sdm_udr.rs",
+        "spawn_leg_refresh",
+        1,
+        TIMER,
+    ),
 ];
 
 /// The words that name a pass over peers.
@@ -520,9 +612,13 @@ const PASS_WORDS: &[&str] = &[
     "sweep",
     "unsubscribe",
     "drain",
-    "expire",
+    "expir",
     "retry",
     "owed",
+    "purge",
+    "reap",
+    "cleanup",
+    "lapse",
 ];
 
 /// The `{...}` block starting at or after `from` in `s`.
@@ -546,12 +642,40 @@ fn block_at(s: &str, from: usize) -> &str {
     &s[open..]
 }
 
+/// The `(...)` span opening at `open` in `s`.
+fn paren_span(s: &str, open: usize) -> &str {
+    let mut depth = 0usize;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[open..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    &s[open..]
+}
+
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Whether `body` has a `for`, `while` or `loop` whose block awaits.
 fn loop_awaits(body: &str) -> bool {
+    // #2216 R41 F3: a stream or iterator combinator whose closure awaits is a
+    // loop too (`stream::iter(peers).for_each(|p| async { ...await })`, serial;
+    // `for_each_concurrent(limit, ...)`, a hand-rolled bound).
+    for call in [".for_each(", "for_each_concurrent(", ".then(", ".fold("] {
+        for (at, _) in body.match_indices(call) {
+            if paren_span(body, at + call.len() - 1).contains(".await") {
+                return true;
+            }
+        }
+    }
     for kw in ["for", "while", "loop"] {
         for (at, _) in body.match_indices(kw) {
             let before = body[..at].chars().next_back();
@@ -601,7 +725,9 @@ fn hand_rolled(src: &str) -> Vec<String> {
 }
 
 /// R44's three planted shapes are flagged: the #2155 serial `for ... .await`,
-/// a `drain_*` fn with a semaphore, and `Semaphore::const_new`. A pass on the
+/// a `drain_*` fn with a semaphore, and `Semaphore::const_new`; and R41's
+/// (#2216): a serial `purge_*` loop (F2), and a stream `for_each` /
+/// `for_each_concurrent(1, ...)` whose closure awaits (F3). A pass on the
 /// shared sweep, and a fn not named for a pass, are not.
 ///
 /// REVERT-VERIFIED: with the loop check dropped, the serial shape passes; with
@@ -629,6 +755,17 @@ async fn refresh_on_the_sweep(items: Vec<(String, u32)>) {
     for _ in 0..1 {}
     nextgcore_sbi::sweep::sweep(limits(), items, || (), |_, _, _| async { todo!() }).await;
 }
+async fn purge_stale_subscriptions(subs: Vec<Sub>) {
+    for s in subs {
+        delete(s).await;
+    }
+}
+async fn refresh_all_peers(xs: Vec<Peer>) {
+    futures::stream::iter(xs).for_each(|x| async move { refresh(x).await; }).await;
+}
+async fn cleanup_legs(xs: Vec<Peer>) {
+    futures::stream::iter(xs).for_each_concurrent(1, |x| async move { release(x).await; }).await;
+}
 async fn serve_requests(reqs: Vec<Req>) {
     for r in reqs {
         answer(r).await;
@@ -640,7 +777,10 @@ async fn serve_requests(reqs: Vec<Req>) {
         vec![
             "release_expired_legs",
             "drain_owed_deletes",
-            "renew_all_legs"
+            "renew_all_legs",
+            "purge_stale_subscriptions",
+            "refresh_all_peers",
+            "cleanup_legs",
         ]
     );
 }
@@ -682,23 +822,72 @@ fn no_hand_rolled_sweeps_remain() {
             }
         }
     }
-    let new: Vec<String> = found
-        .iter()
-        .filter(|(f, n)| !ALLOWED.iter().any(|(af, an, _)| af == f && an == n))
-        .map(|(f, n)| format!("{f}: fn {n}"))
-        .collect();
+    let problems = allowlist_violations(&found, ALLOWED);
     assert!(
-        new.is_empty(),
+        problems.is_empty(),
         "hand-rolled passes over peers: use nextgcore_sbi::sweep::sweep (#2186), or list \
-         one that is not a peer sweep in ALLOWED with its reason: {new:?}"
+         one that is not a peer sweep in ALLOWED with its count and reason: {problems:?}"
     );
-    let stale: Vec<String> = ALLOWED
-        .iter()
-        .filter(|(af, an, _)| !found.iter().any(|(f, n)| f == af && n == an))
-        .map(|(f, n, _)| format!("{f}: fn {n}"))
+}
+
+/// How `found` (file, fn name; one per flagged fn) differs from `allowed`: a
+/// flagged fn with no entry, an entry whose count is not the number found (a
+/// second same-named fn, or one gone), and an entry that matches nothing.
+fn allowlist_violations(
+    found: &[(String, String)],
+    allowed: &[(&str, &str, usize, &str)],
+) -> Vec<String> {
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> = Default::default();
+    for (f, n) in found {
+        *counts.entry((f.as_str(), n.as_str())).or_default() += 1;
+    }
+    let mut out = Vec::new();
+    for ((f, n), c) in &counts {
+        match allowed.iter().find(|(af, an, _, _)| af == f && an == n) {
+            None => out.push(format!("{f}: fn {n} (x{c}) is not in ALLOWED")),
+            Some((_, _, want, _)) if want != c => {
+                out.push(format!("{f}: fn {n}: {c} flagged, ALLOWED says {want}"))
+            }
+            Some(_) => {}
+        }
+    }
+    for (f, n, _, _) in allowed {
+        if !counts.contains_key(&(*f, *n)) {
+            out.push(format!("{f}: fn {n} is in ALLOWED but matches nothing"));
+        }
+    }
+    out
+}
+
+/// #2216 R41 F1: a second serial `reconcile_once` in a file whose one
+/// `reconcile_once` is allowed is caught, because the entry carries its count.
+///
+/// REVERT-VERIFIED: with the count ignored (any number allowed), no violation.
+#[test]
+fn a_second_fn_of_an_allowed_name_in_the_same_file_is_caught() {
+    let src = r#"
+pub async fn reconcile_once() {
+    for p in parked() {
+        send(p).await;
+    }
+}
+mod r41_extra {
+    pub async fn reconcile_once(xs: Vec<u8>) {
+        for x in xs {
+            send(x).await;
+        }
+    }
+}
+"#;
+    let found: Vec<(String, String)> = hand_rolled(src)
+        .into_iter()
+        .map(|n| ("nextgcore-amfd/src/nsac.rs".to_string(), n))
         .collect();
-    assert!(
-        stale.is_empty(),
-        "ALLOWED entries that no longer match: {stale:?}"
-    );
+    assert_eq!(found.len(), 2);
+    let allowed = [("nextgcore-amfd/src/nsac.rs", "reconcile_once", 1, PENDING)];
+    let v = allowlist_violations(&found, &allowed);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("2 flagged, ALLOWED says 1"), "{v:?}");
+    let allowed = [("nextgcore-amfd/src/nsac.rs", "reconcile_once", 2, PENDING)];
+    assert!(allowlist_violations(&found, &allowed).is_empty());
 }
