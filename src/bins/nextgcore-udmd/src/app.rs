@@ -2919,6 +2919,9 @@ fn apply_ee_patch(stored: &mut serde_json::Value, patch: &serde_json::Value) -> 
     if ops.is_empty() {
         return Err("patch carries no operations".to_string());
     }
+    // #2133: applied to a copy and committed only when every op applied, so a
+    // patch refused at its third op changes nothing.
+    let mut working = stored.clone();
     for op in ops {
         let op_name = op
             .get("op")
@@ -2928,38 +2931,95 @@ fn apply_ee_patch(stored: &mut serde_json::Value, patch: &serde_json::Value) -> 
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "PatchItem is missing path".to_string())?;
-        // Only top-level members of EeSubscription are addressable here; that is
-        // what the spec's patch targets (monitoringConfigurations,
-        // callbackReference, reportingOptions, ...). A deeper pointer is refused
-        // rather than half-applied.
-        let member = path.strip_prefix('/').unwrap_or(path);
-        if member.is_empty() || member.contains('/') {
-            return Err(format!(
-                "path {path:?} must address a top-level EeSubscription member"
-            ));
-        }
-        let target = stored
-            .as_object_mut()
-            .ok_or_else(|| "stored subscription is not a JSON object".to_string())?;
-        match op_name {
-            "add" | "replace" => {
-                let value = op
-                    .get("value")
-                    .ok_or_else(|| format!("{op_name} on {path:?} has no value"))?;
-                if op_name == "replace" && !target.contains_key(member) {
-                    return Err(format!("cannot replace absent member {path:?}"));
-                }
-                target.insert(member.to_string(), value.clone());
+        // #2133 (R42 on #2128): a JSON Pointer of any depth (RFC 6901), so a
+        // consumer can set `/reportingOptions/expiry` without replacing the
+        // whole `reportingOptions` (RFC 6902 `add` on an existing member
+        // replaces it). The parent must exist, as RFC 6902 §4.1 requires.
+        let tokens = json_pointer_tokens(path)?;
+        let (last, parents) = tokens
+            .split_last()
+            .ok_or_else(|| format!("path {path:?} must address an EeSubscription member"))?;
+        let mut parent = &mut working;
+        for t in parents {
+            parent = match parent {
+                serde_json::Value::Object(m) => m.get_mut(t),
+                serde_json::Value::Array(a) => t.parse::<usize>().ok().and_then(|i| a.get_mut(i)),
+                _ => None,
             }
-            "remove" => {
-                if target.remove(member).is_none() {
+            .ok_or_else(|| format!("path {path:?}: no member {t:?} to descend into"))?;
+        }
+        let value = || {
+            op.get("value")
+                .cloned()
+                .ok_or_else(|| format!("{op_name} on {path:?} has no value"))
+        };
+        match (op_name, parent) {
+            ("add", serde_json::Value::Object(m)) => {
+                m.insert(last.clone(), value()?);
+            }
+            ("replace", serde_json::Value::Object(m)) => {
+                let slot = m
+                    .get_mut(last.as_str())
+                    .ok_or_else(|| format!("cannot replace absent member {path:?}"))?;
+                *slot = value()?;
+            }
+            ("remove", serde_json::Value::Object(m)) => {
+                if m.remove(last.as_str()).is_none() {
                     return Err(format!("cannot remove absent member {path:?}"));
                 }
             }
-            other => return Err(format!("unsupported patch op {other:?}")),
+            ("add", serde_json::Value::Array(a)) => {
+                let at = if last == "-" {
+                    a.len()
+                } else {
+                    last.parse::<usize>()
+                        .ok()
+                        .filter(|i| *i <= a.len())
+                        .ok_or_else(|| format!("path {path:?}: index out of range"))?
+                };
+                a.insert(at, value()?);
+            }
+            ("replace" | "remove", serde_json::Value::Array(a)) => {
+                let at = last
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|i| *i < a.len())
+                    .ok_or_else(|| format!("path {path:?}: index out of range"))?;
+                if op_name == "replace" {
+                    a[at] = value()?;
+                } else {
+                    a.remove(at);
+                }
+            }
+            ("add" | "replace" | "remove", _) => {
+                return Err(format!(
+                    "path {path:?}: its parent is not an object or array"
+                ));
+            }
+            (other, _) => return Err(format!("unsupported patch op {other:?}")),
         }
     }
+    *stored = working;
     Ok(())
+}
+
+/// The reference tokens of RFC 6901 JSON Pointer `path`, unescaped (`~1` is
+/// `/`, `~0` is `~`). The whole document (`""`) is refused: a patch replaces
+/// members, not the subscription.
+fn json_pointer_tokens(path: &str) -> Result<Vec<String>, String> {
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err(format!("path {path:?} is not a JSON Pointer (RFC 6901)"));
+    };
+    rest.split('/')
+        .map(|t| {
+            if t.is_empty() && rest.is_empty() {
+                return Err(format!(
+                    "path {path:?} must address an EeSubscription member"
+                ));
+            }
+            Ok(t.replace("~1", "/").replace("~0", "~"))
+        })
+        .collect()
 }
 
 /// udmd#1: Nudm_Sdm SoRAckInfo (TS 29.503 5.2.2.6, PUT /am-data/sor-ack).
@@ -5994,6 +6054,75 @@ mod tests {
         let ctx = udm_self();
         let Ok(context) = ctx.read() else { return };
         context.ee_subscription_remove(id);
+    }
+
+    /// **#2133** (R42 on #2128): a PatchItem may address a nested member, so
+    /// `add /reportingOptions/expiry` sets the expiry and keeps the object's
+    /// other members, where `add /reportingOptions` replaces the whole object
+    /// (RFC 6902 §4.1). A missing parent, a bad index or a failing op refuses
+    /// the patch and changes nothing.
+    ///
+    /// REVERT-VERIFIED: with the pre-#2133 top-level-only rule, the nested add
+    /// is refused and `expect("nested add")` panics.
+    #[test]
+    fn ee_patch_sets_a_nested_member_and_keeps_its_siblings_2133() {
+        let mut stored = serde_json::json!({
+            "callbackReference": "http://nef/cb",
+            "reportingOptions": { "maxNumOfReports": 5, "expiry": "2026-01-01T00:00:00Z" },
+            "monitoringConfigurations": { "1": { "eventType": "LOSS_OF_CONNECTIVITY" } },
+            "list": [1, 2]
+        });
+        apply_ee_patch(
+            &mut stored,
+            &serde_json::json!([{
+                "op": "add", "path": "/reportingOptions/expiry", "value": "2099-01-01T00:00:00Z"
+            }]),
+        )
+        .expect("nested add");
+        assert_eq!(
+            stored["reportingOptions"],
+            serde_json::json!({ "maxNumOfReports": 5, "expiry": "2099-01-01T00:00:00Z" }),
+            "maxNumOfReports survives"
+        );
+        // The object form replaces the object, as RFC 6902 says.
+        let mut whole = stored.clone();
+        apply_ee_patch(
+            &mut whole,
+            &serde_json::json!([{
+                "op": "add", "path": "/reportingOptions", "value": { "expiry": "x" }
+            }]),
+        )
+        .expect("object add");
+        assert_eq!(
+            whole["reportingOptions"],
+            serde_json::json!({ "expiry": "x" })
+        );
+        // Array members and escaped tokens.
+        apply_ee_patch(
+            &mut stored,
+            &serde_json::json!([
+                { "op": "add", "path": "/list/-", "value": 3 },
+                { "op": "replace", "path": "/list/0", "value": 9 },
+                { "op": "add", "path": "/monitoringConfigurations/a~1b", "value": {} }
+            ]),
+        )
+        .expect("array and escaped ops");
+        assert_eq!(stored["list"], serde_json::json!([9, 2, 3]));
+        assert!(stored["monitoringConfigurations"].get("a/b").is_some());
+        // Refused, and nothing applied: a missing parent after a good op.
+        let before = stored.clone();
+        for bad in [
+            serde_json::json!([
+                { "op": "add", "path": "/reportingOptions/expiry", "value": "y" },
+                { "op": "add", "path": "/absent/expiry", "value": "z" }
+            ]),
+            serde_json::json!([{ "op": "replace", "path": "/list/7", "value": 1 }]),
+            serde_json::json!([{ "op": "add", "path": "", "value": {} }]),
+            serde_json::json!([{ "op": "add", "path": "/callbackReference/x", "value": 1 }]),
+        ] {
+            assert!(apply_ee_patch(&mut stored, &bad).is_err(), "{bad}");
+            assert_eq!(stored, before, "{bad}: nothing applied");
+        }
     }
 
     #[test]
