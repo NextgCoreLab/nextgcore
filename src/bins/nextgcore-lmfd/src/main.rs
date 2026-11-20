@@ -1664,7 +1664,36 @@ fn age_of_fix_minutes(timestamp: u64) -> Option<u16> {
 /// failure → 500 `POSITIONING_FAILED` — the handler never fabricates
 /// coordinates.
 async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
+    handle_determine_location_with(request, owner_binding::identity_required()).await
+}
+
+/// [`handle_determine_location`] under an explicit SBI profile (#2214): the
+/// profile is read once, and the same value decides the NF-type gate, the new
+/// LDR's owner and the owner check of an LDR it would replace. That also lets a
+/// test drive the production path without the process-wide override.
+async fn handle_determine_location_with(request: &SbiRequest, production: bool) -> SbiResponse {
     log::info!("Determine Location");
+
+    // #2214: DetermineLocation is the AMF's (TS 23.273 Table 8.3.1-1, and every
+    // procedure there that invokes it: "The AMF invokes the
+    // Nlmf_Location_DetermineLocation service operation"; the GMLC reaches the
+    // LMF through the AMF, and is the EventNotify target, not a caller here). The
+    // shared verified-NF-type gate decides before anything is read, so a caller
+    // that is not shown to be an AMF learns nothing and starts no positioning:
+    // a typed certificate must name AMF as its one NF type, and a token must
+    // belong to an instance the NRF lists as an AMF. Under production an
+    // anonymous caller is refused too. Under dev an unidentified plaintext
+    // caller is still served, as every dev resource is.
+    if let Some(refused) = owner_binding::nf_type_refusal_with(
+        request,
+        nextgcore_sbi::types::NfType::Amf,
+        "DetermineLocation",
+        production,
+    )
+    .await
+    {
+        return refused;
+    }
 
     // A5: content-type gate (TS 29.572 yaml:42-47 lists application/json AND
     // multipart/related; yaml:102 lists 415). Any other media type is rejected
@@ -1797,11 +1826,15 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         // #2077: the LDR belongs to its verified creator, and an existing one
         // is replaced only by its owner, so no other NF can re-point a UE's
         // deferred location at its own hgmlcCallBackURI.
-        let owner = match owner_binding::owner_for_new_resource(request, "DetermineLocation") {
+        let owner = match owner_binding::owner_for_new_resource_with(
+            request,
+            "DetermineLocation",
+            production,
+        ) {
             Ok(owner) => owner,
             Err(refused) => return *refused,
         };
-        if let Some(refused) = register_owned_ldr(
+        if let Some(refused) = register_owned_ldr_with(
             LdrContext {
                 ldr_reference: ldr_ref.to_string(),
                 ldr_type: ldr_type.to_string(),
@@ -1812,6 +1845,7 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
             },
             request,
             "DetermineLocation",
+            production,
         ) {
             return refused;
         }
@@ -2547,10 +2581,20 @@ fn register_owned_ldr(
     request: &SbiRequest,
     operation: &str,
 ) -> Option<SbiResponse> {
+    register_owned_ldr_with(ldr, request, operation, owner_binding::identity_required())
+}
+
+/// [`register_owned_ldr`] under an explicit SBI profile (#2214).
+fn register_owned_ldr_with(
+    ldr: LdrContext,
+    request: &SbiRequest,
+    operation: &str,
+    production: bool,
+) -> Option<SbiResponse> {
     let reference = ldr.ldr_reference.clone();
     let result = match lmf_self().read() {
         Ok(c) => c.register_ldr_unless(ldr, |owner| {
-            owner_binding::refuse_non_owner(owner, request, operation)
+            owner_binding::refuse_non_owner_with(owner, request, operation, production)
         }),
         Err(_) => Err(None),
     };
@@ -4142,9 +4186,37 @@ async fn notify_n2(request: &SbiRequest) -> SbiResponse {
     handle_n2_info_notify(request, &test_owner(request)).await
 }
 
+/// #2214: the AMF the tests' DetermineLocation requests come from. The handler
+/// admits only a verified AMF (TS 23.273 Table 8.3.1-1). Under the default
+/// production profile an anonymous request is refused, so a test that drives
+/// positioning as a plain caller would pass only after a sibling set Dev (the
+/// #2157 trap). It calls as this AMF instead: a token the NRF lists as an AMF
+/// (seeded), valid under both profiles.
+#[cfg(test)]
+const TEST_AMF_2214: &str = "aaaaaaaa-2214-4000-8000-0000000000a1";
+
+/// `request` as [`TEST_AMF_2214`], unless it already carries an identity (a
+/// test of another caller sets its own).
+#[cfg(test)]
+fn as_test_amf(mut request: SbiRequest) -> SbiRequest {
+    owner_binding::seed_nf_type_for_test(TEST_AMF_2214, nextgcore_sbi::types::NfType::Amf);
+    if request.peer_cert_nf_instance_id.is_none() && request.oauth2_subject.is_none() {
+        request.oauth2_subject = Some(TEST_AMF_2214.to_string());
+    }
+    request
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2214: [`super::handle_determine_location`] as [`as_test_amf`]'s AMF.
+    /// Shadows the glob import, so every positioning test here calls as the
+    /// AMF. The gate's own tests call `handle_determine_location_with`
+    /// directly.
+    async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
+        super::handle_determine_location(&as_test_amf(request.clone())).await
+    }
 
     /// #1308: with no flag the SBI listener binds loopback, not every interface.
     #[test]
@@ -4264,8 +4336,10 @@ mod tests {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // A real measurement-derived fix must exist for a non-fabricating 200.
         seed_fix("imsi-001010000000099", 40.0);
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(r#"{"supi":"imsi-001010000000099"}"#, "application/json");
+        let req = as_test_amf(
+            SbiRequest::post("/nlmf-loc/v1/determine-location")
+                .with_body(r#"{"supi":"imsi-001010000000099"}"#, "application/json"),
+        );
         let resp = lmf_sbi_request_handler(req).await;
         // Dispatched (not 404); the conformant handler returns 200.
         assert_eq!(resp.status, 200);
@@ -4995,6 +5069,15 @@ mod tests {
     fn from_lmf_2157(request: SbiRequest) -> SbiRequest {
         owner_binding::seed_nf_type_for_test(PEER_2157, nextgcore_sbi::types::NfType::Lmf);
         from_peer_2157(request)
+    }
+
+    /// #2214: the test AMF (`super::TEST_AMF_2214`), the verified AMF a
+    /// DetermineLocation must come from (TS 23.273 Table 8.3.1-1).
+    const AMF_2214: &str = super::TEST_AMF_2214;
+
+    /// `request` from [`AMF_2214`], proven by its token.
+    fn from_amf_2214(request: SbiRequest) -> SbiRequest {
+        as_test_amf(request)
     }
 
     #[tokio::test]
@@ -6747,7 +6830,7 @@ lmf:
             );
         }
         let body = r#"{"supi":"imsi-001010000000104","ldrType":"PERIODIC","ldrReference":"ldr-p"}"#;
-        let req = from_peer_2157(
+        let req = from_amf_2214(
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json"),
         );
         let resp = handle_determine_location(&req).await;
@@ -6770,7 +6853,7 @@ lmf:
                 .ldr_find("ldr-p")
                 .and_then(|l| l.owner)
                 .as_deref(),
-            Some(PEER_2157),
+            Some(AMF_2214),
             "bound to its verified creator"
         );
     }
@@ -6924,7 +7007,7 @@ lmf:
             "ldrReference": "cc01",
             "hgmlcCallBackURI": "http://gmlc/cb"
         }"#;
-        let req = from_peer_2157(
+        let req = from_amf_2214(
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json"),
         );
         let resp = handle_determine_location(&req).await;
@@ -6940,9 +7023,160 @@ lmf:
         assert_eq!(found.hgmlc_callback_uri.as_deref(), Some("http://gmlc/cb"));
         assert_eq!(
             found.owner.as_deref(),
-            Some(PEER_2157),
+            Some(AMF_2214),
             "bound to its creator"
         );
+    }
+
+    /// A deferred (PERIODIC) DetermineLocation body for `supi` and `reference`.
+    fn deferred_2214(supi: &str, reference: &str) -> SbiRequest {
+        let body = serde_json::json!({
+            "supi": supi,
+            "ldrType": "PERIODIC",
+            "ldrReference": reference,
+            "hgmlcCallBackURI": "http://gmlc/cb",
+        });
+        SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(body.to_string(), "application/json")
+    }
+
+    /// **#2214**: DetermineLocation is the AMF's (TS 23.273 Table 8.3.1-1).
+    /// Through `handle_determine_location_with` under **both** profiles, every
+    /// other verified NF type is refused 403 and registers no LDR: a GMLC, SMF,
+    /// NEF or LMF certificate, and the token of an instance the NRF lists as a
+    /// GMLC, directly and through an SCP. (A mixed `[AMF, SMF]` certificate is
+    /// refused by the shared rule once #2218 lands.) Admitted, with the LDR bound
+    /// to the caller: an AMF certificate, an `[AMF, SCP]` certificate, an AMF's
+    /// token alone, and an AMF's token relayed through an SCP.
+    ///
+    /// REVERT-VERIFIED: with the `nf_type_refusal_with` gate removed, the GMLC
+    /// certificate is 200 and "refused: GMLC certificate" fails.
+    #[tokio::test]
+    async fn determine_location_admits_only_a_verified_amf_2214() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        const GMLC: &str = "bbbbbbbb-2214-4000-8000-0000000000b1";
+        const CERT: &str = "cccccccc-2214-4000-8000-0000000000c1";
+        const SCP: &str = "55555555-2214-4000-8000-000000000005";
+        owner_binding::seed_nf_type_for_test(AMF_2214, nextgcore_sbi::types::NfType::Amf);
+        owner_binding::seed_nf_type_for_test(GMLC, nextgcore_sbi::types::NfType::Gmlc);
+        let supi = "imsi-001010000022140";
+        seed_fix(supi, 40.0);
+        let with = |reference: &str, cert: Option<(&str, &[&str])>, token: Option<&str>| {
+            let mut r = deferred_2214(supi, reference);
+            if let Some((id, types)) = cert {
+                r.peer_cert_nf_instance_id = Some(id.to_string());
+                r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            }
+            r.oauth2_subject = token.map(str::to_string);
+            r
+        };
+        let registered = |reference: &str| lmf_self().read().unwrap().ldr_find(reference);
+        for production in [true, false] {
+            let p = u8::from(production);
+            for (what, cert, token) in [
+                ("GMLC certificate", Some((CERT, &["GMLC"][..])), None),
+                ("SMF certificate", Some((CERT, &["SMF"][..])), None),
+                ("NEF certificate", Some((CERT, &["NEF"][..])), None),
+                ("LMF certificate", Some((CERT, &["LMF"][..])), None),
+                ("GMLC token", None, Some(GMLC)),
+                (
+                    "GMLC token through an SCP",
+                    Some((SCP, &["SCP"][..])),
+                    Some(GMLC),
+                ),
+            ] {
+                let reference = format!("x2214-{p}-{}", what.replace([' ', ',', '[', ']'], ""));
+                let resp =
+                    handle_determine_location_with(&with(&reference, cert, token), production)
+                        .await;
+                assert_eq!(
+                    resp.status, 403,
+                    "refused: {what} (production {production}): {:?}",
+                    resp.http.content
+                );
+                assert!(
+                    resp.http
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("DetermineLocation"),
+                    "{what}: the refusal names the operation"
+                );
+                assert!(registered(&reference).is_none(), "{what}: no LDR");
+            }
+            for (what, cert, token, owner) in [
+                ("AMF certificate", Some((CERT, &["AMF"][..])), None, CERT),
+                (
+                    "[AMF, SCP] certificate",
+                    Some((CERT, &["AMF", "SCP"][..])),
+                    None,
+                    CERT,
+                ),
+                ("AMF token", None, Some(AMF_2214), AMF_2214),
+                (
+                    "AMF token through an SCP",
+                    Some((SCP, &["SCP"][..])),
+                    Some(AMF_2214),
+                    AMF_2214,
+                ),
+            ] {
+                let reference = format!("ok2214-{p}-{}", what.replace([' ', ',', '[', ']'], ""));
+                let resp =
+                    handle_determine_location_with(&with(&reference, cert, token), production)
+                        .await;
+                assert_eq!(
+                    resp.status, 200,
+                    "admitted: {what} (production {production}): {:?}",
+                    resp.http.content
+                );
+                let ldr = registered(&reference).expect("registered");
+                assert_eq!(
+                    ldr.owner.as_deref(),
+                    Some(owner),
+                    "{what}: bound to the caller"
+                );
+                if let Ok(c) = lmf_self().read() {
+                    c.cancel_ldr(&reference);
+                }
+            }
+        }
+    }
+
+    /// **#2214** (R44 on #2190): anonymous LDR creation at the handler, until
+    /// now covered only by `owner_binding`'s own tests. Under production an
+    /// anonymous DetermineLocation is refused 403 before anything is read, and
+    /// no LDR exists afterwards. Under dev
+    /// the same request is served and its LDR is ownerless, as every unbound
+    /// dev resource is.
+    ///
+    /// REVERT-VERIFIED: with `nf_type_refusal_with` given `false` for
+    /// `production`, the anonymous request is 200 and "production: anonymous"
+    /// fails.
+    #[tokio::test]
+    async fn an_anonymous_determine_location_is_refused_under_production_2214() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000022141";
+        seed_fix(supi, 40.0);
+        let resp = handle_determine_location_with(&deferred_2214(supi, "anon2214-p"), true).await;
+        assert_eq!(
+            resp.status, 403,
+            "production: anonymous: {:?}",
+            resp.http.content
+        );
+        assert!(lmf_self().read().unwrap().ldr_find("anon2214-p").is_none());
+        let resp = handle_determine_location_with(&deferred_2214(supi, "anon2214-d"), false).await;
+        assert_eq!(resp.status, 200, "dev: anonymous: {:?}", resp.http.content);
+        let ldr = lmf_self()
+            .read()
+            .unwrap()
+            .ldr_find("anon2214-d")
+            .expect("dev: registered");
+        assert_eq!(ldr.owner, None, "dev: ownerless");
+        if let Ok(c) = lmf_self().read() {
+            c.cancel_ldr("anon2214-d");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -8319,6 +8553,11 @@ mod a8_event_notify_tests {
 #[cfg(test)]
 mod positioning_chain_strict_peer {
     use super::*;
+
+    /// #2214: as in `tests`, DetermineLocation is called as the test AMF.
+    async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
+        super::handle_determine_location(&as_test_amf(request.clone())).await
+    }
     use nextgcore_amfd::context::{amf_self, PositioningDlKind, NEXTGCORE_INVALID_POOL_ID};
     use nextgcore_sbi::multipart;
     use nextgcore_sbi::server::SbiServerConfig;
