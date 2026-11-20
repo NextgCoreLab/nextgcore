@@ -32068,8 +32068,8 @@ mod tests {
         let bytes = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
             amf_ue_ngap_id,
             8,
-            &b"lmf-nf-instance-9".to_vec(),
-            &vec![0x01, 0x02, 0x03],
+            b"lmf-nf-instance-9",
+            &[0x01, 0x02, 0x03],
         );
         assert_eq!(bytes[1], 50);
 
@@ -32185,7 +32185,7 @@ mod tests {
         .await;
         let nrppa = vec![0x20u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
         let bytes = crate::gnb_pdus::uplink_non_ue_associated_nrppa_transport(
-            &b"lmf-routing-807".to_vec(),
+            b"lmf-routing-807",
             &nrppa.clone(),
         );
         ngap.process_ngap_message(1, &bytes).await.unwrap();
@@ -32250,7 +32250,7 @@ mod tests {
         let mut ngap = test_ngap_server().await;
         let nrppa = vec![0x00u8, 0x11, 0x22, 0x33, 0x44];
         let bytes = crate::gnb_pdus::uplink_non_ue_associated_nrppa_transport(
-            &b"lmf-nf-instance-2".to_vec(),
+            b"lmf-nf-instance-2",
             &nrppa.clone(),
         );
         assert_eq!(bytes[0], 0x00);

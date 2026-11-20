@@ -3589,8 +3589,8 @@ fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
         crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
             amf,
             ran,
-            &b"lmf-739".to_vec(),
-            &vec![0x20, 0x0B, 0x00],
+            b"lmf-739",
+            &[0x20, 0x0B, 0x00],
         )
     };
     vec![
