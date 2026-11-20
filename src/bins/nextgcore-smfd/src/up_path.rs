@@ -521,7 +521,7 @@ pub fn affected_sessions(
     let Ok(far_peers) = ctx.far_peers.read() else {
         return Vec::new();
     };
-    let toward = |smf_seid: u64| -> Option<(Vec<u32>, bool)> {
+    let toward_on = |smf_seid: u64| -> Option<(Vec<u32>, bool)> {
         let fars = far_peers.get(&smf_seid)?;
         let hits: Vec<(u32, bool)> = fars
             .iter()
@@ -534,6 +534,18 @@ pub fn affected_sessions(
             let access = hits.iter().any(|(_, a)| *a);
             (hits.into_iter().map(|(id, _)| id).collect(), access)
         })
+    };
+    // #2225: in the I-UPF's scope, a failed peer of the session's I-UPF leg (the
+    // NG-RAN on N3, or the PSA on N9) breaks the session's access side. Its
+    // remedy is the PSA session's: FAR 2 (Access) buffers, which the split also
+    // applies at the I-UPF, and the NG-RAN is told. The leg's FARs are not the
+    // PSA's, so they are never modified by their own IDs.
+    let toward = |smf_seid: u64| -> Option<(Vec<u32>, bool)> {
+        if scope.iupf {
+            return toward_on(crate::iupf::leg_seid(smf_seid))
+                .map(|_| (vec![crate::DL_FAR_ID], true));
+        }
+        toward_on(smf_seid)
     };
     let mut out = Vec::new();
     for (r, smf_seid, upf_seid) in five_g {
@@ -721,7 +733,7 @@ pub fn rearm_restored_holds() -> usize {
             .unwrap_or_default();
         entries
     };
-    let pool_keys: Vec<String> = crate::pfcp_path::global_pool()
+    let pool_keys: Vec<String> = crate::pfcp_path::n4_clients()
         .iter()
         .map(|c| c.recovery_time_stamp_key())
         .collect();
@@ -784,7 +796,7 @@ fn arm_rearmed_hold(upf_key: String, ip: IpAddr, generation: u64, left: Duration
     let timer = tokio::spawn(async move {
         let give_up = tokio::time::Instant::now() + MAX_HOLD;
         loop {
-            let associated = match crate::pfcp_path::global_pool()
+            let associated = match crate::pfcp_path::n4_clients()
                 .into_iter()
                 .find(|c| c.recovery_time_stamp_key() == upf_key)
             {
@@ -845,7 +857,7 @@ fn hold_expired(upf_key: &str, ip: IpAddr, generation: u64) {
             }
         };
     }
-    let Some(client) = crate::pfcp_path::global_pool()
+    let Some(client) = crate::pfcp_path::n4_clients()
         .into_iter()
         .find(|c| c.recovery_time_stamp_key() == upf_key)
     else {
@@ -876,7 +888,21 @@ fn spawn_fanout(affected: Vec<Affected>, reason: &'static str, action: Action) {
     if affected.is_empty() {
         return;
     }
-    let fanout = tokio::spawn(async move {
+    crate::pfcp_path::track_restart_fanout(fanout_task(affected, reason, action));
+}
+
+/// Release `affected` at once, PFCP deletion then #39, and return the fan-out
+/// for the caller to track (#2225: the sessions of a lost I-UPF).
+pub fn release_now(affected: Vec<Affected>, reason: &'static str) -> tokio::task::JoinHandle<()> {
+    fanout_task(affected, reason, Action::Release)
+}
+
+fn fanout_task(
+    affected: Vec<Affected>,
+    reason: &'static str,
+    action: Action,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(PATH_FANOUT));
         let mut set = tokio::task::JoinSet::new();
         for a in affected {
@@ -900,14 +926,21 @@ fn spawn_fanout(affected: Vec<Affected>, reason: &'static str, action: Action) {
             });
         }
         while set.join_next().await.is_some() {}
-    });
-    crate::pfcp_path::track_restart_fanout(fanout);
+    })
 }
 
 /// The sessions of an Error Indication Report (TS 29.244 §8.2.21 ERIR): the one
 /// session `smf_seid`, for its forwarding FARs toward `peer`, or all its forwarding
 /// Access FARs when the report names none.
-pub fn deactivate_after_error_indication(smf_seid: u64, peer: Option<IpAddr>) {
+///
+/// #2225: a report on an I-UPF leg's SEID is the leg's PSA session's (TS 23.527
+/// §5.3.3.2: the PDU session is identified, and an I-UPF controlled by this SMF
+/// lets its user plane be restored, so it is deactivated, not deleted). The leg's
+/// FARs toward `peer` decide, and the PSA session's FAR 2 (Access) is the one
+/// deactivated, which the split applies at the I-UPF too.
+pub fn deactivate_after_error_indication(report_seid: u64, peer: Option<IpAddr>) {
+    let on_leg = crate::iupf::is_leg_seid(report_seid);
+    let smf_seid = crate::iupf::psa_seid_of(report_seid);
     let found = {
         let handle = smf_self();
         let Ok(ctx) = handle.read() else { return };
@@ -932,7 +965,7 @@ pub fn deactivate_after_error_indication(smf_seid: u64, peer: Option<IpAddr>) {
             .far_peers
             .read()
             .ok()
-            .and_then(|m| m.get(&smf_seid).cloned())
+            .and_then(|m| m.get(&report_seid).cloned())
             .unwrap_or_default()
             .into_iter()
             .filter(|(_, p)| {
@@ -944,6 +977,11 @@ pub fn deactivate_after_error_indication(smf_seid: u64, peer: Option<IpAddr>) {
             })
             .map(|(id, p)| (id, p.access))
             .collect();
+        let fars = if on_leg && !fars.is_empty() {
+            vec![(crate::DL_FAR_ID, true)]
+        } else {
+            fars
+        };
         reference.map(|(r, upf_seid)| (r, upf_seid, fars))
     };
     let Some((reference, upf_seid, fars)) = found else {

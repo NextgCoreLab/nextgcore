@@ -1875,7 +1875,8 @@ async fn handle_pfcp_session_report_from(
             // `trigger_service_request` flag `n4_handler` sets was reached only from
             // its own unit test — so downlink data for an idle UE never paged and
             // every mobile-terminated service silently failed.
-            trigger_network_initiated_service_request(seid, qfi).await;
+            // #2225: an I-UPF leg's report pages for its PSA session.
+            trigger_network_initiated_service_request(iupf::psa_seid_of(seid), qfi).await;
         } else {
             log::warn!("Report Type has DLDR set but no Downlink Data Report IE present");
         }

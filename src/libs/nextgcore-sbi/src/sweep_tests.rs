@@ -259,6 +259,13 @@ const PENDING: &str = "a serial multi-peer reconciler still to move onto sweep: 
 /// the one the entry was written for.
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("nextgcore-smfd/src/main.rs", "gsm_expiry_permits", 1, LOCAL),
+    // #2225: the queued leg deletions all go to the one configured I-UPF.
+    (
+        "nextgcore-smfd/src/iupf.rs",
+        "retry_pending_deletions",
+        1,
+        ONE_PEER,
+    ),
     (
         "nextgcore-amfd/src/nrf_subscription.rs",
         "unsubscribe_all",

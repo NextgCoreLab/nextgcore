@@ -664,6 +664,19 @@ pub fn global_pool() -> Vec<Arc<PfcpClient>> {
         .unwrap_or_default()
 }
 
+/// Every N4 peer this SMF holds an association with: the PSA pool, and the
+/// configured I-UPF (#2225), which is not a PSA candidate but whose failed paths
+/// are held and released like a pool member's.
+pub fn n4_clients() -> Vec<Arc<PfcpClient>> {
+    let mut clients = global_pool();
+    if let Some(iupf) = crate::iupf::client() {
+        if !clients.iter().any(|c| Arc::ptr_eq(c, &iupf)) {
+            clients.push(iupf);
+        }
+    }
+    clients
+}
+
 /// Session → UPF binding: the SMF's own N4 SEID → PFCP peer address,
 /// recorded at session establishment. Modification/deletion of an existing
 /// session must keep signalling the UPF the session was established on,
@@ -906,6 +919,14 @@ async fn iupf_leg_delete(leg: &crate::iupf::IupfLeg, body: &[u8]) {
     match r.as_ref().map(|(_, b)| parse_cause(b)) {
         Ok(Some(pfcp_cause::REQUEST_ACCEPTED)) => {
             log::info!("I-UPF Session Deletion for SEID 0x{psa_seid:016x}: accepted")
+        }
+        // #2225: unanswered, so retried once the I-UPF is associated again.
+        Err(e) => {
+            log::warn!(
+                "I-UPF Session Deletion for SEID 0x{psa_seid:016x}: {e}; queued, and the \
+                 PSA's goes on"
+            );
+            crate::iupf::queue_deletion(leg.smf_seid, leg.upf_seid);
         }
         other => log::warn!(
             "I-UPF Session Deletion for SEID 0x{psa_seid:016x}: {other:?}; the PSA's goes on"
@@ -2137,6 +2158,19 @@ impl PfcpClient {
                 proceed.notified().await;
             }
         }
+        // #2225: the I-UPF's restart, release or heartbeat loss. Its PSA sessions
+        // are alive, so they are not flushed here: each is deleted at its PSA and
+        // released with #39 (TS 23.527 §4.3.4 leaves restoration a "may").
+        if crate::iupf::is_client(self) {
+            let releases = crate::iupf::release_sessions_of_lost_iupf(reason);
+            let mut assoc = self.assoc.write().await;
+            assoc.associated = false;
+            assoc.peer_recovery_time_stamp = None;
+            assoc.peer_load = None;
+            assoc.peer_load_seq = None;
+            self.publish_associated(&assoc);
+            return releases;
+        }
         // #720: only the sessions on THIS UPF. A pool member's restart, release or
         // heartbeat loss says nothing about the sessions on the other members, which
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
@@ -2246,6 +2280,10 @@ impl PfcpClient {
             assoc.peer_recovery_time_stamp = None;
             assoc.up_function_features = resp.up_function_features;
             self.publish_associated(&assoc);
+            // #2225: the I-UPF sessions whose deletion found it unreachable.
+            if crate::iupf::is_client(self) {
+                crate::iupf::retry_pending_deletions();
+            }
             log::info!(
                 "PFCP association established with {} (UP features={:?})",
                 self.peer(),
@@ -2507,6 +2545,10 @@ fn holds_pfcp_sessions() -> bool {
 /// Whether this SMF holds a PFCP session whose SMF-side SEID is `seid` (#974 review
 /// m2): the set [`held_session_seids`] lists, without building it.
 pub fn holds_session_seid(seid: u64) -> bool {
+    // #2225: an I-UPF leg is held while its PSA session has it.
+    if crate::iupf::is_leg_seid(seid) {
+        return crate::iupf::leg_of(crate::iupf::psa_seid_of(seid)).is_some();
+    }
     let global = smf_self();
     let Ok(ctx) = global.read() else {
         return false;
@@ -2559,6 +2601,10 @@ pub fn holds_session_seid(seid: u64) -> bool {
 /// `pfcp_sessions` entry; else the EPC PDN connection's own `upf_n4_seid`. One map
 /// guard at a time, as every writer takes them.
 pub fn upf_seid_for_session(seid: u64) -> Option<u64> {
+    // #2225: the I-UPF's SEID for a leg.
+    if crate::iupf::is_leg_seid(seid) {
+        return crate::iupf::leg_of(crate::iupf::psa_seid_of(seid)).map(|l| l.upf_seid);
+    }
     let global = smf_self();
     let ctx = global.read().ok()?;
     let inherited = ctx
@@ -2711,6 +2757,10 @@ fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
 /// asking it to retain them, and then releasing them all when it answered without
 /// PSREI, released every UE on the healthy UPFs.
 fn holds_pfcp_sessions_on(client: &PfcpClient) -> bool {
+    // #2225: the I-UPF holds the legs, which no PSA routing names.
+    if crate::iupf::is_client(client) {
+        return crate::iupf::has_legs();
+    }
     let routing = SessionRouting::now();
     held_session_seids()
         .into_iter()
@@ -2722,6 +2772,10 @@ impl PfcpClient {
     /// routing [`session_served_by`] applies. Computed with no guard held across
     /// the ownership check, which takes the N4 maps' own locks.
     pub(crate) fn session_scope(&self) -> crate::restoration::SessionScope {
+        // #2225: the I-UPF's sessions are the legs of PSA sessions.
+        if crate::iupf::is_client(self) {
+            return crate::iupf::session_scope();
+        }
         let (five_g, epc): (Vec<(String, u64)>, Vec<(u64, u64)>) = match smf_self().read() {
             Ok(ctx) => {
                 let inherited = ctx
@@ -2771,6 +2825,7 @@ impl PfcpClient {
                 .collect(),
             refs: five_g.into_iter().map(|(r, _)| r).collect(),
             epc_sess_ids: epc.into_iter().map(|(id, _)| id).collect(),
+            iupf: false,
         }
     }
 }

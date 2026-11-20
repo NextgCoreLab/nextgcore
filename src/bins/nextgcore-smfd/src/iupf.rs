@@ -32,11 +32,31 @@
 //! A Session Deletion deletes the I-UPF's session first. The record of the I-UPF
 //! leg is in the durable snapshot (`iupfLegs`), so a restarted SMF keeps splitting.
 //!
+//! The I-UPF's own failures (#2225):
+//! - **Association loss or restart** (heartbeat loss, a changed Recovery Time
+//!   Stamp, an Association Release, cause 72, sessions not retained): every PSA
+//!   session with a leg is deleted at its PSA, which is alive, and released with
+//!   #39 so the UE re-establishes it ([`release_sessions_of_lost_iupf`]). TS 23.527
+//!   §4.3.4 makes restoring the I-UPF's sessions a "may". This tree's I-UPF
+//!   chooses its F-TEIDs, so a restored leg would also need the NG-RAN's UL tunnel
+//!   moved over N2, and restoration is not done.
+//! - **User Plane Path Failure Reports** (TS 29.244 §5.10A) from the I-UPF are
+//!   held and released as `up_path` does for the PSA's peers. The I-UPF's scope is
+//!   the PSA sessions with a leg ([`session_scope`]). A failed peer of a leg (the
+//!   NG-RAN on N3, or the PSA on N9) deactivates the PSA session's access side.
+//! - **Session Reports** on a leg SEID are attributed to its PSA session:
+//!   Downlink Data Reports page the UE, and Error Indication Reports deactivate the
+//!   user plane (TS 23.527 §5.3.3.2).
+//! - **A leg deletion the I-UPF did not answer** is queued (at most
+//!   [`MAX_PENDING_DELETIONS`]) and sent again once the I-UPF is associated again.
+//!   An answer of any cause ends it, since a restarted I-UPF answers "Session
+//!   context not found".
+//!
 //! Not done, stated: an I-UPF chosen per location (one configured I-UPF serves
 //! every session it applies to), relocation or removal of the I-UPF mid-session
-//! (TS 23.502 §4.3.5.5-6), a split PDU session (additional NG-RAN tunnels, #619)
-//! on an I-UPF session (refused, `split_pdu_session_modification`), and the
-//! I-UPF's own path failure / restart handling (#2225).
+//! (TS 23.502 §4.3.5.5-6), restoring a lost I-UPF's sessions (above), and a split
+//! PDU session (additional NG-RAN tunnels, #619) on an I-UPF session (refused,
+//! `split_pdu_session_modification`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -122,6 +142,211 @@ pub fn client() -> Option<Arc<PfcpClient>> {
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|c| c.client.clone())
+}
+
+/// Whether `client` is the configured I-UPF's (#2225).
+pub fn is_client(client: &PfcpClient) -> bool {
+    CONFIG
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c.client), client))
+}
+
+/// Whether any PSA session has an I-UPF leg.
+pub fn has_legs() -> bool {
+    let ctx = crate::context::smf_self();
+    let Ok(ctx) = ctx.read() else {
+        return false;
+    };
+    let has = ctx.iupf_legs.read().is_ok_and(|l| !l.is_empty());
+    has
+}
+
+/// The PSA sessions with a leg: `(SM context reference, SMF SEID, PSA's SEID)`.
+fn leg_sessions() -> Vec<(String, u64, u64)> {
+    let handle = crate::context::smf_self();
+    let Ok(ctx) = handle.read() else {
+        return Vec::new();
+    };
+    // One map guard at a time.
+    let legs: std::collections::HashSet<u64> = ctx
+        .iupf_legs
+        .read()
+        .map(|l| l.keys().copied().collect())
+        .unwrap_or_default();
+    if legs.is_empty() {
+        return Vec::new();
+    }
+    let inherited = ctx
+        .cp_n4_seids
+        .read()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let sessions = ctx
+        .pfcp_sessions
+        .read()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    sessions
+        .into_iter()
+        .filter_map(|(r, upf_seid)| {
+            let seid = inherited
+                .get(&r)
+                .copied()
+                .unwrap_or_else(|| crate::context::derive_cp_n4_seid(&r));
+            legs.contains(&seid).then_some((r, seid, upf_seid))
+        })
+        .collect()
+}
+
+/// The I-UPF's sessions as a restoration scope (#2225): the PSA sessions with a
+/// leg, marked as the I-UPF's so a report is read against the legs' FARs.
+pub fn session_scope() -> crate::restoration::SessionScope {
+    let sessions = leg_sessions();
+    crate::restoration::SessionScope {
+        seids: sessions.iter().map(|(_, s, _)| *s).collect(),
+        refs: sessions.into_iter().map(|(r, _, _)| r).collect(),
+        epc_sess_ids: Default::default(),
+        iupf: true,
+    }
+}
+
+/// The I-UPF was lost (#2225): its association went, or it restarted. Every leg
+/// is forgotten, and its I-UPF session queued for deletion once the I-UPF is
+/// back (it may have kept them across a heartbeat loss). Every PSA session with a
+/// leg is then deleted at its PSA and released with #39, so the UE re-establishes
+/// it. Returns the fan-out.
+pub fn release_sessions_of_lost_iupf(reason: &str) -> tokio::task::JoinHandle<()> {
+    let sessions = leg_sessions();
+    let legs: Vec<(u64, IupfLeg)> = {
+        let ctx = crate::context::smf_self();
+        let legs = ctx
+            .read()
+            .ok()
+            .and_then(|c| c.iupf_legs.read().ok().map(|l| l.clone()))
+            .unwrap_or_default();
+        legs.into_iter().collect()
+    };
+    for (psa_seid, leg) in &legs {
+        forget(*psa_seid);
+        queue_deletion(leg.smf_seid, leg.upf_seid);
+    }
+    log::error!(
+        "I-UPF lost ({reason}): {} session(s) with an I-UPF leg are deleted at their PSA and \
+         released with #39 (TS 23.527 §4.3.4); {} leg(s) forgotten",
+        sessions.len(),
+        legs.len()
+    );
+    let affected = sessions
+        .into_iter()
+        .map(|(reference, smf_seid, upf_seid)| crate::up_path::Affected {
+            reference: Some(reference),
+            epc_sess_id: None,
+            smf_seid,
+            upf_seid,
+            fars: vec![crate::DL_FAR_ID],
+            access: true,
+        })
+        .collect();
+    crate::up_path::release_now(affected, "I-UPF association lost or restarted")
+}
+
+/// At most this many unanswered I-UPF session deletions wait for the I-UPF to
+/// come back. Beyond that the oldest is dropped, with a warning.
+pub const MAX_PENDING_DELETIONS: usize = 4096;
+
+/// I-UPF sessions whose deletion the I-UPF did not answer: `(SMF SEID, I-UPF
+/// SEID)`.
+static PENDING_DELETIONS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+pub(crate) fn queue_deletion(smf_seid: u64, upf_seid: u64) {
+    let mut q = PENDING_DELETIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if q.iter().any(|(s, _)| *s == smf_seid) {
+        return;
+    }
+    if q.len() >= MAX_PENDING_DELETIONS {
+        if let Some((s, _)) = q.pop_front() {
+            log::warn!(
+                "I-UPF deletion queue full: the session of SEID 0x{s:016x} is no longer \
+                 retried"
+            );
+        }
+    }
+    q.push_back((smf_seid, upf_seid));
+}
+
+/// How many I-UPF session deletions wait for the I-UPF.
+pub fn pending_deletions() -> usize {
+    PENDING_DELETIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// Delete the I-UPF session `(smf_seid, upf_seid)`. True when the I-UPF answered,
+/// whatever the cause: it then holds no such session.
+async fn delete_on_iupf(client: &PfcpClient, smf_seid: u64, upf_seid: u64) -> bool {
+    let body = n4_build::build_session_deletion_request();
+    match client
+        .session_request(
+            pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+            smf_seid,
+            Some(upf_seid),
+            &body,
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!(
+                "I-UPF session of SEID 0x{smf_seid:016x} not deleted ({e}); retried once the \
+                 I-UPF is associated again"
+            );
+            false
+        }
+    }
+}
+
+/// Send the queued I-UPF session deletions again (#2225), after the I-UPF
+/// associated. One that goes unanswered again stays queued.
+pub fn retry_pending_deletions() {
+    let queued: Vec<(u64, u64)> = PENDING_DELETIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
+    if queued.is_empty() {
+        return;
+    }
+    let (Some(client), Ok(rt)) = (client(), tokio::runtime::Handle::try_current()) else {
+        PENDING_DELETIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(queued);
+        return;
+    };
+    log::info!(
+        "I-UPF associated: retrying {} session deletion(s) it did not answer",
+        queued.len()
+    );
+    rt.spawn(async move {
+        for (smf_seid, upf_seid) in queued {
+            if !delete_on_iupf(&client, smf_seid, upf_seid).await {
+                queue_deletion(smf_seid, upf_seid);
+            }
+        }
+    });
+}
+
+/// Forget every queued deletion (tests).
+#[cfg(test)]
+pub(crate) fn clear_pending_deletions() {
+    PENDING_DELETIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Whether a session on `dnn` gets the I-UPF.
@@ -570,8 +795,9 @@ pub fn note_applied(psa_seid: u64, direction: Direction) {
 
 /// The PSA session `psa_seid` went without an N4 Deletion reaching its I-UPF
 /// (association loss, a restart, an unrestorable session; R43 M2 on #2243): its
-/// leg is forgotten and the I-UPF's session deleted, best effort, so the I-UPF
-/// relays nothing toward a PSA tunnel that is gone.
+/// leg is forgotten and the I-UPF's session deleted, so the I-UPF relays nothing
+/// toward a PSA tunnel that is gone. A deletion the I-UPF does not answer is
+/// queued and sent again once it is associated again (#2225).
 pub fn release_leg(psa_seid: u64) {
     let Some(leg) = leg_of(psa_seid) else {
         return;
@@ -582,28 +808,17 @@ pub fn release_leg(psa_seid: u64) {
     };
     let Ok(rt) = tokio::runtime::Handle::try_current() else {
         log::warn!(
-            "I-UPF leg of SEID 0x{psa_seid:016x} forgotten; no runtime to delete its session"
+            "I-UPF leg of SEID 0x{psa_seid:016x} forgotten; no runtime to delete its \
+             session, queued"
         );
+        queue_deletion(leg.smf_seid, leg.upf_seid);
         return;
     };
     rt.spawn(async move {
-        let body = n4_build::build_session_deletion_request();
-        match client
-            .session_request(
-                pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
-                leg.smf_seid,
-                Some(leg.upf_seid),
-                &body,
-            )
-            .await
-        {
-            Ok(_) => log::info!(
-                "I-UPF session of SEID 0x{psa_seid:016x} deleted: its PSA session is gone"
-            ),
-            Err(e) => log::warn!(
-                "I-UPF session of SEID 0x{psa_seid:016x} not deleted ({e}); its PSA session \
-                 is gone"
-            ),
+        if delete_on_iupf(&client, leg.smf_seid, leg.upf_seid).await {
+            log::info!("I-UPF session of SEID 0x{psa_seid:016x} deleted: its PSA session is gone");
+        } else {
+            queue_deletion(leg.smf_seid, leg.upf_seid);
         }
     });
 }
