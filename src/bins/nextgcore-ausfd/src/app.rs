@@ -373,6 +373,12 @@ pub async fn run() -> Result<()> {
     let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
 
+    // #2141 (R40 M1): the self instance before the first request, not only once
+    // NRF registration succeeds: the shared verified-NF-type lookup names it
+    // as `requester-nf-type` (mandatory; nrfd answers 400 without it), which
+    // the old per-crate lookup hard-coded as AUSF. Registration sets it again.
+    register_self_instance(sbi.registration_host().ok(), sbi.port).await;
+
     sbi_server
         .start(ausf_sbi_request_handler)
         .await
@@ -1219,133 +1225,24 @@ fn refuse_foreign_caller_with(
     ))
 }
 
-/// #1964: how long an NRF answer about a caller's NF type is reused.
-const CALLER_TYPE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-/// #1964: at most this many cached answers; a full cache drops the expired ones,
-/// then everything, rather than grow.
-const CALLER_TYPE_CACHE_MAX: usize = 1024;
-
-/// #1964: (NF type, NF instance ID) -> (the instance is of that type, when
-/// learnt). Positive and negative answers both; a failed lookup is never cached
-/// (it fails closed, and the next call asks again).
-static CALLER_TYPE_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
-> = std::sync::OnceLock::new();
-
-fn caller_type_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
-    CALLER_TYPE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn caller_type_key(nf_type: &str, id: &str) -> String {
-    format!(
-        "{}:{}",
-        nf_type.to_ascii_uppercase(),
-        id.to_ascii_lowercase()
-    )
-}
-
-/// Tests: record that the NRF profile of `id` is of type `nf_type` (and of no
-/// other type it is asked about), so a token-identified caller needs no NRF.
-#[cfg(test)]
-pub(crate) fn seed_caller_type_1964(id: &str, nf_type: &str) {
-    let now = std::time::Instant::now();
-    let mut cache = caller_type_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for t in ["AMF", "UDM"] {
-        cache.insert(
-            caller_type_key(t, id),
-            (t.eq_ignore_ascii_case(nf_type), now),
-        );
-    }
-}
-
-/// #1964: whether NF instance `id` is of type `nf_type`, per its NRF profile.
-/// Asked through NFDiscovery with `target-nf-type=<nf_type>` and
-/// `target-nf-instance-id=id`; the answer is yes only if the result names `id`
-/// itself, so an NRF that ignores the instance filter cannot vouch for an
-/// unlisted caller. `Err` when there is no NRF or it does not answer: the caller
-/// then fails closed.
-async fn caller_is(nf_type: &str, id: &str) -> Result<bool, String> {
-    let key = caller_type_key(nf_type, id);
-    if let Some((is_amf, at)) = caller_type_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .copied()
-    {
-        if at.elapsed() < CALLER_TYPE_TTL {
-            return Ok(is_amf);
-        }
-    }
-    let sbi_ctx = nextgcore_sbi::context::global_context();
-    let nrf_uri = sbi_ctx
-        .get_nrf_uri()
-        .await
-        .ok_or("no NRF is configured to look the caller up")?;
-    let (host, port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&host, port).await;
-    let path = format!(
-        "/nnrf-disc/v1/nf-instances?target-nf-type={nf_type}&requester-nf-type=AUSF&target-nf-instance-id={id}"
-    );
-    let resp = client
-        .get(&path)
-        .await
-        .map_err(|e| format!("NRF lookup failed: {e}"))?;
-    if resp.status != 200 {
-        return Err(format!("NRF lookup returned {}", resp.status));
-    }
-    let json: serde_json::Value = serde_json::from_str(resp.http.content.as_deref().unwrap_or(""))
-        .map_err(|e| format!("NRF lookup answer does not parse: {e}"))?;
-    let is_type = json["nfInstances"].as_array().is_some_and(|list| {
-        list.iter().any(|p| {
-            p["nfInstanceId"]
-                .as_str()
-                .is_some_and(|i| i.eq_ignore_ascii_case(id))
-                && p["nfType"]
-                    .as_str()
-                    .is_some_and(|t| t.eq_ignore_ascii_case(nf_type))
-        })
-    });
-    let mut cache = caller_type_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= CALLER_TYPE_CACHE_MAX {
-        cache.retain(|_, (_, at)| at.elapsed() < CALLER_TYPE_TTL);
-        if cache.len() >= CALLER_TYPE_CACHE_MAX {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (is_type, std::time::Instant::now()));
-    Ok(is_type)
-}
-
-/// #1964: whether the caller is of type `nf_type`. A client certificate this
-/// AUSF verified, naming NF types other than the SCP, answers it; relayed by an
-/// SCP (its certificate is the SCP's) or identified by a token alone, the NRF
-/// profile of `caller` does ([`caller_is`]). `Err` when that lookup fails.
+/// #1964, moved onto the shared rule (#2099): whether the caller of `request`
+/// is shown to be an `expected` -- its own certificate's NF types, else the NRF
+/// profile of its verified token subject, cached and failing closed
+/// ([`nextgcore_sbi::owner_binding::verified_nf_type`]). `Err` is why not.
 async fn caller_has_type(
-    caller: &str,
     request: &SbiRequest,
-    nf_type: &str,
-) -> Result<bool, String> {
-    let types = &request.peer_cert_nf_types;
-    let via_scp = types.iter().any(|t| t.eq_ignore_ascii_case("SCP"));
-    if !types.is_empty() && !via_scp {
-        return Ok(types.iter().any(|t| t.eq_ignore_ascii_case(nf_type)));
-    }
-    caller_is(nf_type, caller).await
+    expected: nextgcore_sbi::types::NfType,
+) -> Result<(), String> {
+    nextgcore_sbi::owner_binding::verified_nf_type(request, expected).await
 }
 
 /// #1964: authenticate (TS 29.509 §5.2.2.2, 5G-AKA / EAP-AKA' initiation) is
 /// the AMF's (the SEAF), never the UDM's, though both hold `nausf-auth` and its
 /// ue-authentications scope for Deregister. Which NF is calling:
-/// - a client certificate this AUSF verified, naming NF types other than the
-///   SCP: those types, which must include AMF;
-/// - relayed by an SCP (the certificate is the SCP's) or identified by a token
-///   alone: the NRF profile of that identity ([`caller_is_amf`]), cached for
-///   [`CALLER_TYPE_TTL`]; a lookup that fails refuses (fail closed);
+/// - by the shared rule ([`caller_has_type`], #2099): a client certificate this
+///   AUSF verified naming NF types (not a relay's), which must include AMF;
+///   relayed by an SCP or identified by a token alone, the NRF profile of the
+///   verified token subject, cached; a lookup that fails refuses (fail closed);
 /// - no verified identity at all: admitted only under the `dev` SBI profile (a
 ///   plaintext stack has nothing to check), refused under `production`.
 ///
@@ -1357,40 +1254,22 @@ async fn refuse_authenticate(caller: Option<&str>, request: &SbiRequest) -> Opti
     if relayed_by(request, "SEPP") {
         return None;
     }
-    let types = &request.peer_cert_nf_types;
-    let via_scp = types.iter().any(|t| t.eq_ignore_ascii_case("SCP"));
-    if !types.is_empty() && !via_scp {
-        if types.iter().any(|t| t.eq_ignore_ascii_case("AMF")) {
-            return None;
-        }
-        log::debug!("authenticate refused: the caller's certificate names {types:?}, not AMF");
-        return Some(forbidden(
-            "authenticate is for the AMF (TS 29.509 §5.2.2.2); the caller's certificate \
-             names another NF type",
-        ));
-    }
-    let Some(id) = caller else {
-        if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
-            return Some(forbidden(
-                "authenticate needs a verified caller identity under the production profile",
-            ));
-        }
+    // No verified identity at all: only a plaintext `dev` stack, which has
+    // nothing to check, admits it. A certificate naming NF types is judged by
+    // them even without an identity (the shared rule refuses it).
+    if caller.is_none()
+        && request.peer_cert_nf_types.is_empty()
+        && !nextgcore_sbi::security::SbiProfile::resolve().is_production()
+    {
         return None;
-    };
-    match caller_has_type(id, request, "AMF").await {
-        Ok(true) => None,
-        Ok(false) => {
-            log::debug!("authenticate refused: NF {id} is not an AMF per its NRF profile");
-            Some(forbidden(
-                "authenticate is for the AMF (TS 29.509 §5.2.2.2); the caller's NRF profile \
-                 is not an AMF's",
-            ))
-        }
+    }
+    match caller_has_type(request, nextgcore_sbi::types::NfType::Amf).await {
+        Ok(()) => None,
         Err(why) => {
-            log::warn!("authenticate refused: the caller's NF type could not be checked: {why}");
-            Some(forbidden(
-                "authenticate is for the AMF, and the caller's NF type could not be checked",
-            ))
+            log::debug!("authenticate refused: {why}");
+            Some(forbidden(&format!(
+                "authenticate is for the AMF (TS 29.509 §5.2.2.2): {why}"
+            )))
         }
     }
 }
@@ -1433,22 +1312,17 @@ async fn refuse_deregister(
     }
     // #1964 (R31 M1): the UDM, by NF type. Not by the ue-authentications scope,
     // which the AMF holds too (TS 29.509 OpenAPI), so it would admit every AMF.
-    match caller_has_type(&caller, request, "UDM").await {
-        Ok(true) => None,
-        Ok(false) => {
-            log::debug!(
-                "Deregister refused: NF {caller} is neither the UDM nor the context's owner"
-            );
-            Some(forbidden(
-                "Deregister is for the UDM (TS 29.509 §5.2.2.3) or the NF that started the \
-                 authentication",
-            ))
-        }
+    match caller_has_type(request, nextgcore_sbi::types::NfType::Udm).await {
+        Ok(()) => None,
         Err(why) => {
-            log::warn!("Deregister refused: the caller's NF type could not be checked: {why}");
-            Some(forbidden(
-                "Deregister is for the UDM, and the caller's NF type could not be checked",
-            ))
+            log::debug!(
+                "Deregister refused: NF {caller} is not the context's owner, and not shown to \
+                 be the UDM: {why}"
+            );
+            Some(forbidden(&format!(
+                "Deregister is for the UDM (TS 29.509 §5.2.2.3) or the NF that started the \
+                 authentication: {why}"
+            )))
         }
     }
 }
@@ -2472,6 +2346,21 @@ fn ausf_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::V
 }
 
 /// Build this AUSF's typed self NF instance from [`AUSF_SERVICES`].
+/// #2141: record this AUSF as the global context's self NF instance (its NF
+/// Instance ID, type AUSF), built from the same table as the registered profile.
+async fn register_self_instance(sbi_addr: Option<&str>, sbi_port: u16) {
+    let id = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf);
+    let instance = match sbi_addr {
+        Some(addr) => build_ausf_nf_instance(id, addr, sbi_port),
+        // A wildcard bind with nothing to advertise registers nowhere, but still
+        // names itself as the requester.
+        None => nextgcore_sbi::context::NfInstance::new(id, nextgcore_sbi::types::NfType::Ausf),
+    };
+    nextgcore_sbi::context::global_context()
+        .set_self_instance(instance)
+        .await;
+}
+
 fn build_ausf_nf_instance(
     nf_instance_id: &str,
     sbi_addr: &str,
@@ -3938,7 +3827,10 @@ mod tests {
     fn as_nf_1872(mut req: SbiRequest, token_sub: Option<&str>, cert: Option<&str>) -> SbiRequest {
         // #1964: these callers are AMFs, as their NRF profiles would say.
         for id in token_sub.iter().chain(cert.iter()) {
-            seed_caller_type_1964(id, "AMF");
+            nextgcore_sbi::owner_binding::seed_nf_type_for_test(
+                id,
+                nextgcore_sbi::types::NfType::Amf,
+            );
         }
         req.oauth2_subject = token_sub.map(str::to_string);
         req.peer_cert_nf_instance_id = cert.map(str::to_string);
@@ -4380,7 +4272,10 @@ mod tests {
             req
         };
         let udm_sub = "19640000-0000-4000-8000-0000000000d2";
-        seed_caller_type_1964(udm_sub, "UDM");
+        nextgcore_sbi::owner_binding::seed_nf_type_for_test(
+            udm_sub,
+            nextgcore_sbi::types::NfType::Udm,
+        );
         let r = handle_ue_authentication(&body(via_scp(udm_sub), 2)).await;
         assert!(gate_refused(&r), "a UDM via the SCP: {:?}", r.http.content);
 
@@ -4393,8 +4288,8 @@ mod tests {
                 .content
                 .as_deref()
                 .unwrap_or_default()
-                .contains("could not be checked"),
-            "fails closed: {:?}",
+                .contains("(no NRF is configured to look the caller up)"),
+            "fails closed on a failed lookup, not a negative answer: {:?}",
             r.http.content
         );
 
@@ -4410,7 +4305,10 @@ mod tests {
             r.http.content
         );
         let amf_sub = "19640000-0000-4000-8000-0000000000a5";
-        seed_caller_type_1964(amf_sub, "AMF");
+        nextgcore_sbi::owner_binding::seed_nf_type_for_test(
+            amf_sub,
+            nextgcore_sbi::types::NfType::Amf,
+        );
         let r = handle_ue_authentication(&body(via_scp(amf_sub), 5)).await;
         assert!(
             !gate_refused(&r),
@@ -4476,7 +4374,7 @@ mod tests {
         // The UDM, through the SCP: admitted by its NRF profile.
         let udm = "19180000-0000-4000-8000-0000000000d1";
         let req = via_scp(udm);
-        seed_caller_type_1964(udm, "UDM");
+        nextgcore_sbi::owner_binding::seed_nf_type_for_test(udm, nextgcore_sbi::types::NfType::Udm);
         let r = handle_ue_authentication_deregister(&deregister(req)).await;
         assert_eq!(r.status, 204, "the UDM via the SCP: {:?}", r.http.content);
         assert!(!held(), "the stale context is cleared");
@@ -5755,5 +5653,51 @@ mod tests_advertised_scheme_1791 {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// #2141: at the end of the file: the source guards in
+// nextgcore-core/tests (e.g. nf_logging_init) read production code up to the
+// first `#[cfg(test)]`.
+#[cfg(test)]
+mod self_instance_tests_2141 {
+    /// #2141 (R40 M1): the self instance the shared lookup names as
+    /// `requester-nf-type` is registered before serving, with or without an
+    /// advertised host.
+    ///
+    /// REVERT-VERIFIED: with the startup call removed from `main`, the
+    /// `startup` test below fails; with `register_self_instance` empty, this
+    /// one does.
+    #[test]
+    fn startup_registers_the_self_instance_before_the_listener_serves_2141() {
+        let src = include_str!("app.rs");
+        let main = &src[src.find("pub async fn run(").expect("startup fn")..];
+        let main = &main[..main.find("\n}\n").expect("end of main")];
+        let register = main
+            .find("register_self_instance(")
+            .expect("startup: main registers the self instance");
+        let serve = main
+            .find(".start(ausf_sbi_request_handler)")
+            .expect("main starts the listener");
+        assert!(
+            register < serve,
+            "startup: registered before the listener serves"
+        );
+    }
+
+    #[tokio::test]
+    async fn ausfd_registers_its_self_instance_before_serving_2141() {
+        for host in [None, Some("10.0.0.21")] {
+            super::register_self_instance(host, 7777).await;
+            let me = nextgcore_sbi::context::global_context()
+                .get_self_instance()
+                .await
+                .expect("a self instance");
+            assert_eq!(me.nf_type, nextgcore_sbi::types::NfType::Ausf, "{host:?}");
+            assert_eq!(
+                me.id,
+                nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf)
+            );
+        }
     }
 }

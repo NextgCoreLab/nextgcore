@@ -35,6 +35,8 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# #2099: seed_nf_type_for_test, to type a token-identified caller without an NRF.
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true
 

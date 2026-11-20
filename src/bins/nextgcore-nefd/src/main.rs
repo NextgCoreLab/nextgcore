@@ -3106,7 +3106,10 @@ fn build_nf_profile(
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 }
             ],
-            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"],
+            // #2141 (R41): and the UCMF, which types a NEF caller by
+            // discovering it (the shared sbi verified-NF-type rule); nrfd hides a
+            // profile from a requester this list leaves out.
+            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP", "UCMF"],
             "heartBeatTimer": 10
     });
     // nextgsim#480: offer nnef-ueid to AF consumers only, so the NRF mints that
@@ -3358,6 +3361,11 @@ mod tests {
         );
         assert_eq!(profile["nfType"], "NEF");
         assert_eq!(profile["nfStatus"], "REGISTERED");
+        // #2141: the UCMF discovers the NEF to type a NEF provisioner.
+        assert_eq!(
+            profile["allowedNfTypes"],
+            serde_json::json!(["AF", "AMF", "UDM", "SCP", "UCMF"])
+        );
         assert_eq!(
             profile["nfServices"][0]["serviceName"],
             "nnef-eventexposure"

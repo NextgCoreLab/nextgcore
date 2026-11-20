@@ -1767,10 +1767,11 @@ pub async fn handle_am_policy_delete(pol_asso_id: &str, request: &SbiRequest) ->
 /// admitted only when all of these hold, and refused 403 otherwise, with
 /// nothing changed:
 /// - the body carries `notificationUri` and a `guami` (for UE policies too);
-/// - the caller proved an identity, over a certificate: directly, with that
-///   certificate's own NFTypes naming AMF (no NFTypes is refused), or through
-///   an SCP/SEPP certificate with the verified token `sub` as the identity. A
-///   token with no certificate is refused;
+/// - the caller proved an identity, over a certificate, and is an AMF by the
+///   shared rule (`owner_binding::verified_nf_type`, #2099): directly, its
+///   certificate's own NFTypes name AMF; through an SCP certificate, the NRF
+///   lists the verified token `sub` as an AMF. A certificate with no NFTypes
+///   and no token, a token with no certificate, and a SEPP are refused;
 /// - the NRF holds an AMF profile for that identity whose `guamiList` includes
 ///   the claimed GUAMI ([`sbi_path::amf_serves_guami`]). Behind an SCP this is
 ///   what types the caller. The check fails closed.
@@ -1800,20 +1801,28 @@ async fn owner_or_amf_relocation(
         _ => return Err(refused),
     };
     let types = &request.peer_cert_nf_types;
-    let via_relay = types.iter().any(|t| {
-        nextgcore_sbi::owner_binding::RELAY_NF_TYPES
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(t))
-    });
     // #2035: a relocation comes from an AMF of this PLMN (TS 29.507 §4.2.3.2),
     // whose profile this NRF holds; one relayed by a SEPP is from another
     // PLMN and is refused outright.
     if types.iter().any(|t| t.eq_ignore_ascii_case("SEPP")) {
         return Err(refused);
     }
-    // Not through a relay: the caller's own certificate must name AMF. A token
-    // with no certificate has no NFTypes, so it is refused here too.
-    if !via_relay && !types.iter().any(|t| t.eq_ignore_ascii_case("AMF")) {
+    // #1992: over a certificate only; a token with no certificate is refused.
+    if request
+        .peer_cert_nf_instance_id
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty())
+    {
+        return Err(refused);
+    }
+    // #2099: the caller is an AMF by the shared rule: its own certificate's
+    // NF types, else (through an SCP) the NRF profile of its verified token
+    // subject. A certificate with no NF types and no token is refused.
+    if let Err(why) =
+        nextgcore_sbi::owner_binding::verified_nf_type(request, nextgcore_sbi::types::NfType::Amf)
+            .await
+    {
+        log::debug!("{operation}: relocation refused: {why}");
         return Err(refused);
     }
     if !sbi_path::amf_serves_guami(&caller, &guami).await {
@@ -13124,6 +13133,58 @@ mod tests {
                 .and_then(|a| a.owner)
                 .as_deref(),
             Some(NEW_AMF)
+        );
+        // #2141 (R40 minor 2): the declared behaviour change. A certificate
+        // naming no NF types, with the AMF's own token, is typed through the NRF
+        // (#2099) and the GUAMI check still decides: PEER_AMF (set 20/001,
+        // serving 020041) relocates a fresh association; OTHER_AMF, an AMF that
+        // does not serve 020041, is refused.
+        let am2 = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000021411",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/old-2141",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(am2.status, 201, "{:?}", am2.http.content);
+        let am2_path = location_of(&am2);
+        let am2_id = am2_path.rsplit('/').next().unwrap().to_string();
+        let am2_update = format!("{am2_path}/update");
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &am2_update, Some(am_reloc())),
+            Some(OTHER_AMF),
+            &[],
+            Some(OTHER_AMF),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 403,
+            "typeless + token, wrong GUAMI: {:?}",
+            resp.http.content
+        );
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &am2_update, Some(am_reloc())),
+            Some(PEER_AMF),
+            &[],
+            Some(PEER_AMF),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "a typeless certificate with its token is typed by the NRF: {:?}",
+            resp.http.content
+        );
+        assert_eq!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .ue_am_find_by_association_id(&am2_id)
+                .and_then(|a| a.owner)
+                .as_deref(),
+            Some(PEER_AMF)
         );
         drop(_nrf_guard);
         nrf.stop().await.ok();

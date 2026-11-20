@@ -567,6 +567,10 @@ async fn main() -> Result<()> {
         &settings.nrf_uri,
     )
     .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    // #2141 (R40 M1): the NRF the shared lookup asks, and (below) the
+    // requester it names, are set before the listener serves.
+    global_context().set_nrf_uri(&settings.nrf_uri).await;
+    register_self_instance(&nf_instance_id).await;
 
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
@@ -588,7 +592,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    global_context().set_nrf_uri(&settings.nrf_uri).await;
     // #1482: a failed attempt is retried in the background, and the heartbeat
     // starts after the one that succeeds.
     match sbi.registration_host() {
@@ -792,7 +795,7 @@ async fn ucmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     // because proving a caller relayed by an SCP is a NEF takes an NRF lookup.
     if is_provisioning_path(&request.header.uri) {
         let policy = read_state(ucmf).provisioning_policy().clone();
-        if let Some(refusal) = provisioner_refusal(&policy, &request, caller_is_nef).await {
+        if let Some(refusal) = provisioner_refusal(&policy, &request).await {
             return refusal;
         }
     }
@@ -1446,6 +1449,19 @@ fn provisioning_update_response(
     }
 }
 
+/// #2099, #2141 (R40 M1): record this UCMF as the global context's self NF
+/// instance, before the listener serves. The shared verified-NF-type lookup
+/// names it as `requester-nf-type=UCMF` (mandatory; nrfd answers 400
+/// without), so the NRF also applies the NEF profile's allowedNfTypes (#1998).
+async fn register_self_instance(nf_instance_id: &str) {
+    global_context()
+        .set_self_instance(nextgcore_sbi::context::NfInstance::new(
+            nf_instance_id,
+            NfType::Ucmf,
+        ))
+        .await;
+}
+
 /// TS 29.675 §4.1.3.2: the known Nucmf_Provisioning consumers.
 const PROVISIONING_CONSUMER_NF_TYPES: &[&str] = &["NEF", "AF"];
 
@@ -1487,38 +1503,34 @@ fn is_provisioning_path(uri: &str) -> bool {
 /// type alone suggests (an SCP's certificate says nothing about the consumer,
 /// and a certificate may name no type at all):
 /// - a listed trusted AF is admitted;
-/// - anyone else must prove it is a NEF: by the NF types of its own certificate
-///   when it calls directly, otherwise (relayed by an SCP or SEPP, identified by
-///   a token alone, or a certificate naming no types) by its NRF profile, via
-///   `is_nef`, which fails closed;
+/// - anyone else must prove it is a NEF, by the shared rule
+///   (`owner_binding::verified_nf_type`, #2099): the NF types of its own
+///   certificate when it calls directly, otherwise (relayed by an SCP or SEPP,
+///   or identified by a token) the NRF profile of its verified token subject,
+///   cached and failing closed. A certificate naming no types with no token
+///   cannot be told from a relay's and is refused;
 /// - a caller with no verified identity, or two that disagree, is refused.
 ///
+/// The discovery names `requester-nf-type=UCMF` (this NF's own type), so the
+/// NRF also applies the NEF profile's `allowedNfTypes` (#1998).
+///
 /// Unset `trusted_afs` admits everyone here (the #1916 rules still apply).
-async fn provisioner_refusal<F, Fut>(
+async fn provisioner_refusal(
     policy: &context::ProvisioningPolicy,
     request: &SbiRequest,
-    is_nef: F,
-) -> Option<SbiResponse>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, String>>,
-{
-    provisioner_refusal_with(policy, request, is_nef, production_profile()).await
+) -> Option<SbiResponse> {
+    provisioner_refusal_with(policy, request, production_profile()).await
 }
 
-/// [`provisioner_refusal`] under the profile `production` says: under it a
-/// certificate naming no NF type is no identity on its own (#2065), so it
-/// is refused before the NRF is asked.
-async fn provisioner_refusal_with<F, Fut>(
+/// [`provisioner_refusal`] under the profile `production` says (#2089): under
+/// it a certificate naming no NF type is no identity on its own (#2065), so it
+/// is refused before the NRF is asked; under dev the shared rule refuses it as
+/// well, as it cannot be told from a relay's (#2099).
+async fn provisioner_refusal_with(
     policy: &context::ProvisioningPolicy,
     request: &SbiRequest,
-    is_nef: F,
     production: bool,
-) -> Option<SbiResponse>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, String>>,
-{
+) -> Option<SbiResponse> {
     policy.trusted_afs.as_ref()?;
     let refuse = |why: String| {
         let why = format!("only the NEF or a trusted AF provisions (TS 29.675 §4.1.3.2): {why}");
@@ -1533,136 +1545,18 @@ where
     if policy.trusts_af(Some(&caller)) {
         return None;
     }
-    let types = &request.peer_cert_nf_types;
-    let relayed = types.iter().any(|t| {
-        owner_binding::RELAY_NF_TYPES
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(t))
-    });
-    let direct_typed = request.peer_cert_nf_instance_id.is_some() && !relayed && !types.is_empty();
-    if direct_typed {
-        if types.iter().any(|t| t.eq_ignore_ascii_case("NEF")) {
-            return None;
-        }
-        return refuse(format!(
-            "{caller} is not in ucmf.provisioning.trusted_afs and its certificate names {types:?}"
-        ));
-    }
-    match is_nef(caller.clone()).await {
-        Ok(true) => None,
-        Ok(false) => refuse(format!(
-            "{caller} is not in ucmf.provisioning.trusted_afs and its NRF profile is not a NEF"
-        )),
-        Err(why) => refuse(format!(
-            "{caller} is not in ucmf.provisioning.trusted_afs and could not be shown to be a NEF \
-             ({why})"
-        )),
-    }
-}
-
-/// #1998: how long an NRF answer about whether a caller is a NEF is reused.
-const NEF_LOOKUP_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-/// #1998: at most this many cached answers; a full cache drops the expired
-/// ones, then everything, rather than grow.
-const NEF_LOOKUP_CACHE_MAX: usize = 1024;
-
-/// #1998: verified NF Instance ID (lowercase) -> (it is a NEF, when learnt).
-/// Positive and negative answers both; a failed lookup is never cached (it
-/// fails closed, and the next request asks again). As ausfd's
-/// `CALLER_TYPE_CACHE` (#1964).
-static NEF_LOOKUP_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
-> = std::sync::OnceLock::new();
-
-/// #2025: the one test lock for [`NEF_LOOKUP_CACHE`], declared beside it. Every
-/// test that reads or writes the cache holds it, so tests run in parallel
-/// cannot see each other's answers (or a `clear()` when it fills up).
-#[cfg(test)]
-pub(crate) static NEF_LOOKUP_CACHE_TEST_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
-
-fn nef_lookup_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
-    NEF_LOOKUP_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Whether NF instance `id` is a NEF, per its NRF profile, reusing an answer
-/// for [`NEF_LOOKUP_TTL`] (#1998: every provisioning request by a relayed or
-/// token-identified NEF used to cost one NRF query). Keyed by the caller's
-/// VERIFIED identity, which is all `provisioner_refusal` passes; an `Err` from
-/// `lookup` is returned and not cached, so it keeps failing closed.
-async fn cached_nef_lookup<F, Fut>(id: String, lookup: F) -> Result<bool, String>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, String>>,
-{
-    let key = id.to_ascii_lowercase();
-    if let Some((is_nef, at)) = nef_lookup_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .copied()
+    match owner_binding::verified_nf_type_with(
+        request,
+        nextgcore_sbi::types::NfType::Nef,
+        production,
+    )
+    .await
     {
-        if at.elapsed() < NEF_LOOKUP_TTL {
-            return Ok(is_nef);
-        }
+        Ok(()) => None,
+        Err(why) => refuse(format!(
+            "{caller} is not in ucmf.provisioning.trusted_afs, and {why}"
+        )),
     }
-    let is_nef = lookup(id).await?;
-    let mut cache = nef_lookup_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= NEF_LOOKUP_CACHE_MAX {
-        cache.retain(|_, (_, at)| at.elapsed() < NEF_LOOKUP_TTL);
-        if cache.len() >= NEF_LOOKUP_CACHE_MAX {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (is_nef, std::time::Instant::now()));
-    Ok(is_nef)
-}
-
-/// Whether NF instance `id` is a NEF, per its NRF profile, cached
-/// ([`cached_nef_lookup`], #1998).
-async fn caller_is_nef(id: String) -> Result<bool, String> {
-    cached_nef_lookup(id, nrf_says_nef).await
-}
-
-/// Whether NF instance `id` is a NEF, per its NRF profile (#1989 review M1; the
-/// pattern of ausfd's `caller_is`, #1964). Yes only when the NFDiscovery result
-/// names `id` itself as a NEF, so an NRF that ignores the instance filter cannot
-/// vouch for it. `Err` (no NRF, no answer, an unparsable one) fails closed.
-///
-/// The discovery names `requester-nf-type=UCMF`, so the NRF also applies the
-/// NEF profile's `allowedNfTypes` (TS 29.510 §6.1.6.2.2 NFProfile): a NEF whose profile
-/// does not allow the UCMF is not returned, and is refused here (#1998).
-async fn nrf_says_nef(id: String) -> Result<bool, String> {
-    let sbi_ctx = global_context();
-    let nrf_uri = sbi_ctx
-        .get_nrf_uri()
-        .await
-        .ok_or("no NRF is configured to look the caller up")?;
-    let (host, port, _) = split_uri(&nrf_uri).ok_or("invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&host, port).await;
-    let path = format!(
-        "/nnrf-disc/v1/nf-instances?target-nf-type=NEF&requester-nf-type=UCMF&target-nf-instance-id={id}"
-    );
-    let resp = client
-        .get(&path)
-        .await
-        .map_err(|e| format!("NRF lookup failed: {e}"))?;
-    if resp.status != 200 {
-        return Err(format!("NRF lookup returned {}", resp.status));
-    }
-    let json: Value = serde_json::from_str(resp.http.content.as_deref().unwrap_or(""))
-        .map_err(|e| format!("NRF lookup answer does not parse: {e}"))?;
-    Ok(json["nfInstances"].as_array().is_some_and(|list| {
-        list.iter().any(|p| {
-            p["nfInstanceId"]
-                .as_str()
-                .is_some_and(|i| i.eq_ignore_ascii_case(&id))
-                && p["nfType"]
-                    .as_str()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("NEF"))
-        })
-    }))
 }
 
 /// #1939 item 3: split `configs` into the RACS IDs `request`'s caller may
@@ -3115,14 +3009,16 @@ mod tests {
             r
         };
         let scp = "cccccccc-1939-4000-8000-000000000scp";
-        let nrf_nef_is = |nef: &'static str| {
-            move |id: String| async move { Ok::<bool, String>(id.eq_ignore_ascii_case(nef)) }
-        };
-        let nrf_down = |_id: String| async { Err::<bool, String>("no NRF".into()) };
+        // #2099: the NRF lists NEF_A_1916 as a NEF (seeded); nobody else is
+        // listed, and with no NRF here any other lookup fails closed.
+        nextgcore_sbi::owner_binding::seed_nf_type_for_test(
+            NEF_A_1916,
+            nextgcore_sbi::types::NfType::Nef,
+        );
 
         let open = context::ProvisioningPolicy::default();
         assert!(
-            provisioner_refusal(&open, &caller(&["AF"], Some(af_other), None), nrf_down)
+            provisioner_refusal(&open, &caller(&["AF"], Some(af_other), None))
                 .await
                 .is_none(),
             "unconfigured: not judged"
@@ -3143,53 +3039,49 @@ mod tests {
         };
         // An untrusted AF: direct, via an SCP, with a typeless certificate, token only.
         refused(
-            provisioner_refusal(&policy, &caller(&["AF"], Some(af_other), None), nrf_down).await,
+            provisioner_refusal(&policy, &caller(&["AF"], Some(af_other), None)).await,
             "direct AF certificate",
         );
         refused(
-            provisioner_refusal(
-                &policy,
-                &caller(&["SCP"], Some(scp), Some(af_other)),
-                nrf_nef_is(NEF_A_1916),
-            )
-            .await,
+            provisioner_refusal(&policy, &caller(&["SCP"], Some(scp), Some(af_other))).await,
             "untrusted AF via an SCP",
         );
         refused(
-            provisioner_refusal(
-                &policy,
-                &caller(&[], Some(af_other), None),
-                nrf_nef_is(NEF_A_1916),
-            )
-            .await,
+            provisioner_refusal(&policy, &caller(&[], Some(af_other), None)).await,
             "typeless certificate",
         );
         refused(
-            provisioner_refusal(
-                &policy,
-                &caller(&[], None, Some(af_other)),
-                nrf_nef_is(NEF_A_1916),
-            )
-            .await,
+            provisioner_refusal(&policy, &caller(&[], None, Some(af_other))).await,
             "token only",
         );
         refused(
-            provisioner_refusal(&policy, &caller(&[], None, None), nrf_down).await,
+            provisioner_refusal(&policy, &caller(&[], None, None)).await,
             "anonymous",
         );
-        // A NEF behind an SCP, but the NRF cannot be asked: fails closed.
+        // A NEF behind an SCP that the NRF cannot be asked about (not seeded,
+        // no NRF here): fails closed.
         refused(
             provisioner_refusal(
                 &policy,
-                &caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
-                nrf_down,
+                &caller(
+                    &["SCP"],
+                    Some(scp),
+                    Some("dddddddd-1939-4000-8000-000000000nef"),
+                ),
             )
             .await,
             "NEF via an SCP with no NRF",
         );
+        // #2099: a NEF's certificate naming no types, with no token, cannot be
+        // told from a relay's: the shared rule refuses it, NRF or not.
+        refused(
+            provisioner_refusal(&policy, &caller(&[], Some(NEF_A_1916), None)).await,
+            "typeless NEF certificate, no token",
+        );
 
         // Admitted: the trusted AF however it arrives, a NEF by certificate, a NEF
-        // behind an SCP or with a typeless certificate by its NRF profile.
+        // behind an SCP, or with a typeless certificate and its token, by its NRF
+        // profile.
         for (r, what) in [
             (caller(&["AF"], Some(af_ok), None), "trusted AF direct"),
             (
@@ -3198,34 +3090,25 @@ mod tests {
             ),
             (caller(&["NEF"], Some(NEF_B_1916), None), "NEF certificate"),
         ] {
-            assert!(
-                provisioner_refusal(&policy, &r, nrf_down).await.is_none(),
-                "{what}"
-            );
+            assert!(provisioner_refusal(&policy, &r).await.is_none(), "{what}");
         }
-        assert!(
-            provisioner_refusal(
-                &policy,
-                &caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
-                nrf_nef_is(NEF_A_1916)
-            )
-            .await
-            .is_none(),
-            "a NEF via an SCP, by its NRF profile"
-        );
-        // #2065: a typeless certificate alone is a NEF by its NRF profile only
-        // under dev; under production it is no identity and is refused before
-        // the NRF is asked. Both profiles are passed explicitly, so the test
-        // reads no process-wide override (#2089: it used to pass only after a
-        // sibling had set Dev).
+        for r in [
+            caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
+            caller(&[], Some(NEF_A_1916), Some(NEF_A_1916)),
+        ] {
+            assert!(provisioner_refusal(&policy, &r).await.is_none(), "{r:?}");
+        }
+        // #2065/#2089: a typeless certificate alone. Under production it is no
+        // identity and is refused before the NRF is asked; under dev the shared
+        // rule (#2099) refuses it too, as it cannot be told from a relay's.
+        // Both profiles are passed explicitly, so the test reads no process-wide
+        // override (#2089).
         let typeless = caller(&[], Some(NEF_A_1916), None);
-        assert!(
-            provisioner_refusal_with(&policy, &typeless, nrf_nef_is(NEF_A_1916), false)
-                .await
-                .is_none(),
-            "dev: a typeless NEF certificate, by its NRF profile"
-        );
-        let r = provisioner_refusal_with(&policy, &typeless, nrf_nef_is(NEF_A_1916), true)
+        let dev = provisioner_refusal_with(&policy, &typeless, false)
+            .await
+            .expect("dev: a typeless certificate alone is refused (#2099)");
+        assert_eq!(dev.status, 403);
+        let r = provisioner_refusal_with(&policy, &typeless, true)
             .await
             .expect("production: a typeless certificate alone is no identity");
         assert_eq!(r.status, 403);
@@ -3239,12 +3122,127 @@ mod tests {
         );
     }
 
+    /// #2141 (R41), end to end with no seeded cache: a NEF provisioning with a
+    /// token only (or behind an SCP) is typed by a stand-in NRF that behaves as
+    /// nrfd does: a 400 for a discovery without `requester-nf-type`, and a
+    /// profile hidden from a requester its `allowedNfTypes` leaves out. The NEF
+    /// profile carries UCMF, as nefd's now does. The UCMF registers its self
+    /// instance as at startup, so the NEF is admitted, an AF's token is refused,
+    /// and every lookup names UCMF.
+    ///
+    /// #2141 (R40): ucmfd's startup registers its self instance (and the NRF
+    /// URI the lookup asks) before the listener serves.
+    ///
+    /// REVERT-VERIFIED: with the `register_self_instance` call removed from
+    /// `main`, this fails at "startup".
+    #[test]
+    fn startup_registers_the_self_instance_before_the_listener_serves_2141() {
+        let src = include_str!("main.rs");
+        let main = &src[src.find("async fn main(").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("end of main")];
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("startup: {needle}"))
+        };
+        let serve = at(".start(ucmf_sbi_request_handler)");
+        assert!(
+            at("register_self_instance(") < serve,
+            "startup: self instance first"
+        );
+        assert!(at("set_nrf_uri(") < serve, "startup: NRF URI first");
+    }
+
+    /// REVERT-VERIFIED: with UCMF dropped from the stand-in NEF profile (nefd's
+    /// list before #2141), the NEF is refused and the `NEF via the SCP`
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nef_via_the_scp_is_typed_by_the_nrf_2141() {
+        const NEF: &str = "aaaaaaaa-2141-4000-8000-0000000000ef";
+        const AF: &str = "bbbbbbbb-2141-4000-8000-0000000000af";
+        const SCP: &str = "cccccccc-2141-4000-8000-000000000scp";
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let requesters: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+        let seen = requesters.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    let param = |k: &str| req.http.params.get(k).cloned();
+                    let requester = param("requester-nf-type");
+                    // Only this test's lookups: the NRF URI is process-global,
+                    // so a concurrent test's can reach this stand-in too.
+                    if matches!(param("target-nf-instance-id").as_deref(), Some(NEF | AF)) {
+                        seen.lock().unwrap().push(requester.clone());
+                    }
+                    let Some(requester) = requester else {
+                        return nextgcore_sbi::server::send_error(
+                            400,
+                            "Bad Request",
+                            "requester-nf-type is mandatory",
+                            Some("MANDATORY_QUERY_PARAM_MISSING"),
+                        );
+                    };
+                    let profiles = [
+                        (NEF, "NEF", vec!["AF", "AMF", "UDM", "SCP", "UCMF"]),
+                        (AF, "AF", vec!["NEF", "UCMF"]),
+                    ];
+                    let list: Vec<_> = profiles
+                        .iter()
+                        .filter(|(id, ty, allowed)| {
+                            param("target-nf-instance-id").as_deref() == Some(*id)
+                                && param("target-nf-type").as_deref() == Some(*ty)
+                                && allowed.contains(&requester.as_str())
+                        })
+                        .map(|(id, ty, _)| serde_json::json!({"nfInstanceId": id, "nfType": ty}))
+                        .collect();
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({ "nfInstances": list }))
+                        .expect("json")
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        register_self_instance(nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Ucmf)).await;
+        let policy = context::ProvisioningPolicy {
+            trusted_afs: Some(vec!["dddddddd-2141-4000-8000-00000000trust".to_string()]),
+            vendor_ids: BTreeMap::new(),
+        };
+        let via_scp = |sub: &str| {
+            let mut r = as_nf_1862(
+                with_json(
+                    req("POST", "/nucmf-provisioning/v1/provisionings"),
+                    provisioning_body("0a0b"),
+                ),
+                Some(sub),
+            );
+            r.peer_cert_nf_types = vec!["SCP".to_string()];
+            r.peer_cert_nf_instance_id = Some(SCP.to_string());
+            r
+        };
+        let nef = provisioner_refusal(&policy, &via_scp(NEF)).await;
+        let af = provisioner_refusal(&policy, &via_scp(AF)).await;
+        nrf.stop().await.ok();
+        let requesters = requesters.lock().unwrap().clone();
+        assert!(
+            nef.is_none(),
+            "NEF via the SCP: {:?} (NRF saw {requesters:?})",
+            nef.map(|r| r.http.content)
+        );
+        assert_eq!(af.map(|r| r.status), Some(403), "an AF is not a NEF");
+        assert!(
+            !requesters.is_empty() && requesters.iter().all(|r| r.as_deref() == Some("UCMF")),
+            "every lookup names the UCMF: {requesters:?}"
+        );
+    }
+
     /// #1989 review M1: the provisioning API is judged by [`provisioner_refusal`]
     /// with the real NRF lookup, in the handler every request goes through.
     #[test]
     fn the_handler_judges_provisioners_with_the_nrf_lookup_1989() {
         let src = include_str!("main.rs");
-        let call = "provisioner_refusal(&policy, &request, caller_is_nef).await";
+        let call = "provisioner_refusal(&policy, &request).await";
         assert_eq!(src.matches(call).count(), 2, "the call and this test");
         assert!(is_provisioning_path(
             "/nucmf-provisioning/v1/provisionings/1?x=1"
@@ -3354,114 +3352,5 @@ mod sbi_profile_tests_1795 {
             nextgcore_sbi::types::NfType::Ucmf,
             super::sbi_listener_config,
         );
-    }
-}
-
-/// #1998: the NRF answer about a caller being a NEF is reused for its TTL.
-#[cfg(test)]
-mod nef_lookup_cache_tests_1998 {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::sync::Arc;
-
-    /// **#2025.** Every test fn in this file that touches the NEF lookup cache
-    /// (`cached_nef_lookup(`, `caller_is_nef(`, `nef_lookup_cache()`) holds
-    /// [`NEF_LOOKUP_CACHE_TEST_LOCK`]: a test that does not can race another
-    /// one's entries, as R30's probe raced the #1998 test.
-    ///
-    /// REVERT-VERIFIED: with the lock taken out of the #1998 test, this fails
-    /// naming it.
-    #[test]
-    fn every_test_touching_the_nef_lookup_cache_holds_its_lock_2025() {
-        let src = include_str!("main.rs");
-        let tests = &src[src.find("#[cfg(test)]\nmod ").expect("test modules")..];
-        let touches = ["cached_nef_lookup(", "caller_is_nef(", "nef_lookup_cache()"];
-        let mut unlocked = Vec::new();
-        let mut checked = 0;
-        for chunk in tests
-            .split("\n    async fn ")
-            .chain(tests.split("\n    fn "))
-            .skip(1)
-        {
-            let name: String = chunk.chars().take_while(|c| *c != '(').collect();
-            // The fn body: up to the next item at this indentation.
-            let body = chunk.split("\n    }\n").next().unwrap_or(chunk);
-            if name.contains("_2025") || !touches.iter().any(|t| body.contains(t)) {
-                continue;
-            }
-            checked += 1;
-            if !body.contains("NEF_LOOKUP_CACHE_TEST_LOCK.lock()") {
-                unlocked.push(name);
-            }
-        }
-        assert!(checked >= 1, "the scan finds the #1998 test");
-        assert!(
-            unlocked.is_empty(),
-            "tests touching the cache without its lock: {unlocked:?}"
-        );
-    }
-
-    /// **#1998.** A second provisioning request by the same verified NEF costs
-    /// no NRF query; a refusal is reused too; a failed lookup is not cached (it
-    /// keeps failing closed and the next request asks again); an expired answer
-    /// is asked again; and the key is the verified ID, case-insensitively.
-    ///
-    /// REVERT-VERIFIED: with `cached_nef_lookup` never reading the cache, the
-    /// second call queries again and the first assertion on the count fails;
-    /// with a failed lookup cached as `false`, the second failure is `Ok`.
-    #[tokio::test]
-    async fn the_nef_lookup_is_cached_by_verified_id_and_fails_closed_1998() {
-        let _cache = NEF_LOOKUP_CACHE_TEST_LOCK.lock().await;
-        let asked = Arc::new(AtomicUsize::new(0));
-        let counting = |answer: Result<bool, String>| {
-            let asked = asked.clone();
-            move |_id: String| {
-                asked.fetch_add(1, SeqCst);
-                async move { answer }
-            }
-        };
-        let nef = "19980000-0000-4000-8000-00000000000A".to_string();
-        assert_eq!(
-            cached_nef_lookup(nef.clone(), counting(Ok(true))).await,
-            Ok(true)
-        );
-        assert_eq!(
-            cached_nef_lookup(nef.to_ascii_lowercase(), counting(Ok(false))).await,
-            Ok(true),
-            "reused, whatever the lookup would say now"
-        );
-        assert_eq!(asked.load(SeqCst), 1, "one NRF query for two requests");
-
-        let not_nef = "19980000-0000-4000-8000-00000000000b".to_string();
-        assert_eq!(
-            cached_nef_lookup(not_nef.clone(), counting(Ok(false))).await,
-            Ok(false)
-        );
-        assert_eq!(
-            cached_nef_lookup(not_nef, counting(Ok(true))).await,
-            Ok(false)
-        );
-        assert_eq!(asked.load(SeqCst), 2, "a refusal is reused too");
-
-        let unknown = "19980000-0000-4000-8000-00000000000c".to_string();
-        assert!(
-            cached_nef_lookup(unknown.clone(), counting(Err("NRF down".into())))
-                .await
-                .is_err()
-        );
-        assert!(cached_nef_lookup(unknown, counting(Err("NRF down".into())))
-            .await
-            .is_err());
-        assert_eq!(asked.load(SeqCst), 4, "a failure is never cached");
-
-        // Expired: asked again, and the new answer replaces the old.
-        nef_lookup_cache()
-            .lock()
-            .unwrap()
-            .get_mut(&nef.to_ascii_lowercase())
-            .expect("cached")
-            .1 = std::time::Instant::now() - NEF_LOOKUP_TTL;
-        assert_eq!(cached_nef_lookup(nef, counting(Ok(false))).await, Ok(false));
-        assert_eq!(asked.load(SeqCst), 5, "an expired answer is asked again");
     }
 }
