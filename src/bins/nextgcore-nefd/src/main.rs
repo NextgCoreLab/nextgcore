@@ -3165,45 +3165,15 @@ fn nef_notify_base(
         nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
     ))
 }
-/// #2160: the NF types that consume nnef-eventexposure (TS 23.502 §4.15.3.2:
-/// the AF; the AMF and UDM as monitoring-event producers' peers; the SCP that
-/// relays). The UCMF is on the profile only, for discovery.
-const NEF_EVENT_EXPOSURE_CONSUMERS: &[&str] = &["AF", "AMF", "UDM", "SCP"];
-
 fn build_nf_profile(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
     scheme: nextgcore_sbi::types::UriScheme,
 ) -> serde_json::Value {
+    // #2178: the shared builder, so nrfd's tests reason about this profile.
     #[allow(unused_mut)]
-    let mut profile = serde_json::json!({
-            "nfInstanceId": nf_instance_id,
-            "nfType": "NEF",
-            "nfStatus": "REGISTERED",
-            "ipv4Addresses": [sbi_addr],
-            "nfServices": [
-                {
-                    "serviceInstanceId": format!("{nf_instance_id}-nnef-eventexposure"),
-                    "serviceName": "nnef-eventexposure",
-                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": scheme.as_str(),
-                    "nfServiceStatus": "REGISTERED",
-                    "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
-                    // #2160: the service's consumers, without the UCMF: it only
-                    // discovers the NEF (the profile-level list below) and
-                    // consumes no NEF service, and the NRF grants a service
-                    // token only to a type both levels allow (TS 29.510
-                    // §6.1.6.2.3), so the UCMF gets no nnef-eventexposure token.
-                    "allowedNfTypes": NEF_EVENT_EXPOSURE_CONSUMERS
-                }
-            ],
-            // #2141 (R41): and the UCMF, which types a NEF caller by
-            // discovering it (the shared sbi verified-NF-type rule); nrfd hides a
-            // profile from a requester this list leaves out.
-            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP", "UCMF"],
-            "heartBeatTimer": 10
-    });
+    let mut profile = nextgcore_sbi::nf_profiles::nef(nf_instance_id, sbi_addr, sbi_port, scheme);
     // nextgsim#480: offer nnef-ueid to AF consumers only, so the NRF mints that
     // scope for nothing else.
     #[cfg(feature = "demo-d445a-fl-t8")]
