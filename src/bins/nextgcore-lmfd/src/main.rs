@@ -5002,10 +5002,14 @@ mod tests {
     fn strangers_1865(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
         let mut foreign_cert = request();
         foreign_cert.peer_cert_nf_instance_id = Some(OTHER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        foreign_cert.peer_cert_nf_types = vec!["AMF".into()];
         let mut foreign_token = request();
         foreign_token.oauth2_subject = Some(OTHER_1865.to_string());
         let mut mismatch = request();
         mismatch.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mismatch.peer_cert_nf_types = vec!["AMF".into()];
         mismatch.oauth2_subject = Some(OTHER_1865.to_string());
         vec![
             ("foreign certificate", foreign_cert),
@@ -5081,6 +5085,8 @@ mod tests {
         // The owner, proven by its certificate this time.
         let mut by_cert = patch();
         by_cert.peer_cert_nf_instance_id = Some(OWNER_1865.to_uppercase());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        by_cert.peer_cert_nf_types = vec!["AMF".into()];
         assert_eq!(lmf_sbi_request_handler(by_cert).await.status, 204);
         assert_eq!(samples(), Some(99));
         assert_eq!(
@@ -5095,6 +5101,8 @@ mod tests {
         let before = lmf_self().read().unwrap().exposure_subscription_count();
         let mut mixed = create();
         mixed.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["AMF".into()];
         mixed.oauth2_subject = Some(OTHER_1865.to_string());
         assert_eq!(lmf_sbi_request_handler(mixed).await.status, 403);
         assert_eq!(
@@ -5147,6 +5155,8 @@ mod tests {
         let before = lmf_self().read().unwrap().up_subscription_count();
         let mut mixed = create();
         mixed.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["AMF".into()];
         mixed.oauth2_subject = Some(OTHER_1865.to_string());
         assert_eq!(lmf_sbi_request_handler(mixed).await.status, 403);
         assert_eq!(lmf_self().read().unwrap().up_subscription_count(), before);

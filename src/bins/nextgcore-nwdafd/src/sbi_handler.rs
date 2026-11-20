@@ -2098,10 +2098,14 @@ mod tests {
     fn strangers_1865(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
         let mut foreign_cert = request();
         foreign_cert.peer_cert_nf_instance_id = Some(OTHER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        foreign_cert.peer_cert_nf_types = vec!["NEF".into()];
         let mut foreign_token = request();
         foreign_token.oauth2_subject = Some(OTHER_1865.to_string());
         let mut mismatch = request();
         mismatch.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mismatch.peer_cert_nf_types = vec!["NEF".into()];
         mismatch.oauth2_subject = Some(OTHER_1865.to_string());
         vec![
             ("foreign certificate", foreign_cert),
@@ -2179,6 +2183,8 @@ mod tests {
         // The owner: replace (proven by certificate), read, then delete.
         let mut by_cert = put();
         by_cert.peer_cert_nf_instance_id = Some(OWNER_1865.to_uppercase());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        by_cert.peer_cert_nf_types = vec!["NEF".into()];
         assert_eq!(
             super::handle_subscription_update(&id, &by_cert)
                 .await
@@ -2213,6 +2219,8 @@ mod tests {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
         let mismatch = |mut r: SbiRequest| {
             r.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+            // #2065: typed, as a consumer's certificate is (RFC 9310).
+            r.peer_cert_nf_types = vec!["NEF".into()];
             r.oauth2_subject = Some(OTHER_1865.to_string());
             r
         };

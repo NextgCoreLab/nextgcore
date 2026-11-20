@@ -1747,7 +1747,9 @@ fn provisioning_owner_in(
     production: bool,
 ) -> Result<Option<String>, Box<SbiResponse>> {
     const OP: &str = "Nucmf_Provisioning_Create";
-    match owner_binding::owner_for_new_resource(request, OP)? {
+    // The profile is the caller's `production`, not the process's: a test that
+    // passes it explicitly must not depend on another test's profile override.
+    match owner_binding::owner_for_new_resource_with(request, OP, production)? {
         None if production => {
             let why = "the requester has no verified identity; under the production SBI \
                        profile every provisioning is bound to its creator (TS 33.501 §13.4.1)";

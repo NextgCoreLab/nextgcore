@@ -29063,6 +29063,8 @@ mod tests {
             Some(AMF_A_1860),
         );
         req.peer_cert_nf_instance_id = Some(AMF_B_1860.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        req.peer_cert_nf_types = vec!["AMF".into()];
         let before = smf_self().read().unwrap().sess_count();
         let resp = smf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 403);
@@ -29549,6 +29551,10 @@ mod tests {
                 .then(|| subscription_body("http://127.0.0.1:9/hijacked", Some("imsi-1865")));
             let mut r = anonymous_events_request(method, &location, body);
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                r.peer_cert_nf_types = vec!["AMF".into()];
+            }
             r.oauth2_subject = token.map(str::to_string);
             r
         };
@@ -29603,6 +29609,8 @@ mod tests {
             Some(subscription_body("http://127.0.0.1:9/cb", None)),
         );
         mixed.peer_cert_nf_instance_id = Some(EVENTS_CONSUMER_1865.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["AMF".into()];
         mixed.oauth2_subject = Some(OTHER.into());
         assert_eq!(smf_sbi_request_handler(mixed).await.status, 403);
         assert_eq!(event_exposure::count(), 0, "nothing stored");
