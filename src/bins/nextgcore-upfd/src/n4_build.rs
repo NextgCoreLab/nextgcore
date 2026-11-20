@@ -219,6 +219,9 @@ pub mod pfcp_ie {
     pub const UPDATE_SRR: u16 = 213;
     pub const SESSION_REPORT: u16 = 214;
     pub const SRR_ID: u16 = 215;
+    /// #1450: Transport Delay Reporting in a Create or Update PDR (TS 29.244
+    /// Table 7.5.2.2-6, Table 8.1.2-1: 271).
+    pub const TRANSPORT_DELAY_REPORTING: u16 = 271;
     /// Updated PDR in a Session Modification Response (TS 29.244 §7.5.5.5,
     /// Table 8.1.2-1: 256), #1682.
     pub const UPDATED_PDR: u16 = 256;
@@ -1412,6 +1415,9 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
         pdr.qer_ids
             .push(be_u32(ie, "QER ID shorter than 4 octets")?);
     }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TRANSPORT_DELAY_REPORTING) {
+        pdr.transport_delay_reporting = Some(ie.value.clone());
+    }
 
     Ok(pdr)
 }
@@ -1439,6 +1445,10 @@ pub struct ParsedUpdatePdr {
     pub urr_ids: Option<Vec<u32>>,
     /// The new list; empty when a null QER ID removed them all.
     pub qer_ids: Option<Vec<u32>>,
+    /// #1450: Transport Delay Reporting, "present if [it] needs to be changed (e.g.
+    /// activated or deactivated)" (Table 7.5.4.2-1). `Some(None)`: deactivated
+    /// (null length, §5.6.3).
+    pub transport_delay_reporting: Option<Option<Vec<u8>>>,
 }
 
 /// The new list a repeatable rule-reference IE of an Update PDR gives, or
@@ -1508,6 +1518,9 @@ pub fn parse_update_pdr(data: &[u8]) -> Result<ParsedUpdatePdr, &'static str> {
     }
     pdr.urr_ids = update_id_list(&ies, pfcp_ie::URR_ID, "URR ID shorter than 4 octets")?;
     pdr.qer_ids = update_id_list(&ies, pfcp_ie::QER_ID, "QER ID shorter than 4 octets")?;
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TRANSPORT_DELAY_REPORTING) {
+        pdr.transport_delay_reporting = Some((!ie.value.is_empty()).then(|| ie.value.clone()));
+    }
 
     Ok(pdr)
 }
@@ -1523,6 +1536,9 @@ pub struct ParsedCreatePdr {
     pub urr_ids: Vec<u32>,
     /// Every QER the PDR lists, in order (#1672).
     pub qer_ids: Vec<u32>,
+    /// #1450: the Transport Delay Reporting IE's value (Table 7.5.2.2-6), as
+    /// received; decoded, and acted on, only with GPQM.
+    pub transport_delay_reporting: Option<Vec<u8>>,
 }
 
 /// Parsed PDI (Packet Detection Information)

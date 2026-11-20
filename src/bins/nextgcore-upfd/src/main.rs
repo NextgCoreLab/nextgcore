@@ -54,6 +54,7 @@ pub mod qos_flow_mon;
 pub mod rule_match;
 pub mod session_metrics;
 pub mod timer;
+pub mod transport_delay;
 pub mod tsn_bridge;
 pub mod upf_sm;
 
@@ -1155,6 +1156,37 @@ fn apply_update_pdr(pdr: &mut data_plane::DataPlanePdr, u: &crate::n4_build::Par
     }
 }
 
+/// #1450: provision PDR `pdr_id` of `upf_seid` with the Transport Delay
+/// Reporting IE value `tdr` (TS 29.244 Table 7.5.2.2-6), or remove it (`None`).
+/// A malformed IE is logged and not acted on, as a malformed establishment SRR is
+/// (#1389): the PDR itself is installed.
+fn apply_transport_delay(data_plane: &DataPlane, upf_seid: u64, pdr_id: u16, tdr: Option<&[u8]>) {
+    use nextgcore_pfcp::qos_monitoring::{TransportDelayReporting, TypedIe};
+    let cfg = match tdr.map(TransportDelayReporting::decode_value) {
+        None => None,
+        Some(Ok(ie)) => crate::transport_delay::TransportDelayPdr::from_ie(&ie),
+        Some(Err(e)) => {
+            log::warn!(
+                "SEID={upf_seid:#x} PDR {pdr_id}: malformed Transport Delay Reporting ({e}): \
+                 not acted on"
+            );
+            None
+        }
+    };
+    if tdr.is_none() && !data_plane.transport_delay_active() {
+        return;
+    }
+    if let Some(c) = cfg {
+        log::info!(
+            "SEID={upf_seid:#x} PDR {pdr_id}: Transport Delay Reporting, preceding UL GTP-U \
+             peer {} (DSCP {:?})",
+            c.peer,
+            c.dscp
+        );
+    }
+    data_plane.with_transport_delay(|m| m.set_pdr(upf_seid, pdr_id, cfg));
+}
+
 /// A FAR as the data plane holds it, from a PFCP Create FAR or Update FAR (#918).
 ///
 /// The Outer Header Creation endpoint is the IPv4 address when the OHC carries one,
@@ -1210,7 +1242,16 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 "PFCP Session Established: UPF_SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ipv4:?}, UL_TEID={ul_teid:#x}, DL_TEID={dl_teid:#x}"
             );
 
-            if let Some(ue_ip) = ue_ipv4 {
+            // #1450: an I-UPF's session need not name the UE's address (TS 29.244
+            // Table 7.5.2.2-2: the UE IP Address is conditional in the PDI); it is
+            // one that forwards over a GTP-U tunnel toward the PSA.
+            let iupf = fars.iter().any(|f| {
+                f.forwarding_parameters.as_ref().is_some_and(|fp| {
+                    fp.destination_interface == data_plane::SRC_INTF_CORE
+                        && fp.outer_header_creation.is_some()
+                })
+            });
+            if ue_ipv4.is_some() || iupf {
                 let gnb_socket = if let Some(addr) = gnb_addr {
                     SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
                 } else {
@@ -1313,10 +1354,10 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     );
                     dp_urrs.insert(u.urr_id, Arc::new(urr));
                 }
-                data_plane.add_established_session(
+                let session = data_plane.add_established_session(
                     upf_seid,
                     smf_seid,
-                    ue_ip,
+                    ue_ipv4,
                     ul_teid,
                     dl_teid,
                     gnb_socket,
@@ -1330,6 +1371,30 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         bars: dp_bars,
                     },
                 );
+                // #1450: an I-UPF's downlink PDR detects on its N9 F-TEID (the PFCP
+                // layer wrote the chosen TEID into its PDI).
+                {
+                    let mut tunnels = session.pdr_teids.write().unwrap();
+                    for p in pdrs
+                        .iter()
+                        .filter(|p| p.pdi.source_interface == data_plane::SRC_INTF_CORE)
+                    {
+                        if let Some(f) =
+                            p.pdi.local_f_teid.as_ref().filter(|f| !f.ch && f.teid != 0)
+                        {
+                            tunnels.insert(p.pdr_id, f.teid);
+                            data_plane.sessions.bind_ul_teid(f.teid, upf_seid);
+                        }
+                    }
+                }
+                for p in &pdrs {
+                    apply_transport_delay(
+                        data_plane,
+                        upf_seid,
+                        p.pdr_id,
+                        p.transport_delay_reporting.as_deref(),
+                    );
+                }
                 if pdrs.is_empty() {
                     log::warn!(
                         "PFCP Session Establishment SEID={upf_seid:#x} created no PDR: the \
@@ -1438,7 +1503,32 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 if !removed_pdr_ids.is_empty() {
                     let mut tunnels = session.pdr_teids.write().unwrap();
                     for id in &removed_pdr_ids {
-                        tunnels.remove(id);
+                        // #2197 review M1: a removed PDR's own F-TEID stops routing
+                        // to the session once no PDR of it detects on that TEID
+                        // (TS 29.244 §5.5.3), so a stale N9 TEID is no longer
+                        // matched (a G-PDU on it is an unknown TEID, §7.3.1).
+                        if let Some(teid) = tunnels.remove(id) {
+                            if teid != session.ul_teid && !tunnels.values().any(|t| *t == teid) {
+                                data_plane.sessions.unbind_ul_teid(teid, upf_seid);
+                            }
+                        }
+                        apply_transport_delay(data_plane, upf_seid, *id, None);
+                    }
+                }
+                // #1450: a Create PDR's Transport Delay Reporting, or an Update PDR's
+                // (activated, or deactivated by a null IE). The PFCP layer passes it
+                // on only with GPQM.
+                for p in &created_pdrs {
+                    apply_transport_delay(
+                        data_plane,
+                        upf_seid,
+                        p.pdr_id,
+                        p.transport_delay_reporting.as_deref(),
+                    );
+                }
+                for u in &updated_pdrs {
+                    if let Some(tdr) = &u.transport_delay_reporting {
+                        apply_transport_delay(data_plane, upf_seid, u.pdr_id, tdr.as_deref());
                     }
                 }
                 if !created_pdrs.is_empty() {
@@ -1799,6 +1889,7 @@ mod tests {
             far_id: Some(far_id),
             urr_ids: Vec::new(),
             qer_ids: Default::default(),
+            transport_delay_reporting: None,
         }
     }
 
@@ -1827,6 +1918,192 @@ mod tests {
             urrs: Vec::new(),
             bars: Vec::new(),
         }
+    }
+
+    /// **#1450.** An I-UPF's establishment, as the PFCP layer hands it over: UL PDR 1
+    /// (Access, Transport Delay Reporting toward 10.45.0.7) -> FAR 1 FORW to the Core
+    /// over N9; DL PDR 2 (Core, on its N9 F-TEID 0x1450b) -> FAR 2 FORW to the gNB.
+    /// No UE address (TS 29.244 Table 7.5.2.2-2: conditional at an I-UPF).
+    fn i_upf_established(seid: u64) -> PfcpSessionEvent {
+        let mut ul = far_with_ohc(1, Some(Ipv4Addr::new(10, 9, 0, 1)), None);
+        ul.forwarding_parameters
+            .as_mut()
+            .unwrap()
+            .destination_interface = data_plane::SRC_INTF_CORE;
+        let mut ul_pdr = pdr_through(1, 0, 1);
+        // Remote GTP-U Peer (IE 103, §8.2.70): flags V4 (0x02), 10.45.0.7.
+        ul_pdr.transport_delay_reporting = Some(vec![0x00, 0x67, 0x00, 0x05, 0x02, 10, 45, 0, 7]);
+        let mut dl_pdr = pdr_through(2, 1, 2);
+        dl_pdr.pdi.local_f_teid = Some(crate::n4_build::ParsedFTeid {
+            teid: 0x1450b,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 4)),
+            ipv6: None,
+            v4: true,
+            v6: false,
+            ch: false,
+            chid: false,
+            choose_id: None,
+        });
+        PfcpSessionEvent::SessionEstablished {
+            upf_seid: seid,
+            smf_seid: seid | 0x1_0000,
+            ue_ipv4: None,
+            ul_teid: 0x1450a,
+            dl_teid: 0x4002,
+            gnb_addr: Some(Ipv4Addr::new(10, 9, 0, 2)),
+            pdrs: vec![ul_pdr, dl_pdr],
+            fars: vec![ul, far_with_ohc(2, Some(Ipv4Addr::new(10, 9, 0, 2)), None)],
+            qers: Vec::new(),
+            urrs: Vec::new(),
+            bars: Vec::new(),
+        }
+    }
+
+    /// **#1450.** The data plane installs an I-UPF session with no UE address,
+    /// routes its N9 F-TEID to the Core PDR, and provisions the UL PDR's Transport
+    /// Delay Reporting; a null Transport Delay Reporting in an Update PDR
+    /// deactivates it, and the session's deletion drops it.
+    ///
+    /// REVERT-VERIFIED: with the establishment requiring a UE address (the `iupf`
+    /// arm removed), no session is installed; with the Core PDRs' F-TEIDs not bound,
+    /// the N9 TEID finds no session.
+    #[tokio::test]
+    async fn an_i_upf_session_is_installed_with_its_n9_tunnel_and_transport_delay() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let seid = 0x1450;
+        handle_pfcp_session_event(&dp, i_upf_established(seid)).await;
+        let session = dp.sessions.find_by_seid(seid).expect("installed");
+        assert_eq!(session.ue_ipv4(), None);
+        let by_n9 = dp
+            .sessions
+            .find_by_ul_teid(0x1450b)
+            .expect("N9 TEID routed");
+        assert_eq!(by_n9.upf_seid, seid);
+        let m = session
+            .match_tunnel_pdr(0x1450b, None, None)
+            .expect("a PDR");
+        assert_eq!(
+            (m.pdr_id, m.source_interface),
+            (2, data_plane::SRC_INTF_CORE)
+        );
+        let m = session
+            .match_tunnel_pdr(0x1450a, None, None)
+            .expect("a PDR");
+        assert_eq!(m.pdr_id, 1, "the N3 uplink");
+        assert_eq!(
+            dp.with_transport_delay(|m| m.pdr(seid, 1)).map(|c| c.peer),
+            Some("10.45.0.7".parse().unwrap())
+        );
+        assert_eq!(dp.with_transport_delay(|m| m.pdr(seid, 2)), None);
+        // Deactivated by an Update PDR with a null IE (§5.6.3).
+        let modified = PfcpSessionEvent::SessionModified {
+            upf_seid: seid,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: Vec::new(),
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: vec![crate::n4_build::ParsedUpdatePdr {
+                pdr_id: 1,
+                transport_delay_reporting: Some(None),
+                ..Default::default()
+            }],
+            updated_fars: Vec::new(),
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        handle_pfcp_session_event(&dp, modified).await;
+        assert_eq!(dp.with_transport_delay(|m| m.pdr(seid, 1)), None);
+        assert!(!dp.transport_delay_active());
+        // Provisioned again, then gone with the PDR (Remove PDR).
+        handle_pfcp_session_event(&dp, i_upf_established(seid + 2)).await;
+        assert!(dp.transport_delay_active());
+        let removal = PfcpSessionEvent::SessionModified {
+            upf_seid: seid + 2,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: vec![1],
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: Vec::new(),
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        handle_pfcp_session_event(&dp, removal).await;
+        assert!(!dp.transport_delay_active(), "gone with its PDR");
+        // #2197 review M1: Remove PDR 2 (the Core PDR on the N9 F-TEID): the N9
+        // TEID no longer routes to the session, the N3 one still does.
+        handle_pfcp_session_event(&dp, i_upf_established(seid + 3)).await;
+        assert_eq!(
+            dp.sessions.find_by_ul_teid(0x1450b).map(|s| s.upf_seid),
+            Some(seid + 3)
+        );
+        let remove_dl = PfcpSessionEvent::SessionModified {
+            upf_seid: seid + 3,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: vec![2],
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: Vec::new(),
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        handle_pfcp_session_event(&dp, remove_dl).await;
+        assert!(
+            dp.sessions.find_by_ul_teid(0x1450b).is_none(),
+            "a stale N9 TEID routes nowhere"
+        );
+        assert!(dp.sessions.find_by_ul_teid(0x1450a).is_some());
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionDeleted {
+                upf_seid: seid + 3,
+                ue_ipv4: None,
+            },
+        )
+        .await;
+        // Provisioned again, then gone with the session.
+        handle_pfcp_session_event(&dp, i_upf_established(seid + 1)).await;
+        assert!(dp.transport_delay_active());
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionDeleted {
+                upf_seid: seid + 1,
+                ue_ipv4: None,
+            },
+        )
+        .await;
+        assert!(!dp.transport_delay_active());
     }
 
     /// **#1348, TS 29.244 §5.2.1 / §7.5.2.** A session is never visible without the

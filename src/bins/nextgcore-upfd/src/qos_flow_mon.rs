@@ -27,11 +27,20 @@
 //! - UE to PSA: the N3 part plus the RAN part the NG-RAN returned (DL/UL Delay
 //!   Result, ms, §5.5.3.14/16); round trip = DL + UL.
 //!
+//! GTP-U path based delay (GTPUPM = 1, §5.24.5.3-4, TS 23.501 §5.33.3.3;
+//! #1450), acted on only with GPQM (`--gtpu-path-qos-monitoring`) as well: no
+//! QMP or dummy G-PDU goes out for such a flow (§5.24.5.4); each UL G-PDU of the
+//! flow whose PDU Session Container carries the RAN Delay Results, on a UL PDR
+//! with Transport Delay Reporting (`transport_delay`), is a measurement: DL =
+//! transport + RAN DL, UL = transport + RAN UL, round trip = DL + UL, where
+//! transport is the N3/N9 Delay Result the I-UPF(s) accumulated plus this UPF's
+//! delay to its preceding UL GTP-U peer. Reporting is the same as for GTPUPM = 0
+//! (TS 23.501 §5.33.3.1).
+//!
 //! Limitations, stated honestly:
-//! - Only packet delay via RAN and UPF time stamps (GTPUPM = 0) is measured. A
-//!   control asking for GTP-U path based delay (GTPUPM = 1, which needs an
-//!   I-UPF), congestion, data rate or available bitrate is not acted on: those
-//!   are other features (QMCON, QMDRM, ...), not advertised here.
+//! - Congestion, data rate or available bitrate is not acted on: those are
+//!   other features (QMCON, QMDRM, ...), not advertised here. Without GPQM a
+//!   GTPUPM control is not acted on either.
 //! - A RAN that returns no Delay Result contributes 0 ms for its part, so the
 //!   reported delay is then the N3 part only.
 //! - Direct reporting to a Local NEF or AF (DRQOS) is not supported; every
@@ -131,6 +140,32 @@ impl QmpAnswer {
     }
 }
 
+/// #1450: one GTPUPM measurement, from a UL G-PDU's PDU Session Container
+/// (§5.24.5.4): the end to end accumulated transport delay and the RAN part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSample {
+    pub qfi: u8,
+    pub accumulated_ms: u32,
+    pub dl_ran_ms: Option<u32>,
+    pub ul_ran_ms: Option<u32>,
+}
+
+impl TransportSample {
+    /// DL = transport + RAN DL, UL = transport + RAN UL, round trip = DL + UL
+    /// (TS 29.244 §5.24.5.4; the transport delay is one-way, the same each way,
+    /// TS 23.501 §5.33.3.3's RTT/2).
+    pub fn delays(&self) -> Delays {
+        let t = self.accumulated_ms;
+        let dl = t.saturating_add(self.dl_ran_ms.unwrap_or(0));
+        let ul = t.saturating_add(self.ul_ran_ms.unwrap_or(0));
+        Delays {
+            dl,
+            ul,
+            rp: dl.saturating_add(ul),
+        }
+    }
+}
+
 /// One QoS Monitoring per QoS flow Control Information, as acted on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowControl {
@@ -138,6 +173,8 @@ pub struct FlowControl {
     pub dl: bool,
     pub ul: bool,
     pub rp: bool,
+    /// GTPUPM: measured from GTP-U path monitoring, not QMP time stamps (#1450).
+    pub gtpupm: bool,
     pub event: bool,
     pub periodic: bool,
     pub thresholds: PacketDelayThresholds,
@@ -147,13 +184,18 @@ pub struct FlowControl {
 
 impl FlowControl {
     /// The control this UPF acts on, or `None` (logged) when it asks for nothing
-    /// this UPF measures: no packet delay, or GTP-U path based delay (GTPUPM).
-    pub fn from_ie(ie: &QosMonitoringPerQosFlowControlInformation) -> Option<Self> {
+    /// this UPF measures: no packet delay, or GTP-U path based delay (GTPUPM)
+    /// when `gtpupm_supported` is false (GPQM off, #1450).
+    pub fn from_ie(
+        ie: &QosMonitoringPerQosFlowControlInformation,
+        gtpupm_supported: bool,
+    ) -> Option<Self> {
         let r = ie.requested_qos_monitoring;
-        if r.gtpupm {
+        if r.gtpupm && !gtpupm_supported {
             log::warn!(
                 "QoS Monitoring per QoS flow Control Information for QFI(s) {:?} asks for \
-                 GTP-U path based delay (GTPUPM): not supported, not monitored",
+                 GTP-U path based delay (GTPUPM), which needs GPQM \
+                 (--gtpu-path-qos-monitoring): not monitored",
                 ie.qfis
             );
             return None;
@@ -195,6 +237,7 @@ impl FlowControl {
             dl: r.dlpd,
             ul: r.ulpd,
             rp: r.rppd,
+            gtpupm: r.gtpupm,
             event: f.evett,
             periodic: f.perio,
             thresholds: ie.packet_delay_thresholds.unwrap_or_default(),
@@ -225,7 +268,7 @@ impl FlowControl {
     }
 
     fn same_measurement(&self, other: &Self) -> bool {
-        (self.dl, self.ul, self.rp) == (other.dl, other.ul, other.rp)
+        (self.dl, self.ul, self.rp, self.gtpupm) == (other.dl, other.ul, other.rp, other.gtpupm)
     }
 }
 
@@ -328,9 +371,14 @@ impl SessionMon {
     }
 
     fn monitored_qfis(&self) -> Vec<u8> {
+        self.qfis_where(|_| true)
+    }
+
+    /// The QFIs of the controls `pick` selects.
+    fn qfis_where(&self, pick: impl Fn(&FlowControl) -> bool) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         for (_, ctls) in &self.srrs {
-            for c in ctls {
+            for c in ctls.iter().filter(|c| pick(&c.cfg)) {
                 for q in &c.cfg.qfis {
                     if !out.contains(q) {
                         out.push(*q);
@@ -341,9 +389,10 @@ impl SessionMon {
         out
     }
 
-    /// Keep one probe state per monitored QFI, and only those.
+    /// Keep one probe state per QFI monitored with QMP time stamps, and only
+    /// those: a GTPUPM flow gets no time stamps (§5.24.5.4, #1450).
     fn sync_probes(&mut self) {
-        let qfis = self.monitored_qfis();
+        let qfis = self.qfis_where(|c| !c.gtpupm);
         self.probes.retain(|q, _| qfis.contains(q));
         for q in qfis {
             self.probes.entry(q).or_default();
@@ -376,9 +425,16 @@ pub struct QosFlowMonitor {
     clock_synced: bool,
 }
 
-/// Decode the controls of one SRR, keeping those this UPF acts on.
-pub fn controls_of(ies: &[QosMonitoringPerQosFlowControlInformation]) -> Vec<FlowControl> {
-    let mut out: Vec<FlowControl> = ies.iter().filter_map(FlowControl::from_ie).collect();
+/// Decode the controls of one SRR, keeping those this UPF acts on;
+/// `gtpupm_supported`: GPQM is on, so GTPUPM controls are acted on (#1450).
+pub fn controls_of(
+    ies: &[QosMonitoringPerQosFlowControlInformation],
+    gtpupm_supported: bool,
+) -> Vec<FlowControl> {
+    let mut out: Vec<FlowControl> = ies
+        .iter()
+        .filter_map(|ie| FlowControl::from_ie(ie, gtpupm_supported))
+        .collect();
     if out.len() > MAX_CONTROLS_PER_SRR {
         log::warn!(
             "{} QoS Monitoring per QoS flow Control Information IEs in one SRR: only the \
@@ -622,34 +678,26 @@ impl QosFlowMonitor {
             Some(*q)
         })?;
         let d = answer.delays(clock_synced);
-        let mut out = Vec::new();
-        for (srr_id, ctls) in sess.srrs.iter_mut() {
-            for c in ctls.iter_mut() {
-                let Some(st) = c.flows.get_mut(&qfi) else {
-                    continue;
-                };
-                st.last = Some((d, now));
-                st.sum.0 += d.dl as u64;
-                st.sum.1 += d.ul as u64;
-                st.sum.2 += d.rp as u64;
-                st.count += 1;
-                st.silent_since = now;
-                st.failure_reported = false;
-                if c.cfg.event && c.cfg.exceeds(&d) {
-                    let waited = st
-                        .last_event_report
-                        .is_none_or(|t| now.saturating_duration_since(t) >= c.cfg.min_wait);
-                    if waited {
-                        st.last_event_report = Some(now);
-                        st.pending_event = None;
-                        out.push((*srr_id, report(qfi, c.cfg.measurement(&d), wall, None)));
-                    } else {
-                        st.pending_event = Some(d);
-                    }
-                }
-            }
-        }
+        let out = record(sess, qfi, d, false, now, wall);
         Some((qfi, d, out))
+    }
+
+    /// #1450: a GTPUPM measurement on `upf_seid` (§5.24.5.4). Returns `None`
+    /// when no GTPUPM control of the session monitors the sample's QFI; else
+    /// the delays and the reports they trigger (Event Triggered).
+    pub fn on_transport_sample(
+        &mut self,
+        upf_seid: u64,
+        sample: &TransportSample,
+        now: Instant,
+        wall: SystemTime,
+    ) -> Option<(Delays, Vec<SrrReport>)> {
+        let sess = self.sessions.get_mut(&upf_seid)?;
+        if !sess.qfis_where(|c| c.gtpupm).contains(&sample.qfi) {
+            return None;
+        }
+        let d = sample.delays();
+        Some((d, record(sess, sample.qfi, d, true, now, wall)))
     }
 
     /// One monitoring round at `now`: the dummy G-PDUs to send for flows that
@@ -749,6 +797,46 @@ impl QosFlowMonitor {
         out.reports.sort_by_key(|(s, _)| *s);
         out
     }
+}
+
+/// A measurement `d` of `qfi` into every control of `sess` that monitors it the
+/// same way (`gtpupm`), returning the Event Triggered reports it causes.
+fn record(
+    sess: &mut SessionMon,
+    qfi: u8,
+    d: Delays,
+    gtpupm: bool,
+    now: Instant,
+    wall: SystemTime,
+) -> Vec<SrrReport> {
+    let mut out = Vec::new();
+    for (srr_id, ctls) in sess.srrs.iter_mut() {
+        for c in ctls.iter_mut().filter(|c| c.cfg.gtpupm == gtpupm) {
+            let Some(st) = c.flows.get_mut(&qfi) else {
+                continue;
+            };
+            st.last = Some((d, now));
+            st.sum.0 += d.dl as u64;
+            st.sum.1 += d.ul as u64;
+            st.sum.2 += d.rp as u64;
+            st.count += 1;
+            st.silent_since = now;
+            st.failure_reported = false;
+            if c.cfg.event && c.cfg.exceeds(&d) {
+                let waited = st
+                    .last_event_report
+                    .is_none_or(|t| now.saturating_duration_since(t) >= c.cfg.min_wait);
+                if waited {
+                    st.last_event_report = Some(now);
+                    st.pending_event = None;
+                    out.push((*srr_id, report(qfi, c.cfg.measurement(&d), wall, None)));
+                } else {
+                    st.pending_event = Some(d);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// PLMF: no time stamp came back for a Measurement Period (§5.24.4.3); the

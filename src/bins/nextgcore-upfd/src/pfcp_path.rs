@@ -1505,6 +1505,8 @@ impl PfcpServer {
         // only removes the sessions it holds).
         if let Some(dp) = self.data_plane.read().unwrap().clone() {
             dp.with_qos_flow_monitor(|m| m.clear());
+            // #1450: and their Transport Delay Reporting.
+            dp.with_transport_delay(|m| m.clear());
         }
         let _ = self
             .session_tx
@@ -2578,7 +2580,11 @@ impl PfcpServer {
         // by the CP function and reserved; given back if it is refused.
         let mut chosen_teids: Vec<u32> = Vec::new();
 
-        for pdr in create_pdrs {
+        for mut pdr in create_pdrs {
+            // #1450: Transport Delay Reporting is acted on only with GPQM (§5.24.5).
+            if !self.gpqm() {
+                pdr.transport_delay_reporting = None;
+            }
             log::debug!(
                 "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_ids={:?}, urr_ids={:?}",
                 pdr.pdr_id,
@@ -2601,6 +2607,7 @@ impl PfcpServer {
             // In either case the UPF allocates a fresh non-zero TEID +
             // its N3 GTP-U address and returns it in the Created PDR so
             // uplink GTP-U traffic matches.
+            let core = pdr.pdi.source_interface == crate::data_plane::SRC_INTF_CORE;
             let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
                 if fteid.ch || fteid.teid == 0 {
                     // #1815: one TEID per PDR here, as before; no CHOOSE ID sharing
@@ -2632,14 +2639,17 @@ impl PfcpServer {
                             .map_err(|e| format!("Send error: {e}"))?;
                         return Ok(());
                     };
-                    ul_teid = teid;
-                    pdr_teids.insert(pdr.pdr_id, ul_teid);
+                    if !core {
+                        ul_teid = teid;
+                    }
+                    pdr_teids.insert(pdr.pdr_id, teid);
                     log::debug!(
-                        "Allocated uplink F-TEID: teid={ul_teid:#x} (ch={})",
+                        "Allocated F-TEID for PDR {}: teid={teid:#x} (ch={})",
+                        pdr.pdr_id,
                         fteid.ch
                     );
                     Some(FTeid {
-                        teid: ul_teid,
+                        teid,
                         ipv4,
                         ipv6,
                         choose: false,
@@ -2678,13 +2688,27 @@ impl PfcpServer {
                         }
                         chosen_teids.push(teid);
                     }
-                    ul_teid = teid;
-                    pdr_teids.insert(pdr.pdr_id, ul_teid);
+                    if !core {
+                        ul_teid = teid;
+                    }
+                    pdr_teids.insert(pdr.pdr_id, teid);
                     None
                 }
             } else {
                 None
             };
+            // #1450: an I-UPF's downlink PDR (Source Interface Core) detects on the
+            // F-TEID of its N9 tunnel from the PSA. It is not the session's uplink
+            // TEID; the data plane routes it to the PDR, so the TEID is written into
+            // the parsed PDI, as a modification does (#583).
+            if core {
+                if let (Some(&teid), Some(f)) =
+                    (pdr_teids.get(&pdr.pdr_id), pdr.pdi.local_f_teid.as_mut())
+                {
+                    f.teid = teid;
+                    f.ch = false;
+                }
+            }
 
             // Extract UE IP address
             if let Some(ref ue_ip) = pdr.pdi.ue_ip_address {
@@ -2710,7 +2734,13 @@ impl PfcpServer {
         for far in create_fars {
             log::debug!("FAR {}: apply_action={:#x}", far.far_id, far.apply_action);
 
-            if let Some(ref fp) = far.forwarding_parameters {
+            // #1450: a FAR toward the Core with an Outer Header Creation is an
+            // I-UPF's N9 tunnel to the PSA, not the session's downlink tunnel.
+            if let Some(fp) = far
+                .forwarding_parameters
+                .as_ref()
+                .filter(|fp| fp.destination_interface != crate::data_plane::SRC_INTF_CORE)
+            {
                 if let Some(ref ohc) = fp.outer_header_creation {
                     dl_teid = ohc.teid;
                     gnb_addr = ohc.ipv4;
@@ -3081,6 +3111,15 @@ impl PfcpServer {
             crate::n4_build::parse_update_pdr,
             &mut failure,
         );
+        // #1450: Transport Delay Reporting is acted on only with GPQM (§5.24.5).
+        if !self.gpqm() {
+            for p in created_pdrs.iter_mut() {
+                p.transport_delay_reporting = None;
+            }
+            for p in updated_pdrs.iter_mut() {
+                p.transport_delay_reporting = None;
+            }
+        }
         // #1682: an Update PDR's PDI replaces the stored one (Table 7.5.4.2-1), so a
         // Local F-TEID in it with CHOOSE set (or this tree's zero TEID) asks for a new
         // F-TEID, allocated as for a Create PDR above, and the response carries it in
@@ -3237,9 +3276,12 @@ impl PfcpServer {
         // FAR alone, and a move of the session's tunnel leaves it where it points. Which Updates move the session's tunnel therefore
         // depends on the session, and is decided under its lock below.
         let own_tunnel_fars = own_tunnel_fars_created(&created_pdrs, &created_fars);
+        // #1450: and never a FAR toward the Core: that is an I-UPF's N9 tunnel to the
+        // PSA, not a downlink.
         let tunnel_of = |far: &crate::n4_build::ParsedCreateFar| {
             far.forwarding_parameters
                 .as_ref()
+                .filter(|fp| fp.destination_interface != crate::data_plane::SRC_INTF_CORE)
                 .and_then(|fp| fp.outer_header_creation.as_ref())
                 .map(|ohc| (far.far_id, ohc.teid, ohc.ipv4))
         };
@@ -4044,7 +4086,7 @@ impl PfcpServer {
                 out.extend(m.remove_srr(upf_seid, *id, wall));
             }
             for r in created {
-                let controls = crate::qos_flow_mon::controls_of(&r.qos_controls);
+                let controls = crate::qos_flow_mon::controls_of(&r.qos_controls, self.gpqm());
                 if !controls.is_empty() {
                     log::info!(
                         "SEID {upf_seid:#x}: SRR {} provisions QoS monitoring of QFI(s) {:?}",
@@ -4061,7 +4103,7 @@ impl PfcpServer {
                 m.create_srr(upf_seid, r.srr_id, controls, now, wall);
             }
             for r in updated {
-                let controls = crate::qos_flow_mon::controls_of(&r.qos_controls);
+                let controls = crate::qos_flow_mon::controls_of(&r.qos_controls, self.gpqm());
                 out.extend(m.update_srr(upf_seid, r.srr_id, controls, now, wall));
             }
         });
@@ -13519,6 +13561,17 @@ mod tests {
         let srr = crate::n4_build::parse_srr(&srr_body(1, &[5])).unwrap();
         server.apply_srrs(0x77, &[], &[srr], &[]);
         assert!(dp.with_qos_flow_monitor(|m| m.is_active()));
+        // #1450: and a PDR's Transport Delay Reporting, likewise.
+        dp.with_transport_delay(|m| {
+            m.set_pdr(
+                0x77,
+                1,
+                Some(crate::transport_delay::TransportDelayPdr {
+                    peer: "10.45.0.7".parse().unwrap(),
+                    dscp: None,
+                }),
+            )
+        });
         assert!(
             dp.sessions.find_by_seid(0x77).is_none(),
             "no data-plane session"
@@ -13528,7 +13581,9 @@ mod tests {
         hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
         let _ = exchange(&smf, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
         for _ in 0..50 {
-            if !dp.with_qos_flow_monitor(|m| m.is_active()) {
+            if !dp.with_qos_flow_monitor(|m| m.is_active())
+                && !dp.with_transport_delay(|m| m.is_active())
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -13751,6 +13806,168 @@ mod tests {
             "the refusal must be kept for a retransmission"
         );
         assert_eq!(exchange(&smf, addr, &request).await, resp);
+    }
+
+    /// #1450: Transport Delay Reporting (IE 271, Table 7.5.2.2-6) for a Preceding
+    /// UL GTP-U Peer 10.45.0.7 with no DSCP, by hand:
+    /// - 01 0f: IE Type 271; 00 09: Length 9;
+    /// - 00 67 00 05: Remote GTP-U Peer (IE 103, §8.2.70), Length 5;
+    /// - 02: octet 5 flags, bit 2 V4 (Figure 8.2.70-1); 0a 2d 00 07: the IPv4 address.
+    const TDR_271: [u8; 13] = [
+        0x01, 0x0f, 0x00, 0x09, 0x00, 0x67, 0x00, 0x05, 0x02, 10, 45, 0, 7,
+    ];
+
+    /// #1450: an I-UPF's establishment (TS 23.502 §4.3.2.2.1 step 10): UL PDR 1
+    /// (Access, CHOOSE, Transport Delay Reporting) -> FAR 1 FORW toward the Core
+    /// with the PSA's N9 tunnel (TEID 0x1404 at 127.0.0.5); DL PDR 2 (Core,
+    /// CHOOSE: the I-UPF's N9 F-TEID) LAST -> FAR 2 buffering until the AN tunnel
+    /// is known.
+    fn i_upf_establishment_1450() -> Vec<u8> {
+        let pdr = |id: u16, source: u8, far: u32, tdr: bool| {
+            let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+            pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, source);
+            pdi.add_tlv(pfcp_ie::F_TEID, &[0x05]); // CH | V4
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_pdr_id(id);
+            b.add_u32(pfcp_ie::PRECEDENCE, 10);
+            b.add_tlv(pfcp_ie::PDI, &pdi.build());
+            b.add_u32(pfcp_ie::FAR_ID, far);
+            let mut v = b.build();
+            if tdr {
+                v.extend_from_slice(&TDR_271);
+            }
+            v
+        };
+        let mut fp = crate::n4_build::PfcpMessageBuilder::new();
+        fp.add_u8(pfcp_ie::DESTINATION_INTERFACE, 1); // Core
+        fp.add_tlv(
+            pfcp_ie::OUTER_HEADER_CREATION,
+            &[0x01, 0x00, 0, 0, 0x14, 0x04, 127, 0, 0, 5],
+        );
+        let mut ul_far = crate::n4_build::PfcpMessageBuilder::new();
+        ul_far.add_u32(pfcp_ie::FAR_ID, 1);
+        ul_far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+        ul_far.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp.build());
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1450,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr(1, 0, 1, true));
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr(2, 1, 2, false));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &ul_far.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &forwarding_far(2, None, false));
+        b.build()
+    }
+
+    /// **#1450.** The PFCP layer's half of the I-UPF role and of Transport Delay
+    /// Reporting: the session's uplink TEID is the Access PDR's even with the Core
+    /// PDR's F-TEID chosen after it; the Core PDR's chosen N9 TEID is written into
+    /// its PDI for the data plane; the FAR toward the PSA is not taken as the
+    /// session's downlink tunnel; and IE 271 reaches the data plane only with GPQM.
+    ///
+    /// REVERT-VERIFIED: with a Core PDR's TEID taken as `ul_teid`, or the Core FAR's
+    /// OHC taken as the downlink tunnel, or IE 271 passed on without GPQM, this fails.
+    #[tokio::test]
+    async fn an_i_upf_establishment_keeps_its_tunnels_apart_and_gates_ie_271_1450() {
+        for gpqm in [false, true] {
+            let (server, smf, addr, mut rx) = spawn_test_server().await;
+            server.set_path_qos_monitoring(gpqm);
+            let assoc = build_association_setup_request_payload(Some(1));
+            let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(50, Some(0), 2, &i_upf_establishment_1450()),
+            )
+            .await;
+            assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+            let n3 = created_teid_1834(&resp, 1).expect("PDR 1's F-TEID");
+            let n9 = created_teid_1834(&resp, 2).expect("PDR 2's F-TEID");
+            assert_ne!(n3, n9);
+            let event = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("a session event")
+                    .expect("open")
+                {
+                    e @ PfcpSessionEvent::SessionEstablished { .. } => break e,
+                    _ => continue,
+                }
+            };
+            let PfcpSessionEvent::SessionEstablished {
+                ul_teid,
+                gnb_addr,
+                pdrs,
+                ..
+            } = event
+            else {
+                unreachable!()
+            };
+            assert_eq!(ul_teid, n3, "the N3 uplink TEID, not the N9 one");
+            assert_eq!(gnb_addr, None, "the PSA is not the gNB");
+            let f = pdrs[1].pdi.local_f_teid.as_ref().unwrap();
+            assert_eq!(
+                (f.teid, f.ch),
+                (n9, false),
+                "the N9 F-TEID, for the data plane"
+            );
+            assert_eq!(
+                pdrs[0].transport_delay_reporting.as_deref(),
+                gpqm.then_some(&TDR_271[4..]),
+                "IE 271 only with GPQM"
+            );
+            // A modification: Update PDR 1 deactivating it (null IE 271, §5.6.3),
+            // and a Create PDR 3 carrying it.
+            let upf_seid = *server.sessions.read().await.keys().next().unwrap();
+            let mut upd = crate::n4_build::PfcpMessageBuilder::new();
+            upd.add_pdr_id(1);
+            upd.add_tlv(pfcp_ie::TRANSPORT_DELAY_REPORTING, &[]);
+            let mut create = crate::n4_build::PfcpMessageBuilder::new();
+            create.add_pdr_id(3);
+            create.add_u32(pfcp_ie::PRECEDENCE, 20);
+            let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+            pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+            create.add_tlv(pfcp_ie::PDI, &pdi.build());
+            create.add_u32(pfcp_ie::FAR_ID, 1);
+            let mut create = create.build();
+            create.extend_from_slice(&TDR_271);
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(pfcp_ie::UPDATE_PDR, &upd.build());
+            b.add_tlv(pfcp_ie::CREATE_PDR, &create);
+            let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+            assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+            let event = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("a session event")
+                    .expect("open")
+                {
+                    e @ PfcpSessionEvent::SessionModified { .. } => break e,
+                    _ => continue,
+                }
+            };
+            let PfcpSessionEvent::SessionModified {
+                created_pdrs,
+                updated_pdrs,
+                ..
+            } = event
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                created_pdrs[0].transport_delay_reporting.as_deref(),
+                gpqm.then_some(&TDR_271[4..]),
+                "a Create PDR's IE 271 only with GPQM"
+            );
+            assert_eq!(
+                updated_pdrs[0].transport_delay_reporting,
+                gpqm.then_some(None),
+                "an Update PDR's null IE 271 deactivates, only with GPQM"
+            );
+        }
     }
 
     /// **#1898, source guard.** Every PFCP datagram this server sends goes out
