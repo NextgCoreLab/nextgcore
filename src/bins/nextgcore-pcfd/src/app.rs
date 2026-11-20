@@ -13134,6 +13134,58 @@ mod tests {
                 .as_deref(),
             Some(NEW_AMF)
         );
+        // #2141 (R40 minor 2): the declared behaviour change. A certificate
+        // naming no NF types, with the AMF's own token, is typed through the NRF
+        // (#2099) and the GUAMI check still decides: PEER_AMF (set 20/001,
+        // serving 020041) relocates a fresh association; OTHER_AMF, an AMF that
+        // does not serve 020041, is refused.
+        let am2 = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000021411",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/old-2141",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(am2.status, 201, "{:?}", am2.http.content);
+        let am2_path = location_of(&am2);
+        let am2_id = am2_path.rsplit('/').next().unwrap().to_string();
+        let am2_update = format!("{am2_path}/update");
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &am2_update, Some(am_reloc())),
+            Some(OTHER_AMF),
+            &[],
+            Some(OTHER_AMF),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 403,
+            "typeless + token, wrong GUAMI: {:?}",
+            resp.http.content
+        );
+        let resp = pcf_sbi_request_handler(as_caller(
+            make_request("POST", &am2_update, Some(am_reloc())),
+            Some(PEER_AMF),
+            &[],
+            Some(PEER_AMF),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "a typeless certificate with its token is typed by the NRF: {:?}",
+            resp.http.content
+        );
+        assert_eq!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .ue_am_find_by_association_id(&am2_id)
+                .and_then(|a| a.owner)
+                .as_deref(),
+            Some(PEER_AMF)
+        );
         drop(_nrf_guard);
         nrf.stop().await.ok();
     }

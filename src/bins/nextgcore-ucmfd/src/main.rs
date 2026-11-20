@@ -567,6 +567,10 @@ async fn main() -> Result<()> {
         &settings.nrf_uri,
     )
     .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    // #2141 (R40 M1): the NRF the shared lookup asks, and (below) the
+    // requester it names, are set before the listener serves.
+    global_context().set_nrf_uri(&settings.nrf_uri).await;
+    register_self_instance(&nf_instance_id).await;
 
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
@@ -588,16 +592,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    global_context().set_nrf_uri(&settings.nrf_uri).await;
-    // #2099: the shared verified-NF-type lookup names this NF as the requester
-    // (`requester-nf-type=UCMF`), so the NRF applies the NEF profile's
-    // allowedNfTypes to it (#1998).
-    global_context()
-        .set_self_instance(nextgcore_sbi::context::NfInstance::new(
-            nf_instance_id.clone(),
-            NfType::Ucmf,
-        ))
-        .await;
     // #1482: a failed attempt is retried in the background, and the heartbeat
     // starts after the one that succeeds.
     match sbi.registration_host() {
@@ -1453,6 +1447,19 @@ fn provisioning_update_response(
             notes,
         ),
     }
+}
+
+/// #2099, #2141 (R40 M1): record this UCMF as the global context's self NF
+/// instance, before the listener serves. The shared verified-NF-type lookup
+/// names it as `requester-nf-type=UCMF` (mandatory; nrfd answers 400
+/// without), so the NRF also applies the NEF profile's allowedNfTypes (#1998).
+async fn register_self_instance(nf_instance_id: &str) {
+    global_context()
+        .set_self_instance(nextgcore_sbi::context::NfInstance::new(
+            nf_instance_id,
+            NfType::Ucmf,
+        ))
+        .await;
 }
 
 /// TS 29.675 §4.1.3.2: the known Nucmf_Provisioning consumers.
@@ -3056,6 +3063,99 @@ mod tests {
         ] {
             assert!(provisioner_refusal(&policy, &r).await.is_none(), "{r:?}");
         }
+    }
+
+    /// #2141 (R41), end to end with no seeded cache: a NEF provisioning with a
+    /// token only (or behind an SCP) is typed by a stand-in NRF that behaves as
+    /// nrfd does: a 400 for a discovery without `requester-nf-type`, and a
+    /// profile hidden from a requester its `allowedNfTypes` leaves out. The NEF
+    /// profile carries UCMF, as nefd's now does. The UCMF registers its self
+    /// instance as at startup, so the NEF is admitted, an AF's token is refused,
+    /// and every lookup names UCMF.
+    ///
+    /// REVERT-VERIFIED: with UCMF dropped from the stand-in NEF profile (nefd's
+    /// list before #2141), the NEF is refused and the `NEF via the SCP`
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nef_via_the_scp_is_typed_by_the_nrf_2141() {
+        const NEF: &str = "aaaaaaaa-2141-4000-8000-0000000000ef";
+        const AF: &str = "bbbbbbbb-2141-4000-8000-0000000000af";
+        const SCP: &str = "cccccccc-2141-4000-8000-000000000scp";
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let requesters: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+        let seen = requesters.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    let param = |k: &str| req.http.params.get(k).cloned();
+                    let requester = param("requester-nf-type");
+                    // Only this test's lookups: the NRF URI is process-global,
+                    // so a concurrent test's can reach this stand-in too.
+                    if matches!(param("target-nf-instance-id").as_deref(), Some(NEF | AF)) {
+                        seen.lock().unwrap().push(requester.clone());
+                    }
+                    let Some(requester) = requester else {
+                        return nextgcore_sbi::server::send_error(
+                            400,
+                            "Bad Request",
+                            "requester-nf-type is mandatory",
+                            Some("MANDATORY_QUERY_PARAM_MISSING"),
+                        );
+                    };
+                    let profiles = [
+                        (NEF, "NEF", vec!["AF", "AMF", "UDM", "SCP", "UCMF"]),
+                        (AF, "AF", vec!["NEF", "UCMF"]),
+                    ];
+                    let list: Vec<_> = profiles
+                        .iter()
+                        .filter(|(id, ty, allowed)| {
+                            param("target-nf-instance-id").as_deref() == Some(*id)
+                                && param("target-nf-type").as_deref() == Some(*ty)
+                                && allowed.contains(&requester.as_str())
+                        })
+                        .map(|(id, ty, _)| serde_json::json!({"nfInstanceId": id, "nfType": ty}))
+                        .collect();
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({ "nfInstances": list }))
+                        .expect("json")
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        register_self_instance(nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Ucmf)).await;
+        let policy = context::ProvisioningPolicy {
+            trusted_afs: Some(vec!["dddddddd-2141-4000-8000-00000000trust".to_string()]),
+            vendor_ids: BTreeMap::new(),
+        };
+        let via_scp = |sub: &str| {
+            let mut r = as_nf_1862(
+                with_json(
+                    req("POST", "/nucmf-provisioning/v1/provisionings"),
+                    provisioning_body("0a0b"),
+                ),
+                Some(sub),
+            );
+            r.peer_cert_nf_types = vec!["SCP".to_string()];
+            r.peer_cert_nf_instance_id = Some(SCP.to_string());
+            r
+        };
+        let nef = provisioner_refusal(&policy, &via_scp(NEF)).await;
+        let af = provisioner_refusal(&policy, &via_scp(AF)).await;
+        nrf.stop().await.ok();
+        let requesters = requesters.lock().unwrap().clone();
+        assert!(
+            nef.is_none(),
+            "NEF via the SCP: {:?} (NRF saw {requesters:?})",
+            nef.map(|r| r.http.content)
+        );
+        assert_eq!(af.map(|r| r.status), Some(403), "an AF is not a NEF");
+        assert!(
+            !requesters.is_empty() && requesters.iter().all(|r| r.as_deref() == Some("UCMF")),
+            "every lookup names the UCMF: {requesters:?}"
+        );
     }
 
     /// #1989 review M1: the provisioning API is judged by [`provisioner_refusal`]

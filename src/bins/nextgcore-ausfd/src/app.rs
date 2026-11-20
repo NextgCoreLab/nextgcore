@@ -373,6 +373,12 @@ pub async fn run() -> Result<()> {
     let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
 
+    // #2141 (R40 M1): the self instance before the first request, not only once
+    // NRF registration succeeds: the shared verified-NF-type lookup names it
+    // as `requester-nf-type` (mandatory; nrfd answers 400 without it), which
+    // the old per-crate lookup hard-coded as AUSF. Registration sets it again.
+    register_self_instance(sbi.registration_host().ok(), sbi.port).await;
+
     sbi_server
         .start(ausf_sbi_request_handler)
         .await
@@ -2290,6 +2296,45 @@ fn ausf_allowed_operations(name: &str, allowed: &[&str]) -> Option<serde_json::V
 }
 
 /// Build this AUSF's typed self NF instance from [`AUSF_SERVICES`].
+/// #2141: record this AUSF as the global context's self NF instance (its NF
+/// Instance ID, type AUSF), built from the same table as the registered profile.
+async fn register_self_instance(sbi_addr: Option<&str>, sbi_port: u16) {
+    let id = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf);
+    let instance = match sbi_addr {
+        Some(addr) => build_ausf_nf_instance(id, addr, sbi_port),
+        // A wildcard bind with nothing to advertise registers nowhere, but still
+        // names itself as the requester.
+        None => nextgcore_sbi::context::NfInstance::new(id, nextgcore_sbi::types::NfType::Ausf),
+    };
+    nextgcore_sbi::context::global_context()
+        .set_self_instance(instance)
+        .await;
+}
+
+#[cfg(test)]
+mod self_instance_tests_2141 {
+    /// #2141 (R40 M1): the self instance the shared lookup names as
+    /// `requester-nf-type` is registered before serving, with or without an
+    /// advertised host.
+    ///
+    /// REVERT-VERIFIED: with `register_self_instance` empty, this fails.
+    #[tokio::test]
+    async fn ausfd_registers_its_self_instance_before_serving_2141() {
+        for host in [None, Some("10.0.0.21")] {
+            super::register_self_instance(host, 7777).await;
+            let me = nextgcore_sbi::context::global_context()
+                .get_self_instance()
+                .await
+                .expect("a self instance");
+            assert_eq!(me.nf_type, nextgcore_sbi::types::NfType::Ausf, "{host:?}");
+            assert_eq!(
+                me.id,
+                nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf)
+            );
+        }
+    }
+}
+
 fn build_ausf_nf_instance(
     nf_instance_id: &str,
     sbi_addr: &str,
@@ -4171,8 +4216,8 @@ mod tests {
                 .content
                 .as_deref()
                 .unwrap_or_default()
-                .contains("the NRF does not list"),
-            "fails closed: {:?}",
+                .contains("(no NRF is configured to look the caller up)"),
+            "fails closed on a failed lookup, not a negative answer: {:?}",
             r.http.content
         );
 
