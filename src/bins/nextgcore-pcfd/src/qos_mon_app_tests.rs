@@ -500,3 +500,80 @@ async fn an_app_session_delete_removes_its_rules_at_the_smf_2221() {
     assert_ne!(left[0], rule_a);
     server.stop().await.ok();
 }
+
+/// #2269: a session restored from a snapshot written before #2263 holds its AF
+/// rule under the old key (`PccRule-af-<psi>-<medCompN>`), and its app session
+/// records no rule ids. A modify re-deriving that media component replaces it:
+/// the SMF is sent `null` for the old rule and its QosData in the same decision
+/// as the new rule, and the session keeps only the new one.
+///
+/// REVERT-VERIFIED: without the legacy removal in the modify, this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+async fn a_modify_replaces_the_pre_upgrade_rule_at_the_smf_2269() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    crate::test_support::init_context();
+    let (seen, port, server) = recorder().await;
+    let ip = "10.45.22.69";
+    let _ = sm_policy(port, "imsi-001010000022269", ip, "0").await;
+    let app = af_session(port, "af69", ip).await;
+    let _ = next_post(&seen, "/update", |_| true).await;
+
+    // As restored from a pre-#2263 snapshot: the rule under the old key, and an
+    // app session that recorded no rule ids.
+    let (legacy, legacy_qos) = {
+        let ctx = pcf_self();
+        let c = ctx.read().unwrap();
+        let mut sess = c.sess_find_by_ipv4addr(ip).unwrap();
+        let rule = &mut sess.af_pcc_rules[0];
+        rule.pcc_rule_id = npcf_handler::legacy_af_pcc_rule_id(sess.psi, 1);
+        rule.qos_data.qos_id = format!("QosData-af-{}-1", sess.psi);
+        let ids = (rule.pcc_rule_id.clone(), rule.qos_data.qos_id.clone());
+        c.sess_update(&sess);
+        let mut a = c.app_find_by_app_session_id(&app).unwrap();
+        a.pcc_rule_ids.clear();
+        c.app_update(&a);
+        ids
+    };
+
+    let patch = af_body(
+        port,
+        ip,
+        "0",
+        serde_json::json!({ "events": [{ "event": "USAGE_REPORT" }] }),
+    );
+    let resp = pcf_sbi_request_handler(
+        SbiRequest::patch(format!("/npcf-policyauthorization/v1/app-sessions/{app}"))
+            .with_json_body(&patch)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+    let n = next_post(&seen, "/update", |_| true).await;
+    let d = &n["smPolicyDecision"];
+    let new_rule = rules_of(&app)[0].clone();
+    assert_ne!(new_rule, legacy);
+    assert!(
+        d["pccRules"][&legacy].is_null() && d["pccRules"].get(&legacy).is_some(),
+        "{d}"
+    );
+    assert!(
+        d["qosDecs"].get(&legacy_qos).is_some_and(|v| v.is_null()),
+        "{d}"
+    );
+    assert!(d["pccRules"][&new_rule].is_object(), "{d}");
+    let held: Vec<String> = pcf_self()
+        .read()
+        .unwrap()
+        .sess_find_by_ipv4addr(ip)
+        .unwrap()
+        .af_pcc_rules
+        .iter()
+        .map(|r| r.pcc_rule_id.clone())
+        .collect();
+    assert_eq!(held, vec![new_rule], "the old rule is gone");
+    server.stop().await.ok();
+}

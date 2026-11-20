@@ -6228,18 +6228,36 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
                 // Re-derive the AF PCC rules and push them to the SMF.
                 let mut installed = 0usize;
                 let mut rule_ids = Vec::new();
+                let mut legacy = Vec::new();
                 if let Ok(context) = ctx.read() {
                     if let Some(mut sess) = context.sess_find_by_id(app.sess_id) {
                         let new_rules = media_components_to_pcc(&asc, &sess, app.id);
                         installed = new_rules.len();
                         rule_ids = new_rules.iter().map(|r| r.pcc_rule_id.clone()).collect();
+                        // #2269: the rule a re-derived media component had under
+                        // the pre-#2263 key, from a snapshot written before the
+                        // upgrade, is replaced by the per-app-session one: removed
+                        // here and at the SMF, or the SMF would hold both.
+                        let old: Vec<String> = asc
+                            .med_components
+                            .iter()
+                            .map(|mc| npcf_handler::legacy_af_pcc_rule_id(sess.psi, mc.med_comp_n))
+                            .collect();
+                        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut sess.af_pcc_rules)
+                            .into_iter()
+                            .partition(|r| old.contains(&r.pcc_rule_id));
+                        sess.af_pcc_rules = kept;
+                        legacy = gone;
                         merge_af_pcc_rules(&mut sess, new_rules);
                         context.sess_update(&sess);
                     }
                 }
                 record_app_pcc_rules(app.id, rule_ids);
                 refresh_af_qos_mon(app.id);
-                pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
+                sbi_path::pcf_sbi_send_af_smpolicycontrol_update_notify_removing(
+                    app.sess_id,
+                    &legacy,
+                );
                 log::info!(
                     "App session modify updated {installed} AF PCC rule(s) on sess_id={}",
                     app.sess_id
