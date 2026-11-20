@@ -254,7 +254,9 @@ async fn mtlf_server(ctx: Ctx, serve: Serve) -> (nextgcore_sbi::SbiServer, u16) 
                 match parts.as_slice() {
                     ["nnwdaf-mlmodelprovision", "v1", "subscriptions"] => {
                         crate::sbi_handler::handle_ml_prov_subscription_create_with_ctx(
-                            &guard, &req,
+                            &guard,
+                            &req,
+                            nextgcore_sbi::owner_binding::identity_required(),
                         )
                     }
                     ["nnwdaf-mlmodelprovision", "v1", "models", ev, art] => {
