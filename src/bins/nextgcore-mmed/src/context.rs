@@ -2835,17 +2835,18 @@ pub fn mme_context_init() {
 /// `served_gummei` into it. This must therefore be the first thing that touches
 /// the context (issue #157).
 ///
-/// Returns `false` when a context was already installed, in which case the
-/// configuration was not applied.
-pub fn mme_context_init_with_config(config_path: &str) -> bool {
+/// Returns `Ok(false)` when a context was already installed, in which case the
+/// configuration was not applied, and `Err` when the configuration must not be
+/// started on (#2115: [`crate::config::load_config_checked`]).
+pub fn mme_context_init_with_config(config_path: &str) -> Result<bool, String> {
     let mut ctx = MmeContext::new();
-    crate::config::load_config(&mut ctx, config_path);
+    crate::config::load_config_checked(&mut ctx, config_path)?;
 
     if MME_CONTEXT.set(ctx).is_err() {
-        return false;
+        return Ok(false);
     }
     mme_self().init();
-    true
+    Ok(true)
 }
 
 /// Finalize the global MME context
