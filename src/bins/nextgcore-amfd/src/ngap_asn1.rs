@@ -3615,8 +3615,8 @@ pub fn build_criticality_error_indication_asn1(
 /// Criticality Diagnostics, with the GENERATED codec (#417): the report of a
 /// message the AMF could not decode, or of one in the wrong direction or state
 /// (§10.2, §10.4). The UE NGAP IDs go in when known, so the gNB can correlate
-/// the indication with the UE association (§8.7.5.2). Byte-identical to the
-/// hand-written builder: `error_indication_generated_matches_hand_written`.
+/// the indication with the UE association (§8.7.5.2). The bytes are the hand
+/// derivation: `error_indication_is_the_derived_octets`.
 pub fn build_error_indication_generated(
     amf_ue_ngap_id: Option<u64>,
     ran_ue_ngap_id: Option<u32>,
@@ -14531,8 +14531,8 @@ mod handover_required_tests {
         }
     }
 
-    /// What the hand-written parser and the generated decoder say about the same
-    /// bytes, flattened to comparable values.
+    /// A Handover Required flattened to comparable values: what the gNB sent
+    /// and what the generated decoder read back.
     fn view(r: &HandoverRequired) -> String {
         format!(
             "{} {} {:?} {:?} {:?} {:?} {:?} {:?}",
@@ -14560,29 +14560,24 @@ mod handover_required_tests {
         }
     }
 
-    /// Every Handover Required naming a gNB target the hand-written parser
-    /// accepted decodes to the same values through the generated codec: gNB id
-    /// lengths 22..32 at their extremes, 1..4 sessions, both handover types the
-    /// gNB path takes, with and without Direct Forwarding Path Availability.
+    /// Every Handover Required naming a gNB target, octets derived by hand
+    /// ([`crate::gnb_pdus::handover_required`]), decodes back to the values it
+    /// was derived from: gNB id lengths 22..32 at their extremes, 1..4
+    /// sessions, both handover types the gNB path takes, with and without
+    /// Direct Forwarding Path Availability.
     #[test]
-    fn handover_required_generated_decode_matches_hand_written() {
+    fn handover_required_decodes_the_derived_octets_to_their_values() {
         let mut cases = 0;
         for len in [22u8, 25, 32] {
             for gnb_id in [0u32, 1, ((1u64 << len) - 1) as u32] {
-                // SIZE(1..256): an empty list is refused by the hand-written
-                // builder itself, so the sweep starts at one session.
+                // SIZE(1..256): the sweep starts at one session.
                 for sessions in 1..=4 {
                     for direct in [false, true] {
                         for ho_type in [HandoverType::Intra5gs, HandoverType::FivegsToEps] {
                             let mut msg = required(gnb_target(gnb_id, len), sessions, direct);
                             msg.handover_type = ho_type;
-                            let bytes = builder::build_handover_required(&msg).expect("build");
-                            let Ok(NgapMessage::HandoverRequired(old)) =
-                                parser::decode_ngap_pdu(&bytes)
-                            else {
-                                panic!("hand-written parser refused {len}/{gnb_id}/{sessions}");
-                            };
-                            assert_eq!(view(&generated(&bytes)), view(&old));
+                            let bytes = crate::gnb_pdus::handover_required(&msg);
+                            assert_eq!(view(&generated(&bytes)), view(&msg));
                             cases += 1;
                         }
                     }
@@ -14625,10 +14620,9 @@ mod handover_required_tests {
             GOLDEN
         );
 
-        // The same TargetID inside a whole Handover Required: start from one the
-        // hand-written builder made and replace its TargetID IE.
-        let base = builder::build_handover_required(&required(gnb_target(1, 22), 1, false))
-            .expect("build");
+        // The same TargetID inside a whole Handover Required: start from the
+        // derived one and replace its TargetID IE.
+        let base = crate::gnb_pdus::handover_required(&required(gnb_target(1, 22), 1, false));
         let mut pdu = nextgcore_ngap_gen::decode(&base).expect("decode");
         let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
             panic!("initiatingMessage");
@@ -14662,28 +14656,27 @@ mod handover_required_tests {
                 tac: [0x00, 0x07],
             }
         );
-        // #741: the hand-written parser now reads the conformant encoding the same way.
-        let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
-            panic!("the hand-written parser refused a conformant targeteNB-ID");
-        };
-        let TargetId::TargetGlobalNgEnbId {
-            plmn_identity,
-            ng_enb_id,
-            selected_eps_tai,
-        } = old.target_id
-        else {
-            panic!("an eNB target");
-        };
-        assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
-        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
-        assert_eq!(selected_eps_tai.tac, [0x00, 0x07]);
+        // The derived stand-in writes the same octets for that target.
+        let msg = required(
+            TargetId::TargetGlobalNgEnbId {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                ng_enb_id: nextgcore_ngap::types::NgEnbId::Macro(0x12345),
+                selected_eps_tai: nextgcore_ngap::types::EpsTai {
+                    plmn_identity: [0x99, 0xF9, 0x07],
+                    tac: [0x00, 0x07],
+                },
+            },
+            1,
+            false,
+        );
+        assert_eq!(crate::gnb_pdus::handover_required(&msg), bytes);
     }
 
-    /// #741: every ngENB-ID length survives the generated decode with its kind, and the
-    /// hand-written builder's targeteNB-ID is the octets the generated codec produces
-    /// (the GOLDEN above for the macro case), so the two codecs cannot drift.
+    /// #741: every ngENB-ID length survives the generated decode with its kind,
+    /// and the derived targeteNB-ID is the worked GOLDEN above for the macro
+    /// case.
     #[test]
-    fn every_ng_enb_id_length_round_trips_through_both_codecs() {
+    fn every_ng_enb_id_length_round_trips_through_the_generated_decode() {
         use nextgcore_ngap::types::{EpsTai, NgEnbId};
         let golden_target = |id: NgEnbId| TargetId::TargetGlobalNgEnbId {
             plmn_identity: [0x99, 0xF9, 0x07],
@@ -14704,7 +14697,7 @@ mod handover_required_tests {
         ] {
             let mut msg = required(golden_target(id), 1, false);
             msg.handover_type = HandoverType::FivegsToEps;
-            let bytes = builder::build_handover_required(&msg).expect("build");
+            let bytes = crate::gnb_pdus::handover_required(&msg);
             let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = generated(&bytes).target_id
             else {
                 panic!("an eNB target for {id:?}");
@@ -14717,21 +14710,10 @@ mod handover_required_tests {
                 ];
                 assert!(
                     bytes.windows(GOLDEN.len()).any(|w| w == GOLDEN),
-                    "the hand-written builder writes the X.691 octets"
+                    "the derivation writes the worked X.691 octets"
                 );
             }
-            let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
-                panic!("hand-written parse of {id:?}");
-            };
-            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = old.target_id else {
-                panic!("an eNB target for {id:?}");
-            };
-            assert_eq!(ng_enb_id, id, "the hand-written decode keeps the kind");
         }
-        // A value too wide for its alternative is refused, not truncated.
-        let mut msg = required(golden_target(NgEnbId::ShortMacro(0x4_0000)), 1, false);
-        msg.handover_type = HandoverType::FivegsToEps;
-        assert!(builder::build_handover_required(&msg).is_err());
     }
 
     fn without(bytes: &[u8], id: u16) -> Vec<u8> {
@@ -14750,8 +14732,8 @@ mod handover_required_tests {
     /// TS 38.413 §10.3.4.2 / §10.3.5 for a Class 1 initiating message.
     #[test]
     fn handover_required_follows_ie_criticality() {
-        let base = builder::build_handover_required(&required(gnb_target(1, 22), 1, false))
-            .expect("build");
+        let base = crate::gnb_pdus::handover_required(&required(gnb_target(1, 22), 1, false));
+
         // ignore: dropped, no report.
         assert!(matches!(
             decode_handover_required_asn1(&with_unknown_ie(&base, 9999, 0x40)),
@@ -14868,11 +14850,12 @@ mod handover_3b_ii_tests {
         }
     }
 
-    /// The Handover Request is byte-identical to the hand-written encoder over
-    /// handover types, 1..4 sessions, S-NSSAI with and without SD, every NCC
-    /// and the UE AMBR bounds.
+    /// The Handover Request is the hand derivation
+    /// ([`crate::amf_pdus::handover::handover_request`]) over handover types,
+    /// 1..4 sessions, S-NSSAI with and without SD, every NCC and the UE AMBR
+    /// bounds (1, 10^9 and the 4*10^12 upper bound, one to six octets).
     #[test]
-    fn handover_request_generated_matches_hand_written() {
+    fn handover_request_is_the_derived_octets() {
         let nssais = [
             vec![SNssai { sst: 1, sd: None }],
             vec![
@@ -14894,10 +14877,10 @@ mod handover_3b_ii_tests {
                     for ncc in 0..=7 {
                         for ambr in [1, 1_000_000_000, MAX_BIT_RATE] {
                             let msg = request(handover_type, sessions, nssai, ncc, ambr);
-                            let hand = builder::build_handover_request(&msg).expect("hand-written");
+                            let derived = crate::amf_pdus::handover::handover_request(&msg);
                             assert_eq!(
                                 build_handover_request_generated(&msg).as_deref(),
-                                Some(hand.as_slice()),
+                                Some(derived.as_slice()),
                                 "{handover_type:?} sessions={sessions} ncc={ncc} ambr={ambr}"
                             );
                             cases += 1;
@@ -14936,20 +14919,20 @@ mod handover_3b_ii_tests {
         }
     }
 
-    /// The Handover Command is byte-identical to the hand-written encoder
-    /// whenever its handover list is non-empty; an empty one is left out (the
-    /// IE is optional with SIZE(1..)), where the hand-written encoder wrote a
-    /// zero-length list.
+    /// The Handover Command is the hand derivation
+    /// ([`crate::amf_pdus::handover::handover_command`]) over 0..4 handed-over
+    /// sessions, 0..2 released ones and with or without the NAS security
+    /// parameters; an empty handover list is left out (the IE is optional with
+    /// SIZE(1..)).
     #[test]
-    fn handover_command_generated_matches_hand_written() {
-        for sessions in 1..=4 {
+    fn handover_command_is_the_derived_octets() {
+        for sessions in 0..=4 {
             for release in 0..=2 {
                 for nas in [false, true] {
                     let msg = command(sessions, release, nas);
-                    let hand = builder::build_handover_command(&msg).expect("hand-written");
                     assert_eq!(
-                        build_handover_command_generated(&msg).as_deref(),
-                        Some(hand.as_slice()),
+                        build_handover_command_generated(&msg),
+                        Some(crate::amf_pdus::handover::handover_command(&msg)),
                         "sessions={sessions} release={release} nas={nas}"
                     );
                 }
@@ -15019,20 +15002,16 @@ mod handover_3b_ii_tests {
         }
     }
 
-    /// Every Handover Request Acknowledge the hand-written parser accepts
-    /// decodes to the same values: 1..4 admitted, 0..3 failed sessions.
+    /// Every Handover Request Acknowledge, octets derived by hand
+    /// ([`crate::gnb_pdus::handover_request_acknowledge`]), decodes back to
+    /// the values it was derived from: 1..4 admitted, 0..3 failed sessions.
     #[test]
-    fn handover_request_acknowledge_generated_decode_matches_hand_written() {
+    fn handover_request_acknowledge_decodes_the_derived_octets_to_their_values() {
         for admitted in 1..=4 {
             for failed in 0..=3 {
-                let bytes = builder::build_handover_request_acknowledge(&ack(admitted, failed))
-                    .expect("build");
-                let Ok(NgapMessage::HandoverRequestAcknowledge(hand)) =
-                    parser::decode_ngap_pdu(&bytes)
-                else {
-                    panic!("hand-written parser refused admitted={admitted} failed={failed}");
-                };
-                assert_eq!(ack_view(&decoded_ack(&bytes)), ack_view(&hand));
+                let msg = ack(admitted, failed);
+                let bytes = crate::gnb_pdus::handover_request_acknowledge(&msg);
+                assert_eq!(ack_view(&decoded_ack(&bytes)), ack_view(&msg));
             }
         }
     }
@@ -15053,7 +15032,7 @@ mod handover_3b_ii_tests {
     /// TS 38.413 §10.3.4.2 / §10.3.5 for a response message.
     #[test]
     fn handover_request_acknowledge_follows_ie_criticality() {
-        let base = builder::build_handover_request_acknowledge(&ack(1, 0)).expect("build");
+        let base = crate::gnb_pdus::handover_request_acknowledge(&ack(1, 0));
         assert!(matches!(
             decode_handover_request_acknowledge_asn1(&with_unknown_ie(&base, 9999, 0x40)),
             NasTransportDecode::Proceed {
@@ -15153,12 +15132,11 @@ mod handover_3b_ii_tests {
     ];
 
     fn uplink(container: &[u8]) -> Vec<u8> {
-        builder::build_uplink_ran_status_transfer(&RanStatusTransfer {
+        crate::gnb_pdus::uplink_ran_status_transfer(&RanStatusTransfer {
             amf_ue_ngap_id: 1,
             ran_ue_ngap_id: 2,
             container: container.to_vec(),
         })
-        .expect("build")
     }
 
     fn relay(data: &[u8]) -> RanStatusRelay {
@@ -15171,10 +15149,12 @@ mod handover_3b_ii_tests {
         }
     }
 
-    /// The relayed DOWNLINK RAN STATUS TRANSFER equals the hand-derived octets
-    /// and the hand-written encoder's verbatim relay of the same container.
+    /// The relayed DOWNLINK RAN STATUS TRANSFER equals the octets worked out
+    /// above and the derivation
+    /// ([`crate::amf_pdus::handover::downlink_ran_status_transfer`]) of the
+    /// same container.
     #[test]
-    fn ran_status_relay_matches_hand_derived_and_hand_written() {
+    fn ran_status_relay_matches_the_worked_and_derived_octets() {
         let relayed = relay(&uplink(&RAN_STATUS_CONTAINER));
         assert_eq!(relayed.amf_ue_ngap_id, 1);
         assert_eq!(relayed.ran_ue_ngap_id, 2);
@@ -15182,21 +15162,21 @@ mod handover_3b_ii_tests {
         assert_eq!(item.drb_id.0, 1);
         let downlink = build_downlink_ran_status_transfer_generated(&relayed).expect("encodes");
         assert_eq!(downlink, DOWNLINK_RAN_STATUS);
-        let hand = builder::build_downlink_ran_status_transfer(&RanStatusTransfer {
-            amf_ue_ngap_id: 1,
-            ran_ue_ngap_id: 2,
-            container: RAN_STATUS_CONTAINER.to_vec(),
-        })
-        .expect("hand-written");
-        assert_eq!(downlink, hand);
+        assert_eq!(
+            crate::amf_pdus::handover::downlink_ran_status_transfer(1, 2, &RAN_STATUS_CONTAINER),
+            DOWNLINK_RAN_STATUS
+        );
     }
 
-    /// Byte-identical relays across 1..32 DRBs, 12- and 18-bit COUNTs, with and
-    /// without a receive-status bitmap -- each container encoded by the
-    /// generated codec and relayed verbatim by the hand-written encoder.
+    /// The relay is the derivation across 1..32 DRBs, 12- and 18-bit COUNTs,
+    /// with and without a receive-status bitmap: each container (its octets
+    /// from the generated codec; the relay carries them verbatim, and past 127
+    /// octets in the two-octet length form) read back to its value and
+    /// relayed as the derived DOWNLINK RAN STATUS TRANSFER.
     #[test]
-    fn ran_status_relay_matches_hand_written_across_containers() {
+    fn ran_status_relay_is_the_derived_octets_across_containers() {
         let mut cases = 0;
+        let mut long = false;
         for drbs in [1u8, 2, 7, 32] {
             for sn18 in [false, true] {
                 for bitmap in [false, true] {
@@ -15265,15 +15245,10 @@ mod handover_3b_ii_tests {
                     let bytes = nextgcore_ngap_gen::encode_contained(&container).expect("encode");
                     let relayed = relay(&uplink(&bytes));
                     assert_eq!(relayed.container, container);
-                    let hand = builder::build_downlink_ran_status_transfer(&RanStatusTransfer {
-                        amf_ue_ngap_id: 1,
-                        ran_ue_ngap_id: 2,
-                        container: bytes,
-                    })
-                    .expect("hand-written");
+                    long |= bytes.len() >= 128;
                     assert_eq!(
                         build_downlink_ran_status_transfer_generated(&relayed).expect("encodes"),
-                        hand,
+                        crate::amf_pdus::handover::downlink_ran_status_transfer(1, 2, &bytes),
                         "drbs={drbs} sn18={sn18} bitmap={bitmap}"
                     );
                     cases += 1;
@@ -15281,6 +15256,7 @@ mod handover_3b_ii_tests {
             }
         }
         assert_eq!(cases, 16);
+        assert!(long, "a container past 127 octets is in the matrix");
     }
 
     fn uplink_without(bytes: &[u8], id: u16) -> Vec<u8> {
@@ -15395,38 +15371,35 @@ mod path_switch_tests {
         }
     }
 
-    /// Every Path Switch Request the hand-written parser accepts decodes to the
-    /// same values: 1..4 sessions × 0..2 failed × NR cell ids at their bounds.
+    /// Every Path Switch Request, octets derived by hand
+    /// ([`crate::amf_pdus::handover::path_switch_request`]), decodes back to
+    /// the values it was derived from: 1..4 sessions × 0..2 failed × NR cell
+    /// ids at their 36-bit bounds.
     #[test]
-    fn path_switch_request_generated_decode_matches_hand_written() {
+    fn path_switch_request_decodes_the_derived_octets_to_their_values() {
         for sessions in 1..=4 {
             for failed in 0..=2 {
                 for cell in [0u64, 1, 0xF_FFFF_FFFF] {
-                    let bytes =
-                        builder::build_path_switch_request(&request(sessions, failed, cell))
-                            .expect("build");
-                    let Ok(NgapMessage::PathSwitchRequest(hand)) = parser::decode_ngap_pdu(&bytes)
-                    else {
-                        panic!("hand-written parser refused {sessions}/{failed}/{cell}");
-                    };
+                    let sent = request(sessions, failed, cell);
+                    let bytes = crate::amf_pdus::handover::path_switch_request(&sent);
                     let (gen, notify) = proceed(&bytes);
                     assert!(notify.is_empty());
-                    assert_eq!(gen.ran_ue_ngap_id, hand.ran_ue_ngap_id);
-                    assert_eq!(gen.source_amf_ue_ngap_id, hand.source_amf_ue_ngap_id);
+                    assert_eq!(gen.ran_ue_ngap_id, sent.ran_ue_ngap_id);
+                    assert_eq!(gen.source_amf_ue_ngap_id, sent.source_amf_ue_ngap_id);
                     assert_eq!(
                         format!("{:?}", gen.user_location_info),
-                        format!("{:?}", Some(hand.user_location_info))
+                        format!("{:?}", Some(sent.user_location_info))
                     );
                     assert_eq!(
                         format!("{:?}", gen.ue_security_capabilities),
-                        format!("{:?}", Some(hand.ue_security_capabilities))
+                        format!("{:?}", Some(sent.ue_security_capabilities))
                     );
                     assert_eq!(
                         gen.pdu_session_list
                             .iter()
                             .map(|s| (s.pdu_session_id, s.transfer.clone()))
                             .collect::<Vec<_>>(),
-                        hand.pdu_session_list
+                        sent.pdu_session_list
                             .iter()
                             .map(|s| (s.pdu_session_id, s.transfer.clone()))
                             .collect::<Vec<_>>()
@@ -15451,7 +15424,7 @@ mod path_switch_tests {
     /// TS 38.413 §10.3.4.2 / §10.3.5 for a Class 1 initiating message.
     #[test]
     fn path_switch_request_follows_ie_criticality() {
-        let base = builder::build_path_switch_request(&request(1, 0, 7)).expect("build");
+        let base = crate::amf_pdus::handover::path_switch_request(&request(1, 0, 7));
         assert!(proceed(&with_unknown_ie(&base, 9999, 0x40)).1.is_empty());
         let notify = proceed(&with_unknown_ie(&base, 9999, 0x80)).1;
         assert_eq!(notify[0].ie_id, 9999);
@@ -15533,22 +15506,38 @@ mod path_switch_tests {
         }
     }
 
-    /// The Acknowledge is byte-identical to the hand-written encoder whenever
-    /// its switched list is non-empty; `notify` adds Criticality Diagnostics;
-    /// an empty switched list is not encoded (SIZE(1..), §8.4.4.3 fails it).
+    /// The Acknowledge is the hand derivation
+    /// ([`crate::amf_pdus::handover::path_switch_request_acknowledge`])
+    /// whenever its switched list is non-empty, with and without notify
+    /// Criticality Diagnostics; an empty switched list is not encoded
+    /// (SIZE(1..), §8.4.4.3 fails it).
     #[test]
-    fn path_switch_request_acknowledge_generated_matches_hand_written() {
+    fn path_switch_request_acknowledge_is_the_derived_octets() {
+        let notify = [
+            IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            },
+            IeDiagnostic {
+                ie_id: ngap_gen::ID_USER_LOCATION_INFORMATION,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::MISSING,
+            },
+        ];
         for switched in 1..=4 {
             for released in 0..=2 {
                 for caps_on in [false, true] {
-                    let msg = ack(switched, released, caps_on);
-                    let hand =
-                        builder::build_path_switch_request_acknowledge(&msg).expect("hand-written");
-                    assert_eq!(
-                        build_path_switch_request_acknowledge_generated(&msg, &[]).as_deref(),
-                        Some(hand.as_slice()),
-                        "switched={switched} released={released} caps={caps_on}"
-                    );
+                    for reported in [&notify[..0], &notify[..1], &notify[..]] {
+                        let msg = ack(switched, released, caps_on);
+                        assert_eq!(
+                            build_path_switch_request_acknowledge_generated(&msg, reported),
+                            Some(crate::amf_pdus::handover::path_switch_request_acknowledge(
+                                &msg, reported
+                            )),
+                            "switched={switched} released={released} caps={caps_on} {reported:?}"
+                        );
+                    }
                 }
             }
         }
@@ -15579,11 +15568,12 @@ mod path_switch_tests {
         )));
     }
 
-    /// The Failure is byte-identical to the hand-written encoder for a non-empty
-    /// released list, with and without diagnostics; with no session to release
-    /// it is not encoded (the list is mandatory, SIZE(1..)).
+    /// The Failure is the hand derivation
+    /// ([`crate::amf_pdus::handover::path_switch_request_failure`]) for a
+    /// non-empty released list, with and without diagnostics; with no session
+    /// to release it is not encoded (the list is mandatory, SIZE(1..)).
     #[test]
-    fn path_switch_request_failure_generated_matches_hand_written() {
+    fn path_switch_request_failure_is_the_derived_octets() {
         let diag = [IeDiagnostic {
             ie_id: 9999,
             criticality: ngap_gen::Criticality::REJECT,
@@ -15601,22 +15591,12 @@ mod path_switch_tests {
                     })
                     .collect();
                 let diagnostics: &[IeDiagnostic] = if with_diag { &diag } else { &[] };
-                let hand = builder::build_path_switch_request_failure(&PathSwitchRequestFailure {
-                    amf_ue_ngap_id: 0x1_0000_0001,
-                    ran_ue_ngap_id: 0x42,
-                    released_list: Some(items.clone()),
-                    criticality_diagnostics: with_diag.then(|| CriticalityDiagnostics {
-                        procedure_code: None,
-                        triggering_message: None,
-                        procedure_criticality: None,
-                        ies: vec![IeCriticalityDiagnostics {
-                            ie_criticality: nextgcore_ngap::types::Criticality::Reject,
-                            ie_id: 9999,
-                            type_of_error: TypeOfError::NotUnderstood,
-                        }],
-                    }),
-                })
-                .expect("hand-written");
+                let derived = crate::amf_pdus::handover::path_switch_request_failure(
+                    0x1_0000_0001,
+                    0x42,
+                    &items,
+                    diagnostics,
+                );
                 assert_eq!(
                     build_path_switch_request_failure_generated(
                         0x1_0000_0001,
@@ -15625,7 +15605,7 @@ mod path_switch_tests {
                         diagnostics
                     )
                     .as_deref(),
-                    Some(hand.as_slice()),
+                    Some(derived.as_slice()),
                     "released={released} diag={with_diag}"
                 );
             }
@@ -15685,11 +15665,13 @@ mod ran_configuration_update_tests {
         }
     }
 
-    /// Every update the hand-written parser accepts decodes to the same name and
-    /// the same Supported TA List: TAC as 3 octets big-endian, PLMN, SST, and an
-    /// SD of 0xFFFFFF stored as absent ("no SD", TS 23.003 §28.4.2).
+    /// Every update, octets derived by hand
+    /// ([`crate::gnb_pdus::ran_configuration_update`]), decodes back to the
+    /// name and the Supported TA List it was derived from: TAC as 3 octets
+    /// big-endian, PLMN, SST, and an SD of 0xFFFFFF stored as absent ("no SD",
+    /// TS 23.003 §28.4.2).
     #[test]
-    fn ran_configuration_update_generated_decode_matches_hand_written() {
+    fn ran_configuration_update_decodes_the_derived_octets_to_their_values() {
         let lists = [
             None,
             Some(vec![ta([0, 0, 1], vec![SNssai { sst: 1, sd: None }])]),
@@ -15719,16 +15701,12 @@ mod ran_configuration_update_tests {
         ];
         for name in [None, Some("gnb-renamed")] {
             for list in &lists {
-                let bytes = builder::build_ran_configuration_update(&update(name, list.clone()))
-                    .expect("build");
-                let Ok(NgapMessage::RanConfigurationUpdate(hand)) = parser::decode_ngap_pdu(&bytes)
-                else {
-                    panic!("hand-written parser refused {name:?}/{list:?}");
-                };
+                let sent = update(name, list.clone());
+                let bytes = crate::gnb_pdus::ran_configuration_update(&sent);
                 let (gen, notify) = proceed(&bytes);
                 assert!(notify.is_empty());
-                assert_eq!(gen.ran_node_name, hand.ran_node_name);
-                let expected = hand.supported_ta_list.as_ref().map(|items| {
+                assert_eq!(gen.ran_node_name, sent.ran_node_name);
+                let expected = sent.supported_ta_list.as_ref().map(|items| {
                     items
                         .iter()
                         .map(|item| {
@@ -15783,8 +15761,7 @@ mod ran_configuration_update_tests {
     /// TS 38.413 §10.3.4.2 for a Class 1 initiating message whose IEs are all optional.
     #[test]
     fn ran_configuration_update_follows_ie_criticality() {
-        let base =
-            builder::build_ran_configuration_update(&update(Some("g"), None)).expect("build");
+        let base = crate::gnb_pdus::ran_configuration_update(&update(Some("g"), None));
         assert!(proceed(&with_unknown_ie(&base, 9999, 0x40)).1.is_empty());
         assert_eq!(
             proceed(&with_unknown_ie(&base, 9999, 0x80)).1[0].ie_id,
@@ -15806,48 +15783,39 @@ mod ran_configuration_update_tests {
     /// The empty acknowledge, derived by hand from X.691: successfulOutcome
     /// (CHOICE extension bit `0`, index 1 `01`) + pad `20`; procedure code 35
     /// `23`; criticality reject `00` + pad; open type length 3; SEQUENCE
-    /// extension bit + pad `00`; IE count 0 `00 00`.
+    /// extension bit + pad `00`; IE count 0 `00 00`. With notify diagnostics,
+    /// the derivation
+    /// ([`crate::amf_pdus::handover::ran_configuration_update_acknowledge`])
+    /// for one and for two reported IEs.
     #[test]
-    fn ran_configuration_update_acknowledge_matches_hand_derived_and_hand_written() {
+    fn ran_configuration_update_acknowledge_is_the_derived_octets() {
         let generated = build_ran_configuration_update_acknowledge_generated(&[]).expect("encodes");
         assert_eq!(generated, [0x20, 0x23, 0x00, 0x03, 0x00, 0x00, 0x00]);
-        let hand = builder::build_ran_configuration_update_acknowledge(
-            &RanConfigurationUpdateAcknowledge {
-                criticality_diagnostics: None,
+        let notify = [
+            IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
             },
-        )
-        .expect("hand-written");
-        assert_eq!(generated, hand);
-        let notify = [IeDiagnostic {
-            ie_id: 9999,
-            criticality: ngap_gen::Criticality::NOTIFY,
-            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
-        }];
-        let hand_diag = builder::build_ran_configuration_update_acknowledge(
-            &RanConfigurationUpdateAcknowledge {
-                criticality_diagnostics: Some(CriticalityDiagnostics {
-                    procedure_code: None,
-                    triggering_message: None,
-                    procedure_criticality: None,
-                    ies: vec![IeCriticalityDiagnostics {
-                        ie_criticality: nextgcore_ngap::types::Criticality::Notify,
-                        ie_id: 9999,
-                        type_of_error: TypeOfError::NotUnderstood,
-                    }],
-                }),
+            IeDiagnostic {
+                ie_id: 0,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
             },
-        )
-        .expect("hand-written");
-        assert_eq!(
-            build_ran_configuration_update_acknowledge_generated(&notify).as_deref(),
-            Some(hand_diag.as_slice())
-        );
+        ];
+        for reported in [&notify[..1], &notify[..]] {
+            assert_eq!(
+                build_ran_configuration_update_acknowledge_generated(reported),
+                Some(crate::amf_pdus::handover::ran_configuration_update_acknowledge(reported))
+            );
+        }
     }
 
-    /// The Failure is byte-identical to the hand-written encoder across cause
-    /// groups, Time to Wait and diagnostics.
+    /// The Failure is the hand derivation
+    /// ([`crate::amf_pdus::handover::ran_configuration_update_failure`])
+    /// across cause groups, Time to Wait and diagnostics.
     #[test]
-    fn ran_configuration_update_failure_matches_hand_written() {
+    fn ran_configuration_update_failure_is_the_derived_octets() {
         let diag = [IeDiagnostic {
             ie_id: 9999,
             criticality: ngap_gen::Criticality::REJECT,
@@ -15861,24 +15829,12 @@ mod ran_configuration_update_tests {
         ] {
             for ttw in [None, Some(TimeToWait::V1s), Some(TimeToWait::V60s)] {
                 for with_diag in [false, true] {
-                    let hand = builder::build_ran_configuration_update_failure(
-                        &RanConfigurationUpdateFailure {
-                            cause,
-                            time_to_wait: ttw,
-                            criticality_diagnostics: with_diag.then(|| CriticalityDiagnostics {
-                                procedure_code: None,
-                                triggering_message: None,
-                                procedure_criticality: None,
-                                ies: vec![IeCriticalityDiagnostics {
-                                    ie_criticality: nextgcore_ngap::types::Criticality::Reject,
-                                    ie_id: 9999,
-                                    type_of_error: TypeOfError::NotUnderstood,
-                                }],
-                            }),
-                        },
-                    )
-                    .expect("hand-written");
                     let diagnostics: &[IeDiagnostic] = if with_diag { &diag } else { &[] };
+                    let derived = crate::amf_pdus::handover::ran_configuration_update_failure(
+                        &cause,
+                        ttw,
+                        diagnostics,
+                    );
                     assert_eq!(
                         build_ran_configuration_update_failure_generated(
                             cause,
@@ -15886,7 +15842,7 @@ mod ran_configuration_update_tests {
                             diagnostics
                         )
                         .as_deref(),
-                        Some(hand.as_slice()),
+                        Some(derived.as_slice()),
                         "{cause:?} {ttw:?} {with_diag}"
                     );
                 }
@@ -15901,8 +15857,8 @@ mod error_indication_tests {
     use super::tests::with_unknown_ie;
     use super::*;
 
-    /// Every Cause value the hand-written codec has, in every group.
-    fn every_hand_written_cause() -> Vec<Cause> {
+    /// Every value of the domain Cause, in every group.
+    fn every_domain_cause() -> Vec<Cause> {
         let mut causes = Vec::new();
         for v in 0..=255i64 {
             if let Ok(c) = CauseRadioNetwork::try_from(v) {
@@ -15930,54 +15886,88 @@ mod error_indication_tests {
     const AMF_IDS: [Option<u64>; 5] = [None, Some(0), Some(255), Some(65_536), Some((1 << 40) - 1)];
     const RAN_IDS: [Option<u32>; 4] = [None, Some(0), Some(256), Some(u32::MAX)];
 
-    /// Oracle: the generated builder is byte-identical to the hand-written one
-    /// for every Cause and both UE NGAP IDs at each APER length, present or not.
+    /// The generated builder is the hand derivation
+    /// ([`crate::amf_pdus::handover::error_indication`]) for every Cause and
+    /// both UE NGAP IDs at each APER length, present or not. The derivation
+    /// numbers each Cause by its NAME in the vendored ASN.1, so this also pins
+    /// the domain-to-wire Cause mapping, extension values included.
     #[test]
-    fn error_indication_generated_matches_hand_written() {
-        let causes = every_hand_written_cause();
+    fn error_indication_is_the_derived_octets() {
+        use crate::amf_pdus::handover as d;
+        let causes = every_domain_cause();
         assert!(causes.len() > 60, "{} causes", causes.len());
         for cause in causes {
             for amf in AMF_IDS {
                 for ran in RAN_IDS {
-                    let hand_written = builder::build_error_indication(&ErrorIndication {
-                        amf_ue_ngap_id: amf,
-                        ran_ue_ngap_id: ran,
-                        cause: Some(cause),
-                        criticality_diagnostics: None,
-                    })
-                    .expect("hand-written");
                     let generated =
                         build_error_indication_generated(amf, ran, generated_cause(cause))
                             .expect("generated");
-                    assert_eq!(generated, hand_written, "{cause:?} {amf:?} {ran:?}");
+                    assert_eq!(
+                        generated,
+                        d::error_indication(amf, ran, Some(d::cause(&cause)), None),
+                        "{cause:?} {amf:?} {ran:?}"
+                    );
                 }
             }
         }
     }
 
-    /// Oracle: on every PDU the hand-written parser decodes as an Error
-    /// Indication, the generated decode yields the same IDs, Cause and
-    /// Criticality Diagnostics -- including the diagnostics-only report
-    /// `build_criticality_error_indication_asn1` sends.
+    /// The generated decode reads every derived Error Indication back to the
+    /// values it was derived from: each Cause (as the vendored ASN.1 numbers
+    /// it) with both UE NGAP IDs at each APER length; the diagnostics-only
+    /// report `build_criticality_error_indication_asn1` sends (whose bytes are
+    /// also checked against the derivation); and the empty indication.
     #[test]
-    fn error_indication_generated_decode_matches_hand_written() {
-        let mut pdus = Vec::new();
-        for cause in every_hand_written_cause() {
+    fn error_indication_decodes_the_derived_octets_to_their_values() {
+        use crate::amf_pdus::handover as d;
+        let mut cases: Vec<(Vec<u8>, ErrorIndicationReceived)> = Vec::new();
+        for cause in every_domain_cause() {
             for amf in AMF_IDS {
                 for ran in RAN_IDS {
-                    pdus.push(
-                        build_error_indication_generated(amf, ran, generated_cause(cause))
-                            .expect("build"),
-                    );
+                    cases.push((
+                        d::error_indication(amf, ran, Some(d::cause(&cause)), None),
+                        ErrorIndicationReceived {
+                            amf_ue_ngap_id: amf,
+                            ran_ue_ngap_id: ran,
+                            cause: Some(d::asn1_generated_cause(&cause)),
+                            criticality_diagnostics: None,
+                        },
+                    ));
                 }
             }
         }
+        let diagnostics = vec![
+            IeDiagnostic {
+                ie_id: 4_000,
+                criticality: ngap_gen::Criticality::REJECT,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            },
+            IeDiagnostic {
+                ie_id: ngap_gen::ID_CAUSE,
+                criticality: ngap_gen::Criticality::IGNORE,
+                type_of_error: ngap_gen::TypeOfError::MISSING,
+            },
+        ];
         for (amf, ran) in [(None, None), (Some(7), Some(8))] {
             for cause_protocol in [
                 ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
                 ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
             ] {
-                pdus.push(
+                let cause = ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(cause_protocol));
+                let derived = d::error_indication(
+                    amf,
+                    ran,
+                    Some(d::generated_cause(&cause)),
+                    Some(d::criticality_diagnostics(
+                        Some((
+                            ngap_gen::ID_UE_CONTEXT_RELEASE_REQUEST,
+                            0,
+                            ngap_gen::Criticality::IGNORE,
+                        )),
+                        &diagnostics,
+                    )),
+                );
+                assert_eq!(
                     build_criticality_error_indication_asn1(&CriticalityErrorIndication {
                         amf_ue_ngap_id: amf,
                         ran_ue_ngap_id: ran,
@@ -15987,48 +15977,56 @@ mod error_indication_tests {
                             triggering_message: 0,
                             procedure_criticality: ngap_gen::Criticality::IGNORE,
                         },
-                        diagnostics: vec![
-                            IeDiagnostic {
-                                ie_id: 4_000,
-                                criticality: ngap_gen::Criticality::REJECT,
-                                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
-                            },
-                            IeDiagnostic {
-                                ie_id: ngap_gen::ID_CAUSE,
-                                criticality: ngap_gen::Criticality::IGNORE,
-                                type_of_error: ngap_gen::TypeOfError::MISSING,
-                            },
-                        ],
-                    })
-                    .expect("build"),
+                        diagnostics: diagnostics.clone(),
+                    }),
+                    Some(derived.clone())
                 );
+                cases.push((
+                    derived,
+                    ErrorIndicationReceived {
+                        amf_ue_ngap_id: amf,
+                        ran_ue_ngap_id: ran,
+                        cause: Some(cause),
+                        criticality_diagnostics: Some(ngap_gen::CriticalityDiagnostics {
+                            procedure_code: Some(ngap_gen::ProcedureCode(
+                                ngap_gen::ID_UE_CONTEXT_RELEASE_REQUEST,
+                            )),
+                            triggering_message: Some(ngap_gen::TriggeringMessage(0)),
+                            procedure_criticality: Some(ngap_gen::Criticality(
+                                ngap_gen::Criticality::IGNORE,
+                            )),
+                            i_es_criticality_diagnostics: Some(
+                                ngap_gen::CriticalityDiagnostics_IE_List(
+                                    diagnostics
+                                        .iter()
+                                        .map(|x| ngap_gen::CriticalityDiagnostics_IE_Item {
+                                            ie_criticality: ngap_gen::Criticality(x.criticality),
+                                            ie_id: ngap_gen::ProtocolIE_ID(x.ie_id),
+                                            type_of_error: ngap_gen::TypeOfError(x.type_of_error),
+                                            ie_extensions: None,
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                            ie_extensions: None,
+                        }),
+                    },
+                ));
             }
         }
-        pdus.push(encode_error_indication(None, None, None, None).expect("empty"));
-        for pdu in pdus {
-            let Ok(NgapMessage::ErrorIndication(oracle)) = parser::decode_ngap_pdu(&pdu) else {
-                panic!("hand-written parser refused {pdu:02x?}");
-            };
-            let generated = decode_error_indication_asn1(&pdu).expect("generated");
+        cases.push((
+            d::error_indication(None, None, None, None),
+            ErrorIndicationReceived {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: None,
+                cause: None,
+                criticality_diagnostics: None,
+            },
+        ));
+        for (pdu, expected) in cases {
             assert_eq!(
-                generated.amf_ue_ngap_id, oracle.amf_ue_ngap_id,
-                "{pdu:02x?}"
-            );
-            assert_eq!(
-                generated.ran_ue_ngap_id, oracle.ran_ue_ngap_id,
-                "{pdu:02x?}"
-            );
-            assert_eq!(
-                generated.cause,
-                oracle.cause.map(generated_cause),
-                "{pdu:02x?}"
-            );
-            assert_eq!(
-                generated.criticality_diagnostics,
-                oracle
-                    .criticality_diagnostics
-                    .as_ref()
-                    .map(generated_diagnostics_from),
+                decode_error_indication_asn1(&pdu),
+                Some(expected),
                 "{pdu:02x?}"
             );
         }
@@ -16060,6 +16058,30 @@ mod error_indication_tests {
 
     #[test]
     fn error_indication_golden_bytes() {
+        use crate::amf_pdus::handover as d;
+        assert_eq!(
+            d::error_indication(
+                Some(1),
+                Some(2),
+                Some(d::cause(&Cause::Protocol(
+                    CauseProtocol::TransferSyntaxError
+                ))),
+                None
+            ),
+            UE_ERROR_INDICATION
+        );
+        assert_eq!(
+            d::error_indication(
+                None,
+                None,
+                Some(d::cause(&Cause::Protocol(
+                    CauseProtocol::MessageNotCompatibleWithReceiverState
+                ))),
+                None
+            ),
+            NON_UE_ERROR_INDICATION
+        );
+
         assert_eq!(
             build_error_indication_generated(
                 Some(1),
