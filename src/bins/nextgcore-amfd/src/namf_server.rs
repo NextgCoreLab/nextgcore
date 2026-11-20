@@ -5799,6 +5799,78 @@ fn try_positioning_relay(
         return Some(ue_not_reachable_error());
     }
 
+    // #2256, TS 24.501 §5.4.5.3.2 case c: the LPP downlink carries this
+    // correlation in Additional information and the UE's answer names it again
+    // (§5.4.5.2.5 case c), so remember which LMF it belongs to. That is the
+    // caller's verified identity, else the nfId it declared (TS 29.518
+    // §6.1.6.2.17, "shall be present when the n1MessageClass IE is set to LPP").
+    let lcs_correlation_id = body
+        .get("lcsCorrelationId")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    // The same holds for an NRPPa transfer: the gNB's answer echoes the NGAP
+    // Routing ID, which names this LMF, and its notification carries the
+    // correlation this LMF last used for the UE.
+    let verified_lmf = nextgcore_sbi::owner_binding::verified_consumer_id(request)
+        .ok()
+        .flatten();
+    let declared_nf_id = |pointer: &str| {
+        body.pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from)
+    };
+    if let Some(corr) = lcs_correlation_id.as_deref() {
+        let lmf_id = verified_lmf.clone().or_else(|| {
+            if is_lpp || is_slpp {
+                declared_nf_id("/n1MessageContainer/nfId")
+            } else {
+                declared_nf_id("/n2InfoContainer/nrppaInfo/nfId")
+            }
+        });
+        let service_instance_id = body
+            .pointer(if is_lpp || is_slpp {
+                "/n1MessageContainer/serviceInstanceId"
+            } else {
+                "/n2InfoContainer/nrppaInfo/serviceInstanceId"
+            })
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
+        let route = crate::context::LcsUplinkRoute {
+            lcs_correlation_id: corr.to_string(),
+            lmf_id: lmf_id.clone(),
+            verified: verified_lmf.is_some(),
+            service_instance_id,
+        };
+        let recorded = amf_self()
+            .read()
+            .map(|context| context.lcs_uplink_route_record(ue_context_id, route))
+            .unwrap_or(crate::context::LcsRouteRecord::Full);
+        // R47 on #2261: a downlink whose answer the AMF knows will go to
+        // another LMF is never sent. The transfer is refused (TS 29.518
+        // Table 6.1.3.5.3.1-3, 403 UNSPECIFIED) before anything is queued or
+        // the last-writer record below changes.
+        let refusal = match recorded {
+            crate::context::LcsRouteRecord::Recorded => None,
+            crate::context::LcsRouteRecord::OwnedByAnotherLmf => Some(format!(
+                "lcsCorrelationId '{corr}' belongs to another LMF's location session for \
+                 this UE"
+            )),
+            crate::context::LcsRouteRecord::Full => Some(format!(
+                "this UE holds {} LCS correlations; lcsCorrelationId '{corr}' is not recorded",
+                crate::context::MAX_LCS_UPLINK_ROUTES_PER_UE
+            )),
+        };
+        if let Some(detail) = refusal {
+            log::warn!(
+                "[{ue_context_id}] positioning transfer from LMF {lmf_id:?} refused: {detail}"
+            );
+            return Some(send_error(403, "Forbidden", &detail, Some("UNSPECIFIED")));
+        }
+    }
+
     // Fallback correlation record (TS 29.518 N1N2MessageTransferReqData
     // lcsCorrelationId / servingLMFIdentification, yaml:2771-2774): capture
     // the originating LMF onto the UE context so the uplink leg can route a
@@ -5833,7 +5905,10 @@ fn try_positioning_relay(
         };
         downlinks.push(PendingPositioningDl {
             amf_ue_ngap_id: ue.id,
-            kind: PositioningDlKind::LppToUe { lpp_pdu },
+            kind: PositioningDlKind::LppToUe {
+                lpp_pdu,
+                lcs_correlation_id,
+            },
         });
     }
 
@@ -5886,10 +5961,23 @@ fn try_positioning_relay(
         };
         // The originating LMF id seeds the NGAP RoutingID so the gNB's uplink
         // reply routes back to the right LMF (opaque echo for our relay).
-        let routing_id = nrppa
-            .get("nfId")
-            .and_then(Value::as_str)
-            .map(|s| s.as_bytes().to_vec())
+        // #2256: the Routing ID "identifies an LMF" (TS 38.413 §9.3.3.13), and
+        // the uplink relay routes the gNB's answer by it, so it names the
+        // caller's verified identity when there is one, not an nfId it could
+        // set to another LMF's.
+        let declared = declared_nf_id("/n2InfoContainer/nrppaInfo/nfId");
+        if let (Some(v), Some(d)) = (verified_lmf.as_deref(), declared.as_deref()) {
+            if !nextgcore_sbi::owner_binding::same_nf_instance_id(v, d) {
+                log::warn!(
+                    "[{ue_context_id}] NRPPa transfer from LMF {v} declares nrppaInfo.nfId \
+                     {d}: the Routing ID names {v}"
+                );
+            }
+        }
+        let routing_id = verified_lmf
+            .clone()
+            .or(declared)
+            .map(String::into_bytes)
             .unwrap_or_default();
         downlinks.push(PendingPositioningDl {
             amf_ue_ngap_id: ue.id,
@@ -5970,13 +6058,14 @@ fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> 
     body.to_string().hash(&mut h);
     for dl in downlinks {
         match &dl.kind {
-            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::LppToUe { lpp_pdu, .. } => (0u8, lpp_pdu).hash(&mut h),
             PositioningDlKind::NrppaToGnb {
                 routing_id,
                 nrppa_pdu,
             } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
             PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
             PositioningDlKind::SlppToUe { slpp_pdu, .. } => (3u8, slpp_pdu).hash(&mut h),
+            PositioningDlKind::PayloadNotForwarded { payload, .. } => (4u8, payload).hash(&mut h),
         }
     }
     format!("lcs-{:016x}", h.finish())
