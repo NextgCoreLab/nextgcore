@@ -1020,6 +1020,8 @@ jobs:
           bash docker/iupf-delay-e2e/check-n9.sh \
             "$IUPF_DELAY_OUT/pass/results.txt" "$IUPF_DELAY_OUT/no-n9/results.txt" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: the stale sweep spares a live run (R43 on #2275)
+        run: bash docker/iupf-delay-e2e/check-sweep.sh "$RUNNER_TEMP/iupf-delay-bin" "$IUPF_DELAY_OUT/sweep"
       - name: upload the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

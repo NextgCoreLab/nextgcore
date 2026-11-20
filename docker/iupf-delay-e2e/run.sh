@@ -34,16 +34,26 @@
 # Environment: ECHO_HOLD_MS (40), N9_MS (15, expected), NETEM_N9_MS (N9_MS,
 # injected), TOLERANCE_MS (8; below min(ECHO_HOLD_MS/2, N9_MS)), RUN_ID (this
 # shell's PID; digits only), NET_OCTET (derived from RUN_ID; 1-254),
-# STALE_AFTER_S (3600: another run's resources older than this are swept).
+# SWEEP_ONLY (1: the start-up checks and the sweep, then exit), STALE_AFTER_S
+# (3600: a run started longer ago than this, whose harness is not running, is
+# swept; keep it above the job's lifetime).
 #
 # Usage: run.sh <dir with nextgcore-smfd, nextgcore-upfd, iupf-delay-harness> <out-dir>
 # Needs docker and the sch_netem module; plain `docker run`, no compose. Each run
 # has its own container names, network, subnet and image tags (RUN_ID), so two
 # runs on one host do not clobber each other; a subnet already taken refuses the
 # run rather than reusing it. Every container, network and image carries the
-# label nextg.iupf-delay.run=<RUN_ID>: cleanup removes by that label, so it is
-# idempotent, and it runs at the start too, also sweeping what a killed
-# (SIGKILL) run of another RUN_ID left behind once it is older than any job.
+# label nextg.iupf-delay.run=<RUN_ID>, and nextg.iupf-delay.started=<epoch>, the
+# time run.sh began. Cleanup removes by the run label, so it is idempotent.
+# At start, a run sweeps what a killed (SIGKILL) run left behind, and refuses
+# to touch its own RUN_ID's resources unless they are stale. "Stale" means
+# two things (R43 on #2275):
+#   - the run's newest `started` label is older than STALE_AFTER_S. Build
+#     timestamps are never used: a cached BuildKit rebuild keeps the first
+#     build's .Created, so a live run's images can look hours old;
+#   - the run's harness container is not running. The harness exists only
+#     while run.sh drives a test. A killed run's daemons keep running for
+#     ever, so "any container running" would never let them be swept.
 set -euo pipefail
 
 BIN="$(cd "${1:?binaries dir}" && pwd)"
@@ -65,6 +75,8 @@ fi
 OCTET=$((10#$OCTET))
 STALE_AFTER_S="${STALE_AFTER_S:-3600}"
 LABEL=nextg.iupf-delay.run
+STARTED_LABEL=nextg.iupf-delay.started
+STARTED="$(date +%s)"
 CORE_IMAGE="${IUPF_DELAY_CORE_IMAGE:-nextgcore-core:latest}"
 SMF_IMAGE="nextgcore-rust/smf:iupf-delay-$RUN_ID"
 UPF_IMAGE="nextgcore-rust/upf:iupf-delay-$RUN_ID"
@@ -102,10 +114,9 @@ remove_run() { # <run id>
   mapfile -t ids < <(docker images -q --filter "label=$LABEL=$1" | sort -u)
   [ "${#ids[@]}" -eq 0 ] || docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true
 }
-# Every other run whose resources are older than STALE_AFTER_S: a killed run's.
-sweep_stale() {
-  local now kind fmt id run created ids
-  now="$(date +%s)"
+# Every labelled resource as "<run> <started>", one per line.
+labelled() {
+  local kind fmt ids id
   for kind in container network image; do
     case $kind in
       container) mapfile -t ids < <(docker ps -aq --filter "label=$LABEL"); fmt=.Config.Labels ;;
@@ -114,23 +125,58 @@ sweep_stale() {
     esac
     # ${a[@]+...}: an empty array under set -u in bash < 4.4.
     for id in ${ids[@]+"${ids[@]}"}; do
-      run="$(docker "$kind" inspect -f "{{index $fmt \"$LABEL\"}}" "$id" 2>/dev/null)" || continue
-      created="$(date -d "$(docker "$kind" inspect -f '{{.Created}}' "$id")" +%s 2>/dev/null)" || continue
-      if [ -n "$run" ] && [ "$run" != "$RUN_ID" ] && [ $((now - created)) -gt "$STALE_AFTER_S" ]; then
-        echo "sweeping stale iupf-delay run $run ($kind $id)" >&2
-        remove_run "$run"
-      fi
+      docker "$kind" inspect -f "{{index $fmt \"$LABEL\"}} {{index $fmt \"$STARTED_LABEL\"}}" \
+        "$id" 2>/dev/null || true
     done
   done
 }
-remove_run "$RUN_ID"
+# Whether run <id> is stale: its newest `started` is older than STALE_AFTER_S
+# and its harness is not running. A resource with no `started` label (or a
+# non-numeric one) counts as just started, so it is never swept by mistake.
+is_stale() { # <run id>
+  local newest=0 run started now
+  now="$(date +%s)"
+  if [ -n "$(docker ps -q --filter "label=$LABEL=$1" --filter "name=^iupf-delay-$1-harness\$")" ]; then
+    return 1
+  fi
+  while read -r run started; do
+    [ "$run" = "$1" ] || continue
+    [[ $started =~ ^[0-9]+$ ]] || started=$now
+    [ "$started" -gt "$newest" ] && newest=$started
+  done < <(labelled)
+  [ $((now - newest)) -gt "$STALE_AFTER_S" ]
+}
+# Every other run that is stale: a killed run's leftovers.
+sweep_stale() {
+  local run
+  for run in $(labelled | cut -d' ' -f1 | sort -u); do
+    if ! [[ $run =~ ^[0-9]+$ ]] || [ "$run" = "$RUN_ID" ]; then
+      continue
+    fi
+    if is_stale "$run"; then
+      echo "sweeping stale iupf-delay run $run" >&2
+      remove_run "$run"
+    fi
+  done
+}
+if labelled | grep -q "^$RUN_ID "; then
+  if is_stale "$RUN_ID"; then
+    echo "removing stale resources of an earlier iupf-delay run $RUN_ID" >&2
+    remove_run "$RUN_ID"
+  else
+    echo "run $RUN_ID has live resources; refusing to start (pick another RUN_ID)" >&2
+    exit 2
+  fi
+fi
 sweep_stale
+# SWEEP_ONLY=1: only the start-up checks and the sweep (check-sweep.sh).
+[ "${SWEEP_ONLY:-0}" != 1 ] || exit 0
 
 docker build -q -f "$RUST/Dockerfile.nf" --build-arg CORE_IMAGE="$CORE_IMAGE" \
-  --label "$LABEL=$RUN_ID" \
+  --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" \
   --build-arg NF_NAME=nextgcore-smfd -t "$SMF_IMAGE" "$ctx" >/dev/null
 docker build -q -f "$RUST/Dockerfile.nf" --build-arg CORE_IMAGE="$CORE_IMAGE" \
-  --label "$LABEL=$RUN_ID" \
+  --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" \
   --build-arg NF_NAME=nextgcore-upfd -t "$UPF_IMAGE" "$ctx" >/dev/null
 
 NET="nextg-iupf-delay-$RUN_ID"
@@ -146,7 +192,7 @@ cleanup() {
   remove_run "$RUN_ID"
 }
 trap cleanup EXIT
-docker network create --label "$LABEL=$RUN_ID" --subnet "$P.0/24" "$NET" >/dev/null || {
+docker network create --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --subnet "$P.0/24" "$NET" >/dev/null || {
   echo "cannot create $NET on $P.0/24 (taken?); set NET_OCTET or RUN_ID" >&2
   exit 2
 }
@@ -155,7 +201,7 @@ docker network create --label "$LABEL=$RUN_ID" --subnet "$P.0/24" "$NET" >/dev/n
 # the REAL upfd starts with GTP-U path (GPQM) and QoS flow (QFQM) monitoring.
 # NET_ADMIN for tc and the TUN, the TUN device itself; not privileged.
 upf() { # <name> <own ip> <the other UPF's ip> <tun ip>
-  docker run -d --name "iupf-delay-$RUN_ID-$1" --label "$LABEL=$RUN_ID" --network "$NET" --ip "$2" \
+  docker run -d --name "iupf-delay-$RUN_ID-$1" --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --network "$NET" --ip "$2" \
     --user root --cap-add NET_ADMIN --device /dev/net/tun \
     --sysctl net.ipv4.ip_forward=1 -e RUST_LOG=info \
     --entrypoint /bin/sh "$UPF_IMAGE" -c "
@@ -172,7 +218,7 @@ upf iupf "$IUPF" "$PSA" 10.46.0.1
 
 # The REAL smfd: the PSA is UPF_PFCP_ADDR, the I-UPF is smf.yaml's
 # `intermediate_upf`; a private network of stand-ins, so cleartext h2c.
-docker run -d --name "iupf-delay-$RUN_ID-smf" --label "$LABEL=$RUN_ID" --network "$NET" --ip "$SMF" \
+docker run -d --name "iupf-delay-$RUN_ID-smf" --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --network "$NET" --ip "$SMF" \
   -e RUST_LOG=info -e NEXTGCORE_SBI_PROFILE=dev \
   -e SMF_PFCP_ADDR="$SMF" -e UPF_PFCP_ADDR="$PSA" -e UPF_PFCP_PORT=8805 \
   -e PCF_URI="http://$HARNESS:7777" \
@@ -180,7 +226,7 @@ docker run -d --name "iupf-delay-$RUN_ID-smf" --label "$LABEL=$RUN_ID" --network
   "$SMF_IMAGE" -c /etc/nextgcore/smf.yaml >/dev/null
 
 set +e
-docker run --name "iupf-delay-$RUN_ID-harness" --label "$LABEL=$RUN_ID" --network "$NET" --ip "$HARNESS" \
+docker run --name "iupf-delay-$RUN_ID-harness" --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --network "$NET" --ip "$HARNESS" \
   -e RUST_LOG=info -e NEXTGCORE_SBI_PROFILE=dev \
   -v "$OUT/harness:/harness:ro" --entrypoint /harness/iupf-delay-harness \
   "$CORE_IMAGE" \
