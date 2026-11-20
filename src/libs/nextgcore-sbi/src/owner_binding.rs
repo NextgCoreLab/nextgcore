@@ -220,9 +220,14 @@ pub const NF_TYPE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// everything, rather than grow.
 const NF_TYPE_CACHE_MAX: usize = 1024;
 
-/// (NF type, NF instance ID) -> (the NRF lists that instance with that type,
-/// valid until). Both answers are cached; a lookup that fails is never cached:
-/// it refuses, and the next call asks again.
+/// (NRF URI, NF type, NF instance ID) -> (that NRF lists that instance with
+/// that type, valid until). Both answers are cached; a lookup that fails is
+/// never cached: it refuses, and the next call asks again.
+///
+/// The NRF URI is part of the key (#2120), so after the configured NRF changes
+/// the old NRF's answers are never reused: the new NRF is asked. The type is
+/// part of it too, so an instance's answer as one type is never its answer as
+/// another.
 type NfTypeCache = std::collections::HashMap<String, (bool, std::time::Instant)>;
 
 fn nf_type_cache() -> std::sync::MutexGuard<'static, NfTypeCache> {
@@ -233,22 +238,47 @@ fn nf_type_cache() -> std::sync::MutexGuard<'static, NfTypeCache> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn nf_type_key(nf_type: &str, id: &str) -> String {
+fn nf_type_key(nrf_uri: &str, nf_type: &str, id: &str) -> String {
+    // A space cannot occur in a URI, an NF type or a UUID, so the parts cannot
+    // run into each other.
     format!(
-        "{}:{}",
+        "{} {} {}",
+        nrf_uri.trim().trim_end_matches('/'),
         nf_type.to_ascii_uppercase(),
         id.trim().to_ascii_lowercase()
     )
 }
 
+/// The `seed_nf_type_for_test` answers: (NF type, NF instance ID) keys, valid
+/// whichever NRF is configured, or none.
+#[cfg(any(test, feature = "test-support"))]
+fn seeded_nf_types() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static SEEDED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEDED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Tests (of this crate and, through the `test-support` feature, of the NFs):
-/// record that the NRF lists `id` as an `nf_type`, for the whole test run, so a
-/// token-identified caller needs no NRF. Only ever adds a positive answer for
-/// that one type, so tests using their own ids cannot collide.
+/// record that the NRF lists `id` as an `nf_type`, for the whole test run and
+/// whichever NRF is configured (none included), so a token-identified caller
+/// needs no NRF. Only ever adds a positive answer for that one type, so tests
+/// using their own ids cannot collide.
 #[cfg(any(test, feature = "test-support"))]
 pub fn seed_nf_type_for_test(id: &str, nf_type: crate::types::NfType) {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(24 * 3600);
-    nf_type_cache().insert(nf_type_key(nf_type.to_str(), id), (true, until));
+    seeded_nf_types().insert(nf_type_key("", nf_type.to_str(), id));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn seeded_nf_type(id: &str, nf_type: crate::types::NfType) -> bool {
+    seeded_nf_types().contains(&nf_type_key("", nf_type.to_str(), id))
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn seeded_nf_type(_id: &str, _nf_type: crate::types::NfType) -> bool {
+    false
 }
 
 /// The one NRF client the lookups share, rebuilt only when the NRF URI changes.
@@ -313,8 +343,8 @@ pub async fn nrf_lists_nf_type_at(
 
 /// [`nrf_lists_nf_type_at`] at the configured NRF, through the cache.
 async fn nrf_lists_nf_type(id: &str, nf_type: crate::types::NfType) -> Result<bool, String> {
-    if let Some(listed) = cached_nf_type(id, nf_type) {
-        return Ok(listed);
+    if seeded_nf_type(id, nf_type) {
+        return Ok(true);
     }
     let ctx = crate::context::global_context();
     let nrf_uri = ctx
@@ -325,9 +355,9 @@ async fn nrf_lists_nf_type(id: &str, nf_type: crate::types::NfType) -> Result<bo
     cached_nrf_lists_nf_type_at(&nrf_uri, id, nf_type, requester).await
 }
 
-fn cached_nf_type(id: &str, nf_type: crate::types::NfType) -> Option<bool> {
+fn cached_nf_type(nrf_uri: &str, id: &str, nf_type: crate::types::NfType) -> Option<bool> {
     let (listed, until) = nf_type_cache()
-        .get(&nf_type_key(nf_type.to_str(), id))
+        .get(&nf_type_key(nrf_uri, nf_type.to_str(), id))
         .copied()?;
     (std::time::Instant::now() < until).then_some(listed)
 }
@@ -340,10 +370,10 @@ async fn cached_nrf_lists_nf_type_at(
     nf_type: crate::types::NfType,
     requester: Option<crate::types::NfType>,
 ) -> Result<bool, String> {
-    if let Some(listed) = cached_nf_type(id, nf_type) {
+    if let Some(listed) = cached_nf_type(nrf_uri, id, nf_type) {
         return Ok(listed);
     }
-    let key = nf_type_key(nf_type.to_str(), id);
+    let key = nf_type_key(nrf_uri, nf_type.to_str(), id);
     let listed = nrf_lists_nf_type_at(nrf_uri, id, nf_type, requester).await?;
     let mut cache = nf_type_cache();
     if cache.len() >= NF_TYPE_CACHE_MAX {
@@ -548,6 +578,87 @@ mod tests {
             .await
             .is_err());
         assert_eq!(n(), 3, "a failure is not cached");
+    }
+
+    /// A stand-in NRF for #2120 that lists `listed` as an AMF and records each
+    /// lookup's `target-nf-type`.
+    async fn recording_nrf_2120(
+        listed: &'static str,
+    ) -> (
+        crate::server::SbiServer,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        crate::security::set_sbi_profile_override(crate::security::SbiProfile::Dev);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let s = s.clone();
+                async move {
+                    let param = |k: &str| req.http.params.get(k).cloned().unwrap_or_default();
+                    let target = param("target-nf-type");
+                    s.lock().unwrap().push(target.clone());
+                    let list = if param("target-nf-instance-id") == listed && target == "AMF" {
+                        vec![serde_json::json!({ "nfInstanceId": listed, "nfType": "AMF" })]
+                    } else {
+                        vec![]
+                    };
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({ "nfInstances": list }))
+                        .expect("json")
+                }
+            })
+            .await;
+        (server, format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// **#2120 (1)**: the cache keeps an instance's answer as one NF type apart
+    /// from its answer as another. An AMF the NRF lists, cached as an AMF, is
+    /// asked about again as an SMF, and is not one.
+    ///
+    /// REVERT-VERIFIED: with the type dropped from `nf_type_key`, the SMF ask is
+    /// answered `Ok(true)` from the AMF's cached answer and "is not an SMF"
+    /// fails.
+    #[tokio::test]
+    async fn the_cache_keeps_each_nf_type_apart_2120() {
+        const AMF: &str = "aaaaaaaa-2120-4000-8000-0000000000a1";
+        let (_nrf, nrf, seen) = recording_nrf_2120(AMF).await;
+        let ask = |nf_type| cached_nrf_lists_nf_type_at(&nrf, AMF, nf_type, Some(NfType::Lmf));
+        assert_eq!(ask(NfType::Amf).await, Ok(true), "a listed AMF is an AMF");
+        assert_eq!(ask(NfType::Smf).await, Ok(false), "is not an SMF");
+        assert_eq!(ask(NfType::Smf).await, Ok(false), "still not an SMF");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["AMF", "SMF"],
+            "the SMF ask went to the NRF once, then was cached"
+        );
+    }
+
+    /// **#2120 (2)**: the cache keeps each NRF's answers apart, so after the NRF
+    /// URI changes the new NRF is asked rather than the old one's answer reused.
+    /// The same NRF written with a trailing `/` is the same NRF.
+    ///
+    /// REVERT-VERIFIED: with the NRF URI dropped from `nf_type_key`, the new
+    /// NRF is never asked: the old NRF's `Ok(true)` is returned and "the new
+    /// NRF does not list it" fails.
+    #[tokio::test]
+    async fn the_cache_keeps_each_nrf_apart_2120() {
+        const AMF: &str = "aaaaaaaa-2120-4000-8000-0000000000a2";
+        let (_old, old_nrf, old_seen) = recording_nrf_2120(AMF).await;
+        let (_new, new_nrf, new_seen) = recording_nrf_2120("-").await;
+        let ask = |nrf: String| async move {
+            cached_nrf_lists_nf_type_at(&nrf, AMF, NfType::Amf, Some(NfType::Lmf)).await
+        };
+        assert_eq!(ask(old_nrf.clone()).await, Ok(true), "the old NRF lists it");
+        assert_eq!(ask(format!("{old_nrf}/")).await, Ok(true));
+        assert_eq!(old_seen.lock().unwrap().len(), 1, "one ask of the old NRF");
+        assert_eq!(
+            ask(new_nrf.clone()).await,
+            Ok(false),
+            "the new NRF does not list it"
+        );
+        assert_eq!(new_seen.lock().unwrap().len(), 1, "the new NRF was asked");
     }
 
     /// **#2099**: the caller-side rule. A certificate of the consumer naming NF
