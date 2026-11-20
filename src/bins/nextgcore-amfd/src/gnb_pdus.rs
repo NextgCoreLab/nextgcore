@@ -167,6 +167,7 @@ pub(crate) fn cause(b: &mut Bits, c: &t::Cause) {
     let (choice, index, width) = match c {
         t::Cause::RadioNetwork(t::CauseRadioNetwork::Unspecified) => (0, 0, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::HandoverCancelled) => (0, 5, 6),
+        t::Cause::RadioNetwork(t::CauseRadioNetwork::HoTargetNotAllowed) => (0, 8, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::TngrelocprepExpiry) => (0, 10, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::CellNotAvailable) => (0, 11, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell) => {
@@ -178,6 +179,8 @@ pub(crate) fn cause(b: &mut Bits, c: &t::Cause) {
         t::Cause::Transport(t::CauseTransport::TransportResourceUnavailable) => (1, 0, 1),
         t::Cause::Transport(t::CauseTransport::Unspecified) => (1, 1, 1),
         t::Cause::Nas(t::CauseNas::NormalRelease) => (2, 0, 2),
+        t::Cause::Protocol(t::CauseProtocol::SemanticError) => (3, 4, 3),
+        t::Cause::Misc(t::CauseMisc::OmIntervention) => (4, 3, 3),
         t::Cause::Misc(t::CauseMisc::Unspecified) => (4, 5, 3),
         other => panic!("derive the ASN.1 index of {other:?} before using it"),
     };
