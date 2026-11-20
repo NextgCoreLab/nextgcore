@@ -2418,7 +2418,6 @@ dependencies = [
  "log",
  "mongodb",
  "nextgcore-app",
- "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-crypt",
  "nextgcore-demo",
