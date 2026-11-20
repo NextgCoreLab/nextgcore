@@ -2396,6 +2396,21 @@ mod tests {
         );
 
         let u = ucmf();
+        // #2089 R40: `ucmf()` has just set the process-wide Dev override, so
+        // this checks `provisioning_owner_in` judges by its explicit
+        // `production` and not the process profile, whatever order the suite
+        // runs in. Under production an untyped certificate alone is no
+        // identity (#2065); read through the process profile (Dev) it would
+        // become the owner.
+        let mut untyped = anon.clone();
+        untyped.peer_cert_nf_instance_id = Some(NEF_A_1916.to_string());
+        let refused = provisioning_owner_in(&untyped, true)
+            .expect_err("production: an untyped certificate alone is no identity");
+        assert_eq!(refused.status, 403);
+        assert!(body(&refused)["detail"]
+            .as_str()
+            .unwrap()
+            .contains("names no NF type"));
         assert_eq!(handle(&u, &anon, now()).0.status, 201, "dev: ownerless");
         let state = read_state(&u);
         for who in [Some(NEF_A_1916), Some(NEF_B_1916), None] {

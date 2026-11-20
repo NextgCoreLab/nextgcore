@@ -415,8 +415,20 @@ pub async fn verified_nf_type(
     request: &SbiRequest,
     expected: crate::types::NfType,
 ) -> Result<(), String> {
+    verified_nf_type_with(request, expected, identity_required()).await
+}
+
+/// [`verified_nf_type`] with an explicit `required` (the production rule of
+/// #2065, passed on to [`verified_consumer_id_with`]): under it a certificate
+/// without NF types and no token is refused as no identity at all, before any
+/// NF-type check.
+pub async fn verified_nf_type_with(
+    request: &SbiRequest,
+    expected: crate::types::NfType,
+    required: bool,
+) -> Result<(), String> {
     let want = expected.to_str();
-    match verified_consumer_id(request)? {
+    match verified_consumer_id_with(request, required)? {
         Some(_) => {}
         None => return Err("the requester has no verified identity".to_string()),
     }
@@ -592,49 +604,70 @@ mod tests {
     /// token, an anonymous caller and a certificate/token mismatch refuse; a
     /// token (alone or through an SCP) is the NRF's to vouch for, here seeded.
     ///
+    /// Both profiles are passed explicitly (`verified_nf_type_with`), so the
+    /// test reads no process-global profile and passes run alone (#2089 R40:
+    /// it used to depend on a sibling having set Dev). Under production
+    /// (#2065) the typeless certificate is refused as no identity at all,
+    /// before the NF-type check; under dev it reaches the NF-type check and is
+    /// refused there.
+    ///
     /// REVERT-VERIFIED: with "no NF types" counted as `expected` (the #1860
-    /// rule), the typeless certificate is admitted and its `unwrap_err` panics.
+    /// rule), the dev typeless certificate is admitted and its `unwrap_err`
+    /// panics; with #2065's untyped arm off, the production typeless
+    /// certificate gets the NF-type message and "no identity" fails.
     #[tokio::test]
     async fn verified_nf_type_takes_the_certificate_else_the_nrf_2099() {
         const AMF: &str = "aaaaaaaa-2099-4000-8000-0000000000a3";
         const SCP: &str = "55555555-2099-4000-8000-000000000005";
         seed_nf_type_for_test(AMF, NfType::Amf);
-        let ok = |r: SbiRequest| async move { verified_nf_type(&r, NfType::Amf).await };
-        assert_eq!(
-            ok(caller(Some(B), None, &["AMF"])).await,
-            Ok(()),
-            "direct AMF"
-        );
-        assert!(ok(caller(Some(B), None, &["SMF"]))
-            .await
-            .unwrap_err()
-            .contains("not AMF"));
-        assert!(
-            ok(caller(Some(AMF), None, &[]))
+        for production in [true, false] {
+            let ok = |r: SbiRequest| async move {
+                verified_nf_type_with(&r, NfType::Amf, production).await
+            };
+            assert_eq!(
+                ok(caller(Some(B), None, &["AMF"])).await,
+                Ok(()),
+                "direct AMF (production={production})"
+            );
+            assert!(ok(caller(Some(B), None, &["SMF"]))
                 .await
                 .unwrap_err()
-                .contains("names no NF types"),
-            "typeless certificate"
-        );
-        assert!(ok(caller(None, None, &[])).await.is_err(), "anonymous");
+                .contains("not AMF"));
+            assert!(ok(caller(None, None, &[])).await.is_err(), "anonymous");
+            assert!(
+                ok(caller(Some(A), Some(B), &["AMF"])).await.is_err(),
+                "mismatch"
+            );
+            assert_eq!(
+                ok(caller(None, Some(AMF), &[])).await,
+                Ok(()),
+                "seeded token (production={production})"
+            );
+            assert_eq!(
+                ok(caller(Some(SCP), Some(AMF), &["SCP"])).await,
+                Ok(()),
+                "SCP + token (production={production})"
+            );
+            assert_eq!(
+                ok(caller(Some(AMF), Some(AMF), &[])).await,
+                Ok(()),
+                "typeless certificate plus its token (production={production})"
+            );
+        }
+        let production = verified_nf_type_with(&caller(Some(AMF), None, &[]), NfType::Amf, true)
+            .await
+            .unwrap_err();
         assert!(
-            ok(caller(Some(A), Some(B), &["AMF"])).await.is_err(),
-            "mismatch"
+            production.contains("names no NF type (RFC 9310 NFTypes)")
+                && production.contains("presented no access token"),
+            "under production a typeless certificate alone is no identity: {production}"
         );
-        assert_eq!(
-            ok(caller(None, Some(AMF), &[])).await,
-            Ok(()),
-            "seeded token"
-        );
-        assert_eq!(
-            ok(caller(Some(SCP), Some(AMF), &["SCP"])).await,
-            Ok(()),
-            "SCP + token"
-        );
-        assert_eq!(
-            ok(caller(Some(AMF), Some(AMF), &[])).await,
-            Ok(()),
-            "typeless certificate plus its token"
+        let dev = verified_nf_type_with(&caller(Some(AMF), None, &[]), NfType::Amf, false)
+            .await
+            .unwrap_err();
+        assert!(
+            dev.contains("names no NF types") && dev.contains("cannot be shown to be an AMF"),
+            "under dev a typeless certificate alone fails the NF-type check: {dev}"
         );
     }
 
