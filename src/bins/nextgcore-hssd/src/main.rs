@@ -259,22 +259,54 @@ fn main() -> Result<()> {
             "--diameter-addr (or hss.diameter.addr in the config file)",
         );
 
+        // #2088 (R30 on #2073): the bind result comes back before start-up goes on,
+        // so a listener that cannot be bound goes through `listener_bind_failed`:
+        // fatal under the production profile (exit 78), as every listener but N26
+        // is (#2056). It used to be logged from the server thread while the HSS ran
+        // on with no S6a.
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("hss-s6a-diameter".to_string())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("failed to build S6a tokio runtime");
-                if let Err(e) = runtime.block_on(nextgcore_hssd::hss_s6a_run_server(
-                    listen_addr,
-                    diameter_config,
-                )) {
-                    log::error!("S6a Diameter server terminated: {e}");
-                }
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = bound_tx.send(Err(format!("S6a tokio runtime: {e}")));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    match nextgcore_hssd::hss_s6a_bind(listen_addr).await {
+                        Ok(listener) => {
+                            let _ = bound_tx.send(Ok(()));
+                            if let Err(e) =
+                                nextgcore_hssd::hss_s6a_serve(listener, diameter_config).await
+                            {
+                                log::error!("S6a Diameter server terminated: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            let _ = bound_tx.send(Err(e));
+                        }
+                    }
+                });
             })
             .context("failed to spawn S6a Diameter server thread")?;
-        log::info!("S6a Diameter server started on {listen_addr}");
+        match bound_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => log::info!("S6a Diameter server started on {listen_addr}"),
+            Ok(Err(e)) => {
+                nextgcore_metrics::nf::listener_bind_failed("HSS", "S6a Diameter", listen_addr, &e)
+            }
+            Err(e) => nextgcore_metrics::nf::listener_bind_failed(
+                "HSS",
+                "S6a Diameter",
+                listen_addr,
+                &format!("the listener did not start: {e}"),
+            ),
+        }
     }
 
     // Initialize Cx interface (IMS communication)

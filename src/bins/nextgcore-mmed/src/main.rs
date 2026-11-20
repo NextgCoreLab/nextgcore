@@ -172,6 +172,11 @@ impl MmeApp {
         // an interworking misconfiguration into a total LTE outage. The inter-system TAU
         // path then rejects with EMM cause #9, which is what TS 24.301 requires of an MME
         // without N26 — so the degraded behaviour is the specified one.
+        //
+        // #2073: N26 is the explicit exception to the #2056 production rule that a
+        // configured listener that cannot be bound is fatal at start-up (docs-book
+        // configuration/overview.md, "The N26 exception"); interworking without N26 is a
+        // specified mode (TS 23.501 §5.17.2.3), a metrics listener has no such fallback.
         if let Err(e) = n26_path::n26_open() {
             log::error!(
                 "Failed to open the N26 path: {e}. The MME continues WITHOUT N26: an \

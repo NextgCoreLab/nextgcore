@@ -10,8 +10,13 @@
 //! subscription). Same shape as #1817's and smfd #1875's reconcilers.
 //!
 //! Bounded at [`MAX_PENDING`]: parking one more evicts the oldest, logged at error
-//! and counted `abandoned`. A pass sends for at most [`MAX_PASS`]. Memory-only, like
-//! the NEF's subscriptions themselves: a restart forgets both.
+//! and counted `abandoned`. A pass sends for at most [`MAX_PASS`].
+//!
+//! #2086 (R30): durable with the NEF's state file. The set is written in the same
+//! snapshot as the subscriptions (`parkedUnsubscribes`), and an unsubscribe is
+//! owed ([`owe`]) BEFORE the removal of its subscription is persisted and before
+//! its DELETE is sent, so no restart can find the subscription gone and the
+//! unsubscribe it owes forgotten. A delivered one leaves the set ([`settle`]).
 
 use crate::context::{SouthboundProducer, SouthboundRef};
 use std::collections::VecDeque;
@@ -116,10 +121,71 @@ fn evict(set: &mut VecDeque<Parked>) {
     }
 }
 
+/// #2086: record that `southbound` is owed a DELETE, before anything that
+/// depends on it is persisted or sent. Silent (it is not a failure yet), and not
+/// persisted here: the caller's next persist writes it (with the removal it goes
+/// with). Returns whether it was added.
+pub fn owe(southbound: SouthboundRef) -> bool {
+    let mut set = lock();
+    if set.iter().any(|p| p.southbound == southbound) {
+        return false;
+    }
+    set.push_back(Parked {
+        southbound,
+        since: std::time::Instant::now(),
+    });
+    evict(&mut set);
+    true
+}
+
+/// #2086: `southbound`'s DELETE was delivered: it is no longer owed. Persisted.
+pub fn settle(southbound: &SouthboundRef) {
+    let removed = {
+        let mut set = lock();
+        let before = set.len();
+        set.retain(|p| p.southbound != *southbound);
+        set.len() != before
+    };
+    if removed {
+        persist_state();
+    }
+}
+
+/// #2086: the owed unsubscribes, oldest first, for the state snapshot.
+pub fn snapshot() -> Vec<SouthboundRef> {
+    lock().iter().map(|p| p.southbound.clone()).collect()
+}
+
+/// #2086: install the owed unsubscribes a state snapshot held (startup). Their
+/// [`MAX_AGE`] counts from now: the time parked before the restart is not known.
+pub fn restore(refs: Vec<SouthboundRef>) {
+    for southbound in refs {
+        owe(southbound);
+    }
+}
+
+/// #2086: write the NEF state (subscriptions and owed unsubscribes) now.
+fn persist_state() {
+    if let Ok(c) = crate::context::nef_self().read() {
+        c.persist_now();
+    }
+}
+
 /// Park an unsubscribe that failed. One already parked is not parked twice.
 pub fn park(southbound: SouthboundRef) {
     let mut set = lock();
     if set.iter().any(|p| p.southbound == southbound) {
+        // #2086: already owed (its DELETE was tried after `owe`): now it failed.
+        drop(set);
+        log::warn!(
+            "{} unsubscribe of {} failed; parked, retried every {RECONCILE_PERIOD:?}",
+            southbound.producer.as_str(),
+            southbound.subscription_id
+        );
+        PARKED.inc(&[match southbound.producer {
+            SouthboundProducer::Amf => "amf",
+            SouthboundProducer::Udm => "udm",
+        }]);
         return;
     }
     log::warn!(
@@ -136,6 +202,8 @@ pub fn park(southbound: SouthboundRef) {
         since: std::time::Instant::now(),
     });
     evict(&mut set);
+    drop(set);
+    persist_state();
 }
 
 /// How many unsubscribes are parked.
@@ -234,6 +302,10 @@ pub async fn reconcile_once() -> usize {
     let parked: Vec<SouthboundRef> = set.iter().map(|p| p.southbound.clone()).collect();
     drop(set);
     prune_backoff(&parked);
+    // #2086: the ones that ended leave the state file too.
+    if ended > 0 {
+        persist_state();
+    }
     ended
 }
 

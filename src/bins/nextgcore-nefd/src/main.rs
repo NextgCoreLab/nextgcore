@@ -1018,6 +1018,10 @@ fn spawn_abandoned_create_removal(sub_id: String) {
         let ctx = nef_self();
         let c = ctx.read().ok();
         let found = c.as_ref().and_then(|c| c.subscription_find(&sub_id));
+        // #2086: owed before the removal is persisted, in the same snapshot.
+        if let Some(southbound) = found.as_ref().and_then(|s| s.southbound.clone()) {
+            southbound_reconcile::owe(southbound);
+        }
         if let Some(c) = c.as_ref() {
             c.subscription_remove(&sub_id);
         }
@@ -1405,6 +1409,11 @@ async fn handle_monitoring_subscription_delete(
     // subscription behind with nothing left to remove it. A DELETE that fails is
     // parked for the reconciler.
     {
+        // #2086: the unsubscribe it owes is recorded before the removal is
+        // persisted, in the same snapshot, so a restart cannot lose it.
+        if let Some(southbound) = sub.southbound.clone() {
+            southbound_reconcile::owe(southbound);
+        }
         let ctx = nef_self();
         if let Ok(c) = ctx.read() {
             c.subscription_remove(sub_id);
@@ -2111,8 +2120,18 @@ pub(crate) fn producer_uri(producer: SouthboundProducer) -> Option<String> {
 /// Best-effort DELETE of the southbound producer subscription; one that fails is
 /// parked for [`southbound_reconcile`] and retried until the producer takes it
 /// (#1877). It used to be tried once and only logged.
+///
+/// #2086: the DELETE is owed (and persisted) before it is sent, and settled once
+/// delivered, so a restart in between still sends it.
 async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: SouthboundRef) {
-    if !try_southbound_unsubscribe(producer_uri, &southbound).await {
+    if southbound_reconcile::owe(southbound.clone()) {
+        if let Ok(c) = nef_self().read() {
+            c.persist_now();
+        }
+    }
+    if try_southbound_unsubscribe(producer_uri, &southbound).await {
+        southbound_reconcile::settle(&southbound);
+    } else {
         southbound_reconcile::park(southbound);
     }
 }
@@ -3846,6 +3865,89 @@ mod tests {
             assert!(!parked_after, "and delivered once the AMF answers");
             assert_eq!(tries, 2, "once at delete, once reconciled");
         });
+        reset_context();
+    }
+
+    /// #2086 (R30's audit): with a state file, the unsubscribe a deleted
+    /// subscription owes survives a restart. Right after the AF's DELETE (the
+    /// AMF answering 503), the snapshot on disk no longer holds the subscription
+    /// and does hold the owed AMF unsubscribe; a NEF restarted from that file
+    /// parks it again, and its reconciler delivers it once the AMF answers.
+    ///
+    /// REVERT-VERIFIED: with the owed set left out of the snapshot, the
+    /// restarted NEF parks nothing and the AMF keeps the subscription.
+    #[test]
+    fn an_owed_unsubscribe_survives_a_restart_2086() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        let path = std::env::temp_dir().join(format!(
+            "nefd-2086-{}-{}.json",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_file(&path);
+        nef_self()
+            .write()
+            .unwrap()
+            .set_state_file(path.clone())
+            .expect("first boot");
+        block_on(async {
+            let status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+            let (amf, amf_uri, seen) = amf_1877(Duration::ZERO, status.clone()).await;
+            set_producers(Some(&amf_uri), None);
+            let created = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            assert_eq!(created.status, 201);
+            let sub_id = created_subscription_id(&created).expect("id");
+            let deleted = handle_monitoring_subscription_delete(
+                "af1",
+                &sub_id,
+                &SbiRequest::delete(format!(
+                    "/3gpp-monitoring-event/v1/af1/subscriptions/{sub_id}"
+                )),
+            )
+            .await;
+            assert_eq!(deleted.status, 204);
+            let on_disk: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(on_disk["subscriptions"].as_array().map(Vec::len), Some(0));
+            let owed = on_disk["parkedUnsubscribes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                owed.iter().any(|r| r["subscription_id"] == "s-1877"),
+                "the owed unsubscribe is on disk: {on_disk}"
+            );
+
+            // The restart: the in-memory set is gone; the file restores it.
+            southbound_reconcile::clear_for_test();
+            let mut restarted = context::NefContext::new();
+            restarted.init(16, 16);
+            restarted.set_state_file(path.clone()).expect("restored");
+            let ours = |r: &SouthboundRef| r.subscription_id == "s-1877";
+            assert!(
+                southbound_reconcile::parked().iter().any(ours),
+                "the restarted NEF owes it again"
+            );
+            status.store(204, Ordering::SeqCst);
+            southbound_reconcile::reconcile_once().await;
+            assert!(!southbound_reconcile::parked().iter().any(ours));
+            assert_eq!(
+                deletes_1877(&seen),
+                2,
+                "once at delete, once after the restart"
+            );
+            amf.stop().await.ok();
+        });
+        southbound_reconcile::clear_for_test();
+        nef_self().write().unwrap().detach_state_file_for_test();
+        let _ = std::fs::remove_file(&path);
         reset_context();
     }
 

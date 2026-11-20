@@ -163,6 +163,25 @@ nrf:
   # NRF's own OAuth2 client presents nrf.crt only then). One pod per release:
   # replicas > 1 fails the render (one ID, one certificate).
   nfInstanceId: ""
+  # #2052: rendered as nrf.nf_set_allowlist in nrf.yaml (#1719, #2035). Each
+  # entry is {nf_set_id, nf_types, nf_instance_ids} (the last two optional
+  # lists: absent admits any type / any instance). Under the production profile
+  # (global.sbiProfile) the NRF refuses an AMF's guamiList unless an entry
+  # admits that AMF for its AMF Set's NF Set ID,
+  # set<amfSetId>.region<amfRegionId>.amfset.5gc.mnc<MNC, 3 digits>.mcc<MCC>
+  # (TS 23.003 §2.10.1, §28.12); and once any allowlist is present, under
+  # either profile, an NF's nfSetIdList claims must be listed too.
+  #
+  # Unset (the default): derived from the chart's AMF, one entry for its GUAMI
+  # (global.plmn, amf.config.amfId) admitting type AMF and the AMF's
+  # nfInstanceId only. With the defaults:
+  #   - nf_set_id: set001.region02.amfset.5gc.mnc070.mcc999
+  #     nf_types: [AMF]
+  #     nf_instance_ids: ["<amf's nfInstanceId>"]
+  # A list replaces the derived entry; it must still admit the chart's AMF
+  # (the render fails otherwise), so add your other AMFs' and NF sets' entries
+  # beside it.
+  nfSetAllowlist: null
   image:
     repository: nextgcore-rust/nrf
     tag: latest
@@ -198,6 +217,8 @@ amf:
     enabled: true
     port: 9090
   config:
+    # The GUAMI's AMF Region (0-255) and AMF Set (0-1023), decimal. The NRF's
+    # derived nrf.nfSetAllowlist entry follows them (#2052).
     amfId:
       region: 2
       set: 1

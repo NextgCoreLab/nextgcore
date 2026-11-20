@@ -632,6 +632,10 @@ struct SbiService<H: SbiRequestHandler> {
     peer_cert_present: bool,
     /// #2000: [`SbiRequest::peer_cert_uri_sans`] of that certificate.
     peer_cert_uri_sans: Vec<String>,
+    /// #2076: [`SbiRequest::peer_cert_dns_sans`] of that certificate.
+    peer_cert_dns_sans: Vec<String>,
+    /// #2080: [`SbiRequest::peer_cert_der`] of that certificate.
+    peer_cert_der: Option<Arc<Vec<u8>>>,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
@@ -650,6 +654,8 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             peer_cert_nf_types: self.peer_cert_nf_types.clone(),
             peer_cert_present: self.peer_cert_present,
             peer_cert_uri_sans: self.peer_cert_uri_sans.clone(),
+            peer_cert_dns_sans: self.peer_cert_dns_sans.clone(),
+            peer_cert_der: self.peer_cert_der.clone(),
             server_identity: self.server_identity.clone(),
             overload_reporter: self.overload_reporter.clone(),
         }
@@ -670,6 +676,8 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let peer_cert_nf_types = self.peer_cert_nf_types.clone();
         let peer_cert_present = self.peer_cert_present;
         let peer_cert_uri_sans = self.peer_cert_uri_sans.clone();
+        let peer_cert_dns_sans = self.peer_cert_dns_sans.clone();
+        let peer_cert_der = self.peer_cert_der.clone();
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
@@ -704,6 +712,8 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         request.peer_cert_nf_types = peer_cert_nf_types.clone();
                         request.peer_cert_present = peer_cert_present;
                         request.peer_cert_uri_sans = peer_cert_uri_sans.clone();
+                        request.peer_cert_dns_sans = peer_cert_dns_sans.clone();
+                        request.peer_cert_der = peer_cert_der.clone();
                         request
                     }
                     Err(ConvertRequestError::BodyTooLarge) => {
@@ -1214,6 +1224,8 @@ async fn convert_request(
         oauth2_scope: None,
         peer_cert_present: false,
         peer_cert_uri_sans: Vec::new(),
+        peer_cert_dns_sans: Vec::new(),
+        peer_cert_der: None,
     })
 }
 
@@ -1708,6 +1720,27 @@ impl SbiServer {
                                                         })
                                                         .unwrap_or_default()
                                                 };
+                                                // #2076: and its DNS SANs.
+                                                let peer_cert_dns_sans = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .map(|leaf| {
+                                                            crate::peer_cert::dns_sans_from_der(
+                                                                leaf.as_ref(),
+                                                            )
+                                                        })
+                                                        .unwrap_or_default()
+                                                };
+                                                // #2080: and the leaf itself.
+                                                let peer_cert_der = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .map(|leaf| Arc::new(leaf.as_ref().to_vec()))
+                                                };
                                                 let service = SbiService {
                                                     handler: handler_ref,
                                                     oauth: oauth_ref,
@@ -1717,6 +1750,8 @@ impl SbiServer {
                                                     peer_cert_nf_types,
                                                     peer_cert_present,
                                                     peer_cert_uri_sans,
+                                                    peer_cert_dns_sans,
+                                                    peer_cert_der,
                                                     server_identity: server_identity_ref,
                                                     overload_reporter:
                                                         overload_reporter_ref,
@@ -1753,6 +1788,8 @@ impl SbiServer {
                                         peer_cert_nf_types: Vec::new(),
                                         peer_cert_present: false,
                                         peer_cert_uri_sans: Vec::new(),
+                                        peer_cert_dns_sans: Vec::new(),
+                                        peer_cert_der: None,
                                         server_identity: server_identity_ref,
                                         overload_reporter: overload_reporter_ref,
                                     };

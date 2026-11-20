@@ -131,6 +131,8 @@ Every Service is ClusterIP: nothing is published on a node port, a load
 balancer or the kind host, and `kubectl port-forward` listens on 127.0.0.1
 only (#1365).
 
+The NRF's `nrf.nf_set_allowlist` names the stack's AMF for its AMF Set (#2052; see [NRF](configuration/nrf.md)). The Helm chart derives that entry from the AMF's GUAMI and `nfInstanceId` (`nrf.nfSetAllowlist` overrides it). `k8s/manifests/configmap.yaml` carries it statically: when you change the AMF's PLMN, `amf_id` or `NEXTGCORE_AMF_INSTANCE_ID`, change the entry with it, or the NRF refuses the AMF's GUAMIs.
+
 Every NF exposes Prometheus metrics on port 9090 (`/metrics`); monitoring assets are under `k8s/monitoring/` and `docker/rust/monitoring/`. `teardown.sh` removes the deployment.
 
 ## Where Configs Live

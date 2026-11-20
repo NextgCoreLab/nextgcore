@@ -11,6 +11,9 @@ name = "nextgcore-scpd"
 path = "src/main.rs"
 
 [dependencies]
+# #2080: the SHA-256 and PEM of the x-forwarded-client-cert the SCP sets.
+sha2.workspace = true
+base64.workspace = true
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-metrics = { workspace = true }

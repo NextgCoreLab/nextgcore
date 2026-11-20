@@ -390,6 +390,16 @@ pub fn render(out: &mut String) {
     RECONCILED.render(out);
 }
 
+/// #2068: whether a delete of `context_ref` at the AMF on `port` is parked.
+/// Hold [`PENDING_TEST_LOCK`].
+#[cfg(test)]
+pub fn is_parked_for_test(port: u16, context_ref: &str) -> bool {
+    pending().lock().is_ok_and(|set| {
+        set.iter()
+            .any(|p| p.ctx.port == port && p.ctx.context_ref == context_ref)
+    })
+}
+
 #[cfg(test)]
 pub fn clear_for_test() {
     if let Ok(mut set) = pending().lock() {

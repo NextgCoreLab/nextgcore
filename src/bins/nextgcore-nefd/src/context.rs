@@ -482,6 +482,8 @@ impl NefContext {
             "version": 1,
             "subscriptions": subs,
             "transactions": txns,
+            // #2086: the producer-side subscriptions still owed a DELETE.
+            "parkedUnsubscribes": crate::southbound_reconcile::snapshot(),
         })
     }
 
@@ -517,7 +519,35 @@ impl NefContext {
                 }
             }
         }
+        // #2086: and the unsubscribes still owed, so a restart retries them.
+        if let Some(arr) = doc.get("parkedUnsubscribes").and_then(|v| v.as_array()) {
+            let refs: Vec<SouthboundRef> = arr
+                .iter()
+                .filter_map(
+                    |v| match serde_json::from_value::<SouthboundRef>(v.clone()) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            log::warn!("skipping unreadable parked NEF unsubscribe: {e}");
+                            None
+                        }
+                    },
+                )
+                .collect();
+            restored += refs.len();
+            crate::southbound_reconcile::restore(refs);
+        }
         restored
+    }
+
+    /// #2086: detach the state file (a test's own, so later tests write nowhere).
+    #[cfg(test)]
+    pub(crate) fn detach_state_file_for_test(&mut self) {
+        self.state = nextgcore_core::state_store::StateStore::new(None);
+    }
+
+    /// #2086: persist now (the owed-unsubscribe set changed).
+    pub(crate) fn persist_now(&self) {
+        self.persist();
     }
 
     /// Snapshot to disk after a mutation. A no-op when no state file is

@@ -41,6 +41,23 @@ data:
               client_auth: optional
               # Minimum TLS version per 3GPP TS 33.501 §13.2
               min_version: "1.2"
+      # #2052: who may claim which NF Set (#1719), and which AMF may list GUAMIs
+      # of which AMF Set (#2035, TS 23.003 §2.10.1, §28.12). Under the
+      # production profile the NRF refuses an AMF's guamiList unless an entry
+      # admits that AMF for its AMF Set; under dev, once this list is present,
+      # it is enforced too. The one entry is this stack's AMF: amf.yaml below
+      # (guami PLMN 999/70, amf_id region 2, set 1) and NEXTGCORE_AMF_INSTANCE_ID
+      # in amf.yaml's Deployment (docker/rust/certs/nf-identities.txt). These
+      # are static manifests: when you change the AMF's PLMN, region, set or
+      # instance ID, change this entry with it. The NF Set ID is
+      # set<set, 3 hex digits>.region<region, 2 hex digits>.amfset.5gc.mnc<MNC,
+      # 3 digits>.mcc<MCC>; region 2, set 1 are 02 and 001. An AMF Set's other
+      # AMFs go into its nf_instance_ids; another AMF Set needs its own entry.
+      nf_set_allowlist:
+        - nf_set_id: set001.region02.amfset.5gc.mnc070.mcc999
+          nf_types: [AMF]
+          nf_instance_ids:
+            - "6b1d7e3c-0000-4000-8000-000000000af0"
 
   ausf.yaml: |
     logger:

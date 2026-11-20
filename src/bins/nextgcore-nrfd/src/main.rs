@@ -15419,6 +15419,249 @@ mod tests_guami_uniqueness_2035 {
     }
 }
 
+/// #2052: the shipped Helm chart and k8s manifests provision their AMF in
+/// `nrf.nf_set_allowlist` for the AMF Set its GUAMI encodes, so a
+/// production-profile NRF admits the AMF's `guamiList` (#2035), and only that
+/// AMF's. Each check reads the rendered `nrf.yaml` through nrfd's own parser
+/// ([`NrfPolicy::from_yaml`]) and runs [`refuse_unbound_amf_guamis`] under the
+/// production profile on the `guamiList` the AMF publishes for its rendered
+/// `amf.yaml` (TS 23.003 §2.10.1: region, set and pointer in the AMF ID).
+#[cfg(test)]
+mod tests_shipped_nf_set_allowlist_2052 {
+    use super::tests_nf_set_ids_1719::ALLOWLIST;
+    use super::*;
+    use nextgcore_core::helm_render;
+    use nextgcore_sbi::security::SbiProfile;
+    use serde_json::json;
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+    }
+
+    /// The `amfInfo` amfd publishes for `amf_yaml` (its first GUAMI's region
+    /// and set, the GUAMIs of that set), as `amf_info_of` in amfd builds it.
+    fn amf_info_for(amf_yaml: &str) -> serde_json::Value {
+        let doc: serde_yaml::Value = serde_yaml::from_str(amf_yaml).expect("amf.yaml parses");
+        let num = |v: &serde_yaml::Value| v.as_u64().expect("a number") as u32;
+        let text = |v: &serde_yaml::Value| match v {
+            serde_yaml::Value::String(s) => s.clone(),
+            other => serde_yaml::to_string(other).unwrap().trim().to_string(),
+        };
+        let guamis: Vec<(u32, u32, serde_json::Value)> = doc["amf"]["guami"]
+            .as_sequence()
+            .expect("amf.guami")
+            .iter()
+            .map(|g| {
+                let (region, set) = (num(&g["amf_id"]["region"]), num(&g["amf_id"]["set"]));
+                let pointer = g["amf_id"]["pointer"].as_u64().unwrap_or(0) as u32;
+                let guami = json!({
+                    "plmnId": {
+                        "mcc": text(&g["plmn_id"]["mcc"]),
+                        "mnc": text(&g["plmn_id"]["mnc"]),
+                    },
+                    "amfId": format!("{:06x}", (region << 16) | (set << 6) | pointer),
+                });
+                (region, set, guami)
+            })
+            .collect();
+        let (region, set, _) = guamis.first().expect("a GUAMI");
+        let (region, set) = (*region, *set);
+        json!({
+            "amfInfo": {
+                "amfRegionId": format!("{region:02x}"),
+                "amfSetId": format!("{set:03x}"),
+                "guamiList": guamis
+                    .into_iter()
+                    .filter(|(r, s, _)| (*r, *s) == (region, set))
+                    .map(|(_, _, g)| g)
+                    .collect::<Vec<_>>(),
+            }
+        })
+    }
+
+    /// Under the production profile, whether the NRF configured by `nrf_yaml`
+    /// admits NFRegister of `amf_id` with `profile`'s `guamiList`.
+    fn admits(nrf_yaml: &str, amf_id: &str, profile: &serde_json::Value) -> bool {
+        let yaml: NrfYaml = serde_yaml::from_str(nrf_yaml).expect("nrf.yaml parses");
+        let allow = NrfPolicy::from_yaml(&yaml).nf_set_allowlist;
+        let guamis = nextgcore_nrfd::sbi_path::guami_list_of(profile);
+        assert!(!guamis.is_empty(), "the AMF lists GUAMIs");
+        ALLOWLIST.sync_scope(allow, || {
+            refuse_unbound_amf_guamis(
+                "NFRegister",
+                amf_id,
+                "AMF",
+                profile,
+                &guamis,
+                SbiProfile::Production,
+            )
+            .is_none()
+        })
+    }
+
+    /// The whole check for one stack: the allowlist names the AMF Set the
+    /// AMF's GUAMI encodes, for exactly its instance, and the production check
+    /// admits it and refuses any other AMF and another AMF Set.
+    fn check(stack: &str, nrf_yaml: &str, amf_yaml: &str, amf_id: &str) {
+        let profile = amf_info_for(amf_yaml);
+        let guamis = nextgcore_nrfd::sbi_path::guami_list_of(&profile);
+        let region =
+            u32::from_str_radix(profile["amfInfo"]["amfRegionId"].as_str().unwrap(), 16).unwrap();
+        let set =
+            u32::from_str_radix(profile["amfInfo"]["amfSetId"].as_str().unwrap(), 16).unwrap();
+        let want = amf_set_nf_set_id(region, set, guamis[0]).expect("a PLMN");
+        let yaml: NrfYaml = serde_yaml::from_str(nrf_yaml).expect("nrf.yaml parses");
+        let allow = NrfPolicy::from_yaml(&yaml)
+            .nf_set_allowlist
+            .unwrap_or_default();
+        assert!(
+            allow
+                .iter()
+                .any(|a| a.nf_set_id.eq_ignore_ascii_case(&want) && a.admits(&want, "AMF", amf_id)),
+            "{stack}: the rendered nrf.nf_set_allowlist provisions the AMF {amf_id} for its \
+             GUAMI-derived AMF Set {want}; got {allow:?}"
+        );
+        assert!(
+            admits(nrf_yaml, amf_id, &profile),
+            "{stack}: a production NRF admits the AMF's guamiList"
+        );
+        assert!(
+            !admits(nrf_yaml, "20520000-0000-4000-8000-0000000000ff", &profile),
+            "{stack}: another AMF claiming the same AMF Set is refused (the entry names the \
+             AMF's instance)"
+        );
+        let mut other = profile.clone();
+        let other_set = (set + 1) & 0x3ff;
+        other["amfInfo"]["amfSetId"] = json!(format!("{other_set:03x}"));
+        for g in other["amfInfo"]["guamiList"].as_array_mut().unwrap() {
+            g["amfId"] = json!(format!("{:06x}", (region << 16) | (other_set << 6)));
+        }
+        assert!(
+            !admits(nrf_yaml, amf_id, &other),
+            "{stack}: the AMF listing GUAMIs of another AMF Set is refused"
+        );
+    }
+
+    /// #2052: `helm template` with `global.sbiProfile=production`: the NRF runs
+    /// the production profile and its allowlist admits the chart's AMF for
+    /// the AMF Set of its configured GUAMI. And an operator's
+    /// `nrf.nfSetAllowlist` replaces the derived entry.
+    ///
+    /// REVERT-VERIFIED: with the chart's derived default removed
+    /// (`nextgcore.nfSetAllowlist` rendering nothing when unset), the
+    /// "provisions the AMF" assertion fails; with its `nf_instance_ids`
+    /// dropped, the "another AMF ... is refused" assertion does.
+    #[test]
+    fn the_helm_chart_provisions_its_amf_for_its_amf_set_2052() {
+        let root = repo_root();
+        let Some(rendered) =
+            helm_render::render_chart_with(&root, &["--set", "global.sbiProfile=production"])
+        else {
+            return;
+        };
+        assert_eq!(
+            helm_render::deployment_env_in(&rendered, "t-nrf", "nrf", "NEXTGCORE_SBI_PROFILE")
+                .as_deref(),
+            Some("production"),
+            "the NRF runs the production profile"
+        );
+        let amf_id =
+            helm_render::deployment_env_in(&rendered, "t-amf", "amf", "NEXTGCORE_AMF_INSTANCE_ID")
+                .expect("the AMF pins its nfInstanceId");
+        let nrf = helm_render::config_in(&rendered, "nrf.yaml").expect("nrf.yaml");
+        let amf = helm_render::config_in(&rendered, "amf.yaml").expect("amf.yaml");
+        check("helm", &nrf, &amf, &amf_id);
+
+        // Another AMF Set and PLMN: the derived entry follows them.
+        let rendered = helm_render::render_chart_with(
+            &root,
+            &[
+                "--set",
+                "global.sbiProfile=production",
+                "--set",
+                "amf.config.amfId.region=255",
+                "--set",
+                "amf.config.amfId.set=1023",
+                "--set-string",
+                "global.plmn.mcc=001",
+                "--set-string",
+                "global.plmn.mnc=01",
+            ],
+        )
+        .expect("helm ran above");
+        let nrf = helm_render::config_in(&rendered, "nrf.yaml").expect("nrf.yaml");
+        assert!(
+            nrf.contains("set3ff.regionff.amfset.5gc.mnc001.mcc001"),
+            "the derived entry follows amf.config.amfId and global.plmn: {nrf}"
+        );
+
+        // An operator's list replaces the derived entry.
+        let explicit = format!(
+            "nrf.nfSetAllowlist=[{{\"nf_set_id\":\"SET001.region02.amfset.5gc.mnc070.mcc999\",\
+             \"nf_types\":[\"AMF\"],\"nf_instance_ids\":[\"{amf_id}\"]}},\
+             {{\"nf_set_id\":\"set1.pcfset.5gc.mnc070.mcc999\",\"nf_types\":[\"PCF\"]}}]"
+        );
+        let rendered = helm_render::render_chart_with(
+            &root,
+            &[
+                "--set",
+                "global.sbiProfile=production",
+                "--set-json",
+                &explicit,
+            ],
+        )
+        .expect("helm ran above");
+        let nrf = helm_render::config_in(&rendered, "nrf.yaml").expect("nrf.yaml");
+        let amf = helm_render::config_in(&rendered, "amf.yaml").expect("amf.yaml");
+        let yaml: NrfYaml = serde_yaml::from_str(&nrf).expect("nrf.yaml parses");
+        let allow = NrfPolicy::from_yaml(&yaml)
+            .nf_set_allowlist
+            .expect("an allowlist");
+        assert_eq!(
+            allow
+                .iter()
+                .map(|a| a.nf_set_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "SET001.region02.amfset.5gc.mnc070.mcc999",
+                "set1.pcfset.5gc.mnc070.mcc999"
+            ],
+            "the operator's list, verbatim"
+        );
+        check("helm (operator list)", &nrf, &amf, &amf_id);
+    }
+
+    /// #2052: the static k8s manifests (k8s/manifests/configmap.yaml, the base
+    /// of k8s/ and deploy/eks/) list their AMF: its GUAMI in amf.yaml and its
+    /// pinned nfInstanceId in k8s/manifests/amf.yaml. Checked under the
+    /// production profile, which those manifests do not yet run (dev).
+    ///
+    /// REVERT-VERIFIED: with the entry's set changed to 002, the "provisions
+    /// the AMF" assertion fails.
+    #[test]
+    fn the_k8s_manifests_provision_their_amf_for_its_amf_set_2052() {
+        let root = repo_root();
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let amf_manifest = std::fs::read_to_string(root.join("k8s/manifests/amf.yaml")).unwrap();
+        let amf_id = helm_render::deployment_env_in(
+            &amf_manifest,
+            "amf",
+            "amf",
+            "NEXTGCORE_AMF_INSTANCE_ID",
+        )
+        .expect("k8s/manifests/amf.yaml pins NEXTGCORE_AMF_INSTANCE_ID");
+        check(
+            "k8s",
+            cm["data"]["nrf.yaml"].as_str().expect("nrf.yaml"),
+            cm["data"]["amf.yaml"].as_str().expect("amf.yaml"),
+            &amf_id,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests_nf_set_ids_1719 {
     use super::*;

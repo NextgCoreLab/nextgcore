@@ -430,6 +430,11 @@ def check_k8s(table, fname, docs):
                     errors.append('%s configures %s but presents no certificate' % (w, u))
             else:
                 nf_type, want = table[row]
+                if nf_type == 'NRF':
+                    # #2052: the IDs its nf_set_allowlist names are other NFs'.
+                    allowlist = nrf_allowlist(k8s_texts(c, pod, configmaps))
+                    errors += check_nrf_allowlist(w, table, allowlist)
+                    ids = ids - {i for i, _ in allowlist if i != want}
                 if not ids:
                     errors.append('%s pins no nfInstanceId; its certificate names urn:uuid:%s'
                                   % (w, want))
@@ -447,6 +452,45 @@ def check_k8s(table, fname, docs):
             if env.get('NEXTGCORE_NRF_TLS_SERVER_NAME') != 'nrf':
                 errors.append('%s: NEXTGCORE_NRF_TLS_SERVER_NAME is %r, not nrf'
                               % (w, env.get('NEXTGCORE_NRF_TLS_SERVER_NAME')))
+    return errors
+
+
+def nrf_allowlist(texts):
+    """#2052: the `nrf.nf_set_allowlist` entries among the NRF's config texts, as
+    [(nf_instance_id, nf_types or None)]. These IDs name the OTHER NFs the NRF
+    lets claim an NF Set (the chart derives the AMF's), not the NRF itself."""
+    out = []
+    for text in texts:
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            continue
+        for doc in docs:
+            nrf = doc.get('nrf') if isinstance(doc, dict) else None
+            for entry in (nrf or {}).get('nf_set_allowlist') or [] if isinstance(nrf, dict) else []:
+                if not isinstance(entry, dict):
+                    continue
+                types = entry.get('nf_types')
+                for i in entry.get('nf_instance_ids') or []:
+                    out.append((str(i).strip().lower(),
+                                [str(t).strip().upper() for t in types] if types else None))
+    return out
+
+
+def check_nrf_allowlist(where, table, allowlist):
+    """#2052: every NF instance an NRF allowlist entry names is a row of
+    certs/nf-identities.txt of a type the entry admits, so the entry binds a set
+    to an NF whose certificate names that ID."""
+    by_id = {want.lower(): (row, nf_type) for row, (nf_type, want) in table.items()}
+    errors = []
+    for nf_id, types in allowlist:
+        hit = by_id.get(nf_id)
+        if hit is None:
+            errors.append('%s: nrf.nf_set_allowlist names %s, which no row of '
+                          'certs/nf-identities.txt has' % (where, nf_id))
+        elif types is not None and hit[1].upper() not in types:
+            errors.append('%s: nrf.nf_set_allowlist names %s (row %s, %s) for nf_types %s'
+                          % (where, nf_id, hit[0], hit[1], types))
     return errors
 
 
@@ -848,6 +892,28 @@ def self_test():
     for edit, needle in cases6:
         errs = broken6(edit)
         assert any(needle in e for e in errs), (needle, errs)
+    # #2052: the NRF's nf_set_allowlist names the AMF's ID; that is not the NRF
+    # configuring another identity, but it must name a row of a type it admits.
+    def nrf_with(entries):
+        def edit(d):
+            cfg = yaml.safe_load(d[0]['data']['nrf.yaml'])
+            cfg['nrf']['nf_set_allowlist'] = entries
+            d[0]['data']['nrf.yaml'] = yaml.safe_dump(cfg)
+        return edit
+    amf_entry = {'nf_set_id': 'set001.region02.amfset.5gc.mnc070.mcc999',
+                 'nf_types': ['AMF'], 'nf_instance_ids': [t6['amf'][1]]}
+    assert broken6(nrf_with([amf_entry])) == [], broken6(nrf_with([amf_entry]))
+    for entries, needle in [
+            ([dict(amf_entry, nf_instance_ids=['6b1d7e3c-0000-4000-8000-0000000005f0'])],
+             'which no row of'),
+            ([dict(amf_entry, nf_types=['SMF'])], 'for nf_types'),
+    ]:
+        errs = broken6(nrf_with(entries))
+        assert len(errs) == 1 and needle in errs[0], (needle, errs)
+    # Outside the allowlist the NRF still may configure no other NF's ID.
+    errs = broken6(lambda d: d[2]['spec']['template']['spec']['containers'][0]['env'].append(
+        {'name': 'X', 'value': t6['amf'][1]}))
+    assert any('configures ' + t6['amf'][1] in e for e in errs), errs
     # Rule 7: a Helm render, as rule 6 plus the rendered identity table.
     t7 = {'amf': t6['amf'], 'nrf': t6['nrf']}
     ids = {'kind': 'ConfigMap', 'metadata': {'name': 'r-nf-identities'}, 'data': {
