@@ -13158,10 +13158,14 @@ mod tests {
             };
             let mut cert = base();
             cert.peer_cert_nf_instance_id = Some(OTHER.into());
+            // #2065: typed, as a consumer's certificate is (RFC 9310).
+            cert.peer_cert_nf_types = vec!["AF".into()];
             let mut token = base();
             token.oauth2_subject = Some(OTHER.into());
             let mut mismatch = base();
             mismatch.peer_cert_nf_instance_id = Some(TEST_CONSUMER_1865.into());
+            // #2065: typed, as a consumer's certificate is (RFC 9310).
+            mismatch.peer_cert_nf_types = vec!["AF".into()];
             mismatch.oauth2_subject = Some(OTHER.into());
             vec![
                 ("foreign certificate", cert),
@@ -13401,6 +13405,10 @@ mod tests {
             let b = (method == "PUT").then(|| body("http://127.0.0.1:9/hijacked"));
             let mut r = make_request(method, &location, b);
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                r.peer_cert_nf_types = vec!["AF".into()];
+            }
             r.oauth2_subject = token.map(str::to_string);
             r
         };
@@ -13457,6 +13465,8 @@ mod tests {
             Some(body("http://127.0.0.1:9/mixed")),
         );
         mixed.peer_cert_nf_instance_id = Some(TEST_CONSUMER_1865.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["AF".into()];
         mixed.oauth2_subject = Some(OTHER.into());
         assert_eq!(pcf_sbi_request_handler(mixed).await.status, 403);
         assert!(
@@ -15087,6 +15097,10 @@ mod tests {
         );
         let as_nf = |mut r: SbiRequest, cert: Option<&str>, token: Option<&str>| {
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                r.peer_cert_nf_types = vec!["AF".into()];
+            }
             r.oauth2_subject = token.map(str::to_string);
             r
         };

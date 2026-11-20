@@ -22,9 +22,13 @@
 //!    consumer's NF Instance ID), which survives an SCP hop (TS 33.501 §13.3).
 //!
 //! A relay is recognised only by the RFC 9310 NFTypes extension of its
-//! certificate. An SCP certificate without one counts as the consumer, so it
-//! disagrees with the consumer's token and the request is refused: this fails
-//! closed (R32 on #1936).
+//! certificate. #2065: a certificate that names NO NF type cannot be told from a
+//! relay's, so under the `production` SBI profile it is not an identity at all:
+//! with a token, the token's `sub` is the caller; without one, the caller is
+//! refused (an untyped SCP certificate would otherwise own every resource
+//! created through it, fail-open). Under `dev` an untyped certificate still
+//! counts as the consumer, as before: it then disagrees with a consumer's token
+//! behind an SCP and the request is refused (R32 on #1936).
 //!
 //! A binding is to one NF instance. There is no NF-set or AMF-set awareness
 //! (TS 29.500 §6.5, TS 23.501 §5.21): a set member that takes over another's
@@ -111,8 +115,41 @@ pub fn identity_required() -> bool {
 }
 
 /// The caller's verified NF Instance ID: `Ok(None)` when it proved none,
-/// `Err(detail)` when its certificate and token name different NF instances.
+/// `Err(detail)` when its certificate and token name different NF instances,
+/// or (#2065, under [`identity_required`]) when its only identity is a
+/// certificate that names no NF type.
 pub fn verified_consumer_id(request: &SbiRequest) -> Result<Option<String>, String> {
+    verified_consumer_id_with(request, identity_required())
+}
+
+/// [`verified_consumer_id`] with an explicit `required` (the production rule of
+/// #2065 for an untyped certificate).
+pub fn verified_consumer_id_with(
+    request: &SbiRequest,
+    required: bool,
+) -> Result<Option<String>, String> {
+    let untyped = request.peer_cert_nf_types.is_empty()
+        && request
+            .peer_cert_nf_instance_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+    if required && untyped {
+        // #2065: an untyped certificate is not an identity under production.
+        return match request
+            .oauth2_subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(sub) => Ok(Some(sub.to_string())),
+            None => Err(
+                "the requester's client certificate names no NF type (RFC 9310 \
+                         NFTypes), so it cannot be told from a relay's, and it presented no \
+                         access token"
+                    .to_string(),
+            ),
+        };
+    }
     let relay = is_relay_certificate(&request.peer_cert_nf_types);
     let cert = request
         .peer_cert_nf_instance_id
@@ -149,7 +186,7 @@ pub fn owner_for_new_resource_with(
     operation: &str,
     required: bool,
 ) -> Result<Option<String>, Box<SbiResponse>> {
-    match verified_consumer_id(request) {
+    match verified_consumer_id_with(request, required) {
         Err(why) => Err(Box::new(forbidden(operation, &why))),
         Ok(None) if required => Err(Box::new(forbidden(
             operation,
@@ -180,7 +217,7 @@ pub fn non_owner_refusal_with(
                 .to_string()
         });
     };
-    match verified_consumer_id(request) {
+    match verified_consumer_id_with(request, required) {
         Err(why) => Some(why),
         Ok(None) => Some(format!(
             "the requester has no verified identity; the resource belongs to NF instance \
@@ -452,8 +489,20 @@ pub async fn verified_nf_type(
     request: &SbiRequest,
     expected: crate::types::NfType,
 ) -> Result<(), String> {
+    verified_nf_type_with(request, expected, identity_required()).await
+}
+
+/// [`verified_nf_type`] with an explicit `required` (the production rule of
+/// #2065, passed on to [`verified_consumer_id_with`]): under it a certificate
+/// without NF types and no token is refused as no identity at all, before any
+/// NF-type check.
+pub async fn verified_nf_type_with(
+    request: &SbiRequest,
+    expected: crate::types::NfType,
+    required: bool,
+) -> Result<(), String> {
     let want = expected.to_str();
-    match verified_consumer_id(request)? {
+    match verified_consumer_id_with(request, required)? {
         Some(_) => {}
         None => return Err("the requester has no verified identity".to_string()),
     }
@@ -778,49 +827,70 @@ mod tests {
     /// token, an anonymous caller and a certificate/token mismatch refuse; a
     /// token (alone or through an SCP) is the NRF's to vouch for, here seeded.
     ///
+    /// Both profiles are passed explicitly (`verified_nf_type_with`), so the
+    /// test reads no process-global profile and passes run alone (#2089 R40:
+    /// it used to depend on a sibling having set Dev). Under production
+    /// (#2065) the typeless certificate is refused as no identity at all,
+    /// before the NF-type check; under dev it reaches the NF-type check and is
+    /// refused there.
+    ///
     /// REVERT-VERIFIED: with "no NF types" counted as `expected` (the #1860
-    /// rule), the typeless certificate is admitted and its `unwrap_err` panics.
+    /// rule), the dev typeless certificate is admitted and its `unwrap_err`
+    /// panics; with #2065's untyped arm off, the production typeless
+    /// certificate gets the NF-type message and "no identity" fails.
     #[tokio::test]
     async fn verified_nf_type_takes_the_certificate_else_the_nrf_2099() {
         const AMF: &str = "aaaaaaaa-2099-4000-8000-0000000000a3";
         const SCP: &str = "55555555-2099-4000-8000-000000000005";
         seed_nf_type_for_test(AMF, NfType::Amf);
-        let ok = |r: SbiRequest| async move { verified_nf_type(&r, NfType::Amf).await };
-        assert_eq!(
-            ok(caller(Some(B), None, &["AMF"])).await,
-            Ok(()),
-            "direct AMF"
-        );
-        assert!(ok(caller(Some(B), None, &["SMF"]))
-            .await
-            .unwrap_err()
-            .contains("not AMF"));
-        assert!(
-            ok(caller(Some(AMF), None, &[]))
+        for production in [true, false] {
+            let ok = |r: SbiRequest| async move {
+                verified_nf_type_with(&r, NfType::Amf, production).await
+            };
+            assert_eq!(
+                ok(caller(Some(B), None, &["AMF"])).await,
+                Ok(()),
+                "direct AMF (production={production})"
+            );
+            assert!(ok(caller(Some(B), None, &["SMF"]))
                 .await
                 .unwrap_err()
-                .contains("names no NF types"),
-            "typeless certificate"
-        );
-        assert!(ok(caller(None, None, &[])).await.is_err(), "anonymous");
+                .contains("not AMF"));
+            assert!(ok(caller(None, None, &[])).await.is_err(), "anonymous");
+            assert!(
+                ok(caller(Some(A), Some(B), &["AMF"])).await.is_err(),
+                "mismatch"
+            );
+            assert_eq!(
+                ok(caller(None, Some(AMF), &[])).await,
+                Ok(()),
+                "seeded token (production={production})"
+            );
+            assert_eq!(
+                ok(caller(Some(SCP), Some(AMF), &["SCP"])).await,
+                Ok(()),
+                "SCP + token (production={production})"
+            );
+            assert_eq!(
+                ok(caller(Some(AMF), Some(AMF), &[])).await,
+                Ok(()),
+                "typeless certificate plus its token (production={production})"
+            );
+        }
+        let production = verified_nf_type_with(&caller(Some(AMF), None, &[]), NfType::Amf, true)
+            .await
+            .unwrap_err();
         assert!(
-            ok(caller(Some(A), Some(B), &["AMF"])).await.is_err(),
-            "mismatch"
+            production.contains("names no NF type (RFC 9310 NFTypes)")
+                && production.contains("presented no access token"),
+            "under production a typeless certificate alone is no identity: {production}"
         );
-        assert_eq!(
-            ok(caller(None, Some(AMF), &[])).await,
-            Ok(()),
-            "seeded token"
-        );
-        assert_eq!(
-            ok(caller(Some(SCP), Some(AMF), &["SCP"])).await,
-            Ok(()),
-            "SCP + token"
-        );
-        assert_eq!(
-            ok(caller(Some(AMF), Some(AMF), &[])).await,
-            Ok(()),
-            "typeless certificate plus its token"
+        let dev = verified_nf_type_with(&caller(Some(AMF), None, &[]), NfType::Amf, false)
+            .await
+            .unwrap_err();
+        assert!(
+            dev.contains("names no NF types") && dev.contains("cannot be shown to be an AMF"),
+            "under dev a typeless certificate alone fails the NF-type check: {dev}"
         );
     }
 
@@ -886,36 +956,76 @@ mod tests {
     #[test]
     fn the_identity_is_the_certificate_else_the_token_and_they_must_agree() {
         assert_eq!(
-            verified_consumer_id(&caller(Some(A), None, &["AMF"])),
+            verified_consumer_id_with(&caller(Some(A), None, &["AMF"]), false),
             Ok(Some(A.into()))
         );
         assert_eq!(
-            verified_consumer_id(&caller(None, Some(A), &[])),
+            verified_consumer_id_with(&caller(None, Some(A), &[]), false),
             Ok(Some(A.into()))
         );
         assert_eq!(
-            verified_consumer_id(&caller(Some(A), Some(&A.to_uppercase()), &[])),
+            verified_consumer_id_with(&caller(Some(A), Some(&A.to_uppercase()), &[]), false),
             Ok(Some(A.into()))
         );
         // Through an SCP: its certificate is not the consumer; the token is.
         assert_eq!(
-            verified_consumer_id(&caller(Some(B), Some(A), &["SCP"])),
+            verified_consumer_id_with(&caller(Some(B), Some(A), &["SCP"]), false),
             Ok(Some(A.into()))
         );
         assert_eq!(
-            verified_consumer_id(&caller(Some(B), None, &["sepp"])),
+            verified_consumer_id_with(&caller(Some(B), None, &["sepp"]), false),
             Ok(None)
         );
-        assert_eq!(verified_consumer_id(&caller(None, None, &[])), Ok(None));
-        assert!(verified_consumer_id(&caller(Some(A), Some(B), &["AMF"])).is_err());
+        assert_eq!(
+            verified_consumer_id_with(&caller(None, None, &[]), false),
+            Ok(None)
+        );
+        assert!(verified_consumer_id_with(&caller(Some(A), Some(B), &["AMF"]), false).is_err());
     }
 
+    /// #2065: under production a certificate naming no NF type is not an identity:
+    /// alone it is refused (it cannot be told from an untyped relay's, which would
+    /// own every resource created through it); with a token the token's `sub` is
+    /// the caller. Typed certificates and dev are unchanged. REVERT-VERIFIED: with
+    /// the untyped arm removed, the lone untyped certificate is accepted as A.
+    #[test]
+    fn an_untyped_certificate_is_no_identity_under_production_2065() {
+        assert!(
+            verified_consumer_id_with(&caller(Some(A), None, &[]), true).is_err(),
+            "an untyped certificate alone must be refused"
+        );
+        assert_eq!(
+            verified_consumer_id_with(&caller(Some(B), Some(A), &[]), true),
+            Ok(Some(A.into())),
+            "with a token, the token's sub is the caller"
+        );
+        assert_eq!(
+            verified_consumer_id_with(&caller(Some(A), None, &["AMF"]), true),
+            Ok(Some(A.into())),
+            "a typed certificate is still an identity"
+        );
+        // Dev: as before.
+        assert_eq!(
+            verified_consumer_id_with(&caller(Some(A), None, &[]), false),
+            Ok(Some(A.into()))
+        );
+        // Through the create and manage paths.
+        assert!(owner_for_new_resource_with(&caller(Some(A), None, &[]), "Create", true).is_err());
+        assert!(non_owner_refusal_with(Some(A), &caller(Some(A), None, &[]), true).is_some());
+        assert_eq!(
+            non_owner_refusal_with(Some(A), &caller(Some(B), Some(A), &[]), true),
+            None
+        );
+    }
+
+    /// (#2065: the certificates here are typed, an AMF's; an untyped one is no
+    /// identity under `required`, see `an_untyped_certificate_is_no_identity_...`.)
     /// REVERT-VERIFIED: with the `required` arm removed the anonymous create
     /// under `required` returns `Ok(None)`; with the mismatch mapped to
     /// `Ok(None)` the mixed caller is not refused.
     #[test]
     fn create_refuses_a_mismatch_always_and_an_anonymous_caller_when_required() {
-        let mixed = caller(Some(A), Some(B), &[]);
+        let mixed = caller(Some(A), Some(B), &["AMF"]);
         for required in [false, true] {
             let refused = owner_for_new_resource_with(&mixed, "Subscribe", required)
                 .expect_err("certificate and token disagree");
@@ -943,7 +1053,7 @@ mod tests {
     fn only_the_owner_manages_a_bound_resource_and_an_ownerless_one_is_frozen_when_required() {
         for required in [false, true] {
             assert_eq!(
-                non_owner_refusal_with(Some(A), &caller(Some(A), None, &[]), required),
+                non_owner_refusal_with(Some(A), &caller(Some(A), None, &["AMF"]), required),
                 None
             );
             assert_eq!(
@@ -955,10 +1065,10 @@ mod tests {
                 None
             );
             for other in [
-                caller(Some(B), None, &[]),
+                caller(Some(B), None, &["AMF"]),
                 caller(None, Some(B), &[]),
                 caller(None, None, &[]),
-                caller(Some(A), Some(B), &[]),
+                caller(Some(A), Some(B), &["AMF"]),
                 caller(Some(A), None, &["SCP"]),
             ] {
                 assert!(
@@ -969,10 +1079,10 @@ mod tests {
         }
         // Ownerless: open under dev, frozen under production, for every caller.
         assert_eq!(
-            non_owner_refusal_with(None, &caller(Some(B), None, &[]), false),
+            non_owner_refusal_with(None, &caller(Some(B), None, &["AMF"]), false),
             None
         );
-        for anyone in [caller(Some(B), None, &[]), caller(None, None, &[])] {
+        for anyone in [caller(Some(B), None, &["AMF"]), caller(None, None, &[])] {
             let resp = refuse_non_owner_with(None, &anyone, "Unsubscribe", true)
                 .expect("an ownerless resource is frozen under production");
             assert_eq!(resp.status, 403);

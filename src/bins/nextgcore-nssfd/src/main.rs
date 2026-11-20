@@ -6102,6 +6102,8 @@ nssf:
         .with_json_body(&body)
         .unwrap();
         cert_req.peer_cert_nf_instance_id = Some(owner.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        cert_req.peer_cert_nf_types = vec!["AMF".into()];
         assert_eq!(
             handle_nssai_availability_update(owner, &cert_req)
                 .await
@@ -6210,6 +6212,11 @@ nssf:
             ));
             r.oauth2_subject = token.map(str::to_string);
             r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            if cert.is_some() {
+                // #2065: a consumer's certificate names its NF type (RFC 9310); an
+                // untyped one is no identity under the production profile.
+                r.peer_cert_nf_types = vec!["AMF".into()];
+            }
             r
         };
         for (req, what) in [
@@ -6253,6 +6260,8 @@ nssf:
         let mut put = authenticated_availability_request("PUT", owner, Some(&body));
         put.oauth2_subject = Some("19370000-0000-4000-8000-0000000000b2".into());
         put.peer_cert_nf_instance_id = Some(owner.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        put.peer_cert_nf_types = vec!["AMF".into()];
         let r = handle_nssai_availability_update(owner, &put).await;
         assert_eq!(r.status, 403, "{:?}", r.http.content);
         assert!(with_nssf_context(|c| c.get_nssai_availability(owner).is_none()).unwrap());
@@ -7832,6 +7841,11 @@ mod subscription_owner_tests_1909 {
 
     fn with(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
         r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        if cert.is_some() {
+            // #2065: a consumer's certificate names its NF type (RFC 9310); an
+            // untyped one is no identity under the production profile.
+            r.peer_cert_nf_types = vec!["AMF".into()];
+        }
         r.oauth2_subject = token.map(str::to_string);
         r
     }

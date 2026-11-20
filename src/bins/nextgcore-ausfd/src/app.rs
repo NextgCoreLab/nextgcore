@@ -1031,6 +1031,20 @@ fn retired_auth_ctx() -> SbiResponse {
 /// `Err` is the reason a caller is refused: its token names an NF its own
 /// certificate does not.
 fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
+    caller_identity_with(
+        request,
+        nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+    )
+}
+
+/// [`caller_identity`] under the profile `production` says (#2065).
+///
+/// Under production a certificate that names NO NF type (RFC 9310 NFTypes) is not
+/// an identity: it cannot be told from an untyped relay's, which would otherwise
+/// own every context started through it. With a token, the token's `sub` is the
+/// caller; without one the caller is refused. Under dev it still counts as the
+/// caller's (the rule of `nextgcore_sbi::owner_binding`, #2065).
+fn caller_identity_with(request: &SbiRequest, production: bool) -> Result<Option<String>, String> {
     let verified = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
@@ -1039,6 +1053,13 @@ fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
     };
     let token = verified(&request.oauth2_subject);
     let cert = verified(&request.peer_cert_nf_instance_id);
+    if production && cert.is_some() && request.peer_cert_nf_types.is_empty() {
+        return token.map(Some).ok_or_else(|| {
+            "the client certificate names no NF type, so it cannot be told from a relay's, \
+             and no access token was presented"
+                .to_string()
+        });
+    }
     match (token, cert) {
         (Some(t), Some(c)) if !t.eq_ignore_ascii_case(&c) => {
             // #1928: a certificate naming the SCP AND another NF type could
@@ -1145,14 +1166,43 @@ fn forbidden(detail: &str) -> SbiResponse {
 /// caller whose identities conflict is refused either way (#1907). `Some` is
 /// the refusal to send.
 fn refuse_foreign_caller(ue: &crate::context::AusfUe, request: &SbiRequest) -> Option<SbiResponse> {
-    let caller = match caller_identity(request) {
+    refuse_foreign_caller_with(
+        ue,
+        request,
+        nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+    )
+}
+
+/// [`refuse_foreign_caller`] under the profile `production` says. #2065: under
+/// production an UNBOUND context (one restored from before #1872, or started by a
+/// caller that proved no identity under dev) is frozen, as `owner_binding` freezes
+/// an ownerless resource: no caller can show it started it.
+fn refuse_foreign_caller_with(
+    ue: &crate::context::AusfUe,
+    request: &SbiRequest,
+    production: bool,
+) -> Option<SbiResponse> {
+    let caller = match caller_identity_with(request, production) {
         Ok(caller) => caller,
         Err(why) => {
             log::debug!("authCtxId {} refused: {why}", ue.ctx_id);
             return Some(forbidden(&why));
         }
     };
-    let owner = ue.owner.as_deref()?;
+    let Some(owner) = ue.owner.as_deref() else {
+        if production {
+            log::debug!(
+                "authCtxId {} refused: it has no verified owner and is frozen under the \
+                 production profile",
+                ue.ctx_id
+            );
+            return Some(forbidden(
+                "the authentication context has no verified owner, so no caller can be \
+                 shown to have started it",
+            ));
+        }
+        return None;
+    };
     if caller
         .as_deref()
         .is_some_and(|c| c.eq_ignore_ascii_case(owner))
@@ -3708,6 +3758,11 @@ mod tests {
         // other ausfd test doing the same under parallel `cargo test`.
         let _guard = crate::test_support::lock_context();
         let _lock = TEST_MUTEX.lock().await;
+        // #2089: an anonymous DELETE of an unbound context is the dev
+        // lifecycle; under production the context is frozen (#2065, pinned by
+        // `an_untyped_certificate_and_an_unbound_context_under_production_2065`).
+        // Set and left set (CONVENTIONS): run alone, this used to get 403.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         ausf_context_init(128);
 
         let ctx_id = {
@@ -3887,6 +3942,11 @@ mod tests {
         }
         req.oauth2_subject = token_sub.map(str::to_string);
         req.peer_cert_nf_instance_id = cert.map(str::to_string);
+        // #2065: an AMF's certificate names its type (RFC 9310); an untyped one is
+        // no identity under production, which the #2065 tests exercise on purpose.
+        if cert.is_some() && req.peer_cert_nf_types.is_empty() {
+            req.peer_cert_nf_types = vec!["AMF".into()];
+        }
         req
     }
 
@@ -4140,6 +4200,42 @@ mod tests {
             Some(&AMF_A_1872.to_uppercase()),
         );
         assert_eq!(caller_identity(&same).unwrap().as_deref(), Some(AMF_A_1872));
+    }
+
+    /// #2065: under production a certificate naming no NF type is no identity
+    /// (alone: refused; with a token: the token's sub), and an unbound context is
+    /// frozen; under dev both are as before. REVERT-VERIFIED: with the untyped arm
+    /// removed the lone untyped certificate is accepted; with the freeze removed the
+    /// unbound context admits anyone.
+    #[test]
+    fn an_untyped_certificate_and_an_unbound_context_under_production_2065() {
+        let mut untyped = SbiRequest::default();
+        untyped.peer_cert_nf_instance_id = Some(AMF_A_1872.into());
+        assert!(caller_identity_with(&untyped, true).is_err());
+        assert_eq!(
+            caller_identity_with(&untyped, false).unwrap().as_deref(),
+            Some(AMF_A_1872),
+            "dev: as before"
+        );
+        let mut via = untyped.clone();
+        via.oauth2_subject = Some(AMF_B_1872.into());
+        assert_eq!(
+            caller_identity_with(&via, true).unwrap().as_deref(),
+            Some(AMF_B_1872),
+            "with a token, the token's sub"
+        );
+
+        let mut ctx = crate::context::AusfContext::new();
+        ctx.init(8);
+        let unbound = ctx.ue_add("suci-0-001-01-0000-0-0-2065000001").unwrap();
+        assert!(unbound.owner.is_none());
+        let caller = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), None);
+        let refused = refuse_foreign_caller_with(&unbound, &caller, true).expect("frozen");
+        assert_eq!(refused.status, 403);
+        assert!(
+            refuse_foreign_caller_with(&unbound, &caller, false).is_none(),
+            "dev: open"
+        );
     }
 
     /// (2) at the handler: the authentication is refused before a context is
@@ -4960,6 +5056,10 @@ mod tests {
     async fn test_missing_supi_or_suci_is_rejected() {
         let _guard = crate::test_support::lock_context();
         let _lock = TEST_MUTEX.lock().await;
+        // #2089: the body check is what this test is about; under production an
+        // anonymous Authenticate is refused 403 before the body is read (#1964).
+        // Set and left set (CONVENTIONS): run alone, this used to get 403.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         ausf_context_init(64);
 
         // No UDM is configured for this test on purpose: if the handler still

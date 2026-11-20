@@ -909,6 +909,8 @@ mod tests {
                 1 => r.oauth2_subject = Some(OTHER.into()),
                 2 => {
                     r.peer_cert_nf_instance_id = Some(TEST_EES_1937.into());
+                    // #2065: typed, as a consumer's certificate is (RFC 9310).
+                    r.peer_cert_nf_types = vec!["AF".into()];
                     r.oauth2_subject = Some(OTHER.into());
                 }
                 _ => {}
