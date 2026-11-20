@@ -659,8 +659,16 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(period).await;
             reconcile_pending_subscriptions().await;
-            // #2102: and live legs are refreshed before they lapse.
-            refresh_live_subscriptions_at(now_unix_secs()).await;
+        }
+    });
+    // #2102: live legs are refreshed before they lapse. #2128 (R42): on their
+    // own task, so a blackholed producer's refreshes cannot hold up the #111
+    // retries above (nor they it).
+    tokio::spawn(async move {
+        let period = Duration::from_secs(reconcile_interval_secs());
+        loop {
+            tokio::time::sleep(period).await;
+            refresh_live_subscriptions_with(Arc::new(now_unix_secs)).await;
         }
     });
     // #1877: and southbound unsubscribes that failed are retried until delivered.
@@ -1770,19 +1778,43 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
 /// timed out after the producer took it, and neither TS 29.518 nor TS 29.503
 /// gives the NEF a way to learn its id -- is never refreshed and lapses at the
 /// producer within this.
+///
+/// #2128 (R42): at least four refresh ticks ([`reconcile_interval_secs`]), so
+/// the margin below always leaves two ticks to refresh in.
 fn southbound_lifetime_secs() -> u64 {
-    std::env::var("NEF_SOUTHBOUND_LIFETIME_SECS")
+    let configured = std::env::var("NEF_SOUTHBOUND_LIFETIME_SECS")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600)
-        .max(60)
+        .and_then(|v| v.parse().ok());
+    refresh_timing(configured, reconcile_interval_secs()).0
 }
 
 /// #2102: a live leg is refreshed once at most this much of its lifetime is
-/// left: half of it, so several missed sweeps ([`reconcile_interval_secs`])
-/// still refresh it in time.
+/// left: half of it, so several missed sweeps still refresh it in time. #2128
+/// (R42): with the lifetime at least four ticks, that is at least two refresh
+/// ticks ([`reconcile_interval_secs`]), so a refresh cannot first fall due a
+/// second before the leg lapses.
 fn southbound_refresh_margin_secs() -> u64 {
     southbound_lifetime_secs() / 2
+}
+
+/// #2128: (lifetime, refresh margin) for a configured lifetime (default one
+/// hour, at least one minute) and a refresh tick of `interval` seconds: the
+/// lifetime is at least four ticks, the margin half of it.
+fn refresh_timing(configured: Option<u64>, interval: u64) -> (u64, u64) {
+    let lifetime = configured
+        .unwrap_or(3600)
+        .max(60)
+        .max(interval.saturating_mul(4));
+    (lifetime, lifetime / 2)
+}
+
+/// #2128 (R42): at most this many producers are refreshed at once in a pass.
+const REFRESH_MAX_PRODUCERS: usize = 8;
+
+/// #2128 (R42): one producer's refreshes in a pass stop after this long (one
+/// tick); the rest wait for the next pass.
+fn refresh_pass_budget() -> Duration {
+    Duration::from_secs(reconcile_interval_secs().max(1))
 }
 
 /// #2102: `body` asking for `expiry` (UNIX seconds): the AMF's
@@ -1857,10 +1889,39 @@ pub struct RefreshReport {
     pub lapsed: usize,
     /// Refreshes that failed and are tried again next sweep.
     pub failed: usize,
+    /// #2128: due legs not tried this pass, because their producer had already
+    /// failed one in it or the pass budget ran out; tried next pass.
+    pub skipped: usize,
+}
+
+impl RefreshReport {
+    fn add(&mut self, other: RefreshReport) {
+        self.refreshed += other.refreshed;
+        self.lapsed += other.lapsed;
+        self.failed += other.failed;
+        self.skipped += other.skipped;
+    }
+}
+
+/// #2102: [`refresh_live_subscriptions_with`] with the clock stopped at `now`
+/// (UNIX seconds).
+pub async fn refresh_live_subscriptions_at(now: u64) -> RefreshReport {
+    refresh_live_subscriptions_with(Arc::new(move || now)).await
+}
+
+/// #2128 (R42): remove `sub_id`, whose leg `southbound` lapsed, owing its DELETE
+/// first (#2086): the snapshot that drops the subscription carries the owed
+/// unsubscribe, so a restart in between still sends it.
+fn remove_lapsed_leg(sub_id: &str, southbound: &SouthboundRef) {
+    southbound_reconcile::owe(southbound.clone());
+    if let Ok(c) = nef_self().read() {
+        c.subscription_remove(sub_id);
+    }
 }
 
 /// #2102: refresh every live southbound leg within
-/// [`southbound_refresh_margin_secs`] of its expiry, as of `now` (UNIX seconds).
+/// [`southbound_refresh_margin_secs`] of its expiry, reading `clock` (UNIX
+/// seconds) afresh for each leg.
 ///
 /// - A leg made before #2102 (no expiry recorded) is refreshed at once, which
 ///   bounds it.
@@ -1873,53 +1934,120 @@ pub struct RefreshReport {
 ///   the producer ignored the expiry.
 /// - Any other failure is retried next sweep.
 ///
+/// #2128 (R42), the #1994 shape: legs are refreshed per producer, up to
+/// [`REFRESH_MAX_PRODUCERS`] producers at once, each in expiry order. A producer
+/// that fails a refresh (no answer, or a 5xx) is not tried again in this pass,
+/// and one producer's refreshes stop after [`refresh_pass_budget`]. So a
+/// blackholed producer costs one request timeout per pass, and other
+/// producers' legs are refreshed regardless.
+///
 /// Only subscriptions this NEF holds are refreshed, so an orphan lapses.
-pub async fn refresh_live_subscriptions_at(now: u64) -> RefreshReport {
+pub async fn refresh_live_subscriptions_with(
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> RefreshReport {
     let live = match nef_self().read() {
         Ok(c) => c.subscriptions_live(),
         Err(_) => return RefreshReport::default(),
     };
-    let margin = southbound_refresh_margin_secs();
     let mut report = RefreshReport::default();
+    let mut by_producer: std::collections::BTreeMap<String, Vec<NefMonitoringSubscription>> =
+        std::collections::BTreeMap::new();
     for sub in live {
+        let Some(southbound) = sub.southbound.as_ref() else {
+            continue;
+        };
+        match southbound
+            .producer_base
+            .clone()
+            .or_else(|| producer_uri(southbound.producer))
+        {
+            Some(base) => by_producer.entry(base).or_default().push(sub),
+            None => {
+                log::warn!(
+                    "monitoring subscription {}: no {} URI to refresh its leg at",
+                    sub.id,
+                    southbound.producer.as_str()
+                );
+                report.failed += 1;
+            }
+        }
+    }
+    let slots = Arc::new(tokio::sync::Semaphore::new(REFRESH_MAX_PRODUCERS));
+    let mut workers = Vec::new();
+    for (base, legs) in by_producer {
+        let (slots, clock) = (slots.clone(), clock.clone());
+        workers.push(spawn_detached(async move {
+            let _slot = slots.acquire_owned().await;
+            refresh_producer_legs(base, legs, clock).await
+        }));
+    }
+    for worker in workers {
+        match worker.await {
+            Ok(r) => report.add(r),
+            Err(e) => log::error!("a refresh worker failed: {e}"),
+        }
+    }
+    if report != RefreshReport::default() {
+        log::info!(
+            "refresh sweep: {} refreshed, {} lapsed, {} failed, {} skipped",
+            report.refreshed,
+            report.lapsed,
+            report.failed,
+            report.skipped
+        );
+    }
+    report
+}
+
+/// #2128: one producer's part of a refresh pass (see
+/// [`refresh_live_subscriptions_with`]).
+async fn refresh_producer_legs(
+    base: String,
+    legs: Vec<NefMonitoringSubscription>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> RefreshReport {
+    let margin = southbound_refresh_margin_secs();
+    let started = std::time::Instant::now();
+    let budget = refresh_pass_budget();
+    let mut producer_failed = false;
+    let mut report = RefreshReport::default();
+    for sub in legs {
         let Some(southbound) = sub.southbound.clone() else {
             continue;
         };
+        let now = clock();
         if sub
             .southbound_expiry
             .is_some_and(|e| e > now.saturating_add(margin))
         {
             continue;
         }
-        let remove = |why: &str| {
+        let gone = |why: &str| {
             log::warn!(
                 "monitoring subscription {}: its {} leg {why}; removing it",
                 sub.id,
                 southbound.producer.as_str()
             );
-            if let Ok(c) = nef_self().read() {
-                c.subscription_remove(&sub.id);
-            }
         };
         if sub.southbound_expiry.is_some_and(|e| e <= now) {
-            // #2086: owed before the removal is persisted, in the same snapshot.
-            southbound_reconcile::owe(southbound.clone());
-            remove("expired before a refresh got through");
-            let uri = southbound
-                .producer_base
-                .clone()
-                .or_else(|| producer_uri(southbound.producer));
-            southbound_unsubscribe(uri, southbound).await;
+            gone("expired before a refresh got through");
+            remove_lapsed_leg(&sub.id, &southbound);
+            // Owed already; sent on its own task so a dead producer's DELETE
+            // timeout does not hold up the pass (parked for retry if it fails).
+            drop(spawn_detached(southbound_unsubscribe(
+                Some(base.clone()),
+                southbound,
+            )));
             report.lapsed += 1;
             continue;
         }
-        let base = southbound
-            .producer_base
-            .clone()
-            .or_else(|| producer_uri(southbound.producer));
-        let Some((host, port)) = base.as_deref().and_then(parse_host_port) else {
+        if producer_failed || started.elapsed() >= budget {
+            report.skipped += 1;
+            continue;
+        }
+        let Some((host, port)) = parse_host_port(&base) else {
             log::warn!(
-                "monitoring subscription {}: no usable {} URI to refresh its leg at",
+                "monitoring subscription {}: invalid {} URI {base:?} to refresh its leg at",
                 sub.id,
                 southbound.producer.as_str()
             );
@@ -1941,7 +2069,10 @@ pub async fn refresh_live_subscriptions_at(now: u64) -> RefreshReport {
                 }
             }
             Ok(resp) if resp.status == 404 => {
-                remove("is gone at the producer (404 on refresh)");
+                gone("is gone at the producer (404 on refresh)");
+                if let Ok(c) = nef_self().read() {
+                    c.subscription_remove(&sub.id);
+                }
                 report.lapsed += 1;
             }
             Ok(resp) => {
@@ -1951,25 +2082,21 @@ pub async fn refresh_live_subscriptions_at(now: u64) -> RefreshReport {
                     southbound.producer.as_str(),
                     resp.status
                 );
+                // A 5xx is the producer failing; a 4xx is this one leg.
+                producer_failed |= resp.status >= 500;
                 report.failed += 1;
             }
             Err(e) => {
                 log::warn!(
-                    "monitoring subscription {}: {} refresh failed: {e}",
+                    "monitoring subscription {}: {} refresh failed: {e}; its other legs \
+                     wait for the next pass",
                     sub.id,
                     southbound.producer.as_str()
                 );
+                producer_failed = true;
                 report.failed += 1;
             }
         }
-    }
-    if report != RefreshReport::default() {
-        log::info!(
-            "refresh sweep: {} refreshed, {} lapsed, {} failed",
-            report.refreshed,
-            report.lapsed,
-            report.failed
-        );
     }
     report
 }
@@ -3675,6 +3802,24 @@ mod tests {
         (srv, format!("http://127.0.0.1:{}", addr.port()), seen)
     }
 
+    /// #2128 (R42 minor 3): seconds the stand-in producers grant short of the
+    /// expiry asked for (0: they grant it). Set only under `lock_globals`.
+    static GRANT_CUT_2102: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The expiry `asked` (RFC 3339) less [`GRANT_CUT_2102`].
+    fn granted_2102(asked: &serde_json::Value) -> serde_json::Value {
+        let cut = GRANT_CUT_2102.load(Ordering::SeqCst);
+        match asked
+            .as_str()
+            .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch)
+        {
+            Some(at) => serde_json::json!(nextgcore_sbi::datetime::epoch_to_rfc3339(
+                at.saturating_sub(cut)
+            )),
+            None => asked.clone(),
+        }
+    }
+
     /// #2102: what a stand-in producer saw: (method, uri, JSON body).
     type Seen2102 = Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
 
@@ -3708,7 +3853,7 @@ mod tests {
                     ));
                     match (req.header.method.as_str(), producer) {
                         ("PATCH", SouthboundProducer::Amf) => {
-                            let expiry = body[0]["value"].clone();
+                            let expiry = granted_2102(&body[0]["value"]);
                             SbiResponse::with_status(patch)
                                 .with_json_body(&serde_json::json!({
                                     "subscription": { "options": { "expiry": expiry } }
@@ -3718,10 +3863,14 @@ mod tests {
                         ("PATCH", SouthboundProducer::Udm) => SbiResponse::with_status(patch),
                         ("POST", SouthboundProducer::Amf) => {
                             tokio::time::sleep(post_delay).await;
+                            let mut granted = body["subscription"].clone();
+                            if let Some(at) = granted.pointer("/options/expiry").cloned() {
+                                granted["options"]["expiry"] = granted_2102(&at);
+                            }
                             SbiResponse::with_status(201)
                                 .with_header("location", "/namf-evts/v1/subscriptions/s-2102")
                                 .with_json_body(&serde_json::json!({
-                                    "subscription": body["subscription"].clone(),
+                                    "subscription": granted,
                                     "subscriptionId": "s-2102"
                                 }))
                                 .expect("json")
@@ -3973,6 +4122,13 @@ mod tests {
             assert_eq!(failed.failed, 1, "a 503 refresh is retried");
             assert!(nef_self().read().unwrap().subscription_find(&id).is_some());
             let lapsed = refresh_live_subscriptions_at(e0).await;
+            // #2128: the DELETE goes out on its own task.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while requests_2102(&seen, "DELETE").is_empty()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             let deletes = requests_2102(&seen, "DELETE");
             srv.stop().await.ok();
             assert_eq!(lapsed.lapsed, 1);
@@ -4043,6 +4199,261 @@ mod tests {
         });
         southbound_reconcile::clear_for_test();
         reset_context();
+    }
+
+    /// #2128: a stored subscription whose live leg is at `base`, expiring at
+    /// `expiry`; its id.
+    fn live_leg_2128(producer: SouthboundProducer, base: &str, id: &str, expiry: u64) -> String {
+        let monitoring = match producer {
+            SouthboundProducer::Amf => "LOCATION_REPORTING",
+            SouthboundProducer::Udm => "LOSS_OF_CONNECTIVITY",
+        };
+        let mut sub =
+            NefMonitoringSubscription::new("af1", monitoring, "http://af.example.com/cb", "{}");
+        let delete_path = match producer {
+            SouthboundProducer::Amf => format!("/namf-evts/v1/subscriptions/{id}"),
+            SouthboundProducer::Udm => {
+                format!("/nudm-ee/v1/imsi-001010000002128/ee-subscriptions/{id}")
+            }
+        };
+        sub.southbound = Some(SouthboundRef {
+            producer,
+            subscription_id: id.to_string(),
+            delete_path,
+            producer_base: Some(base.to_string()),
+        });
+        sub.southbound_expiry = Some(expiry);
+        let sub_id = sub.id.clone();
+        nef_self()
+            .read()
+            .unwrap()
+            .subscription_insert(sub)
+            .expect("insert");
+        sub_id
+    }
+
+    /// #2128 (R42 MAJOR): a blackholed producer does not starve a healthy one.
+    /// Four AMF legs, due first, sit at an AMF that never answers a PATCH, and
+    /// one UDM leg at a healthy UDM. One pass sends the AMF a single refresh
+    /// (its timeout), skips its other legs, and refreshes the UDM leg, all within
+    /// about one request timeout.
+    ///
+    /// REVERT-VERIFIED: with a failed producer tried again for each of its legs
+    /// (`producer_failed` ignored), the AMF is sent four PATCHes and the pass
+    /// takes four timeouts, and the `one refresh at the blackholed AMF` assertion
+    /// fails.
+    #[test]
+    fn a_blackholed_producer_does_not_starve_a_healthy_one_2128() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let amf_patches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = amf_patches.clone();
+            let (amf, amf_addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(8)).await;
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            let amf_uri = format!("http://127.0.0.1:{}", amf_addr.port());
+            let (udm, udm_uri, udm_seen) = producer_2102(
+                SouthboundProducer::Udm,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(204)),
+            )
+            .await;
+            let now = now_unix_secs();
+            for n in 0..4 {
+                live_leg_2128(
+                    SouthboundProducer::Amf,
+                    &amf_uri,
+                    &format!("s-2128-{n}"),
+                    now + 10 + n,
+                );
+            }
+            let udm_leg = live_leg_2128(SouthboundProducer::Udm, &udm_uri, "ee-2128", now + 20);
+
+            let started = std::time::Instant::now();
+            let report = refresh_live_subscriptions_at(now).await;
+            let took = started.elapsed();
+            let udm_expiry = nef_self()
+                .read()
+                .unwrap()
+                .subscription_find(&udm_leg)
+                .and_then(|s| s.southbound_expiry);
+            amf.stop().await.ok();
+            udm.stop().await.ok();
+
+            assert_eq!(
+                amf_patches.load(Ordering::SeqCst),
+                1,
+                "one refresh at the blackholed AMF: {report:?}"
+            );
+            assert_eq!(report.skipped, 3, "{report:?}");
+            assert_eq!(report.refreshed, 1, "the UDM leg is refreshed: {report:?}");
+            assert_eq!(requests_2102(&udm_seen, "PATCH").len(), 1);
+            assert_eq!(udm_expiry, Some(now + southbound_lifetime_secs()));
+            assert!(
+                took < Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS * 2 + 1),
+                "about one request timeout: {took:?}"
+            );
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2128 (R42 minor 2, #2086): the snapshot that removes a lapsed leg's
+    /// subscription already carries its owed DELETE, so a restart straight
+    /// after the removal still sends it.
+    ///
+    /// REVERT-VERIFIED: with the `owe` in `remove_lapsed_leg` dropped, the
+    /// snapshot has no owed unsubscribe and the `owed in the same snapshot`
+    /// assertion fails.
+    #[test]
+    fn a_lapsed_legs_removal_is_persisted_with_its_owed_delete_2128() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        let path = std::env::temp_dir().join(format!(
+            "nefd-2128-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        nef_self()
+            .write()
+            .unwrap()
+            .set_state_file(path.clone())
+            .expect("first boot");
+        let id = live_leg_2128(
+            SouthboundProducer::Amf,
+            "http://127.0.0.1:9",
+            "s-2128-owed",
+            1,
+        );
+        let southbound = nef_self()
+            .read()
+            .unwrap()
+            .subscription_find(&id)
+            .and_then(|s| s.southbound)
+            .expect("leg");
+        remove_lapsed_leg(&id, &southbound);
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        southbound_reconcile::clear_for_test();
+        nef_self().write().unwrap().detach_state_file_for_test();
+        let _ = std::fs::remove_file(&path);
+        reset_context();
+
+        assert_eq!(on_disk["subscriptions"].as_array().map(Vec::len), Some(0));
+        let owed = on_disk["parkedUnsubscribes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            owed.iter().any(|r| r["subscription_id"] == "s-2128-owed"),
+            "owed in the same snapshot: {on_disk}"
+        );
+    }
+
+    /// #2128 (R42 minor 3): the expiry recorded is the one the producer
+    /// GRANTED, not the one asked for, on create and on refresh: this AMF grants
+    /// ten minutes less than asked each time.
+    ///
+    /// REVERT-VERIFIED: with `requested` recorded instead of
+    /// `confirmed_expiry(..)` on create, the `granted on create` assertion
+    /// fails; on refresh, the `granted on refresh` assertion fails.
+    #[test]
+    fn the_granted_expiry_is_recorded_2128() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        GRANT_CUT_2102.store(600, Ordering::SeqCst);
+        block_on(async {
+            let (amf, amf_uri, seen) = producer_2102(
+                SouthboundProducer::Amf,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(200)),
+            )
+            .await;
+            set_producers(Some(&amf_uri), None);
+            let resp = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            let id = created_subscription_id(&resp).expect("id");
+            let recorded = || {
+                nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_find(&id)
+                    .and_then(|s| s.southbound_expiry)
+                    .expect("an expiry")
+            };
+            let asked = requests_2102(&seen, "POST")[0]
+                .1
+                .pointer("/subscription/options/expiry")
+                .map(epoch_2102)
+                .expect("asked");
+            let e0 = recorded();
+            let due = e0 - southbound_refresh_margin_secs();
+            let report = refresh_live_subscriptions_at(due).await;
+            let e1 = recorded();
+            amf.stop().await.ok();
+
+            assert_eq!(e0, asked - 600, "granted on create");
+            assert_eq!(report.refreshed, 1, "{report:?}");
+            assert_eq!(
+                e1,
+                due + southbound_lifetime_secs() - 600,
+                "granted on refresh"
+            );
+        });
+        GRANT_CUT_2102.store(0, Ordering::SeqCst);
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2128 (R42 minor 4): the refresh margin leaves at least two refresh
+    /// ticks, and the lifetime at least four, whatever
+    /// `NEF_SOUTHBOUND_LIFETIME_SECS` says: at the 60 s minimum with the shipped
+    /// 30 s tick, the lifetime is raised to 120 s and the margin is 60 s.
+    ///
+    /// REVERT-VERIFIED: with the four-tick floor dropped, a 60 s lifetime keeps
+    /// a 30 s margin and the `two ticks` assertion fails.
+    #[test]
+    fn the_refresh_margin_leaves_two_ticks_2128() {
+        for (configured, interval) in [
+            (Some(60), 30),
+            (Some(60), 1),
+            (None, 30),
+            (Some(100), 300),
+            (Some(0), 30),
+        ] {
+            let (lifetime, margin) = refresh_timing(configured, interval);
+            assert!(lifetime >= 60, "{configured:?}/{interval}");
+            assert!(
+                margin >= 2 * interval,
+                "two ticks: {configured:?}/{interval}: {margin}"
+            );
+            assert!(margin < lifetime, "{configured:?}/{interval}");
+        }
+        assert_eq!(refresh_timing(Some(60), 30), (120, 60));
+        assert_eq!(refresh_timing(None, 30), (3600, 1800));
     }
 
     fn deletes_1877(seen: &Seen1877) -> usize {
