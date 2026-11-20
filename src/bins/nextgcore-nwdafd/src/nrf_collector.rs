@@ -35,92 +35,11 @@ use std::sync::{Arc, RwLock};
 /// An OAuth2-required listener admits a notification on it by that token.
 pub const CALLBACK_SEGMENT: &str = "nf-status-notify";
 
-/// #2093: how long a replaced subscription's token still admits notifications
-/// when the NRF gave no validity for it (the NRF may still deliver on the old
-/// subscription until it lapses).
-const RETIRED_TOKEN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+/// #2093 / #2172: the per-subscription token book, shared with every
+/// NFStatusNotify receiver (`nextgcore_sbi::nf_status_notify`).
+pub use nextgcore_sbi::nf_status_notify::{TokenBook, RETIRED_TOKEN_GRACE};
 
-/// At most this many tokens are held (the current one, ones being subscribed,
-/// and retired ones in their grace window); the oldest go first.
-const MAX_TOKENS: usize = 4;
-
-/// #2093: the callback tokens of this NWDAF's NFStatusSubscribe subscriptions,
-/// ONE PER SUBSCRIPTION (each subscribe mints its own), not one per process: a
-/// token seen by a relay on one subscription's notifications proves nothing
-/// about another's, and a replaced subscription's token stops working once its
-/// grace window ends.
-#[derive(Debug, Default)]
-pub struct TokenBook {
-    /// The token of the subscription in force, once the NRF accepted it.
-    current: Option<String>,
-    /// Minted for a subscribe the NRF has not answered yet.
-    pending: Vec<String>,
-    /// Replaced subscriptions' tokens, with the instant each stops working.
-    retired: Vec<(String, std::time::Instant)>,
-}
-
-impl TokenBook {
-    /// Mint the token for a new NFStatusSubscribe.
-    pub fn mint(&mut self) -> String {
-        let token = uuid::Uuid::new_v4().simple().to_string();
-        self.pending.push(token.clone());
-        self.prune(std::time::Instant::now());
-        token
-    }
-
-    /// The NRF accepted the subscription carrying `token`: it is now the current
-    /// one, and the one it replaces keeps working until `retire_at`.
-    pub fn activate(&mut self, token: &str, retire_at: std::time::Instant) {
-        self.pending.retain(|t| t != token);
-        if let Some(previous) = self.current.replace(token.to_string()) {
-            if previous != token {
-                self.retired.push((previous, retire_at));
-            }
-        }
-        self.prune(std::time::Instant::now());
-    }
-
-    /// A subscribe carrying `token` failed: forget it.
-    pub fn abandon(&mut self, token: &str) {
-        self.pending.retain(|t| t != token);
-    }
-
-    /// Whether `token` names a subscription this NWDAF holds at `now`: the
-    /// current one, one being subscribed, or a replaced one in its grace window.
-    pub fn holds(&self, token: &str, now: std::time::Instant) -> bool {
-        let eq = |t: &str| nextgcore_sbi::callback_auth::token_eq(t, token);
-        self.current.as_deref().is_some_and(eq)
-            || self.pending.iter().any(|t| eq(t))
-            || self.retired.iter().any(|(t, until)| *until > now && eq(t))
-    }
-
-    fn prune(&mut self, now: std::time::Instant) {
-        self.retired.retain(|(_, until)| *until > now);
-        while self.pending.len() + self.retired.len() + 1 > MAX_TOKENS && !self.retired.is_empty() {
-            self.retired.remove(0);
-        }
-        while self.pending.len() + 1 > MAX_TOKENS {
-            self.pending.remove(0);
-        }
-    }
-
-    /// The current token, minting one as current when there is none (start-up,
-    /// before the first subscribe answers; tests).
-    fn current_or_mint(&mut self) -> String {
-        if let Some(t) = &self.current {
-            return t.clone();
-        }
-        let token = uuid::Uuid::new_v4().simple().to_string();
-        self.current = Some(token.clone());
-        token
-    }
-}
-
-static TOKENS: std::sync::Mutex<TokenBook> = std::sync::Mutex::new(TokenBook {
-    current: None,
-    pending: Vec::new(),
-    retired: Vec::new(),
-});
+static TOKENS: std::sync::Mutex<TokenBook> = std::sync::Mutex::new(TokenBook::new());
 
 fn tokens() -> std::sync::MutexGuard<'static, TokenBook> {
     TOKENS.lock().unwrap_or_else(|e| e.into_inner())
@@ -660,42 +579,9 @@ pub fn refuse_notifier(
     correlated: bool,
     production: bool,
 ) -> Option<SbiResponse> {
-    if !production {
-        return None;
-    }
-    let refuse = |why: &str| {
-        log::debug!("NFStatusNotify refused: {why}");
-        Some(nextgcore_sbi::server::send_forbidden(
-            &format!("NFStatusNotify: {why}"),
-            None,
-        ))
-    };
-    if !correlated {
-        return refuse(
-            "the notification names no subscription of this NWDAF (the callback carries no \
-             correlation token)",
-        );
-    }
-    let names = |ty: &str| {
-        request
-            .peer_cert_nf_types
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(ty))
-    };
-    // #2093: the NRF directly, or an SCP relaying it (indirect communication,
-    // TS 23.501 §6.3.1.0) that presents the subscription's own token. The token
-    // is per subscription, so a relay that saw another subscription's cannot
-    // use it here; `correlated` already says this one is held.
-    // #2131: the shared relay rule, so `[SCP, X]` is X, not a relay.
-    let relay_scp = nextgcore_sbi::owner_binding::is_relay_certificate(&request.peer_cert_nf_types)
-        && names("SCP");
-    if names("NRF") || relay_scp {
-        return None;
-    }
-    refuse(
-        "only the NRF, directly or through an SCP, delivers NF status notifications; the \
-         requester's verified certificate names neither",
-    )
+    // #2172: the rule every NFStatusNotify receiver applies (#2093, #2131 and
+    // #2153 included: an NRF-only certificate, or a relay-only one naming SCP).
+    nextgcore_sbi::nf_status_notify::refuse_notifier(request, correlated, production)
 }
 
 /// Handle an NFStatusNotify that arrived on the tokenised callback
@@ -866,8 +752,8 @@ mod tests {
             ),
             None
         );
-        assert!(book.pending.is_empty(), "the minted token was abandoned");
-        assert!(book.current.is_none());
+        assert_eq!(book.pending_len(), 0, "the minted token was abandoned");
+        assert!(book.current().is_none());
         let (token, uri) = mint_for_subscribe(
             &mut book,
             &format!(
