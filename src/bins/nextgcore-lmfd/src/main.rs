@@ -7043,14 +7043,23 @@ lmf:
     /// **#2214**: DetermineLocation is the AMF's (TS 23.273 Table 8.3.1-1).
     /// Through `handle_determine_location_with` under **both** profiles, every
     /// other verified NF type is refused 403 and registers no LDR: a GMLC, SMF,
-    /// NEF or LMF certificate, and the token of an instance the NRF lists as a
-    /// GMLC, directly and through an SCP. (A mixed `[AMF, SMF]` certificate is
-    /// refused by the shared rule once #2218 lands.) Admitted, with the LDR bound
-    /// to the caller: an AMF certificate, an `[AMF, SCP]` certificate, an AMF's
-    /// token alone, and an AMF's token relayed through an SCP.
+    /// NEF or LMF certificate, a mixed `[AMF, SMF]` certificate (#2218), and the
+    /// token of an instance the NRF lists as a GMLC, directly and through an SCP.
+    /// Admitted, with the LDR bound to the caller: an AMF certificate, an
+    /// `[AMF, SCP]` certificate, an AMF's token alone, and an AMF's token relayed
+    /// through an SCP.
+    ///
+    /// #2237: the GMLC token is refused by the TYPE rule. Its instance is seeded
+    /// as a GMLC, so the lookup answers "listed, not as an AMF" and the refusal
+    /// says so. Before, the seed was never read (a seed only answers for its own
+    /// type), and the token was refused because no NRF was configured.
     ///
     /// REVERT-VERIFIED: with the `nf_type_refusal_with` gate removed, the GMLC
-    /// certificate is 200 and "refused: GMLC certificate" fails.
+    /// certificate is 200 and "refused: GMLC certificate" fails. With the GMLC
+    /// seed removed, "the GMLC token is refused by its type" fails: the refusal
+    /// is "no NRF is configured". With a multi-type certificate admitted when
+    /// one of its types is AMF (#2218's rule off), the `[AMF, SMF]` certificate
+    /// is 200.
     #[tokio::test]
     async fn determine_location_admits_only_a_verified_amf_2214() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -7079,6 +7088,11 @@ lmf:
                 ("SMF certificate", Some((CERT, &["SMF"][..])), None),
                 ("NEF certificate", Some((CERT, &["NEF"][..])), None),
                 ("LMF certificate", Some((CERT, &["LMF"][..])), None),
+                (
+                    "[AMF, SMF] certificate",
+                    Some((CERT, &["AMF", "SMF"][..])),
+                    None,
+                ),
                 ("GMLC token", None, Some(GMLC)),
                 (
                     "GMLC token through an SCP",
@@ -7103,6 +7117,14 @@ lmf:
                         .contains("DetermineLocation"),
                     "{what}: the refusal names the operation"
                 );
+                if token == Some(GMLC) {
+                    let body = resp.http.content.as_deref().unwrap_or("");
+                    assert!(
+                        body.contains(&format!("the NRF does not list {GMLC} as an AMF"))
+                            && !body.contains("no NRF is configured"),
+                        "{what}: the GMLC token is refused by its type: {body}"
+                    );
+                }
                 assert!(registered(&reference).is_none(), "{what}: no LDR");
             }
             for (what, cert, token, owner) in [
@@ -7139,6 +7161,71 @@ lmf:
                 if let Ok(c) = lmf_self().read() {
                     c.cancel_ldr(&reference);
                 }
+            }
+        }
+    }
+
+    /// **#2237** (R45 on #2233): the DetermineLocation amfd actually sends gets
+    /// through lmfd's gate and is served. The body is amfd's own
+    /// (`nextgcore_amfd::sbi_path::determine_location_input`, which
+    /// `call_lmf_determine_location` posts as JSON), and the caller is proven an
+    /// AMF the two ways amfd's client can prove it: its certificate (`[AMF]`)
+    /// and its token. Both profiles. Seeded fixes stand in for the positioning.
+    ///
+    /// REVERT-VERIFIED: with amfd's body naming the SUPI under another member,
+    /// lmfd answers 400 and "amfd's request with its certificate" fails, so the
+    /// test reads amfd's body, not a copy.
+    #[tokio::test]
+    async fn amfds_own_determine_location_passes_the_gate_2237() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        const CERT: &str = "cccccccc-2237-4000-8000-0000000000c1";
+        owner_binding::seed_nf_type_for_test(AMF_2214, nextgcore_sbi::types::NfType::Amf);
+        let supi = "imsi-001010000022370";
+        seed_fix(supi, 40.0);
+        let mut ue = nextgcore_amfd::context::AmfUe::new(2237, 2237);
+        ue.supi = Some(supi.to_string());
+        ue.nr_cgi.plmn_id = nextgcore_amfd::context::PlmnId::new("001", "01");
+        ue.nr_cgi.cell_id = 0x0_0223_7001;
+        // A GMLC RequestPosInfo, as amfd's ProvidePositioningInfo receives it.
+        let request_pos_info = serde_json::json!({
+            "lcsClientType": "EMERGENCY_SERVICES",
+            "locationQoS": { "hAccuracy": 50.0 },
+            "supportedGADShapes": ["POINT", "POINT_UNCERTAINTY_CIRCLE"],
+        });
+        let input =
+            nextgcore_amfd::sbi_path::determine_location_input(&ue, supi, &request_pos_info);
+        assert_eq!(input["supi"], supi, "the fixture is amfd's body");
+        assert!(input["ncgi"]["nrCellId"].is_string());
+        let amfds = |cert: bool| {
+            let mut r = SbiRequest::post("/nlmf-loc/v1/determine-location")
+                .with_json_body(&input)
+                .expect("json");
+            if cert {
+                r.peer_cert_nf_instance_id = Some(CERT.to_string());
+                r.peer_cert_nf_types = vec!["AMF".to_string()];
+            } else {
+                r.oauth2_subject = Some(AMF_2214.to_string());
+            }
+            r
+        };
+        for production in [true, false] {
+            for (what, cert) in [
+                ("amfd's request with its certificate", true),
+                ("amfd's request with its token", false),
+            ] {
+                let resp = handle_determine_location_with(&amfds(cert), production).await;
+                assert_eq!(
+                    resp.status, 200,
+                    "{what} (production {production}): {:?}",
+                    resp.http.content
+                );
+                let body: serde_json::Value =
+                    serde_json::from_str(resp.http.content.as_deref().unwrap_or("")).expect("json");
+                assert!(
+                    body["locationEstimate"].is_object(),
+                    "{what}: a LocationData: {body}"
+                );
             }
         }
     }

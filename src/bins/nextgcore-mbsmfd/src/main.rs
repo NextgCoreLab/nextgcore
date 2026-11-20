@@ -3833,9 +3833,13 @@ mod tests {
             let (status, body) = check(&smf, "", true).expect("refused");
             assert_eq!(status, 403, "production: empty nfcInstanceId");
             assert!(body.contains("is not the calling NF"), "{body}");
+            // #2237: refused for the first missing thing, its identity, not
+            // merely refused.
+            let (status, body) = check(&anonymous, "", true).expect("refused");
+            assert_eq!(status, 403, "production: anonymous and empty");
             assert!(
-                check(&anonymous, "", true).is_some(),
-                "production: anonymous and empty"
+                body.contains("proved no NF identity"),
+                "anonymous and empty: {body}"
             );
             assert_eq!(
                 check(&smf, SMF, true),
