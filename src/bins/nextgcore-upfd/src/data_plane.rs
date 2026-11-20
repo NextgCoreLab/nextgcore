@@ -5995,7 +5995,7 @@ impl DataPlane {
         let seid = session.upf_seid;
         let (cfg, d) = self
             .with_transport_delay(|m| Some((m.pdr(seid, pdr_id)?, m.delay_for(seid, pdr_id)?)))?;
-        let from_ran = preceding_is_ran(session, cfg.peer);
+        let from_ran = preceding_is_ran(session, &cfg);
         let out = crate::transport_delay::add_n3_n9_delay(content, d, from_ran)?;
         log::trace!("SEID {seid:#x} PDR {pdr_id}: {d} ms added to the N3/N9 Delay Result");
         Some(out)
@@ -6137,7 +6137,7 @@ impl DataPlane {
         // #2197 review m2: directly on N3, an N3/N9 Delay Result on the packet
         // is none a UPF wrote (TS 38.415 §5.5.3.21, TS 29.244 §5.24.5.3 NOTE):
         // the PSA's own N3 delay is the transport delay.
-        let upstream = if preceding_is_ran(session, cfg.peer) {
+        let upstream = if preceding_is_ran(session, &cfg) {
             0
         } else {
             ul.n3_n9_delay_result.unwrap_or(0)
@@ -6539,8 +6539,11 @@ pub fn build_relay_gpdu(teid: u32, container: Option<&[u8]>, payload: &[u8]) -> 
 
 /// #2197 review m2: whether `peer`, a PDR's preceding UL GTP-U peer, is the
 /// session's NG-RAN (its N3 downlink endpoint): then no UPF precedes this one.
-fn preceding_is_ran(session: &DataPlaneSession, peer: IpAddr) -> bool {
-    session.gnb_addr().ip().to_canonical() == peer.to_canonical()
+fn preceding_is_ran(
+    session: &DataPlaneSession,
+    cfg: &crate::transport_delay::TransportDelayPdr,
+) -> bool {
+    !cfg.n9_peer && session.gnb_addr().ip().to_canonical() == cfg.peer.to_canonical()
 }
 
 // ============================================================================

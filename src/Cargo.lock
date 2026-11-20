@@ -3506,6 +3506,7 @@ dependencies = [
  "nextgcore-pfcp",
  "nextgcore-sbi",
  "nextgcore-tun",
+ "nextgcore-upfd",
  "proptest",
  "serde_json",
  "tokio",

@@ -63,7 +63,7 @@ thiserror.workspace = true
 [dev-dependencies]
 # #2208: the in-process end to end runs two REAL UPFs (PSA and I-UPF) through
 # upfd's library. Dev-only, not linked into the binary.
-nextgcore-upfd = { path = "../nextgcore-upfd" }
+nextgcore-upfd = { path = "../nextgcore-upfd", features = ["test-support"] }
 libc.workspace = true
 # #2099: `owner_binding::seed_nf_type_for_test`, the NRF stand-in for the
 # verified-NF-type rule. Dev-only.

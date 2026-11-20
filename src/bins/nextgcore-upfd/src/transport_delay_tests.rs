@@ -179,6 +179,7 @@ fn pdr(peer: &str) -> TransportDelayPdr {
     TransportDelayPdr {
         peer: ip(peer),
         dscp: None,
+        n9_peer: false,
     }
 }
 
@@ -196,7 +197,8 @@ fn the_ie_names_the_peer_and_the_dscp() {
         TransportDelayPdr::from_ie(&ie),
         Some(TransportDelayPdr {
             peer: ip("10.45.0.7"),
-            dscp: Some(34)
+            dscp: Some(34),
+            n9_peer: false,
         })
     );
     // An IPv4-mapped IPv6 peer is the IPv4 peer (the probe's answer comes from it).
@@ -373,6 +375,7 @@ fn each_dscp_is_probed_and_measured_on_its_own() {
     let ef = TransportDelayPdr {
         peer: ip("10.0.0.5"),
         dscp: Some(46),
+        n9_peer: false,
     };
     m.set_pdr(1, 1, Some(pdr("10.0.0.5")));
     m.set_pdr(1, 2, Some(ef));
@@ -383,4 +386,23 @@ fn each_dscp_is_probed_and_measured_on_its_own() {
     m.on_echo_response(probes[0].0, probes[0].2, t0 + Duration::from_millis(20));
     m.on_echo_response(probes[1].0, probes[1].2, t0 + Duration::from_millis(4));
     assert_eq!((m.delay_for(1, 1), m.delay_for(1, 2)), (Some(10), Some(2)));
+}
+
+/// #2208: a Preceding UL GTP-U Peer with the Destination Interface Core is one
+/// the SMF names an N9 peer (another UPF); without DI, or with Access, it is not.
+#[test]
+fn a_preceding_peer_with_di_core_is_an_n9_peer_2208() {
+    use nextgcore_pfcp::qos_monitoring::TransportDelayReporting;
+    use nextgcore_pfcp::types::RemoteGtpUPeer;
+    let with = |di: Option<u8>| TransportDelayReporting {
+        preceding_ul_gtpu_peer: RemoteGtpUPeer {
+            ipv4: Some([10, 45, 0, 7]),
+            destination_interface: di,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(TransportDelayPdr::from_ie(&with(Some(1))).unwrap().n9_peer);
+    assert!(!TransportDelayPdr::from_ie(&with(Some(0))).unwrap().n9_peer);
+    assert!(!TransportDelayPdr::from_ie(&with(None)).unwrap().n9_peer);
 }
