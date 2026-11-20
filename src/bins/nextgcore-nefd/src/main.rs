@@ -1877,6 +1877,32 @@ fn confirmed_expiry(producer: SouthboundProducer, response: &SbiResponse) -> Opt
     nextgcore_sbi::datetime::rfc3339_to_epoch(granted)
 }
 
+/// #2163 (R42 on #2158): whether a UDM's answer to the member-form refresh is
+/// the refusal of the PATH itself, the one an older udmd gives: a 400 whose
+/// ProblemDetails `invalidParams` names `/reportingOptions/expiry`, or whose
+/// `detail` does (a udmd from before #2133 says the path "must address a
+/// top-level EeSubscription member"). Any other 400 is a genuine refusal of the
+/// refresh, so the whole-object form is not tried for it.
+fn refuses_the_member_path(resp: &SbiResponse) -> bool {
+    const PATH: &str = "/reportingOptions/expiry";
+    if resp.status != 400 {
+        return false;
+    }
+    let Some(problem) = resp
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+    else {
+        return false;
+    };
+    let named_param = problem["invalidParams"]
+        .as_array()
+        .is_some_and(|params| params.iter().any(|p| p["param"].as_str() == Some(PATH)));
+    let named_detail = problem["detail"].as_str().is_some_and(|d| d.contains(PATH));
+    named_param || named_detail
+}
+
 /// #2102: the modification that moves a live leg's expiry to `expiry`: the
 /// AMF's AmfUpdateEventOptionItem (TS 29.518 §6.2.6.2.7, `replace` of
 /// `/options/expiry`), the UDM's PatchItem (TS 29.503 §5.5.2.4
@@ -2150,7 +2176,7 @@ async fn refresh_producer_legs(
         // left to lapse during a rolling upgrade (nef.md: upgrade udmd first).
         if southbound.producer == SouthboundProducer::Udm
             && sub.southbound_expiry.is_some()
-            && matches!(&answer, Ok(resp) if resp.status == 400)
+            && matches!(&answer, Ok(resp) if refuses_the_member_path(resp))
         {
             log::warn!(
                 "monitoring subscription {}: the UDM refused `add /reportingOptions/expiry` \
@@ -4304,6 +4330,66 @@ mod tests {
         reset_context();
     }
 
+    /// **#2163** (R42 on #2158): the old-udmd fallback is for the refusal of the
+    /// member path only: a 400 whose `invalidParams` or `detail` names
+    /// `/reportingOptions/expiry`. A 400 for anything else (an expiry already
+    /// passed, a malformed subscription), another status, or a 400 without a
+    /// ProblemDetails is a refusal of the refresh and is not retried.
+    ///
+    /// REVERT-VERIFIED: with `refuses_the_member_path` back to "any 400", the
+    /// "a genuine refusal is not retried" cases are `true`.
+    #[test]
+    fn only_a_refusal_of_the_member_path_falls_back_2163() {
+        let problem = |status: u16, body: serde_json::Value| {
+            SbiResponse::with_status(status)
+                .with_json_body(&body)
+                .expect("json")
+        };
+        assert!(refuses_the_member_path(&problem(
+            400,
+            serde_json::json!({ "status": 400, "detail":
+                "path \"/reportingOptions/expiry\" must address a top-level EeSubscription member" })
+        )));
+        assert!(refuses_the_member_path(&problem(
+            400,
+            serde_json::json!({ "status": 400, "invalidParams": [
+                { "param": "/reportingOptions/expiry", "reason": "unsupported path" }
+            ]})
+        )));
+        for (resp, what) in [
+            (
+                problem(
+                    400,
+                    serde_json::json!({ "status": 400, "detail":
+                    "reportingOptions.expiry has already passed", "cause": "MANDATORY_IE_INCORRECT" }),
+                ),
+                "a genuine refusal is not retried",
+            ),
+            (
+                problem(
+                    400,
+                    serde_json::json!({ "status": 400, "invalidParams": [
+                        { "param": "/monitoringConfigurations" }
+                    ]}),
+                ),
+                "a genuine refusal is not retried (another param)",
+            ),
+            (
+                SbiResponse::with_status(400),
+                "a 400 without a ProblemDetails",
+            ),
+            (
+                problem(
+                    403,
+                    serde_json::json!({ "detail": "/reportingOptions/expiry" }),
+                ),
+                "another status",
+            ),
+        ] {
+            assert!(!refuses_the_member_path(&resp), "{what}");
+        }
+    }
+
     /// **#2154** (R42 on #2152): TS 29.591 defines no cancellation indication,
     /// so a Nnef_EventExposure subscriber whose subscription the NEF removes is
     /// sent nothing, while a T8 one in the same sweep gets its `cancelInd`.
@@ -4368,7 +4454,12 @@ mod tests {
                             return SbiResponse::with_status(404);
                         }
                         if body[0]["path"] == "/reportingOptions/expiry" {
-                            return SbiResponse::with_status(400);
+                            // What a udmd from before #2133 answers (#2163).
+                            return nextgcore_sbi::server::send_bad_request(
+                                "path \"/reportingOptions/expiry\" must address a top-level \
+                                 EeSubscription member",
+                                Some("INVALID_MSG_FORMAT"),
+                            );
                         }
                         SbiResponse::with_status(204)
                     }

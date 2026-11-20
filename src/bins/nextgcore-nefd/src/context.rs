@@ -890,6 +890,78 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **#2163** (R42 on #2158): the API a subscription was made on survives a
+    /// restart, so a Nnef_EventExposure subscriber is still notified in the TS
+    /// 29.591 shape afterwards; and a record from before #2154, which has no tag,
+    /// restores as T8, the shape it was always notified in.
+    ///
+    /// REVERT-VERIFIED: with `#[serde(skip)]` on `northbound_api`, the snapshot
+    /// carries no tag and "the tag is written" fails (and the Nnef subscription
+    /// restores as T8).
+    #[test]
+    fn the_subscription_api_tag_survives_a_restart_2163() {
+        let path = temp_state_path("api-tag-2163");
+        let _ = std::fs::remove_file(&path);
+        let (nnef_id, t8_id);
+        {
+            let mut ctx = NefContext::new();
+            ctx.init(16, 16);
+            ctx.set_state_file(path.clone()).expect("first boot");
+            let nnef = NefMonitoringSubscription::new(
+                "notif-2163",
+                "UE_REACHABILITY",
+                "https://c/n",
+                "{}",
+            )
+            .with_northbound_api(crate::NorthboundApi::NnefEventExposure);
+            let t8 =
+                NefMonitoringSubscription::new("af-2163", "UE_REACHABILITY", "https://af/n", "{}");
+            nnef_id = nnef.id.clone();
+            t8_id = t8.id.clone();
+            ctx.subscription_insert(nnef).expect("insert");
+            ctx.subscription_insert(t8).expect("insert");
+        }
+        let restart = || {
+            let mut restarted = NefContext::new();
+            restarted.init(16, 16);
+            assert_eq!(restarted.set_state_file(path.clone()).expect("restored"), 2);
+            let api = |id: &str| restarted.subscription_find(id).map(|s| s.northbound_api);
+            (api(&nnef_id), api(&t8_id))
+        };
+        assert_eq!(
+            restart(),
+            (
+                Some(crate::NorthboundApi::NnefEventExposure),
+                Some(crate::NorthboundApi::T8MonitoringEvent)
+            ),
+            "both tags survive"
+        );
+
+        // A pre-#2154 snapshot: the same records with the tag member removed.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut stripped = 0;
+        for sub in doc["subscriptions"].as_array_mut().expect("subscriptions") {
+            let obj = sub.as_object_mut().expect("object");
+            for key in ["northbound_api", "northboundApi"] {
+                if obj.remove(key).is_some() {
+                    stripped += 1;
+                }
+            }
+        }
+        assert_eq!(stripped, 2, "the tag is written: {doc}");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        assert_eq!(
+            restart(),
+            (
+                Some(crate::NorthboundApi::T8MonitoringEvent),
+                Some(crate::NorthboundApi::T8MonitoringEvent)
+            ),
+            "a record without the tag restores as T8"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// **Issue #192.** A deleted subscription must NOT come back after a restart.
     ///
     /// Persisting inserts but not removals is the subtler half of the bug: the
