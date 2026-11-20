@@ -337,8 +337,27 @@ pub(crate) fn subscribe_body_at(
 /// an AmfUpdateEventOptionItem cannot remove one, so the caller subscribes
 /// afresh.
 async fn amf_refresh_expiry(subscription_uri: &str, expiry: Option<u64>) -> Option<u64> {
-    let expiry = expiry?;
-    let (host, port, path) = split_uri(subscription_uri)?;
+    match amf_modify_expiry(subscription_uri, expiry?).await {
+        Modify::Granted(granted) => Some(granted),
+        Modify::Refused | Modify::Unreachable => None,
+    }
+}
+
+/// #2182: what an AMF did with a Namf_EventExposure modify of a leg's expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Modify {
+    /// Taken; the expiry the AMF granted.
+    Granted(u64),
+    /// Answered, but not taken (404: it no longer holds the leg; another 4xx).
+    Refused,
+    /// No answer, or a 5xx: the AMF is not working now.
+    Unreachable,
+}
+
+async fn amf_modify_expiry(subscription_uri: &str, expiry: u64) -> Modify {
+    let Some((host, port, path)) = split_uri(subscription_uri) else {
+        return Modify::Refused;
+    };
     let client = crate::app::uncached_peer_client(&host, port, NfType::Amf).await;
     let patch = json!([{
         "op": "replace",
@@ -347,21 +366,27 @@ async fn amf_refresh_expiry(subscription_uri: &str, expiry: Option<u64>) -> Opti
     }]);
     match tokio::time::timeout(amf_call_timeout(), client.patch_json(&path, &patch)).await {
         // #2156: the AMF's AmfUpdatedEventSubscription names what it granted.
-        Ok(Ok(resp)) if resp.is_success() => Some(granted_expiry(&resp).unwrap_or(expiry)),
+        Ok(Ok(resp)) if resp.is_success() => {
+            Modify::Granted(granted_expiry(&resp).unwrap_or(expiry))
+        }
         Ok(Ok(resp)) => {
             log::warn!(
                 "Namf_EventExposure modify of {subscription_uri}'s expiry returned {}",
                 resp.status
             );
-            None
+            if resp.status >= 500 {
+                Modify::Unreachable
+            } else {
+                Modify::Refused
+            }
         }
         Ok(Err(e)) => {
             log::warn!("Namf_EventExposure modify of {subscription_uri} failed: {e}");
-            None
+            Modify::Unreachable
         }
         Err(_) => {
             log::warn!("Namf_EventExposure modify of {subscription_uri} timed out");
-            None
+            Modify::Unreachable
         }
     }
 }
@@ -912,6 +937,7 @@ pub async fn reconcile(id: &str) {
                 expiry: sub.expiry,
                 amf_expiry: Some(granted.unwrap_or(asked)),
             };
+            renew_soon_if_short(id, granted.unwrap_or(asked), now);
             if !store_leg(id, Some(leg)) {
                 // Unsubscribed while the AMF answered: do not leave it behind.
                 amf_unsubscribe(&subscription_uri).await;
@@ -953,11 +979,19 @@ pub fn on_amf_registered(supi: &str) {
 /// [`LEG_RENEW_MARGIN_SECS`] of `now` and earlier than the leg needs
 /// ([`leg_expiry_target`]): an AMF that granted less than asked stops
 /// reporting at its own time, and a leg of a subscription with no expiry is
-/// bounded. Renewed by Namf modify, recording what the AMF grants; a leg the
-/// AMF does not renew is dropped and subscribed afresh. Returns how many were
-/// renewed.
+/// bounded. Renewed by Namf modify, recording what the AMF grants. A leg the
+/// AMF refuses (404: it no longer holds it) is dropped and subscribed afresh.
+/// Returns how many were renewed.
+///
+/// #2182 (R42 on #2156), the #2128 / #2149 shape: legs are renewed per AMF, in
+/// the order they lapse, up to [`LEG_RENEW_MAX_AMFS`] AMFs at once, and an AMF
+/// that does not answer one renewal (no answer, a 5xx) is not tried again this
+/// pass; its legs stay and are tried on the next one. So a dead AMF with many
+/// due legs costs one call timeout per pass, and other AMFs' legs are renewed
+/// regardless, well inside the margin. It runs on its own task
+/// ([`spawn_amf_leg_renewal`]), not the 30 s lapse sweep's.
 pub async fn renew_amf_legs(now: u64) -> usize {
-    let due: Vec<String> = {
+    let mut due: Vec<(Option<String>, u64, String)> = {
         let ctx = udm_self();
         let Ok(context) = ctx.read() else {
             return 0;
@@ -966,46 +1000,113 @@ pub async fn renew_amf_legs(now: u64) -> usize {
             .ee_subscriptions_with_amf_leg()
             .into_iter()
             .filter(|sub| !sub.is_expired(now))
-            .filter(|sub| {
-                sub.amf_leg.as_ref().is_some_and(|leg| {
-                    leg.amf_expiry.is_some_and(|granted| {
-                        granted <= now.saturating_add(LEG_RENEW_MARGIN_SECS)
-                            && granted < leg_expiry_target(sub, now)
-                    })
-                })
+            .filter_map(|sub| {
+                let granted = sub.amf_leg.as_ref()?.amf_expiry?;
+                (granted <= now.saturating_add(LEG_RENEW_MARGIN_SECS)
+                    && granted < leg_expiry_target(&sub, now))
+                .then(|| (leg_authority(&sub), granted, sub.id))
             })
-            .map(|sub| sub.id)
             .collect()
     };
+    due.sort_by_key(|(_, granted, _)| *granted);
+    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<String>> = Default::default();
+    for (amf, _, id) in due {
+        by_amf.entry(amf).or_default().push(id);
+    }
+    let slots = Arc::new(tokio::sync::Semaphore::new(LEG_RENEW_MAX_AMFS));
+    let mut workers = tokio::task::JoinSet::new();
+    for (_, ids) in by_amf {
+        let slots = slots.clone();
+        workers.spawn(async move {
+            let _slot = slots.acquire_owned().await;
+            let mut renewed = 0usize;
+            for id in ids {
+                match renew_one(&id, now).await {
+                    Modify::Granted(_) => renewed += 1,
+                    Modify::Refused => {}
+                    // This AMF is not answering: its other legs wait for the next pass.
+                    Modify::Unreachable => break,
+                }
+            }
+            renewed
+        });
+    }
     let mut renewed = 0;
-    for id in due {
-        let lock = leg_lock(&id);
-        let _held = lock.lock().await;
-        let Some(sub) = find_subscription(&id) else {
-            continue;
-        };
-        let Some(leg) = sub.amf_leg.clone() else {
-            continue;
-        };
-        let target = leg_expiry_target(&sub, now);
-        match amf_refresh_expiry(&leg.subscription_uri, Some(target)).await {
-            Some(granted) => {
-                store_leg(
-                    &id,
-                    Some(AmfEeLeg {
-                        amf_expiry: Some(granted),
-                        ..leg
-                    }),
-                );
-                renewed += 1;
-            }
-            None => {
-                drop_leg(&id, &sub, "the AMF did not renew it").await;
-                spawn_reconcile(&id);
-            }
-        }
+    while let Some(done) = workers.join_next().await {
+        renewed += done.unwrap_or(0);
     }
     renewed
+}
+
+/// #2182: at most this many AMFs have legs renewed at once in a pass.
+pub const LEG_RENEW_MAX_AMFS: usize = 8;
+
+/// #2182: how often [`renew_amf_legs`] runs. Well inside
+/// [`LEG_RENEW_MARGIN_SECS`], so a pass that took one call timeout for a dead
+/// AMF still leaves the next pass time to renew.
+pub const LEG_RENEW_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #2182: run [`renew_amf_legs`] every [`LEG_RENEW_TICK`], on a task of its own.
+pub fn spawn_amf_leg_renewal() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(LEG_RENEW_TICK);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            renew_amf_legs(crate::context::now_unix_secs()).await;
+        }
+    });
+}
+
+/// Renew `id`'s AMF leg (under its leg lock). A refused one is dropped and
+/// reconciled.
+async fn renew_one(id: &str, now: u64) -> Modify {
+    let lock = leg_lock(id);
+    let _held = lock.lock().await;
+    let Some(sub) = find_subscription(id) else {
+        return Modify::Refused;
+    };
+    let Some(leg) = sub.amf_leg.clone() else {
+        return Modify::Refused;
+    };
+    let target = leg_expiry_target(&sub, now);
+    let outcome = amf_modify_expiry(&leg.subscription_uri, target).await;
+    match outcome {
+        Modify::Granted(granted) => {
+            store_leg(
+                id,
+                Some(AmfEeLeg {
+                    amf_expiry: Some(granted),
+                    ..leg
+                }),
+            );
+            renew_soon_if_short(id, granted, now);
+        }
+        Modify::Refused => {
+            drop_leg(id, &sub, "the AMF did not renew it").await;
+            spawn_reconcile(id);
+        }
+        Modify::Unreachable => {}
+    }
+    outcome
+}
+
+/// #2182 (R42 on #2156): a grant too short for [`LEG_RENEW_TICK`] to catch
+/// (under two ticks left) is renewed at half its remaining time, on its own
+/// timer, rather than lapsing between passes.
+fn renew_soon_if_short(id: &str, granted: u64, now: u64) {
+    let left = granted.saturating_sub(now);
+    if left >= 2 * LEG_RENEW_TICK.as_secs() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let id = id.to_string();
+    handle.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(left / 2)).await;
+        renew_one(&id, crate::context::now_unix_secs()).await;
+    });
 }
 
 /// Delete `sub`'s AMF leg, for a subscription that has been removed. Waits for
@@ -2186,6 +2287,172 @@ mod tests {
             Some(due + UNBOUNDED_LEG_LIFETIME_SECS)
         );
         clear(supi);
+    }
+
+    /// **#2182** (R42 on #2156): renewals go per AMF, up to eight at once, and an
+    /// AMF that does not answer is not tried again that pass. One blackholed AMF
+    /// with ten due legs and a healthy AMF with one: the pass takes about one
+    /// call timeout, the healthy leg is renewed, the dead AMF is asked once, and
+    /// its legs are kept for the next pass (not dropped).
+    ///
+    /// REVERT-VERIFIED: with the AMFs renewed one at a time
+    /// (`LEG_RENEW_MAX_AMFS` = 1 and no skip), the pass takes ten timeouts and
+    /// "about one call timeout" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_dead_amf_does_not_delay_a_healthy_renewal_2182() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        const TIMEOUT_MS: u64 = 400;
+        AMF_CALL_TIMEOUT_MS.store(TIMEOUT_MS, Ordering::Relaxed);
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hole_addr = hole.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = hole.accept().await {
+                conns.push(c);
+            }
+        });
+        let now = crate::context::now_unix_secs();
+        let (_amf, healthy, seen) = recorder(move |_| {
+            SbiResponse::with_status(200)
+                .with_json_body(&json!({ "subscription": { "options": {
+                    "trigger": "CONTINUOUS",
+                    "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now + 600),
+                }}}))
+                .expect("json")
+        })
+        .await;
+        let due_leg = |amf: std::net::SocketAddr, n: &str| {
+            let mut sub = UdmEeSubscription::for_ue(
+                "imsi-001010000021820",
+                "http://nef.example.org/ee-notify",
+                json!({
+                    "callbackReference": "http://nef.example.org/ee-notify",
+                    "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}},
+                    "reportingOptions": {
+                        "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now + 600)
+                    },
+                })
+                .to_string(),
+            );
+            sub.amf_leg = Some(AmfEeLeg {
+                subscription_uri: format!("http://{amf}/namf-evts/v1/subscriptions/{n}"),
+                change_token: "t".to_string(),
+                amf_instance_id: Some("amf".to_string()),
+                notify_uri: "http://nef.example.org/ee-notify".to_string(),
+                events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+                expiry: Some(now + 600),
+                amf_expiry: Some(now + 60),
+            });
+            let id = sub.id.clone();
+            udm_self().read().unwrap().ee_subscription_insert(sub);
+            id
+        };
+        let dead: Vec<String> = (0..10)
+            .map(|i| due_leg(hole_addr, &format!("dead-{i}")))
+            .collect();
+        let live = due_leg(healthy, "live-2182");
+
+        let started = std::time::Instant::now();
+        let renewed = renew_amf_legs(now).await;
+        let took = started.elapsed();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        held.abort();
+
+        assert_eq!(renewed, 1, "the healthy leg is renewed");
+        assert!(
+            took < std::time::Duration::from_millis(TIMEOUT_MS * 2),
+            "about one call timeout: {took:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            stored(&live)
+                .and_then(|s| s.amf_leg)
+                .and_then(|l| l.amf_expiry),
+            Some(now + 600)
+        );
+        for id in &dead {
+            assert_eq!(
+                stored(id)
+                    .and_then(|s| s.amf_leg)
+                    .and_then(|l| l.amf_expiry),
+                Some(now + 60),
+                "a dead AMF's leg is kept for the next pass"
+            );
+        }
+        for id in dead.iter().chain([&live]) {
+            udm_self().read().unwrap().ee_subscription_remove(id);
+        }
+    }
+
+    /// **#2182** (R42 on #2156): a grant too short for the renewal tick is
+    /// renewed on its own timer, at half its remaining time, rather than lapsing
+    /// between passes.
+    ///
+    /// REVERT-VERIFIED: with `renew_soon_if_short` doing nothing, no PATCH
+    /// reaches the AMF and "renewed before it lapses" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_short_grant_is_renewed_on_its_own_timer_2182() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        let now = crate::context::now_unix_secs();
+        let (_amf, amf, seen) = recorder(move |_| {
+            SbiResponse::with_status(200)
+                .with_json_body(&json!({ "subscription": { "options": {
+                    "trigger": "CONTINUOUS",
+                    "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now + 600),
+                }}}))
+                .expect("json")
+        })
+        .await;
+        let mut sub = UdmEeSubscription::for_ue(
+            "imsi-001010000021821",
+            "http://nef.example.org/ee-notify",
+            json!({
+                "callbackReference": "http://nef.example.org/ee-notify",
+                "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}},
+                "reportingOptions": { "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now + 600) },
+            })
+            .to_string(),
+        );
+        sub.amf_leg = Some(AmfEeLeg {
+            subscription_uri: format!("http://{amf}/namf-evts/v1/subscriptions/short"),
+            change_token: "t".to_string(),
+            amf_instance_id: Some("amf".to_string()),
+            notify_uri: "http://nef.example.org/ee-notify".to_string(),
+            events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            expiry: Some(now + 600),
+            amf_expiry: Some(now + 3),
+        });
+        let id = sub.id.clone();
+        udm_self().read().unwrap().ee_subscription_insert(sub);
+        renew_soon_if_short(&id, now + 3, now);
+        let mut renewed = false;
+        for _ in 0..40 {
+            if stored(&id)
+                .and_then(|s| s.amf_leg)
+                .and_then(|l| l.amf_expiry)
+                == Some(now + 600)
+            {
+                renewed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            renewed,
+            "renewed before it lapses: {:?}",
+            seen.lock().unwrap()
+        );
+        udm_self().read().unwrap().ee_subscription_remove(&id);
     }
 
     /// **#2149** (R42 on #2144): the AMF leg carries the Nudm_EE subscription's

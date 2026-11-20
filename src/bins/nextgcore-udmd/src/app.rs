@@ -650,6 +650,8 @@ pub async fn run() -> Result<()> {
     drop(crate::ee_amf::spawn_unsubscribe_reconciler());
     // #2125: and EE subscriptions lapse at their granted expiry.
     spawn_ee_expiry_sweep();
+    // #2182: the AMF leg renewal, on a task of its own (not the lapse sweep's).
+    crate::ee_amf::spawn_amf_leg_renewal();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -2887,8 +2889,6 @@ fn spawn_ee_expiry_sweep() {
         loop {
             tick.tick().await;
             sweep_expired_ee_subscriptions(crate::context::now_unix_secs()).await;
-            // #2156: and keep the live subscriptions' AMF legs from lapsing.
-            crate::ee_amf::renew_amf_legs(crate::context::now_unix_secs()).await;
         }
     });
 }
