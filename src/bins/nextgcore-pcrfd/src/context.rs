@@ -533,8 +533,9 @@ impl PcrfContext {
         if !self.state.is_enabled() {
             return;
         }
-        let doc = self.snapshot();
-        if let Err(e) = self.state.persist(&doc) {
+        // #2151: snapshot under the store's write lock, so concurrent persists
+        // publish in snapshot order.
+        if let Err(e) = self.state.persist_with(|| self.snapshot()) {
             // The session exists in memory but not on disk: the CCR was answered
             // and a restart will reject its updates with 5002.
             log::error!("PCRF state was NOT persisted: {e}");

@@ -1282,9 +1282,11 @@ impl NsacfContext {
     /// Serialize quotas + memberships to the state file (atomic tmp+rename).
     /// Best-effort: failures are logged, never fatal.
     pub fn save_state(&self) {
-        // Monotonic sequence so concurrent saves use distinct tmp files (the
-        // rename is atomic, so last-writer-wins yields a consistent snapshot).
+        // #2151: each snapshot is numbered as it is taken, under SNAPSHOT_LOCK,
+        // and the write (on the blocking pool, so writes can finish out of
+        // order) is skipped when a later-numbered one already reached the file.
         static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SNAPSHOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let path = match self.state_file.read() {
             Ok(p) => match p.clone() {
                 Some(p) => p,
@@ -1292,6 +1294,7 @@ impl NsacfContext {
             },
             Err(_) => return,
         };
+        let snapshotting = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Issue #66: a failed load left the quota set EMPTY, so writing now would
         // replace the unreadable file with nothing and make the loss permanent.
         if self
@@ -1359,9 +1362,11 @@ impl NsacfContext {
         // The shared writer (issue #66) does the serialise + temp + fsync +
         // rename, so the per-save sequence that used to name the temp file is no
         // longer needed -- it derives a non-colliding name itself.
-        let _ = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        drop(snapshotting);
         let write = move || {
-            if let Err(e) = nextgcore_core::state_store::write_snapshot(&path, &state) {
+            if let Err(e) = nextgcore_core::state_store::write_snapshot_numbered(&path, seq, &state)
+            {
                 log::warn!("Failed to persist NSACF state: {e}");
             }
         };

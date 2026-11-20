@@ -164,6 +164,81 @@ impl StateStore {
             source,
         })
     }
+
+    /// #2151: take the snapshot and write it under one lock (this path's write
+    /// lock), so concurrent persists publish in snapshot order: the file last
+    /// written holds the newest snapshot. [`StateStore::persist`] of a document
+    /// taken beforehand can publish an older snapshot over a newer one.
+    ///
+    /// `snapshot` runs with the path's write lock held: it must not persist,
+    /// and its callers must hold no write guard it needs (the rule every
+    /// `persist` here already documents).
+    pub fn persist_with(
+        &self,
+        snapshot: impl FnOnce() -> serde_json::Value,
+    ) -> Result<(), StateStoreError> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        if self.poisoned {
+            return Err(StateStoreError::Poisoned {
+                path: path.to_path_buf(),
+            });
+        }
+        write_snapshot_with(path, snapshot)
+    }
+}
+
+/// #2151: [`write_snapshot`] of the document `snapshot` returns, taken under
+/// `path`'s write lock, so concurrent writers publish in snapshot order (see
+/// [`StateStore::persist_with`]). The same contract as [`write_snapshot`].
+pub fn write_snapshot_with(
+    path: &Path,
+    snapshot: impl FnOnce() -> serde_json::Value,
+) -> Result<(), StateStoreError> {
+    let lock = path_write_lock(path);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let doc = snapshot();
+    write_atomic_locked(path, &doc).map_err(|source| StateStoreError::WriteFailed {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// #2151: [`write_snapshot`] of a document numbered `seq`, skipped when this
+/// process has already written `path` with a later number. For a writer that
+/// hands its write to another thread (nsacfd's blocking pool), so writes can
+/// finish out of order: it numbers each snapshot as it takes it, under its own
+/// lock, and the older one is not renamed over the newer. `Ok(false)` when
+/// skipped.
+pub fn write_snapshot_numbered(
+    path: &Path,
+    seq: u64,
+    doc: &serde_json::Value,
+) -> Result<bool, StateStoreError> {
+    type Written = std::collections::HashMap<PathBuf, u64>;
+    static WRITTEN: std::sync::OnceLock<std::sync::Mutex<Written>> = std::sync::OnceLock::new();
+    let lock = path_write_lock(path);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let written = WRITTEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if written.get(path).is_some_and(|last| *last >= seq) {
+            return Ok(false);
+        }
+    }
+    write_atomic_locked(path, doc).map_err(|source| StateStoreError::WriteFailed {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    WRITTEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), seq);
+    Ok(true)
 }
 
 /// Read a snapshot from `path` without owning a [`StateStore`].
@@ -210,8 +285,23 @@ pub fn write_snapshot(path: &Path, doc: &serde_json::Value) -> Result<(), StateS
 /// The temporary file is named from the full file name rather than via
 /// `Path::with_extension`, which would *replace* an existing extension and so
 /// map `udr.state` and `udr.json` in one directory onto the same `udr.tmp`.
+///
+/// #2148: concurrent writes of one path are safe. Each write has its own
+/// temporary file (`.<name>.<pid>.<seq>.tmp`), so two writers never truncate
+/// or interleave into one file, and one cannot rename the other's file away
+/// before it is complete; and the writes of one path are serialised
+/// ([`path_write_lock`]), so each rename publishes one writer's whole,
+/// fsynced document.
 fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
+    let lock = path_write_lock(path);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    write_atomic_locked(path, doc)
+}
+
+/// [`write_atomic`], for a caller already holding `path`'s write lock.
+fn write_atomic_locked(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
     use std::io::Write;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -226,12 +316,14 @@ fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("state path has no file name"))?
         .to_string_lossy()
         .into_owned();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_name = format!(".{file_name}.{}.{seq}.tmp", std::process::id());
     let tmp = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(format!(".{file_name}.tmp")),
-        _ => PathBuf::from(format!(".{file_name}.tmp")),
+        Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
     };
 
-    {
+    let written = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         #[cfg(unix)]
         {
@@ -241,8 +333,12 @@ fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
         f.write_all(&serialized)?;
         f.flush()?;
         f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     // Durably record the rename itself.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -254,9 +350,175 @@ fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
     Ok(())
 }
 
+/// #2148: the lock serialising the writes of `path` within this process.
+/// Paths are compared as given; one store writes one path.
+fn path_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **#2151**: concurrent `persist_with`s publish in snapshot order. Eight
+    /// threads each bump a shared generation and persist a snapshot of it
+    /// (taking a varying time, as a real snapshot walking an NF's maps does)
+    /// while a reader watches the file. The generation on disk never goes
+    /// back, and ends at the last one. A snapshot taken outside the lock (`let
+    /// doc = snap(); store.persist(&doc)`) can be renamed over a newer one.
+    ///
+    /// REVERT-VERIFIED: with `write_snapshot_with` taking the snapshot before
+    /// the path lock, the reader sees the generation go back and `never goes
+    /// back` fails.
+    #[test]
+    fn concurrent_persists_publish_in_snapshot_order_2151() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let dir = tmpdir("order-2151");
+        let path = dir.join("nf.json");
+        let generation = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let (mut last, mut went_back) = (0u64, 0usize);
+                while !done.load(Ordering::SeqCst) {
+                    let g = std::fs::read(&path)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|v| v["gen"].as_u64());
+                    if let Some(g) = g {
+                        if g < last {
+                            went_back += 1;
+                        }
+                        last = last.max(g);
+                    }
+                }
+                went_back
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, generation) = (path.clone(), generation.clone());
+                std::thread::spawn(move || {
+                    let store = StateStore::new(Some(path));
+                    for _ in 0..40 {
+                        generation.fetch_add(1, Ordering::SeqCst);
+                        store
+                            .persist_with(|| {
+                                let g = generation.load(Ordering::SeqCst);
+                                let jitter = (g.wrapping_mul(2_654_435_761) >> 7) % 800;
+                                std::thread::sleep(std::time::Duration::from_micros(jitter));
+                                serde_json::json!({ "gen": g })
+                            })
+                            .expect("persist");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer");
+        }
+        done.store(true, Ordering::SeqCst);
+        let went_back = reader.join().expect("reader");
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(went_back, 0, "the generation on disk never goes back");
+        assert_eq!(
+            on_disk["gen"].as_u64(),
+            Some(generation.load(Ordering::SeqCst)),
+            "the newest snapshot is the one on disk"
+        );
+    }
+
+    /// **#2151**: a numbered write older than one already written is skipped.
+    #[test]
+    fn an_older_numbered_snapshot_is_not_written_over_a_newer_2151() {
+        let dir = tmpdir("numbered-2151");
+        let path = dir.join("nsacf.json");
+        assert_eq!(
+            write_snapshot_numbered(&path, 2, &serde_json::json!({"n": 2})).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            write_snapshot_numbered(&path, 1, &serde_json::json!({"n": 1})).ok(),
+            Some(false)
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on_disk["n"], 2, "the newer one stays");
+    }
+
+    /// **#2148** (R42 on #2128): many threads persisting one path at once each
+    /// succeed, and the file always holds one writer's whole document. With one
+    /// fixed temporary file, two writers truncated and interleaved into it and
+    /// one renamed it away under the other (ENOENT, or a torn snapshot).
+    ///
+    /// REVERT-VERIFIED: with the temporary name back to `.<name>.tmp` and the
+    /// path lock removed, writes fail ("every persist succeeds") or the file
+    /// holds a torn document.
+    #[test]
+    fn concurrent_persists_of_one_path_never_tear_2148() {
+        let dir = tmpdir("concurrent-2148");
+        let path = dir.join("nef.json");
+        let writers: Vec<_> = (0..8u64)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = StateStore::new(Some(path.clone()));
+                    let mut failures = Vec::new();
+                    let mut torn = 0;
+                    for round in 0..40u64 {
+                        // Large enough that a write is many syscalls.
+                        let doc = serde_json::json!({
+                            "writer": w,
+                            "round": round,
+                            "pad": vec![format!("{w}-{round}"); 2000],
+                        });
+                        if let Err(e) = store.persist(&doc) {
+                            failures.push(e.to_string());
+                        }
+                        match std::fs::read(&path)
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        {
+                            Some(v) if v["pad"].as_array().map(Vec::len) == Some(2000) => {}
+                            _ => torn += 1,
+                        }
+                    }
+                    (failures, torn)
+                })
+            })
+            .collect();
+        let mut failures = Vec::new();
+        let mut torn = 0;
+        for w in writers {
+            let (f, t) = w.join().expect("writer");
+            failures.extend(f);
+            torn += t;
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "every persist succeeds: {failures:?}");
+        assert_eq!(torn, 0, "the file always holds one whole document");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("ngc-state-{}-{tag}", std::process::id()));
