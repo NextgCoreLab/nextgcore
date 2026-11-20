@@ -2711,6 +2711,7 @@ dependencies = [
  "nextgcore-diameter",
  "nextgcore-gtp",
  "nextgcore-nas",
+ "nextgcore-ngap-gen",
  "nextgcore-pfcp",
  "nextgcore-s1ap",
  "nextgcore-sbi",

@@ -1,0 +1,20 @@
+# #2222: the SMF of the nightly I-UPF per-flow delay run. run.sh rewrites
+# 172.29.22. to the run's own subnet. The PSA is
+# UPF_PFCP_ADDR (run.sh); the I-UPF is inserted on N9 for every DNN.
+logger:
+  level: info
+
+smf:
+  sbi:
+    server:
+      - address: 172.29.22.4
+        port: 7777
+  # TS 23.501 §5.33.3.1: the PCF's QoS monitoring policy, measured per GTP-U path
+  # (§5.33.3.3): each UPF measures the delay to its preceding GTP-U peer with Echo
+  # and the PSA adds them up (GTPUPM, TS 29.244 §5.24.5.3).
+  qos_monitoring:
+    pcc: true
+    method: gtpu_path
+  # TS 23.502 §4.3.5.4: the I-UPF between the NG-RAN and the PSA.
+  intermediate_upf:
+    pfcp: 172.29.22.8
