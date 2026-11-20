@@ -9,6 +9,7 @@ const LEG: IupfLeg = IupfLeg {
     n3: (0x1111, [127, 0, 0, 21]),
     n9: (0x2222, [127, 0, 0, 22]),
     psa_ul: (0x3333, [127, 0, 0, 31]),
+    dl_tunnel: Some((0x77, [10, 0, 0, 4])),
 };
 
 fn top(body: &[u8]) -> Vec<(u16, Vec<u8>)> {
@@ -60,7 +61,8 @@ fn a_tunnel_activation_goes_to_the_i_upf_and_the_psa_forwards_over_n9_2208() {
         }],
         ..Default::default()
     });
-    let (psa, iupf) = split_modification(&body, &LEG);
+    let sp = split_modification(&body, &LEG);
+    let (psa, iupf) = (sp.psa.clone(), sp.iupf.clone());
     let iupf = top(&iupf.expect("the I-UPF gets the tunnel"));
     assert_eq!(
         iupf[0].0,
@@ -92,6 +94,44 @@ fn a_tunnel_activation_goes_to_the_i_upf_and_the_psa_forwards_over_n9_2208() {
         "the PSA forwards to the I-UPF over N9"
     );
     assert!(psa.iter().any(|(t, _)| *t == pfcp_ie::UPDATE_QER));
+    // R43 M1: toward active, and what undoes the I-UPF's half: its previous tunnel.
+    assert_eq!(sp.direction, Direction::TowardActive((0x77, [10, 0, 0, 5])));
+    let restore = top(&sp.iupf_restore);
+    assert_eq!(
+        ohc_of(&restore[0].1),
+        LEG.dl_tunnel,
+        "back to the previous NG-RAN tunnel"
+    );
+}
+
+/// R43 minor 2: PFCPSMReq-Flags go by flag: SNDEM to the I-UPF (its NG-RAN
+/// tunnel), DROBU and QAURR to the PSA (its buffer and URRs).
+#[test]
+fn pfcpsmreq_flags_go_to_the_upf_that_acts_on_them_2208() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&pfcp_ie::PFCPSMREQ_FLAGS.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.push(0x07);
+    body.extend(build_session_modification_request(
+        &SessionModificationParams {
+            update_fars_activate: vec![(
+                2,
+                0,
+                Some((0x0100, 0x77, Some([10, 0, 0, 5]), None)),
+                false,
+            )],
+            ..Default::default()
+        },
+    ));
+    let sp = split_modification(&body, &LEG);
+    let flag = |b: &[u8]| {
+        top(b)
+            .into_iter()
+            .find(|(t, _)| *t == pfcp_ie::PFCPSMREQ_FLAGS)
+            .map(|(_, v)| v[0])
+    };
+    assert_eq!(flag(sp.iupf.as_deref().unwrap()), Some(0x02), "SNDEM");
+    assert_eq!(flag(&sp.psa), Some(0x05), "DROBU and QAURR");
 }
 
 /// AN release (TS 23.502 §4.2.6): FAR 2 to BUFF|NOCP goes to both, so the PSA
@@ -104,16 +144,22 @@ fn an_apply_action_change_goes_to_both_and_the_rest_stays_with_the_psa_2208() {
         update_fars_apply_action: vec![(2, BUFF | NOCP)],
         ..Default::default()
     });
-    let (psa, iupf) = split_modification(&body, &LEG);
+    let sp = split_modification(&body, &LEG);
+    let (psa, iupf) = (sp.psa.clone(), sp.iupf.clone());
     assert_eq!(psa, body, "the PSA buffers");
     assert_eq!(iupf.as_deref(), Some(&body[..]), "the I-UPF stops");
+    // R43 M1: an Apply Action change, and what undoes the PSA's half: FORW to N9.
+    assert_eq!(sp.direction, Direction::ApplyAction(BUFF | NOCP));
+    let restore = top(&sp.psa_restore);
+    assert_eq!(ohc_of(&restore[0].1), Some(LEG.n9));
 
     let other = build_session_modification_request(&SessionModificationParams {
         update_fars_apply_action: vec![(5, BUFF)],
         remove_srr_ids: vec![3],
         ..Default::default()
     });
-    let (psa, iupf) = split_modification(&other, &LEG);
+    let sp = split_modification(&other, &LEG);
+    let (psa, iupf) = (sp.psa.clone(), sp.iupf.clone());
     assert_eq!(psa, other);
     assert_eq!(iupf, None);
 }
@@ -124,7 +170,7 @@ fn an_apply_action_change_goes_to_both_and_the_rest_stays_with_the_psa_2208() {
 #[tokio::test]
 async fn the_i_upf_gets_n3_uplink_toward_the_psa_and_an_n9_downlink_2208() {
     let (client, _peer) = crate::pfcp_path::stand_in::client_with_silent_peer().await;
-    let body = establishment_body(&client, 0x1000, 9, LEG.psa_ul);
+    let body = establishment_body(&client, 0x1000, LEG.psa_ul);
     let ies = top(&body);
     assert_eq!(
         ies.iter()

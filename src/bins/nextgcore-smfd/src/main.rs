@@ -1537,6 +1537,7 @@ async fn main() -> Result<()> {
         n4_clients.push(client.clone());
         iupf::set(Some((client, dnns)));
     }
+    iupf::warn_orphaned_legs();
 
     // Recovery counter for S5/S8. Derived from the process start rather than persisted:
     // smfd has no restart-counter file, and inventing one here would be a second answer
@@ -3791,7 +3792,7 @@ async fn pfcp_session_establish(
 
     // #2208: an I-UPF on N9 when one is configured for the DNN (TS 23.502
     // §4.3.5.4): the NG-RAN is then given the I-UPF's N3 F-TEID.
-    if let Some(leg) = iupf::insert(smf_n4_seid, dnn, flow_qfi, (upf_teid, upf_ip)).await {
+    if let Some(leg) = iupf::insert(smf_n4_seid, dnn, (upf_teid, upf_ip)).await {
         (upf_teid, upf_ip) = leg.n3;
     }
 

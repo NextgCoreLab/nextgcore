@@ -700,6 +700,9 @@ pub(crate) fn forget_session_endpoint_for_test(smf_n4_seid: u64) {
 /// recursive read on a `std::sync::RwLock` deadlocks behind a queued writer, the
 /// #636 class).
 pub fn forget_session_peer(smf_n4_seid: u64) {
+    // #2208 (R43 M2 on #2243): a PSA session gone without its I-UPF hearing of it
+    // releases the I-UPF's too. A no-op after a Deletion, which forgot the leg.
+    crate::iupf::release_leg(smf_n4_seid);
     if let Ok(mut map) = session_peers().write() {
         map.remove(&smf_n4_seid);
     }
@@ -852,52 +855,61 @@ pub fn clear_tsc_reports_for_test() {
     }
 }
 
-/// The I-UPF half of a Session Modification or Deletion of a PSA session with an
-/// I-UPF `leg` (#2208, `crate::iupf`), sent before the PSA's. A Modification
-/// whose I-UPF part the I-UPF does not accept fails as a whole, the PSA's part
-/// unsent. A Deletion goes on to the PSA whatever the I-UPF answers (logged).
-async fn iupf_leg_request(
-    msg_type: u8,
-    leg: &crate::iupf::IupfLeg,
-    body: &[u8],
-) -> Result<(), PfcpRequestError> {
-    let psa_seid = crate::iupf::psa_seid_of(leg.smf_seid);
-    let Some(client) = crate::iupf::client() else {
-        if msg_type == pfcp_message_type::SESSION_DELETION_REQUEST {
-            crate::iupf::forget(psa_seid);
-            return Ok(());
-        }
-        return Err(PfcpRequestError::Local(
-            "the session has an I-UPF leg but no I-UPF is configured".into(),
-        ));
-    };
-    if msg_type == pfcp_message_type::SESSION_DELETION_REQUEST {
-        let r = client
-            .session_request(msg_type, leg.smf_seid, Some(leg.upf_seid), body)
-            .await;
-        match r.as_ref().map(|(_, b)| parse_cause(b)) {
-            Ok(Some(pfcp_cause::REQUEST_ACCEPTED)) => {
-                log::info!("I-UPF Session Deletion for SEID 0x{psa_seid:016x}: accepted")
-            }
-            other => log::warn!(
-                "I-UPF Session Deletion for SEID 0x{psa_seid:016x}: {other:?}; the PSA's goes on"
-            ),
-        }
-        crate::iupf::forget(psa_seid);
-        return Ok(());
+/// What undoes the first half of a split modification when the request is
+/// dropped before the second half is applied (#2208, R43 M1: cancellation
+/// safety): sent from a task of its own.
+struct UndoOnDrop(Option<((Arc<PfcpClient>, u64, Option<u64>), Vec<u8>)>);
+
+impl Drop for UndoOnDrop {
+    fn drop(&mut self) {
+        let Some(((client, seid, upf_seid), body)) = self.0.take() else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(async move {
+            let r = client
+                .session_request_direct(
+                    pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+                    seid,
+                    upf_seid,
+                    &body,
+                )
+                .await;
+            log::warn!(
+                "SEID 0x{seid:016x}: a split modification was cancelled between its halves; \
+                 the first half undone: {:?}",
+                r.map(|(_, b)| parse_cause(&b))
+            );
+        });
     }
-    let Some(iupf_body) = crate::iupf::split_modification(body, leg).1 else {
-        return Ok(());
+}
+
+/// The I-UPF half of a Session Deletion of a PSA session with an I-UPF `leg`
+/// (#2208, `crate::iupf`), sent before the PSA's, which goes on whatever the I-UPF
+/// answers (logged).
+async fn iupf_leg_delete(leg: &crate::iupf::IupfLeg, body: &[u8]) {
+    let psa_seid = crate::iupf::psa_seid_of(leg.smf_seid);
+    crate::iupf::forget(psa_seid);
+    let Some(client) = crate::iupf::client() else {
+        return;
     };
-    let (_, resp) = client
-        .session_request(msg_type, leg.smf_seid, Some(leg.upf_seid), &iupf_body)
-        .await?;
-    match parse_cause(&resp) {
-        Some(pfcp_cause::REQUEST_ACCEPTED) => Ok(()),
-        Some(cause) => Err(PfcpRequestError::Rejected { cause }),
-        None => Err(PfcpRequestError::Local(
-            "the I-UPF's Session Modification Response has no Cause".into(),
-        )),
+    let r = client
+        .session_request(
+            pfcp_message_type::SESSION_DELETION_REQUEST,
+            leg.smf_seid,
+            Some(leg.upf_seid),
+            body,
+        )
+        .await;
+    match r.as_ref().map(|(_, b)| parse_cause(b)) {
+        Ok(Some(pfcp_cause::REQUEST_ACCEPTED)) => {
+            log::info!("I-UPF Session Deletion for SEID 0x{psa_seid:016x}: accepted")
+        }
+        other => log::warn!(
+            "I-UPF Session Deletion for SEID 0x{psa_seid:016x}: {other:?}; the PSA's goes on"
+        ),
     }
 }
 
@@ -1619,19 +1631,98 @@ impl PfcpClient {
                 || msg_type == pfcp_message_type::SESSION_DELETION_REQUEST)
         {
             if let Some(leg) = crate::iupf::leg_of(smf_seid) {
-                Box::pin(iupf_leg_request(msg_type, &leg, body)).await?;
-                let psa = if msg_type == pfcp_message_type::SESSION_MODIFICATION_REQUEST {
-                    crate::iupf::split_modification(body, &leg).0
-                } else {
-                    body.to_vec()
-                };
-                return self
-                    .session_request_direct(msg_type, smf_seid, upf_seid, &psa)
+                if msg_type == pfcp_message_type::SESSION_DELETION_REQUEST {
+                    Box::pin(iupf_leg_delete(&leg, body)).await;
+                    return self
+                        .session_request_direct(msg_type, smf_seid, upf_seid, body)
+                        .await;
+                }
+                return Box::pin(self.split_modification_request(smf_seid, upf_seid, body, &leg))
                     .await;
             }
         }
         self.session_request_direct(msg_type, smf_seid, upf_seid, body)
             .await
+    }
+
+    /// A Session Modification of PSA session `smf_seid` with I-UPF `leg`, split
+    /// (`crate::iupf`) and ordered by direction, with the half applied first undone
+    /// when the other fails or the request is cancelled between them (#2208, R43
+    /// M1 on #2243, failure-path properties 1 and 3):
+    /// - toward active (an NG-RAN tunnel): the I-UPF first, then the PSA;
+    /// - an Apply Action change (AN release): the PSA first, so it buffers before
+    ///   the I-UPF stops, then the I-UPF.
+    async fn split_modification_request(
+        &self,
+        smf_seid: u64,
+        upf_seid: Option<u64>,
+        body: &[u8],
+        leg: &crate::iupf::IupfLeg,
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        use crate::iupf::Direction;
+        let msg = pfcp_message_type::SESSION_MODIFICATION_REQUEST;
+        let split = crate::iupf::split_modification(body, leg);
+        let Some(iupf_body) = split.iupf.clone() else {
+            return self
+                .session_request_direct(msg, smf_seid, upf_seid, &split.psa)
+                .await;
+        };
+        let Some(iupf) = crate::iupf::client() else {
+            return Err(PfcpRequestError::Local(
+                "the session has an I-UPF leg but no I-UPF is configured".into(),
+            ));
+        };
+        let accepted = |r: &Result<(u8, Vec<u8>), PfcpRequestError>| matches!(r, Ok((_, b)) if parse_cause(b) == Some(pfcp_cause::REQUEST_ACCEPTED));
+        let iupf_leg = (iupf.clone(), leg.smf_seid, Some(leg.upf_seid));
+        let psa_leg = client_for_session(smf_seid).map(|c| (c, smf_seid, upf_seid));
+        // (first, first's undo, second's send): which UPF goes first.
+        let toward_active = matches!(split.direction, Direction::TowardActive(_));
+        let first = if toward_active {
+            iupf.session_request_direct(msg, leg.smf_seid, Some(leg.upf_seid), &iupf_body)
+                .await
+        } else {
+            self.session_request_direct(msg, smf_seid, upf_seid, &split.psa)
+                .await
+        };
+        if !accepted(&first) {
+            return first;
+        }
+        // The first half is applied: until the second is, a cancellation undoes it.
+        let undo = if toward_active {
+            Some((iupf_leg, split.iupf_restore.clone()))
+        } else {
+            psa_leg.map(|l| (l, split.psa_restore.clone()))
+        };
+        let mut guard = UndoOnDrop(undo);
+        crate::iupf::test_hold_between_legs().await;
+        let second = if toward_active {
+            self.session_request_direct(msg, smf_seid, upf_seid, &split.psa)
+                .await
+        } else {
+            iupf.session_request_direct(msg, leg.smf_seid, Some(leg.upf_seid), &iupf_body)
+                .await
+        };
+        if accepted(&second) {
+            guard.0 = None;
+            crate::iupf::note_applied(smf_seid, split.direction);
+            return if toward_active { second } else { first };
+        }
+        // Undone now, awaited, so the caller sees the session as it was.
+        if let Some(((c, s, u), restore)) = guard.0.take() {
+            match c.session_request_direct(msg, s, u, &restore).await {
+                Ok(_) => log::warn!(
+                    "SEID 0x{smf_seid:016x}: the {} refused its half of the split; the {} half \
+                     was undone",
+                    if toward_active { "PSA" } else { "I-UPF" },
+                    if toward_active { "I-UPF" } else { "PSA" }
+                ),
+                Err(e) => log::error!(
+                    "SEID 0x{smf_seid:016x}: the split failed and its first half could not be \
+                     undone: {e}"
+                ),
+            }
+        }
+        second
     }
 
     /// [`Self::session_request`] for this peer alone.
@@ -1995,7 +2086,7 @@ impl PfcpClient {
     /// is about to empty, so notifying afterwards would have nobody to notify.
     /// Previously this cleared the map, logged a count, and left every AMF
     /// believing in contexts that could not carry a packet.
-    async fn teardown_association(&self, reason: &str) {
+    pub(crate) async fn teardown_association(&self, reason: &str) {
         let releases = self.begin_teardown(reason).await;
         let _ = releases.await;
     }
@@ -2722,6 +2813,9 @@ pub fn clear_pfcp_sessions() -> usize {
     // eps_to_5gs end-to-end test lose its N4 session.
     #[cfg(test)]
     assert_teardown_is_serialised();
+    // #2208 (R43 M2 on #2243): every I-UPF session goes with them. Before the
+    // context guards are taken: the release reads the context itself.
+    crate::iupf::release_all_legs();
     if let Ok(ctx) = smf_self().read() {
         let n = {
             match ctx.pfcp_sessions.write() {

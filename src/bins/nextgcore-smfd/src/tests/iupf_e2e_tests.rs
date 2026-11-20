@@ -22,6 +22,8 @@ struct Upf {
     pfcp: std::net::SocketAddr,
     /// The UPF's N4 session census.
     sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Its data plane, to read the rules it holds.
+    dp: Arc<DataPlane>,
     ip: std::net::Ipv4Addr,
     runtime: runtime::Runtime,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -80,9 +82,10 @@ async fn upf(net: u8) -> Upf {
         },
         0
     );
+    let dp = Arc::new(dp);
     let runtime = runtime::start(
         Arc::new(server),
-        Arc::new(dp),
+        dp.clone(),
         rx,
         shutdown.clone(),
         runtime::RuntimeOptions {
@@ -95,6 +98,7 @@ async fn upf(net: u8) -> Upf {
     Upf {
         pfcp,
         sessions,
+        dp,
         ip,
         runtime,
         shutdown,
@@ -275,6 +279,80 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
         "on the gNB's TEID"
     );
 
+    // R43 M3: AN release (BUFF|NOCP): the PSA buffers, so the downlink reaches
+    // nobody meanwhile; on re-activation the buffered packet comes out of the
+    // I-UPF to the (new) gNB tunnel. The probes sent above are drained first.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    while let Ok(Ok(_)) = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        gnb.recv_from(&mut buf),
+    )
+    .await
+    {}
+    pfcp_deactivate_dl_far(smf_seid, lookup_upf_seid(&reference).unwrap())
+        .await
+        .expect("the user plane is released");
+    let mut marked = dl;
+    marked[4] = 0x22; // an IP identification that tells this packet apart
+    marked[5] = 0x08;
+    unsafe {
+        libc::write(
+            psa.n6.1,
+            marked.as_ptr() as *const libc::c_void,
+            marked.len(),
+        )
+    };
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            gnb.recv_from(&mut buf)
+        )
+        .await
+        .is_err(),
+        "nothing reaches the gNB while the session is idle"
+    );
+    pfcp_session_modify(
+        smf_seid,
+        lookup_upf_seid(&reference).unwrap(),
+        0x220a,
+        gnb_ip.octets(),
+    )
+    .await
+    .expect("the user plane is re-activated");
+    // The I-UPF first sends the End Marker on the old tunnel (SNDEM, TS 29.281
+    // §7.3.2), then the buffered G-PDU on the new one.
+    let mut end_marker_on_old = false;
+    let (n, from) = loop {
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), gnb.recv_from(&mut buf))
+                .await
+                .expect("the buffered packet is delivered")
+                .unwrap();
+        if buf[1] == 0xfe {
+            end_marker_on_old |= u32::from_be_bytes(buf[4..8].try_into().unwrap()) == 0x2208;
+            continue;
+        }
+        break (n, from);
+    };
+    assert!(
+        end_marker_on_old,
+        "the End Marker on the old tunnel, from the I-UPF"
+    );
+    assert_eq!(
+        from.ip(),
+        std::net::IpAddr::V4(iupf_upf.ip),
+        "through the I-UPF"
+    );
+    assert_eq!(
+        u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+        0x220a,
+        "on the new tunnel"
+    );
+    assert!(
+        buf[..n].windows(2).any(|w| w == [0x22, 0x08]),
+        "the packet the PSA buffered"
+    );
+
     // Release: both N4 sessions go.
     pfcp_session_delete(smf_seid, lookup_upf_seid(&reference).unwrap())
         .await
@@ -297,4 +375,205 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     forget_seeded_session(&reference);
     iupf::set(None);
     pfcp_path::clear_global_upf_for_test();
+}
+
+/// The I-UPF's FAR 2, as its data plane holds it: (Apply Action, OHC TEID).
+fn iupf_far2(u: &Upf, upf_seid: u64) -> (u16, Option<u32>) {
+    let s =
+        u.dp.sessions
+            .find_by_seid(upf_seid)
+            .expect("the I-UPF's session");
+    let fars = s.fars.read().unwrap();
+    let f = &fars[&crate::DL_FAR_ID];
+    (f.apply_action, f.ohc_teid)
+}
+
+/// A session on the stand-in PSA (which can refuse) with the real I-UPF, for the
+/// failure-path tests (R43 M1/M2 on #2243).
+async fn session_with_refusing_psa(
+    iupf_upf: &Upf,
+    supi: &str,
+    psi: u8,
+) -> (
+    pfcp_path::stand_in::StandInUpf,
+    String,
+    u64,
+    iupf::IupfLeg,
+    tokio::task::JoinHandle<()>,
+) {
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let psa = pfcp_path::stand_in::associated_upf().await;
+    smf_context_init(64, 256, 512);
+    std::env::remove_var("PCF_URI");
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let client = Arc::new(pfcp_path::PfcpClient::new(
+        sock.clone(),
+        iupf_upf.pfcp,
+        [127, 0, 0, 1],
+    ));
+    let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+    iupf::set(Some((client.clone(), Vec::new())));
+    client.associate().await.expect("the I-UPF associates");
+    let n1_msg = n1(
+        psi,
+        1,
+        gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+        &[0x91, 0x00],
+    );
+    let resp = handle_sm_context_create(&create_request(supi, psi, &n1_msg)).await;
+    assert_eq!(resp.status, 201, "created");
+    let root: serde_json::Value =
+        serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+    let reference = root["smContextRef"].as_str().unwrap().to_string();
+    let seid = smf_n4_seid_for(&reference);
+    let leg = iupf::leg_of(seid).expect("the I-UPF is inserted");
+    (psa, reference, seid, leg, listener)
+}
+
+/// R43 M1 on #2243, failure-path properties 1 and 3: a split modification the
+/// PSA refuses, or one cancelled between its halves, leaves both UPFs as they
+/// were.
+/// - Toward active, the I-UPF goes first: a PSA refusal puts the I-UPF's FAR 2
+///   back to BUFF; a cancellation between the halves puts it back to the
+///   previous NG-RAN tunnel.
+/// - Toward idle (an Apply Action change), the PSA goes first: a PSA refusal
+///   leaves the I-UPF untouched; a cancellation between the halves puts the
+///   PSA's FAR 2 back to FORW toward the I-UPF.
+///
+/// REVERT-VERIFIED: see the PR.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
+    use crate::n4_build::apply_action::{BUFF, FORW};
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _q = qos_mon::TEST_LOCK.lock().await;
+    let _seeded = crate::context::SeededState::track();
+    let iupf_upf = upf(28).await;
+    let (psa, reference, seid, leg, listener) =
+        session_with_refusing_psa(&iupf_upf, "imsi-001010000022087", 6).await;
+    let upf_seid = lookup_upf_seid(&reference).unwrap();
+    assert_eq!(
+        iupf_far2(&iupf_upf, leg.upf_seid).0 & FORW,
+        0,
+        "buffering at first"
+    );
+
+    // Toward active, the PSA refuses: the I-UPF is put back to BUFF.
+    psa.reject_modification(1);
+    assert!(pfcp_session_modify(seid, upf_seid, 0x2208, [127, 0, 0, 77])
+        .await
+        .is_err());
+    let (action, ohc) = iupf_far2(&iupf_upf, leg.upf_seid);
+    assert_eq!(
+        (action & FORW, action & BUFF),
+        (0, BUFF),
+        "the I-UPF buffers again: {action:#x} {ohc:?}"
+    );
+
+    // Activated for real.
+    pfcp_session_modify(seid, upf_seid, 0x2208, [127, 0, 0, 77])
+        .await
+        .expect("activated");
+    assert_eq!(iupf_far2(&iupf_upf, leg.upf_seid), (FORW, Some(0x2208)));
+
+    // Toward active, cancelled between the halves: back to the previous tunnel.
+    let hold = iupf::BetweenLegs::arm();
+    let task = tokio::spawn(async move {
+        let _ = pfcp_session_modify(seid, upf_seid, 0x2209, [127, 0, 0, 78]).await;
+    });
+    hold.reached.notified().await;
+    assert_eq!(
+        iupf_far2(&iupf_upf, leg.upf_seid).1,
+        Some(0x2209),
+        "the I-UPF half is applied"
+    );
+    task.abort();
+    let _ = task.await;
+    drop(hold);
+    wait_until(|| iupf_far2(&iupf_upf, leg.upf_seid).1 == Some(0x2208)).await;
+    assert_eq!(
+        iupf_far2(&iupf_upf, leg.upf_seid),
+        (FORW, Some(0x2208)),
+        "the previous tunnel"
+    );
+
+    // Toward idle, the PSA refuses: the PSA goes first, so the I-UPF is untouched.
+    psa.reject_modification(1);
+    assert!(pfcp_deactivate_dl_far(seid, upf_seid).await.is_err());
+    assert_eq!(
+        iupf_far2(&iupf_upf, leg.upf_seid),
+        (FORW, Some(0x2208)),
+        "the I-UPF still forwards"
+    );
+
+    // Toward idle, cancelled between the halves: the PSA's FAR 2 is put back to
+    // FORW toward the I-UPF's N9 F-TEID, and the I-UPF never heard of it.
+    psa.clear_seen();
+    let hold = iupf::BetweenLegs::arm();
+    let task = tokio::spawn(async move {
+        let _ = pfcp_deactivate_dl_far(seid, upf_seid).await;
+    });
+    hold.reached.notified().await;
+    task.abort();
+    let _ = task.await;
+    drop(hold);
+    let n9 = leg.n9;
+    wait_until(|| psa.modification_bodies().len() >= 2).await;
+    let bodies = psa.modification_bodies();
+    let restored = bodies.last().unwrap();
+    let ohc = pfcp_path::find_ie(restored, 10)
+        .and_then(|f| pfcp_path::find_ie(f, 11))
+        .and_then(|fp| pfcp_path::find_ie(fp, 84));
+    assert_eq!(
+        ohc.map(|o| (
+            u32::from_be_bytes(o[2..6].try_into().unwrap()),
+            [o[6], o[7], o[8], o[9]]
+        )),
+        Some(n9),
+        "the PSA's FAR 2 forwards to the I-UPF again"
+    );
+    assert_eq!(
+        iupf_far2(&iupf_upf, leg.upf_seid),
+        (FORW, Some(0x2208)),
+        "the I-UPF never stopped"
+    );
+
+    listener.abort();
+    iupf::forget(seid);
+    cancel_gsm_timer_for_test(&reference);
+    forget_seeded_session(&reference);
+    iupf::set(None);
+    drop(psa);
+}
+
+/// R43 M2 on #2243: a PSA session that goes without an N4 Deletion (here the
+/// PSA's association is torn down, TS 23.527 §4.2) releases its I-UPF leg: the
+/// I-UPF's session is deleted and the leg forgotten.
+///
+/// REVERT-VERIFIED: see the PR.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_psa_teardown_deletes_the_i_upf_session_2208() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _q = qos_mon::TEST_LOCK.lock().await;
+    let _seeded = crate::context::SeededState::track();
+    let iupf_upf = upf(29).await;
+    let (psa, reference, seid, _leg, listener) =
+        session_with_refusing_psa(&iupf_upf, "imsi-001010000022086", 7).await;
+    assert_eq!(iupf_upf.sessions.load(Ordering::SeqCst), 1);
+    psa.client
+        .teardown_association("test: the PSA restarted")
+        .await;
+    wait_until(|| iupf_upf.sessions.load(Ordering::SeqCst) == 0).await;
+    assert_eq!(
+        iupf_upf.sessions.load(Ordering::SeqCst),
+        0,
+        "the I-UPF's session is deleted"
+    );
+    assert!(iupf::leg_of(seid).is_none(), "and the leg forgotten");
+    listener.abort();
+    cancel_gsm_timer_for_test(&reference);
+    forget_seeded_session(&reference);
+    iupf::set(None);
+    drop(psa);
 }
