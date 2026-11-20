@@ -1010,8 +1010,9 @@ pub fn on_amf_registered(supi: &str) {
 /// AMF refuses (404: it no longer holds it) is dropped and subscribed afresh.
 /// Returns how many were renewed.
 ///
-/// #2182 (R42 on #2156), the #2128 / #2149 shape: legs are renewed per AMF, in
-/// the order they lapse, up to [`LEG_RENEW_MAX_AMFS`] AMFs at once, and an AMF
+/// #2182 (R42 on #2156), the #2128 / #2149 shape, on the shared sweep since
+/// #2186: legs are renewed per AMF, in the order they lapse, up to
+/// [`LEG_RENEW_MAX_AMFS`] AMFs at once, and an AMF
 /// that does not answer one renewal (no answer, a 5xx) is not tried again this
 /// pass; its legs stay and are tried on the next one. So a dead AMF with many
 /// due legs costs one call timeout per pass, and other AMFs' legs are renewed
@@ -1037,33 +1038,31 @@ pub async fn renew_amf_legs(now: u64) -> usize {
             .collect()
     };
     due.sort_by_key(|(_, granted, _)| *granted);
-    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<String>> = Default::default();
-    for (amf, _, id) in due {
-        by_amf.entry(amf).or_default().push(id);
-    }
-    let slots = Arc::new(tokio::sync::Semaphore::new(LEG_RENEW_MAX_AMFS));
-    let mut workers = tokio::task::JoinSet::new();
-    for (_, ids) in by_amf {
-        let slots = slots.clone();
-        workers.spawn(async move {
-            let _slot = slots.acquire_owned().await;
-            let mut renewed = 0usize;
-            for id in ids {
-                match renew_one(&id, now).await {
-                    Modify::Granted(_) => renewed += 1,
-                    Modify::Refused => {}
-                    // This AMF is not answering: its other legs wait for the next pass.
-                    Modify::Unreachable => break,
-                }
+    // #2186: on the shared sweep: one renewal in flight per AMF, up to
+    // LEG_RENEW_MAX_AMFS AMFs at once, an unreachable AMF parked for the rest of
+    // the pass (its legs stay for the next one), nothing new after one tick, and
+    // the time read per leg (`now` plus the time the pass has run).
+    let started = tokio::time::Instant::now();
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: LEG_RENEW_MAX_AMFS,
+        budget: LEG_RENEW_TICK,
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        due.into_iter().map(|(amf, _, id)| (amf, id)),
+        move || now.saturating_add(started.elapsed().as_secs()),
+        |_amf, id: String, at| async move {
+            match renew_one(&id, at).await {
+                Modify::Granted(_) => (nextgcore_sbi::sweep::Verdict::Answered, true),
+                Modify::Refused => (nextgcore_sbi::sweep::Verdict::Answered, false),
+                // This AMF is not answering: its other legs wait for the next pass.
+                Modify::Unreachable => (nextgcore_sbi::sweep::Verdict::PeerDown, false),
             }
-            renewed
-        });
-    }
-    let mut renewed = 0;
-    while let Some(done) = workers.join_next().await {
-        renewed += done.unwrap_or(0);
-    }
-    renewed
+        },
+    )
+    .await;
+    report.done.iter().filter(|(_, renewed)| *renewed).count()
 }
 
 /// #2182: at most this many AMFs have legs renewed at once in a pass.
@@ -2123,6 +2122,7 @@ mod tests {
                 notify_uri: "http://nef.example.org/ee-notify".to_string(),
                 events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
                 expiry: Some(now - 1),
+                amf_expiry: Some(now - 1),
             });
             udm_self().read().unwrap().ee_subscription_insert(sub);
             uris.push(uri);

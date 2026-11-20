@@ -501,6 +501,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "spawn_unsubscribe_reconciler",
         TIMER,
     ),
+    (
+        "nextgcore-udmd/src/ee_amf.rs",
+        "spawn_amf_leg_renewal",
+        TIMER,
+    ),
     ("nextgcore-udmd/src/sdm_udr.rs", "drain", CONCURRENT),
     ("nextgcore-udmd/src/sdm_udr.rs", "refresh_legs", ONE_PEER),
     ("nextgcore-udmd/src/sdm_udr.rs", "spawn_leg_refresh", TIMER),
