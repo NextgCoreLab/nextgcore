@@ -7143,22 +7143,33 @@ lmf:
         }
     }
 
-    /// **#2214** (R44 on #2190): anonymous LDR creation at the handler, until
-    /// now covered only by `owner_binding`'s own tests. Under production an
-    /// anonymous DetermineLocation is refused 403 before anything is read, and
-    /// no LDR exists afterwards. Under dev
-    /// the same request is served and its LDR is ownerless, as every unbound
-    /// dev resource is.
+    /// **#2214** (R44 on #2190): anonymous callers at the handler, until now
+    /// covered only by `owner_binding`'s own tests. Under production:
+    /// - an anonymous immediate DetermineLocation (no LDR) is refused 403 by
+    ///   the NF-type gate before anything is read;
+    /// - an anonymous deferred one, which would create an LDR, is refused 403
+    ///   and no LDR exists. Both the gate and `owner_for_new_resource` refuse
+    ///   it, so no single revert reaches this case.
     ///
-    /// REVERT-VERIFIED: with `nf_type_refusal_with` given `false` for
-    /// `production`, the anonymous request is 200 and "production: anonymous"
-    /// fails.
+    /// Under dev the deferred request is served and its LDR is ownerless, as
+    /// every unbound dev resource is.
+    ///
+    /// REVERT-VERIFIED: with the `nf_type_refusal_with` gate removed, the
+    /// immediate request is 200 and "production: anonymous immediate" fails.
     #[tokio::test]
     async fn an_anonymous_determine_location_is_refused_under_production_2214() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let supi = "imsi-001010000022141";
         seed_fix(supi, 40.0);
+        let immediate = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(format!(r#"{{"supi":"{supi}"}}"#), "application/json");
+        let resp = handle_determine_location_with(&immediate, true).await;
+        assert_eq!(
+            resp.status, 403,
+            "production: anonymous immediate: {:?}",
+            resp.http.content
+        );
         let resp = handle_determine_location_with(&deferred_2214(supi, "anon2214-p"), true).await;
         assert_eq!(
             resp.status, 403,
