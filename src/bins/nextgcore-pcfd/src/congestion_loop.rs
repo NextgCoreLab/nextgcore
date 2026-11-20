@@ -58,7 +58,7 @@ pub const DEMO_SPEC: nextgcore_demo::DemoSpec = nextgcore_demo::DemoSpec {
 #[serde(deny_unknown_fields)]
 pub struct LoopYaml {
     /// The Area of Interest, as NR cells.
-    pub cells: Option<Vec<CellYaml>>,
+    pub cells: Option<Vec<CellConfigYaml>>,
     /// Only sessions on this slice SST (absent: any).
     pub sst: Option<u8>,
     /// Only sessions on this DNN (absent: any).
@@ -80,9 +80,21 @@ pub struct LoopYaml {
     pub dry_run: Option<bool>,
 }
 
-/// One AoI cell.
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+/// One AoI cell as the file writes it. The PLMN digits stay YAML values so a
+/// number can be told from a string (#2115): serde_yaml reads `mcc: 999` into
+/// a `String` field as "999" without complaint, and a YAML 1.1 re-dump of
+/// "070" reaches it as 56.
+#[derive(Debug, Default, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct CellConfigYaml {
+    pub mcc: serde_yaml::Value,
+    pub mnc: serde_yaml::Value,
+    /// 9 hex digits (TS 29.571 `NrCellId`).
+    pub nr_cell_id: String,
+}
+
+/// One resolved AoI cell.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CellYaml {
     pub mcc: String,
     pub mnc: String,
@@ -119,32 +131,29 @@ impl Settings {
     /// Resolve the block; `Err` fails start-up (a throttle on live sessions must
     /// not run on a guessed configuration).
     pub fn from_yaml(y: &LoopYaml) -> Result<Self, String> {
-        let cells = y.cells.clone().unwrap_or_default();
-        if cells.is_empty() {
+        use nextgcore_core::plmn::{config_digits, PlmnPart};
+        let configured = y.cells.clone().unwrap_or_default();
+        if configured.is_empty() {
             return Err("pcf.congestion_loop.cells must name at least one NR cell".into());
         }
-        for c in &cells {
+        let mut cells = Vec::with_capacity(configured.len());
+        for (i, c) in configured.into_iter().enumerate() {
             if c.nr_cell_id.len() != 9 || !c.nr_cell_id.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(format!(
                     "pcf.congestion_loop.cells: nr_cell_id {:?} is not 9 hex digits",
                     c.nr_cell_id
                 ));
             }
-            if c.mcc.len() != 3 || !matches!(c.mnc.len(), 2 | 3) {
-                return Err(format!(
-                    "pcf.congestion_loop.cells: PLMN {}/{} is not 3+2/3 digits",
-                    c.mcc, c.mnc
-                ));
-            }
+            // #2115: quoted digits only (TS 23.003 §2.2); a number is refused.
+            let field = |part: PlmnPart| format!("pcf.congestion_loop.cells[{i}].{}", part.key());
+            cells.push(CellYaml {
+                mcc: config_digits(&field(PlmnPart::Mcc), PlmnPart::Mcc, &c.mcc)?,
+                mnc: config_digits(&field(PlmnPart::Mnc), PlmnPart::Mnc, &c.mnc)?,
+                nr_cell_id: c.nr_cell_id.to_ascii_uppercase(),
+            });
         }
         let s = Self {
-            cells: cells
-                .into_iter()
-                .map(|c| CellYaml {
-                    nr_cell_id: c.nr_cell_id.to_ascii_uppercase(),
-                    ..c
-                })
-                .collect(),
+            cells,
             sst: y.sst,
             dnn: y.dnn.clone(),
             protected_supis: y.protected_supis.clone().unwrap_or_default(),
@@ -681,7 +690,7 @@ mod tests {
 
     fn settings() -> Settings {
         Settings::from_yaml(&LoopYaml {
-            cells: Some(vec![CellYaml {
+            cells: Some(vec![CellConfigYaml {
                 mcc: "999".into(),
                 mnc: "70".into(),
                 nr_cell_id: "000000010".into(),
@@ -864,6 +873,48 @@ mod tests {
         .unwrap();
         assert_eq!(s.cells[0].nr_cell_id, "00000001A");
         assert_eq!((s.floor_kbps, s.throttle_kbps), (500, 1000), "defaults");
+    }
+
+    /// **#2115** (R41 on #2127): a cell's PLMN must be quoted digits. A YAML
+    /// number is refused even with the right length (`999`, or `56` from a
+    /// YAML 1.1 re-dump of "070"), naming the field, and start-up fails; the
+    /// quoted form resolves as written.
+    ///
+    /// REVERT-VERIFIED: with the number read as its digits again (the
+    /// `String` field), the `999` and `56` cases resolve and `unwrap_err`
+    /// panics.
+    #[test]
+    fn a_cell_plmn_must_be_quoted_digits_2115() {
+        let root = |cell: &str| {
+            serde_yaml::from_str::<serde_yaml::Value>(&format!(
+                "pcf: {{congestion_loop: {{cells: [{{nr_cell_id: '000000010', {cell}}}]}}}}"
+            ))
+            .unwrap()
+        };
+        for (cell, want) in [
+            (
+                "mcc: 999, mnc: '70'",
+                "pcf.congestion_loop.cells[0].mcc=999 reached the configuration as a number",
+            ),
+            (
+                "mcc: '999', mnc: 56",
+                "pcf.congestion_loop.cells[0].mnc=56 reached the configuration as a number",
+            ),
+            (
+                "mcc: '9999', mnc: '70'",
+                "pcf.congestion_loop.cells[0].mcc=\"9999\": an MCC is 3 digits",
+            ),
+        ] {
+            let err = settings_from_root(&root(cell)).unwrap_err();
+            assert!(err.contains(want), "{cell}: {err}");
+        }
+        let s = settings_from_root(&root("mcc: '001', mnc: '070'"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (s.cells[0].mcc.as_str(), s.cells[0].mnc.as_str()),
+            ("001", "070")
+        );
     }
 
     #[test]
