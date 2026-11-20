@@ -1503,13 +1503,29 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<bool, String>>,
 {
+    provisioner_refusal_with(policy, request, is_nef, production_profile()).await
+}
+
+/// [`provisioner_refusal`] under the profile `production` says: under it a
+/// certificate naming no NF type is no identity on its own (#2065), so it
+/// is refused before the NRF is asked.
+async fn provisioner_refusal_with<F, Fut>(
+    policy: &context::ProvisioningPolicy,
+    request: &SbiRequest,
+    is_nef: F,
+    production: bool,
+) -> Option<SbiResponse>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
     policy.trusted_afs.as_ref()?;
     let refuse = |why: String| {
         let why = format!("only the NEF or a trusted AF provisions (TS 29.675 §4.1.3.2): {why}");
         log::debug!("{why}");
         Some(nextgcore_sbi::server::send_forbidden(&why, None))
     };
-    let caller = match owner_binding::verified_consumer_id(request) {
+    let caller = match owner_binding::verified_consumer_id_with(request, production) {
         Ok(Some(caller)) => caller,
         Ok(None) => return refuse("the requester has no verified identity".into()),
         Err(why) => return refuse(why),
@@ -3187,17 +3203,40 @@ mod tests {
                 "{what}"
             );
         }
-        for r in [
-            caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
-            caller(&[], Some(NEF_A_1916), None),
-        ] {
-            assert!(
-                provisioner_refusal(&policy, &r, nrf_nef_is(NEF_A_1916))
-                    .await
-                    .is_none(),
-                "{r:?}"
-            );
-        }
+        assert!(
+            provisioner_refusal(
+                &policy,
+                &caller(&["SCP"], Some(scp), Some(NEF_A_1916)),
+                nrf_nef_is(NEF_A_1916)
+            )
+            .await
+            .is_none(),
+            "a NEF via an SCP, by its NRF profile"
+        );
+        // #2065: a typeless certificate alone is a NEF by its NRF profile only
+        // under dev; under production it is no identity and is refused before
+        // the NRF is asked. Both profiles are passed explicitly, so the test
+        // reads no process-wide override (#2089: it used to pass only after a
+        // sibling had set Dev).
+        let typeless = caller(&[], Some(NEF_A_1916), None);
+        assert!(
+            provisioner_refusal_with(&policy, &typeless, nrf_nef_is(NEF_A_1916), false)
+                .await
+                .is_none(),
+            "dev: a typeless NEF certificate, by its NRF profile"
+        );
+        let r = provisioner_refusal_with(&policy, &typeless, nrf_nef_is(NEF_A_1916), true)
+            .await
+            .expect("production: a typeless certificate alone is no identity");
+        assert_eq!(r.status, 403);
+        assert!(
+            body(&r)["detail"]
+                .as_str()
+                .unwrap()
+                .contains("names no NF type"),
+            "{:?}",
+            body(&r)
+        );
     }
 
     /// #1989 review M1: the provisioning API is judged by [`provisioner_refusal`]
