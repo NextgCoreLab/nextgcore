@@ -540,8 +540,9 @@ fn unsubscribe_backoff_now() -> tokio::time::Instant {
 /// test says time has passed.
 ///
 /// **The contract (#2217, R41): manual only, for every udmd test.** An AMF that
-/// fails in a test stays backing off however long the test sleeps (paused-time
-/// `tokio::time::advance` does not move it either). A test that
+/// fails in a test stays backing off however long the test sleeps (udmd's tests
+/// cannot pause time: its dev-dependencies do not enable tokio `test-util`). A
+/// test that
 /// needs the AMF tried again advances this clock past the wait
 /// ([`UNSUBSCRIBE_BACKOFF_BASE`] after a first failure, doubled after each
 /// further one), or starts clean with `clear_parked_unsubscribes_for_test`,
@@ -2397,13 +2398,16 @@ mod tests {
     }
 
     /// **#2217** (R41): the test backoff clock's contract, pinned. An AMF that
-    /// failed stays backing off through a sleep, and its wait ends once a test
-    /// advances the clock past it, with no real time passing.
+    /// failed stays backing off through a sleep (the clock does not move), and
+    /// its wait ends once a test advances the clock past it, with no real time
+    /// passing.
     ///
     /// REVERT-VERIFIED: with the test clock reading the runtime's
     /// `tokio::time::Instant::now()` (the production clock), and with
     /// `advance_unsubscribe_backoff_clock_for_test` a no-op, "advancing the
-    /// clock past the wait ends it" fails.
+    /// clock past the wait ends it" fails; with R41's opt-in alternative (the
+    /// real clock plus the advanced offset), "a sleep does not move the clock"
+    /// fails.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
     async fn the_test_backoff_clock_moves_only_when_a_test_advances_it_2217() {
@@ -2413,12 +2417,17 @@ mod tests {
         clear_parked_unsubscribes_for_test();
         let amf = amf_of("http://127.0.0.1:22170/namf-evts/v1/subscriptions/clock-2217");
         UNSUBSCRIBE_BACKOFF.note_failure(&amf);
+        // R48: the clock itself, not the backoff, which a 20 ms sleep against a
+        // 30 s base could not end under any clock.
+        let t0 = unsubscribe_backoff_now();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let clock_after_sleep = unsubscribe_backoff_now();
         let after_sleep = UNSUBSCRIBE_BACKOFF.backing_off(&amf);
         advance_unsubscribe_backoff_clock_for_test(UNSUBSCRIBE_BACKOFF_BASE);
         let after_clock_advance = UNSUBSCRIBE_BACKOFF.backing_off(&amf);
         clear_parked_unsubscribes_for_test();
 
+        assert_eq!(clock_after_sleep, t0, "a sleep does not move the clock");
         assert!(after_sleep, "a sleep does not end it");
         assert!(
             !after_clock_advance,
