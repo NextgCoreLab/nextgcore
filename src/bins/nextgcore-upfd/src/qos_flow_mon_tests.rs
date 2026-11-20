@@ -768,3 +768,37 @@ fn a_periodic_gtpupm_control_averages_and_reports_a_silent_period_as_a_failure()
     let m2 = r.reports[0].1[0].1.qos_monitoring_measurement;
     assert!(m2.packet_delay_measurement_failure);
 }
+
+/// #2270: a GTPUPM period whose samples differ reports a round trip of exactly
+/// its DL plus its UL (§5.24.5.4: each sample's round trip is DL + UL). The
+/// three averaged and rounded down on their own gave 10 + 10 and a round trip of
+/// 21: the I-UPF end to end failed so under load, which is what varies the
+/// transport delay.
+///
+/// REVERT-VERIFIED: with `average` dividing the round trip sum on its own, this
+/// fails (21).
+#[test]
+fn a_gtpupm_period_s_round_trip_is_its_dl_plus_its_ul_2270() {
+    let mut m = QosFlowMonitor::new(false);
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    m.create_srr(SEID, 1, vec![gtpupm_ctl(9, false, None)], now, wall);
+    for (i, t) in [10u32, 11].iter().enumerate() {
+        let s = TransportSample {
+            qfi: 9,
+            accumulated_ms: *t,
+            dl_ran_ms: Some(0),
+            ul_ran_ms: Some(0),
+        };
+        m.on_transport_sample(SEID, &s, now + ms(10 * i as u64), wall);
+    }
+    let r = m.round(now + Duration::from_secs(2), wall);
+    let q = r.reports[0].1[0].1.qos_monitoring_measurement;
+    let (dl, ul, rt) = (
+        q.downlink_packet_delay.unwrap(),
+        q.uplink_packet_delay.unwrap(),
+        q.round_trip_packet_delay.unwrap(),
+    );
+    assert_eq!((dl, ul), (10, 10), "10.5 rounded down each way");
+    assert_eq!(rt, dl + ul, "RTT = DL + UL");
+}
