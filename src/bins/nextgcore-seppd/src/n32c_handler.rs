@@ -1403,6 +1403,76 @@ mod tests {
         );
     }
 
+    /// #2096 (R30 on #2092): a second exchange-params that replaces an N32-f
+    /// context drops the replaced context's PRINS SEQ counters and replay
+    /// windows, on the responder (`handle_exchange_params_request`) and on the
+    /// initiator (`handle_exchange_params_response`).
+    ///
+    /// REVERT-VERIFIED: with the prune removed at the responder's install, the
+    /// first state assertion fails; at the initiator's, the second.
+    #[test]
+    fn a_replaced_n32f_context_leaves_no_prins_state_2096() {
+        let _g = crate::context::lock_global_test_state();
+        {
+            let ctx = sepp_self();
+            let mut context = ctx.write().unwrap();
+            context.set_sender("sepp.local.example.com");
+        }
+        let request = |ctx_id: &str| SecParamExchReqData {
+            sender: Some("sepp-a.example.com".to_string()),
+            n32f_context_id: ctx_id.to_string(),
+            jwe_cipher_suite_list: vec!["A256GCM".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: Some(vec![IpxProviderSecInfo {
+                ipx_provider_id: "sepp-a.example.com".to_string(),
+                raw_public_key_list: Some(vec![test_es256_pubkey_pem()]),
+                certificate_list: None,
+            }]),
+            sender_api_root: None,
+        };
+        let secrets = || {
+            let secret = vec![0x5au8; N32F_EXPORTER_SECRET_LEN];
+            set_n32c_tls_exporter_secret("sepp-a.example.com", secret.clone());
+            set_n32c_tls_exporter_secret("sepp.local.example.com", secret);
+        };
+        let mut node_b = SeppNode::new(20, "sepp-a.example.com");
+        node_b.negotiated_security_scheme = SecurityCapability::Prins;
+        let mut node_a = SeppNode::new(21, "sepp.local.example.com");
+        node_a.negotiated_security_scheme = SecurityCapability::Prins;
+
+        // The first context, and SEQ state for it, as after its first message.
+        secrets();
+        let req1 = request(&crate::prins::generate_n32f_context_id());
+        let rsp1 = handle_exchange_params_request(&mut node_b, &req1).unwrap();
+        handle_exchange_params_response(&mut node_a, &req1, &rsp1).unwrap();
+        let old = node_b.n32f_security.as_ref().unwrap().kid.clone();
+        assert_eq!(node_a.n32f_security.as_ref().unwrap().kid, old);
+        crate::prins::seed_context_state(&old);
+
+        // The responder replaces it.
+        secrets();
+        let req2 = request(&crate::prins::generate_n32f_context_id());
+        let rsp2 = handle_exchange_params_request(&mut node_b, &req2).unwrap();
+        assert_ne!(node_b.n32f_security.as_ref().unwrap().kid, old);
+        assert_eq!(
+            crate::prins::context_state_len(&old),
+            0,
+            "the responder's replacement drops the old context's state"
+        );
+
+        // The initiator replaces it too.
+        crate::prins::seed_context_state(&old);
+        handle_exchange_params_response(&mut node_a, &req2, &rsp2).unwrap();
+        assert_ne!(node_a.n32f_security.as_ref().unwrap().kid, old);
+        assert_eq!(
+            crate::prins::context_state_len(&old),
+            0,
+            "the initiator's replacement drops the old context's state"
+        );
+    }
+
     /// #100: an `exchange-params` request that OMITS `sender` is accepted end to end
     /// by the handler — `sender` is optional (`required: [n32fContextId]` only), and
     /// this used to be refused with `MANDATORY_IE_INCORRECT` → 400 twice over: once

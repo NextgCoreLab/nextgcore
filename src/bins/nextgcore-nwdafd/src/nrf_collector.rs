@@ -35,27 +35,126 @@ use std::sync::{Arc, RwLock};
 /// An OAuth2-required listener admits a notification on it by that token.
 pub const CALLBACK_SEGMENT: &str = "nf-status-notify";
 
-static CALLBACK_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// #2093: how long a replaced subscription's token still admits notifications
+/// when the NRF gave no validity for it (the NRF may still deliver on the old
+/// subscription until it lapses).
+const RETIRED_TOKEN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// This process's NFStatusNotify callback token: a UUID v4 (122 random bits).
-pub fn callback_token() -> &'static str {
-    CALLBACK_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+/// At most this many tokens are held (the current one, ones being subscribed,
+/// and retired ones in their grace window); the oldest go first.
+const MAX_TOKENS: usize = 4;
+
+/// #2093: the callback tokens of this NWDAF's NFStatusSubscribe subscriptions,
+/// ONE PER SUBSCRIPTION (each subscribe mints its own), not one per process: a
+/// token seen by a relay on one subscription's notifications proves nothing
+/// about another's, and a replaced subscription's token stops working once its
+/// grace window ends.
+#[derive(Debug, Default)]
+pub struct TokenBook {
+    /// The token of the subscription in force, once the NRF accepted it.
+    current: Option<String>,
+    /// Minted for a subscribe the NRF has not answered yet.
+    pending: Vec<String>,
+    /// Replaced subscriptions' tokens, with the instant each stops working.
+    retired: Vec<(String, std::time::Instant)>,
 }
 
-/// The callback path the NFStatusSubscribe names.
+impl TokenBook {
+    /// Mint the token for a new NFStatusSubscribe.
+    pub fn mint(&mut self) -> String {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        self.pending.push(token.clone());
+        self.prune(std::time::Instant::now());
+        token
+    }
+
+    /// The NRF accepted the subscription carrying `token`: it is now the current
+    /// one, and the one it replaces keeps working until `retire_at`.
+    pub fn activate(&mut self, token: &str, retire_at: std::time::Instant) {
+        self.pending.retain(|t| t != token);
+        if let Some(previous) = self.current.replace(token.to_string()) {
+            if previous != token {
+                self.retired.push((previous, retire_at));
+            }
+        }
+        self.prune(std::time::Instant::now());
+    }
+
+    /// A subscribe carrying `token` failed: forget it.
+    pub fn abandon(&mut self, token: &str) {
+        self.pending.retain(|t| t != token);
+    }
+
+    /// Whether `token` names a subscription this NWDAF holds at `now`: the
+    /// current one, one being subscribed, or a replaced one in its grace window.
+    pub fn holds(&self, token: &str, now: std::time::Instant) -> bool {
+        let eq = |t: &str| nextgcore_sbi::callback_auth::token_eq(t, token);
+        self.current.as_deref().is_some_and(eq)
+            || self.pending.iter().any(|t| eq(t))
+            || self.retired.iter().any(|(t, until)| *until > now && eq(t))
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.retired.retain(|(_, until)| *until > now);
+        while self.pending.len() + self.retired.len() + 1 > MAX_TOKENS && !self.retired.is_empty() {
+            self.retired.remove(0);
+        }
+        while self.pending.len() + 1 > MAX_TOKENS {
+            self.pending.remove(0);
+        }
+    }
+
+    /// The current token, minting one as current when there is none (start-up,
+    /// before the first subscribe answers; tests).
+    fn current_or_mint(&mut self) -> String {
+        if let Some(t) = &self.current {
+            return t.clone();
+        }
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        self.current = Some(token.clone());
+        token
+    }
+}
+
+static TOKENS: std::sync::Mutex<TokenBook> = std::sync::Mutex::new(TokenBook {
+    current: None,
+    pending: Vec::new(),
+    retired: Vec::new(),
+});
+
+fn tokens() -> std::sync::MutexGuard<'static, TokenBook> {
+    TOKENS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The token of the subscription in force (minted when there is none yet).
+pub fn callback_token() -> String {
+    tokens().current_or_mint()
+}
+
+/// The callback path carrying `token`.
+pub fn callback_path_for(token: &str) -> String {
+    format!("/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/{token}")
+}
+
+/// The callback path of the subscription in force.
 pub fn callback_path() -> String {
-    format!(
-        "/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/{}",
-        callback_token()
-    )
+    callback_path_for(&callback_token())
 }
 
-/// Whether `token` is the one [`callback_path`] carries: the check both the
-/// route and the server's OAuth2 callback exemption (#1421) apply.
+/// `callback_uri` with its token segment replaced by `token`, when it is one of
+/// these callbacks; otherwise unchanged.
+pub fn callback_uri_with_token(callback_uri: &str, token: &str) -> String {
+    let marker = format!("/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/");
+    match callback_uri.find(&marker) {
+        Some(at) => format!("{}{}", &callback_uri[..at], callback_path_for(token)),
+        None => callback_uri.to_string(),
+    }
+}
+
+/// Whether `token` names a subscription this NWDAF holds (#2093): the check
+/// both the route and the server's OAuth2 callback exemption (#1421) apply.
 pub fn holds_callback_token(token: &str) -> bool {
-    CALLBACK_TOKEN
-        .get()
-        .is_some_and(|t| nextgcore_sbi::callback_auth::token_eq(t, token))
+    tokens().holds(token, std::time::Instant::now())
 }
 
 /// Renew the NRF subscription when it expires within this margin (seconds).
@@ -139,7 +238,15 @@ pub async fn subscribe_nf_status(ctx: &Arc<RwLock<NwdafContext>>) {
         base_path.trim_end_matches('/')
     );
 
-    let body = build_nf_status_subscription_body(&config.callback_uri);
+    // #2093: this subscription's own token.
+    let token = tokens().mint();
+    let callback_uri = callback_uri_with_token(&config.callback_uri, &token);
+    let previous_validity = ctx
+        .read()
+        .ok()
+        .and_then(|g| g.nrf_status_subscription())
+        .and_then(|sub| sub.validity_unix);
+    let body = build_nf_status_subscription_body(&callback_uri);
     let Some(client) = crate::notification_dispatcher::nrf_client(&config.nrf_uri) else {
         log::warn!(
             "NRF NFStatusSubscribe: invalid NRF URI '{}'",
@@ -163,18 +270,43 @@ pub async fn subscribe_nf_status(ctx: &Arc<RwLock<NwdafContext>>) {
                     if let Ok(guard) = ctx.read() {
                         guard.set_nrf_status_subscription(Some(sub));
                     }
+                    tokens().activate(&token, retire_at(previous_validity));
                 }
-                None => log::warn!(
-                    "NRF NFStatusSubscribe: 201 without a parseable subscriptionId — will retry"
-                ),
+                None => {
+                    tokens().abandon(&token);
+                    log::warn!(
+                        "NRF NFStatusSubscribe: 201 without a parseable subscriptionId — will retry"
+                    )
+                }
             }
         }
-        Ok(resp) => log::warn!(
-            "NRF NFStatusSubscribe rejected (status {}) — will retry",
-            resp.status
-        ),
-        Err(e) => log::warn!("NRF NFStatusSubscribe failed: {e} — will retry"),
+        Ok(resp) => {
+            tokens().abandon(&token);
+            log::warn!(
+                "NRF NFStatusSubscribe rejected (status {}) — will retry",
+                resp.status
+            )
+        }
+        Err(e) => {
+            tokens().abandon(&token);
+            log::warn!("NRF NFStatusSubscribe failed: {e} — will retry")
+        }
     }
+}
+
+/// When a replaced subscription's token stops working (#2093): when that
+/// subscription lapses at the NRF (`validity_unix`), else after
+/// [`RETIRED_TOKEN_GRACE`].
+fn retire_at(validity_unix: Option<u64>) -> std::time::Instant {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let left = validity_unix
+        .map(|v| std::time::Duration::from_secs(v.saturating_sub(now_unix)))
+        .unwrap_or(RETIRED_TOKEN_GRACE)
+        .min(std::time::Duration::from_secs(24 * 3600));
+    std::time::Instant::now() + left
 }
 
 /// Dispatcher-tick hook: (re-)subscribe when the collector is armed and there
@@ -517,17 +649,23 @@ pub fn refuse_notifier(
              correlation token)",
         );
     }
-    let from_nrf = request
-        .peer_cert_nf_types
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case("NRF"));
-    if !from_nrf {
-        return refuse(
-            "only the NRF delivers NF status notifications; the requester's \
-                       verified certificate does not name NF type NRF",
-        );
+    let names = |ty: &str| {
+        request
+            .peer_cert_nf_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(ty))
+    };
+    // #2093: the NRF directly, or an SCP relaying it (indirect communication,
+    // TS 23.501 §6.3.1.0) that presents the subscription's own token. The token
+    // is per subscription, so a relay that saw another subscription's cannot
+    // use it here; `correlated` already says this one is held.
+    if names("NRF") || names("SCP") {
+        return None;
     }
-    None
+    refuse(
+        "only the NRF, directly or through an SCP, delivers NF status notifications; the \
+         requester's verified certificate names neither",
+    )
 }
 
 /// Handle an NFStatusNotify that arrived on the tokenised callback
@@ -634,8 +772,8 @@ mod tests {
         };
         for (req, correlated, what) in [
             (from(&["AMF"]), true, "an AMF's certificate"),
-            (from(&["SCP"]), true, "an SCP's certificate"),
             (from(&[]), true, "no certificate"),
+            (from(&["SCP"]), false, "an SCP on the legacy callback"),
             (from(&["NRF"]), false, "the NRF on the legacy callback"),
         ] {
             let ctx = isolated_ctx();
@@ -654,6 +792,157 @@ mod tests {
         let ctx = isolated_ctx();
         let resp = handle_nf_status_notify_gated_with_ctx(&ctx, &from(&[]), false, false).await;
         assert_eq!(resp.status, 204);
+    }
+
+    /// #2093: each subscribe gets its own token, and a replaced subscription's
+    /// stops working when its grace window ends; a token never minted is never
+    /// held.
+    #[test]
+    fn callback_tokens_are_per_subscription_2093() {
+        let mut book = TokenBook::default();
+        let first = book.mint();
+        let now = std::time::Instant::now();
+        assert!(book.holds(&first, now), "held while being subscribed");
+        book.activate(&first, now);
+        let second = book.mint();
+        assert_ne!(first, second, "one token per subscription");
+        // The first stays valid for its grace window after the second replaces it.
+        book.activate(&second, now + std::time::Duration::from_secs(60));
+        assert!(book.holds(&first, now));
+        assert!(book.holds(&second, now));
+        assert!(!book.holds(&first, now + std::time::Duration::from_secs(61)));
+        assert!(book.holds(&second, now + std::time::Duration::from_secs(61)));
+        // A failed subscribe's token is forgotten.
+        let failed = book.mint();
+        book.abandon(&failed);
+        assert!(!book.holds(&failed, now));
+        assert!(!book.holds("0123456789abcdef0123456789abcdef", now));
+    }
+
+    /// #2093 (probe), under production: the NRF directly, or an SCP presenting
+    /// the subscription's own token, feeds NF_LOAD; an SCP presenting another
+    /// (replaced, lapsed) subscription's token, and a forged sender with the right
+    /// token, do not. REVERT-VERIFIED: with the SCP arm removed the relayed
+    /// notification is refused; with one process-wide token the lapsed one is held.
+    #[tokio::test]
+    async fn the_nrf_or_an_scp_with_this_subscriptions_token_feeds_nf_load_2093() {
+        let body = json!({
+            "event": "NF_REGISTERED",
+            "nfInstanceUri": "http://nrf.example:7777/nnrf-nfm/v1/nf-instances/smf-2093",
+            "nfProfile": {
+                "nfInstanceId": "smf-2093",
+                "nfType": "SMF",
+                "nfStatus": "REGISTERED",
+                "load": 70
+            }
+        });
+        let mut book = TokenBook::default();
+        let now = std::time::Instant::now();
+        let old = book.mint();
+        book.activate(&old, now);
+        let current = book.mint();
+        book.activate(&current, now); // the old one lapses at once
+        let from = |types: &[&str]| {
+            let mut r = notify_req(&body);
+            r.peer_cert_nf_instance_id = Some("dddddddd-2093-4000-8000-00000000000d".into());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let deliver = |types: &'static [&'static str], token: String| {
+            let correlated = book.holds(&token, now + std::time::Duration::from_millis(1));
+            let req = from(types);
+            async move {
+                let ctx = isolated_ctx();
+                let resp =
+                    handle_nf_status_notify_gated_with_ctx(&ctx, &req, correlated, true).await;
+                (resp.status, nf_load_infos(&ctx, "smf-2093").len())
+            }
+        };
+        assert_eq!(
+            deliver(&["NRF"], current.clone()).await,
+            (204, 1),
+            "the NRF directly"
+        );
+        assert_eq!(
+            deliver(&["SCP"], current.clone()).await,
+            (204, 1),
+            "an SCP with this subscription's token"
+        );
+        assert_eq!(
+            deliver(&["SCP"], old.clone()).await,
+            (403, 0),
+            "an SCP with another (lapsed) subscription's token"
+        );
+        assert_eq!(
+            deliver(&["AMF"], current.clone()).await,
+            (403, 0),
+            "a forged sender with the right token"
+        );
+    }
+
+    /// #2093: every NFStatusSubscribe names a token of its own in its
+    /// `nfStatusNotificationUri`, the NRF's acceptance makes it the current one,
+    /// and the one it replaces stays held through its grace window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_subscribe_names_its_own_token_2093() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        let sink = Arc::clone(&seen);
+        nrf.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body: Value =
+                    serde_json::from_str(req.http.content.as_deref().unwrap_or("{}")).unwrap();
+                let n = {
+                    let mut seen = sink.lock().unwrap();
+                    seen.push(body);
+                    seen.len()
+                };
+                SbiResponse::with_status(201)
+                    .with_json_body(&json!({ "subscriptionId": format!("sub-2093-{n}") }))
+                    .unwrap()
+            }
+        })
+        .await
+        .expect("stub NRF");
+        let ctx = isolated_ctx();
+        ctx.read()
+            .unwrap()
+            .set_nrf_collector_config(crate::context::NrfCollectorConfig {
+                nrf_uri: format!("http://{addr}"),
+                callback_uri: format!("http://127.0.0.1:7777{}", callback_path_for("seed")),
+            });
+        subscribe_nf_status(&ctx).await;
+        subscribe_nf_status(&ctx).await;
+        nrf.stop().await.expect("stop");
+
+        let tokens: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                b["nfStatusNotificationUri"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(tokens.len(), 2);
+        assert_ne!(tokens[0], tokens[1], "one token per subscription");
+        assert!(tokens.iter().all(|t| t != "seed"));
+        assert_eq!(callback_token(), tokens[1], "the accepted one is current");
+        assert!(
+            holds_callback_token(&tokens[0]),
+            "the replaced one, in its grace window"
+        );
     }
 
     /// #2081: both routes go through the gate under the real profile.

@@ -444,6 +444,10 @@ jobs:
           refuse 'names no nf_instance_ids' --set global.sbiProfile=production \
             --set-json 'nrf.nfSetAllowlist=[{"nf_set_id":"set001.region02.amfset.5gc.mnc070.mcc999","nf_types":["AMF"]}]'
           refuse 'is not a profile' --set global.sbiProfile=prd
+          # R41 on #2114: values the NFs read as production never render dev.
+          refuse 'global.sbiProfile is empty' --set global.sbiProfile=
+          refuse 'reached the chart as a bool' --set global.sbiProfile=false
+          refuse 'reached the chart as a int64' --set global.sbiProfile=0
           # An alias of production drops the NSSF's opt-out too.
           if helm template t deploy/helm/nextgcore --set global.siteId=ci --set global.sbiProfile=prod \
               | grep -q 'require: false'; then
