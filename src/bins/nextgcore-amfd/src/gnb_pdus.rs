@@ -1,5 +1,5 @@
 //! #417 stage B3.3: the NGAP PDUs amfd's tests stand in for a gNB or a CBCF
-//! with. They are octets derived by hand from the TS 38.413 V17.9 ASN.1 and
+//! with. They are octets derived by hand from the TS 38.413 ASN.1 and
 //! X.691 ALIGNED, through [`crate::aper_golden::Bits`], with the derivation
 //! written beside each builder. They used to come from the hand-written
 //! `nextgcore-ngap` builders.
@@ -7,6 +7,12 @@
 //! Each builder is pinned twice in this module's tests: by a vector worked out
 //! octet by octet in the test, and by the generated codec's strict decode,
 //! which has to read those octets as the PDU the builder says they are.
+//!
+//! Which release: the ASN.1 is V17.9.0, the module vendored at
+//! `libs/nextgcore-ngap-gen/asn/ngap-17.9.asn` (see its `PROVENANCE.md`), which
+//! is what the generated codec is compiled from. The § numbers cite the prose
+//! of TS 38.413 V19.3.0 (`38413-j30`), the text kept with the specs; the message
+//! and IE sections cited here carry the same numbers there.
 
 use crate::aper_golden::{pdu, Bits};
 
@@ -161,6 +167,7 @@ pub(crate) fn cause(b: &mut Bits, c: &t::Cause) {
     let (choice, index, width) = match c {
         t::Cause::RadioNetwork(t::CauseRadioNetwork::Unspecified) => (0, 0, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::HandoverCancelled) => (0, 5, 6),
+        t::Cause::RadioNetwork(t::CauseRadioNetwork::HoTargetNotAllowed) => (0, 8, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::TngrelocprepExpiry) => (0, 10, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::CellNotAvailable) => (0, 11, 6),
         t::Cause::RadioNetwork(t::CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell) => {
@@ -172,6 +179,8 @@ pub(crate) fn cause(b: &mut Bits, c: &t::Cause) {
         t::Cause::Transport(t::CauseTransport::TransportResourceUnavailable) => (1, 0, 1),
         t::Cause::Transport(t::CauseTransport::Unspecified) => (1, 1, 1),
         t::Cause::Nas(t::CauseNas::NormalRelease) => (2, 0, 2),
+        t::Cause::Protocol(t::CauseProtocol::SemanticError) => (3, 4, 3),
+        t::Cause::Misc(t::CauseMisc::OmIntervention) => (4, 3, 3),
         t::Cause::Misc(t::CauseMisc::Unspecified) => (4, 5, 3),
         other => panic!("derive the ASN.1 index of {other:?} before using it"),
     };
@@ -199,13 +208,6 @@ pub(crate) fn user_location(loc: &t::UserLocationInformation) -> Vec<u8> {
     b.field(1, 2).field(0, 3);
     nr_cgi(&mut b, *nr_cgi_plmn, *nr_cell_identity);
     b.field(0, 2).octets(tai_plmn).octets(tai_tac);
-    b.finish()
-}
-
-/// NAS-PDU `OCTET STRING`, unconstrained: the aligned length, the octets.
-fn octet_string(o: &[u8]) -> Vec<u8> {
-    let mut b = Bits::default();
-    b.open(o);
     b.finish()
 }
 
@@ -244,7 +246,7 @@ pub(crate) fn initial_ue_message(m: &t::InitialUeMessage) -> Vec<u8> {
     };
     let mut ies = vec![
         (85, 0, crate::aper_golden::ran_ue_ngap_id(m.ran_ue_ngap_id)),
-        (38, 0, octet_string(&m.nas_pdu)),
+        (38, 0, crate::aper_golden::open_value(&m.nas_pdu)),
         (121, 0, user_location(&m.user_location_info)),
         (90, 1, rrc.finish()),
     ];
@@ -265,7 +267,7 @@ pub(crate) fn uplink_nas_transport(m: &t::UplinkNasTransport) -> Vec<u8> {
         &[
             (10, 0, crate::aper_golden::amf_ue_ngap_id(m.amf_ue_ngap_id)),
             (85, 0, crate::aper_golden::ran_ue_ngap_id(m.ran_ue_ngap_id)),
-            (38, 0, octet_string(&m.nas_pdu)),
+            (38, 0, crate::aper_golden::open_value(&m.nas_pdu)),
             (121, 1, user_location(&m.user_location_info)),
         ],
     )
@@ -386,7 +388,7 @@ pub(crate) fn global_ran_node_id(b: &mut Bits, id: &t::GlobalRanNodeId) {
     }
 }
 
-/// NgENB-ID (§9.3.1.8): CHOICE of four (not extensible), macroNgENB-ID `00`
+/// NgENB-ID (within Global ng-eNB ID, §9.3.1.8): CHOICE of four (not extensible), macroNgENB-ID `00`
 /// `BIT STRING (SIZE(20))`, shortMacroNgENB-ID `01` `(SIZE(18))`,
 /// longMacroNgENB-ID `10` `(SIZE(21))`; each fixed and longer than sixteen
 /// bits, so aligned with no length (§16.10).
@@ -487,7 +489,11 @@ pub(crate) fn handover_required(m: &t::HandoverRequired) -> Vec<u8> {
         ies.push((22, 1, vec![0x00]));
     }
     ies.push((61, 0, session_list(&sessions)));
-    ies.push((101, 0, octet_string(&m.source_to_target_container)));
+    ies.push((
+        101,
+        0,
+        crate::aper_golden::open_value(&m.source_to_target_container),
+    ));
     pdu(0, 12, 0, &ies)
 }
 
@@ -514,7 +520,11 @@ pub(crate) fn handover_request_acknowledge(m: &t::HandoverRequestAcknowledge) ->
             .collect();
         ies.push((56, 1, session_list(&failed)));
     }
-    ies.push((106, 0, octet_string(&m.target_to_source_container)));
+    ies.push((
+        106,
+        0,
+        crate::aper_golden::open_value(&m.target_to_source_container),
+    ));
     pdu(1, 13, 0, &ies)
 }
 
@@ -552,7 +562,7 @@ pub(crate) fn handover_failure(m: &t::HandoverFailure) -> Vec<u8> {
     )
 }
 
-/// HANDOVER NOTIFY (§9.2.3.8): initiatingMessage, id-HandoverNotification 11,
+/// HANDOVER NOTIFY (§9.2.3.7): initiatingMessage, id-HandoverNotification 11,
 /// ignore; ids 10, 85 (reject); id 121 UserLocationInformation (ignore).
 pub(crate) fn handover_notify(m: &t::HandoverNotify) -> Vec<u8> {
     pdu(
@@ -567,7 +577,7 @@ pub(crate) fn handover_notify(m: &t::HandoverNotify) -> Vec<u8> {
     )
 }
 
-/// PATH SWITCH REQUEST (§9.2.3.9): initiatingMessage, id-PathSwitchRequest
+/// PATH SWITCH REQUEST (§9.2.3.8): initiatingMessage, id-PathSwitchRequest
 /// 25, reject:
 /// - id 85 RAN-UE-NGAP-ID, id 100 SourceAMF-UE-NGAP-ID (reject);
 /// - id 121 UserLocationInformation (ignore);
@@ -615,6 +625,434 @@ pub(crate) fn path_switch_request(m: &t::PathSwitchRequest) -> Vec<u8> {
     )
 }
 
+/// An NR-CGIList `SIZE(1..16384)`: count-1 in two aligned octets (range
+/// 16384, §11.5.7.3), then each NR-CGI.
+fn nr_cgi_list(b: &mut Bits, cells: &[t::NrCgi]) {
+    assert!(!cells.is_empty());
+    b.octets(&(cells.len() as u16 - 1).to_be_bytes());
+    for c in cells {
+        nr_cgi(b, c.plmn_identity, c.nr_cell_identity);
+    }
+}
+
+fn nr_cells(list: &t::PwsCellList) -> &[t::NrCgi] {
+    match list {
+        t::PwsCellList::Nr(cells) => cells,
+        t::PwsCellList::Eutra(_) => panic!("E-UTRA cell lists are not derived here"),
+    }
+}
+
+fn global_ran_node_id_value(id: &t::GlobalRanNodeId) -> Vec<u8> {
+    let mut b = Bits::default();
+    global_ran_node_id(&mut b, id);
+    b.finish()
+}
+
+/// PWS RESTART INDICATION (§9.2.8.5) from a gNB: initiatingMessage,
+/// id-PWSRestartIndication 34, ignore:
+/// - id 16 CellIDListForRestart (reject): CHOICE of three (not extensible)
+///   nR-CGIListforRestart `01`, padded, then [`nr_cgi_list`];
+/// - id 27 GlobalRANNodeID (reject): [`global_ran_node_id`];
+/// - id 104 TAIListForRestart (reject): `SIZE(1..2048)`, count-1 in two
+///   aligned octets (range 2048); per TAI extension `0`, iE-Extensions `0`,
+///   the PLMN and TAC. No Emergency Area ID list.
+pub(crate) fn pws_restart_indication(m: &t::PwsRestartIndication) -> Vec<u8> {
+    assert!(
+        m.emergency_area_id_list_for_restart.is_empty(),
+        "the Emergency Area ID list is not derived here"
+    );
+    let mut cells = Bits::default();
+    cells.field(1, 2);
+    nr_cgi_list(&mut cells, nr_cells(&m.cell_list));
+    let mut tais = Bits::default();
+    tais.octets(&(m.tai_list_for_restart.len() as u16 - 1).to_be_bytes());
+    for tai in &m.tai_list_for_restart {
+        tais.field(0, 2).octets(&tai.tai_plmn).octets(&tai.tai_tac);
+    }
+    pdu(
+        0,
+        34,
+        1,
+        &[
+            (16, 0, cells.finish()),
+            (27, 0, global_ran_node_id_value(&m.global_ran_node_id)),
+            (104, 0, tais.finish()),
+        ],
+    )
+}
+
+/// PWS FAILURE INDICATION (§9.2.8.6) for any number of failed NR cells: as
+/// [`pws_failure_indication`], with the list's count-1 in its two octets.
+pub(crate) fn pws_failure(m: &t::PwsFailureIndication) -> Vec<u8> {
+    let mut cells = Bits::default();
+    cells.field(1, 2);
+    nr_cgi_list(&mut cells, nr_cells(&m.failed_cell_list));
+    pdu(
+        0,
+        33,
+        1,
+        &[
+            (81, 0, cells.finish()),
+            (27, 0, global_ran_node_id_value(&m.global_ran_node_id)),
+        ],
+    )
+}
+
+/// [`write_replace_warning_request`] from the domain struct: only the members
+/// that derivation covers may be set.
+pub(crate) fn write_replace_warning(m: &t::WriteReplaceWarningRequest) -> Vec<u8> {
+    assert!(
+        m.warning_area_list.is_none()
+            && m.warning_type.is_none()
+            && m.warning_security_info.is_none()
+            && !m.concurrent_warning_message_indicator
+            && m.warning_area_coordinates.is_none(),
+        "only the Data Coding Scheme and Warning Message Contents options are derived here"
+    );
+    write_replace_warning_request(
+        m.message_identifier,
+        m.serial_number,
+        m.repetition_period,
+        m.number_of_broadcasts_requested,
+        m.data_coding_scheme.expect("a Data Coding Scheme"),
+        m.warning_message_contents.as_deref().expect("contents"),
+    )
+}
+
+/// [`write_replace_warning_response`] from the domain struct, with no
+/// Broadcast Completed Area List and no Criticality Diagnostics.
+pub(crate) fn write_replace_warning_answer(m: &t::WriteReplaceWarningResponse) -> Vec<u8> {
+    assert!(
+        m.broadcast_completed_area_list.is_none() && m.criticality_diagnostics.is_none(),
+        "the optional lists are not derived here"
+    );
+    write_replace_warning_response(m.message_identifier, m.serial_number, None)
+}
+
+/// PWS CANCEL RESPONSE (§9.2.8.4): successfulOutcome, id-PWSCancel 32,
+/// reject; ids 35 and 95 (reject). No Broadcast Cancelled Area List, no
+/// Criticality Diagnostics.
+pub(crate) fn pws_cancel_response(m: &t::PwsCancelResponse) -> Vec<u8> {
+    assert!(
+        m.broadcast_cancelled_area_list.is_none() && m.criticality_diagnostics.is_none(),
+        "the optional lists are not derived here"
+    );
+    pdu(
+        1,
+        32,
+        0,
+        &[
+            (35, 0, sixteen_bits(m.message_identifier)),
+            (95, 0, sixteen_bits(m.serial_number)),
+        ],
+    )
+}
+
+/// The PDU session item lists of a session-management response: each
+/// `SEQUENCE (SIZE(1..256)) OF` an item of the same shape (pDUSessionID, its
+/// transfer as an `OCTET STRING (CONTAINING ...)`, iE-Extensions, `...`), so
+/// [`session_list`]; an empty list is the optional IE left out.
+macro_rules! items {
+    ($list:expr) => {
+        $list
+            .iter()
+            .map(|i| (i.pdu_session_id, i.transfer.as_slice()))
+            .collect::<Vec<(u8, &[u8])>>()
+    };
+}
+
+/// The two UE NGAP IDs at `criticality`, then each non-empty list as its IE.
+fn session_response(
+    amf: u64,
+    ran: u32,
+    id_criticality: u8,
+    lists: &[(u16, u8, Vec<(u8, &[u8])>)],
+) -> Vec<(u16, u8, Vec<u8>)> {
+    let mut ies = vec![
+        (10, id_criticality, crate::aper_golden::amf_ue_ngap_id(amf)),
+        (85, id_criticality, crate::aper_golden::ran_ue_ngap_id(ran)),
+    ];
+    for (id, criticality, items) in lists {
+        if !items.is_empty() {
+            ies.push((*id, *criticality, session_list(items)));
+        }
+    }
+    ies
+}
+
+/// PDU SESSION RESOURCE SETUP RESPONSE (§9.2.1.2): successfulOutcome,
+/// id-PDUSessionResourceSetup 29, reject; ids 10, 85 (ignore); id 75
+/// PDUSessionResourceSetupListSURes and id 58
+/// PDUSessionResourceFailedToSetupListSURes (ignore).
+pub(crate) fn pdu_session_resource_setup_response(
+    m: &t::PduSessionResourceSetupResponse,
+) -> Vec<u8> {
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        1,
+        &[
+            (75, 1, items!(m.setup_list)),
+            (58, 1, items!(m.failed_list)),
+        ],
+    );
+    pdu(1, 29, 0, &ies)
+}
+
+/// PDU SESSION RESOURCE MODIFY RESPONSE (§9.2.1.6): successfulOutcome,
+/// id-PDUSessionResourceModify 26, reject; ids 10, 85 (ignore); id 65
+/// PDUSessionResourceModifyListModRes and id 54
+/// PDUSessionResourceFailedToModifyListModRes (ignore).
+pub(crate) fn pdu_session_resource_modify_response(
+    m: &t::PduSessionResourceModifyResponse,
+) -> Vec<u8> {
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        1,
+        &[
+            (65, 1, items!(m.modify_list)),
+            (54, 1, items!(m.failed_list)),
+        ],
+    );
+    pdu(1, 26, 0, &ies)
+}
+
+/// PDU SESSION RESOURCE RELEASE RESPONSE (§9.2.1.4): successfulOutcome,
+/// id-PDUSessionResourceRelease 28, reject; ids 10, 85 (ignore); id 70
+/// PDUSessionResourceReleasedListRelRes (ignore, mandatory).
+pub(crate) fn pdu_session_resource_release_response(
+    m: &t::PduSessionResourceReleaseResponse,
+) -> Vec<u8> {
+    assert!(
+        !m.released_list.is_empty(),
+        "the released list is mandatory"
+    );
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        1,
+        &[(70, 1, items!(m.released_list))],
+    );
+    pdu(1, 28, 0, &ies)
+}
+
+/// PDU SESSION RESOURCE NOTIFY (§9.2.1.7): initiatingMessage,
+/// id-PDUSessionResourceNotify 30, ignore; ids 10, 85 (reject); id 66
+/// PDUSessionResourceNotifyList (reject); id 67
+/// PDUSessionResourceReleasedListNot (ignore).
+pub(crate) fn pdu_session_resource_notify(m: &t::PduSessionResourceNotify) -> Vec<u8> {
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        0,
+        &[
+            (66, 0, items!(m.notify_list)),
+            (67, 1, items!(m.released_list)),
+        ],
+    );
+    pdu(0, 30, 1, &ies)
+}
+
+/// PDU SESSION RESOURCE MODIFY INDICATION (§9.2.1.8): initiatingMessage,
+/// id-PDUSessionResourceModifyIndication 27, reject; ids 10, 85 (reject); id
+/// 63 PDUSessionResourceModifyListModInd (reject, mandatory).
+pub(crate) fn pdu_session_resource_modify_indication(
+    m: &t::PduSessionResourceModifyIndication,
+) -> Vec<u8> {
+    assert!(!m.modify_list.is_empty(), "the modify list is mandatory");
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        0,
+        &[(63, 0, items!(m.modify_list))],
+    );
+    pdu(0, 27, 0, &ies)
+}
+
+/// INITIAL CONTEXT SETUP RESPONSE (§9.2.2.2) with no session lists:
+/// successfulOutcome, id-InitialContextSetup 14, reject; ids 10, 85 (ignore).
+pub(crate) fn initial_context_setup_response(m: &t::InitialContextSetupResponse) -> Vec<u8> {
+    pdu(
+        1,
+        14,
+        0,
+        &session_response(m.amf_ue_ngap_id, m.ran_ue_ngap_id, 1, &[]),
+    )
+}
+
+/// INITIAL CONTEXT SETUP FAILURE (§9.2.2.3) with no session list:
+/// unsuccessfulOutcome, id-InitialContextSetup 14, reject; ids 10, 85 and id
+/// 15 Cause, all ignore.
+pub(crate) fn initial_context_setup_failure(m: &t::InitialContextSetupFailure) -> Vec<u8> {
+    let mut ies = session_response(m.amf_ue_ngap_id, m.ran_ue_ngap_id, 1, &[]);
+    ies.push((15, 1, cause_value(&m.cause)));
+    pdu(2, 14, 0, &ies)
+}
+
+/// RANNodeName, the ASN.1 `PrintableString (SIZE(1..150, ...))`: the size
+/// extension bit `0`, length-1 in an 8-bit field (range 150, a constrained
+/// whole number, not aligned), then the characters. PrintableString has 74
+/// characters, so b = 7 and the ALIGNED variant rounds it to 8 bits per
+/// character (§30.5.2); ub x 8 = 1200 bits is past 16, so the characters are
+/// octet-aligned (§30.5.7), each its ASCII octet.
+fn ran_node_name(name: &str) -> Vec<u8> {
+    assert!((1..=150).contains(&name.len()) && name.is_ascii());
+    let mut b = Bits::default();
+    b.bit(false)
+        .field(name.len() as u64 - 1, 8)
+        .octets(name.as_bytes());
+    b.finish()
+}
+
+/// SupportedTAList (the ASN.1 `SupportedTAList`, carried by NG Setup and RAN
+/// Configuration Update):
+/// - `SIZE(1..256)`: count-1 in one aligned octet (range 256);
+/// - SupportedTAItem: extension `0`, iE-Extensions `0`; TAC `OCTET STRING
+///   (SIZE(3))` aligned; BroadcastPLMNList `SIZE(1..12)`: count-1 in four bits;
+/// - BroadcastPLMNItem: extension `0`, iE-Extensions `0`; the PLMN aligned;
+///   SliceSupportList `SIZE(1..1024)`: ub 1024 is below 64K, so count-1 in two
+///   aligned octets (range 1024);
+/// - SliceSupportItem: extension `0`, iE-Extensions `0`; S-NSSAI extension
+///   `0`, presence sD, iE-Extensions `0`; SST `OCTET STRING (SIZE(1))`, fixed
+///   and at most two octets, so eight bits NOT aligned (§17.6); SD
+///   `OCTET STRING (SIZE(3))` aligned.
+fn supported_ta_list(items: &[t::SupportedTaItem]) -> Vec<u8> {
+    assert!((1..=256).contains(&items.len()));
+    let mut b = Bits::default();
+    b.octets(&[(items.len() - 1) as u8]);
+    for item in items {
+        assert!((1..=12).contains(&item.broadcast_plmn_list.len()));
+        b.field(0, 2)
+            .octets(&item.tac)
+            .field(item.broadcast_plmn_list.len() as u64 - 1, 4);
+        for plmn in &item.broadcast_plmn_list {
+            let slices = &plmn.tai_slice_support_list;
+            assert!((1..=1024).contains(&slices.len()));
+            b.field(0, 2)
+                .octets(&plmn.plmn_identity)
+                .octets(&(slices.len() as u16 - 1).to_be_bytes());
+            for slice in slices {
+                b.field(0, 2)
+                    .bit(false)
+                    .bit(slice.sd.is_some())
+                    .bit(false)
+                    .field(u64::from(slice.sst), 8);
+                if let Some(sd) = slice.sd {
+                    b.octets(&sd);
+                }
+            }
+        }
+    }
+    b.finish()
+}
+
+/// PagingDRX `ENUMERATED {v32, v64, v128, v256, ...}`: extension `0` + two
+/// bits, padded.
+fn paging_drx(drx: t::PagingDrx) -> Vec<u8> {
+    let index = match drx {
+        t::PagingDrx::V32 => 0,
+        t::PagingDrx::V64 => 1,
+        t::PagingDrx::V128 => 2,
+        t::PagingDrx::V256 => 3,
+    };
+    let mut b = Bits::default();
+    b.bit(false).field(index, 2);
+    b.finish()
+}
+
+/// NG SETUP REQUEST (§9.2.6.1): initiatingMessage, id-NGSetup 21, reject; id
+/// 27 GlobalRANNodeID (reject); id 82 RANNodeName (ignore) when named; id 102
+/// SupportedTAList (reject); id 21 DefaultPagingDRX (ignore).
+pub(crate) fn ng_setup_request(m: &t::NgSetupRequest) -> Vec<u8> {
+    let mut ies = vec![(27, 0, global_ran_node_id_value(&m.global_ran_node_id))];
+    if let Some(name) = &m.ran_node_name {
+        ies.push((82, 1, ran_node_name(name)));
+    }
+    ies.push((102, 0, supported_ta_list(&m.supported_ta_list)));
+    ies.push((21, 1, paging_drx(m.default_paging_drx)));
+    pdu(0, 21, 0, &ies)
+}
+
+/// RAN CONFIGURATION UPDATE (§9.2.6.4): initiatingMessage,
+/// id-RANConfigurationUpdate 35, reject; each present member as its IE: id 82
+/// RANNodeName (ignore), id 102 SupportedTAList (reject), id 21
+/// DefaultPagingDRX (ignore), id 27 GlobalRANNodeID (ignore).
+pub(crate) fn ran_configuration_update(m: &t::RanConfigurationUpdate) -> Vec<u8> {
+    let mut ies = Vec::new();
+    if let Some(name) = &m.ran_node_name {
+        ies.push((82, 1, ran_node_name(name)));
+    }
+    if let Some(list) = &m.supported_ta_list {
+        ies.push((102, 0, supported_ta_list(list)));
+    }
+    if let Some(drx) = m.default_paging_drx {
+        ies.push((21, 1, paging_drx(drx)));
+    }
+    if let Some(id) = &m.global_ran_node_id {
+        ies.push((27, 1, global_ran_node_id_value(id)));
+    }
+    pdu(0, 35, 0, &ies)
+}
+
+/// UPLINK RAN STATUS TRANSFER (§9.2.3.13): initiatingMessage,
+/// id-UplinkRANStatusTransfer 49, ignore; ids 10, 85 (reject); id 84
+/// RANStatusTransfer-TransparentContainer (reject). The container is a
+/// SEQUENCE, not an OCTET STRING, so the IE's open type holds the caller's
+/// octets, which must already be its complete encoding, directly.
+pub(crate) fn uplink_ran_status_transfer(m: &t::RanStatusTransfer) -> Vec<u8> {
+    pdu(
+        0,
+        49,
+        1,
+        &[
+            (10, 0, crate::aper_golden::amf_ue_ngap_id(m.amf_ue_ngap_id)),
+            (85, 0, crate::aper_golden::ran_ue_ngap_id(m.ran_ue_ngap_id)),
+            (84, 0, m.container.clone()),
+        ],
+    )
+}
+
+/// UPLINK UE ASSOCIATED NRPPA TRANSPORT (§9.2.9.2): initiatingMessage,
+/// id-UplinkUEAssociatedNRPPaTransport 50, ignore; ids 10, 85 (reject); id 89
+/// RoutingID and id 46 NRPPa-PDU (reject), both unconstrained OCTET STRINGs.
+pub(crate) fn uplink_ue_associated_nrppa_transport(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    routing_id: &[u8],
+    nrppa_pdu: &[u8],
+) -> Vec<u8> {
+    pdu(
+        0,
+        50,
+        1,
+        &[
+            (10, 0, crate::aper_golden::amf_ue_ngap_id(amf_ue_ngap_id)),
+            (85, 0, crate::aper_golden::ran_ue_ngap_id(ran_ue_ngap_id)),
+            (89, 0, crate::aper_golden::open_value(routing_id)),
+            (46, 0, crate::aper_golden::open_value(nrppa_pdu)),
+        ],
+    )
+}
+
+/// UPLINK NON UE ASSOCIATED NRPPA TRANSPORT (§9.2.9.4): initiatingMessage,
+/// id-UplinkNonUEAssociatedNRPPaTransport 47, ignore; id 89 RoutingID and id
+/// 46 NRPPa-PDU (reject).
+pub(crate) fn uplink_non_ue_associated_nrppa_transport(
+    routing_id: &[u8],
+    nrppa_pdu: &[u8],
+) -> Vec<u8> {
+    pdu(
+        0,
+        47,
+        1,
+        &[
+            (89, 0, crate::aper_golden::open_value(routing_id)),
+            (46, 0, crate::aper_golden::open_value(nrppa_pdu)),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,16 +1078,34 @@ mod tests {
                 g::InitiatingMessageValue::Id_HandoverCancel(v) => (10, ies!(v)),
                 g::InitiatingMessageValue::Id_HandoverNotification(v) => (11, ies!(v)),
                 g::InitiatingMessageValue::Id_PathSwitchRequest(v) => (25, ies!(v)),
+                g::InitiatingMessageValue::Id_PWSRestartIndication(v) => (34, ies!(v)),
+                g::InitiatingMessageValue::Id_NGSetup(v) => (21, ies!(v)),
+                g::InitiatingMessageValue::Id_RANConfigurationUpdate(v) => (35, ies!(v)),
+                g::InitiatingMessageValue::Id_UplinkRANStatusTransfer(v) => (49, ies!(v)),
+                g::InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(v) => (50, ies!(v)),
+                g::InitiatingMessageValue::Id_UplinkNonUEAssociatedNRPPaTransport(v) => {
+                    (47, ies!(v))
+                }
+                g::InitiatingMessageValue::Id_PDUSessionResourceNotify(v) => (30, ies!(v)),
+                g::InitiatingMessageValue::Id_PDUSessionResourceModifyIndication(v) => {
+                    (27, ies!(v))
+                }
                 other => panic!("unexpected {other:?}"),
             },
             g::NGAP_PDU::SuccessfulOutcome(m) => match m.value {
                 g::SuccessfulOutcomeValue::Id_WriteReplaceWarning(v) => (51, ies!(v)),
                 g::SuccessfulOutcomeValue::Id_UEContextRelease(v) => (41, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PWSCancel(v) => (32, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(v) => (29, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PDUSessionResourceModify(v) => (26, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(v) => (28, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_InitialContextSetup(v) => (14, ies!(v)),
                 g::SuccessfulOutcomeValue::Id_HandoverResourceAllocation(v) => (13, ies!(v)),
                 other => panic!("unexpected {other:?}"),
             },
             g::NGAP_PDU::UnsuccessfulOutcome(m) => match m.value {
                 g::UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(v) => (13, ies!(v)),
+                g::UnsuccessfulOutcomeValue::Id_InitialContextSetup(v) => (14, ies!(v)),
                 other => panic!("unexpected {other:?}"),
             },
         }
@@ -1076,5 +1532,417 @@ mod tests {
         expected.extend_from_slice(&[0x00, 0x4c, 0x00, 0x05, 0x00, 0x00, 0x01, 0x01, 0x00]);
         assert_eq!(pdu, expected);
         assert_eq!(ids(&pdu), (25, vec![85, 100, 121, 119, 76]));
+    }
+
+    #[test]
+    fn pws_restart_and_cancel_response_are_the_worked_octets() {
+        let gnb = t::GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: plmn(),
+            gnb_id: 0x686,
+            gnb_id_len: 32,
+        };
+        let restart = pws_restart_indication(&t::PwsRestartIndication {
+            cell_list: t::PwsCellList::Nr(vec![t::NrCgi {
+                plmn_identity: plmn(),
+                nr_cell_identity: 0x686,
+            }]),
+            global_ran_node_id: gnb.clone(),
+            tai_list_for_restart: vec![t::TaiListItem {
+                tai_plmn: plmn(),
+                tai_tac: [0x00, 0x00, 0x74],
+            }],
+            emergency_area_id_list_for_restart: Vec::new(),
+        });
+        assert_eq!(
+            restart,
+            [
+                0x00, 0x22, 0x40, 0x2d, 0x00, 0x00, 0x03, // initiatingMessage, 34, ignore, 45
+                // CellIDListForRestart (reject, 12): `01` + pad, count-1 `00 00`,
+                // NR-CGI `00` + pad, PLMN, NCI 0x686 in 36 bits.
+                0x00, 0x10, 0x00, 0x0c, 0x40, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00,
+                0x68, 0x60, //
+                // GlobalRANNodeID (reject, 9): `00 00` + pad, PLMN, `0 1010` + pad, 32 bits.
+                0x00, 0x1b, 0x00, 0x09, 0x00, 0x00, 0xf1, 0x10, 0x50, 0x00, 0x00, 0x06, 0x86,
+                // TAIListForRestart (reject, 9): count-1 `00 00`, `00` + pad, PLMN, TAC.
+                0x00, 0x68, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x74,
+            ]
+        );
+        assert_eq!(ids(&restart), (34, vec![16, 27, 104]));
+        // The two-cell failure indication: count-1 `00 01`.
+        let failure = pws_failure(&t::PwsFailureIndication {
+            failed_cell_list: t::PwsCellList::Nr(vec![
+                t::NrCgi {
+                    plmn_identity: plmn(),
+                    nr_cell_identity: 1,
+                },
+                t::NrCgi {
+                    plmn_identity: plmn(),
+                    nr_cell_identity: 2,
+                },
+            ]),
+            global_ran_node_id: gnb,
+        });
+        assert_eq!(&failure[11..14], [0x40, 0x00, 0x01]);
+        assert_eq!(ids(&failure), (33, vec![81, 27]));
+        let cancel = pws_cancel_response(&t::PwsCancelResponse {
+            message_identifier: 0xB399,
+            serial_number: 0xC399,
+            broadcast_cancelled_area_list: None,
+            criticality_diagnostics: None,
+        });
+        assert_eq!(
+            cancel,
+            [
+                0x20, 0x20, 0x00, 0x0f, 0x00, 0x00, 0x02, // successfulOutcome, 32, reject
+                0x00, 0x23, 0x00, 0x02, 0xb3, 0x99, //
+                0x00, 0x5f, 0x00, 0x02, 0xc3, 0x99,
+            ]
+        );
+        assert_eq!(ids(&cancel), (32, vec![35, 95]));
+    }
+
+    #[test]
+    fn session_management_responses_are_the_worked_octets() {
+        // Setup Response, one set-up session (PSI 1, transfer `a1`) and one
+        // failed (PSI 2, `c1`): successfulOutcome `20`, 29 `1d`, reject.
+        let setup = pdu_session_resource_setup_response(&t::PduSessionResourceSetupResponse {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            setup_list: vec![t::PduSessionResourceSetupResponseItem {
+                pdu_session_id: 1,
+                transfer: vec![0xa1],
+            }],
+            failed_list: vec![t::PduSessionResourceFailedItem {
+                pdu_session_id: 2,
+                transfer: vec![0xc1],
+            }],
+        });
+        assert_eq!(
+            setup,
+            [
+                0x20, 0x1d, 0x00, 0x21, 0x00, 0x00, 0x04, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x4b, 0x40, 0x05, 0x00, 0x00, 0x01, 0x01, 0xa1, // id 75
+                0x00, 0x3a, 0x40, 0x05, 0x00, 0x00, 0x02, 0x01, 0xc1, // id 58
+            ]
+        );
+        assert_eq!(ids(&setup), (29, vec![10, 85, 75, 58]));
+        // Notify: initiatingMessage, 30 `1e`, ignore; ids at reject; the notify
+        // list at reject, no released list.
+        let notify = pdu_session_resource_notify(&t::PduSessionResourceNotify {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            notify_list: vec![t::PduSessionResourceNotifyItem {
+                pdu_session_id: 5,
+                transfer: vec![0x51],
+            }],
+            released_list: Vec::new(),
+        });
+        assert_eq!(
+            notify,
+            [
+                0x00, 0x1e, 0x40, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x02, //
+                0x00, 0x42, 0x00, 0x05, 0x00, 0x00, 0x05, 0x01, 0x51, // id 66
+            ]
+        );
+        assert_eq!(ids(&notify), (30, vec![10, 85, 66]));
+        let modify = pdu_session_resource_modify_response(&t::PduSessionResourceModifyResponse {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            modify_list: vec![t::PduSessionResourceModifyResponseItem {
+                pdu_session_id: 2,
+                transfer: vec![0x21],
+            }],
+            failed_list: Vec::new(),
+        });
+        assert_eq!(&modify[..4], [0x20, 0x1a, 0x00, 0x18]);
+        assert_eq!(ids(&modify), (26, vec![10, 85, 65]));
+        let release =
+            pdu_session_resource_release_response(&t::PduSessionResourceReleaseResponse {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 2,
+                released_list: vec![t::PduSessionResourceReleasedItem {
+                    pdu_session_id: 3,
+                    transfer: Vec::new(),
+                }],
+            });
+        // An empty transfer is its zero length octet.
+        assert_eq!(
+            &release[release.len() - 8..],
+            [0x00, 0x46, 0x40, 0x04, 0x00, 0x00, 0x03, 0x00]
+        );
+        assert_eq!(ids(&release), (28, vec![10, 85, 70]));
+        let indication =
+            pdu_session_resource_modify_indication(&t::PduSessionResourceModifyIndication {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 2,
+                modify_list: vec![t::PduSessionResourceModifyIndicationItem {
+                    pdu_session_id: 6,
+                    transfer: vec![0x61],
+                }],
+            });
+        assert_eq!(&indication[..4], [0x00, 0x1b, 0x00, 0x18]);
+        assert_eq!(ids(&indication), (27, vec![10, 85, 63]));
+    }
+
+    #[test]
+    fn initial_context_setup_outcomes_are_the_worked_octets() {
+        let response = initial_context_setup_response(&t::InitialContextSetupResponse {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+        });
+        assert_eq!(
+            response,
+            [
+                0x20, 0x0e, 0x00, 0x0f, 0x00, 0x00, 0x02, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02,
+            ]
+        );
+        assert_eq!(ids(&response), (14, vec![10, 85]));
+        let failure = initial_context_setup_failure(&t::InitialContextSetupFailure {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            cause: t::Cause::RadioNetwork(t::CauseRadioNetwork::Unspecified),
+        });
+        // unsuccessfulOutcome `40`; Cause radioNetwork 0 `000 0 000000` -> `00 00`.
+        assert_eq!(
+            failure,
+            [
+                0x40, 0x0e, 0x00, 0x15, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x0f, 0x40, 0x02, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(ids(&failure), (14, vec![10, 85, 15]));
+    }
+
+    /// R44 on #2213: Handover Required with Direct Forwarding Path
+    /// Availability. IE 22 (ignore) goes between TargetID and the session list
+    /// as `ENUMERATED {direct-path-available, ...}`: one extension bit,
+    /// padded, `00`.
+    #[test]
+    fn handover_required_with_direct_forwarding_is_the_worked_octets() {
+        let mut m = required(t::TargetId::TargetRanNodeId {
+            global_ran_node_id: t::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: plmn(),
+                gnb_id: 0x7_4402,
+                gnb_id_len: 22,
+            },
+            selected_tai: t::TaiListItem {
+                tai_plmn: plmn(),
+                tai_tac: [0x00, 0x00, 0x01],
+            },
+        });
+        let without = handover_required(&m);
+        m.direct_forwarding_path_availability =
+            Some(t::DirectForwardingPathAvailability::DirectPathAvailable);
+        let with = handover_required(&m);
+        // The TargetID IE is the last of the first 48 octets of `without`
+        // (header 4 + count 3 + ids 12 + type 5 + cause 6 + target 18): the
+        // DFPA IE `00 16 40 01 00` follows it, the IE count goes 7 -> 8 and
+        // the PDU length 60 -> 65.
+        let mut expected = without.clone();
+        expected[3] = 0x41;
+        expected[6] = 0x08;
+        expected.splice(48..48, [0x00, 0x16, 0x40, 0x01, 0x00]);
+        assert_eq!(with, expected);
+        assert_eq!(ids(&with), (12, vec![10, 85, 29, 15, 105, 22, 61, 101]));
+        let crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } =
+            crate::ngap_asn1::decode_handover_required_asn1(&with)
+        else {
+            panic!("the derived Handover Required decodes");
+        };
+        assert!(message.direct_forwarding_path_availability.is_some());
+    }
+
+    /// R44 on #2213: the shortMacro (`01`, 18 bits) and longMacro (`10`, 21
+    /// bits) ng-eNB ID arms, as the TargetID IE value of a Handover Required:
+    /// `01 00 00` + pad -> `40`; PLMN; the arm's index, padded; the ID bits
+    /// aligned; EPS-TAI `00`; padded; PLMN; EPS-TAC `00 07`.
+    #[test]
+    fn the_short_and_long_macro_ng_enb_ids_are_the_worked_octets() {
+        let target = |id| {
+            let pdu = handover_required(&required(t::TargetId::TargetGlobalNgEnbId {
+                plmn_identity: plmn(),
+                ng_enb_id: id,
+                selected_eps_tai: t::EpsTai {
+                    plmn_identity: plmn(),
+                    tac: [0x00, 0x07],
+                },
+            }));
+            assert_eq!(ids(&pdu), (12, vec![10, 85, 29, 15, 105, 61, 101]));
+            let at = pdu
+                .windows(2)
+                .position(|w| w == [0x00, 0x69])
+                .expect("TargetID");
+            let len = pdu[at + 3] as usize;
+            pdu[at + 4..at + 4 + len].to_vec()
+        };
+        // shortMacro 0x2ABCD in 18 bits `10 1010 1011 1100 1101`, then EPS-TAI
+        // `00`: `1010 1010 1111 0011 0100` -> `aa f3 40`.
+        assert_eq!(
+            target(t::NgEnbId::ShortMacro(0x2_ABCD)),
+            [0x40, 0x00, 0xf1, 0x10, 0x40, 0xaa, 0xf3, 0x40, 0x00, 0xf1, 0x10, 0x00, 0x07]
+        );
+        // longMacro 0x1ABCDE in 21 bits `1 1010 1011 1100 1101 1110`, then
+        // EPS-TAI `00`: `1101 0101 1110 0110 1111 0000` -> `d5 e6 f0`.
+        assert_eq!(
+            target(t::NgEnbId::LongMacro(0x1A_BCDE)),
+            [0x40, 0x00, 0xf1, 0x10, 0x80, 0xd5, 0xe6, 0xf0, 0x00, 0xf1, 0x10, 0x00, 0x07]
+        );
+    }
+
+    /// NG Setup Request and RAN Configuration Update, by hand and read back
+    /// through the generated decoder value by value (the SIZE(1..65536) lesson:
+    /// an id-level decode check passes a wrong count).
+    #[test]
+    fn ng_setup_and_ran_configuration_update_are_the_worked_octets() {
+        let ta = |tac: [u8; 3], sst: u8, sd: Option<[u8; 3]>| t::SupportedTaItem {
+            tac,
+            broadcast_plmn_list: vec![t::BroadcastPlmnItem {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                tai_slice_support_list: vec![t::SNssai { sst, sd }],
+            }],
+        };
+        let setup = ng_setup_request(&t::NgSetupRequest {
+            global_ran_node_id: t::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                gnb_id: 1,
+                gnb_id_len: 32,
+            },
+            ran_node_name: Some("g1".to_string()),
+            supported_ta_list: vec![ta([0, 0, 1], 1, None)],
+            default_paging_drx: t::PagingDrx::V128,
+        });
+        assert_eq!(
+            setup,
+            [
+                0x00, 0x15, 0x00, 0x2e, 0x00, 0x00, 0x04, // initiatingMessage, 21, reject, 46
+                // GlobalRANNodeID (reject, 9).
+                0x00, 0x1b, 0x00, 0x09, 0x00, 0x99, 0xf9, 0x07, 0x50, 0x00, 0x00, 0x00, 0x01,
+                // RANNodeName (ignore, 4): `0` + length-1 `00000001`, pad; "g1".
+                0x00, 0x52, 0x40, 0x04, 0x00, 0x80, b'g', b'1', //
+                // SupportedTAList (reject, 10): count-1 `00`; item `00` pad; TAC;
+                // BPLMN count-1 `0000` + item `00` + pad; PLMN; slices count-1
+                // `00 00`; `00` + `0 0 0` + SST `00000001` -> `00 08`.
+                0x00, 0x66, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x99, 0xf9, 0x07, 0x00,
+                0x00, 0x00, 0x08, //
+                // DefaultPagingDRX (ignore, 1): v128 `0 10` -> `40`.
+                0x00, 0x15, 0x40, 0x01, 0x40,
+            ]
+        );
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_NGSetup(req),
+            ..
+        }) = nextgcore_ngap_gen::decode(&setup).expect("strict decode")
+        else {
+            panic!("NG Setup Request");
+        };
+        use g::NGSetupRequestProtocolIEs_EntryValue as Ie;
+        for ie in req.protocol_i_es.0 {
+            match ie.value {
+                Ie::Id_RANNodeName(n) => assert_eq!(n.0, "g1"),
+                Ie::Id_SupportedTAList(l) => {
+                    let item = &l.0[0];
+                    assert_eq!(item.tac.0, [0, 0, 1]);
+                    let bplmn = &item.broadcast_plmn_list.0[0];
+                    assert_eq!(bplmn.plmn_identity.0, [0x99, 0xf9, 0x07]);
+                    let s = &bplmn.tai_slice_support_list.0[0].s_nssai;
+                    assert_eq!((s.sst.0.clone(), s.sd.is_none()), (vec![1], true));
+                }
+                Ie::Id_DefaultPagingDRX(d) => assert_eq!(d.0, g::PagingDRX::V128),
+                Ie::Id_GlobalRANNodeID(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // RAN Configuration Update with two TAs, the second with an SD.
+        let rcu = ran_configuration_update(&t::RanConfigurationUpdate {
+            ran_node_name: None,
+            supported_ta_list: Some(vec![
+                ta([0, 0, 7], 1, None),
+                ta([0, 0, 8], 2, Some([1, 2, 3])),
+            ]),
+            default_paging_drx: None,
+            global_ran_node_id: None,
+        });
+        assert_eq!(ids(&rcu), (35, vec![102]));
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_RANConfigurationUpdate(update),
+            ..
+        }) = nextgcore_ngap_gen::decode(&rcu).expect("strict decode")
+        else {
+            panic!("RAN Configuration Update");
+        };
+        let g::RANConfigurationUpdateProtocolIEs_EntryValue::Id_SupportedTAList(list) =
+            &update.protocol_i_es.0[0].value
+        else {
+            panic!("SupportedTAList");
+        };
+        let read: Vec<_> = list
+            .0
+            .iter()
+            .map(|item| {
+                let s = &item.broadcast_plmn_list.0[0].tai_slice_support_list.0[0].s_nssai;
+                (
+                    item.tac.0.clone(),
+                    s.sst.0.clone(),
+                    s.sd.as_ref().map(|d| d.0.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (vec![0, 0, 7], vec![1], None),
+                (vec![0, 0, 8], vec![2], Some(vec![1, 2, 3])),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_transfer_and_nrppa_transports_are_the_worked_octets() {
+        let status = uplink_ran_status_transfer(&t::RanStatusTransfer {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            container: vec![
+                0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+            ],
+        });
+        assert_eq!(&status[..4], [0x00, 0x31, 0x40, 0x1f]);
+        assert_eq!(
+            &status[status.len() - 16..],
+            [
+                0x00, 0x54, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56,
+                0x00, 0x78
+            ]
+        );
+        assert_eq!(ids(&status), (49, vec![10, 85, 84]));
+        let ue = uplink_ue_associated_nrppa_transport(1, 2, b"r1", &[0x20, 0x0b]);
+        assert_eq!(
+            ue,
+            [
+                0x00, 0x32, 0x40, 0x1d, 0x00, 0x00, 0x04, // initiatingMessage, 50, ignore, 29
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x02, //
+                0x00, 0x59, 0x00, 0x03, 0x02, b'r', b'1', // RoutingID
+                0x00, 0x2e, 0x00, 0x03, 0x02, 0x20, 0x0b, // NRPPa-PDU
+            ]
+        );
+        assert_eq!(ids(&ue), (50, vec![10, 85, 89, 46]));
+        let non_ue = uplink_non_ue_associated_nrppa_transport(b"r1", &[0x20, 0x0b]);
+        assert_eq!(
+            non_ue,
+            [
+                0x00, 0x2f, 0x40, 0x11, 0x00, 0x00, 0x02, // initiatingMessage, 47, ignore, 17
+                0x00, 0x59, 0x00, 0x03, 0x02, b'r', b'1', //
+                0x00, 0x2e, 0x00, 0x03, 0x02, 0x20, 0x0b,
+            ]
+        );
+        assert_eq!(ids(&non_ue), (47, vec![89, 46]));
     }
 }

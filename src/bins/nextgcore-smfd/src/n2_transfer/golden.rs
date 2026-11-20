@@ -4,6 +4,9 @@
 //! against now that the hand-written `nextgcore-ngap` transfer codec is gone
 //! from this crate's dependencies. Nothing here is taken from either encoder:
 //! every function writes the bits its doc comment derives from the schema.
+//! The ASN.1 is V17.9.0 (the vendored module the codec is compiled from); the
+//! § numbers cite the V19.3.0 prose (`38413-j30`), where these transfers keep
+//! the same section numbers.
 //!
 //! The transfers carry lists and integers whose width depends on the value, so
 //! the derivations are written against [`Bits`], a bit sink with exactly the
@@ -308,7 +311,7 @@ pub(crate) fn modify_request_octets(ambr: Option<(u64, u64)>, qfis: &[u8]) -> Ve
     container(&ies)
 }
 
-/// `PDUSessionResourceModifyConfirmTransfer` (§9.3.4.4):
+/// `PDUSessionResourceModifyConfirmTransfer` (§9.3.4.7):
 ///
 /// - extension `0`; presence additionalNG-UUPTNLInformation,
 ///   qosFlowFailedToModifyList, iE-Extensions `0`;
@@ -376,7 +379,7 @@ fn cause(b: &mut Bits, c: SmfCause) {
     b.field(choice, 3).bit(false).field(index, width);
 }
 
-/// `PDUSessionResourceModifyIndicationUnsuccessfulTransfer` (§9.3.4.13) and
+/// `PDUSessionResourceModifyIndicationUnsuccessfulTransfer` (§9.3.4.22) and
 /// `PDUSessionResourceReleaseCommandTransfer` (§9.3.4.12) share a layout:
 /// extension `0`, iE-Extensions `0`, the Cause, padded.
 ///
@@ -434,7 +437,7 @@ pub(crate) fn setup_response_octets(
     })
 }
 
-/// `PDUSessionResourceModifyIndicationTransfer` (§9.3.4.5): extension `0`;
+/// `PDUSessionResourceModifyIndicationTransfer` (§9.3.4.6): extension `0`;
 /// presence additionalDLQosFlowPerTNLInformation, iE-Extensions `0`; then as
 /// [`setup_response_octets`].
 pub(crate) fn modify_indication_octets(

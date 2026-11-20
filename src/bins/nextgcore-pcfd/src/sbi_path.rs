@@ -3157,18 +3157,28 @@ pub fn pcf_self_info_for(
 /// pinned the bare path failed whenever they ran after that one: 2 under
 /// shuffle seed 7, 7 under 42. The expectation follows the global instead. It
 /// is checked against an independent spelling: with no identity it is exactly
-/// `path`; with one it is `http(s)://` + host + `:` + port + `path`.
+/// `path`; with one it is `http://` + host + `:` + port + `path`.
+///
+/// #2214: the scheme is pinned, not "http or https". It is the one this PCF
+/// advertises (`advertised_sbi_scheme`, #92), and in the unit-test binary
+/// that is `http`: only `run` turns TLS on (`set_sbi_tls_active`). The helper
+/// asserts that premise too, so a test that ever turns TLS on fails here,
+/// naming the reason, instead of being matched by the wrong scheme.
 #[cfg(test)]
 pub(crate) fn expected_resource_uri_for_test(path: &str) -> String {
     let uri = pcf_resource_uri(path);
     match pcf_self_info() {
         None => assert_eq!(uri, path),
         Some(info) => {
-            let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
-            let rest = format!("://{host}:{}{path}", info.sbi_port);
             assert!(
-                uri == format!("http{rest}") || uri == format!("https{rest}"),
-                "{uri} is not the apiRoot of {info:?} followed by {path}"
+                !SBI_TLS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                "the unit tests advertise plaintext SBI; a test turned TLS on"
+            );
+            let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
+            assert_eq!(
+                uri,
+                format!("http://{host}:{}{path}", info.sbi_port),
+                "the apiRoot of {info:?} followed by {path}"
             );
         }
     }

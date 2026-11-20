@@ -2556,6 +2556,125 @@ mod tests {
         udm_self().read().unwrap().ee_subscription_remove(&id);
     }
 
+    /// A stand-in AMF answering every request with a 600 s grant from `now`,
+    /// recording when each arrived; and a subscription for `supi` whose leg at
+    /// it holds `granted`.
+    async fn short_grant_leg(
+        supi: &str,
+        granted: u64,
+        now: u64,
+    ) -> (SbiServer, String, Arc<Mutex<Vec<std::time::Instant>>>) {
+        let arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::default();
+        let at = arrivals.clone();
+        let (server, amf, _seen) = recorder(move |_| {
+            at.lock().unwrap().push(std::time::Instant::now());
+            SbiResponse::with_status(200)
+                .with_json_body(&json!({ "subscription": { "options": {
+                    "trigger": "CONTINUOUS",
+                    "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now + 600),
+                }}}))
+                .expect("json")
+        })
+        .await;
+        let mut sub = UdmEeSubscription::for_ue(
+            supi,
+            "http://nef.example.org/ee-notify",
+            json!({
+                "callbackReference": "http://nef.example.org/ee-notify",
+                "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}},
+                "reportingOptions": { "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now + 600) },
+            })
+            .to_string(),
+        );
+        sub.amf_leg = Some(AmfEeLeg {
+            subscription_uri: format!("http://{amf}/namf-evts/v1/subscriptions/short"),
+            change_token: "t".to_string(),
+            amf_instance_id: Some("amf".to_string()),
+            notify_uri: "http://nef.example.org/ee-notify".to_string(),
+            events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            expiry: Some(now + 600),
+            amf_expiry: Some(granted),
+        });
+        let id = sub.id.clone();
+        udm_self().read().unwrap().ee_subscription_insert(sub);
+        (server, id, arrivals)
+    }
+
+    /// **#2226** (R42 on #2182): a short-grant timer armed for one grant does
+    /// not renew once a newer grant has replaced it on the leg (the tick, or
+    /// another timer, renewed it meanwhile). Otherwise every renewal would start
+    /// one more timer chain.
+    ///
+    /// REVERT-VERIFIED: with the timer renewing without checking that the leg
+    /// still holds its grant, the AMF gets a modify and "a stale timer does not
+    /// renew" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_timer_for_a_replaced_grant_does_not_renew_2226() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        let now = crate::context::now_unix_secs();
+        let (_amf, id, arrivals) = short_grant_leg("imsi-001010000022260", now + 15, now).await;
+        // Armed for the 15 s grant, seen 2 s before it lapses: fires after 1 s.
+        renew_soon_if_short(&id, now + 15, now + 600, now + 13);
+        // A newer grant replaces it before the timer fires.
+        let leg = stored(&id).and_then(|s| s.amf_leg).expect("leg");
+        store_leg(
+            &id,
+            Some(AmfEeLeg {
+                amf_expiry: Some(now + 300),
+                ..leg
+            }),
+        );
+        tokio::time::sleep(LEG_RENEW_MIN_DELAY + Duration::from_millis(800)).await;
+        let sent = arrivals.lock().unwrap().len();
+        let kept = stored(&id)
+            .and_then(|s| s.amf_leg)
+            .and_then(|l| l.amf_expiry);
+        udm_self().read().unwrap().ee_subscription_remove(&id);
+
+        assert_eq!(sent, 0, "a stale timer does not renew");
+        assert_eq!(kept, Some(now + 300), "the newer grant stands");
+    }
+
+    /// **#2226** (R42 on #2182): a grant whose half-life is under a second (here
+    /// 1 s left, so `left / 2` is 0) still waits [`LEG_RENEW_MIN_DELAY`] before
+    /// its timer renews, so an AMF cannot set the renewal rate. Then it renews.
+    ///
+    /// REVERT-VERIFIED: without the floor (`left / 2` alone), the modify arrives
+    /// at once and "waits at least the floor" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_sub_second_timer_waits_the_floor_2226() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        let now = crate::context::now_unix_secs();
+        let (_amf, id, arrivals) = short_grant_leg("imsi-001010000022261", now + 1, now).await;
+        let armed = std::time::Instant::now();
+        renew_soon_if_short(&id, now + 1, now + 600, now);
+        let mut first = None;
+        for _ in 0..60 {
+            if let Some(t) = arrivals.lock().unwrap().first().copied() {
+                first = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        udm_self().read().unwrap().ee_subscription_remove(&id);
+
+        let waited = first.map(|t| t - armed).expect("renewed after the floor");
+        assert!(
+            waited >= LEG_RENEW_MIN_DELAY,
+            "waits at least the floor: renewed after {waited:?}"
+        );
+    }
+
     /// **#2182** (R42 on #2182): an AMF that grants a leg 0 s, then 1 s on every
     /// later answer, is not chased. Such a grant is taken as the AMF declining
     /// the leg: what it made is unsubscribed, no leg is kept (so the UDM reports

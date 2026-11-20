@@ -51,9 +51,10 @@
 //! `nfStatusNotificationUri` the subscriptions advertised, through amfd's
 //! router under the production profile, and requires 403, with two SMFs cached
 //! so an NRF control on the SMF subscription really evicts (and so a forged
-//! one acting before the check would be seen). nwdafd is a
-//! binary-only crate whose unit tests share the process's Dev override, so its
-//! backstop is #2215.
+//! one acting before the check would be seen). nwdafd's (#2215) is
+//! `nf_status_sender_backstop_2215_tests` in its `main.rs`: the router takes
+//! its SBI profile as an argument (`nwdaf_sbi_request_handler_with`), so the
+//! test drives it under production while sibling tests hold the Dev override.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -82,23 +83,23 @@ const ROUTES: &[Route] = &[
     (
         "nextgcore-nwdafd",
         "main.rs",
-        "nwdaf_sbi_request_handler",
+        "nwdaf_sbi_request_handler_with",
         &[
             "if *segment == nrf_collector::CALLBACK_SEGMENT =>",
             "{",
             "match method {",
             r#""POST" if nrf_collector::holds_callback_token(token) => {"#,
-            "nrf_collector::handle_nf_status_notify_from(&request, true).await",
+            "nrf_collector::handle_nf_status_notify_from(&request, true, profile).await",
         ],
         "handle_nf_status_notify_from",
     ),
     (
         "nextgcore-nwdafd",
         "main.rs",
-        "nwdaf_sbi_request_handler",
+        "nwdaf_sbi_request_handler_with",
         &[
             r#"["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {"#,
-            r#""POST" => nrf_collector::handle_nf_status_notify_from(&request, false).await,"#,
+            r#""POST" => nrf_collector::handle_nf_status_notify_from(&request, false, profile).await,"#,
         ],
         "handle_nf_status_notify_from",
     ),
@@ -185,7 +186,7 @@ const NOT_ROUTES: &[NotRoute] = &[
     (
         "nextgcore-nwdafd",
         "main.rs",
-        "nwdaf_sbi_request_handler",
+        "nwdaf_sbi_request_handler_with",
         r#"_ => send_method_not_allowed(method, "nf-status-notify/{token}"),"#,
         1,
     ),
