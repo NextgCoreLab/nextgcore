@@ -2374,34 +2374,11 @@ mod tests {
     /// The target's acknowledge for an indirect-forwarding handover: both flows accepted,
     /// both accepted for forwarding, one DL forwarding tunnel for the session.
     fn ho_ack_transfer_with_forwarding() -> Vec<u8> {
-        use nextgcore_ngap::transfer::{
-            GtpTunnel, HandoverRequestAcknowledgeTransfer, QosFlowItemWithDataForwarding,
-            TransportLayerAddress, UpTransportLayerInformation,
-        };
-        HandoverRequestAcknowledgeTransfer {
-            dl_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                transport_layer_address: TransportLayerAddress::from_ipv4(GNB_DL.0),
-                gtp_teid: GNB_DL.1.to_be_bytes(),
-            }),
-            dl_forwarding_up_tnl_information: Some(UpTransportLayerInformation::GtpTunnel(
-                GtpTunnel {
-                    transport_layer_address: TransportLayerAddress::from_ipv4(GNB_FWD.0),
-                    gtp_teid: GNB_FWD.1.to_be_bytes(),
-                },
-            )),
-            security_result: None,
-            qos_flow_setup_response_list: [5, DEDICATED_EBI]
-                .into_iter()
-                .map(|qfi| QosFlowItemWithDataForwarding {
-                    qos_flow_identifier: qfi,
-                    data_forwarding_accepted: true,
-                })
-                .collect(),
-            qos_flow_failed_to_setup_list: Vec::new(),
-            data_forwarding_response_drb_list: Vec::new(),
-        }
-        .encode()
-        .unwrap()
+        crate::n2_transfer::golden::handover_request_acknowledge_octets(
+            (GNB_DL.1, GNB_DL.0),
+            Some((GNB_FWD.1, GNB_FWD.0)),
+            &[(5, true), (DEDICATED_EBI, true)],
+        )
     }
 
     /// The F-TEID at `instance` in a Bearer Context, as (interface type, TEID, IPv4).
@@ -2412,26 +2389,159 @@ mod tests {
     }
 
     fn ho_ack_transfer() -> Vec<u8> {
-        use nextgcore_ngap::transfer::{
-            GtpTunnel, HandoverRequestAcknowledgeTransfer, QosFlowItemWithDataForwarding,
-            TransportLayerAddress, UpTransportLayerInformation,
-        };
-        HandoverRequestAcknowledgeTransfer {
-            dl_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                transport_layer_address: TransportLayerAddress::from_ipv4(GNB_DL.0),
-                gtp_teid: GNB_DL.1.to_be_bytes(),
-            }),
-            dl_forwarding_up_tnl_information: None,
-            security_result: None,
-            qos_flow_setup_response_list: vec![QosFlowItemWithDataForwarding {
-                qos_flow_identifier: 5,
-                data_forwarding_accepted: false,
-            }],
-            qos_flow_failed_to_setup_list: Vec::new(),
-            data_forwarding_response_drb_list: Vec::new(),
-        }
-        .encode()
-        .unwrap()
+        crate::n2_transfer::golden::handover_request_acknowledge_octets(
+            (GNB_DL.1, GNB_DL.0),
+            None,
+            &[(5, false)],
+        )
+    }
+
+    /// The target gNB's HANDOVER REQUEST ACKNOWLEDGE (TS 38.413 §9.2.3.5) for one
+    /// admitted PDU session, as octets derived by hand from the V17.9 ASN.1 and X.691
+    /// ALIGNED (#417 stage B; this stood in through the hand-written builder before):
+    ///
+    /// - NGAP-PDU CHOICE, extensible, of three: extension `0`, successfulOutcome `01`;
+    ///   procedureCode `INTEGER (0..255)` one aligned octet, id-HandoverResourceAllocation
+    ///   `0d`; criticality reject `00`, padded; the value as an open type;
+    /// - HandoverRequestAcknowledge: extension `0`, padded; four IEs `00 04`;
+    /// - id 10 AMF-UE-NGAP-ID (ignore): `INTEGER (0..2^40-1)` is past 64K, so the octet
+    ///   count n (1..5) as n-1 in three bits, padded, then n octets (§11.5.7.4);
+    /// - id 85 RAN-UE-NGAP-ID (ignore): `INTEGER (0..2^32-1)`, n (1..4) as n-1 in two
+    ///   bits, then n octets;
+    /// - id 53 PDUSessionResourceAdmittedList (ignore): `SIZE(1..256)` count-1 in one
+    ///   aligned octet (range 256, §11.5.7.2); the item's extension `0` and iE-Extensions
+    ///   `0`; PDUSessionID `INTEGER (0..255)` one aligned octet; the transfer OCTET STRING
+    ///   with its aligned length determinant;
+    /// - id 106 TargetToSource-TransparentContainer (reject): OCTET STRING, length and
+    ///   octets.
+    fn gnb_handover_request_acknowledge(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+        transfer: &[u8],
+        container: &[u8],
+    ) -> Vec<u8> {
+        let mut value = crate::n2_transfer::golden::Bits::default();
+        value.bit(false).octets(&[0x00, 0x04]);
+        gnb_ie(&mut value, 10, 1, &gnb_amf_ue_ngap_id(amf_ue_ngap_id));
+        gnb_ie(&mut value, 85, 1, &gnb_ran_ue_ngap_id(ran_ue_ngap_id));
+        let mut admitted = crate::n2_transfer::golden::Bits::default();
+        admitted
+            .octets(&[0x00])
+            .bit(false)
+            .bit(false)
+            .octets(&[psi]);
+        admitted.open(transfer);
+        gnb_ie(&mut value, 53, 1, &admitted.finish());
+        let mut c = crate::n2_transfer::golden::Bits::default();
+        c.open(container);
+        gnb_ie(&mut value, 106, 0, &c.finish());
+        let mut pdu = crate::n2_transfer::golden::Bits::default();
+        pdu.bit(false).field(1, 2).octets(&[13]).field(0, 2);
+        pdu.open(&value.finish());
+        pdu.finish()
+    }
+
+    /// The target gNB's HANDOVER NOTIFY (TS 38.413 §9.2.3.8) from an NR cell, derived as
+    /// [`gnb_handover_request_acknowledge`] is:
+    ///
+    /// - initiatingMessage `0 00`, id-HandoverNotification `0b`, criticality ignore
+    ///   `01`, padded -> `00 0b 40`; the value open type;
+    /// - HandoverNotify: extension `0`, three IEs; id 10 and id 85 (reject) as above;
+    /// - id 121 UserLocationInformation (ignore): CHOICE of four (not extensible)
+    ///   userLocationInformationNR `01`; UserLocationInformationNR extension `0`,
+    ///   timeStamp `0`, iE-Extensions `0`; NR-CGI extension `0`, iE-Extensions `0`,
+    ///   PLMNIdentity `OCTET STRING (SIZE(3))` aligned with no length (§17.6),
+    ///   NRCellIdentity `BIT STRING (SIZE(36))` aligned with no length (§16.10); TAI
+    ///   extension `0`, iE-Extensions `0` in the cell's last octet, then the PLMN and the
+    ///   TAC `OCTET STRING (SIZE(3))`, both aligned.
+    fn gnb_handover_notify(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        plmn: [u8; 3],
+        nr_cell_identity: u64,
+        tac: [u8; 3],
+    ) -> Vec<u8> {
+        let mut value = crate::n2_transfer::golden::Bits::default();
+        value.bit(false).octets(&[0x00, 0x03]);
+        gnb_ie(&mut value, 10, 0, &gnb_amf_ue_ngap_id(amf_ue_ngap_id));
+        gnb_ie(&mut value, 85, 0, &gnb_ran_ue_ngap_id(ran_ue_ngap_id));
+        let mut uli = crate::n2_transfer::golden::Bits::default();
+        uli.field(1, 2).field(0, 3).field(0, 2).octets(&plmn);
+        uli.align()
+            .field(nr_cell_identity, 36)
+            .field(0, 2)
+            .octets(&plmn)
+            .octets(&tac);
+        gnb_ie(&mut value, 121, 1, &uli.finish());
+        let mut pdu = crate::n2_transfer::golden::Bits::default();
+        pdu.bit(false).field(0, 2).octets(&[11]).field(1, 2);
+        pdu.open(&value.finish());
+        pdu.finish()
+    }
+
+    /// A ProtocolIE-Field: id two aligned octets, criticality two bits, the open type.
+    fn gnb_ie(b: &mut crate::n2_transfer::golden::Bits, id: u16, criticality: u8, value: &[u8]) {
+        b.octets(&id.to_be_bytes())
+            .field(u64::from(criticality), 2)
+            .open(value);
+    }
+
+    /// `INTEGER (lb..ub)` past 64K: n-1 in `width` bits, then the value in its minimal n
+    /// octets, aligned (X.691 §11.5.7.4).
+    fn gnb_long_integer(value: u64, width: u32) -> Vec<u8> {
+        let be = value.to_be_bytes();
+        let skip = be.iter().take_while(|o| **o == 0).count().min(7);
+        let mut b = crate::n2_transfer::golden::Bits::default();
+        b.field((8 - skip) as u64 - 1, width).octets(&be[skip..]);
+        b.finish()
+    }
+
+    fn gnb_amf_ue_ngap_id(v: u64) -> Vec<u8> {
+        gnb_long_integer(v, 3)
+    }
+
+    fn gnb_ran_ue_ngap_id(v: u32) -> Vec<u8> {
+        gnb_long_integer(u64::from(v), 2)
+    }
+
+    /// The two stand-ins against vectors worked out octet by octet from the derivations
+    /// above, so a slip in the shared [`crate::n2_transfer::golden::Bits`] helpers shows
+    /// here and not as a confusing end-to-end failure.
+    #[test]
+    fn the_gnb_stand_ins_are_the_derived_octets() {
+        // AMF 1, RAN 77, PSI 5, a one-octet transfer `ab`, container `c0 fe`.
+        assert_eq!(
+            gnb_handover_request_acknowledge(1, 77, 5, &[0xab], &[0xc0, 0xfe]),
+            [
+                0x20, 0x0d, 0x00, 0x1f, // successfulOutcome, 13, reject, length 31
+                0x00, 0x00, 0x04, // extension, four IEs
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, // AMF-UE-NGAP-ID: n=1 `000`, 01
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x4d, // RAN-UE-NGAP-ID: n=1 `00`, 4d
+                0x00, 0x35, 0x40, 0x05, 0x00, 0x00, 0x05, 0x01, 0xab, // admitted list
+                0x00, 0x6a, 0x00, 0x03, 0x02, 0xc0, 0xfe, // container
+            ]
+        );
+        // AMF 0x1_0000_0000 (n=5), RAN 0x0102 (n=2), PLMN 99f907, NCI 0x1A2001, TAC 000001.
+        assert_eq!(
+            gnb_handover_notify(
+                0x1_0000_0000,
+                0x0102,
+                [0x99, 0xf9, 0x07],
+                0x1A2001,
+                [0, 0, 1]
+            ),
+            [
+                0x00, 0x0b, 0x40, 0x27, // initiatingMessage, 11, ignore, length 39
+                0x00, 0x00, 0x03, // extension, three IEs
+                0x00, 0x0a, 0x00, 0x06, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, // n=5 `100`
+                0x00, 0x55, 0x00, 0x03, 0x40, 0x01, 0x02, // n=2 `01`
+                0x00, 0x79, 0x40, 0x0f, // UserLocationInformation, ignore, length 15
+                0x40, 0x99, 0xf9, 0x07, // `01 000 00`, the NR-CGI PLMN
+                0x00, 0x01, 0xa2, 0x00, 0x10, // NCI 0x0001a2001 in 36 bits, TAI `00`, padding
+                0x99, 0xf9, 0x07, 0x00, 0x00, 0x01, // the TAI PLMN and TAC
+            ]
+        );
     }
 
     /// Does an N4 Session Modification body carry an IE of `ie_type` whose value contains
@@ -2643,29 +2753,16 @@ mod tests {
             (5, 1),
             "PDU session 5, S-NSSAI SST 1"
         );
-        let n2 =
-            nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&items[0].2)
-                .expect("the SMF's PDUSessionResourceSetupRequestTransfer");
-        let nextgcore_ngap::transfer::UpTransportLayerInformation::GtpTunnel(ul) =
-            &n2.ul_ngu_up_tnl_information;
+        let n2 = crate::n2_transfer::test_view::setup_request(&items[0].2);
         assert_eq!(
-            u32::from_be_bytes(ul.gtp_teid),
+            n2.ul.teid,
             crate::pfcp_path::stand_in::N3_STAND_IN_TEID,
             "CN Tunnel Info is the N3 tunnel step 6 allocated"
         );
         let flows: Vec<_> = n2
-            .qos_flow_setup_request_list
+            .flows
             .iter()
-            .map(|f| {
-                (
-                    f.qos_flow_identifier,
-                    f.e_rab_id,
-                    f.qos_flow_level_qos_parameters
-                        .gbr_qos_information
-                        .as_ref()
-                        .map(|g| g.guaranteed_flow_bit_rate_dl),
-                )
-            })
+            .map(|(qfi, q, e_rab_id)| (*qfi, *e_rab_id, q.gbr.map(|g| g.2)))
             .collect();
         assert_eq!(
             flows,
@@ -2692,19 +2789,13 @@ mod tests {
 
         // Steps 10-14.
         upf.clear_seen();
-        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
-            &nextgcore_ngap::types::HandoverRequestAcknowledge {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id: 77,
-                admitted_list: vec![nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
-                    pdu_session_id: 5,
-                    transfer: ho_ack_transfer_with_forwarding(),
-                }],
-                failed_list: None,
-                target_to_source_container: vec![0xC0, 0xFE],
-            },
-        )
-        .unwrap();
+        let ack = gnb_handover_request_acknowledge(
+            amf_ue_ngap_id,
+            77,
+            5,
+            &ho_ack_transfer_with_forwarding(),
+            &[0xC0, 0xFE],
+        );
         ngap.harness_handover_request_acknowledge(TARGET_ASSOC, &ack)
             .await
             .unwrap();
@@ -2775,19 +2866,7 @@ mod tests {
         let plmn = nextgcore_amfd::n26_build::encode_plmn_bcd(
             &nextgcore_amfd::context::PlmnId::new("999", "70"),
         );
-        let notify = nextgcore_ngap::builder::build_handover_notify(
-            &nextgcore_ngap::types::HandoverNotify {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id: 77,
-                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
-                    nr_cgi_plmn: plmn,
-                    nr_cell_identity: 0x1A2001,
-                    tai_plmn: plmn,
-                    tai_tac: [0, 0, 1],
-                },
-            },
-        )
-        .unwrap();
+        let notify = gnb_handover_notify(amf_ue_ngap_id, 77, plmn, 0x1A2001, [0, 0, 1]);
         ngap.harness_handover_notify(TARGET_ASSOC, &notify)
             .await
             .unwrap();
@@ -2984,10 +3063,7 @@ mod tests {
         });
         let created = handle_create(&body).await;
         assert_eq!(created.status, 201);
-        let n2 = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(
-            &created.http.parts[0].data,
-        )
-        .unwrap();
+        let n2 = crate::n2_transfer::test_view::setup_request(&created.http.parts[0].data);
         assert!(n2.direct_forwarding_path_availability && !n2.data_forwarding_not_possible);
         let reference =
             serde_json::from_str::<serde_json::Value>(created.http.content.as_deref().unwrap())
@@ -3227,34 +3303,11 @@ mod tests {
             .expect("gNB GTP-U");
         const N3_DL: u32 = 0x0000_ABCD;
         const FWD_DL: u32 = 0x0000_F0D0;
-        let ack = {
-            use nextgcore_ngap::transfer::{
-                GtpTunnel, HandoverRequestAcknowledgeTransfer, QosFlowItemWithDataForwarding,
-                TransportLayerAddress, UpTransportLayerInformation,
-            };
-            let tunnel = |teid: u32| {
-                UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                    transport_layer_address: TransportLayerAddress::from_ipv4(local.octets()),
-                    gtp_teid: teid.to_be_bytes(),
-                })
-            };
-            HandoverRequestAcknowledgeTransfer {
-                dl_ngu_up_tnl_information: tunnel(N3_DL),
-                dl_forwarding_up_tnl_information: Some(tunnel(FWD_DL)),
-                security_result: None,
-                qos_flow_setup_response_list: [5, DEDICATED_EBI]
-                    .into_iter()
-                    .map(|qfi| QosFlowItemWithDataForwarding {
-                        qos_flow_identifier: qfi,
-                        data_forwarding_accepted: true,
-                    })
-                    .collect(),
-                qos_flow_failed_to_setup_list: Vec::new(),
-                data_forwarding_response_drb_list: Vec::new(),
-            }
-            .encode()
-            .unwrap()
-        };
+        let ack = crate::n2_transfer::golden::handover_request_acknowledge_octets(
+            (N3_DL, local.octets()),
+            Some((FWD_DL, local.octets())),
+            &[(5, true), (DEDICATED_EBI, true)],
+        );
         let prepared = handle_prepared(&reference, &ack).await;
         assert_eq!(prepared.status, 200);
         let root: serde_json::Value =
@@ -4532,22 +4585,19 @@ mod tests {
         );
     }
 
-    /// #417: the EPS→5GS Setup Request Transfer, now encoded by the generated codec, is
-    /// byte for byte what the hand-written codec built from the same session -- over GBR and
-    /// non-GBR bearers, both PCI / PVI settings, with and without a Session-AMBR, and every
-    /// forwarding indication. The oracle below is the pre-#417 builder, with one rule
-    /// since aligned to TS 38.413 §9.3.1.12 (#1147 review m2: GBR information by the
-    /// 5QI's resource type); what it checks is the encoding.
+    /// #417: the EPS→5GS Setup Request Transfer, encoded by the generated codec, is the
+    /// octets derived by hand from TS 38.413 V17.9 and X.691 (`n2_transfer::golden`) --
+    /// over GBR and non-GBR bearers, both PCI / PVI settings, with and without a
+    /// Session-AMBR, and every forwarding indication. `expected` is the session-to-transfer
+    /// mapping the encoder under test is meant to apply, stated independently: one flow
+    /// per bearer with QFI and E-RAB ID the EBI, the ARP clamped to 1..=15 and its
+    /// "disable" flags inverted (TS 29.274 §8.15), GBR information by the 5QI's
+    /// resource type (TS 38.413 §9.3.1.12, #1147 review m2), the Session-AMBR when it is
+    /// not 0/0. Before stage B the reference bytes came from the hand-written codec.
     #[test]
-    fn the_handover_setup_request_transfer_is_the_hand_written_bytes() {
-        use nextgcore_ngap::transfer::{
-            AllocationAndRetentionPriority, GbrQosInformation, GtpTunnel, NonDynamic5qiDescriptor,
-            PduSessionAggregateMaximumBitRate, PduSessionResourceSetupRequestTransfer,
-            PduSessionType, PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
-            QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
-            UpTransportLayerInformation,
-        };
-        fn oracle(
+    fn the_handover_setup_request_transfer_is_the_derived_octets() {
+        use crate::n2_transfer::{golden, Arp, Gbr, QosFlowSetup, SetupRequest};
+        fn expected(
             sess: &SmfSess,
             bearers: &[context::SmfBearer],
             n3_ul: (u32, [u8; 4]),
@@ -4556,67 +4606,37 @@ mod tests {
             let flows = bearers
                 .iter()
                 .map(|b| {
-                    // #1147 review m2: GBR by the 5QI's resource type (TS 38.413
-                    // §9.3.1.12), as the encoder under test decides it.
                     let gbr = crate::context::QosCharacteristics::from_5qi(b.qos.index)
                         .map(|c| c.is_gbr())
                         .unwrap_or(b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0)
-                        .then_some(GbrQosInformation {
-                            maximum_flow_bit_rate_dl: b.qos.mbr_downlink,
-                            maximum_flow_bit_rate_ul: b.qos.mbr_uplink,
-                            guaranteed_flow_bit_rate_dl: b.qos.gbr_downlink,
-                            guaranteed_flow_bit_rate_ul: b.qos.gbr_uplink,
-                            notification_control: false,
-                            maximum_packet_loss_rate_dl: None,
-                            maximum_packet_loss_rate_ul: None,
+                        .then_some(Gbr {
+                            mfbr_dl: b.qos.mbr_downlink,
+                            mfbr_ul: b.qos.mbr_uplink,
+                            gfbr_dl: b.qos.gbr_downlink,
+                            gfbr_ul: b.qos.gbr_uplink,
                         });
-                    QosFlowSetupRequestItem {
-                        qos_flow_identifier: b.ebi,
-                        qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                            qos_characteristics: QosCharacteristics::NonDynamic5qi(
-                                NonDynamic5qiDescriptor::new(u16::from(b.qos.index)),
-                            ),
-                            allocation_and_retention_priority: AllocationAndRetentionPriority {
-                                priority_level_arp: b.qos.arp_priority_level.clamp(1, 15),
-                                pre_emption_capability: if b.qos.arp_preempt_cap {
-                                    PreEmptionCapability::ShallNotTriggerPreEmption
-                                } else {
-                                    PreEmptionCapability::MayTriggerPreEmption
-                                },
-                                pre_emption_vulnerability: if b.qos.arp_preempt_vuln {
-                                    PreEmptionVulnerability::NotPreEmptable
-                                } else {
-                                    PreEmptionVulnerability::PreEmptable
-                                },
-                            },
-                            gbr_qos_information: gbr,
-                            reflective_qos_attribute: false,
-                            additional_qos_flow_information: false,
+                    QosFlowSetup {
+                        qfi: b.ebi,
+                        five_qi: u16::from(b.qos.index),
+                        arp: Arp {
+                            priority_level: b.qos.arp_priority_level.clamp(1, 15),
+                            may_trigger_pre_emption: !b.qos.arp_preempt_cap,
+                            pre_emptable: !b.qos.arp_preempt_vuln,
                         },
+                        gbr,
                         e_rab_id: Some(b.ebi),
+                        qos_monitoring: None,
                     }
                 })
                 .collect();
-            PduSessionResourceSetupRequestTransfer {
-                pdu_session_aggregate_maximum_bit_rate: (sess.session_ambr.downlink > 0
-                    || sess.session_ambr.uplink > 0)
-                    .then_some(PduSessionAggregateMaximumBitRate {
-                        dl: sess.session_ambr.downlink,
-                        ul: sess.session_ambr.uplink,
-                    }),
-                ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                    transport_layer_address: TransportLayerAddress::from_ipv4(n3_ul.1),
-                    gtp_teid: n3_ul.0.to_be_bytes(),
-                }),
+            golden::setup_request_octets(&SetupRequest {
+                ambr: (sess.session_ambr.downlink > 0 || sess.session_ambr.uplink > 0)
+                    .then_some((sess.session_ambr.downlink, sess.session_ambr.uplink)),
+                ul_tunnel: n3_ul,
                 data_forwarding_not_possible: forwarding.not_possible(),
-                pdu_session_type: PduSessionType::Ipv4,
-                security_indication: None,
-                network_instance: None,
-                qos_flow_setup_request_list: flows,
                 direct_forwarding_path_availability: forwarding.direct,
-            }
-            .encode()
-            .unwrap()
+                flows,
+            })
         }
 
         let bearer =
@@ -4652,7 +4672,7 @@ mod tests {
                     assert_eq!(
                         build_handover_setup_request_transfer(&sess, &bearers[..n], n3, forwarding)
                             .unwrap(),
-                        oracle(&sess, &bearers[..n], n3, forwarding),
+                        expected(&sess, &bearers[..n], n3, forwarding),
                         "AMBR ({dl}, {ul}), forwarding {forwarding:?}, {n} bearers"
                     );
                 }

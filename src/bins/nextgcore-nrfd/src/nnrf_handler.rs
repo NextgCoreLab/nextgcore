@@ -2863,20 +2863,12 @@ mod tests {
     /// hidden from the UCMF and the `discovered` assertion fails.
     #[test]
     fn the_ucmf_still_discovers_the_nef_2160() {
-        let nef = serde_json::json!({
-            "nfInstanceId": "aaaaaaaa-2160-4000-8000-0000000000ef",
-            "nfType": "NEF",
-            "nfStatus": "REGISTERED",
-            "nfServices": [{
-                "serviceInstanceId": "nef-2160-nnef-eventexposure",
-                "serviceName": "nnef-eventexposure",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"]
-            }],
-            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP", "UCMF"]
-        });
+        let nef = nextgcore_sbi::nf_profiles::nef(
+            "aaaaaaaa-2160-4000-8000-0000000000ef",
+            "10.0.0.9",
+            7817,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let query = |requester: &str| DiscoveryQuery {
             target_nf_type: "NEF".to_string(),
             requester_nf_type: requester.to_string(),
