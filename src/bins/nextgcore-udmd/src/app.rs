@@ -650,6 +650,8 @@ pub async fn run() -> Result<()> {
     drop(crate::ee_amf::spawn_unsubscribe_reconciler());
     // #2125: and EE subscriptions lapse at their granted expiry.
     spawn_ee_expiry_sweep();
+    // #2182: the AMF leg renewal, on a task of its own (not the lapse sweep's).
+    crate::ee_amf::spawn_amf_leg_renewal();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -6301,6 +6303,7 @@ mod tests {
             notify_uri: "http://nef.example.org/ee-notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY_REPORT".to_string()],
             expiry: None,
+            amf_expiry: None,
         });
         let lapsed_id = lapsed.id.clone();
         udm_self().read().unwrap().ee_subscription_insert(lapsed);
