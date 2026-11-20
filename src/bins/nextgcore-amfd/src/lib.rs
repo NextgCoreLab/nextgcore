@@ -51,6 +51,8 @@ mod property_tests;
 pub(crate) mod aper_golden;
 #[cfg(test)]
 pub(crate) mod gnb_pdus;
+#[cfg(test)]
+pub(crate) mod amf_pdus;
 
 // Wave-6 H1: expose the real Namf SBI request handler + the N1N2MessageTransfer
 // consumer so peer NF crates (lmfd/udmd/smfd/pcfd) can drive them in-process
