@@ -4169,15 +4169,22 @@ impl DataPlane {
 
         self.tun = Some(tun);
 
-        // Create GTP-U socket
+        self.bind_gtpu(gtpu_addr).await?;
+
+        log::info!("Data plane initialized");
+        Ok(())
+    }
+
+    /// Bind the IPv4 GTP-U socket and take its address as the N3 address (#2208:
+    /// split out of [`Self::init`], so a data plane without a TUN device, an
+    /// in-process test's, binds it the same way).
+    pub async fn bind_gtpu(&mut self, gtpu_addr: SocketAddr) -> io::Result<()> {
         log::info!("Binding GTP-U socket on {gtpu_addr}");
         let socket = TokioUdpSocket::bind(gtpu_addr).await?;
         self.gtpu_socket = Some(Arc::new(socket));
         if let IpAddr::V4(ip) = gtpu_addr.ip() {
             *self.local_gtpu_addr.write().unwrap() = ip;
         }
-
-        log::info!("Data plane initialized");
         Ok(())
     }
 
@@ -4264,12 +4271,18 @@ impl DataPlane {
         let tun = self.tun.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "TUN device not initialized")
         })?;
+        self.run_on(tun.fd()).await
+    }
+
+    /// [`Self::run`] with N6 on `tun_fd` (#2208): the TUN device's in the binary; a
+    /// non-blocking datagram socket's in an in-process test, which then reads the
+    /// uplink IP packets and writes the downlink ones.
+    pub async fn run_on(&self, tun_fd: RawFd) -> io::Result<()> {
         let gtpu = self.gtpu_socket.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "GTP-U socket not initialized")
         })?;
 
         // Clone for the tasks
-        let tun_fd = tun.fd();
         let gtpu_clone = gtpu.clone();
         let shutdown = self.shutdown.clone();
         let stats = &self.stats;
