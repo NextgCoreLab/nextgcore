@@ -2137,6 +2137,9 @@ async fn refresh_producer_legs(
     let budget = refresh_pass_budget();
     let mut producer_failed = false;
     let mut report = RefreshReport::default();
+    // #2148: the DELETEs this pass owes for lapsed legs, sent below by this
+    // worker (so at most REFRESH_MAX_PRODUCERS at once), not one task each.
+    let mut lapsed = Vec::new();
     for sub in legs {
         let Some(southbound) = sub.southbound.clone() else {
             continue;
@@ -2158,12 +2161,7 @@ async fn refresh_producer_legs(
         if sub.southbound_expiry.is_some_and(|e| e <= now) {
             gone("expired before a refresh got through");
             remove_lapsed_leg(&sub.id, &southbound);
-            // Owed already; sent on its own task so a dead producer's DELETE
-            // timeout does not hold up the pass (parked for retry if it fails).
-            drop(spawn_detached(southbound_unsubscribe(
-                Some(base.clone()),
-                southbound,
-            )));
+            lapsed.push(southbound);
             report.lapsed += 1;
             continue;
         }
@@ -2243,6 +2241,19 @@ async fn refresh_producer_legs(
                 producer_failed = true;
                 report.failed += 1;
             }
+        }
+    }
+    // #2148: the lapsed legs' DELETEs, owed (and persisted) already by
+    // `remove_lapsed_leg`. Sent one at a time, after the refreshes, and not
+    // once this producer has failed or the budget is spent: whatever is not
+    // sent stays owed, and the #1877 reconciler sends it with its backoff.
+    for southbound in lapsed {
+        if producer_failed || started.elapsed() >= budget {
+            break;
+        }
+        southbound_unsubscribe(Some(base.clone()), southbound.clone()).await;
+        if southbound_reconcile::is_owed(&southbound) {
+            producer_failed = true;
         }
     }
     report
@@ -4865,6 +4876,78 @@ mod tests {
             assert_eq!(report.refreshed, 1, "the UDM leg is refreshed: {report:?}");
             assert_eq!(requests_2102(&udm_seen, "PATCH").len(), 1);
             assert_eq!(udm_expiry, Some(now + southbound_lifetime_secs()));
+            assert!(
+                took < Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS * 2 + 1),
+                "about one request timeout: {took:?}"
+            );
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2148 (R42 on #2128): lapsed legs' DELETEs are bounded. Five legs lapse
+    /// at once at an AMF that never answers a DELETE. The pass sends one (its
+    /// timeout) and stops; all five subscriptions are removed and all five
+    /// DELETEs stay owed for the #1877 reconciler. Before, each lapsed leg
+    /// spawned its own DELETE task, with no bound.
+    ///
+    /// REVERT-VERIFIED: with one detached `southbound_unsubscribe` per lapsed leg
+    /// again, the AMF receives five DELETEs and the `one DELETE` assertion fails.
+    #[test]
+    fn lapsed_legs_deletes_are_bounded_2148() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = deletes.clone();
+            let (amf, amf_addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let count = count.clone();
+                    async move {
+                        if req.header.method == "DELETE" {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        tokio::time::sleep(Duration::from_secs(8)).await;
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            let amf_uri = format!("http://127.0.0.1:{}", amf_addr.port());
+            let now = now_unix_secs();
+            let ids: Vec<String> = (0..5)
+                .map(|n| {
+                    live_leg_2128(
+                        SouthboundProducer::Amf,
+                        &amf_uri,
+                        &format!("s-2148-{n}"),
+                        now - 1,
+                    )
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let report = refresh_live_subscriptions_at(now).await;
+            let took = started.elapsed();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let sent = deletes.load(Ordering::SeqCst);
+            let owed: Vec<String> = southbound_reconcile::parked()
+                .into_iter()
+                .map(|r| r.subscription_id)
+                .filter(|id| id.starts_with("s-2148-"))
+                .collect();
+            let held = ids
+                .iter()
+                .filter(|id| nef_self().read().unwrap().subscription_find(id).is_some())
+                .count();
+            amf.stop().await.ok();
+
+            assert_eq!(report.lapsed, 5, "{report:?}");
+            assert_eq!(held, 0, "every lapsed subscription is removed");
+            assert_eq!(sent, 1, "one DELETE at the dead AMF this pass");
+            assert_eq!(owed.len(), 5, "all five stay owed: {owed:?}");
             assert!(
                 took < Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS * 2 + 1),
                 "about one request timeout: {took:?}"

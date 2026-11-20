@@ -138,6 +138,11 @@ pub fn owe(southbound: SouthboundRef) -> bool {
     true
 }
 
+/// #2148: whether a DELETE of `southbound` is still owed (not yet delivered).
+pub fn is_owed(southbound: &SouthboundRef) -> bool {
+    lock().iter().any(|p| p.southbound == *southbound)
+}
+
 /// #2086: `southbound`'s DELETE was delivered: it is no longer owed. Persisted.
 pub fn settle(southbound: &SouthboundRef) {
     let removed = {

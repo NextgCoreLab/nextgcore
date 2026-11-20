@@ -1621,9 +1621,12 @@ impl NwdafContext {
         if !self.state.is_enabled() {
             return;
         }
-        let doc = self.snapshot();
-        self.dirty.store(false, Ordering::SeqCst);
-        if let Err(e) = self.state.persist(&doc) {
+        // #2151: snapshot under the store's write lock, so concurrent persists
+        // publish in snapshot order.
+        if let Err(e) = self.state.persist_with(|| {
+            self.dirty.store(false, Ordering::SeqCst);
+            self.snapshot()
+        }) {
             // The consumer's subscription exists in memory but not on disk: the
             // request was answered successfully and will not survive a restart.
             // Error, not warn — this is the promise being quietly broken.
@@ -1661,7 +1664,7 @@ impl NwdafContext {
     /// flush is still covered by the next tick.
     pub fn flush_state_if_dirty(&self) {
         if self.dirty.swap(false, Ordering::SeqCst) {
-            if let Err(e) = self.state.persist(&self.snapshot()) {
+            if let Err(e) = self.state.persist_with(|| self.snapshot()) {
                 log::error!("NWDAF state was NOT persisted: {e}");
             }
         }

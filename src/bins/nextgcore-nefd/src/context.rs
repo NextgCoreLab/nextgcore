@@ -576,8 +576,10 @@ impl NefContext {
         if !self.state.is_enabled() {
             return;
         }
-        let doc = self.snapshot();
-        if let Err(e) = self.state.persist(&doc) {
+        // #2148/#2151: the snapshot is taken under the store's write lock, so
+        // concurrent persists (the #2128 refresh workers, a request) publish in
+        // snapshot order.
+        if let Err(e) = self.state.persist_with(|| self.snapshot()) {
             // The AF's subscription exists in memory but not on disk: the create
             // was answered successfully and will not survive a restart.
             log::error!("NEF state was NOT persisted: {e}");
@@ -827,6 +829,11 @@ mod tests {
     /// state is visible outside the operator's network.
     #[test]
     fn subscriptions_and_transactions_survive_a_restart() {
+        // #2148: the snapshot carries the process-wide owed-unsubscribe set
+        // (#2086), so another test's parked DELETE would be restored with these
+        // records: hold the NEF state lock and start from an empty set.
+        let _guard = super::lock_nef_context_for_test();
+        crate::southbound_reconcile::clear_for_test();
         let path = temp_state_path("restart");
         let _ = std::fs::remove_file(&path);
 
@@ -898,6 +905,11 @@ mod tests {
     /// exactly this shape on its DB-delete path.
     #[test]
     fn a_deleted_subscription_is_not_resurrected_by_a_restart() {
+        // #2148: the snapshot carries the process-wide owed-unsubscribe set
+        // (#2086), so another test's parked DELETE would be restored with these
+        // records: hold the NEF state lock and start from an empty set.
+        let _guard = super::lock_nef_context_for_test();
+        crate::southbound_reconcile::clear_for_test();
         let path = temp_state_path("delete");
         let _ = std::fs::remove_file(&path);
 

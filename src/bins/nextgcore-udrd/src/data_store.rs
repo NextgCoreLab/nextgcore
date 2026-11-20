@@ -263,8 +263,9 @@ impl UdrDataStore {
             );
             return;
         }
-        let doc = self.snapshot();
-        if let Err(e) = nextgcore_core::state_store::write_snapshot(path, &doc) {
+        // #2151: snapshot under the path's write lock, so concurrent persists
+        // publish in snapshot order.
+        if let Err(e) = nextgcore_core::state_store::write_snapshot_with(path, || self.snapshot()) {
             log::warn!("UDR state persist failed: {e}");
         }
     }
