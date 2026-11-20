@@ -292,7 +292,20 @@ fn outbound_oauth2_client(
 }
 
 fn northbound_auth() -> NorthboundAuth {
+    #[cfg(test)]
+    if let Ok(auth) = TEST_NORTHBOUND_AUTH.try_with(|a| *a) {
+        return auth;
+    }
     NORTHBOUND_AUTH.get().copied().unwrap_or_default()
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// #2132 (R41 on #2159): the northbound enforcement [`northbound_auth`]
+    /// returns inside `TEST_NORTHBOUND_AUTH.scope(..)`, so a handler test can
+    /// run under mTLS/OAuth2 enforcement without setting the process-wide
+    /// `NORTHBOUND_AUTH` once and for every other test.
+    pub(crate) static TEST_NORTHBOUND_AUTH: NorthboundAuth;
 }
 
 /// The authenticated identity of the caller, `Ok(None)` when the request carries
@@ -342,12 +355,28 @@ fn authenticated_client_id_with(
     if auth.oauth2 {
         verified.oauth2_subject = request.oauth2_subject.clone();
     }
-    nextgcore_sbi::owner_binding::verified_consumer_id_with(&verified, production)
+    let identity = nextgcore_sbi::owner_binding::verified_consumer_id_with(&verified, production)?;
+    // #2132 (R41 on #2159): under mTLS enforcement every caller presents a
+    // certificate, so `None` here means a relay's (SCP/SEPP) certificate with
+    // no verified token behind it. Taking that as anonymous would let the relay
+    // create an ownerless (scsAsId-keyed) subscription whenever OAuth2 is not
+    // also enforced; refuse it instead.
+    if identity.is_none()
+        && nextgcore_sbi::owner_binding::is_relay_certificate(&verified.peer_cert_nf_types)
+    {
+        return Err(
+            "the requester's client certificate is a relay's (SCP/SEPP), which is no caller \
+             identity, and no verified access token names the consumer behind it"
+                .to_string(),
+        );
+    }
+    Ok(identity)
 }
 
 /// #2132: the 403 for a request whose credentials are no identity (see
-/// [`authenticated_client_id`]). Sent before any resource is looked up, so it
-/// says nothing about whether one exists.
+/// [`authenticated_client_id`]). Every route checks identity first, before
+/// any validation, southbound call or subscription lookup, so the refusal says
+/// nothing about whether a UE or a subscription exists.
 fn refuse_unidentified(operation: &str, why: &str) -> SbiResponse {
     log::debug!("{operation} refused: {why}");
     nextgcore_sbi::server::send_forbidden(&format!("{operation}: {why}"), None)
@@ -961,6 +990,11 @@ async fn handle_nnef_event_exposure_create(request: &SbiRequest) -> SbiResponse 
 
 /// DELETE /nnef-eventexposure/v1/subscriptions/{subId} — TS 29.591 Unsubscribe.
 async fn handle_nnef_event_exposure_delete(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #2132: identity first, so a caller whose credentials are no identity
+    // cannot tell a 404 from a 403.
+    if let Err(why) = authenticated_client_id(request, northbound_auth()) {
+        return refuse_unidentified("Nnef_EventExposure unsubscribe", &why);
+    }
     // Ownership is checked against the subscription's stored `scs_as_id`, which for
     // this API is the consumer's `notifId` -- so the delete resolves it from the
     // stored subscription rather than from the path, which carries no consumer id.
@@ -1096,6 +1130,15 @@ async fn handle_monitoring_subscription_create(
     request: &SbiRequest,
     api: NorthboundApi,
 ) -> SbiResponse {
+    // #2132: identity first, before validation and before the southbound UDM
+    // GPSI lookup, so a caller whose credentials are no identity learns
+    // nothing (no 404 UE_NOT_FOUND) and causes no southbound call. Issue #110:
+    // ownership is keyed to an identity this process verified, not to the
+    // caller-supplied {scsAsId} path segment.
+    let owner_id = match authenticated_client_id(request, northbound_auth()) {
+        Ok(id) => id,
+        Err(why) => return refuse_unidentified("monitoring subscription create", &why),
+    };
     let handoff = Arc::new(Mutex::new(CreateHandoff::Pending));
     let mut guard = CreateAbandonGuard {
         handoff: handoff.clone(),
@@ -1103,7 +1146,8 @@ async fn handle_monitoring_subscription_create(
     };
     let (scs_as_id, request) = (scs_as_id.to_string(), request.clone());
     let task = spawn_detached(async move {
-        let response = handle_monitoring_subscription_create_inner(&scs_as_id, &request, api).await;
+        let response =
+            handle_monitoring_subscription_create_inner(&scs_as_id, &request, api, owner_id).await;
         CreateHandoff::finish(&handoff, &response);
         response
     });
@@ -1119,6 +1163,7 @@ async fn handle_monitoring_subscription_create_inner(
     scs_as_id: &str,
     request: &SbiRequest,
     api: NorthboundApi,
+    owner_id: Option<String>,
 ) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
@@ -1266,13 +1311,6 @@ async fn handle_monitoring_subscription_create_inner(
                 );
             }
         },
-    };
-
-    // Issue #110: ownership is keyed to an identity this process verified, not to
-    // the caller-supplied {scsAsId} path segment.
-    let owner_id = match authenticated_client_id(request, northbound_auth()) {
-        Ok(id) => id,
-        Err(why) => return refuse_unidentified("monitoring subscription create", &why),
     };
 
     let sub = NefMonitoringSubscription::new(
@@ -5974,6 +6012,130 @@ mod tests {
         reset_context();
     }
 
+    /// **#2132 (R41 on #2159)**: under northbound mTLS + OAuth2 enforcement, a
+    /// caller whose credentials are no identity (a certificate and a token
+    /// naming different instances, or a relay's certificate with no token) is
+    /// refused 403 FIRST: the monitoring create makes no southbound UDM GPSI
+    /// lookup and stores nothing, and the Nnef unsubscribe answers the same 403
+    /// for a subscription that exists and one that does not, so neither route
+    /// tells a 404 from a 403.
+    ///
+    /// REVERT-VERIFIED: with the create's identity check moved back after the
+    /// GPSI resolution, the UDM stub sees an id-translation-result request and
+    /// the "no southbound call" assertion fails; with the Nnef delete's check
+    /// removed, the unknown subscription answers 404.
+    #[test]
+    fn a_caller_with_no_identity_is_refused_before_any_lookup_2132() {
+        let _guard = lock_globals();
+        reset_context();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                nextgcore_sbi::security::set_sbi_profile_override(
+                    nextgcore_sbi::security::SbiProfile::Dev,
+                );
+                let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+                let sink = Arc::clone(&seen);
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let udm = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+                udm.start(move |req: SbiRequest| {
+                    let sink = Arc::clone(&sink);
+                    async move {
+                        sink.lock().expect("seen").push(req.header.uri.clone());
+                        SbiResponse::with_status(404)
+                    }
+                })
+                .await
+                .expect("UDM stub starts");
+                let udm_uri = format!("http://127.0.0.1:{}", addr.port());
+                if let Ok(mut c) = nef_self().write() {
+                    c.set_endpoints(None, Some(udm_uri.clone()), None, None);
+                    c.set_udm_sdm_uri(Some(udm_uri));
+                }
+                let enforced = NorthboundAuth {
+                    oauth2: true,
+                    mtls: true,
+                };
+                let mismatch = |mut r: SbiRequest| {
+                    r.peer_cert_nf_instance_id =
+                        Some("aaaaaaaa-2132-4000-8000-00000000000a".into());
+                    r.peer_cert_nf_types = vec!["AF".into()];
+                    r.oauth2_subject = Some("bbbbbbbb-2132-4000-8000-00000000000b".into());
+                    r
+                };
+                let relay_alone = |mut r: SbiRequest| {
+                    r.peer_cert_nf_instance_id =
+                        Some("55555555-2132-4000-8000-000000000005".into());
+                    r.peer_cert_nf_types = vec!["SCP".into()];
+                    r
+                };
+                for (what, credentials) in [
+                    ("mismatch", &mismatch as &dyn Fn(SbiRequest) -> SbiRequest),
+                    ("relay alone", &relay_alone),
+                ] {
+                    let create = credentials(monitoring_request(serde_json::json!({
+                        "monitoringType": "LOSS_OF_CONNECTIVITY",
+                        "externalId": "ue2132@fl.nextg",
+                        "notificationDestination": "http://127.0.0.1:9/af/v1/notify/x"
+                    })));
+                    let response = TEST_NORTHBOUND_AUTH
+                        .scope(
+                            enforced,
+                            handle_monitoring_subscription_create(
+                                "af-2132",
+                                &create,
+                                NorthboundApi::T8MonitoringEvent,
+                            ),
+                        )
+                        .await;
+                    assert_eq!(response.status, 403, "{what}: {:?}", response.http.content);
+                    assert!(
+                        seen.lock().expect("seen").is_empty(),
+                        "{what}: no southbound call before the identity check"
+                    );
+                    assert_eq!(
+                        nef_self().read().unwrap().subscription_count(),
+                        0,
+                        "{what}: nothing stored"
+                    );
+                }
+
+                // The Nnef unsubscribe: an existing subscription and an unknown
+                // one get the same 403.
+                let stored = NefMonitoringSubscription::new(
+                    "notif-2132",
+                    "LOSS_OF_CONNECTIVITY",
+                    "http://127.0.0.1:9/af/v1/notify/x",
+                    "{}",
+                );
+                let stored_id = stored.id.clone();
+                nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_insert(stored)
+                    .expect("stored");
+                for id in [stored_id.as_str(), "no-such-subscription-2132"] {
+                    let del = mismatch(SbiRequest::delete(format!(
+                        "/nnef-eventexposure/v1/subscriptions/{id}"
+                    )));
+                    let response = TEST_NORTHBOUND_AUTH
+                        .scope(enforced, handle_nnef_event_exposure_delete(id, &del))
+                        .await;
+                    assert_eq!(response.status, 403, "{id}: {:?}", response.http.content);
+                }
+                assert!(nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_find(&stored_id)
+                    .is_some());
+                drop(udm);
+            });
+        reset_context();
+    }
+
     /// **Issue #1439, at the handler.** A producer notification whose reports are
     /// all of another type is answered 204 and forwards NOTHING to the AF; the
     /// matching one is delivered to the AF's notificationDestination over the
@@ -6413,16 +6575,15 @@ mod tests {
         for production in [true, false] {
             let id = |r: SbiRequest| authenticated_client_id_with(&r, mtls, production);
             assert_eq!(id(req(Some(AF), &["AF"], None)), Ok(Some(AF.into())));
-            assert_eq!(
-                id(req(Some(SCP), &["SCP"], None)),
-                Ok(None),
-                "an SCP certificate alone is no identity (production={production})"
-            );
-            assert_eq!(
-                id(req(Some(SCP), &["SEPP"], None)),
-                Ok(None),
-                "nor a SEPP's"
-            );
+            for relay in ["SCP", "SEPP"] {
+                assert!(
+                    id(req(Some(SCP), &[relay], None))
+                        .unwrap_err()
+                        .contains("is a relay's"),
+                    "a {relay} certificate alone is no identity, and is refused rather \
+                     than taken as anonymous (production={production})"
+                );
+            }
             assert_eq!(
                 id(req(Some(SCP), &["SCP"], Some(AF))),
                 Ok(Some(AF.into())),

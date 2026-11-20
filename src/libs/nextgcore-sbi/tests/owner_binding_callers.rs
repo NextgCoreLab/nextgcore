@@ -7,13 +7,14 @@
 
 const CALLERS: &[&str] = &[
     "nextgcore-amfd",
-    "nextgcore-ausfd", // its own `caller_identity`, the same rule (#2065)
+    "nextgcore-ausfd", // `caller_identity_with` is the shared helper (#2132)
     "nextgcore-bsfd",
     "nextgcore-dccfd",
     "nextgcore-easdfd",
     "nextgcore-eesd",
     "nextgcore-lmfd",
     "nextgcore-mbsmfd",
+    "nextgcore-nefd", // `authenticated_client_id_with` (#2132)
     "nextgcore-nsacfd",
     "nextgcore-nssfd",
     "nextgcore-nwdafd",
