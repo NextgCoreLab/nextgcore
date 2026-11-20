@@ -819,6 +819,53 @@ mod tests {
         assert_eq!(on_disk["v"], 2);
     }
 
+    /// **#2188** (R42 on #2181): the per-write result map drains. After 8
+    /// threads × 40 concurrent persists of one path, every fifth of them led by a
+    /// snapshot that panics, every result has been read and dropped and no lead
+    /// is left open: the path's group holds nothing. A result kept for a caller
+    /// that never reads it would grow without bound, silently.
+    ///
+    /// REVERT-VERIFIED: with `waiting` one too many (the leader counted among
+    /// the callers still to read), entries are never drained and the `drained`
+    /// assertion fails.
+    #[test]
+    fn the_group_commit_result_map_drains_2188() {
+        let dir = tmpdir("drain-2188");
+        let path = dir.join("nf.json");
+        let writers: Vec<_> = (0..8u64)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..40u64 {
+                        let panics = (w * 40 + i) % 5 == 0;
+                        let path = path.clone();
+                        let _ = std::panic::catch_unwind(move || {
+                            StateStore::new(Some(path)).persist_with(|| {
+                                if panics {
+                                    panic!("a poisoned lock");
+                                }
+                                serde_json::json!({ "w": w, "i": i })
+                            })
+                        });
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer");
+        }
+        let group = commit_group(&path);
+        let (pending, leading, requested, flushed) = {
+            let st = group.0.lock().unwrap();
+            (st.pending.len(), st.leading, st.requested, st.flushed)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(requested, 320, "every persist was numbered");
+        assert_eq!(flushed, requested, "every caller was covered by a write");
+        assert!(!leading, "no lead is left open");
+        assert_eq!(pending, 0, "drained: every result was read and dropped");
+    }
+
     /// **#2170**: a write that fails fails every caller it covered, not just
     /// its leader: none returns `Ok` for a change that is not on disk.
     ///
