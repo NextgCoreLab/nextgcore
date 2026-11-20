@@ -1499,15 +1499,14 @@ async fn a_release_of_an_unregistered_ue_does_not_wait_for_a_blackholed_smf() {
     server.ue_auth_state.with_mut(ue, |s| s.registered = false);
     hold_blackholed(&mut server, ue, 1, "rel-922-dead");
     hold_session(&mut server, ue, 2, "rel-922-live", port);
-    let request = crate::gnb_pdus::ue_context_release_request(
-        &nextgcore_ngap::types::UeContextReleaseRequest {
+    let request =
+        crate::gnb_pdus::ue_context_release_request(&crate::ngap_types::UeContextReleaseRequest {
             amf_ue_ngap_id: ue,
             ran_ue_ngap_id: ran,
-            cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                nextgcore_ngap::types::CauseRadioNetwork::UserInactivity,
+            cause: crate::ngap_types::Cause::RadioNetwork(
+                crate::ngap_types::CauseRadioNetwork::UserInactivity,
             ),
-        },
-    );
+        });
 
     let started = Instant::now();
     server
@@ -1981,7 +1980,7 @@ async fn a_registration_update_to_a_blackholed_smf_does_not_hold_the_ngap_task()
 /// a blackholed SMF the handlers return at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n2_sm_relays_to_a_blackholed_smf_do_not_hold_the_ngap_task() {
-    use nextgcore_ngap::types as t;
+    use crate::ngap_types as t;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_923_041u64, 71u32);
     secured_registered_ue(&mut server, ue, ran);
@@ -2331,16 +2330,14 @@ async fn a_release_before_the_connected_report_reports_no_idle_1645() {
             // A partial reset naming this UE alone: the UE store is process-global,
             // and a whole-interface reset of association 1 would idle every sibling
             // test's UE on it too.
-            let item = nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+            let item = crate::ngap_types::UeAssociatedLogicalNgConnectionItem {
                 amf_ue_ngap_id: Some(new),
                 ran_ue_ngap_id: None,
             };
             server
                 .handle_ng_reset(
                     1,
-                    &ng_reset_pdu(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
-                        item,
-                    ])),
+                    &ng_reset_pdu(crate::ngap_types::ResetType::PartOfNgInterface(vec![item])),
                 )
                 .await
                 .expect("handled");
@@ -2444,16 +2441,14 @@ async fn an_ng_reset_that_supersedes_waiting_activations_closes_their_join_1924(
         "the join waits for both activations"
     );
 
-    let item = nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+    let item = crate::ngap_types::UeAssociatedLogicalNgConnectionItem {
         amf_ue_ngap_id: Some(new),
         ran_ue_ngap_id: None,
     };
     server
         .handle_ng_reset(
             1,
-            &ng_reset_pdu(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
-                item,
-            ])),
+            &ng_reset_pdu(crate::ngap_types::ResetType::PartOfNgInterface(vec![item])),
         )
         .await
         .expect("handled");

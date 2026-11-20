@@ -4149,7 +4149,7 @@ pub struct AmfGnb {
     pub gnb_id_len: u8,
     /// The ngENB-ID, with its length, of a node that set up NG as an ng-eNB
     /// (TS 38.413 §9.3.1.8, #876); `None` for a gNB.
-    pub ng_enb_id: Option<nextgcore_ngap::types::NgEnbId>,
+    pub ng_enb_id: Option<crate::ngap_types::NgEnbId>,
     /// PLMN ID (received from gNB)
     pub plmn_id: PlmnId,
     /// gNB state
@@ -6009,7 +6009,7 @@ pub struct PredictedCell {
 pub enum RecommendedPagingTarget {
     /// A Global RAN Node ID (§9.3.1.5), matched against the identity each gNB or
     /// ng-eNB gave at NG Setup.
-    RanNode(nextgcore_ngap::types::GlobalRanNodeId),
+    RanNode(crate::ngap_types::GlobalRanNodeId),
     /// A TAI (§9.3.3.11): the nodes serving it.
     Tai(PlmnId, u32),
 }

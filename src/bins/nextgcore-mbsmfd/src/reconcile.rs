@@ -99,6 +99,61 @@ fn peer_of(c: &AmfMbsContext) -> String {
 #[cfg(test)]
 pub static PENDING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// #2236: how many `release_retries` tasks are running. Each can still park into
+/// [`pending`]: after its last retry, or when it is dropped mid-retry (#2075),
+/// which is what a test's runtime does to it at shutdown. A test that returned
+/// while its retry was in flight released [`PENDING_TEST_LOCK`] first, so its
+/// retry parked into the NEXT holder's set (seen as 2 for 1 in
+/// `an_amf_back_after_the_retry_budget_still_gets_the_delete_1817` and
+/// `the_reconcilers_404_ends_a_parked_contexts_token_1985`). Guarded by
+/// [`PENDING_TEST_LOCK`]: a test that starts retries waits for
+/// [`retries_settled`] before it lets go of the lock.
+#[cfg(test)]
+static RETRIES_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One running `release_retries` task, counted in [`RETRIES_RUNNING`] from its
+/// spawn to its end (or its drop).
+#[cfg(test)]
+pub struct RetryRunning(());
+
+#[cfg(test)]
+impl RetryRunning {
+    pub fn start() -> Self {
+        RETRIES_RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for RetryRunning {
+    fn drop(&mut self) {
+        RETRIES_RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Wait until no `release_retries` task is running, so none parks after the
+/// caller lets go of [`PENDING_TEST_LOCK`]. Hold the lock.
+#[cfg(test)]
+pub async fn retries_settled() {
+    for _ in 0..1000 {
+        if RETRIES_RUNNING.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("a release_retries task is still running after 10 s");
+}
+
+/// #2236: how many times the delete of `c` is parked (0 or 1: [`park`] does not
+/// add one twice). Hold [`PENDING_TEST_LOCK`].
+#[cfg(test)]
+pub fn parked_copies(c: &AmfMbsContext) -> usize {
+    pending()
+        .lock()
+        .map(|s| s.iter().filter(|p| same_context(&p.ctx, c)).count())
+        .unwrap_or(0)
+}
+
 /// Park `contexts` for the reconciler. A record already parked is not added twice,
 /// so a re-driven release does not send two deletes for one context.
 pub fn park(contexts: Vec<AmfMbsContext>) {

@@ -62,11 +62,11 @@ pub(super) fn uplink_nas_transport(
     ran_ue_ngap_id: u32,
     nas: &[u8],
 ) -> Vec<u8> {
-    crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
+    crate::gnb_pdus::uplink_nas_transport(&crate::ngap_types::UplinkNasTransport {
         amf_ue_ngap_id,
         ran_ue_ngap_id,
         nas_pdu: nas.to_vec(),
-        user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+        user_location_info: crate::ngap_types::UserLocationInformation::Nr {
             nr_cgi_plmn: [0x00, 0xF1, 0x10],
             nr_cell_identity: 1,
             tai_plmn: [0x00, 0xF1, 0x10],
@@ -856,7 +856,7 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
     seed_gnb_session(&server, source).await;
     seed_gnb_session(&server, target).await;
     let unswitched = crate::ngap_asn1::path_switch_unsuccessful_transfer(
-        nextgcore_ngap::types::Cause::Misc(nextgcore_ngap::types::CauseMisc::Unspecified),
+        crate::ngap_types::Cause::Misc(crate::ngap_types::CauseMisc::Unspecified),
     )
     .expect("encode");
 
@@ -3437,7 +3437,7 @@ async fn a_released_connection_loses_its_contextless_allocation() {
     take_sent_ngap(&mut server);
 
     let complete = crate::gnb_pdus::ue_context_release_complete(
-        &nextgcore_ngap::types::UeContextReleaseComplete {
+        &crate::ngap_types::UeContextReleaseComplete {
             amf_ue_ngap_id: id,
             ran_ue_ngap_id: 512,
         },
@@ -3465,7 +3465,7 @@ async fn a_released_connection_loses_its_contextless_allocation() {
 /// association's allocation is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ng_reset_drops_the_contextless_allocations_it_resets() {
-    use nextgcore_ngap::types::{
+    use crate::ngap_types::{
         Cause, CauseTransport, NgReset, ResetType, UeAssociatedLogicalNgConnectionItem,
     };
     let mut server = capturing_ngap_server().await;
@@ -3551,7 +3551,7 @@ fn decoded_error_indication(pdu: &[u8]) -> Option<(Option<u64>, Option<u32>, Opt
 /// Every gNB->AMF UE-associated message of the #739 table and of the #787 / #805
 /// follow-ups, naming `(amf, ran)`.
 fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
-    use nextgcore_ngap::types as t;
+    use crate::ngap_types as t;
     let uli = super::test_user_location(1, 0x10);
     let radio_cap = nextgcore_ngap_gen::encode(&g::NGAP_PDU::InitiatingMessage(
         g::InitiatingMessage {
@@ -5340,11 +5340,11 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
     assert!(decode_ics(&sent[0].1).is_some(), "the ICS went out");
 
     let failure = crate::gnb_pdus::initial_context_setup_failure(
-        &nextgcore_ngap::types::InitialContextSetupFailure {
+        &crate::ngap_types::InitialContextSetupFailure {
             amf_ue_ngap_id: new_id,
             ran_ue_ngap_id: 512,
-            cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+            cause: crate::ngap_types::Cause::RadioNetwork(
+                crate::ngap_types::CauseRadioNetwork::Unspecified,
             ),
         },
     );
@@ -5383,7 +5383,7 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
     assert_eq!(released[0].0, new_id);
 
     let complete = crate::gnb_pdus::ue_context_release_complete(
-        &nextgcore_ngap::types::UeContextReleaseComplete {
+        &crate::ngap_types::UeContextReleaseComplete {
             amf_ue_ngap_id: new_id,
             ran_ue_ngap_id: 512,
         },
@@ -5707,8 +5707,8 @@ async fn abort_with_sessions(
             let failure = crate::ngap_asn1::tests::ics_failure_pdu(
                 ue,
                 ran,
-                nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+                crate::ngap_types::Cause::RadioNetwork(
+                    crate::ngap_types::CauseRadioNetwork::Unspecified,
                 ),
             );
             server
@@ -6029,7 +6029,7 @@ async fn the_create_carries_the_request_type_and_a_priority_ues_message_priority
     ue_ready_for_sessions(&mut server, priority.0, priority.1);
     server.note_establishment_cause(
         priority.0,
-        nextgcore_ngap::types::RrcEstablishmentCause::MpsPriorityAccess as u8,
+        crate::ngap_types::RrcEstablishmentCause::MpsPriorityAccess as u8,
     );
 
     let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
@@ -6076,7 +6076,7 @@ async fn the_create_carries_the_request_type_and_a_priority_ues_message_priority
 /// handler, the mps-PriorityAccess UE is not marked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_establishment_cause_marks_a_high_priority_access_ue() {
-    use nextgcore_ngap::types::RrcEstablishmentCause as C;
+    use crate::ngap_types::RrcEstablishmentCause as C;
     let mut server = capturing_ngap_server().await;
     const ASSOC_1222: u64 = 1_222_001;
     for (n, (cause, expected)) in [
@@ -6090,7 +6090,7 @@ async fn the_establishment_cause_marks_a_high_priority_access_ue() {
     .enumerate()
     {
         let ran_ue_ngap_id = 1_222_100 + n as u32;
-        let pdu = crate::gnb_pdus::initial_ue_message(&nextgcore_ngap::types::InitialUeMessage {
+        let pdu = crate::gnb_pdus::initial_ue_message(&crate::ngap_types::InitialUeMessage {
             ran_ue_ngap_id,
             nas_pdu: vec![
                 0x7E,
