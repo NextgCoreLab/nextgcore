@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -198,7 +198,7 @@ smf:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
   pfcp:
     server:
       - address: 172.23.0.4
@@ -298,18 +298,21 @@ smf:
 <p><strong>Termination grace period.</strong> A graceful shutdown runs against ONE deadline, taken when the signal arrives: 43 s by default. <code>SMF_SHUTDOWN_BUDGET_SECS</code> overrides it, clamped to 30-3600 s with a warning; the shipped manifests set it to the grace period less 2 s, and the Helm chart derives it from <code>smf.terminationGracePeriodSeconds</code>. NFDeregister gets at most 3 s. Every SGW is told first (Delete Bearer, which does not wait for an answer). Then each UPF association is released: the #39 releases to the UEs get whatever is left after reserving 12 s for the Association Release (T1 x (N1+1)) and 12 s for the S5/S8 retransmissions. The UEs not reached by then are counted in the log, and the UPF deletes their sessions on the release. On the durable path (association kept), the EPC PFCP deletions are bounded by the same deadline. The shipped SMF and PGW-C manifests set <code>terminationGracePeriodSeconds: 45</code>, and docker compose sets <code>stop_grace_period: 45s</code>.</p>
 <p><strong>Durable state is a one-way upgrade.</strong> The snapshot format is versioned. This release writes version 2 (5G CP SEIDs <code>1&lt;&lt;48 | ref</code>; a version-1 session keeps its legacy <code>ref | 0x1000</code> SEID). An older binary refuses a newer snapshot rather than misread it, so rolling smfd back across this change with a state file fails to start. Remove the file (the sessions are then released) or roll forward.
 | <code>SMF_SBI_ADVERTISE_URI</code> | derived from the advertised SBI host and port | Externally reachable base URI used in PCF callback (<code>notificationUri</code>) URIs. One naming no host or a wildcard host refuses startup (#1322). |
+| <code>SMF_NETWORK_PAGING_GUARD_SECS</code> | <code>60</code> | How long the SMF waits on a network-triggered paging (TS 23.502 §4.2.3.3, #1631) that the AMF never reports on before it takes the paging as unanswered: the session goes back to DEACTIVATED and the next Downlink Data Report pages again. While a paging is in progress, a report pages again only for a higher ARP priority. Set it above the AMF’s whole paging window, T3513 × (retransmissions + 1): amfd’s defaults (<code>AMF_T3513_SECS</code> 5, four retransmissions) give 25 s. A shorter guard lets the SMF page again while the AMF is still paging. |
+| <code>SMF_UE_UNREACHABLE_UPF_POLICY</code> | <code>refrain</code> | TS 23.502 §4.2.3.3 step 3c policy toward the UPF once the AMF reports the UE unreachable (504 <code>UE_NOT_REACHABLE</code>, or <code>UE_NOT_REACHABLE_FOR_SESSION</code> for one non-3GPP session), #1707. While the UE is recorded unreachable, a Downlink Data Report pages nothing (step 3a), and the SMF subscribes at the AMF to <code>REACHABILITY_REPORT</code> (“UE Reachable for DL Traffic”). The values are:<br>- <code>refrain</code>: no N4 change.<br>- <code>stop-notifications</code>: the downlink FAR buffers without NOCP.<br>- <code>discard</code> or <code>stop-notifications-and-discard</code>: the FAR drops. Both are one Apply Action, because NOCP needs BUFF (TS 29.244 §8.2.26).<br><br>A REACHABLE report, the UE’s user-plane activation, or the hold below ends the record. Ending it re-arms the FAR to BUFF|NOCP and deletes the subscription. Any other value is read as <code>refrain</code>.<br><br>The FAR policy applies only to the session whose paging the AMF refused. A 504 records the whole UE, so its other sessions page nothing either (step 3a), but their FARs stay BUFF|NOCP: under <code>discard</code>, their buffered data is not discarded.<br><br>A <code>UE_NOT_REACHABLE_FOR_SESSION</code> record ends at once against an AMF that sends the immediate REACHABLE report (TS 29.518 §5.3.1). REACHABILITY_REPORT is not per access, so a UE reachable over 3GPP is reported REACHABLE, and the next Downlink Data Report repeats the cycle. amfd never sends that cause. |
+| <code>SMF_UE_UNREACHABLE_HOLD_SECS</code> | <code>3600</code> | How long an unreachable record holds with no reachability report (#1707). This bounds the record when an AMF loses the subscription; the subscription’s <code>expiry</code> is the same. |
 | <code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code> | unset / <code>7777</code> | UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>500 SYSTEM_FAILURE</code> (<code>504 PEER_NOT_RESPONDING</code> when the UDM does not answer). |
 | <code>NRF_URI</code> | unset | NRF URI, used when the YAML names none. |
 | <code>PCF_URI</code> / <code>NSACF_URI</code> | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
 | <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port: the shared families, the PDU session establishment counters (#1368) and the SMF gauges; see the Observability chapter. |
 | <code>NEXTGCORE_METRICS_BIND</code> | <code>127.0.0.1</code> | Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network. |
-| <code>SMF_UDM</code> | off | <code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
+| <code>SMF_UDM</code> | off | <code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. With it on, the <code>sm-data</code> entry used is the one for the session’s own S-NSSAI, its SD compared in either case (TS 29.571 §5.4.4.2; FFFFFF is no SD). When the UDM answers only with entries for other slices, the create is refused 403 <code>SNSSAI_DENIED</code> with 5GSM cause #70 (#1878). Before #1878 it took the first entry, so the session got another slice’s AMBR and 5QI. |
 | <code>SMF_EPS_INTERWORKING</code> | off | <code>1</code>/<code>true</code> makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
 | <code>SMF_IWK_SNSSAI</code> | SST <code>1</code> | S-NSSAI (<code>sst</code> or <code>sst:sd</code>, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475). |
 | <code>SMF_PGW_FQDN</code> | unset | PGW-C+SMF FQDN registered with the UDM; blank is treated as unset. |
 | <code>SMF_INDIRECT_FORWARDING_TIMER_MS</code> | <code>3000</code> | How long the UPF keeps EPS→5GS indirect data-forwarding tunnels after the handover executes. |
 | <code>SMF_GN_ADDR</code> | <code>127.0.0.1</code> | GGSN address this SMF puts in Gn Create/Update PDP Context Responses (GTPv1 interworking). |
-| <code>SMF_EASDF</code> / <code>SMF_EASDF_EDGE_FQDN</code> | off / unset | <code>1</code>/<code>true</code> enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); <code>SMF_EASDF_EDGE_FQDN</code> lists the FQDN patterns (e.g. <code>*.edge.example.com</code>) to steer. Enabled with no pattern logs a warning and steers nothing. |
+| <code>SMF_EASDF</code> / <code>SMF_EASDF_EDGE_FQDN</code> | off / unset | <code>1</code>/<code>true</code> enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); <code>SMF_EASDF_EDGE_FQDN</code> lists the FQDN patterns (e.g. <code>*.edge.example.com</code>) to steer. Enabled with no pattern logs a warning and steers nothing. Under the <code>production</code> SBI profile the SMF dials the EASDF (and the NRF for its discovery) over https with its client certificate (#1648), which easdfd serves under the same profile (#1677). With OAuth2 enforcement on, the DNS-context requests carry the NRF-issued token. Each DNS context is given its own report URI, <code>{apiRoot}/nsmf-callback/v1/{smContextRef}/easdf-dns-report/{token}</code> (#1518). An OAuth2-required listener admits the EASDF’s token-less report on that token, and the report is applied only to that session’s own DNS context. The old <code>nsmf-pdusession/v1/easdf-dns-reports</code> route is served only for DNS contexts created before #1518. |
 | <code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>_UL_BPS</code> | <code>150000000</code> / <code>50000000</code> | Session-AMBR caps for RedCap UEs. |
 | <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> | unset | <code>1</code>/<code>true</code>/<code>yes</code> forces OAuth2 enforcement, taking precedence over the YAML knob. |
 | <code>NEXTGCORE_SMF_STATE_FILE</code> | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when <code>--state-file</code> is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
@@ -414,7 +417,26 @@ path is unchanged.</li>
 <li><strong>Count-out.</strong> Every release sends the DECREASE, alongside the UDM cleanup. A same-PSI re-establishment on the same S-NSSAI waits for the old session’s DECREASE if it is already sent, and takes the admission over if it is not (then neither a DECREASE nor a new INCREASE is sent). A re-establishment on another S-NSSAI waits for neither.</li>
 <li><strong>Shutdown and boot.</strong> A shutdown that releases the association counts out every session still admitted, alongside the #39 fan-out and the Association Release, within the shutdown deadline. A durable shutdown counts nothing out: the sessions continue. At boot, a snapshot session that cannot be restored is counted out.</li>
 </ul>
-<p><code>smf_nsac_decrease_failures_total</code> counts the DECREASEs the NSACF refused or did not answer. Each such session stays counted at the NSACF. Precautionary DECREASEs are not counted.</p>
+<p><code>smf_nsac_decrease_failures_total</code> counts the DECREASEs the NSACF refused or did not answer, the reconciler’s retries included. Precautionary DECREASEs are not counted. (Before #1875 each such session stayed counted at the NSACF for good; that no longer holds.)</p>
+<h2 id="release-cleanup-reconciler-1875"><a class="header" href="#release-cleanup-reconciler-1875">Release-cleanup reconciler (#1875)</a></h2>
+<p>A release (or a create’s rollback) owes four peers a cleanup: the NSACF DECREASE, the SM Policy Association delete (TS 29.512 §4.2.5), the Nudm_UECM_Deregistration and the Nudm_SDM_Unsubscribe (TS 23.502 §4.3.4.2 steps 14-15). One that fails or times out is parked and retried every 30 s until the peer accepts it; a 404 counts as accepted, because the peer does not hold the record. A 4xx the PCF refuses with is not retried.</p>
+<ul>
+<li><strong>Bounded.</strong> At most 4096 parked cleanups. Parking one more evicts the oldest, which is logged at error and counted <code>abandoned</code>. One pass sends for at most 30 s.</li>
+<li><strong>Durable.</strong> The parked set is written into the state snapshot (<code>pendingCleanups</code>) and restored at boot, when the durable state is configured (<code>--state-file</code> / <code>NEXTGCORE_SMF_STATE_FILE</code>). Without it the set is memory-only, like the sessions.</li>
+<li><strong>Never against a live session.</strong> A DECREASE or deregistration names a (SUPI, PSI). A new session for that pair supersedes it: its INCREASE or registration is the live one, so nothing is sent. A session for the pair still being created defers it to the next pass.</li>
+</ul>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Type</th><th>Labels</th><th>Counts</th></tr>
+</thead>
+<tbody>
+<tr><td><code>smf_release_cleanups_pending</code></td><td>gauge</td><td><code>kind</code>: <code>nsac_decrease</code>, <code>sm_policy_delete</code>, <code>uecm_deregister</code>, <code>sdm_unsubscribe</code></td><td>cleanups parked now</td></tr>
+<tr><td><code>smf_release_cleanups_parked_total</code></td><td>counter</td><td><code>kind</code></td><td>cleanups that failed and were parked</td></tr>
+<tr><td><code>smf_release_cleanups_reconciled_total</code></td><td>counter</td><td><code>kind</code>, <code>result</code>: <code>delivered</code>, <code>superseded</code>, <code>refused</code>, <code>abandoned</code></td><td>parked cleanups the reconciler ended, and how</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="restoration-signalling-193"><a class="header" href="#restoration-signalling-193">Restoration signalling (#193)</a></h2>
 <p>The interlock above decides what the SMF <em>believes</em>. This decides what it
 <strong>tells the AMF</strong>, which before #193 was nothing: the SMF flushed N sessions,
@@ -467,6 +489,14 @@ large session count produces a proportional burst at the AMF.</li>
 same sessions and is not notified here; that is <code>Npcf_SMPolicyControl_Delete</code>
 on the release path, which this does not drive.</li>
 </ul>
+<h2 id="p-cscf-restoration-1398"><a class="header" href="#p-cscf-restoration-1398">P-CSCF restoration (#1398)</a></h2>
+<p>The SMF offers <code>suppFeat</code> <code>"100"</code> on the SM policy create: PCSCF-Restoration-Enhancement, TS 29.512 Table 5.8-1 feature 9, and no other optional feature. When the PCF’s UpdateNotify carries <code>smPolicyDecision.pcscfRestIndication: true</code> (TS 29.512 §4.2.3.18), the SMF answers 204 and then releases the PDU session for reactivation. The release is the same one a UPF restart triggers:</p>
+<ul>
+<li>the SM policy association is terminated;</li>
+<li>the N4 session is deleted;</li>
+<li>the PDU SESSION RELEASE COMMAND with 5GSM cause #39 “reactivation requested” goes out with the N2 Release Command, under T3592.</li>
+</ul>
+<p>The UE then re-establishes the session and selects a P-CSCF again. TS 23.380 also allows a PDU Session Modification that hands the UE a new P-CSCF list. TS 24.501 §6.3.2.2 limits that to a UE the SMF gave P-CSCF addresses at establishment, and this SMF puts none in the ePCO, so the release is the only option open to it. A retried copy of the notify starts no second release.</p>
 <h2 id="parsed-but-inert-yaml-sections"><a class="header" href="#parsed-but-inert-yaml-sections">Parsed-but-inert YAML sections</a></h2>
 <p>The example file follows an Open5GS-style layout, but the typed deserializer reads only <code>smf.sbi</code>, <code>smf.gtpc</code>, <code>smf.dns</code> and <code>smf.mtu</code> (unknown keys are silently dropped). The following sections in the shipped example currently have <strong>no effect</strong> on <code>nextgcore-smfd</code>:</p>
 <ul>
@@ -497,6 +527,16 @@ counter and registered nothing, so every <code>Retrieve</code> answered
 reference is read back out of the session rather than computed alongside it because
 <code>sess_add_by_psi</code> mints it from the <em>same</em> counter — computing both would consume the
 counter twice and leave the handler’s reference one behind the session’s.</p>
+<p><strong>Serving-AMF binding (#1860).</strong> The <code>smContextRef</code> is <code>{index}-{32 random hex}</code>, so
+one reference says nothing about another, and only the full string resolves. Each SM
+context is bound to the verified identity of the AMF that created it: the access
+token’s <code>sub</code>, or its client certificate’s NF Instance ID (not an SCP’s). The binding
+is persisted with the policy binding. Modify, release and retrieve from any other
+caller are refused <code>403</code> before the handler runs. An AMF change (TS 29.502 Table
+6.1.6.2.3-1: <code>servingNfId</code> with the new <code>smContextStatusUri</code>) is admitted only from the
+new AMF itself, whose verified identity must be that <code>servingNfId</code>. A context created
+with no verified identity (the <code>dev</code> profile), or restored from a snapshot written
+before #1860, is not bound.</p>
 <p>A create that fails after registration <strong>rolls the registration back</strong>. An abandoned
 registration would be an SM context the AMF never learned about and will never
 release.</p>
