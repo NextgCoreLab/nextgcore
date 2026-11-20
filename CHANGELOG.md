@@ -12,6 +12,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 
 ## [Unreleased]
 
+### Upgrade notes
+- **Upgrade udmd before nefd** (#2154). nefd refreshes its UDM Nudm_EE legs with
+  `add /reportingOptions/expiry` (#2133), which a udmd from before #2133 answers 400. nefd falls
+  back once to the whole-object form, which keeps legs alive across a rolling upgrade but replaces
+  the UDM's other `reportingOptions` members, so upgrade udmd first.
+
 ### Added
 - udmd's durable state file (#1836) gets a volume on Kubernetes (#1885). The Helm chart's
   `udm.durableState` (off by default) mounts a ReadWriteOnce claim, or an emptyDir, at
