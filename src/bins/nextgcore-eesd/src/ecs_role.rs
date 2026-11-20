@@ -529,29 +529,52 @@ fn require_verified_caller(
     }
 }
 
-/// R30 on #2053: EES registration is for EESs. A caller identified by its
-/// certificate alone must present one whose NFTypes name the EES; an AMF's
-/// certificate cannot register as an EES. A token caller was granted the
-/// `eecs-eesregistration` scope for its type by the token issuer.
+/// R30 on #2053, #2210: EES registration is for EESs.
+///
+/// - The consumer's own typed certificate decides, by the shared rule
+///   (`owner_binding::certificate_nf_type_refusal`, the certificate half of
+///   `verified_nf_type`): its NFTypes, relay types set aside (#2113), must be
+///   exactly `[EES]`. An AMF's certificate is refused, and so is a mixed
+///   `[EES, AMF]` one (TS 33.310 §6.1.3c.3: one NF type per instance), even
+///   with a token: the typed certificate is the caller's own word.
+/// - Otherwise (a token alone, or through a relay's certificate) the token's
+///   `eecs-eesregistration` scope, which `require_verified_caller` has already
+///   verified, is the authorization. The shared `verified_nf_type` token half
+///   cannot apply here: it asks the NRF whether the subject is listed as that
+///   NF type, and the EES is not an NRF `NFType` (TS 29.510 `NFType`
+///   enumerates EASDF but no EES), so every token EES would be refused.
+/// - Anything else (no token and no typed certificate) is refused. In practice
+///   `require_verified_caller` has refused it already; this does not rely on that.
 fn require_ees_type(request: &SbiRequest) -> Option<SbiResponse> {
+    let refuse = |why: String| {
+        Some(nextgcore_sbi::server::send_forbidden(
+            &format!("EES registration is for an EES: {why}"),
+            None,
+        ))
+    };
+    let types = &request.peer_cert_nf_types;
+    let own_certificate = request
+        .peer_cert_nf_instance_id
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty())
+        && !types.is_empty()
+        && !nextgcore_sbi::owner_binding::is_relay_certificate(types);
+    if own_certificate {
+        return match nextgcore_sbi::owner_binding::certificate_nf_type_refusal(types, "EES") {
+            Ok(()) => None,
+            Err(why) => refuse(why),
+        };
+    }
     let has_token = request
         .oauth2_subject
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
-    if has_token
-        || request
-            .peer_cert_nf_types
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case("EES"))
-    {
+    if has_token {
         return None;
     }
-    Some(nextgcore_sbi::server::send_forbidden(
-        &format!(
-            "EES registration is for an EES; the requester's certificate names {:?}",
-            request.peer_cert_nf_types
-        ),
-        None,
+    refuse(format!(
+        "the requester presents neither its own typed certificate nor an access token \
+         (certificate NF types {types:?})"
     ))
 }
 
