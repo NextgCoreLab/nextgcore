@@ -3250,6 +3250,49 @@ pub async fn resolve_lmf_endpoint_for(sel: Option<&LmfSelectionInput>) -> Option
     Some((host, port))
 }
 
+/// The `InputData` body of the AMF's DetermineLocation for `ue` (whose SUPI is
+/// `supi`) on the GMLC's `request_pos_info` ([`call_lmf_determine_location`]).
+/// Its own function so the LMF's tests send exactly what the AMF sends (#2237).
+pub fn determine_location_input(
+    ue: &AmfUe,
+    supi: &str,
+    request_pos_info: &serde_json::Value,
+) -> serde_json::Value {
+    let mut input = serde_json::json!({ "supi": supi });
+    // The cell the AMF has the UE in: `InputData.ncgi` (TS 29.572 §6.1.6.2.2). This is
+    // the E-CID starting point for the LMF's solve, and the AMF is the only party
+    // that has it.
+    input["ncgi"] = serde_json::json!({
+        "plmnId": { "mcc": ue.nr_cgi.plmn_id.mcc(), "mnc": ue.nr_cgi.plmn_id.mnc() },
+        "nrCellId": format!("{:09X}", ue.nr_cgi.cell_id & 0xF_FFFF_FFFF),
+    });
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        input["gpsi"] = serde_json::json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        input["pei"] = serde_json::json!(pei);
+    }
+    // Carried through from the GMLC's request: these are the members that change what
+    // the LMF computes, and dropping them would answer a different question than the
+    // one asked.
+    if let Some(qos) = request_pos_info.get("locationQoS") {
+        input["locationQoS"] = qos.clone();
+    }
+    if let Some(shapes) = request_pos_info.get("supportedGADShapes") {
+        input["supportedGADShapes"] = shapes.clone();
+    }
+    if let Some(client_type) = request_pos_info.get("lcsClientType") {
+        input["externalClientType"] = client_type.clone();
+    }
+    if let Some(priority) = request_pos_info.get("priority") {
+        input["priority"] = priority.clone();
+    }
+    if let Some(corr) = request_pos_info.get("lcsCorrelationId") {
+        input["correlationID"] = corr.clone();
+    }
+    input
+}
+
 /// `Nlmf_Location_DetermineLocation`: POST /nlmf-loc/v1/determine-location
 /// (TS 29.572 §6.1.4.2, driven by TS 29.518 §5.5.2.2.1 / TS 23.273 §6.1).
 ///
@@ -3294,38 +3337,7 @@ pub async fn call_lmf_determine_location(
         "no LMF endpoint (NRF discovery found none, LMF_SBI_ADDR unset)".to_string()
     })?;
 
-    let mut input = serde_json::json!({ "supi": supi });
-    // The cell the AMF has the UE in: `InputData.ncgi` (TS 29.572 §6.1.6.2.2). This is
-    // the E-CID starting point for the LMF's solve, and the AMF is the only party
-    // that has it.
-    input["ncgi"] = serde_json::json!({
-        "plmnId": { "mcc": ue.nr_cgi.plmn_id.mcc(), "mnc": ue.nr_cgi.plmn_id.mnc() },
-        "nrCellId": format!("{:09X}", ue.nr_cgi.cell_id & 0xF_FFFF_FFFF),
-    });
-    if let Some(gpsi) = ue.gpsi.as_deref() {
-        input["gpsi"] = serde_json::json!(gpsi);
-    }
-    if let Some(pei) = ue.pei.as_deref() {
-        input["pei"] = serde_json::json!(pei);
-    }
-    // Carried through from the GMLC's request: these are the members that change what
-    // the LMF computes, and dropping them would answer a different question than the
-    // one asked.
-    if let Some(qos) = request_pos_info.get("locationQoS") {
-        input["locationQoS"] = qos.clone();
-    }
-    if let Some(shapes) = request_pos_info.get("supportedGADShapes") {
-        input["supportedGADShapes"] = shapes.clone();
-    }
-    if let Some(client_type) = request_pos_info.get("lcsClientType") {
-        input["externalClientType"] = client_type.clone();
-    }
-    if let Some(priority) = request_pos_info.get("priority") {
-        input["priority"] = priority.clone();
-    }
-    if let Some(corr) = request_pos_info.get("lcsCorrelationId") {
-        input["correlationID"] = corr.clone();
-    }
+    let input = determine_location_input(ue, supi, request_pos_info);
 
     let client = peer_client(nextgcore_sbi::types::NfType::Lmf, &lmf_host, lmf_port);
     let response = client
