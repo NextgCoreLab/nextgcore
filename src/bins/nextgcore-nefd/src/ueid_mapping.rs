@@ -17,9 +17,13 @@
 //!   - PUT updates it (`UeIdMappingInfo`), answered 200;
 //!   - PATCH modifies it (`UeIdMappingInfoPatch`), answered 200;
 //!   - DELETE removes it, answered 204.
-//! - **Ownership:** the caller's identity is the one this process verified
-//!   (issue #110), never the `{afId}` alone. A provisioning is visible and
-//!   changeable only by the AF that made it. Any other caller gets 404.
+//! - **The `{afId}` is the caller's verified identity** (R48 on #2265): the
+//!   identity this process verified (issue #110, mTLS SAN or OAuth2 `sub`). A
+//!   request with no verified identity, or whose `{afId}` names another AF, is
+//!   refused (403) for every verb. The authorisation below and the ownership
+//!   both rest on it, so the path cannot name an AF the caller is not.
+//! - **Ownership:** a provisioning is visible and changeable only by the AF
+//!   that made it. Any other caller gets 404.
 //! - **The AF must be allowed for the GPSI's UE** (§4.4.32.4: "the NEF shall
 //!   then check whether the AF is authorized to perform this operation"). The
 //!   NEF reads the UE's Ranging and Sidelink Positioning privacy profile from
@@ -243,7 +247,24 @@ pub async fn route(
             None,
         );
     };
-    let caller = caller.as_deref();
+    // R48 on #2265: the `{afId}` is the verified caller's, never a path segment
+    // taken on trust. Authorisation (the UE's privacy profile names AFs) and
+    // ownership both rest on it, so a caller that is not verified, or names
+    // another AF, is refused for every verb.
+    let Some(verified) = caller.as_deref() else {
+        return nextgcore_sbi::server::send_forbidden(
+            "UE ID mapping provisioning requires a verified AF identity",
+            None,
+        );
+    };
+    if verified != af_id {
+        log::warn!("UE ID mapping provisioning refused: caller {verified} used afId {af_id}");
+        return nextgcore_sbi::server::send_forbidden(
+            "the afId is not the requesting AF's verified identity",
+            None,
+        );
+    }
+    let caller = Some(verified);
     let not_found = || send_not_found("UE ID Mapping Information Provisioning not found", None);
     let owned = |id: &str| {
         nef_self()
@@ -550,13 +571,13 @@ mod tests {
     async fn an_af_provisions_a_mapping_into_the_udr_2260() {
         let _g = crate::context::lock_nef_context_for_test();
         let (_p, uri, docs) = peers(HashMap::from([
-            ("msisdn-12260".to_string(), allowing(&["af1"])),
-            ("msisdn-22260".to_string(), allowing(&["af1"])),
+            ("msisdn-12260".to_string(), allowing(&[AF1])),
+            ("msisdn-22260".to_string(), allowing(&[AF1])),
         ]))
         .await;
         reset_with(&uri);
         let m = mapping("ue-a-2260", "msisdn-12260");
-        let resp = call(AF1, "af1", "POST", None, Some(m.clone())).await;
+        let resp = call(AF1, AF1, "POST", None, Some(m.clone())).await;
         assert_eq!(resp.status, 201, "{:?}", resp.http.content);
         let loc = resp
             .http
@@ -565,15 +586,15 @@ mod tests {
             .cloned()
             .expect("Location");
         let pp = loc
-            .strip_prefix("/3gpp-ueid/v1/af1/pp/")
+            .strip_prefix(&format!("/3gpp-ueid/v1/{AF1}/pp/"))
             .expect("the spec's URI")
             .to_string();
         assert_eq!(body(&resp), m);
         assert_eq!(docs.lock().unwrap().get(&pp), Some(&m), "stored in the UDR");
-        assert_eq!(body(&call(AF1, "af1", "GET", None, None).await), json!([m]));
+        assert_eq!(body(&call(AF1, AF1, "GET", None, None).await), json!([m]));
 
         let patch = mapping("ue-a-2260", "msisdn-22260");
-        let resp = call(AF1, "af1", "PATCH", Some(&pp), Some(patch.clone())).await;
+        let resp = call(AF1, AF1, "PATCH", Some(&pp), Some(patch.clone())).await;
         assert_eq!(resp.status, 200, "{:?}", resp.http.content);
         assert_eq!(
             docs.lock().unwrap().get(&pp),
@@ -581,12 +602,9 @@ mod tests {
             "the UDR follows"
         );
 
-        assert_eq!(
-            call(AF1, "af1", "DELETE", Some(&pp), None).await.status,
-            204
-        );
+        assert_eq!(call(AF1, AF1, "DELETE", Some(&pp), None).await.status, 204);
         assert!(docs.lock().unwrap().is_empty(), "gone from the UDR");
-        assert_eq!(call(AF1, "af1", "GET", Some(&pp), None).await.status, 404);
+        assert_eq!(call(AF1, AF1, "GET", Some(&pp), None).await.status, 404);
     }
 
     /// **#2260, R48 BLOCKER on #2265: 1:1 for every write path.** AF2 may range
@@ -594,7 +612,8 @@ mod tests {
     /// - POST an exact copy of AF1's mapping, nor the same ID to its own GPSI;
     /// - PUT or PATCH its own mapping onto AF1's ID.
     /// In each case the answer is 403 and the UDR still maps the ID to one GPSI.
-    /// It also cannot read or delete AF1's provisioning (404).
+    /// It also cannot read or delete AF1's provisioning: under AF1's afId it is
+    /// refused (403), and under its own the ppId is not found (404).
     ///
     /// REVERT-VERIFIED: with the UDR's 403 taken as a success in `udr_put`, the
     /// copy is stored (201), and the PUT then moves it (200).
@@ -603,14 +622,14 @@ mod tests {
     async fn an_af_cannot_copy_then_move_another_af_s_mapping_2260() {
         let _g = crate::context::lock_nef_context_for_test();
         let (_p, uri, docs) = peers(HashMap::from([
-            ("msisdn-32260".to_string(), allowing(&["af1", "af2"])),
-            ("msisdn-42260".to_string(), allowing(&["af2"])),
+            ("msisdn-32260".to_string(), allowing(&[AF1, AF2])),
+            ("msisdn-42260".to_string(), allowing(&[AF2])),
         ]))
         .await;
         reset_with(&uri);
         let resp = call(
             AF1,
-            "af1",
+            AF1,
             "POST",
             None,
             Some(mapping("victim-2260", "msisdn-32260")),
@@ -630,13 +649,13 @@ mod tests {
                 mapping("victim-2260", "msisdn-42260"),
             ),
         ] {
-            let resp = call(AF2, "af2", "POST", None, Some(m)).await;
+            let resp = call(AF2, AF2, "POST", None, Some(m)).await;
             assert_eq!(resp.status, 403, "{what}: {:?}", resp.http.content);
         }
         // Its own mapping, then moved onto the victim's ID.
         let resp = call(
             AF2,
-            "af2",
+            AF2,
             "POST",
             None,
             Some(mapping("mine-2260", "msisdn-42260")),
@@ -651,7 +670,7 @@ mod tests {
         for method in ["PUT", "PATCH"] {
             let resp = call(
                 AF2,
-                "af2",
+                AF2,
                 method,
                 Some(&pp2),
                 Some(mapping("victim-2260", "msisdn-42260")),
@@ -673,8 +692,12 @@ mod tests {
         );
 
         for method in ["GET", "DELETE"] {
-            let resp = call(AF2, "af1", method, Some(&pp1), None).await;
-            assert_eq!(resp.status, 404, "{method} by another AF");
+            // Under AF1's afId: not AF2's to use (403). Under its own: no such
+            // provisioning of AF2's (404).
+            let resp = call(AF2, AF1, method, Some(&pp1), None).await;
+            assert_eq!(resp.status, 403, "{method} under AF1's afId");
+            let resp = call(AF2, AF2, method, Some(&pp1), None).await;
+            assert_eq!(resp.status, 404, "{method} of AF1's ppId under its own");
         }
         assert!(docs.lock().unwrap().contains_key(&pp1));
     }
@@ -696,18 +719,21 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // the std guard serialises the NEF context
     async fn an_af_the_ue_s_profile_does_not_name_cannot_map_its_gpsi_2260() {
         let _g = crate::context::lock_nef_context_for_test();
-        let mut disallowed = allowing(&["af2"]);
+        let mut disallowed = allowing(&[AF2]);
         disallowed["rangingSlPrivacyData"]["rslppi"] =
             json!({"rangingSlPrivacyInd": "RANGINGSL_DISALLOWED"});
         let not_allowed = json!({"rangingSlPrivacyData": {"rangingSlUnrelatedClass": {
             "rangingSlDefaultUnrelatedClass": {},
             "rangingSlExternalUnrelatedClass": {"rangingSlAfExternals": [
-                {"afId": "af2", "rangingSlPrivacyCheckRelatedAction": "RANGINGSL_NOT_ALLOWED"}]}}}});
+                {"afId": AF2, "rangingSlPrivacyCheckRelatedAction": "RANGINGSL_NOT_ALLOWED"}]}}}});
         let (_p, uri, docs) = peers(HashMap::from([
-            ("msisdn-52260".to_string(), allowing(&["af-victim"])),
+            (
+                "msisdn-52260".to_string(),
+                allowing(&["aaaaaaaa-2260-4000-8000-0000000000fb"]),
+            ),
             ("msisdn-62260".to_string(), disallowed),
             ("msisdn-72260".to_string(), not_allowed),
-            ("msisdn-82260".to_string(), allowing(&["af2"])),
+            ("msisdn-82260".to_string(), allowing(&[AF2])),
         ]))
         .await;
         reset_with(&uri);
@@ -719,7 +745,7 @@ mod tests {
         ] {
             let resp = call(
                 AF2,
-                "af2",
+                AF2,
                 "POST",
                 None,
                 Some(mapping("victim-id-2260", gpsi)),
@@ -732,7 +758,7 @@ mod tests {
         // the victim's.
         let resp = call(
             AF2,
-            "af2",
+            AF2,
             "POST",
             None,
             Some(mapping("own-2260", "msisdn-82260")),
@@ -746,7 +772,7 @@ mod tests {
             .to_string();
         let resp = call(
             AF2,
-            "af2",
+            AF2,
             "PATCH",
             Some(&pp),
             Some(mapping("own-2260", "msisdn-52260")),
@@ -759,13 +785,79 @@ mod tests {
         );
     }
 
+    /// **#2260, R48 BLOCKER on #2265 at 563aaea7.** The `{afId}` is bound to the
+    /// verified caller. AF2 cannot POST under the victim AF's afId a mapping for
+    /// a GPSI whose profile names only that AF. It is refused with 403 and
+    /// nothing is written. Every other verb under a foreign afId is refused too,
+    /// and so is a request with no verified identity.
+    ///
+    /// REVERT-VERIFIED: with the caller-is-afId check removed, the probe's POST
+    /// is answered 201 and the UDR stores the squat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the std guard serialises the NEF context
+    async fn an_af_cannot_act_under_another_af_s_id_2260() {
+        let _g = crate::context::lock_nef_context_for_test();
+        let victim_af = "aaaaaaaa-2260-4000-8000-0000000000fa";
+        let (_p, uri, docs) = peers(HashMap::from([(
+            "msisdn-52260".to_string(),
+            allowing(&[victim_af]),
+        )]))
+        .await;
+        reset_with(&uri);
+        let resp = call(
+            AF2,
+            victim_af,
+            "POST",
+            None,
+            Some(mapping("squat-r48", "msisdn-52260")),
+        )
+        .await;
+        assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+        assert!(docs.lock().unwrap().is_empty(), "nothing written");
+        for (method, pp) in [
+            ("GET", None),
+            ("GET", Some("x")),
+            ("PUT", Some("x")),
+            ("PATCH", Some("x")),
+            ("DELETE", Some("x")),
+        ] {
+            let resp = call(
+                AF2,
+                victim_af,
+                method,
+                pp,
+                Some(mapping("squat-r48", "msisdn-52260")),
+            )
+            .await;
+            assert_eq!(resp.status, 403, "{method} {pp:?} under another AF's afId");
+        }
+        // No verified identity: refused.
+        let mut anon = from(AF2, "POST", Some(mapping("squat-r48", "msisdn-52260")));
+        anon.oauth2_subject = None;
+        let resp = TEST_NORTHBOUND_AUTH
+            .scope(ENFORCED, route("POST", victim_af, None, &anon))
+            .await;
+        assert_eq!(resp.status, 403);
+        assert!(docs.lock().unwrap().is_empty());
+        // The victim AF itself, verified, is allowed.
+        let resp = call(
+            victim_af,
+            victim_af,
+            "POST",
+            None,
+            Some(mapping("real-r48", "msisdn-52260")),
+        )
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+    }
+
     #[test]
     fn the_profile_names_the_af_2260() {
-        assert!(profile_allows(&allowing(&["af1"]), "af1"));
-        assert!(!profile_allows(&allowing(&["af1"]), "af2"));
-        assert!(!profile_allows(&json!({}), "af1"));
-        let mut p = allowing(&["af1"]);
+        assert!(profile_allows(&allowing(&[AF1]), AF1));
+        assert!(!profile_allows(&allowing(&[AF1]), AF2));
+        assert!(!profile_allows(&json!({}), AF1));
+        let mut p = allowing(&[AF1]);
         p["rangingSlPrivacyData"]["rslpi"] = json!({"rangingSlPrivacyInd": "RANGINGSL_ALLOWED"});
-        assert!(profile_allows(&p, "af1"), "the table's spelling");
+        assert!(profile_allows(&p, AF1), "the table's spelling");
     }
 }

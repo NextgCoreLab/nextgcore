@@ -79,5 +79,5 @@ An AF provisions the mapping between a Ranging/Sidelink Positioning Application 
 - **Only 1:1 mappings are accepted** (TS 29.522 §4.4.32.1 NOTE). The UDR enforces this for every writer.
   - Its check and its write are one step.
   - An ID or GPSI that another mapping already has, even as an exact copy, is refused with 403, and so is the NEF's request.
-- Only the AF that made a provisioning can see or change it, judged by its verified identity. Any other caller gets 404.
+- The `{afId}` must be the caller's verified identity (mTLS certificate SAN or OAuth2 `sub`). A request without a verified identity, or naming another AF, is refused with 403 on every verb. Only the AF that made a provisioning can see or change it; under its own afId, another AF gets 404.
 - Provisionings persist in the NEF state file.
