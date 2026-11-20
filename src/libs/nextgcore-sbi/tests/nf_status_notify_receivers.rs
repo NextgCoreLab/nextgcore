@@ -47,6 +47,65 @@ const ROUTES: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// Lines that name an NFStatusNotify path and are NOT a route, with why:
+/// (crate, file, a substring of the line).
+const NOT_ROUTES: &[(&str, &str, &str)] = &[
+    // The constants that hold the paths.
+    (
+        "nextgcore-amfd",
+        "nrf_subscription.rs",
+        "pub const NOTIFY_PATH",
+    ),
+    (
+        "nextgcore-nwdafd",
+        "nrf_collector.rs",
+        "pub const CALLBACK_SEGMENT",
+    ),
+    // The nfStatusNotificationUri the NF subscribes with (built, not routed).
+    ("nextgcore-amfd", "nrf_subscription.rs", "{NOTIFY_PATH}"),
+    ("nextgcore-nwdafd", "nrf_collector.rs", "{CALLBACK_SEGMENT}"),
+    // The OAuth2 callback exemptions, which let the route's token through the
+    // bearer check and do not themselves serve anything.
+    (
+        "nextgcore-amfd",
+        "namf_server.rs",
+        "crate::nrf_subscription::NOTIFY_PATH)",
+    ),
+    (
+        "nextgcore-nwdafd",
+        "main.rs",
+        "route(nrf_collector::CALLBACK_SEGMENT)",
+    ),
+    // The 405 text inside the guarded nwdafd arm.
+    (
+        "nextgcore-nwdafd",
+        "main.rs",
+        r#"send_method_not_allowed(method, "nf-status-notify/{token}")"#,
+    ),
+    // Log-only arms of the ported state machines: no HTTP route dispatches an
+    // SBI request to them (they are fed timer events only), and they act on nothing.
+    (
+        "nextgcore-bsfd",
+        "bsf_sm.rs",
+        r#"Some("nf-status-notify") =>"#,
+    ),
+    (
+        "nextgcore-nssfd",
+        "nssf_sm.rs",
+        r#"Some("nf-status-notify") =>"#,
+    ),
+    (
+        "nextgcore-seppd",
+        "sepp_sm.rs",
+        r#"Some("nf-status-notify") =>"#,
+    ),
+    (
+        "nextgcore-udrd",
+        "udr_sm.rs",
+        r#"Some("nf-status-notify") =>"#,
+    ),
+];
+
 /// The sender of NFStatusNotify, which builds the route rather than serving it.
 const SENDERS: &[&str] = &["nextgcore-nrfd"];
 
@@ -90,12 +149,14 @@ fn names_notify_path(s: &str) -> bool {
     s.contains("nf-status-notify") || s.contains("nfstatus-notify")
 }
 
-/// The router arms of `sources` that match an NFStatusNotify path, as
-/// (file, trimmed line).
-fn route_arms(sources: &Sources) -> Vec<(String, String)> {
-    // `const NAME: &str = "...nf-status-notify..."` in file `m.rs`: a comparison
-    // to `NAME` in that file, or to `m::NAME` anywhere, is a route. (Another
-    // module's const of the same name is not.)
+/// Every non-comment line of `sources` that names an NFStatusNotify path, as
+/// (file, trimmed line), whatever its syntax: a string literal containing
+/// `nf-status-notify` or `nfstatus-notify` (a match arm, a slice pattern, an
+/// `==`, a `format!`), or a use of a `const` holding such a path (`NAME` in the
+/// file that defines it, `module::NAME` anywhere; another module's const of the
+/// same name is not). #2187 (R41): a nested `"nf-status-notify" => ...` arm is
+/// such a line, so it is found without recognising match shapes.
+fn path_mentions(sources: &Sources) -> Vec<(String, String)> {
     let consts: Vec<(String, String, String)> = sources
         .iter()
         .flat_map(|(file, t)| {
@@ -104,6 +165,7 @@ fn route_arms(sources: &Sources) -> Vec<(String, String)> {
                     let l = l.trim();
                     let rest = l
                         .strip_prefix("pub const ")
+                        .or_else(|| l.strip_prefix("pub(crate) const "))
                         .or_else(|| l.strip_prefix("const "))?;
                     let (name, value) = rest.split_once(':')?;
                     let module = file.trim_end_matches(".rs").to_string();
@@ -113,27 +175,45 @@ fn route_arms(sources: &Sources) -> Vec<(String, String)> {
                 .collect::<Vec<_>>()
         })
         .collect();
-    let mut arms = Vec::new();
+    let mut out = Vec::new();
     for (file, text) in sources {
         for line in code_lines(text) {
             let l = line.trim();
-            let compares = l.contains("==")
-                && (names_notify_path(l)
-                    || consts.iter().any(|(def_file, module, name)| {
-                        l.contains(&format!("== {module}::{name}"))
-                            || l.contains(&format!("== crate::{module}::{name}"))
-                            || (def_file == file && l.contains(&format!("== {name}")))
-                    }));
-
-            let slice_arm = l.starts_with('[')
-                && (l.contains("=>") || l.contains(" if "))
-                && names_notify_path(l);
-            if compares || slice_arm {
-                arms.push((file.clone(), l.to_string()));
+            let uses_const = consts.iter().any(|(def_file, module, name)| {
+                l.contains(&format!("{module}::{name}"))
+                    || (def_file == file && contains_word(l, name))
+            });
+            if names_notify_path(l) || uses_const {
+                out.push((file.clone(), l.to_string()));
             }
         }
     }
-    arms
+    out
+}
+
+fn contains_word(line: &str, word: &str) -> bool {
+    line.match_indices(word).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + word.len()..].chars().next();
+        let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        !ident(before) && !ident(after)
+    })
+}
+
+/// #2187: whether `line` names the NFStatusNotify subscription or its callback
+/// in any spelling: `nfStatusNotificationUri`, `nf_status_notification_uri`
+/// (a serde field renamed to camelCase), or an `NfStatusNotify` type.
+fn names_status_subscription(line: &str) -> bool {
+    let folded: String = line
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect();
+    // The URI in any spelling; the type by its CamelCase name (a snake_case
+    // `handle_nf_status_notify` helper with no route, as bsfd has, is not one).
+    folded.contains("nfstatusnotificationuri")
+        || line.contains("NfStatusNotify")
+        || line.contains("nnrf-nfm/v1/subscriptions")
 }
 
 /// The functions defined in `sources`, name -> body text (to the closing
@@ -202,14 +282,25 @@ fn reaches_check(fns: &HashMap<String, String>, name: &str) -> bool {
 }
 
 /// Every problem the guard finds in `crates` (name -> sources), for `routes`.
-fn problems(crates: &[(String, Sources)], routes: &[(&str, &str, &str, &str)]) -> Vec<String> {
+fn problems(
+    crates: &[(String, Sources)],
+    routes: &[(&str, &str, &str, &str)],
+    not_routes: &[(&str, &str, &str)],
+) -> Vec<String> {
     let mut out = Vec::new();
     for (name, sources) in crates {
+        if SENDERS.contains(&name.as_str()) {
+            continue;
+        }
         let listed: Vec<_> = routes.iter().filter(|r| r.0 == name).collect();
-        for (file, arm) in route_arms(sources) {
-            if !listed.iter().any(|r| r.1 == file && arm.contains(r.2)) {
+        for (file, line) in path_mentions(sources) {
+            let route = listed.iter().any(|r| r.1 == file && line.contains(r.2));
+            let explained = not_routes
+                .iter()
+                .any(|(c, f, m)| c == name && *f == file && line.contains(m));
+            if !route && !explained {
                 out.push(format!(
-                    "{name}/{file}: unlisted NFStatusNotify route arm `{arm}`"
+                    "{name}/{file}: unlisted NFStatusNotify route arm `{line}`"
                 ));
             }
         }
@@ -233,12 +324,10 @@ fn problems(crates: &[(String, Sources)], routes: &[(&str, &str, &str, &str)]) -
                 out.push(format!("{name}: {handler} never reaches {CHECK}"));
             }
         }
-        let subscribes = sources.iter().any(|(_, t)| {
-            code_lines(t).any(|l| {
-                l.contains("nfStatusNotificationUri") || l.contains("nnrf-nfm/v1/subscriptions")
-            })
-        });
-        if subscribes && listed.is_empty() && !SENDERS.contains(&name.as_str()) {
+        let subscribes = sources
+            .iter()
+            .any(|(_, t)| code_lines(t).any(names_status_subscription));
+        if subscribes && listed.is_empty() {
             out.push(format!(
                 "{name}: subscribes to NF status at the NRF but has no listed, checked \
                  NFStatusNotify route"
@@ -246,6 +335,10 @@ fn problems(crates: &[(String, Sources)], routes: &[(&str, &str, &str, &str)]) -
         }
     }
     out
+}
+
+fn problems3(crates: &[(String, Sources)], routes: &[(&str, &str, &str, &str)]) -> Vec<String> {
+    problems(crates, routes, &[])
 }
 
 fn tree() -> Vec<(String, Sources)> {
@@ -272,7 +365,7 @@ fn tree() -> Vec<(String, Sources)> {
 
 #[test]
 fn every_nf_status_notify_route_checks_the_sender_2172() {
-    assert_eq!(problems(&tree(), ROUTES), Vec::<String>::new());
+    assert_eq!(problems(&tree(), ROUTES, NOT_ROUTES), Vec::<String>::new());
 }
 
 /// #2179: the guard fails on each blind spot of the per-crate check: a second,
@@ -303,7 +396,7 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
     )];
     let one = |name: &str, file: &str, text: &str| vec![(name.to_string(), src(&[(file, text)]))];
     assert_eq!(
-        problems(&one("x-amfd", "server.rs", guarded), &routes),
+        problems3(&one("x-amfd", "server.rs", guarded), &routes),
         Vec::<String>::new(),
         "the guarded shape passes"
     );
@@ -313,7 +406,7 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
         "    }\n}\nfn on_notify",
         "        \"cb2\" if parts[2] == \"nf-status-notify-v2\" => { act(parts[3]) }\n    }\n}\nfn on_notify",
     );
-    let found = problems(&one("x-amfd", "server.rs", &second), &routes);
+    let found = problems3(&one("x-amfd", "server.rs", &second), &routes);
     assert!(
         found
             .iter()
@@ -326,10 +419,46 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
         "nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p);",
         "act();",
     );
-    let found = problems(&one("x-amfd", "server.rs", &unchecked), &routes);
+    let found = problems3(&one("x-amfd", "server.rs", &unchecked), &routes);
     assert!(
         found.iter().any(|p| p.contains("never reaches")),
         "{found:?}"
+    );
+
+    // #2187 (R41): a nested match arm, the commonest router shape.
+    let nested = guarded.replace(
+        "    }\n}\nfn on_notify",
+        "        \"cb3\" => match parts[2] { \"nf-status-notify\" => act(parts[3]), _ => {} },\n    }\n}\nfn on_notify",
+    );
+    let found = problems3(&one("x-amfd", "server.rs", &nested), &routes);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("unlisted NFStatusNotify route arm")),
+        "a nested match arm fails: {found:?}"
+    );
+
+    // #2187 (R41): a renamed receiver built from a serde field and a split path.
+    let serde = r#"
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Sub { nf_status_notification_uri: String }
+fn uri(base: &str) -> String { format!("{base}/nrf-{}", "notify") }
+"#;
+    let found = problems3(&one("x-serdefd", "main.rs", serde), &routes);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("subscribes to NF status at the NRF")),
+        "a camelCase serde field fails: {found:?}"
+    );
+    let typed = "fn on(n: NfStatusNotify) { act(n) }\n";
+    let found = problems3(&one("x-typedfd", "main.rs", typed), &routes);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("subscribes to NF status at the NRF")),
+        "an NfStatusNotify type fails: {found:?}"
     );
 
     // A receiver under a renamed path, in a crate that subscribes.
@@ -337,7 +466,7 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
 fn subscribe() { let body = json!({ "nfStatusNotificationUri": format!("{base}/nrf-notify") }); }
 fn route(p: &str) { if p == "/nrf-notify" { act() } }
 "#;
-    let found = problems(&one("x-newfd", "main.rs", renamed), &routes);
+    let found = problems3(&one("x-newfd", "main.rs", renamed), &routes);
     assert!(
         found
             .iter()
