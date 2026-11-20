@@ -1424,3 +1424,106 @@ async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
     iupf::clear_pending_deletions();
     iupf::set(None);
 }
+
+/// A silent I-UPF counting what it hears, and a client toward it with deletion
+/// T1 `t1` and N1 `n1`, installed as the I-UPF, with deletions 1..=3 queued.
+async fn silent_iupf_with_queue(
+    t1: std::time::Duration,
+    n1: u32,
+) -> (
+    Arc<pfcp_path::PfcpClient>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+    let heard = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = heard.clone();
+    let ear = tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        while silent.recv(&mut buf).await.is_ok() {
+            h.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let client = Arc::new(
+        pfcp_path::PfcpClient::new(sock, silent_addr, [127, 0, 0, 1])
+            .with_deletion_timer_for_test(t1, n1),
+    );
+    client.set_assoc_state_for_test(true, None, None).await;
+    iupf::set(Some((client.clone(), Vec::new())));
+    for i in 1..=3u64 {
+        iupf::queue_deletion(iupf::leg_seid(i << 4), i);
+    }
+    (client, heard, ear)
+}
+
+fn queued_1_to_3() -> Vec<(u64, u64)> {
+    (1..=3u64).map(|i| (iupf::leg_seid(i << 4), i)).collect()
+}
+
+/// #2277: a resend pass belongs to the association it started under. When the
+/// I-UPF re-associates before the pass sends its first deletion, it sends none
+/// and keeps all three queued.
+///
+/// REVERT-VERIFIED: without the pass's generation check, this fails.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resend_pass_sends_nothing_once_the_i_upf_re_associates_2277() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    iupf::clear_pending_deletions();
+    let (client, heard, ear) =
+        silent_iupf_with_queue(std::time::Duration::from_millis(50), 0).await;
+    let hold = iupf::BeforeRetry::arm();
+    iupf::retry_pending_deletions();
+    hold.reached.notified().await;
+    client.bump_association_generation_for_test().await;
+    drop(hold);
+    wait_until(|| !iupf::retry_running()).await;
+    assert_eq!(
+        heard.load(Ordering::SeqCst),
+        0,
+        "no deletion under the new association"
+    );
+    assert_eq!(
+        iupf::pending_deletion_list(),
+        queued_1_to_3(),
+        "all kept, in order"
+    );
+    ear.abort();
+    iupf::clear_pending_deletions();
+    iupf::set(None);
+}
+
+/// #2277: a deletion being retransmitted when the I-UPF re-associates is not
+/// retransmitted under the new association (the window of the issue: a restart,
+/// a re-association and a new leg on a reused SEID inside one T1 x N1). The pass
+/// stops there with all three kept.
+///
+/// REVERT-VERIFIED: without `session_request_within`'s generation check, this
+/// fails (the retransmissions are heard).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_is_not_retransmitted_under_a_new_association_2277() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    iupf::clear_pending_deletions();
+    let (client, heard, ear) =
+        silent_iupf_with_queue(std::time::Duration::from_millis(200), 3).await;
+    iupf::retry_pending_deletions();
+    wait_until(|| heard.load(Ordering::SeqCst) >= 1).await;
+    client.bump_association_generation_for_test().await;
+    wait_until(|| !iupf::retry_running()).await;
+    assert_eq!(
+        heard.load(Ordering::SeqCst),
+        1,
+        "the first transmission only"
+    );
+    assert_eq!(
+        iupf::pending_deletion_list(),
+        queued_1_to_3(),
+        "all kept, in order"
+    );
+    ear.abort();
+    iupf::clear_pending_deletions();
+    iupf::set(None);
+}

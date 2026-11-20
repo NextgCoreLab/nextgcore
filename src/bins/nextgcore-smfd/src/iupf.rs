@@ -323,16 +323,32 @@ pub fn drop_pending_deletions(why: &str) {
 /// Delete the I-UPF session `(smf_seid, upf_seid)`. True when the I-UPF answered,
 /// whatever the cause: it then holds no such session.
 async fn delete_on_iupf(client: &PfcpClient, smf_seid: u64, upf_seid: u64) -> bool {
+    delete_on_iupf_within(client, None, smf_seid, upf_seid).await
+}
+
+/// [`delete_on_iupf`], sent only while the association is `generation` when one
+/// is given (#2277, [`PfcpClient::session_request_within`]).
+async fn delete_on_iupf_within(
+    client: &PfcpClient,
+    generation: Option<u64>,
+    smf_seid: u64,
+    upf_seid: u64,
+) -> bool {
     let body = n4_build::build_session_deletion_request();
-    match client
-        .session_request(
-            pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
-            smf_seid,
-            Some(upf_seid),
-            &body,
-        )
-        .await
-    {
+    let kind = pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST;
+    let sent = match generation {
+        Some(g) => {
+            client
+                .session_request_within(g, kind, smf_seid, Some(upf_seid), &body)
+                .await
+        }
+        None => {
+            client
+                .session_request(kind, smf_seid, Some(upf_seid), &body)
+                .await
+        }
+    };
+    match sent {
         Ok(_) => true,
         Err(e) => {
             log::warn!(
@@ -398,6 +414,14 @@ impl Drop for BeforeRetry {
 /// setup in which the I-UPF confirmed it retained its sessions (R45 M1 on
 /// #2268). One pass at a time. A pass stops at the first deletion the I-UPF does
 /// not answer, and that one and the rest stay queued (R45 m1).
+///
+/// #2277: a pass belongs to the association it started under. It records that
+/// association's generation, and each deletion (its first transmission and every
+/// retransmission) is sent only under it; once another association replaces it,
+/// the deletion is not sent and the pass stops, keeping it and the rest queued. A queued I-UPF SEID
+/// names its session only within the association it was queued under; across an
+/// I-UPF restart and re-association it may name a new leg the restarted I-UPF
+/// gave the same SEID, and that leg would be deleted.
 pub fn retry_pending_deletions() {
     if pending_deletions() == 0 {
         return;
@@ -414,6 +438,7 @@ pub fn retry_pending_deletions() {
     RETRY_PASSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     rt.spawn(async move {
         let _guard = guard;
+        let generation = client.association_generation().await;
         #[cfg(test)]
         {
             let hold = BEFORE_RETRY.lock().unwrap().take();
@@ -427,7 +452,10 @@ pub fn retry_pending_deletions() {
             pending_deletions()
         );
         while let Some((smf_seid, upf_seid)) = with_pending(|p| p.queue.front().copied()) {
-            if !delete_on_iupf(&client, smf_seid, upf_seid).await {
+            // #2277: under the association the pass started under, or not at all:
+            // a deletion refused as the association changed fails, and the pass
+            // stops with it and the rest queued.
+            if !delete_on_iupf_within(&client, Some(generation), smf_seid, upf_seid).await {
                 break;
             }
             with_pending(|p| {
