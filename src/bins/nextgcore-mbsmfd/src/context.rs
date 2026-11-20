@@ -1103,35 +1103,40 @@ impl MbSmfContext {
     /// drop its record, so the session's release does not delete it again, and
     /// the token. Returns whether a record was dropped.
     pub fn drop_amf_context_by_token(&self, token: &str) -> bool {
+        // #2274: one critical section, `amf_contexts` then `amf_notify_tokens`
+        // (the order of [`Self::record_amf_context`]), so no one sees the record
+        // gone while its tokens are still admitted. Before, the records went
+        // under `amf_contexts` and the tokens after it was released.
+        let Ok(mut map) = self.amf_contexts.lock() else {
+            return false;
+        };
+        let Ok(mut tokens) = self.amf_notify_tokens.lock() else {
+            return false;
+        };
         // #1930: the token names an AMF context; the record of it may carry
         // another token of the same context (a session that took it over).
-        let key = self
-            .amf_notify_tokens
-            .lock()
-            .ok()
-            .and_then(|t| t.get(token).and_then(|v| v.context.clone()));
+        let key = tokens.get(token).and_then(|v| v.context.clone());
         let names =
             |c: &AmfMbsContext| c.notify_token == token || key.as_ref() == Some(&context_key(c));
         let mut dropped_records = Vec::new();
-        if let Ok(mut map) = self.amf_contexts.lock() {
-            for list in map.values_mut() {
-                list.retain(|c| {
-                    let gone = names(c);
-                    if gone {
-                        dropped_records.push(c.clone());
-                    }
-                    !gone
-                });
-            }
-            map.retain(|_, list| !list.is_empty());
+        for list in map.values_mut() {
+            list.retain(|c| {
+                let gone = names(c);
+                if gone {
+                    dropped_records.push(c.clone());
+                }
+                !gone
+            });
         }
-        self.forget_amf_notify_token(token);
+        map.retain(|_, list| !list.is_empty());
+        tokens.remove(token);
         for c in &dropped_records {
-            self.forget_amf_context_tokens(c);
+            let k = context_key(c);
+            tokens.retain(|t, v| *t != c.notify_token && v.context.as_ref() != Some(&k));
         }
         // #1985: a context no session records (its delete is parked) has tokens
         // too: the AMF released it, so they all go.
-        if let (Some(key), Ok(mut tokens)) = (key, self.amf_notify_tokens.lock()) {
+        if let Some(key) = key {
             tokens.retain(|_, t| t.context.as_ref() != Some(&key));
         }
         !dropped_records.is_empty()
