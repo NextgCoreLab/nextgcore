@@ -165,6 +165,10 @@ fn request_capabilities_encodes_to_the_hand_derived_octets() {
 #[test]
 fn request_capabilities_decodes_field_by_field() {
     let msg = decode(&REQUEST_CAPABILITIES).expect("decodes");
+    // Canonical: the decoded value re-encodes to the same octets, pad bits
+    // included, which a field-by-field compare cannot see (X.691 §10.1.3
+    // pads with zeros).
+    assert_eq!(encode(&msg).expect("re-encodes"), REQUEST_CAPABILITIES);
     assert_eq!(msg.application_layer_id, None);
     assert_eq!(msg.transaction_id, Some(SLPP_MessageTransactionID(1)));
     assert!(!msg.end_transaction.0);
@@ -271,6 +275,10 @@ fn provide_capabilities_encodes_to_the_hand_derived_octets() {
 #[test]
 fn provide_capabilities_decodes_field_by_field() {
     let msg = decode(&PROVIDE_CAPABILITIES).expect("decodes");
+    // Canonical: the decoded value re-encodes to the same octets, pad bits
+    // included, which a field-by-field compare cannot see (X.691 §10.1.3
+    // pads with zeros).
+    assert_eq!(encode(&msg).expect("re-encodes"), PROVIDE_CAPABILITIES);
     assert_eq!(
         msg.application_layer_id,
         Some(SLPP_MessageApplicationLayerID(UE_APP_ID.to_vec()))
@@ -372,6 +380,13 @@ fn request_location_information_encodes_to_the_hand_derived_octets() {
 #[test]
 fn request_location_information_decodes_field_by_field() {
     let msg = decode(&REQUEST_LOCATION_INFORMATION).expect("decodes");
+    // Canonical: the decoded value re-encodes to the same octets, pad bits
+    // included, which a field-by-field compare cannot see (X.691 §10.1.3
+    // pads with zeros).
+    assert_eq!(
+        encode(&msg).expect("re-encodes"),
+        REQUEST_LOCATION_INFORMATION
+    );
     assert_eq!(msg.transaction_id, Some(SLPP_MessageTransactionID(2)));
     assert!(!msg.end_transaction.0);
     let SLPP_MessageBody_c1::RequestLocationInformation(r) = body_of(&msg) else {
@@ -382,6 +397,23 @@ fn request_location_information_decodes_field_by_field() {
     else {
         panic!("criticalExtensionsFuture");
     };
+    // The containers are compared whole as well: decoding a container reads
+    // its value bits and ignores its pad bits, so a corrupted pad octet would
+    // otherwise decode to the same fields.
+    assert_eq!(
+        ies.common_i_es_request_location_information
+            .as_ref()
+            .expect("common")
+            .0,
+        COMMON_REQUEST_LOCATION_INFORMATION
+    );
+    assert_eq!(
+        ies.sl_rtt_request_location_information
+            .as_ref()
+            .expect("sl-RTT")
+            .0,
+        SL_RTT_REQUEST_LOCATION_INFORMATION
+    );
     let common: CommonIEsRequestLocationInformation = decode_ie(
         &ies.common_i_es_request_location_information
             .as_ref()
@@ -524,6 +556,13 @@ fn provide_location_information_encodes_to_the_hand_derived_octets() {
 #[test]
 fn provide_location_information_decodes_field_by_field() {
     let msg = decode(&PROVIDE_LOCATION_INFORMATION).expect("decodes");
+    // Canonical: the decoded value re-encodes to the same octets, pad bits
+    // included, which a field-by-field compare cannot see (X.691 §10.1.3
+    // pads with zeros).
+    assert_eq!(
+        encode(&msg).expect("re-encodes"),
+        PROVIDE_LOCATION_INFORMATION
+    );
     assert_eq!(
         msg.application_layer_id,
         Some(SLPP_MessageApplicationLayerID(UE_APP_ID.to_vec()))
