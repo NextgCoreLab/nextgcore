@@ -1338,7 +1338,14 @@ pub(crate) async fn delete_in_lane(c: &AmfMbsContext) -> Option<namf_client::Con
 /// for the whole task, the one in flight included, so an abort (between retries
 /// or mid-delete) parks them with the reconciler instead of losing them.
 pub(crate) fn release_retries(failed: Vec<AmfMbsContext>) -> tokio::task::JoinHandle<()> {
+    // #2236: counted from here, so a test sees it before the task first runs.
+    #[cfg(test)]
+    let running = reconcile::RetryRunning::start();
     spawn_detached(async move {
+        // Declared before the deletes, so dropped after them: their park on a
+        // drop (#2075) is counted as running.
+        #[cfg(test)]
+        let _running = running;
         let mut undelivered = UndeliveredDeletes(failed);
         for delay in AMF_RELEASE_RETRY_DELAYS {
             tokio::time::sleep(delay).await;
