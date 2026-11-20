@@ -289,12 +289,59 @@ pub(crate) fn subscribe_body(
         "nfId": nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Udm).to_string(),
         "supi": sub.ue_identity,
     });
+    // #2149 (R42 on #2144): the AMF leg lapses with the Nudm_EE subscription it
+    // serves, so a UDM restart between the two cannot orphan it at the AMF
+    // (TS 29.518 §6.2.6.2.4 AmfEventMode: `trigger` is mandatory there).
+    if let Some(expiry) = sub.expiry {
+        subscription["options"] = json!({
+            "trigger": "CONTINUOUS",
+            "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(expiry),
+        });
+    }
     if let Some(base) = notify_base() {
         subscription["subsChangeNotifyUri"] =
             json!(format!("{base}{}", subs_change_path(&sub.id, change_token)));
         subscription["subsChangeNotifyCorrelationId"] = json!(sub.id);
     }
     json!({ "subscription": subscription })
+}
+
+/// #2149: move an AMF leg's expiry to `expiry` (TS 29.518 §6.2.6.2.7
+/// AmfUpdateEventOptionItem, `replace /options/expiry`). `false` when the AMF
+/// did not take it (no answer, a non-2xx), or when there is no expiry to set:
+/// an AmfUpdateEventOptionItem cannot remove one, so the caller subscribes
+/// afresh.
+async fn amf_refresh_expiry(subscription_uri: &str, expiry: Option<u64>) -> bool {
+    let Some(expiry) = expiry else {
+        return false;
+    };
+    let Some((host, port, path)) = split_uri(subscription_uri) else {
+        return false;
+    };
+    let client = crate::app::uncached_peer_client(&host, port, NfType::Amf).await;
+    let patch = json!([{
+        "op": "replace",
+        "path": "/options/expiry",
+        "value": nextgcore_sbi::datetime::epoch_to_rfc3339(expiry),
+    }]);
+    match tokio::time::timeout(amf_call_timeout(), client.patch_json(&path, &patch)).await {
+        Ok(Ok(resp)) if resp.is_success() => true,
+        Ok(Ok(resp)) => {
+            log::warn!(
+                "Namf_EventExposure modify of {subscription_uri}'s expiry returned {}",
+                resp.status
+            );
+            false
+        }
+        Ok(Err(e)) => {
+            log::warn!("Namf_EventExposure modify of {subscription_uri} failed: {e}");
+            false
+        }
+        Err(_) => {
+            log::warn!("Namf_EventExposure modify of {subscription_uri} timed out");
+            false
+        }
+    }
 }
 
 /// POST the subscription to the AMF at `amf_base`; the created resource's
@@ -770,7 +817,23 @@ pub async fn reconcile(id: &str) {
     let fits = |leg: &AmfEeLeg| leg.notify_uri == sub.callback_reference && leg.events == events;
     if let Some(leg) = &sub.amf_leg {
         if fits(leg) && leg.amf_instance_id.as_deref() == Some(serving_amf.as_str()) {
-            return;
+            if leg.expiry == sub.expiry {
+                return;
+            }
+            // #2149: the subscription was refreshed (or its expiry dropped):
+            // move the leg's expiry by Namf_EventExposure modify rather than
+            // subscribing again. A leg the AMF no longer takes this for is
+            // replaced below.
+            if amf_refresh_expiry(&leg.subscription_uri, sub.expiry).await {
+                store_leg(
+                    id,
+                    Some(AmfEeLeg {
+                        expiry: sub.expiry,
+                        ..leg.clone()
+                    }),
+                );
+                return;
+            }
         }
     }
     let Some(amf_base) = resolve_amf(&serving_amf).await else {
@@ -803,6 +866,7 @@ pub async fn reconcile(id: &str) {
                 amf_instance_id: Some(serving_amf),
                 notify_uri: sub.callback_reference.clone(),
                 events,
+                expiry: sub.expiry,
             };
             if !store_leg(id, Some(leg)) {
                 // Unsubscribed while the AMF answered: do not leave it behind.
@@ -845,16 +909,40 @@ pub fn on_amf_registered(supi: &str) {
 /// a reconcile in flight; one that finishes later finds the subscription gone and
 /// deletes what it made.
 pub async fn release(sub: &UdmEeSubscription) {
+    release_with(sub, true).await;
+}
+
+/// [`release`], trying the DELETE now only when `attempt` (else it is parked
+/// for the unsubscribe reconciler straight away). Whether the AMF took it now:
+/// `true` too for a subscription with no leg.
+pub(crate) async fn release_with(sub: &UdmEeSubscription, attempt: bool) -> bool {
     let lock = leg_lock(&sub.id);
-    {
+    let delivered = {
         let _held = lock.lock().await;
         // `sub` is the copy removed from the store, so it carries any leg a
         // reconcile stored before the removal.
-        if let Some(leg) = &sub.amf_leg {
-            amf_unsubscribe(&leg.subscription_uri).await;
+        match &sub.amf_leg {
+            None => true,
+            Some(leg) => {
+                let delivered = attempt && try_amf_unsubscribe(&leg.subscription_uri).await;
+                if !delivered {
+                    park_unsubscribe(&leg.subscription_uri);
+                }
+                delivered
+            }
         }
-    }
+    };
     drop_leg_lock(&sub.id);
+    delivered
+}
+
+/// #2149: the `scheme://host:port` of the AMF holding `sub`'s leg, for grouping
+/// releases by producer. `None` without a leg.
+pub(crate) fn leg_authority(sub: &UdmEeSubscription) -> Option<String> {
+    sub.amf_leg
+        .as_ref()
+        .and_then(|leg| authority(&leg.subscription_uri))
+        .map(str::to_string)
 }
 
 /// Compare two tokens without an early exit on the first differing byte.
@@ -1524,6 +1612,95 @@ mod tests {
         assert_eq!(still.len(), 3, "the blackholed ones stay parked: {still:?}");
     }
 
+    /// **#2149** (R42 on #2144): the expiry sweep releases AMF legs per AMF, up to
+    /// eight AMFs at once, and an AMF that fails one release is not tried again
+    /// that sweep (its remaining legs are parked at once). Two blackholed AMFs
+    /// with two lapsed legs each and a healthy AMF with one: the sweep takes
+    /// about one call timeout, the healthy leg is deleted, and the four dead
+    /// legs are parked for the unsubscribe reconciler.
+    ///
+    /// REVERT-VERIFIED: with the releases awaited one at a time in sweep order
+    /// (the pre-#2149 loop), the sweep takes at least four timeouts and "about
+    /// one call timeout" fails; with a failed AMF tried again for each of its
+    /// legs, it takes at least two and fails the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn the_expiry_sweep_releases_per_amf_in_parallel_2149() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        const TIMEOUT_MS: u64 = 600;
+        AMF_CALL_TIMEOUT_MS.store(TIMEOUT_MS, Ordering::Relaxed);
+        let mut holes = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            holes.push(hole.local_addr().unwrap());
+            held.push(tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((c, _)) = hole.accept().await {
+                    conns.push(c);
+                }
+            }));
+        }
+        let (_amf, healthy, seen) = recorder(|_| SbiResponse::with_status(204)).await;
+        let now = crate::context::now_unix_secs();
+        let lapsed_at = |amf: std::net::SocketAddr, n: &str| {
+            let mut sub = UdmEeSubscription::for_ue(
+                "imsi-001010000021490",
+                "http://nef.example.org/ee-notify",
+                json!({
+                    "callbackReference": "http://nef.example.org/ee-notify",
+                    "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}},
+                    "reportingOptions": {
+                        "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now - 1)
+                    },
+                })
+                .to_string(),
+            );
+            sub.amf_leg = Some(AmfEeLeg {
+                subscription_uri: format!("http://{amf}/namf-evts/v1/subscriptions/{n}"),
+                change_token: "t".to_string(),
+                amf_instance_id: Some("amf".to_string()),
+                notify_uri: "http://nef.example.org/ee-notify".to_string(),
+                events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+                expiry: Some(now - 1),
+            });
+            assert!(sub.is_expired(now), "the fixture has lapsed");
+            udm_self().read().unwrap().ee_subscription_insert(sub);
+        };
+        for (i, hole) in holes.iter().enumerate() {
+            lapsed_at(*hole, &format!("dead-{i}-a"));
+            lapsed_at(*hole, &format!("dead-{i}-b"));
+        }
+        lapsed_at(healthy, "live-2149");
+
+        let started = std::time::Instant::now();
+        let swept = crate::app::sweep_expired_ee_subscriptions(now).await;
+        let took = started.elapsed();
+        let parked: Vec<String> = lock_parked()
+            .iter()
+            .map(|p| p.uri.clone())
+            .filter(|u| holes.iter().any(|h| u.contains(&h.to_string())))
+            .collect();
+        clear_parked_unsubscribes_for_test();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        for h in held {
+            h.abort();
+        }
+
+        assert_eq!(swept, 5);
+        assert!(
+            took < std::time::Duration::from_millis(TIMEOUT_MS * 2 - 100),
+            "about one call timeout: {took:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "the healthy leg is deleted");
+        assert_eq!(parked.len(), 4, "the dead legs are parked: {parked:?}");
+    }
+
     /// #1987: eight dead AMFs, each with an unsubscribe parked ahead of a healthy
     /// AMF's, do not delay it: one pass delivers it. Sent in turn, the dead ones
     /// cost 8 x 450 ms against the 500 ms pass, and the healthy one waited passes.
@@ -1766,6 +1943,80 @@ mod tests {
         clear(supi);
     }
 
+    /// **#2149** (R42 on #2144): the AMF leg carries the Nudm_EE subscription's
+    /// granted expiry (`options.expiry`, TS 29.518 AmfEventMode), so it lapses at
+    /// the AMF with it. A refresh moves the leg's expiry by Namf modify: the same
+    /// AMF subscription, its expiry moved, no second one.
+    ///
+    /// REVERT-VERIFIED: with `subscribe_body` sending no `options`, the AMF
+    /// subscription's expiry is `None` and "the AMF leg lapses with it" fails;
+    /// with the reconcile ignoring an expiry change, "the refresh moves the
+    /// AMF leg's expiry" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM/AMF state
+    async fn the_amf_leg_lapses_with_its_ee_subscription_2149() {
+        let supi = "imsi-001010000002149";
+        let _guard = setup(supi);
+        let (_amf, _amf_base) = real_amf("amf-2149").await;
+        let (_nef, nef, _seen) = nef_stub("nef-2149").await;
+        let client = mock_udr();
+        assert_eq!(register(supi, "amf-2149", &client).await, 201);
+        let now = crate::context::now_unix_secs();
+        let at = |s: u64| nextgcore_sbi::datetime::epoch_to_rfc3339(s);
+        let mut req = SbiRequest::post(format!("/nudm-ee/v1/{supi}/ee-subscriptions"));
+        req.http.content = Some(
+            json!({
+                "callbackReference": nef,
+                "monitoringConfigurations": loc(),
+                "reportingOptions": { "expiry": at(now + 600) },
+            })
+            .to_string(),
+        );
+        let resp = crate::app::handle_ee_subscribe(supi, &crate::app::as_test_consumer(&req)).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        wait_idle().await;
+        let body: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = body["eeSubscription"]["subscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let amf_expiry = |uri: &str| {
+            amf_subscription(uri)
+                .and_then(|s| s.expiry)
+                .and_then(|e| e.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+        };
+        let leg = leg_of(&id).expect("leg");
+        assert_eq!(leg.expiry, Some(now + 600));
+        assert_eq!(
+            amf_expiry(&leg.subscription_uri),
+            Some(now + 600),
+            "the AMF leg lapses with it"
+        );
+
+        let ops = json!([{
+            "op": "add", "path": "/reportingOptions", "value": { "expiry": at(now + 1200) }
+        }]);
+        assert_eq!(ee_patch(supi, &id, ops).await, 204);
+        let moved = leg_of(&id).expect("leg");
+        assert_eq!(
+            moved.subscription_uri, leg.subscription_uri,
+            "the same AMF subscription"
+        );
+        assert_eq!(moved.expiry, Some(now + 1200));
+        assert_eq!(
+            amf_expiry(&moved.subscription_uri),
+            Some(now + 1200),
+            "the refresh moves the AMF leg's expiry"
+        );
+        assert_eq!(
+            amf_subscriptions_to(supi, &nef),
+            1,
+            "no second AMF subscription"
+        );
+        clear(supi);
+    }
+
     /// **#1449 review 3.** A leg that is no longer at the serving AMF does not
     /// silence the fallback: the UE moves to an AMF this UDM cannot resolve, the
     /// old leg is dropped (and deleted), and the NEF hears the UDM's LoC. The same
@@ -1829,6 +2080,7 @@ mod tests {
             amf_instance_id: Some("amf-a".to_string()),
             notify_uri: "http://nef/cb".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            expiry: None,
         };
         sub.amf_leg = Some(leg.clone());
         assert!(amf_reports(&sub, "LOSS_OF_CONNECTIVITY", Some("amf-a")));
@@ -2143,6 +2395,7 @@ mod tests {
             amf_instance_id: Some("amf-old".to_string()),
             notify_uri: "http://nef.example.org/notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            expiry: None,
         });
         let id = sub.id.clone();
         {
@@ -2237,6 +2490,7 @@ mod tests {
             amf_instance_id: Some("amf-old".to_string()),
             notify_uri: "http://nef.example.org/notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            expiry: None,
         });
         let id = sub.id.clone();
         {
@@ -2351,6 +2605,7 @@ mod tests {
             amf_instance_id: Some("amf-10449".to_string()),
             notify_uri: "http://nef.example.org/notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            expiry: None,
         });
         let id = sub.id.clone();
         udm_self()
