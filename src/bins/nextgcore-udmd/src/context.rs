@@ -823,10 +823,12 @@ pub struct NfProfileConfig {
 impl Default for NfProfileConfig {
     fn default() -> Self {
         // The historical literals, so an unconfigured deployment registers
-        // exactly as it did before #85.
+        // as it did before #85, plus the UDR (#2123, R41 M2): it discovers the
+        // UDM to verify a UDM caller's type, and nrfd hides a profile whose
+        // allowedNfTypes leaves the requester out.
         Self {
             heart_beat_timer: 10,
-            allowed_nf_types: ["AMF", "SMF", "AUSF", "PCF", "SCP"]
+            allowed_nf_types: ["AMF", "SMF", "AUSF", "PCF", "SCP", "UDR"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
