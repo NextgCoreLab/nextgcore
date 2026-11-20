@@ -5481,17 +5481,26 @@ mod tests {
     /// #995: this SMF's own stamp is NTP-era seconds (TS 29.244 §8.2.65).
     #[tokio::test]
     async fn the_smf_recovery_time_stamp_is_ntp_seconds() {
+        // #2161: the stamp is the process's (one per process, taken at its first
+        // use), so in a long single-threaded or shuffled run it can predate this
+        // test by minutes; "within 60 s of now" failed whenever a sibling took
+        // it first. What matters is that the client carries THE process stamp
+        // and that it is NTP-era seconds: Unix seconds read about 70 years
+        // (2.2e9 s) behind, which no test run's age comes near.
+        //
+        // REVERT-VERIFIED: with `recovery_time::now` returning Unix seconds,
+        // the "NTP-era seconds" assertion fails.
         let (client, _upf) = make_client_with_peer().await;
+        assert_eq!(
+            client.recovery_time_stamp,
+            smf_recovery_time_stamp(),
+            "every client carries the one process stamp"
+        );
         let now = nextgcore_pfcp::recovery_time::now();
-        // The stamp is the process's, taken at its first use (#974 review m7), so
-        // it is not "within a minute of now": #2157, under shuffle seed 7 that first
-        // use came from a sibling more than 60 s before this ran. What is NTP-era
-        // here is the epoch: Unix seconds are 2_208_988_800 behind, so a day's
-        // slack still tells the two apart.
-        assert_eq!(client.recovery_time_stamp, smf_recovery_time_stamp());
+        let age = now.wrapping_sub(client.recovery_time_stamp);
         assert!(
-            now.wrapping_sub(client.recovery_time_stamp) < 86_400,
-            "{} is not NTP-era seconds of this run (now {now})",
+            age < 6 * 3600,
+            "NTP-era seconds, started this run: stamp {} is {age} s before now {now}",
             client.recovery_time_stamp
         );
     }

@@ -836,7 +836,27 @@ fn handle_ucmf_notify_callback(token: &str, request: &SbiRequest) -> SbiResponse
 /// `nfProfile` is never read: the next request re-discovers (see
 /// `nrf_subscription`). 204 on success, 400 for a body without `event` or
 /// `nfInstanceUri`.
+///
+/// #2172 (SECURITY): under the production SBI profile the sender must also be
+/// the NRF (an NRF-only certificate) or an SCP relaying it
+/// (`nextgcore_sbi::nf_status_notify`), checked before the body is read, so a
+/// forged NF_DEREGISTERED from another peer that learnt a token cannot evict a
+/// healthy NF from the cache.
 async fn handle_nf_status_notify_callback(token: &str, request: &SbiRequest) -> SbiResponse {
+    handle_nf_status_notify_callback_in(
+        token,
+        request,
+        nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+    )
+    .await
+}
+
+/// [`handle_nf_status_notify_callback`] under the profile `production` says.
+pub(crate) async fn handle_nf_status_notify_callback_in(
+    token: &str,
+    request: &SbiRequest,
+    production: bool,
+) -> SbiResponse {
     use crate::nrf_subscription::{
         apply_notification, classify_notification, token_nf_type, NotifyError,
     };
@@ -844,6 +864,11 @@ async fn handle_nf_status_notify_callback(token: &str, request: &SbiRequest) -> 
         log::warn!("NF status notification on a subscription this AMF does not hold; refused");
         return SbiResponse::with_status(404);
     };
+    if let Some(refused) =
+        nextgcore_sbi::nf_status_notify::refuse_notifier(request, true, production)
+    {
+        return refused;
+    }
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
     };
