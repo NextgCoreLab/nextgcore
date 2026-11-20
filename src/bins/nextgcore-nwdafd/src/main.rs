@@ -1854,9 +1854,23 @@ mod tests {
 
     // --- G2-1: NFStatusNotify callback route ---
 
+    /// The legacy token-less NFStatusNotify route is routed, and what it answers
+    /// depends on the SBI profile (#2081): under dev it ingests (204); under
+    /// production it carries no subscription correlation, so it is refused 403
+    /// whatever the certificate.
+    ///
+    /// #2121 (R42 on #2140): the router reads the process profile, so the test
+    /// sets Dev and leaves it set (CONVENTIONS: nwdafd tests only ever set
+    /// Dev, and there is no profile lock to take), and asserts the production
+    /// refusal explicitly through the gate with `production = true`. It used
+    /// to set nothing and pass only after a sibling had set Dev.
+    ///
+    /// REVERT-VERIFIED: with the Dev override removed, the test fails alone at
+    /// the 204 assertion (403).
     #[tokio::test]
     async fn test_routing_nfstatus_notify_post_routed() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let req = SbiRequest::post("/nnwdaf-nfstatus-notify/v1/notify")
             .with_json_body(&serde_json::json!({
                 "event": "NF_REGISTERED",
@@ -1869,8 +1883,20 @@ mod tests {
                 }
             }))
             .expect("valid JSON body");
+        let mut from_nrf = req.clone();
+        from_nrf.peer_cert_nf_instance_id = Some("eeeeeeee-2121-4000-8000-00000000000e".into());
+        from_nrf.peer_cert_nf_types = vec!["NRF".into()];
         let resp = nwdaf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 204, "NFStatusNotify must route and return 204");
+        // Production: the token-less route is refused, even from the NRF.
+        let ctx = nwdaf_self();
+        let resp =
+            nrf_collector::handle_nf_status_notify_gated_with_ctx(&ctx, &from_nrf, false, true)
+                .await;
+        assert_eq!(
+            resp.status, 403,
+            "production refuses the uncorrelated route"
+        );
     }
 
     #[tokio::test]
