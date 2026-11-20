@@ -554,6 +554,10 @@ pub struct AmfEeLeg {
     pub notify_uri: String,
     /// The Namf event types subscribed.
     pub events: Vec<String>,
+    /// #2149: the `options.expiry` (UNIX seconds) the AMF was asked for: the
+    /// Nudm_EE subscription's granted expiry (TS 29.518 §6.2.6.2.4
+    /// AmfEventMode). `None` for a subscription with no expiry.
+    pub expiry: Option<u64>,
 }
 
 impl UdmEeSubscription {

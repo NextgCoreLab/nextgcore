@@ -2788,6 +2788,20 @@ pub async fn handle_ee_unsubscribe(
     let Some(sub) = found else {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     };
+    // #2149 (R42 on #2144): a lapsed subscription no longer exists, so its
+    // DELETE is 404, as its modify is. It is taken out now and its AMF leg
+    // released (on its own task, #1877) rather than left for the sweep.
+    if sub.is_expired(crate::context::now_unix_secs()) {
+        let removed = udm_self()
+            .read()
+            .ok()
+            .and_then(|c| c.ee_subscription_remove(subscription_id));
+        if let Some(sub) = removed {
+            let task = tokio::spawn(async move { crate::ee_amf::release(&sub).await });
+            let _ = task.await;
+        }
+        return send_problem(404, "NOT_FOUND", "Subscription not found");
+    }
     // #1865: only the consumer that created it, checked before any side effect.
     if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
         sub.owner.as_deref(),
@@ -2825,12 +2839,42 @@ pub async fn sweep_expired_ee_subscriptions(now: u64) -> usize {
             .map(|c| c.ee_subscriptions_take_expired(now))
             .unwrap_or_default()
     };
-    for sub in &expired {
+    let count = expired.len();
+    // #2149 (R42 on #2144), the #2128 shape: releases are grouped by the AMF
+    // holding each leg, up to EE_SWEEP_MAX_AMFS AMFs at once, each in turn. An
+    // AMF that fails one release (no answer, a 5xx) is not tried again this
+    // sweep: its remaining legs are parked for the unsubscribe reconciler at
+    // once. So a blackholed AMF costs one request timeout per sweep, and the
+    // other AMFs' legs are released regardless.
+    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<UdmEeSubscription>> =
+        std::collections::BTreeMap::new();
+    for sub in expired {
         log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
-        crate::ee_amf::release(sub).await;
+        by_amf
+            .entry(crate::ee_amf::leg_authority(&sub))
+            .or_default()
+            .push(sub);
     }
-    expired.len()
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(EE_SWEEP_MAX_AMFS));
+    let mut workers = tokio::task::JoinSet::new();
+    for (_, subs) in by_amf {
+        let slots = slots.clone();
+        workers.spawn(async move {
+            let _slot = slots.acquire_owned().await;
+            let mut amf_failed = false;
+            for sub in &subs {
+                if !crate::ee_amf::release_with(sub, !amf_failed).await {
+                    amf_failed = true;
+                }
+            }
+        });
+    }
+    while workers.join_next().await.is_some() {}
+    count
 }
+
+/// #2149: at most this many AMFs are released at once in one sweep.
+const EE_SWEEP_MAX_AMFS: usize = 8;
 
 /// #2125: how often lapsed EE subscriptions are swept.
 const EE_EXPIRY_SWEEP: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2902,11 +2946,13 @@ pub async fn handle_ee_modify(
     }
     // #2125: a patched expiry (the consumer's refresh) is granted, capped, as on
     // create; nothing is stored when it is refused.
-    if let Err(detail) =
-        crate::context::ee_grant_expiry(&mut stored, crate::context::now_unix_secs())
-    {
-        return send_bad_request(&detail, Some("MANDATORY_IE_INCORRECT"));
-    }
+    // #2149 (R42 on #2144): what the patch asked for, to tell a shortened grant.
+    let asked = crate::context::ee_requested_expiry(&stored).ok().flatten();
+    let granted =
+        match crate::context::ee_grant_expiry(&mut stored, crate::context::now_unix_secs()) {
+            Ok(granted) => granted,
+            Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_INCORRECT")),
+        };
 
     // The callbackReference is cached alongside the raw body, so a patch that
     // changes it must update both or the next notification goes to the old URI.
@@ -2936,9 +2982,36 @@ pub async fn handle_ee_modify(
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
     // #1440: the patch may add or drop an AMF-detected event, or move the
-    // callback the AMF notifies.
+    // callback the AMF notifies. #2149: or move the expiry its AMF leg carries.
     crate::ee_amf::spawn_reconcile(subscription_id);
-    SbiResponse::with_status(204)
+    ee_modify_answer(asked, granted)
+}
+
+/// #2149 (R42 on #2144): the answer to a Nudm_EE modify. 204 when the patch was
+/// applied as asked. When the UDM granted a shorter expiry than the patch asked
+/// for (its lifetime cap), 200 with a TS 29.571 `PatchResult` (the TS 29.503
+/// UpdateEeSubscription 200 body) whose ReportItem names
+/// `/reportingOptions/expiry` and, as its `reason`, the granted DateTime: the
+/// patch was only partly applied, and a consumer refreshing on its own
+/// schedule must learn when the subscription now lapses.
+fn ee_modify_answer(asked: Option<u64>, granted: Option<u64>) -> SbiResponse {
+    match (asked, granted) {
+        (Some(asked), Some(granted)) if granted < asked => {
+            let body = serde_json::json!({
+                "report": [{
+                    "path": "/reportingOptions/expiry",
+                    "reason": format!(
+                        "granted {}",
+                        nextgcore_sbi::datetime::epoch_to_rfc3339(granted)
+                    ),
+                }]
+            });
+            SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .unwrap_or_else(|_| SbiResponse::with_status(204))
+        }
+        _ => SbiResponse::with_status(204),
+    }
 }
 
 /// Apply an `EeSubscription` patch in place.
@@ -6037,11 +6110,21 @@ mod tests {
         assert_eq!(r.status, 204, "{:?}", r.http.content);
         assert_eq!(stored(&short_id).and_then(|s| s.expiry), Some(now + 300));
         let r = modify(short_id.clone(), refresh(at(now + 10 * 365 * 86_400))).await;
-        assert_eq!(r.status, 204);
         let capped = stored(&short_id).and_then(|s| s.expiry).unwrap();
         assert!(
             capped <= crate::context::now_unix_secs() + max,
             "capped on refresh"
+        );
+        // #2149: a shortened grant is answered 200 with a PatchResult naming
+        // the expiry and the DateTime granted, so the consumer learns it.
+        assert_eq!(r.status, 200, "{:?}", r.http.content);
+        assert_eq!(
+            json(&r),
+            serde_json::json!({ "report": [{
+                "path": "/reportingOptions/expiry",
+                "reason": format!("granted {}", at(capped)),
+            }]}),
+            "the shortened grant is reported"
         );
         let r = modify(short_id.clone(), refresh(at(now - 1))).await;
         assert_eq!(r.status, 400);
@@ -6076,6 +6159,7 @@ mod tests {
             amf_instance_id: Some("amf-2125".to_string()),
             notify_uri: "http://nef.example.org/ee-notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY_REPORT".to_string()],
+            expiry: None,
         });
         let lapsed_id = lapsed.id.clone();
         udm_self().read().unwrap().ee_subscription_insert(lapsed);
@@ -6093,15 +6177,26 @@ mod tests {
         assert!(reported.contains(&open_id) && reported.contains(&short_id));
         let r = modify(lapsed_id.clone(), refresh(at(now + 300))).await;
         assert_eq!(r.status, 404, "a refresh after the expiry finds it gone");
-
-        let swept = sweep_expired_ee_subscriptions(crate::context::now_unix_secs()).await;
-        amf.stop().await.ok();
-        assert_eq!(swept, 1, "swept");
-        assert!(stored(&lapsed_id).is_none());
+        // #2149 (R42 on #2144): and so does a DELETE, which releases its AMF
+        // leg now rather than at the sweep.
+        let mut del = SbiRequest::delete(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{lapsed_id}"));
+        del.http.content = None;
+        let r = handle_ee_unsubscribe(ue, &lapsed_id, &crate::app::as_test_consumer(&del)).await;
+        assert_eq!(r.status, 404, "a DELETE after the expiry finds it gone");
+        assert!(stored(&lapsed_id).is_none(), "and it is removed");
         assert_eq!(
             deletes.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "its AMF subscription is deleted"
+            "its AMF subscription is deleted by the DELETE"
+        );
+
+        let swept = sweep_expired_ee_subscriptions(crate::context::now_unix_secs()).await;
+        amf.stop().await.ok();
+        assert_eq!(swept, 0, "the DELETE already removed it");
+        assert_eq!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "and its AMF subscription is deleted once"
         );
         for id in [&far_id, &short_id, &open_id] {
             assert!(stored(id).is_some(), "{id} is not swept");

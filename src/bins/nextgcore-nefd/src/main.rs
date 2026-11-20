@@ -1858,8 +1858,19 @@ fn confirmed_expiry(producer: SouthboundProducer, response: &SbiResponse) -> Opt
         SouthboundProducer::Udm => body
             .pointer("/eeSubscription/reportingOptions/expiry")
             .or_else(|| body.pointer("/reportingOptions/expiry")),
-    }?;
-    nextgcore_sbi::datetime::rfc3339_to_epoch(text.as_str()?)
+    };
+    if let Some(text) = text {
+        return nextgcore_sbi::datetime::rfc3339_to_epoch(text.as_str()?);
+    }
+    // #2149: a UDM modify answered 200 with a PatchResult (TS 29.571) reports a
+    // shortened grant as the ReportItem for `/reportingOptions/expiry`, the
+    // granted DateTime in its `reason` ("granted <DateTime>", nextgcore udmd).
+    let item = body["report"]
+        .as_array()?
+        .iter()
+        .find(|item| item["path"].as_str() == Some("/reportingOptions/expiry"))?;
+    let granted = item["reason"].as_str()?.rsplit(' ').next()?;
+    nextgcore_sbi::datetime::rfc3339_to_epoch(granted)
 }
 
 /// #2102: the modification that moves a live leg's expiry to `expiry`: the
@@ -3979,6 +3990,47 @@ mod tests {
         });
         southbound_reconcile::clear_for_test();
         reset_context();
+    }
+
+    /// #2149: a UDM modify answered 200 with a PatchResult reporting a shortened
+    /// grant gives the granted expiry; the other UDM forms still parse, and a
+    /// PatchResult about another path gives none.
+    ///
+    /// REVERT-VERIFIED: with the PatchResult arm removed, the first assertion
+    /// is `None`.
+    #[test]
+    fn a_udm_patch_result_reports_the_granted_expiry_2149() {
+        let at = nextgcore_sbi::datetime::epoch_to_rfc3339(2_000_000_000);
+        let answer = |body: serde_json::Value| {
+            SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .expect("json")
+        };
+        assert_eq!(
+            confirmed_expiry(
+                SouthboundProducer::Udm,
+                &answer(serde_json::json!({ "report": [{
+                    "path": "/reportingOptions/expiry", "reason": format!("granted {at}")
+                }]}))
+            ),
+            Some(2_000_000_000)
+        );
+        assert_eq!(
+            confirmed_expiry(
+                SouthboundProducer::Udm,
+                &answer(serde_json::json!({ "reportingOptions": { "expiry": at } }))
+            ),
+            Some(2_000_000_000)
+        );
+        assert_eq!(
+            confirmed_expiry(
+                SouthboundProducer::Udm,
+                &answer(serde_json::json!({ "report": [{
+                    "path": "/monitoringConfigurations", "reason": format!("granted {at}")
+                }]}))
+            ),
+            None
+        );
     }
 
     /// #2102: a live leg, AMF and UDM, is made with an expiry and refreshed
