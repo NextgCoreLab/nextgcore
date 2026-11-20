@@ -41,10 +41,11 @@ mod namf_client;
 mod nlmf;
 mod nrppa_downlink; // #103: LMF-initiated NRPPa toward NG-RAN
 mod nrppa_positioning; // #807: NRPPa answers of the Multi-RTT procedures
-mod nrppa_uplink; // #515: E-CID Measurement Report on the generated codec, TS 38.455 §10
-                  // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
-                  // Wired into `context::compute_location`; solve_tdoa remains available for
-                  // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
+mod nrppa_uplink;
+mod nudr_client; // #2260: the Application Layer IDs the 5GC maps to a UE // #515: E-CID Measurement Report on the generated codec, TS 38.455 §10
+                 // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
+                 // Wired into `context::compute_location`; solve_tdoa remains available for
+                 // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
 mod site_config;
 mod slpp; // #557: SLPP sidelink positioning (TS 38.355, TS 38.305 §8.15.2) // #103: cell/TRP coordinates from configuration
@@ -1562,6 +1563,25 @@ async fn sl_rtt_range(input: &nlmf::InputData, peer: &str, budget: Duration) -> 
         return None;
     }
     let deadline = tokio::time::Instant::now() + budget;
+    // #2260: the Application Layer IDs the 5GC maps to the target (TS 23.586
+    // §4.3.5, TS 29.519 §6.2.26), read for its GPSI before anything is asked of
+    // it. Only a report under one of them is held, and only it yields a range.
+    let Some(gpsi) = input.gpsi.as_deref() else {
+        log::warn!(
+            "SLPP ranging for {target}: no GPSI in the request, so no Application Layer \
+             ID can be authorised for it (TS 23.586 §4.3.5)"
+        );
+        return None;
+    };
+    let Some(ids) = nudr_client::authorised_app_layer_ids(gpsi).await else {
+        log::warn!("SLPP ranging for {target}: its Application Layer IDs could not be read");
+        return None;
+    };
+    if ids.is_empty() {
+        log::warn!("SLPP ranging for {target}: the UDR maps no Application Layer ID to it");
+        return None;
+    }
+    slpp::app_id_bindings().authorise(target, &ids);
     let amf = namf_client::discover_amf(input.amf_id.as_deref()).await?;
     let lmf_id = lmf_self()
         .read()
@@ -1734,20 +1754,22 @@ fn slpp_uplink_answers(ue: &str, session: Option<&str>, bytes: &[u8]) -> Vec<Vec
             }
         }
         Ok(uplink) => {
-            // R45 M1 on #2254: only an answer to an exchange this LMF started binds
-            // an applicationLayerID or adds halves, and only under the ID of the UE
-            // it arrived from.
+            // R45 M1 on #2254: only an answer to an exchange this LMF started adds
+            // halves, and only under the ID of the UE it arrived from. #2260: that
+            // ID is one the 5GC maps to the UE (bound before the run began), never
+            // one the UE claims for itself.
             let solicited = slpp::exchanges().is_waiting(ue, uplink.transaction());
             let app_id = match &uplink {
                 slpp::Uplink::Capabilities { app_id, .. }
                 | slpp::Uplink::Location { app_id, .. } => app_id.as_deref(),
                 _ => None,
             };
-            let owns_id = solicited && app_id.is_some_and(|a| slpp::app_id_bindings().claim(a, ue));
+            let owns_id =
+                solicited && app_id.is_some_and(|a| slpp::app_id_bindings().is_bound_to(a, ue));
             if solicited && app_id.is_some() && !owns_id {
                 log::warn!(
-                    "SLPP from {ue}: its applicationLayerID is bound to another UE; its \
-                     report is not held"
+                    "SLPP from {ue}: its applicationLayerID is not one the network maps to \
+                     it (TS 23.586 §4.3.5); its report is not held"
                 );
             }
             if let slpp::Uplink::Location {
@@ -8982,6 +9004,70 @@ mod positioning_chain_strict_peer {
         SbiServer,
         tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
     ) {
+        let (amf, nrf, _udr, rx) = start_positioning_harness_with_udr(supi, None).await;
+        (amf, nrf, rx)
+    }
+
+    /// #2260: [`start_positioning_harness`], plus, when `ueid_mappings` is given,
+    /// a UDR the NRF also returns, whose `nudr-dr` answers
+    /// `GET /application-data/ueid-mappings?gpsis=..` (TS 29.519 §6.2.26) with the
+    /// `UeIdMappingInfo` entries of `ueid_mappings` for those GPSIs.
+    async fn start_positioning_harness_with_udr(
+        supi: String,
+        ueid_mappings: Option<serde_json::Value>,
+    ) -> (
+        SbiServer,
+        SbiServer,
+        Option<SbiServer>,
+        tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    ) {
+        let mut udr_instance = None;
+        let mut udr_server = None;
+        if let Some(table) = ueid_mappings {
+            let (udr_listener, udr_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let server = SbiServer::on_listener(SbiServerConfig::new(udr_addr), udr_listener);
+            server
+                .start(move |req: SbiRequest| {
+                    let table = table.clone();
+                    async move {
+                        let path = req.header.uri.split('?').next().unwrap_or("");
+                        if req.header.method != "GET"
+                            || path != "/nudr-dr/v2/application-data/ueid-mappings"
+                        {
+                            return SbiResponse::with_status(404);
+                        }
+                        let query = req.http.params.get("gpsis").cloned().unwrap_or_default();
+                        let gpsis: Vec<&str> = query.split(',').collect();
+                        let hits: Vec<serde_json::Value> = table
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|m| {
+                                m["rsUeIdMappingInfo"]["gpsi"]
+                                    .as_str()
+                                    .is_some_and(|g| gpsis.contains(&g))
+                            })
+                            .cloned()
+                            .collect();
+                        SbiResponse::ok().with_body(
+                            serde_json::Value::Array(hits).to_string(),
+                            "application/json",
+                        )
+                    }
+                })
+                .await
+                .expect("udr stub start");
+            udr_instance = Some(serde_json::json!({
+                "nfInstanceId": "udr-2260",
+                "nfServices": [{
+                    "serviceName": "nudr-dr",
+                    "scheme": "http",
+                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": udr_addr.port() }]
+                }]
+            }));
+            udr_server = Some(server);
+        }
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(4);
 
         let (amf_listener, amf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -9041,17 +9127,16 @@ mod positioning_chain_strict_peer {
         let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let nrf_port = nrf_addr.port();
         let nrf_server = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
-        let search = serde_json::json!({
-            "nfInstances": [{
-                "nfInstanceId": "amf-strict-peer",
-                "nfServices": [{
-                    "serviceName": "namf-comm",
-                    "scheme": "http",
-                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": amf_port }]
-                }]
+        let mut instances = vec![serde_json::json!({
+            "nfInstanceId": "amf-strict-peer",
+            "nfServices": [{
+                "serviceName": "namf-comm",
+                "scheme": "http",
+                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": amf_port }]
             }]
-        })
-        .to_string();
+        })];
+        instances.extend(udr_instance);
+        let search = serde_json::json!({ "nfInstances": instances }).to_string();
         nrf_server
             .start(move |_req: SbiRequest| {
                 let search = search.clone();
@@ -9064,7 +9149,7 @@ mod positioning_chain_strict_peer {
             .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
             .await;
 
-        (amf_server, nrf_server, tap_rx)
+        (amf_server, nrf_server, udr_server, tap_rx)
     }
 
     // =======================================================================
@@ -9383,20 +9468,37 @@ mod positioning_chain_strict_peer {
             );
         }
         seed_amf_connected_ue(&supi);
-        // R45 M1 on #2254: A5A5A5 is bound to whichever UE first answered with it;
-        // here that must be this target.
-        crate::slpp::app_id_bindings().forget(&[0xA5, 0xA5, 0xA5]);
+        // #2260: the UE's Application Layer ID is the one the UDR maps to its
+        // GPSI. The golden's A5A5A5 octets are no UTF-8 string, so no
+        // ApplicationlayerId can name them; the UE here reports as "ue-557".
+        let me: &[u8] = b"ue-557";
+        crate::slpp::app_id_bindings().forget(me);
         crate::slpp::sl_rtt_store().note(
             b"ZZZ",
             &[crate::slpp::SlRttHalf {
-                peer: vec![0xA5, 0xA5, 0xA5],
+                peer: me.to_vec(),
                 rx_tx_tc: 326.0,
             }],
         );
-        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+        let (amf_server, nrf_server, _udr, mut tap_rx) = start_positioning_harness_with_udr(
+            supi.clone(),
+            Some(serde_json::json!([
+                {"rsUeIdMappingInfo": {"appLayerId": "ue-557", "gpsi": "msisdn-10557"}}
+            ])),
+        )
+        .await;
+        let located_as_me = {
+            let mut m = nextgcore_slpp_gen::decode(
+                &crate::slpp::golden::NEXTGSIM_UE_PROVIDE_LOCATION_INFORMATION,
+            )
+            .unwrap();
+            m.application_layer_id =
+                Some(nextgcore_slpp_gen::generated::SLPP_MessageApplicationLayerID(me.to_vec()));
+            nextgcore_slpp_gen::encode(&m).unwrap()
+        };
 
         let body = format!(
-            r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+            r#"{{"supi":"{supi}","gpsi":"msisdn-10557","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
                 "ecgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"eutraCellId":"0000001"}},
                 "maxRespTime":20,
                 "requestedRangingSlResult":["RANGING"],
@@ -9462,13 +9564,7 @@ mod positioning_chain_strict_peer {
             dl,
             crate::slpp::build_request_location_information(tid, seq2).unwrap()
         );
-        answer_slpp(
-            &corr,
-            &supi,
-            &crate::slpp::golden::NEXTGSIM_UE_PROVIDE_LOCATION_INFORMATION,
-            tid,
-        )
-        .await;
+        answer_slpp(&corr, &supi, &located_as_me, tid).await;
 
         let resp = tokio::time::timeout(Duration::from_secs(20), det)
             .await
@@ -9484,7 +9580,83 @@ mod positioning_chain_strict_peer {
         // The UE's half is the 38.133 bin of a 50 m flight time and the peer's is
         // 326 Tc, so the sum resolves to within one 4 Tc step (0.3 m) of 50 m.
         assert!((d - 50.0).abs() < 0.5, "distance {d}");
+        crate::slpp::app_id_bindings().forget(me);
 
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// **#2260, fail closed.** When the UDR maps the UE's Application Layer ID
+    /// to another GPSI (TS 29.519 §6.2.26), the LMF authorises no ID for the
+    /// target. It sends it no SLPP at all and returns the location without a
+    /// distance, even with the peer's half held under that ID.
+    ///
+    /// REVERT-VERIFIED: with the authorisation skipped (the run goes on with no
+    /// authorised ID), lmfd sends RequestCapabilities.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_id_the_udr_maps_to_another_gpsi_gets_no_sl_rtt_run_2260() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _slpp = crate::slpp::SLPP_GLOBALS_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000002260".to_string();
+        lmf_context_init(1024);
+        prime_lmf_self();
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_cell_coord(
+                "pci-77".to_string(),
+                crate::positioning::TrpCoord::new(40.1, -74.5, 0.0),
+            );
+        }
+        seed_amf_connected_ue(&supi);
+        crate::slpp::sl_rtt_store().note(
+            b"ZZZ",
+            &[crate::slpp::SlRttHalf {
+                peer: b"ue-2260".to_vec(),
+                rx_tx_tc: 326.0,
+            }],
+        );
+        let (amf_server, nrf_server, _udr, mut tap_rx) = start_positioning_harness_with_udr(
+            supi.clone(),
+            Some(serde_json::json!([
+                {"rsUeIdMappingInfo": {"appLayerId": "ue-2260", "gpsi": "msisdn-OTHER"}}
+            ])),
+        )
+        .await;
+        let body = format!(
+            r#"{{"supi":"{supi}","gpsi":"msisdn-12260","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "ecgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"eutraCellId":"0000001"}},
+                "maxRespTime":20,
+                "requestedRangingSlResult":["RANGING"],
+                "relatedUes":[{{"applicationlayerId":"ZZZ","relatedUeType":"REFERENCE_UE"}}]}}"#
+        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+        answer_capability_request(&mut tap_rx, &supi, true, false).await;
+        let (corr, _dl, txn) = next_downlink(&mut tap_rx).await;
+        let ul_lpp = build_ecid_lpp(77, 60, 800, txn);
+        assert_eq!(
+            notify_n1(&amfd_notify_request(&corr, &supi, &ul_lpp))
+                .await
+                .status,
+            204
+        );
+        let resp = tokio::time::timeout(Duration::from_secs(20), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("no panic");
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert!(v["locationEstimate"].is_object(), "the location is kept");
+        assert!(v.get("distanceDirection").is_none(), "no distance: {v}");
+        assert!(
+            tap_rx.try_recv().is_err(),
+            "no SLPP was sent to a target with no authorised ID"
+        );
+        crate::slpp::sl_rtt_store().clear();
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
     }

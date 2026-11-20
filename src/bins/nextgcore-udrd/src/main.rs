@@ -4504,7 +4504,99 @@ async fn handle_application_data(
             collection @ ("bdtPolicyData" | "iptvConfigData" | "serviceParamData"
             | "am-influence-data" | "af-qos-data-sets" | "eas-deploy-data"),
         ) => handle_application_dataset(collection, parts.get(4).copied(), method, request),
+        // #2260: the Ranging/SL UE ID mappings (TS 29.519 §6.2.26, §6.2.27).
+        Some("ueid-mappings") => handle_ueid_mappings(parts.get(4).copied(), method, request),
         _ => send_not_found("Unknown application-data resource", None),
+    }
+}
+
+/// #2260: `/application-data/ueid-mappings[/{ueMappingId}]` (TS 29.519
+/// §6.2.26, §6.2.27; TS 23.586 §4.3.5): the UDR stores the mapping between a
+/// Ranging/Sidelink Positioning Application Layer ID and a GPSI, provisioned by
+/// an AF through the NEF or pre-provisioned by the operator (Table 5.2.x NOTE 2).
+///
+/// - The collection GET filters by `gpsis` or `app-layer-ids`, which are
+///   mutually exclusive (Table 6.2.26.3.1-1 NOTE), and answers an array of
+///   `UeIdMappingInfo`, empty when nothing matches (Table 6.2.26.3.1-3).
+/// - The individual resource supports GET, PUT (create or update) and DELETE
+///   (§6.2.27.3). A `rsUeIdMappingInfo` must carry both `appLayerId` and `gpsi`
+///   (TS 29.522 `RangSlUeIdMappInfo`, both required).
+fn handle_ueid_mappings(id: Option<&str>, method: &str, request: &SbiRequest) -> SbiResponse {
+    const STORE: &str = "app-ueid-mappings";
+    let ds = data_store::store();
+    let member = |doc: &serde_json::Value, name: &str| {
+        doc.get("rsUeIdMappingInfo")
+            .and_then(|m| m.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    match (id, method) {
+        (None, "GET") => {
+            let gpsis = csv_param(request, "gpsis");
+            let app_ids = csv_param(request, "app-layer-ids");
+            if gpsis.is_some() && app_ids.is_some() {
+                return send_bad_request(
+                    "gpsis and app-layer-ids are mutually exclusive",
+                    Some("INVALID_QUERY_PARAM"),
+                );
+            }
+            let keep = |doc: &serde_json::Value| match (&gpsis, &app_ids) {
+                (Some(g), _) => member(doc, "gpsi").is_some_and(|v| g.contains(&v)),
+                (_, Some(a)) => member(doc, "appLayerId").is_some_and(|v| a.contains(&v)),
+                _ => true,
+            };
+            let list: Vec<serde_json::Value> = ds
+                .doc_list(STORE)
+                .into_iter()
+                .map(|(_, v)| v)
+                .filter(keep)
+                .collect();
+            SbiResponse::with_status(200).with_body(
+                serde_json::Value::Array(list).to_string(),
+                "application/json",
+            )
+        }
+        (Some(id), "GET") => match ds.doc_get(STORE, id) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("UE ID Mapping not found", Some("DATA_NOT_FOUND")),
+        },
+        (Some(id), "PUT") => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            if body.get("rsUeIdMappingInfo").is_some() {
+                for attr in ["appLayerId", "gpsi"] {
+                    if member(&body, attr).is_none() {
+                        return missing_mandatory(&format!("rsUeIdMappingInfo.{attr}"));
+                    }
+                }
+            }
+            let path = format!("/nudr-dr/v2/application-data/ueid-mappings/{id}");
+            if ds.doc_put(STORE, id, body.clone()) {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+            }
+        }
+        (Some(id), "DELETE") => {
+            if ds.doc_remove(STORE, id).is_some() {
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found("UE ID Mapping not found", Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, "application-data/ueid-mappings"),
     }
 }
 
@@ -9407,6 +9499,78 @@ udr:
             .await
             .expect("PUT iptv without multiAccCtrls");
         assert_eq!(resp.status, 400);
+        udr.stop().await.expect("stop");
+    }
+
+    /// #2260: the Ranging/SL UE ID mappings (TS 29.519 §6.2.26, §6.2.27): an
+    /// operator-provisioned mapping is found by its GPSI and by its Application
+    /// Layer ID, the two filters are mutually exclusive, a mapping without its
+    /// GPSI is refused, and a DELETE removes it.
+    ///
+    /// REVERT-VERIFIED: with the route removed, every request is "Unknown
+    /// application-data resource" (404).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_ueid_mappings_2260() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let base = "/nudr-dr/v2/application-data/ueid-mappings";
+        let a = json!({"rsUeIdMappingInfo": {"appLayerId": "ue-a-2260", "gpsi": "msisdn-12260"}});
+        let b = json!({"rsUeIdMappingInfo": {"appLayerId": "ue-b-2260", "gpsi": "msisdn-22260"}});
+        let resp = client
+            .put_json(&format!("{base}/m-a"), &a)
+            .await
+            .expect("PUT a");
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(
+            resp.http.headers.get("location").map(String::as_str),
+            Some("/nudr-dr/v2/application-data/ueid-mappings/m-a")
+        );
+        let resp = client
+            .put_json(&format!("{base}/m-b"), &b)
+            .await
+            .expect("PUT b");
+        assert_eq!(resp.status, 201);
+        let resp = client
+            .put_json(&format!("{base}/m-b"), &b)
+            .await
+            .expect("PUT b again");
+        assert_eq!(resp.status, 200, "an update");
+
+        let get = |q: String| {
+            let client = &client;
+            async move { client.get(&format!("{base}{q}")).await.expect("GET") }
+        };
+        let resp = get("?gpsis=msisdn-12260".into()).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_of(&resp), json!([a]), "by GPSI");
+        let resp = get("?app-layer-ids=ue-b-2260".into()).await;
+        assert_eq!(json_of(&resp), json!([b]), "by Application Layer ID");
+        let resp = get("?gpsis=msisdn-99999".into()).await;
+        assert_eq!(
+            (resp.status, json_of(&resp)),
+            (200, json!([])),
+            "none: empty"
+        );
+        let resp = get("?gpsis=msisdn-12260&app-layer-ids=ue-a-2260".into()).await;
+        assert_eq!(resp.status, 400, "mutually exclusive");
+        assert_eq!(json_of(&resp)["cause"], "INVALID_QUERY_PARAM");
+        let resp = get("/m-a".into()).await;
+        assert_eq!((resp.status, json_of(&resp)), (200, a.clone()));
+
+        let resp = client
+            .put_json(
+                &format!("{base}/m-c"),
+                &json!({"rsUeIdMappingInfo": {"appLayerId": "ue-c"}}),
+            )
+            .await
+            .expect("PUT without gpsi");
+        assert_eq!(resp.status, 400);
+        assert_eq!(json_of(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        let resp = client.delete(&format!("{base}/m-a")).await.expect("DELETE");
+        assert_eq!(resp.status, 204);
+        assert_eq!(json_of(&get("?gpsis=msisdn-12260".into()).await), json!([]));
+        assert_eq!(get("/m-a".into()).await.status, 404);
+        let _ = client.delete(&format!("{base}/m-b")).await;
         udr.stop().await.expect("stop");
     }
 
