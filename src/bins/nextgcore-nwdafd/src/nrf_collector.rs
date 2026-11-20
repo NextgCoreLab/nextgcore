@@ -141,13 +141,28 @@ pub fn callback_path() -> String {
     callback_path_for(&callback_token())
 }
 
-/// `callback_uri` with its token segment replaced by `token`, when it is one of
-/// these callbacks; otherwise unchanged.
-pub fn callback_uri_with_token(callback_uri: &str, token: &str) -> String {
+/// `callback_uri` with its token segment replaced by `token`, or `None` when it
+/// is not one of these callbacks and so cannot carry the token (#2131).
+pub fn callback_uri_with_token(callback_uri: &str, token: &str) -> Option<String> {
     let marker = format!("/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/");
-    match callback_uri.find(&marker) {
-        Some(at) => format!("{}{}", &callback_uri[..at], callback_path_for(token)),
-        None => callback_uri.to_string(),
+    callback_uri
+        .find(&marker)
+        .map(|at| format!("{}{}", &callback_uri[..at], callback_path_for(token)))
+}
+
+/// #2131 (R40 on #2119): mint the token for one NFStatusSubscribe and the
+/// callback URI carrying it. `None` when `callback_uri` has no token segment:
+/// the token is abandoned at once, so it is never activated (notifications on
+/// such a URI could name no subscription, and are refused anyway), and no
+/// subscribe is sent.
+fn mint_for_subscribe(book: &mut TokenBook, callback_uri: &str) -> Option<(String, String)> {
+    let token = book.mint();
+    match callback_uri_with_token(callback_uri, &token) {
+        Some(uri) => Some((token, uri)),
+        None => {
+            book.abandon(&token);
+            None
+        }
     }
 }
 
@@ -238,9 +253,17 @@ pub async fn subscribe_nf_status(ctx: &Arc<RwLock<NwdafContext>>) {
         base_path.trim_end_matches('/')
     );
 
-    // #2093: this subscription's own token.
-    let token = tokens().mint();
-    let callback_uri = callback_uri_with_token(&config.callback_uri, &token);
+    // #2093: this subscription's own token. #2131: only on a callback that can
+    // carry it.
+    let Some((token, callback_uri)) = mint_for_subscribe(&mut tokens(), &config.callback_uri)
+    else {
+        log::error!(
+            "NRF NFStatusSubscribe not sent: the callback URI has no /nnwdaf-callback/v1/\
+             {CALLBACK_SEGMENT}/ token segment, so its notifications could name no \
+             subscription"
+        );
+        return;
+    };
     let previous_validity = ctx
         .read()
         .ok()
@@ -618,14 +641,18 @@ pub async fn handle_nf_status_notify_with_ctx(
 /// The NF load values in a notification feed NF_LOAD analytics, so only the NRF,
 /// about a subscription this NWDAF made, may deliver one. Under the production
 /// SBI profile:
-/// - `correlated` must hold: the request came in on the tokenised callback of
-///   [`callback_path`] (the subscription's correlation in the callback URI). The
-///   token-less route of subscriptions made before #1421 carries none, so it is
-///   refused;
-/// - the TLS peer must be the NRF: the verified client certificate names NF type
-///   NRF (RFC 9310). The NRF's notification carries no bearer (TS 33.501
-///   §13.4.1), so the certificate is the only proof of who sent it. A relay (SCP)
-///   or another NF is refused.
+/// - `correlated` must hold: the request came in on a tokenised callback whose
+///   token the [`TokenBook`] holds (#2093: one token per subscription, so the
+///   subscription in force, one being subscribed, or a replaced one in its
+///   grace window). The token-less route of subscriptions made before #1421
+///   carries none, so it is refused;
+/// - the TLS peer must be the NRF, or an SCP relaying it: the verified client
+///   certificate names NF type NRF, or is a relay's naming SCP
+///   ([`nextgcore_sbi::owner_binding::is_relay_certificate`]: relay types only;
+///   RFC 9310). The NRF's notification carries no bearer (TS 33.501 §13.4.1),
+///   so the certificate plus the per-subscription token is the only proof. A
+///   certificate naming SCP and another NF type is that NF's, not a relay's
+///   (#2131, the #2113 rule), and is refused like any other NF.
 ///
 /// Under dev both are accepted as before (plaintext, nothing to verify).
 pub fn refuse_notifier(
@@ -659,7 +686,10 @@ pub fn refuse_notifier(
     // TS 23.501 §6.3.1.0) that presents the subscription's own token. The token
     // is per subscription, so a relay that saw another subscription's cannot
     // use it here; `correlated` already says this one is held.
-    if names("NRF") || names("SCP") {
+    // #2131: the shared relay rule, so `[SCP, X]` is X, not a relay.
+    let relay_scp = nextgcore_sbi::owner_binding::is_relay_certificate(&request.peer_cert_nf_types)
+        && names("SCP");
+    if names("NRF") || relay_scp {
         return None;
     }
     refuse(
@@ -819,11 +849,49 @@ mod tests {
         assert!(!book.holds("0123456789abcdef0123456789abcdef", now));
     }
 
+    /// #2131 (R40 on #2119): a callback URI without the token segment cannot
+    /// carry the token, so none is left pending (none can be activated) and no
+    /// subscribe is sent; a tokenised one gets the minted token, held.
+    ///
+    /// REVERT-VERIFIED: with `callback_uri_with_token` returning the URI
+    /// unchanged when it has no token segment, the tokenless case yields a URI
+    /// and the `None` assertion fails.
+    #[test]
+    fn a_callback_that_cannot_carry_the_token_activates_none_2131() {
+        let mut book = TokenBook::default();
+        assert_eq!(
+            mint_for_subscribe(
+                &mut book,
+                "https://nwdaf.example:8443/nnwdaf-callback/v1/other"
+            ),
+            None
+        );
+        assert!(book.pending.is_empty(), "the minted token was abandoned");
+        assert!(book.current.is_none());
+        let (token, uri) = mint_for_subscribe(
+            &mut book,
+            &format!(
+                "https://nwdaf.example:8443{}",
+                callback_path_for("placeholder")
+            ),
+        )
+        .expect("a tokenised callback");
+        assert_eq!(
+            uri,
+            format!("https://nwdaf.example:8443/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/{token}")
+        );
+        assert!(book.holds(&token, std::time::Instant::now()));
+    }
+
     /// #2093 (probe), under production: the NRF directly, or an SCP presenting
     /// the subscription's own token, feeds NF_LOAD; an SCP presenting another
     /// (replaced, lapsed) subscription's token, and a forged sender with the right
     /// token, do not. REVERT-VERIFIED: with the SCP arm removed the relayed
     /// notification is refused; with one process-wide token the lapsed one is held.
+    /// #2131: with `holds`'s `until > now` check dropped, "once its grace
+    /// window has passed" fails (pruning cannot reach that token); with the SCP
+    /// arm back on `names("SCP")`, the mixed `[SCP, AMF]` certificate is
+    /// admitted.
     #[tokio::test]
     async fn the_nrf_or_an_scp_with_this_subscriptions_token_feeds_nf_load_2093() {
         let body = json!({
@@ -838,8 +906,13 @@ mod tests {
         });
         let mut book = TokenBook::default();
         let now = std::time::Instant::now();
+        // #2131: a replaced token still IN the book (its grace ends at `now + 1
+        // s`, after the pruning `activate` does), so only `holds`'s lapse check
+        // can refuse it once that instant has passed.
+        let graced = book.mint();
+        book.activate(&graced, now);
         let old = book.mint();
-        book.activate(&old, now);
+        book.activate(&old, now + std::time::Duration::from_secs(1));
         let current = book.mint();
         book.activate(&current, now); // the old one lapses at once
         let from = |types: &[&str]| {
@@ -848,8 +921,8 @@ mod tests {
             r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
             r
         };
-        let deliver = |types: &'static [&'static str], token: String| {
-            let correlated = book.holds(&token, now + std::time::Duration::from_millis(1));
+        let deliver_at = |types: &'static [&'static str], token: String, at_ms: u64| {
+            let correlated = book.holds(&token, now + std::time::Duration::from_millis(at_ms));
             let req = from(types);
             async move {
                 let ctx = isolated_ctx();
@@ -858,6 +931,7 @@ mod tests {
                 (resp.status, nf_load_infos(&ctx, "smf-2093").len())
             }
         };
+        let deliver = |types: &'static [&'static str], token: String| deliver_at(types, token, 1);
         assert_eq!(
             deliver(&["NRF"], current.clone()).await,
             (204, 1),
@@ -877,6 +951,25 @@ mod tests {
             deliver(&["AMF"], current.clone()).await,
             (403, 0),
             "a forged sender with the right token"
+        );
+        // #2131 (R40): the lapse check alone. `graced` is still in the book:
+        // held within its grace window, refused once it has passed.
+        assert_eq!(
+            deliver_at(&["SCP"], graced.clone(), 1).await,
+            (204, 1),
+            "a replaced subscription's token within its grace window"
+        );
+        assert_eq!(
+            deliver_at(&["SCP"], graced.clone(), 2_000).await,
+            (403, 0),
+            "the same token once its grace window has passed"
+        );
+        // #2131 (R40): a certificate naming SCP and another type is that NF's
+        // (the #2113 relay rule), not a relay's.
+        assert_eq!(
+            deliver(&["SCP", "AMF"], current.clone()).await,
+            (403, 0),
+            "a mixed [SCP, AMF] certificate is an AMF's"
         );
     }
 
