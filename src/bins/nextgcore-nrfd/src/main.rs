@@ -15586,6 +15586,9 @@ mod tests_shipped_nf_set_allowlist_2052 {
                 "global.plmn.mcc=001",
                 "--set-string",
                 "global.plmn.mnc=01",
+                // #2069: the seeded subscriber's IMSI is of global.plmn.
+                "--set-string",
+                "subscriber.imsi=001010000000001",
             ],
         )
         .expect("helm ran above");
@@ -15595,11 +15598,13 @@ mod tests_shipped_nf_set_allowlist_2052 {
             "the derived entry follows amf.config.amfId and global.plmn: {nrf}"
         );
 
-        // An operator's list replaces the derived entry.
+        // An operator's list replaces the derived entry. #2069: under production
+        // every entry names its NF instances (an id-less one fails the render).
         let explicit = format!(
             "nrf.nfSetAllowlist=[{{\"nf_set_id\":\"SET001.region02.amfset.5gc.mnc070.mcc999\",\
              \"nf_types\":[\"AMF\"],\"nf_instance_ids\":[\"{amf_id}\"]}},\
-             {{\"nf_set_id\":\"set1.pcfset.5gc.mnc070.mcc999\",\"nf_types\":[\"PCF\"]}}]"
+             {{\"nf_set_id\":\"set1.pcfset.5gc.mnc070.mcc999\",\"nf_types\":[\"PCF\"],\
+             \"nf_instance_ids\":[\"6b1d7e3c-0000-4000-8000-000000000cf0\"]}}]"
         );
         let rendered = helm_render::render_chart_with(
             &root,
@@ -15629,6 +15634,63 @@ mod tests_shipped_nf_set_allowlist_2052 {
             "the operator's list, verbatim"
         );
         check("helm (operator list)", &nrf, &amf, &amf_id);
+    }
+
+    /// #2069: a leading-zero PLMN reaches the NRF and the AMF with its exact
+    /// digits, in the dev and the production profile: TS 23.003's test PLMN
+    /// 001-01 and a 3-digit MNC 070 (TS 23.003 §2.2). The AMF Set NF Set ID
+    /// nrfd derives from the GUAMI the rendered amf.yaml configures is the
+    /// one the chart derived for nrf.nf_set_allowlist, digit for digit, so a
+    /// production NRF admits the AMF ([`check`]).
+    ///
+    /// REVERT-VERIFIED: with `nextgcore.plmnId` rendering the digits through
+    /// `int` (the leading zeros dropped), the "the GUAMI's NF Set ID" assertion
+    /// fails (`...mnc001.mcc1` for 001-01). The template's unquoted form alone
+    /// does not: serde_yaml 0.9 reads an unquoted `001` as a string;
+    /// nextgcore-core's `every_rendered_config_carries_the_plmn_digits_quoted_2069`
+    /// covers that.
+    #[test]
+    fn a_leading_zero_plmn_reaches_the_nrf_and_its_allowlist_2069() {
+        let root = repo_root();
+        for profile in ["dev", "production"] {
+            for (mcc, mnc, imsi) in [
+                ("001", "01", "001010000000001"),
+                ("001", "070", "001070000000001"),
+            ] {
+                let args = [
+                    format!("global.sbiProfile={profile}"),
+                    format!("global.plmn.mcc={mcc}"),
+                    format!("global.plmn.mnc={mnc}"),
+                    format!("subscriber.imsi={imsi}"),
+                ];
+                let mut extra = Vec::new();
+                for a in &args {
+                    extra.extend(["--set-string", a.as_str()]);
+                }
+                let Some(rendered) = helm_render::render_chart_with(&root, &extra) else {
+                    return;
+                };
+                let case = format!("helm {profile}, PLMN {mcc}-{mnc}");
+                let nrf = helm_render::config_in(&rendered, "nrf.yaml").expect("nrf.yaml");
+                let amf = helm_render::config_in(&rendered, "amf.yaml").expect("amf.yaml");
+                let amf_id = helm_render::deployment_env_in(
+                    &rendered,
+                    "t-amf",
+                    "amf",
+                    "NEXTGCORE_AMF_INSTANCE_ID",
+                )
+                .expect("the AMF pins its nfInstanceId");
+                let profile_doc = amf_info_for(&amf);
+                let guamis = nextgcore_nrfd::sbi_path::guami_list_of(&profile_doc);
+                let mnc3 = format!("{mnc:0>3}");
+                assert_eq!(
+                    amf_set_nf_set_id(2, 1, guamis[0]).as_deref(),
+                    Some(format!("set001.region02.amfset.5gc.mnc{mnc3}.mcc{mcc}").as_str()),
+                    "{case}: the GUAMI's NF Set ID carries the PLMN's digits"
+                );
+                check(&case, &nrf, &amf, &amf_id);
+            }
+        }
     }
 
     /// #2052: the static k8s manifests (k8s/manifests/configmap.yaml, the base
