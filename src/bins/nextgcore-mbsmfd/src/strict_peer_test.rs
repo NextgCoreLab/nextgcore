@@ -31,6 +31,22 @@ use nextgcore_sbi::multipart;
 // The single Nmbsmf_MBSSession ContextUpdate route under test.
 const ROUTE: &str = "/nmbsmf-mbssession/v1/mbs-sessions/contexts/update";
 
+/// The strict peer's NF instance ID: the body's `nfcInstanceId` and the
+/// verified identity it calls with (#2060: they must agree).
+///
+/// #2157: the peer used to call with no identity at all, which only a dev
+/// deployment admits, so these tests passed only after a sibling had set the
+/// Dev override and failed 403 alone. A conformant AMF proves who it is, so the
+/// peer now carries its access-token subject and the round trip runs under the
+/// default (production) profile.
+const AMF_PEER: &str = "amf-strict-peer";
+
+/// `req` as the strict peer's verified identity (its token `sub`).
+fn as_amf_peer(mut req: SbiRequest) -> SbiRequest {
+    req.oauth2_subject = Some(AMF_PEER.to_string());
+    req
+}
+
 // Every golden container below carries TMGI PLMN 208/93 (BCD `02 F8 39` per
 // TS 24.008 §10.5.1.3) so the shared prefix is reviewer-rederivable; each test
 // uses a distinct 3-octet MBS Service ID to isolate its session in the global
@@ -116,7 +132,7 @@ fn session_transport_present(svc: [u8; 3]) -> bool {
 /// references `content_id`. No `crate::types` involved.
 fn amf_ctx_update_json(svc_hex: &str, ngap_ie_type: &str, content_id: &str) -> String {
     format!(
-        r#"{{"nfcInstanceId":"amf-strict-peer","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc_hex}","plmnId":{{"mcc":"208","mnc":"93"}}}}}},"ranNodeId":{{"gNbId":{{"bitLength":24,"gNBValue":"000001"}}}},"n2MbsSmInfo":{{"ngapIeType":"{ngap_ie_type}","ngapData":{{"contentId":"{content_id}"}}}}}}"#
+        r#"{{"nfcInstanceId":"{AMF_PEER}","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc_hex}","plmnId":{{"mcc":"208","mnc":"93"}}}}}},"ranNodeId":{{"gNbId":{{"bitLength":24,"gNBValue":"000001"}}}},"n2MbsSmInfo":{{"ngapIeType":"{ngap_ie_type}","ngapData":{{"contentId":"{content_id}"}}}}}}"#
     )
 }
 
@@ -142,7 +158,7 @@ async fn amf_post_multipart(json: &str, content_id: &str, ngap_bytes: &[u8]) -> 
     for p in decoded.parts {
         req.http.add_part(p);
     }
-    crate::mbsmf_sbi_request_handler(req).await
+    crate::mbsmf_sbi_request_handler(as_amf_peer(req)).await
 }
 
 /// AMF peer decodes an mbsmfd 200 multipart/related response: re-encode the
@@ -245,14 +261,16 @@ async fn mbs_context_update_strict_peer_corrupt_container_4xx() {
     let json = amf_ctx_update_json("0000b4", "MBS_DIS_SETUP_REQ", "binaryDataN2Information");
     let rsp = amf_post_multipart(&json, "binaryDataN2Information", &container).await;
 
-    assert_ne!(
-        rsp.status, 200,
-        "corrupt container must NOT pass through as 200"
+    // #2157: exactly 400 (TS 29.500 §5.2.7.2, the decode refusal). The old
+    // "not 200, some 4xx/5xx" was also met by the 403 an anonymous peer gets
+    // under production, which is how this test hid its profile dependency.
+    assert_eq!(
+        rsp.status, 400,
+        "corrupt container is fail-closed 400, not passed through as 200"
     );
     assert!(
-        (400..600).contains(&rsp.status),
-        "corrupt container is fail-closed (4xx/5xx), got {}",
-        rsp.status
+        !session_transport_present(SVC),
+        "a refused setup establishes no shared transport"
     );
     assert!(
         rsp.http
@@ -273,9 +291,9 @@ async fn mbs_context_update_strict_peer_json_only_dangling_400() {
 
     let json = amf_ctx_update_json("0000d6", "MBS_DIS_SETUP_REQ", "binaryDataN2Information");
     // No `.with_part(...)`: the referenced contentId has no body part.
-    let rsp = crate::mbsmf_sbi_request_handler(
+    let rsp = crate::mbsmf_sbi_request_handler(as_amf_peer(
         SbiRequest::post(ROUTE).with_body(json, "application/json"),
-    )
+    ))
     .await;
 
     assert_eq!(rsp.status, 400, "dangling contentId is fail-closed");

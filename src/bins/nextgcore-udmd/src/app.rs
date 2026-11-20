@@ -650,6 +650,8 @@ pub async fn run() -> Result<()> {
     drop(crate::ee_amf::spawn_unsubscribe_reconciler());
     // #2125: and EE subscriptions lapse at their granted expiry.
     spawn_ee_expiry_sweep();
+    // #2182: the AMF leg renewal, on a task of its own (not the lapse sweep's).
+    crate::ee_amf::spawn_amf_leg_renewal();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -1129,12 +1131,16 @@ async fn route_nudm_ueau(
     uri: &str,
 ) -> SbiResponse {
     // #1866: KAUSF goes to the AUSF only. Refused before the SUPI is parsed or
-    // the UDR is read, so a refusal has no side effect.
-    if let Some(refused) = crate::consumer_gate::refuse_consumer_type(
+    // the UDR is read, so a refusal has no side effect. #2082: by the shared
+    // verified-NF-type rule (CONVENTIONS), so a certificate without NF types,
+    // or a relay's alone, is no AUSF under production.
+    if let Some(refused) = nextgcore_sbi::owner_binding::nf_type_refusal(
         request,
+        nextgcore_sbi::types::NfType::Ausf,
         "nudm-ueau",
-        crate::consumer_gate::UEAU_CONSUMER_NF_TYPES,
-    ) {
+    )
+    .await
+    {
         return refused;
     }
     let supi = parts.get(2).copied().unwrap_or("");
@@ -2840,37 +2846,93 @@ pub async fn sweep_expired_ee_subscriptions(now: u64) -> usize {
             .unwrap_or_default()
     };
     let count = expired.len();
-    // #2149 (R42 on #2144), the #2128 shape: releases are grouped by the AMF
-    // holding each leg, up to EE_SWEEP_MAX_AMFS AMFs at once, each in turn. An
-    // AMF that fails one release (no answer, a 5xx) is not tried again this
-    // sweep: its remaining legs are parked for the unsubscribe reconciler at
-    // once. So a blackholed AMF costs one request timeout per sweep, and the
-    // other AMFs' legs are released regardless.
-    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<UdmEeSubscription>> =
-        std::collections::BTreeMap::new();
-    for sub in expired {
-        log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
-        by_amf
-            .entry(crate::ee_amf::leg_authority(&sub))
-            .or_default()
-            .push(sub);
-    }
-    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(EE_SWEEP_MAX_AMFS));
-    let mut workers = tokio::task::JoinSet::new();
-    for (_, subs) in by_amf {
-        let slots = slots.clone();
-        workers.spawn(async move {
-            let _slot = slots.acquire_owned().await;
-            let mut amf_failed = false;
-            for sub in &subs {
-                if !crate::ee_amf::release_with(sub, !amf_failed).await {
-                    amf_failed = true;
-                }
+    // #2149 (R42 on #2144), the #2128 shape, now the shared sweep (#2186):
+    // releases are grouped by the AMF holding each leg, one at a time per AMF, up
+    // to EE_SWEEP_MAX_AMFS AMFs at once. An AMF that fails one release (no
+    // answer, a 5xx) is parked for the rest of the pass, and so is anything the
+    // pass's budget does not reach: those legs go to the unsubscribe reconciler
+    // at once (the records are already gone, so nothing else would release them).
+    // So a blackholed AMF costs one request timeout per sweep, and the other
+    // AMFs' legs are released regardless.
+    //
+    // #2186 (R44 minor 3): cancel-safe. The records are already gone, so a leg
+    // whose release had not finished (or not started) when the pass is dropped
+    // (shutdown) would be lost: `unsettled` holds every leg until its release
+    // settles it (delivered or parked), and its drop parks the rest for the
+    // reconciler.
+    let unsettled = std::sync::Arc::new(UnsettledLegs::default());
+    let items: Vec<_> = expired
+        .into_iter()
+        .map(|sub| {
+            log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
+            if let Some(leg) = &sub.amf_leg {
+                unsettled.hold(&sub.id, &leg.subscription_uri);
             }
-        });
+            (crate::ee_amf::leg_authority(&sub), sub)
+        })
+        .collect();
+    let settle = unsettled.clone();
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: EE_SWEEP_MAX_AMFS,
+        budget: EE_EXPIRY_SWEEP,
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        items,
+        || (),
+        move |_amf, sub: UdmEeSubscription, ()| {
+            let settle = settle.clone();
+            async move {
+                let delivered = crate::ee_amf::release_with(&sub, true).await;
+                settle.settled(&sub.id);
+                let verdict = if delivered {
+                    nextgcore_sbi::sweep::Verdict::Answered
+                } else {
+                    nextgcore_sbi::sweep::Verdict::PeerDown
+                };
+                (verdict, ())
+            }
+        },
+    )
+    .await;
+    for (_, sub, _) in report.skipped {
+        crate::ee_amf::release_with(&sub, false).await;
+        unsettled.settled(&sub.id);
     }
-    while workers.join_next().await.is_some() {}
     count
+}
+
+/// #2186: the AMF legs of a release sweep not yet settled (delivered or
+/// parked); dropped with any left, it parks them for the unsubscribe reconciler.
+#[derive(Default)]
+struct UnsettledLegs(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl UnsettledLegs {
+    fn hold(&self, id: &str, uri: &str) {
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(id.to_string(), uri.to_string());
+        }
+    }
+
+    fn settled(&self, id: &str) {
+        if let Ok(mut m) = self.0.lock() {
+            m.remove(id);
+        }
+    }
+}
+
+impl Drop for UnsettledLegs {
+    fn drop(&mut self) {
+        let left: Vec<String> = match self.0.lock() {
+            Ok(mut m) => m.drain().map(|(_, uri)| uri).collect(),
+            Err(_) => return,
+        };
+        for uri in left {
+            log::warn!("EE release sweep cancelled: {uri} parked for the unsubscribe reconciler");
+            crate::ee_amf::park_unsubscribe(&uri);
+        }
+    }
 }
 
 /// #2149: at most this many AMFs are released at once in one sweep.
@@ -4352,8 +4414,16 @@ mod tests {
     /// another NF type gets 403 on every Nudm_UEAU operation, before the body is
     /// read; the AUSF reaches the handler (its 400 names the missing IE, which
     /// only the handler produces).
+    ///
+    /// #2082: the gate is the shared `owner_binding::nf_type_refusal`, so the
+    /// certificates carry their NF Instance ID as a verified one does. The
+    /// router reads the process profile; this test asserts the dev routing
+    /// (Dev set and left set, CONVENTIONS), and the production refusals of an
+    /// untyped or relay-only certificate are pinned in sbi
+    /// `the_nf_type_gate_admits_only_a_verified_type_2082`.
     #[tokio::test]
     async fn nudm_ueau_is_refused_to_a_non_ausf_certificate_1866() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         const SUPI: &str = "imsi-001010000000001";
         let gen = format!("/nudm-ueau/v1/{SUPI}/security-information/generate-auth-data");
         let request = |method: &str, uri: &str, types: &[&str], body: serde_json::Value| {
@@ -4364,6 +4434,7 @@ mod tests {
             r.http.set_content(body.to_string());
             r.http.set_header("Content-Type", "application/json");
             r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r.peer_cert_nf_instance_id = Some("dddddddd-1866-4000-8000-00000000000d".to_string());
             r
         };
         let full = serde_json::json!({
@@ -4382,7 +4453,9 @@ mod tests {
                 let pd: serde_json::Value = serde_json::from_str(&body).expect("ProblemDetails");
                 let detail = pd["detail"].as_str().unwrap_or_default();
                 assert!(
-                    detail.contains("served to NF type(s) [\"AUSF\"] only") && detail.contains(t),
+                    detail.contains("nudm-ueau")
+                        && detail.contains(t)
+                        && detail.contains("not AUSF"),
                     "{body}"
                 );
                 assert!(
@@ -6230,6 +6303,7 @@ mod tests {
             notify_uri: "http://nef.example.org/ee-notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY_REPORT".to_string()],
             expiry: None,
+            amf_expiry: None,
         });
         let lapsed_id = lapsed.id.clone();
         udm_self().read().unwrap().ee_subscription_insert(lapsed);
@@ -7346,9 +7420,15 @@ mod tests {
             .unwrap_or_else(|_| SbiResponse::with_status(500))
     }
 
-    /// A stub AUSF that counts the Nausf_SoRProtection / UPUProtection requests
-    /// it receives. Registered in the shared SBI context under `instance_id` so
-    /// udmd's AUSF selection can resolve it.
+    /// A stub AUSF that counts every Nausf_SoRProtection / UPUProtection request
+    /// it receives. Registered in the process-wide SBI NF cache under
+    /// `instance_id` so udmd's AUSF selection can resolve it, so the caller must
+    /// hold `CONTEXT_GUARD` and remove it again (`remove_stub_ausfs`).
+    ///
+    /// #2210: it counts all requests, not only its test's SUPI. The stray hit
+    /// #2082 saw on `ausf-a` (shuffle seed 9001) came from sor.rs's
+    /// "AUSF unreachable" tests reading the cache without the guard. They take
+    /// it now, so isolation needs no filter.
     async fn start_stub_ausf(
         instance_id: &str,
     ) -> (SbiServer, Arc<std::sync::atomic::AtomicUsize>) {
@@ -7362,10 +7442,12 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
         server
-            .start(move |_req: SbiRequest| {
+            .start(move |req: SbiRequest| {
                 let counter = Arc::clone(&counter);
                 async move {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if req.header.uri.contains("/nausf-") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     // 204 with no SorSecurityInfo: the injector then withholds
                     // (fail-closed). WHICH AUSF was asked is the whole question
                     // here, so a successful protection is not needed.
@@ -7388,6 +7470,20 @@ mod tests {
         instance.add_service(svc);
         global_context().add_nf_instance(instance).await;
         (server, hits)
+    }
+
+    /// #2210: take every AUSF out of the process-wide NF cache. The pinning test
+    /// calls it first, so the "any cached AUSF" fallback can only find its own
+    /// stand-ins, and last, so no sibling reaches a stopped stand-in through
+    /// that fallback. The caller holds `CONTEXT_GUARD`.
+    async fn remove_stub_ausfs() {
+        let ctx = nextgcore_sbi::context::global_context();
+        for inst in ctx
+            .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Ausf)
+            .await
+        {
+            ctx.remove_nf_instance(&inst.id).await;
+        }
     }
 
     /// #1811: the UDM's real 5G AKA (Nudm_UEAU generate-auth-data: the
@@ -7530,12 +7626,15 @@ mod tests {
         std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
 
         let (udm_server, client) = start_real_udm().await;
-        let supi = "imsi-001010000000001";
+        let supi = "imsi-001010000002082";
         let gen_path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
 
         // --- criterion 5a: the request's ausfInstanceId is PERSISTED ---------
-        // Two AUSFs exist; "ausf-a" is registered first, so it is what the
-        // "any cached AUSF" fallback would pick.
+        // #2210: isolated, not filtered. Under CONTEXT_GUARD, with every other
+        // AUSF taken out of the cache, exactly two AUSFs exist; "ausf-a" is
+        // registered first, so it is what the "any cached AUSF" fallback would
+        // pick. Both stand-ins count every request they get.
+        remove_stub_ausfs().await;
         let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a").await;
         let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b").await;
 
@@ -7688,6 +7787,14 @@ mod tests {
         udr_server.stop().await.expect("stop udr");
         ausf_a_server.stop().await.expect("stop ausf-a");
         ausf_b_server.stop().await.expect("stop ausf-b");
+        remove_stub_ausfs().await;
+        assert!(
+            nextgcore_sbi::context::global_context()
+                .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Ausf)
+                .await
+                .is_empty(),
+            "no stand-in AUSF is left for a sibling's fallback"
+        );
     }
 
     // ========================================================================

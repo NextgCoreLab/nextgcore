@@ -2037,7 +2037,7 @@ mod tests {
             &[0xA8, 0x40],
             &nextgcore_amfd::n26_build::encode_enb_target_identification(
                 &[0x00, 0xF1, 0x10],
-                nextgcore_ngap::types::NgEnbId::Macro(0x804),
+                nextgcore_amfd::ngap_types::NgEnbId::Macro(0x804),
                 [0x00, 0x01],
             )
             .expect("a macro eNB id encodes"),
@@ -2627,7 +2627,7 @@ mod tests {
         // A well-formed eNB this MME has no S1 with.
         let elsewhere = nextgcore_amfd::n26_build::encode_enb_target_identification(
             &[0x00, 0xF1, 0x10],
-            nextgcore_ngap::types::NgEnbId::Macro(0x7_4199),
+            nextgcore_amfd::ngap_types::NgEnbId::Macro(0x7_4199),
             [0x00, 0x01],
         )
         .unwrap();
@@ -2639,7 +2639,7 @@ mod tests {
         // Positive control: the bystander itself, named, is admitted.
         let named = nextgcore_amfd::n26_build::encode_enb_target_identification(
             &[0x00, 0xF1, 0x10],
-            nextgcore_ngap::types::NgEnbId::Macro(0x7_4101),
+            nextgcore_amfd::ngap_types::NgEnbId::Macro(0x7_4101),
             [0x00, 0x01],
         )
         .unwrap();
@@ -2700,7 +2700,7 @@ mod tests {
         pdn.add_ie(nextgcore_gtp::v2::Gtp2AmbrIe::new(1_000, 2_000).to_ie(0));
         let named = nextgcore_amfd::n26_build::encode_enb_target_identification(
             &[0x00, 0xF1, 0x10],
-            nextgcore_ngap::types::NgEnbId::Macro(0x9_6301),
+            nextgcore_amfd::ngap_types::NgEnbId::Macro(0x9_6301),
             [0x00, 0x01],
         )
         .unwrap();
@@ -2822,7 +2822,7 @@ mod tests {
     #[test]
     fn the_relocation_target_is_the_enb_the_target_identification_names() {
         use crate::context::PlmnId;
-        use nextgcore_ngap::types::NgEnbId;
+        use nextgcore_amfd::ngap_types::NgEnbId;
         use nextgcore_s1ap::EnbId;
         let mut ctx = MmeContext::new();
         assert!(crate::config::load_config(
@@ -3017,7 +3017,7 @@ mod tests {
             &[0xA4, 0x08],
             &nextgcore_amfd::n26_build::encode_enb_target_identification(
                 &[0x00, 0xF1, 0x10],
-                nextgcore_ngap::types::NgEnbId::Macro(0x408),
+                nextgcore_amfd::ngap_types::NgEnbId::Macro(0x408),
                 [0x04, 0x08],
             )
             .expect("fits"),

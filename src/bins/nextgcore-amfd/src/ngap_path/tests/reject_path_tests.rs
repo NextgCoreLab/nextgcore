@@ -148,24 +148,18 @@ async fn stored_tacs(server: &NgapServer) -> Vec<u32> {
 
 /// A RAN CONFIGURATION UPDATE replacing the TA list with TAC 7.
 fn rcu() -> Vec<u8> {
-    nextgcore_ngap::builder::build_ran_configuration_update(
-        &nextgcore_ngap::types::RanConfigurationUpdate {
-            ran_node_name: Some("g752".to_string()),
-            supported_ta_list: Some(vec![nextgcore_ngap::types::SupportedTaItem {
-                tac: [0x00, 0x00, 0x07],
-                broadcast_plmn_list: vec![nextgcore_ngap::types::BroadcastPlmnItem {
-                    plmn_identity: [0x99, 0xF9, 0x07],
-                    tai_slice_support_list: vec![nextgcore_ngap::types::SNssai {
-                        sst: 1,
-                        sd: None,
-                    }],
-                }],
-            }]),
-            default_paging_drx: None,
-            global_ran_node_id: None,
-        },
-    )
-    .expect("build")
+    crate::gnb_pdus::ran_configuration_update(&crate::ngap_types::RanConfigurationUpdate {
+        ran_node_name: Some("g752".to_string()),
+        supported_ta_list: Some(vec![crate::ngap_types::SupportedTaItem {
+            tac: [0x00, 0x00, 0x07],
+            broadcast_plmn_list: vec![crate::ngap_types::BroadcastPlmnItem {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tai_slice_support_list: vec![crate::ngap_types::SNssai { sst: 1, sd: None }],
+            }],
+        }]),
+        default_paging_drx: None,
+        global_ran_node_id: None,
+    })
 }
 
 /// `pdu` with one more protocol IE appended (`id`, criticality octet, a

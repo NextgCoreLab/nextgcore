@@ -666,6 +666,10 @@ fn created(location: String, body: &Value) -> SbiResponse {
 /// MTLF, `/subscriptions` by an AnLF-only NWDAF; with the demo off, or on the
 /// other role, both are 404. Creates and manages are owner-bound under
 /// [`owner_binding::identity_required`] (the SBI profile), see the module docs.
+///
+/// #2239: tests only. The router calls [`route_with`] with its own profile, so
+/// nothing in the binary reads the process profile here.
+#[cfg(test)]
 pub fn route(
     monitor: Option<&'static Monitor>,
     ctx: &RwLock<NwdafContext>,

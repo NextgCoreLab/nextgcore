@@ -504,7 +504,7 @@ pub(crate) fn encode_initiating(
         .ok()
 }
 
-/// Build Multicast Session Activation Request (AMF -> gNB), TS 38.413 §9.2.9.1,
+/// Build Multicast Session Activation Request (AMF -> gNB), TS 38.413 §9.2.17.6,
 /// with the GENERATED codec (#417). Both IEs and the procedure are criticality
 /// reject.
 ///
@@ -558,7 +558,7 @@ fn build_mcast_session_activation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
     )
 }
 
-/// Build Multicast Session Deactivation Request (AMF -> gNB), TS 38.413 §9.2.9.3,
+/// Build Multicast Session Deactivation Request (AMF -> gNB), TS 38.413 §9.2.17.9,
 /// with the GENERATED codec (#417): the activation request's shape
 /// (38413-j30.txt:42892) with the deactivation transfer, IE 305.
 fn build_mcast_session_deactivation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
@@ -603,7 +603,7 @@ fn build_mcast_session_deactivation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
     )
 }
 
-/// Build Multicast Group Paging (AMF -> gNBs in the MBS area), TS 38.413 §9.2.9.5,
+/// Build Multicast Group Paging (AMF -> gNBs in the MBS area), TS 38.413 §9.2.4.2,
 /// with the GENERATED codec (#417). The procedure and both IEs are criticality
 /// ignore (38413-j30.txt:43085): a peer that cannot parse the area list still
 /// pages.
@@ -692,10 +692,7 @@ fn build_mcast_group_paging(tmgi: &Tmgi, area_tacs: &[u32]) -> Option<Vec<u8>> {
 pub(crate) mod tests {
     use super::*;
 
-    use nextgcore_asn1c::ngap::types::ProcedureCode;
-    use nextgcore_ngap::ie::MulticastGroupPagingArea;
-    use nextgcore_ngap::mbs_transfer::MbsSessionId;
-    use nextgcore_ngap::types::TaiListItem;
+    use crate::aper_golden::{self, Bits};
 
     fn test_tmgi() -> Tmgi {
         Tmgi::new(0x000101, [0x00, 0xF1, 0x10])
@@ -969,7 +966,7 @@ pub(crate) mod tests {
 
         let msg = ctx.build_group_paging(session.mbs_session_id).unwrap();
         let (proc_code, ies) = decode_initiating(&msg);
-        assert_eq!(proc_code, ProcedureCode::MULTICAST_GROUP_PAGING.0);
+        assert_eq!(proc_code, ngap_gen::ID_MULTICAST_GROUP_PAGING);
         assert_eq!(proc_code, 74, "38413-j30.txt:59161");
 
         // The IEs are the ones TS 38.413 lists, and the area list is present
@@ -1007,7 +1004,7 @@ pub(crate) mod tests {
             .build_group_paging(populated.mbs_session_id)
             .expect("one TAC is enough to page");
         let (proc_code, ies) = decode_initiating(&msg);
-        assert_eq!(proc_code, ProcedureCode::MULTICAST_GROUP_PAGING.0);
+        assert_eq!(proc_code, ngap_gen::ID_MULTICAST_GROUP_PAGING);
         assert!(ies.contains(&307), "the area list must be on the wire");
     }
 
@@ -1015,7 +1012,7 @@ pub(crate) mod tests {
     fn an_activation_pdu_decodes_as_procedure_71_carrying_session_id_and_transfer() {
         let msg = build_mcast_session_activation_request(&test_tmgi()).unwrap();
         let (proc_code, ies) = decode_initiating(&msg);
-        assert_eq!(proc_code, ProcedureCode::MULTICAST_SESSION_ACTIVATION.0);
+        assert_eq!(proc_code, ngap_gen::ID_MULTICAST_SESSION_ACTIVATION);
         assert_eq!(proc_code, 71, "38413-j30.txt:59155");
         assert_eq!(
             ies,
@@ -1029,7 +1026,7 @@ pub(crate) mod tests {
     fn a_deactivation_pdu_decodes_as_procedure_72_with_its_own_transfer_ie() {
         let msg = build_mcast_session_deactivation_request(&test_tmgi()).unwrap();
         let (proc_code, ies) = decode_initiating(&msg);
-        assert_eq!(proc_code, ProcedureCode::MULTICAST_SESSION_DEACTIVATION.0);
+        assert_eq!(proc_code, ngap_gen::ID_MULTICAST_SESSION_DEACTIVATION);
         assert_eq!(proc_code, 72, "38413-j30.txt:59157");
         assert_eq!(
             ies,
@@ -1043,20 +1040,22 @@ pub(crate) mod tests {
     /// 68/69/70/71, so activation was labelled `id-BroadcastSessionSetup`.
     #[test]
     fn mbs_procedure_codes_are_distinct_from_the_broadcast_procedures() {
+        // #417 stage B: the generated constants (the V17.9 ASN.1 constant definitions, §9.4.7), in place
+        // of the hand-written asn1c table.
         let codes = [
-            ProcedureCode::MULTICAST_SESSION_ACTIVATION.0,
-            ProcedureCode::MULTICAST_SESSION_DEACTIVATION.0,
-            ProcedureCode::MULTICAST_SESSION_UPDATE.0,
-            ProcedureCode::MULTICAST_GROUP_PAGING.0,
+            ngap_gen::ID_MULTICAST_SESSION_ACTIVATION,
+            ngap_gen::ID_MULTICAST_SESSION_DEACTIVATION,
+            ngap_gen::ID_MULTICAST_SESSION_UPDATE,
+            ngap_gen::ID_MULTICAST_GROUP_PAGING,
         ];
         assert_eq!(codes, [71, 72, 73, 74]);
 
         // Controls: the codes an off-by-three lands on (38413-j30.txt:59145-59153).
-        assert_eq!(ProcedureCode::BROADCAST_SESSION_MODIFICATION.0, 66);
-        assert_eq!(ProcedureCode::BROADCAST_SESSION_RELEASE.0, 67);
-        assert_eq!(ProcedureCode::BROADCAST_SESSION_SETUP.0, 68);
-        assert_eq!(ProcedureCode::DISTRIBUTION_SETUP.0, 69);
-        assert_eq!(ProcedureCode::DISTRIBUTION_RELEASE.0, 70);
+        assert_eq!(ngap_gen::ID_BROADCAST_SESSION_MODIFICATION, 66);
+        assert_eq!(ngap_gen::ID_BROADCAST_SESSION_RELEASE, 67);
+        assert_eq!(ngap_gen::ID_BROADCAST_SESSION_SETUP, 68);
+        assert_eq!(ngap_gen::ID_DISTRIBUTION_SETUP, 69);
+        assert_eq!(ngap_gen::ID_DISTRIBUTION_RELEASE, 70);
         for code in codes {
             assert!(
                 !(66..=70).contains(&code),
@@ -1065,12 +1064,71 @@ pub(crate) mod tests {
         }
     }
 
-    /// The hand-written codec's `MBS-SessionID` for `tmgi` with its halves
-    /// SWAPPED: it writes its `plmn_identity` field first, so feeding it the
-    /// service id there yields the TS 23.003 octet order, and every remaining
-    /// byte can be compared as-is.
-    fn spec_ordered_hand_written_id(tmgi: &Tmgi) -> MbsSessionId {
-        MbsSessionId::new(tmgi.mbs_service_id, tmgi.plmn_id)
+    /// The six TMGI octets as TS 23.003 §30.2 orders them: MBS Service ID first,
+    /// then the PLMN. The hand-written codec had them the other way round.
+    fn derived_tmgi(tmgi: &Tmgi) -> Vec<u8> {
+        let mut o = tmgi.mbs_service_id.to_vec();
+        o.extend_from_slice(&tmgi.plmn_id);
+        o
+    }
+
+    /// MBS-SessionID (§9.3.1.206) with no NID: extension `0`, nID `0`,
+    /// iE-Extensions `0`, padded `00`, then TMGI `OCTET STRING (SIZE(6))` --
+    /// fixed and longer than two octets, so aligned with no length (§17.6).
+    fn derived_session_id(tmgi: &Tmgi) -> Vec<u8> {
+        let mut b = Bits::default();
+        b.field(0, 3).octets(&derived_tmgi(tmgi));
+        b.finish()
+    }
+
+    /// MULTICAST SESSION ACTIVATION / DEACTIVATION REQUEST (§9.2.17.6, §9.2.17.9):
+    /// initiatingMessage, procedure 71 / 72, reject; MBS-SessionID (299,
+    /// reject); the request transfer (304 / 305, reject), an unconstrained
+    /// OCTET STRING holding the transfer: extension `0`, iE-Extensions `0`, then
+    /// its own MBS-SessionID's three bits, padded `00`, and the TMGI.
+    fn derived_activation_or_deactivation(procedure: u8, transfer_id: u16, tmgi: &Tmgi) -> Vec<u8> {
+        let mut transfer = Bits::default();
+        transfer.field(0, 2).field(0, 3).octets(&derived_tmgi(tmgi));
+        let mut octet_string = Bits::default();
+        octet_string.open(&transfer.finish());
+        aper_golden::pdu(
+            0,
+            procedure,
+            0,
+            &[
+                (299, 0, derived_session_id(tmgi)),
+                (transfer_id, 0, octet_string.finish()),
+            ],
+        )
+    }
+
+    /// MULTICAST GROUP PAGING (§9.2.4.2): initiatingMessage, procedure 74,
+    /// ignore; MBS-SessionID (299, ignore); MulticastGroupPagingAreaList (307,
+    /// ignore): one area -- count-1 in six bits (SIZE(1..64)); the item's
+    /// extension, uE-PagingList and iE-Extensions bits `000`; the area's
+    /// extension and iE-Extensions `00`; MBS-AreaTAIList count-1 in four bits
+    /// (SIZE(1..16)); then per TAI its extension and iE-Extensions `00` and the
+    /// PLMN and TAC, both `OCTET STRING (SIZE(3))`, aligned with no length.
+    /// More than 16 TACs are cut to the first 16 (maxnoofTAIforPaging), as the
+    /// builder does.
+    fn derived_group_paging(tmgi: &Tmgi, tacs: &[u32]) -> Vec<u8> {
+        let tacs = &tacs[..tacs.len().min(MAX_TAI_FOR_PAGING)];
+        let mut area = Bits::default();
+        area.field(0, 6).field(0, 3).field(0, 2);
+        area.field(tacs.len() as u64 - 1, 4);
+        for &tac in tacs {
+            area.field(0, 2).octets(&tmgi.plmn_id).octets(&[
+                (tac >> 16) as u8,
+                (tac >> 8) as u8,
+                tac as u8,
+            ]);
+        }
+        aper_golden::pdu(
+            0,
+            74,
+            1,
+            &[(299, 1, derived_session_id(tmgi)), (307, 1, area.finish())],
+        )
     }
 
     fn tmgis() -> Vec<Tmgi> {
@@ -1082,59 +1140,50 @@ pub(crate) mod tests {
         ]
     }
 
-    /// Oracle: the generated activation and deactivation requests are the
-    /// hand-written ones byte for byte, but for the TMGI octet order the
-    /// hand-written codec had backwards (see `tmgi_octets`).
+    /// The generated activation and deactivation requests are the derived
+    /// octets, for every TMGI shape (#417 stage B: this compared them against
+    /// the hand-written builder before).
     #[test]
-    fn activation_and_deactivation_generated_match_hand_written() {
+    fn activation_and_deactivation_are_the_derived_octets() {
         for tmgi in tmgis() {
-            let id = spec_ordered_hand_written_id(&tmgi);
             assert_eq!(
                 build_mcast_session_activation_request(&tmgi).expect("generated"),
-                nextgcore_ngap::builder::build_multicast_session_activation_request(&id)
-                    .expect("hand-written"),
+                derived_activation_or_deactivation(71, 304, &tmgi),
                 "{tmgi:?}"
             );
             assert_eq!(
                 build_mcast_session_deactivation_request(&tmgi).expect("generated"),
-                nextgcore_ngap::builder::build_multicast_session_deactivation_request(&id)
-                    .expect("hand-written"),
+                derived_activation_or_deactivation(72, 305, &tmgi),
                 "{tmgi:?}"
             );
         }
+        // The derivation reproduces the octet-by-octet golden below.
+        assert_eq!(
+            derived_activation_or_deactivation(71, 304, &test_tmgi()),
+            ACTIVATION_REQUEST
+        );
     }
 
-    /// Oracle: group paging, for every area size up to maxnoofTAIforPaging and
-    /// one past it (truncated), with TACs at every octet.
+    /// Group paging, for every area size up to maxnoofTAIforPaging and one
+    /// past it (truncated), with TACs at every octet.
     #[test]
-    fn group_paging_generated_matches_hand_written() {
+    fn group_paging_is_the_derived_octets() {
         for tmgi in tmgis() {
             for n in 1..=MAX_TAI_FOR_PAGING + 1 {
                 let tacs: Vec<u32> = (0..n as u32)
                     .map(|i| (0x01_0203 * (i + 1)) & 0xFF_FFFF)
                     .collect();
-                let area_tai_list = tacs
-                    .iter()
-                    .take(MAX_TAI_FOR_PAGING)
-                    .map(|&tac| TaiListItem {
-                        tai_plmn: tmgi.plmn_id,
-                        tai_tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
-                    })
-                    .collect();
                 assert_eq!(
                     build_mcast_group_paging(&tmgi, &tacs).expect("generated"),
-                    nextgcore_ngap::builder::build_multicast_group_paging(
-                        &spec_ordered_hand_written_id(&tmgi),
-                        &[MulticastGroupPagingArea { area_tai_list }],
-                    )
-                    .expect("hand-written"),
+                    derived_group_paging(&tmgi, &tacs),
                     "{tmgi:?} with {n} TACs"
                 );
             }
         }
+        assert_eq!(derived_group_paging(&test_tmgi(), &[7]), GROUP_PAGING);
     }
 
-    /// TS 38.413 §9.2.9.1, derived by hand (X.691 ALIGNED), for MBS Service ID
+    /// TS 38.413 §9.2.17.6, derived by hand (X.691 ALIGNED), for MBS Service ID
     /// 000101 under PLMN 00F110: initiatingMessage `00`, procedure 71 `47`,
     /// reject `00`, length 26; extension bit + 2 IEs `00 00 02`.
     /// MBS-SessionID 299 `01 2B`, reject, length 7: three preamble bits
@@ -1148,7 +1197,7 @@ pub(crate) mod tests {
         0x00, 0xF1, 0x10, 0x01, 0x30, 0x00, 0x08, 0x07, 0x00, 0x00, 0x01, 0x01, 0x00, 0xF1, 0x10,
     ];
 
-    /// TS 38.413 §9.2.9.5, by hand: procedure 74 `4A`, ignore `40`, length 27.
+    /// TS 38.413 §9.2.4.2, by hand: procedure 74 `4A`, ignore `40`, length 27.
     /// MBS-SessionID as above but ignore. Area list 307 `01 33`, ignore, length
     /// 9: list count-1 in 6 bits, the item's 3 preamble bits, the area's 2, the
     /// TAI list count-1 in 4 bits, the TAI's 2 -- 17 bits, padded to `00 00
@@ -1235,57 +1284,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// Oracle for the extraction: on every outcome, the hand-written reader
-    /// (kept verbatim below) yields the same six octets, split the other way
-    /// round -- the octet order it shared with the hand-written builder.
+    /// The outcome builder above, against the derivation: successfulOutcome,
+    /// procedure 71, reject; one MBS-SessionID IE (299, ignore). So the
+    /// extraction round trip in [`an_outcome_yields_the_session_tmgi`] reads
+    /// derived bytes for every TMGI shape (#417 stage B: this was an oracle
+    /// against the hand-written reader before).
     #[test]
-    fn extraction_matches_the_hand_written_reader_but_for_the_octet_order() {
+    fn the_activation_response_is_the_derived_octets() {
         for tmgi in tmgis() {
-            let old = hand_written_extract(&activation_response(&tmgi)).expect("oracle");
             assert_eq!(
-                (old.plmn_id, old.mbs_service_id),
-                (tmgi.mbs_service_id, tmgi.plmn_id),
+                activation_response(&tmgi),
+                aper_golden::pdu(1, 71, 0, &[(299, 1, derived_session_id(&tmgi))]),
                 "{tmgi:?}"
             );
         }
-    }
-
-    /// The pre-#417 `ngap_asn1::extract_mbs_session_id`, verbatim but for its
-    /// doc comment, as the oracle above.
-    fn hand_written_extract(data: &[u8]) -> Option<Tmgi> {
-        use nextgcore_asn1c::ngap::pdu::{
-            InitiatingMessageValue, NgapPdu, SuccessfulOutcomeValue, UnsuccessfulOutcomeValue,
-        };
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
-        let mut decoder = AperDecoder::new(data);
-        let pdu = NgapPdu::decode_aper(&mut decoder).ok()?;
-        let ies = match pdu {
-            NgapPdu::InitiatingMessage(m) => match m.value {
-                InitiatingMessageValue::Other(ies) => ies,
-                _ => return None,
-            },
-            NgapPdu::SuccessfulOutcome(m) => match m.value {
-                SuccessfulOutcomeValue::Other(ies) => ies,
-                _ => return None,
-            },
-            NgapPdu::UnsuccessfulOutcome(m) => match m.value {
-                UnsuccessfulOutcomeValue::Other(ies) => ies,
-                _ => return None,
-            },
-        };
-        let field = ies
-            .ies
-            .iter()
-            .find(|ie| ie.id.0 == nextgcore_ngap::ie::IE_ID_MBS_SESSION_ID)?;
-        let mut ie_decoder = AperDecoder::new(&field.value);
-        let _ext = ie_decoder.read_bit().ok()?;
-        let _nid_present = ie_decoder.read_bit().ok()?;
-        let plmn = ie_decoder.decode_octet_string(Some(3), Some(3)).ok()?;
-        let service = ie_decoder.decode_octet_string(Some(3), Some(3)).ok()?;
-        Some(Tmgi {
-            plmn_id: plmn.try_into().ok()?,
-            mbs_service_id: service.try_into().ok()?,
-        })
     }
 }

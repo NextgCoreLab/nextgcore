@@ -31,15 +31,26 @@ type Entries = BTreeMap<String, (Instant, Duration)>;
 pub struct PeerBackoff {
     base: Duration,
     max: Duration,
+    /// What "now" is: [`Instant::now`], or a test's own clock ([`Self::with_clock`]).
+    now: fn() -> Instant,
     peers: Mutex<Entries>,
 }
 
 impl PeerBackoff {
     /// A backoff starting at `base` and capped at `max`.
     pub const fn new(base: Duration, max: Duration) -> Self {
+        Self::with_clock(base, max, Instant::now)
+    }
+
+    /// [`Self::new`], reading the time from `now` (#2196). A test whose runtime
+    /// cannot be paused (real sockets on a multi-thread runtime) passes a clock it
+    /// advances itself, so "inside the window" does not depend on how loaded the
+    /// host is; production passes [`Instant::now`] through [`Self::new`].
+    pub const fn with_clock(base: Duration, max: Duration, now: fn() -> Instant) -> Self {
         Self {
             base,
             max,
+            now,
             peers: Mutex::new(BTreeMap::new()),
         }
     }
@@ -52,7 +63,7 @@ impl PeerBackoff {
     pub fn backing_off(&self, peer: &str) -> bool {
         self.peers()
             .get(peer)
-            .is_some_and(|(next, _)| Instant::now() < *next)
+            .is_some_and(|(next, _)| (self.now)() < *next)
     }
 
     /// Record a failure at `peer`: it is left alone for `base` after its first
@@ -63,7 +74,7 @@ impl PeerBackoff {
             .get(peer)
             .map_or(self.base, |(_, current)| current.saturating_mul(2))
             .min(self.max);
-        peers.insert(peer.to_string(), (Instant::now() + wait, wait));
+        peers.insert(peer.to_string(), ((self.now)() + wait, wait));
         wait
     }
 
@@ -180,6 +191,33 @@ mod tests {
         assert!(b.backing_off("dead"));
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(!b.backing_off("dead"), "due again after its wait");
+    }
+
+    /// #2196: a backoff built `with_clock` reads that clock, not the runtime's:
+    /// the window opens and closes only as that clock moves.
+    ///
+    /// REVERT-VERIFIED: with `backing_off` and `note_failure` reading
+    /// `Instant::now()` again, this fails: the peer is still backing off after
+    /// its clock has passed the wait.
+    #[test]
+    fn a_backoff_reads_its_own_clock_2196() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        static OFFSET_MS: AtomicU64 = AtomicU64::new(0);
+        fn now() -> Instant {
+            *EPOCH.get_or_init(Instant::now)
+                + Duration::from_millis(OFFSET_MS.load(Ordering::SeqCst))
+        }
+        let b = PeerBackoff::with_clock(BASE, MAX, now);
+        b.note_failure("dead");
+        OFFSET_MS.store(
+            (BASE - Duration::from_millis(1)).as_millis() as u64,
+            Ordering::SeqCst,
+        );
+        assert!(b.backing_off("dead"), "inside its wait on its clock");
+        OFFSET_MS.store(BASE.as_millis() as u64, Ordering::SeqCst);
+        assert!(!b.backing_off("dead"), "due once its clock passes the wait");
     }
 
     /// `retain` drops the peers with nothing left parked.

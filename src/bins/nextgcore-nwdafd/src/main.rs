@@ -789,8 +789,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// NWDAF SBI request handler
+/// NWDAF SBI request handler, under the process's SBI profile.
 async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    nwdaf_sbi_request_handler_with(request, nextgcore_sbi::security::SbiProfile::resolve()).await
+}
+
+/// [`nwdaf_sbi_request_handler`] under `profile`, passed in rather than
+/// resolved from the process-wide override (#2215), so a test can drive the
+/// real router under production while sibling tests hold the Dev override.
+/// Every check in the router runs under `profile` (#2239): the NFStatusNotify
+/// sender check (`refuse_notifier`), the subscription owner checks in
+/// `sbi_handler` and the Nnwdaf_MLModelMonitor ones (`model_monitor::route_with`).
+/// Nothing below reads the process profile.
+async fn nwdaf_sbi_request_handler_with(
+    request: SbiRequest,
+    profile: nextgcore_sbi::security::SbiProfile,
+) -> SbiResponse {
+    // #2239: the owner checks' rule (`true` = production) from this profile.
+    let required = profile.is_production();
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
@@ -821,13 +837,13 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // Nnwdaf_EventsSubscription service
         ["nnwdaf-eventssubscription", "v1", "subscriptions"] => match method {
-            "POST" => handle_subscription_create(&request).await,
+            "POST" => handle_subscription_create(&request, required).await,
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["nnwdaf-eventssubscription", "v1", "subscriptions", subscription_id] => match method {
-            "GET" => handle_subscription_get(subscription_id, &request).await,
-            "PUT" => handle_subscription_update(subscription_id, &request).await,
-            "DELETE" => handle_subscription_delete(subscription_id, &request).await,
+            "GET" => handle_subscription_get(subscription_id, &request, required).await,
+            "PUT" => handle_subscription_update(subscription_id, &request, required).await,
+            "DELETE" => handle_subscription_delete(subscription_id, &request, required).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
@@ -850,12 +866,14 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Nnwdaf_MLModelProvision service — TS 29.520 is a Subscribe/Notify
         // resource on /subscriptions.
         ["nnwdaf-mlmodelprovision", "v1", "subscriptions"] => match method {
-            "POST" => handle_ml_prov_subscription_create(&request).await,
+            "POST" => handle_ml_prov_subscription_create(&request, required).await,
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["nnwdaf-mlmodelprovision", "v1", "subscriptions", subscription_id] => match method {
-            "PUT" => handle_ml_prov_subscription_update(subscription_id, &request).await,
-            "DELETE" => handle_ml_prov_subscription_delete(subscription_id, &request).await,
+            "PUT" => handle_ml_prov_subscription_update(subscription_id, &request, required).await,
+            "DELETE" => {
+                handle_ml_prov_subscription_delete(subscription_id, &request, required).await
+            }
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
@@ -866,7 +884,7 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         {
             match method {
                 "POST" if nrf_collector::holds_callback_token(token) => {
-                    nrf_collector::handle_nf_status_notify_from(&request, true).await
+                    nrf_collector::handle_nf_status_notify_from(&request, true, profile).await
                 }
                 "POST" => send_not_found("no such NF status subscription callback", None),
                 _ => send_method_not_allowed(method, "nf-status-notify/{token}"),
@@ -881,7 +899,7 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // #2081: under production this carries no subscription correlation, so
         // it is refused (`nrf_collector::refuse_notifier`); under dev as before.
         ["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {
-            "POST" => nrf_collector::handle_nf_status_notify_from(&request, false).await,
+            "POST" => nrf_collector::handle_nf_status_notify_from(&request, false, profile).await,
             _ => send_method_not_allowed(method, "notify"),
         },
 
@@ -921,12 +939,13 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // nextgsim#468: Nnwdaf_MLModelMonitor (registrations at an MTLF,
         // subscriptions at an AnLF). 404 with the demo off.
         #[cfg(feature = "demo-d441e-model-retrain")]
-        ["nnwdaf-mlmodelmonitor", "v1", rest @ ..] => model_monitor::route(
+        ["nnwdaf-mlmodelmonitor", "v1", rest @ ..] => model_monitor::route_with(
             model_monitor::monitor(),
             &nwdaf_self(),
             method,
             rest,
             &request,
+            required,
         ),
         // nextgsim#468: an AnLF's Nnwdaf_MLModelMonitor_Notify, on the
         // notificationUri this MTLF gave it (`model_monitor`).
@@ -3124,6 +3143,7 @@ mod callback_oauth2_1421_tests {
     /// and ingests nothing; so is a service request without a bearer.
     #[tokio::test]
     async fn the_nrf_status_notify_is_admitted_on_its_token_only() {
+        let _tokens = nrf_collector::TOKENS_TEST_LOCK.lock().await;
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
         // #1869: the real nrfd notifier dials this loopback h2c callback, which
         // only the dev profile does. Set and left set (CONVENTIONS).
@@ -3201,6 +3221,7 @@ mod callback_oauth2_1421_tests {
     /// (`left: 403, right: 204`).
     #[tokio::test]
     async fn the_tokenised_route_refuses_a_forged_token_itself() {
+        let _tokens = nrf_collector::TOKENS_TEST_LOCK.lock().await;
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
         let body =
             json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": "http://nrf/x/nwdaf-1421-r" });
@@ -3364,5 +3385,349 @@ mod sbi_profile_tests_1795 {
             nextgcore_sbi::types::NfType::Nwdaf,
             super::sbi_listener_config,
         );
+    }
+}
+
+#[cfg(test)]
+mod nf_status_sender_backstop_2215_tests {
+    //! #2215 (SECURITY): nwdafd's runtime backstop to the NFStatusNotify source
+    //! guard (`libs/nextgcore-sbi/tests/nf_status_notify_receivers.rs`), the
+    //! twin of amfd's `tests/nf_status_notify_sender_backstop_2179.rs`. It reads
+    //! no source: it subscribes at a stand-in NRF through the real
+    //! `subscribe_nf_status`, then sends a forged NF_DEREGISTERED to every
+    //! `nfStatusNotificationUri` the NRF was given, and to the legacy token-less
+    //! route, through the real router under production
+    //! ([`super::nwdaf_sbi_request_handler_with`]). Each must be 403. The
+    //! profile is passed in, so the Dev override sibling tests set cannot turn
+    //! the check off mid-test.
+    //!
+    //! What it does not prove: the TLS layer (the request carries the
+    //! verified-certificate fields the server fills in), and a receiver on a
+    //! path nwdafd never advertises, which is the source guard's to find.
+    use super::*;
+    use nextgcore_sbi::security::{set_sbi_profile_override, SbiProfile};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    /// A stand-in NRF that grants every NFStatusSubscribe and records its body.
+    async fn stand_in_nrf() -> (SbiServer, SocketAddr, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf =
+            SbiServer::on_listener(nextgcore_sbi::server::SbiServerConfig::new(addr), listener);
+        let sink = Arc::clone(&seen);
+        nrf.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if req.header.method != "POST"
+                    || req.header.uri.split('?').next() != Some("/nnrf-nfm/v1/subscriptions")
+                {
+                    return SbiResponse::with_status(404);
+                }
+                let body: Value = serde_json::from_str(req.http.content.as_deref().unwrap_or("{}"))
+                    .unwrap_or(Value::Null);
+                let n = {
+                    let mut seen = sink.lock().unwrap();
+                    seen.push(body);
+                    seen.len()
+                };
+                SbiResponse::with_status(201)
+                    .with_json_body(&json!({ "subscriptionId": format!("sub-2215-{n}") }))
+                    .unwrap()
+            }
+        })
+        .await
+        .expect("stand-in NRF");
+        (nrf, addr, seen)
+    }
+
+    /// The path part of an absolute URI.
+    fn path_of(uri: &str) -> &str {
+        let rest = uri.split_once("://").map_or(uri, |(_, r)| r);
+        &rest[rest.find('/').expect("an absolute URI with a path")..]
+    }
+
+    /// #2238 (R45): each refused notification is also checked for having
+    /// changed nothing in the state the router ingests into (a seeded NF in
+    /// `nwdaf_self()`), and the NRF controls for having changed it.
+    ///
+    /// REVERT-VERIFIED (act before the check, R45's two plants): ingesting in
+    /// `handle_nf_status_notify_gated_with_ctx` before `refuse_notifier` and
+    /// then returning its 403, and ingesting at the top of
+    /// `nwdaf_sbi_request_handler_with` for a POST to an NF-status path, each
+    /// fail "a refused notification changed nothing". So does R45's P3 on #2238,
+    /// ingesting through `handle_nf_status_notify_with_ctx` inside
+    /// `handle_nf_status_notify_from` before the gated call (#2239): of the
+    /// NFStatusNotify tests, only this backstop catches it.
+    ///
+    /// REVERT-VERIFIED: with `refuse_notifier` given `production = false` in
+    /// `nrf_collector::handle_nf_status_notify_gated_with_ctx`, the forged
+    /// `[AMF]` sender on the advertised path is 204 (`left: 204, right: 403`).
+    /// And with `nrf_collector::handle_nf_status_notify_from` back to resolving
+    /// `SbiProfile::resolve()` instead of the router's profile, it fails the same
+    /// way under the Dev override this test sets (#2215's race).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_advertised_nf_status_notify_path_refuses_a_forged_sender_2215() {
+        let _tokens = nrf_collector::TOKENS_TEST_LOCK.lock().await;
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        // Subscribing goes out over loopback plaintext, which only dev dials.
+        // Set and left set (CONVENTIONS); the receiving half below passes its
+        // profile to the router instead of reading this.
+        set_sbi_profile_override(SbiProfile::Dev);
+        let (nrf, addr, seen) = stand_in_nrf().await;
+        let ctx = {
+            let mut c = context::NwdafContext::new("nwdaf-2215".to_string());
+            c.init(64);
+            Arc::new(RwLock::new(c))
+        };
+        ctx.read()
+            .unwrap()
+            .set_nrf_collector_config(context::NrfCollectorConfig {
+                nrf_uri: format!("http://{addr}"),
+                callback_uri: format!(
+                    "http://127.0.0.1:7777{}",
+                    nrf_collector::callback_path_for("seed")
+                ),
+            });
+        nrf_collector::subscribe_nf_status(&ctx).await;
+        nrf.stop().await.expect("stop");
+        let advertised: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                b["nfStatusNotificationUri"]
+                    .as_str()
+                    .expect("the subscription advertises a notification URI")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(advertised.len(), 1, "one NFStatusSubscribe: {advertised:?}");
+
+        // #2238 (R45): state the router ingests into, so a notification that
+        // acts before (or despite) the check is seen, not only its status code.
+        // A real instance with a known load, in `nwdaf_self()`.
+        const ID: &str = "nwdaf-2215-seeded-amf";
+        let seeded = || {
+            nwdaf_self()
+                .read()
+                .unwrap()
+                .lock_engine()
+                .nf_meta(ID)
+                .map(|m| (m.nf_type.clone(), m.nf_status.clone(), m.last_load))
+        };
+        nwdaf_self().read().unwrap().lock_engine().upsert_nf_meta(
+            ID,
+            analytics::NfProfileMeta {
+                nf_type: "AMF".to_string(),
+                nf_status: "REGISTERED".to_string(),
+                last_load: Some(42),
+            },
+        );
+        let want = Some(("AMF".to_string(), "REGISTERED".to_string(), Some(42)));
+        assert_eq!(seeded(), want);
+        let uri = format!("http://nrf.test:7777/nnrf-nfm/v1/nf-instances/{ID}");
+        let dereg = json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": uri });
+        let changed = json!({
+            "event": "NF_PROFILE_CHANGED", "nfInstanceUri": uri,
+            "nfProfile": { "nfInstanceId": ID, "nfType": "AMF", "nfStatus": "SUSPENDED", "load": 99 },
+        });
+        let with = |body: &Value, path: &str, types: &[&str]| {
+            let mut r =
+                SbiRequest::post(path.to_string()).with_body(body.to_string(), "application/json");
+            r.peer_cert_present = !types.is_empty();
+            r.peer_cert_nf_instance_id =
+                (!types.is_empty()).then(|| "ffffffff-2215-4000-8000-0000000000f1".to_string());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        let route = |req: SbiRequest| async move {
+            nwdaf_sbi_request_handler_with(req, SbiProfile::Production).await
+        };
+        // The advertised tokenised callback, and the legacy token-less route
+        // (routed, never advertised since #1421).
+        let mut paths: Vec<String> = advertised.iter().map(|u| path_of(u).to_string()).collect();
+        paths.push("/nnwdaf-nfstatus-notify/v1/notify".to_string());
+        for path in &paths {
+            for forged in [
+                &["AMF"][..],
+                &["SMF"],
+                &["NRF", "AMF"],
+                &["SCP", "AMF"],
+                &[],
+            ] {
+                for body in [&dereg, &changed] {
+                    let resp = route(with(body, path, forged)).await;
+                    assert_eq!(
+                        resp.status, 403,
+                        "{path}, sender {forged:?}, {}: {:?}",
+                        body["event"], resp.http.content
+                    );
+                    assert_eq!(
+                        seeded(),
+                        want,
+                        "{path}, sender {forged:?}, {}: a refused notification changed nothing",
+                        body["event"]
+                    );
+                }
+            }
+        }
+
+        // Controls: the NRF's certificate on the advertised path gets past the
+        // check AND acts, so the 403s above are the sender check, not an earlier
+        // refusal (an unheld token would be 404), and "changed nothing" above
+        // could have failed. The profile change takes, then the deregistration.
+        let resp = route(with(&changed, &paths[0], &["NRF"])).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert_eq!(
+            seeded(),
+            Some(("AMF".to_string(), "SUSPENDED".to_string(), Some(99))),
+            "the NRF's NF_PROFILE_CHANGED is ingested"
+        );
+        let resp = route(with(&dereg, &paths[0], &["NRF"])).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert_eq!(
+            seeded(),
+            None,
+            "the NRF's NF_DEREGISTERED drops the instance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod router_profile_2239_tests {
+    //! #2239: every check in the router runs under the profile passed to
+    //! [`super::nwdaf_sbi_request_handler_with`], not the process's. Each test
+    //! sets the Dev override (and leaves it set, CONVENTIONS) and drives the
+    //! router under `Production`: had a check read the process profile, it
+    //! would have run under Dev and admitted the request.
+    use super::*;
+    use nextgcore_sbi::security::{set_sbi_profile_override, SbiProfile};
+    use serde_json::json;
+
+    async fn route(req: SbiRequest, profile: SbiProfile) -> SbiResponse {
+        nwdaf_sbi_request_handler_with(req, profile).await
+    }
+
+    fn post(path: &str, body: &serde_json::Value) -> SbiRequest {
+        SbiRequest::post(path).with_json_body(body).unwrap()
+    }
+
+    /// Analytics and ML-provision subscriptions: an anonymous create is
+    /// refused under production (and admitted under dev); a record that has no
+    /// owner (created anonymously under dev) is frozen under production for
+    /// every operation the router serves on it, and open under dev.
+    ///
+    /// REVERT-VERIFIED: with the router passing
+    /// `owner_binding::identity_required()` (the process profile) instead of
+    /// `profile.is_production()`, the production create is 201 and the test
+    /// fails at "an anonymous create is refused under production".
+    #[tokio::test]
+    async fn the_subscription_owner_checks_run_under_the_routers_profile_2239() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        set_sbi_profile_override(SbiProfile::Dev);
+        let events = (
+            "/nnwdaf-eventssubscription/v1/subscriptions",
+            json!({
+                "eventSubscriptions": [{ "event": "NF_LOAD" }],
+                "notificationURI": "http://consumer-2239.example/cb",
+            }),
+            true, // has GET
+        );
+        let ml = (
+            "/nnwdaf-mlmodelprovision/v1/subscriptions",
+            json!({
+                "notifUri": "http://consumer-2239.example/ml",
+                "mLEventSubscs": [{ "mLEvent": "NF_LOAD" }],
+            }),
+            false,
+        );
+        for (base, body, has_get) in [events, ml] {
+            assert_eq!(
+                route(post(base, &body), SbiProfile::Production)
+                    .await
+                    .status,
+                403,
+                "{base}: an anonymous create is refused under production"
+            );
+            let created = route(post(base, &body), SbiProfile::Dev).await;
+            assert_eq!(created.status, 201, "{base}: admitted under dev");
+            let location = created.http.get_header("Location").expect("Location");
+            let item = location
+                .rsplit_once('/')
+                .map(|(_, id)| format!("{base}/{id}"))
+                .unwrap();
+            if has_get {
+                assert_eq!(
+                    route(SbiRequest::get(&item), SbiProfile::Production)
+                        .await
+                        .status,
+                    403,
+                    "{item}: GET of an ownerless record under production"
+                );
+                assert_eq!(
+                    route(SbiRequest::get(&item), SbiProfile::Dev).await.status,
+                    200
+                );
+            }
+            let put = SbiRequest::put(&item).with_json_body(&body).unwrap();
+            assert_eq!(
+                route(put.clone(), SbiProfile::Production).await.status,
+                403,
+                "{item}: PUT of an ownerless record under production"
+            );
+            assert_eq!(
+                route(SbiRequest::delete(&item), SbiProfile::Production)
+                    .await
+                    .status,
+                403,
+                "{item}: DELETE of an ownerless record under production"
+            );
+            assert_eq!(
+                route(SbiRequest::delete(&item), SbiProfile::Dev)
+                    .await
+                    .status,
+                204,
+                "{item}: open under dev, and still there after the refusals"
+            );
+        }
+    }
+
+    /// Nnwdaf_MLModelMonitor (an AnLF's `/subscriptions`): an anonymous create
+    /// is refused under production, whatever the process profile.
+    ///
+    /// REVERT-VERIFIED: with the router calling the ambient `route` (the
+    /// process profile), the production create is not 403.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    #[tokio::test]
+    async fn the_model_monitor_checks_run_under_the_routers_profile_2239() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        set_sbi_profile_override(SbiProfile::Dev);
+        let m = model_monitor::install(model_monitor::Monitor::new(
+            "on",
+            crate::role::Role::Anlf,
+            "http://127.0.0.1:7815",
+            "nwdaf-2239",
+            "http://127.0.0.1:1",
+        ));
+        if m.role != crate::role::Role::Anlf {
+            // Another test installed the process's monitor first; this route
+            // is then not an AnLF's and the check is not reachable here.
+            return;
+        }
+        let req = post(
+            "/nnwdaf-mlmodelmonitor/v1/subscriptions",
+            &json!({
+                "modelIds": [1],
+                "notificationUri": "http://mtlf-2239.example/cb",
+                "notifCorrId": "corr-2239",
+            }),
+        );
+        assert_eq!(
+            route(req.clone(), SbiProfile::Production).await.status,
+            403,
+            "an anonymous MLModelMonitor subscribe is refused under production"
+        );
+        assert_ne!(route(req, SbiProfile::Dev).await.status, 403);
     }
 }

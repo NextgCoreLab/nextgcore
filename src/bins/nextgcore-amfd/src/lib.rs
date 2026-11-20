@@ -31,6 +31,7 @@ pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
 pub mod ngap_sm;
+pub mod ngap_types; // #417 B3.1: NGAP domain values (moved from nextgcore-ngap)
 pub mod nrf_subscription; // #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5)
 pub mod nsac; // #1876: NSAC UE counts out as well as in, with a reconciler
 pub mod nwdaf_mobility; // nextgsim#464: UE Mobility analytics for paging (TS 23.501 §5.4.3.1)
@@ -46,6 +47,13 @@ pub mod xn_handover; // Rel-15: Xn path switch and N2 handover (TS 23.502 §4.9)
 
 #[cfg(test)]
 mod property_tests;
+// #417 stage B: the X.691 sink the hand-derived NGAP goldens are written with.
+#[cfg(test)]
+pub(crate) mod amf_pdus;
+#[cfg(test)]
+pub(crate) mod aper_golden;
+#[cfg(test)]
+pub(crate) mod gnb_pdus;
 
 // Wave-6 H1: expose the real Namf SBI request handler + the N1N2MessageTransfer
 // consumer so peer NF crates (lmfd/udmd/smfd/pcfd) can drive them in-process
@@ -101,6 +109,45 @@ pub mod test_support {
     /// `dereg_queue_test_lock` and [`PAGING_STRATEGY_LOCK`] -- the order the existing
     /// `SmfEnvGuard` tests already use, so no two tests can deadlock.
     pub static SMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// #2039: a test that replaces the process-wide served GUAMIs (`served_guami`,
+    /// read by every GUTI resolution) must hold [`CONTEXT_GUARD`]. Two GUAMI guards
+    /// each save the list and put it back on drop, so one held outside the lock
+    /// restored a stale (empty) list in the middle of a sibling's registration:
+    /// "the UNACKNOWLEDGED 5G-GUTI must identify the UE" at shuffle seed 1, every
+    /// run. Called by those guards; panics when nobody holds the lock, so a test
+    /// that forgets it fails deterministically.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn assert_context_guard_held(what: &str) {
+        if CONTEXT_GUARD.try_lock().is_ok() {
+            panic!("{what} replaces the served GUAMIs with CONTEXT_GUARD free: take it (#2039)");
+        }
+    }
+
+    /// #2039: the association most handler tests put their UEs on (their `ASSOC`
+    /// constant, and the literal `1`). The UE store is process-wide, so an
+    /// association-wide release of it (an SCTP association loss, a whole-interface
+    /// NG Reset) idles every running test's UE on it: about sixty in a full run,
+    /// whose activations are then rolled back and whose Accepts are not sent.
+    #[cfg(test)]
+    pub(crate) const SHARED_TEST_ASSOCIATION: u64 = 1;
+
+    /// Test-only: refuse an association-wide release of
+    /// [`SHARED_TEST_ASSOCIATION`] (#2039), so a test that would idle its
+    /// siblings' UEs fails by name, deterministically, instead of making
+    /// unrelated SMF-session tests flake. A test that releases a whole association
+    /// uses one of its own.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn refuse_releasing_the_shared_test_association(association_id: u64, what: &str) {
+        if association_id == SHARED_TEST_ASSOCIATION {
+            panic!(
+                "{what} of association {association_id}, which every handler test's UEs \
+                 share: it would idle them all (#2039); use an association of this test's own"
+            );
+        }
+    }
 
     /// Test-only enforcement of [`SMF_ENV_LOCK`] for the PCF endpoint (#1933): every
     /// site that resolves the PCF calls this first, and it panics when nobody holds
