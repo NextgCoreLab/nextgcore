@@ -10927,12 +10927,20 @@ impl NgapServer {
     /// carries that correlation as `lcsCorrelationId`. Several LMFs, or several
     /// sessions of one UE, each get their own answers.
     ///
-    /// Fallback, the single-session behaviour from before #2256: an uplink with
-    /// no Additional information, one naming a correlation this AMF never sent,
-    /// or one whose LMF named no identity goes to the most recent LPP
-    /// subscription, tagged with the most recent correlation recorded for the UE
-    /// (last writer wins). That is right with one LMF and one session at a time,
-    /// and only then.
+    /// Abort, §5.4.5.2.5 case c) 2): Additional information that names no
+    /// correlation this AMF holds (one it never sent, or one no longer held) is
+    /// routing information for no LMF the AMF can forward to, so "the AMF shall
+    /// abort the procedure": the uplink is discarded, not handed to some other
+    /// LMF. A correlation whose LMF gave no identity goes only to a
+    /// subscription with no owner.
+    ///
+    /// Fallback, the single-session behaviour from before #2256, for an uplink
+    /// with **no** Additional information: the most recent LPP subscription,
+    /// tagged with the most recent correlation recorded for the UE (last writer
+    /// wins). That is right with one LMF and one session at a time, and only
+    /// then. It is a deliberate deviation: §5.4.5.2.5 case c) 1) says the AMF
+    /// shall abort when the Additional information is absent, and #2256's
+    /// criterion 2 chose to keep the fallback for UEs that do not echo it.
     ///
     /// Fail-OPEN toward the UE: with NO registered LPP subscription the legacy
     /// abnormal action is preserved byte-for-byte — a Downlink NAS TRANSPORT
@@ -10979,34 +10987,58 @@ impl NgapServer {
                 return Ok(());
             };
             match supi.as_deref() {
+                None => (None, None, None, None),
                 Some(s) => {
-                    let named_lmf = routing
-                        .as_deref()
-                        .and_then(|corr| guard.lcs_uplink_route_find(s, corr))
-                        .and_then(|route| route.lmf_id);
-                    let default_target = match &named_lmf {
-                        Some(lmf) => Some((lmf.clone(), routing.clone())),
-                        None => guard.lcs_uplink_route_latest(s).and_then(|route| {
-                            route
-                                .lmf_id
-                                .map(|lmf| (lmf, Some(route.lcs_correlation_id)))
+                    // §5.4.5.2.5 case c) 2): Additional information present but naming
+                    // no correlation this AMF holds: abort, never another LMF.
+                    let route = match additional_information {
+                        None => None,
+                        Some(_) => match routing
+                            .as_deref()
+                            .and_then(|corr| guard.lcs_uplink_route_find(s, corr))
+                        {
+                            Some(route) => Some(route),
+                            None => {
+                                let len = lpp.len();
+                                log::warn!(
+                                    "UL {class} ({len} B, UE {amf_ue_ngap_id}) aborted: its \
+                                     Additional information names {routing:?}, no LCS \
+                                     correlation this AMF holds (TS 24.501 §5.4.5.2.5 c) 2))"
+                                );
+                                return Ok(());
+                            }
+                        },
+                    };
+                    let named_lmf = route.as_ref().and_then(|r| r.lmf_id.clone());
+                    let target = match (&route, named_lmf.as_deref()) {
+                        (None, _) => crate::context::UplinkLmf::Unnamed,
+                        (Some(_), Some(lmf)) => crate::context::UplinkLmf::Named(lmf),
+                        (Some(_), None) => crate::context::UplinkLmf::Anonymous,
+                    };
+                    // With no subscription to notify, the LMF whose NRF default is
+                    // tried: the routing information's, else (no Additional
+                    // information) the LMF of the UE's latest positioning transfer.
+                    // An LMF that gave no identity cannot be looked up.
+                    let default_target = match &route {
+                        Some(r) => r
+                            .lmf_id
+                            .clone()
+                            .map(|lmf| (lmf, routing.clone(), r.service_instance_id.clone())),
+                        None => guard.lcs_uplink_route_latest(s).and_then(|r| {
+                            r.lmf_id
+                                .map(|lmf| (lmf, Some(r.lcs_correlation_id), r.service_instance_id))
                         }),
                     };
-                    // #557: SLPP goes to the serving LMF's SLPP subscription,
-                    // else its LPP one, and the notification still says
-                    // "SLPP", so the LMF never reads SLPP as LPP.
+                    // #557: SLPP goes to the serving LMF's SLPP subscription, else its
+                    // LPP one, and the notification still says "SLPP", so the LMF
+                    // never reads SLPP as LPP.
                     (
-                        guard.n1n2_subscription_find_positioning_routed(
-                            s,
-                            class,
-                            named_lmf.as_deref(),
-                        ),
+                        guard.n1n2_subscription_find_positioning_routed(s, class, target),
                         guard.lcs_correlation_find(s),
                         named_lmf,
                         default_target,
                     )
                 }
-                None => (None, None, None, None),
             }
         };
 
@@ -11042,7 +11074,7 @@ impl NgapServer {
         // subscription lookup falls back for #557). Looked
         // up off the NGAP task; when there is none the UE gets the #90 below,
         // queued for the positioning pump.
-        if let Some((lmf, lcs_correlation_id)) = default_target {
+        if let Some((lmf, lcs_correlation_id, service_instance_id)) = default_target {
             log::info!(
                 "UL LPP ({} B, amf_ue_ngap_id {amf_ue_ngap_id}): no 'LPP' subscription for \
                  LMF {lmf}; trying its NRF default notification subscription",
@@ -11051,6 +11083,7 @@ impl NgapServer {
             tokio::spawn(async move {
                 match crate::sbi_path::lmf_default_notification_uri(
                     &lmf,
+                    service_instance_id.as_deref(),
                     crate::sbi_path::LmfDefaultNotification::N1Lpp,
                 )
                 .await
@@ -14325,9 +14358,8 @@ impl NgapServer {
     /// ([`crate::context::AmfContext::n1n2_subscription_find_n2_routed`]), never
     /// one another LMF owns, and carries the subscription's `lcsCorrelationId`,
     /// else the one that LMF last used for the UE. The Routing ID is the
-    /// notification's `nfId`. With no Routing ID to go by, the single-session
-    /// fallback: the most recent NRPPa subscription and the UE's last
-    /// correlation.
+    /// notification's `nfId`. An empty Routing ID (our downlink's for an LMF
+    /// that gave no identity) goes only to a subscription with no owner.
     ///
     /// Fail-closed: with no registered consumer the PDU is dropped with a
     /// WARN and counted in [`UL_NRPPA_DROPPED_NO_CONSUMER`] — a relay with no
@@ -14392,39 +14424,45 @@ impl NgapServer {
         // #2256, TS 38.413 §9.3.3.13: the Routing ID "identifies an LMF". Our
         // downlink seeds it from the LMF's identity (verified, else the declared
         // nrppaInfo.nfId) and the gNB echoes it, so it names the LMF whose
-        // subscription gets the answer and whose correlation tags it. An empty or
-        // non-UTF-8 Routing ID names none: the single-session fallback (most
-        // recent subscription, last correlation), as before #2256.
+        // subscription gets the answer and whose correlation tags it. Our
+        // downlink sends an empty Routing ID only for an LMF that gave no
+        // identity, so an empty (or non-UTF-8) one goes only to a subscription
+        // with no owner, never to one another LMF owns (R47 on #2261), tagged
+        // with the correlation such an LMF last used.
         let named_lmf = String::from_utf8(ul.routing_id.clone())
             .ok()
             .filter(|s| !s.trim().is_empty());
 
         // A3 registry lookup (exact-class, fail-closed), routed by the Routing
         // ID, + the correlation that LMF last used (else the UE's last one).
-        let (sub, lmf_corr, fallback_corr) = {
+        let target = named_lmf.as_deref().map_or(
+            crate::context::UplinkLmf::Anonymous,
+            crate::context::UplinkLmf::Named,
+        );
+        let (sub, lmf_route) = {
             let ctx = crate::context::amf_self();
             let Ok(guard) = ctx.read() else {
                 return Ok(());
             };
             match supi.as_deref() {
                 Some(s) => (
-                    guard.n1n2_subscription_find_n2_routed(s, "NRPPa", named_lmf.as_deref()),
-                    named_lmf
-                        .as_deref()
-                        .and_then(|l| guard.lcs_uplink_route_latest_for_lmf(s, l)),
-                    guard.lcs_correlation_find(s),
+                    guard.n1n2_subscription_find_n2_routed(s, "NRPPa", target),
+                    guard.lcs_uplink_route_latest_for_lmf(s, named_lmf.as_deref()),
                 ),
-                None => (None, None, None),
+                None => (None, None),
             }
         };
+        let lmf_corr = lmf_route.as_ref().map(|r| r.lcs_correlation_id.clone());
+        let service_instance_id = lmf_route.and_then(|r| r.service_instance_id);
         let Some(callback_uri) = sub.as_ref().and_then(|s| s.n2_notify_callback_uri.clone()) else {
             // #2256, TS 29.518 §5.2.2.3.6.3 step 1: no N2 notification URI, so
             // the default notification subscription in the NRF profile of the
             // LMF the Routing ID names, looked up off the NGAP task.
-            if let (Some(lmf), true) = (named_lmf, supi.is_some()) {
+            if let (Some(lmf), true) = (named_lmf.clone(), supi.is_some()) {
                 tokio::spawn(async move {
                     match crate::sbi_path::lmf_default_notification_uri(
                         &lmf,
+                        service_instance_id.as_deref(),
                         crate::sbi_path::LmfDefaultNotification::N2Nrppa,
                     )
                     .await
@@ -14453,22 +14491,16 @@ impl NgapServer {
             UL_NRPPA_DROPPED_NO_CONSUMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "Uplink UE-associated NRPPa (association {association_id}, \
-                 amf_ue_ngap_id {amf_ue_ngap_id}, supi {supi:?}) dropped: no LMF N2 \
-                 'NRPPa' subscription registered and no Routing ID naming an LMF \
+                 amf_ue_ngap_id {amf_ue_ngap_id}, supi {supi:?}, Routing ID LMF \
+                 {named_lmf:?}) dropped: no LMF N2 'NRPPa' subscription it can be \
                  (no ErrorIndication sent — transparent relay, TS 23.273 Section 6.11)"
             );
             return Ok(());
         };
         let sub = sub.expect("callback_uri implies subscription");
 
-        // The UE's last correlation may be another LMF's: it is used only when
-        // the Routing ID names no LMF.
-        let lcs_correlation_id = sub.lcs_correlation_id.clone().or(lmf_corr).or_else(|| {
-            named_lmf
-                .is_none()
-                .then(|| fallback_corr.map(|r| r.lcs_correlation_id))
-                .flatten()
-        });
+        // Never the UE's last correlation, which may be another LMF's.
+        let lcs_correlation_id = sub.lcs_correlation_id.clone().or(lmf_corr);
         // The Routing ID is the LMF identity: it is the notification's nfId.
         let nf_id = named_lmf.clone();
 

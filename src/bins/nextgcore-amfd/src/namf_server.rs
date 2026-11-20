@@ -5799,24 +5799,6 @@ fn try_positioning_relay(
         return Some(ue_not_reachable_error());
     }
 
-    // Fallback correlation record (TS 29.518 N1N2MessageTransferReqData
-    // lcsCorrelationId / servingLMFIdentification, yaml:2771-2774): capture
-    // the originating LMF onto the UE context so the uplink leg can route a
-    // UE/gNB reply back even without an explicit N1N2 subscription
-    // (last-writer-wins).
-    if let Some(corr) = body.get("lcsCorrelationId").and_then(Value::as_str) {
-        let record = LcsCorrelationRecord {
-            lcs_correlation_id: corr.to_string(),
-            serving_lmf_identification: body
-                .get("servingLMFIdentification")
-                .and_then(Value::as_str)
-                .map(String::from),
-        };
-        if let Ok(context) = amf_self().read() {
-            context.lcs_correlation_set(ue_context_id, record);
-        }
-    }
-
     // #2256, TS 24.501 §5.4.5.3.2 case c: the LPP downlink carries this
     // correlation in Additional information and the UE's answer names it again
     // (§5.4.5.2.5 case c), so remember which LMF it belongs to. That is the
@@ -5847,20 +5829,63 @@ fn try_positioning_relay(
                 declared_nf_id("/n2InfoContainer/nrppaInfo/nfId")
             }
         });
+        let service_instance_id = body
+            .pointer(if is_lpp || is_slpp {
+                "/n1MessageContainer/serviceInstanceId"
+            } else {
+                "/n2InfoContainer/nrppaInfo/serviceInstanceId"
+            })
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
         let route = crate::context::LcsUplinkRoute {
             lcs_correlation_id: corr.to_string(),
             lmf_id: lmf_id.clone(),
+            verified: verified_lmf.is_some(),
+            service_instance_id,
         };
         let recorded = amf_self()
             .read()
             .map(|context| context.lcs_uplink_route_record(ue_context_id, route))
-            .unwrap_or(false);
-        if !recorded {
+            .unwrap_or(crate::context::LcsRouteRecord::Full);
+        // R47 on #2261: a downlink whose answer the AMF knows will go to
+        // another LMF is never sent. The transfer is refused (TS 29.518
+        // Table 6.1.3.5.3.1-3, 403 UNSPECIFIED) before anything is queued or
+        // the last-writer record below changes.
+        let refusal = match recorded {
+            crate::context::LcsRouteRecord::Recorded => None,
+            crate::context::LcsRouteRecord::OwnedByAnotherLmf => Some(format!(
+                "lcsCorrelationId '{corr}' belongs to another LMF's location session for \
+                 this UE"
+            )),
+            crate::context::LcsRouteRecord::Full => Some(format!(
+                "this UE holds {} LCS correlations; lcsCorrelationId '{corr}' is not recorded",
+                crate::context::MAX_LCS_UPLINK_ROUTES_PER_UE
+            )),
+        };
+        if let Some(detail) = refusal {
             log::warn!(
-                "[{ue_context_id}] positioning transfer from LMF {lmf_id:?} reuses LCS correlation \
-                 {corr:?}, which belongs to another LMF: the UE's answers to it still go to \
-                 that LMF"
+                "[{ue_context_id}] positioning transfer from LMF {lmf_id:?} refused: {detail}"
             );
+            return Some(send_error(403, "Forbidden", &detail, Some("UNSPECIFIED")));
+        }
+    }
+
+    // Fallback correlation record (TS 29.518 N1N2MessageTransferReqData
+    // lcsCorrelationId / servingLMFIdentification, yaml:2771-2774): capture
+    // the originating LMF onto the UE context so the uplink leg can route a
+    // UE/gNB reply back even without an explicit N1N2 subscription
+    // (last-writer-wins).
+    if let Some(corr) = body.get("lcsCorrelationId").and_then(Value::as_str) {
+        let record = LcsCorrelationRecord {
+            lcs_correlation_id: corr.to_string(),
+            serving_lmf_identification: body
+                .get("servingLMFIdentification")
+                .and_then(Value::as_str)
+                .map(String::from),
+        };
+        if let Ok(context) = amf_self().read() {
+            context.lcs_correlation_set(ue_context_id, record);
         }
     }
 

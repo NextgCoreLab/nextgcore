@@ -29,6 +29,14 @@ pub struct NfService {
     pub ip_addresses: Vec<String>,
     /// Service port
     pub port: u16,
+    /// The NFService's `serviceInstanceId` (TS 29.510 §6.1.6.2.3), when the
+    /// profile names one.
+    pub service_instance_id: Option<String>,
+    /// The NFService's `defaultNotificationSubscriptions` (TS 29.510
+    /// §6.1.6.2.3) as the NRF returned them: this service instance's defaults,
+    /// which a consumer that named it takes before its NF's (TS 29.518
+    /// §5.2.2.3.5.3 step 1). Empty when it names none.
+    pub default_notification_subscriptions: Vec<serde_json::Value>,
 }
 
 impl NfService {
@@ -41,6 +49,8 @@ impl NfService {
             fqdn: None,
             ip_addresses: Vec::new(),
             port: 80,
+            service_instance_id: None,
+            default_notification_subscriptions: Vec::new(),
         }
     }
 }

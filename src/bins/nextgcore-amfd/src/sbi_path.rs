@@ -792,6 +792,17 @@ async fn amf_nrf_discover_qualified_at(
                     {
                         let mut svc = NfService::new(svc_name, svc_type);
                         nextgcore_sbi::nf_addressing::read_service_addresses(&mut svc, svc_json);
+                        // #2256: a service instance's own defaults (TS 29.518
+                        // §5.2.2.3.5.3 step 1).
+                        svc.service_instance_id = svc_json
+                            .get("serviceInstanceId")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        svc.default_notification_subscriptions = svc_json
+                            .get("defaultNotificationSubscriptions")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
                         instance.add_service(svc);
                     }
                 }
@@ -3452,20 +3463,72 @@ impl LmfDefaultNotification {
     }
 }
 
+/// How long [`lmf_default_notification_uri`] remembers that the NRF knows no
+/// such LMF (#2256, R47 on #2261), so that each uplink for it does not query
+/// the NRF again.
+pub const LMF_UNKNOWN_TO_NRF_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most LMF ids [`LMF_UNKNOWN_TO_NRF`] holds; past it, a new one is not
+/// remembered (its lookups reach the NRF, as before), never evicting one.
+pub const LMF_UNKNOWN_TO_NRF_MAX: usize = 1024;
+
+/// LMF NF Instance ID -> when an NRF discovery for it last found nothing.
+static LMF_UNKNOWN_TO_NRF: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::Mutex::new(None);
+
+/// Whether the NRF was found to know no LMF `lmf_id` within
+/// [`LMF_UNKNOWN_TO_NRF_TTL`].
+fn lmf_unknown_to_nrf(lmf_id: &str) -> bool {
+    let mut guard = LMF_UNKNOWN_TO_NRF.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    match map.get(lmf_id) {
+        Some(at) if at.elapsed() < LMF_UNKNOWN_TO_NRF_TTL => true,
+        Some(_) => {
+            map.remove(lmf_id);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Remember that the NRF knows no LMF `lmf_id`.
+fn remember_lmf_unknown_to_nrf(lmf_id: &str) {
+    let mut guard = LMF_UNKNOWN_TO_NRF.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    if map.len() >= LMF_UNKNOWN_TO_NRF_MAX {
+        map.retain(|_, at| at.elapsed() < LMF_UNKNOWN_TO_NRF_TTL);
+    }
+    if map.len() < LMF_UNKNOWN_TO_NRF_MAX {
+        map.insert(lmf_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// Test-only: forget every LMF remembered as unknown to the NRF.
+#[doc(hidden)]
+pub fn forget_lmfs_unknown_to_nrf_for_test() {
+    *LMF_UNKNOWN_TO_NRF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// #2256, TS 29.518 §5.2.2.3.5.3 / §5.2.2.3.6.3 step 1: "If the corresponding
 /// N1 [N2] notification URI is not available, the AMF shall retrieve the NF
 /// profile of the NF Service Consumer (e.g. the LMF) from the NRF using the NF
 /// Instance Identifier received during corresponding N1N2MessageTransfer ...
-/// and fetch [the] Notification URI from the default notification subscription"
-/// of that kind.
+/// and further identify the corresponding service instance if Service Instance
+/// Identifier was also received, and fetch [the] Notification URI from the
+/// default notification subscription" of that kind.
 ///
-/// The profile is this AMF's cached one for `lmf_id`, else the one an NRF
-/// discovery for that instance (`target-nf-instance-id`) returns, as
+/// With `service_instance_id`, that NFService's default comes first, then the
+/// NF profile's (which applies to all its services); without it, the NF
+/// profile's. The profile is this AMF's cached one for `lmf_id`, else the one
+/// an NRF discovery for that instance (`target-nf-instance-id`) returns, as
 /// [`resolve_lmf_by_identification`] finds it. A cached profile with no such
-/// default subscription is the answer: the NRF is not asked again on every
-/// uplink. `None` when the LMF is unknown or names none.
+/// default is the answer, and an LMF the NRF does not know is remembered for
+/// [`LMF_UNKNOWN_TO_NRF_TTL`]: neither is asked of the NRF on every uplink.
+/// `None` when the LMF is unknown or names no such default.
 pub async fn lmf_default_notification_uri(
     lmf_id: &str,
+    service_instance_id: Option<&str>,
     kind: LmfDefaultNotification,
 ) -> Option<String> {
     let sbi_ctx = global_context();
@@ -3473,16 +3536,29 @@ pub async fn lmf_default_notification_uri(
         if instance.nf_type != nextgcore_sbi::types::NfType::Lmf {
             return None;
         }
-        instance
-            .default_notification_subscriptions
-            .iter()
-            .filter(|d| kind.matches(d))
-            .find_map(|d| d.get("callbackUri").and_then(|v| v.as_str()))
-            .filter(|uri| !uri.trim().is_empty())
-            .map(str::to_string)
+        let uri_in = |defaults: &[serde_json::Value]| {
+            defaults
+                .iter()
+                .filter(|d| kind.matches(d))
+                .find_map(|d| d.get("callbackUri").and_then(|v| v.as_str()))
+                .filter(|uri| !uri.trim().is_empty())
+                .map(str::to_string)
+        };
+        service_instance_id
+            .and_then(|sid| {
+                instance
+                    .services
+                    .iter()
+                    .find(|svc| svc.service_instance_id.as_deref() == Some(sid))
+            })
+            .and_then(|svc| uri_in(&svc.default_notification_subscriptions))
+            .or_else(|| uri_in(&instance.default_notification_subscriptions))
     };
     if let Some(instance) = sbi_ctx.get_nf_instance(lmf_id).await {
         return pick(instance);
+    }
+    if lmf_unknown_to_nrf(lmf_id) {
+        return None;
     }
     let extra = [(
         "target-nf-instance-id",
@@ -3492,10 +3568,14 @@ pub async fn lmf_default_notification_uri(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    amf_nrf_discover_qualified_at(nrf_override, "LMF", "nlmf-loc", &extra)
-        .await
-        .ok()?;
-    pick(sbi_ctx.get_nf_instance(lmf_id).await?)
+    let _ = amf_nrf_discover_qualified_at(nrf_override, "LMF", "nlmf-loc", &extra).await;
+    match sbi_ctx.get_nf_instance(lmf_id).await {
+        Some(instance) => pick(instance),
+        None => {
+            remember_lmf_unknown_to_nrf(lmf_id);
+            None
+        }
+    }
 }
 
 /// `Nlmf_Location_CancelLocation`: POST /nlmf-loc/v1/cancel-location
