@@ -1795,9 +1795,8 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
                         sub.id,
                         now.saturating_sub(leg.since)
                     );
-                    if let Ok(c) = ctx.read() {
-                        c.subscription_remove(&sub.id);
-                    }
+                    // #2133: and the AF is told (cancelInd).
+                    remove_and_tell_af(&sub.id);
                     report.expired += 1;
                 } else {
                     log::debug!("southbound leg for {} still deferred ({outcome:?})", sub.id);
@@ -1909,14 +1908,28 @@ fn confirmed_expiry(producer: SouthboundProducer, response: &SbiResponse) -> Opt
 
 /// #2102: the modification that moves a live leg's expiry to `expiry`: the
 /// AMF's AmfUpdateEventOptionItem (TS 29.518 §6.2.6.2.7, `replace` of
-/// `/options/expiry`), the UDM's PatchItem on `reportingOptions` (TS 29.503
-/// §5.5.2.4 UpdateEeSubscription; `add` sets the member whether or not the
-/// subscription carried one, so a leg made before #2102 is bounded too).
-fn refresh_patch(producer: SouthboundProducer, expiry: u64) -> serde_json::Value {
+/// `/options/expiry`), the UDM's PatchItem (TS 29.503 §5.5.2.4
+/// UpdateEeSubscription).
+///
+/// #2133 (R42 on #2128): for the UDM, `add` of `/reportingOptions/expiry`
+/// when the leg was made with `reportingOptions` (every leg that recorded an
+/// expiry, `has_reporting_options`): RFC 6902 `add` on `/reportingOptions`
+/// itself REPLACES the whole object, dropping every other member the UDM holds
+/// (maxNumOfReports, reportMode, ...). A leg made before #2102 carries no
+/// `reportingOptions`, so `/reportingOptions/expiry` has no parent to add to;
+/// it gets the whole object, which replaces nothing.
+fn refresh_patch(
+    producer: SouthboundProducer,
+    expiry: u64,
+    has_reporting_options: bool,
+) -> serde_json::Value {
     let at = nextgcore_sbi::datetime::epoch_to_rfc3339(expiry);
     match producer {
         SouthboundProducer::Amf => serde_json::json!([
             { "op": "replace", "path": "/options/expiry", "value": at }
+        ]),
+        SouthboundProducer::Udm if has_reporting_options => serde_json::json!([
+            { "op": "add", "path": "/reportingOptions/expiry", "value": at }
         ]),
         SouthboundProducer::Udm => serde_json::json!([
             { "op": "add", "path": "/reportingOptions", "value": { "expiry": at } }
@@ -1959,9 +1972,50 @@ pub async fn refresh_live_subscriptions_at(now: u64) -> RefreshReport {
 /// unsubscribe, so a restart in between still sends it.
 fn remove_lapsed_leg(sub_id: &str, southbound: &SouthboundRef) {
     southbound_reconcile::owe(southbound.clone());
-    if let Ok(c) = nef_self().read() {
-        c.subscription_remove(sub_id);
+    remove_and_tell_af(sub_id);
+}
+
+/// #2133 (R42 on #2128): remove `sub_id` on the NEF's own initiative (its leg
+/// lapsed, or was never established in time) and tell the AF, which would
+/// otherwise wait for notifications that can no longer come. TS 29.122
+/// MonitoringNotification `cancelInd` (reused by TS 29.522's MonitoringEvent
+/// API) is the defined indication: a notification naming the subscription with
+/// `cancelInd: true` and no reports. Best effort, on its own task, like every
+/// AF notification: the removal does not wait for it. An AF-requested DELETE
+/// is not notified (the AF asked).
+fn remove_and_tell_af(sub_id: &str) {
+    let removed = nef_self()
+        .read()
+        .ok()
+        .and_then(|c| c.subscription_remove(sub_id));
+    let Some(sub) = removed else {
+        return;
+    };
+    let notification = cancellation_notification(&sub);
+    if tokio::runtime::Handle::try_current().is_err() {
+        log::warn!(
+            "monitoring subscription {}: removed, but no runtime to tell the AF on",
+            sub.id
+        );
+        return;
     }
+    let (id, destination) = (sub.id.clone(), sub.notification_destination.clone());
+    drop(spawn_detached(async move {
+        forward_notification_to_af(&id, destination, notification).await;
+    }));
+}
+
+/// #2133: the MonitoringNotification that tells the AF its subscription is
+/// cancelled (TS 29.122 `cancelInd`; `subscription` is the only mandatory
+/// member).
+fn cancellation_notification(sub: &NefMonitoringSubscription) -> serde_json::Value {
+    serde_json::json!({
+        "subscription": format!(
+            "/3gpp-monitoring-event/v1/{}/subscriptions/{}",
+            sub.scs_as_id, sub.id
+        ),
+        "cancelInd": true,
+    })
 }
 
 /// #2102: refresh every live southbound leg within
@@ -2101,7 +2155,12 @@ async fn refresh_producer_legs(
         };
         let requested = now.saturating_add(southbound_lifetime_secs());
         let client = service_client(&host, port, southbound.producer.nf_type());
-        let patch = refresh_patch(southbound.producer, requested);
+        // #2133: a leg that recorded an expiry was made with reportingOptions.
+        let patch = refresh_patch(
+            southbound.producer,
+            requested,
+            sub.southbound_expiry.is_some(),
+        );
         match client.patch_json(&southbound.delete_path, &patch).await {
             Ok(resp) if resp.is_success() => {
                 let expiry = confirmed_expiry(southbound.producer, &resp).unwrap_or(requested);
@@ -2115,9 +2174,8 @@ async fn refresh_producer_legs(
             }
             Ok(resp) if resp.status == 404 => {
                 gone("is gone at the producer (404 on refresh)");
-                if let Ok(c) = nef_self().read() {
-                    c.subscription_remove(&sub.id);
-                }
+                // #2133: and the AF is told (cancelInd).
+                remove_and_tell_af(&sub.id);
                 report.lapsed += 1;
             }
             Ok(resp) => {
@@ -4026,6 +4084,168 @@ mod tests {
         reset_context();
     }
 
+    /// **#2133** (R42 on #2128): when the NEF removes an AF's subscription on its
+    /// own initiative, the AF is told with a MonitoringNotification naming the
+    /// subscription with `cancelInd: true` (TS 29.122): a leg gone at the
+    /// producer (404 on refresh), a leg whose expiry passed before a refresh got
+    /// through, and a deferred leg past its deadline. An AF-requested DELETE is
+    /// not notified. The notification is detached, so the AF stub is polled.
+    ///
+    /// REVERT-VERIFIED, each site on its own: with the 404 arm, the lapsed arm
+    /// (`remove_lapsed_leg`) or the pending-deadline arm back on a plain
+    /// `subscription_remove`, that case's "the AF is told" assertion fails.
+    #[test]
+    fn a_subscription_the_nef_removes_is_cancelled_at_the_af_2133() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let af_seen: Seen2102 = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = af_seen.clone();
+            let (af, af_addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let sink = sink.clone();
+                    async move {
+                        let body = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|c| serde_json::from_str(c).ok())
+                            .unwrap_or_default();
+                        sink.lock().unwrap().push((
+                            req.header.method.clone(),
+                            req.header.uri.clone(),
+                            body,
+                        ));
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            let af_uri = format!("http://127.0.0.1:{}/af-2133", af_addr.port());
+            let patch_status = Arc::new(std::sync::atomic::AtomicU16::new(404));
+            let (producer, uri, _seen) =
+                producer_2102(SouthboundProducer::Amf, Duration::ZERO, patch_status).await;
+            set_producers(Some(&uri), None);
+            let insert = |sub: NefMonitoringSubscription| {
+                let id = sub.id.clone();
+                nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_insert(sub)
+                    .expect("insert");
+                id
+            };
+            let live = |expiry: u64, leg: &str| {
+                let mut sub = NefMonitoringSubscription::new(
+                    "af1",
+                    "LOCATION_REPORTING",
+                    af_uri.clone(),
+                    "{}",
+                );
+                sub.southbound = Some(SouthboundRef {
+                    producer: SouthboundProducer::Amf,
+                    subscription_id: leg.to_string(),
+                    delete_path: format!("/namf-evts/v1/subscriptions/{leg}"),
+                    producer_base: Some(uri.clone()),
+                });
+                sub.southbound_expiry = Some(expiry);
+                sub
+            };
+            let told = |id: &str| {
+                let id = id.to_string();
+                let seen = af_seen.clone();
+                async move {
+                    let want = serde_json::json!({
+                        "subscription": format!("/3gpp-monitoring-event/v1/af1/subscriptions/{id}"),
+                        "cancelInd": true,
+                    });
+                    for _ in 0..200 {
+                        if seen
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(m, _, b)| m == "POST" && *b == want)
+                        {
+                            return true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    false
+                }
+            };
+
+            // A leg the producer no longer holds (404 on refresh).
+            let now = now_unix_secs();
+            let gone = insert(live(now + 10, "s-2133-gone"));
+            let report = refresh_live_subscriptions_at(now).await;
+            assert_eq!(report.lapsed, 1, "{report:?}");
+            assert!(told(&gone).await, "404 on refresh: the AF is told");
+
+            // A leg whose expiry passed before a refresh got through.
+            let lapsed = insert(live(now - 1, "s-2133-lapsed"));
+            let report = refresh_live_subscriptions_at(now).await;
+            assert_eq!(report.lapsed, 1, "{report:?}");
+            assert!(told(&lapsed).await, "lapsed leg: the AF is told");
+
+            // A deferred leg past its deadline (no AMF to retry at).
+            set_producers(None, None);
+            let mut deferred =
+                NefMonitoringSubscription::new("af1", "LOCATION_REPORTING", af_uri.clone(), "{}");
+            deferred.pending = Some(PendingSouthbound {
+                producer: SouthboundProducer::Amf,
+                path: "/namf-evts/v1/subscriptions".to_string(),
+                body: serde_json::json!({}),
+                since: now - 10,
+            });
+            let deferred = insert(deferred);
+            std::env::set_var("NEF_PENDING_LEG_DEADLINE_SECS", "0");
+            let report = reconcile_pending_subscriptions().await;
+            std::env::remove_var("NEF_PENDING_LEG_DEADLINE_SECS");
+            assert_eq!(report.expired, 1, "{report:?}");
+            assert!(
+                told(&deferred).await,
+                "deferred leg past its deadline: the AF is told"
+            );
+
+            assert_eq!(
+                af_seen.lock().unwrap().len(),
+                3,
+                "one cancellation per removal, and nothing else"
+            );
+            af.stop().await.ok();
+            producer.stop().await.ok();
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2133 (R42 on #2128): the UDM refresh names `reportingOptions/expiry`
+    /// for a leg made with reportingOptions, so RFC 6902 `add` does not
+    /// replace the object's other members; a leg made before #2102 (none
+    /// recorded) gets the whole object, as it has none to lose.
+    ///
+    /// REVERT-VERIFIED: with the UDM arm always sending `/reportingOptions`,
+    /// the first assertion fails (and so does #2102's patch assertion).
+    #[test]
+    fn the_udm_refresh_adds_the_expiry_member_not_the_object_2133() {
+        let at = nextgcore_sbi::datetime::epoch_to_rfc3339(2_000_000_000);
+        assert_eq!(
+            refresh_patch(SouthboundProducer::Udm, 2_000_000_000, true),
+            serde_json::json!([{ "op": "add", "path": "/reportingOptions/expiry", "value": at }])
+        );
+        assert_eq!(
+            refresh_patch(SouthboundProducer::Udm, 2_000_000_000, false),
+            serde_json::json!([{
+                "op": "add", "path": "/reportingOptions", "value": { "expiry": at }
+            }])
+        );
+        assert_eq!(
+            refresh_patch(SouthboundProducer::Amf, 2_000_000_000, true),
+            refresh_patch(SouthboundProducer::Amf, 2_000_000_000, false),
+            "the AMF's AmfUpdateEventOptionItem is a member replace either way"
+        );
+    }
+
     /// #2102: a live leg, AMF and UDM, is made with an expiry and refreshed
     /// before it lapses, by the spec modification: the AMF's
     /// AmfUpdateEventOptionItem `replace /options/expiry`, the UDM's PatchItem on
@@ -4119,11 +4339,13 @@ mod tests {
                     }
                     SouthboundProducer::Udm => {
                         assert!(path.ends_with("/ee-subscriptions/ee-2102"), "{path}");
+                        // #2133: the member, not the object, so the UDM's other
+                        // reportingOptions members survive.
                         assert_eq!(
                             patch,
                             &serde_json::json!([{
-                                "op": "add", "path": "/reportingOptions",
-                                "value": { "expiry": at }
+                                "op": "add", "path": "/reportingOptions/expiry",
+                                "value": at
                             }])
                         );
                     }
