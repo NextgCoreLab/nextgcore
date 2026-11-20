@@ -2197,6 +2197,9 @@ pub struct SmfContext {
     /// holding it got its modifications nowhere and its Session Reports refused.
     /// Persisted per SM context with the session map.
     pub session_upfs: RwLock<HashMap<u64, String>>,
+    /// #2208: the I-UPF leg of each session that has one, by the PSA session's
+    /// SMF-side SEID (`crate::iupf`). Persisted per SM context as `iupfLegs`.
+    pub iupf_legs: RwLock<HashMap<u64, crate::iupf::IupfLeg>>,
     /// A [`SmfContext::persist_soon`] write is scheduled (#1075).
     pub persist_pending: std::sync::atomic::AtomicBool,
     /// Snapshot writes this context made: the coalescing's observable (#1075).
@@ -2332,6 +2335,7 @@ impl SmfContext {
             far_peers: RwLock::new(HashMap::new()),
             failed_up_paths: RwLock::new(HashMap::new()),
             session_upfs: RwLock::new(HashMap::new()),
+            iupf_legs: RwLock::new(HashMap::new()),
             persist_pending: std::sync::atomic::AtomicBool::new(false),
             persist_writes: std::sync::atomic::AtomicU64::new(0),
             persist_lock: std::sync::Mutex::new(()),
@@ -2547,6 +2551,20 @@ impl SmfContext {
         // uplink F-TEID, which the UP activation, the network-triggered Service
         // Request, a handover and a path switch all have to name, and which the UPF
         // gave only at establishment.
+        // #2208: per SM context, like `sessionUpfs`.
+        let iupf_legs: std::collections::BTreeMap<String, crate::iupf::IupfLeg> = {
+            let m = read_through(&self.iupf_legs, "iupf_legs");
+            pfcp_sessions
+                .keys()
+                .filter_map(|r| {
+                    let seid = cp_n4_seids
+                        .get(r)
+                        .copied()
+                        .unwrap_or_else(|| derive_cp_n4_seid(r));
+                    m.get(&seid).map(|l| (r.clone(), *l))
+                })
+                .collect()
+        };
         let upf_ul_endpoints: std::collections::BTreeMap<String, serde_json::Value> =
             read_through(&self.upf_ul_endpoints, "upf_ul_endpoints")
                 .iter()
@@ -2581,6 +2599,7 @@ impl SmfContext {
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
             "sessionUpfs": session_upfs,
+            "iupfLegs": iupf_legs,
             "upfUlEndpoints": upf_ul_endpoints,
             "failedUpPaths": read_through(&self.failed_up_paths, "failed_up_paths")
                 .iter()
@@ -2812,6 +2831,23 @@ impl SmfContext {
                 (seid, key)
             })
             .collect();
+        // #2208: absent before it existed (no session had an I-UPF).
+        let iupf_legs: Vec<(u64, crate::iupf::IupfLeg)> = doc
+            .get("iupfLegs")
+            .and_then(|v| {
+                serde_json::from_value::<HashMap<String, crate::iupf::IupfLeg>>(v.clone()).ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(r, _)| pfcp_sessions.contains_key(r))
+            .map(|(r, leg)| {
+                let seid = cp_n4_seids
+                    .get(&r)
+                    .copied()
+                    .unwrap_or_else(|| derive_cp_n4_seid(&r));
+                (seid, leg)
+            })
+            .collect();
         let restored_refs: Vec<String> = pfcp_sessions.keys().cloned().collect();
         // One lock at a time, as in `snapshot`.
         if let Ok(mut map) = self.pfcp_sessions.write() {
@@ -2854,6 +2890,9 @@ impl SmfContext {
         crate::reconcile::restore(pending_cleanups);
         if let Ok(mut map) = self.session_upfs.write() {
             map.extend(session_upfs);
+        }
+        if let Ok(mut map) = self.iupf_legs.write() {
+            map.extend(iupf_legs);
         }
         // #1230: the UPF N3 uplink endpoint of each restored SM context. A record that
         // does not read is skipped, and its session is then handled like one from an
@@ -3135,6 +3174,7 @@ impl SmfContext {
         heal(&self.far_peers, "far_peers");
         heal(&self.failed_up_paths, "failed_up_paths");
         heal(&self.session_upfs, "session_upfs");
+        heal(&self.iupf_legs, "iupf_legs");
         heal(&self.policy_bindings, "policy_bindings");
         heal(&self.unrestorable_sessions, "unrestorable_sessions");
     }
@@ -4443,6 +4483,7 @@ pub(crate) struct SeededState {
     cp_n4_seids: std::collections::HashSet<String>,
     far_peers: std::collections::HashSet<u64>,
     session_upfs: std::collections::HashSet<u64>,
+    iupf_legs: std::collections::HashSet<u64>,
     gsm_timers: std::collections::HashSet<String>,
 }
 
@@ -4460,6 +4501,7 @@ impl SeededState {
             cp_n4_seids: keys_of(&ctx.cp_n4_seids),
             far_peers: keys_of(&ctx.far_peers),
             session_upfs: keys_of(&ctx.session_upfs),
+            iupf_legs: keys_of(&ctx.iupf_legs),
             gsm_timers: crate::gsm_timer_refs_for_test(),
         }
     }
@@ -4503,6 +4545,7 @@ impl Drop for SeededState {
         retain_keys(&ctx.cp_n4_seids, &self.cp_n4_seids);
         retain_keys(&ctx.far_peers, &self.far_peers);
         retain_keys(&ctx.session_upfs, &self.session_upfs);
+        retain_keys(&ctx.iupf_legs, &self.iupf_legs);
         crate::retain_gsm_timers_for_test(&self.gsm_timers);
     }
 }
@@ -5606,6 +5649,54 @@ mod tests {
                 .copied(),
             Some(1_700_000_000)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #2208: the I-UPF leg of each restored session comes back with it, under the
+    /// PSA session's SMF-side SEID, so its modifications keep being split; one
+    /// whose session the snapshot does not restore does not.
+    #[test]
+    fn i_upf_legs_survive_a_restore_2208() {
+        let path = temp_state_path("iupf-legs");
+        let leg = crate::iupf::IupfLeg {
+            smf_seid: 0,
+            upf_seid: 0x22,
+            n3: (0x1, [127, 0, 0, 2]),
+            n9: (0x2, [127, 0, 0, 2]),
+            psa_ul: (0x3, [127, 0, 0, 3]),
+        };
+        let derived = {
+            let ctx = ctx_with_state(&path);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("22081".to_string(), 0x2208);
+            let derived = derive_cp_n4_seid("22081");
+            {
+                let mut m = ctx.iupf_legs.write().unwrap();
+                m.insert(
+                    derived,
+                    crate::iupf::IupfLeg {
+                        smf_seid: crate::iupf::leg_seid(derived),
+                        ..leg
+                    },
+                );
+                m.insert(0x0777, leg);
+            }
+            ctx.persist();
+            derived
+        };
+        let restored = ctx_with_state(&path);
+        let m = restored.iupf_legs.read().unwrap();
+        assert_eq!(
+            m.get(&derived).copied(),
+            Some(crate::iupf::IupfLeg {
+                smf_seid: crate::iupf::leg_seid(derived),
+                ..leg
+            })
+        );
+        assert!(!m.contains_key(&0x0777));
+        drop(m);
         let _ = std::fs::remove_file(&path);
     }
 

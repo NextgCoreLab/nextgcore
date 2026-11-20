@@ -852,11 +852,64 @@ pub fn clear_tsc_reports_for_test() {
     }
 }
 
+/// The I-UPF half of a Session Modification or Deletion of a PSA session with an
+/// I-UPF `leg` (#2208, `crate::iupf`), sent before the PSA's. A Modification
+/// whose I-UPF part the I-UPF does not accept fails as a whole, the PSA's part
+/// unsent. A Deletion goes on to the PSA whatever the I-UPF answers (logged).
+async fn iupf_leg_request(
+    msg_type: u8,
+    leg: &crate::iupf::IupfLeg,
+    body: &[u8],
+) -> Result<(), PfcpRequestError> {
+    let psa_seid = crate::iupf::psa_seid_of(leg.smf_seid);
+    let Some(client) = crate::iupf::client() else {
+        if msg_type == pfcp_message_type::SESSION_DELETION_REQUEST {
+            crate::iupf::forget(psa_seid);
+            return Ok(());
+        }
+        return Err(PfcpRequestError::Local(
+            "the session has an I-UPF leg but no I-UPF is configured".into(),
+        ));
+    };
+    if msg_type == pfcp_message_type::SESSION_DELETION_REQUEST {
+        let r = client
+            .session_request(msg_type, leg.smf_seid, Some(leg.upf_seid), body)
+            .await;
+        match r.as_ref().map(|(_, b)| parse_cause(b)) {
+            Ok(Some(pfcp_cause::REQUEST_ACCEPTED)) => {
+                log::info!("I-UPF Session Deletion for SEID 0x{psa_seid:016x}: accepted")
+            }
+            other => log::warn!(
+                "I-UPF Session Deletion for SEID 0x{psa_seid:016x}: {other:?}; the PSA's goes on"
+            ),
+        }
+        crate::iupf::forget(psa_seid);
+        return Ok(());
+    }
+    let Some(iupf_body) = crate::iupf::split_modification(body, leg).1 else {
+        return Ok(());
+    };
+    let (_, resp) = client
+        .session_request(msg_type, leg.smf_seid, Some(leg.upf_seid), &iupf_body)
+        .await?;
+    match parse_cause(&resp) {
+        Some(pfcp_cause::REQUEST_ACCEPTED) => Ok(()),
+        Some(cause) => Err(PfcpRequestError::Rejected { cause }),
+        None => Err(PfcpRequestError::Local(
+            "the I-UPF's Session Modification Response has no Cause".into(),
+        )),
+    }
+}
+
 /// Resolve the PFCP client serving an EXISTING session by the SMF-side N4
 /// SEID. Falls back to the process-wide default client when no binding is
 /// recorded; with a single configured UPF that is always the same client,
 /// so the legacy behavior is unchanged.
 pub fn client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
+    // #2208: an I-UPF leg's session is on the configured I-UPF.
+    if crate::iupf::is_leg_seid(smf_n4_seid) {
+        return crate::iupf::client();
+    }
     recorded_client(smf_n4_seid).or_else(global_client)
 }
 
@@ -1554,6 +1607,35 @@ impl PfcpClient {
     /// session with SMF-side SEID `smf_seid`: [`Self::request`], and then the GTP-U
     /// peers of its FARs are learnt from the request the UPF accepted (#994).
     pub async fn session_request(
+        &self,
+        msg_type: u8,
+        smf_seid: u64,
+        upf_seid: Option<u64>,
+        body: &[u8],
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        // #2208: a session with an I-UPF on N9 is split here, for every procedure.
+        if !crate::iupf::is_leg_seid(smf_seid)
+            && (msg_type == pfcp_message_type::SESSION_MODIFICATION_REQUEST
+                || msg_type == pfcp_message_type::SESSION_DELETION_REQUEST)
+        {
+            if let Some(leg) = crate::iupf::leg_of(smf_seid) {
+                Box::pin(iupf_leg_request(msg_type, &leg, body)).await?;
+                let psa = if msg_type == pfcp_message_type::SESSION_MODIFICATION_REQUEST {
+                    crate::iupf::split_modification(body, &leg).0
+                } else {
+                    body.to_vec()
+                };
+                return self
+                    .session_request_direct(msg_type, smf_seid, upf_seid, &psa)
+                    .await;
+            }
+        }
+        self.session_request_direct(msg_type, smf_seid, upf_seid, body)
+            .await
+    }
+
+    /// [`Self::session_request`] for this peer alone.
+    async fn session_request_direct(
         &self,
         msg_type: u8,
         smf_seid: u64,

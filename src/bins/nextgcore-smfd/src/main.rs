@@ -55,6 +55,7 @@ mod n4_handler;
 mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod n6_delay; // #1502: N6 delay measurement, provisioned over N4 association (TS 29.244 §5.33.8)
 use nextgcore_sbi::owner_binding; // #1860, on the shared #1865 helper
+mod iupf; // #2208: an intermediate UPF on N9 (TS 23.502 §4.3.5.4)
 mod pcc_qos_mon; // #2208: the PCF's QoS monitoring policy (qosMonDecs / refQosMon) at the PSA
 mod pfcp_path;
 mod pfcp_sm;
@@ -831,6 +832,8 @@ struct SmfSection {
     n6_delay_measurement: Option<n6_delay::N6DelayYaml>,
     /// #2208: how the PCF's QoS monitoring policy is measured (TS 23.501 §5.33.3.1).
     qos_monitoring: Option<pcc_qos_mon::QosMonitoringYaml>,
+    /// #2208: an intermediate UPF inserted on N9 (TS 23.502 §4.3.5.4).
+    intermediate_upf: Option<iupf::IupfYaml>,
 }
 
 /// Root YAML document
@@ -867,6 +870,8 @@ struct SmfConfig {
     qos_monitoring_method: pcc_qos_mon::Method,
     /// #2208 review M1: `smf.qos_monitoring.pcc`, off unless configured.
     qos_monitoring_pcc: bool,
+    /// #2208: `smf.intermediate_upf`, its PFCP peer and DNNs.
+    intermediate_upf: Option<(pfcp_path::UpfPeerSpec, Vec<String>)>,
 }
 
 impl Default for SmfConfig {
@@ -888,6 +893,7 @@ impl Default for SmfConfig {
             n6_delay: None,
             qos_monitoring_method: pcc_qos_mon::Method::PerQosFlow,
             qos_monitoring_pcc: false,
+            intermediate_upf: None,
         }
     }
 }
@@ -965,6 +971,12 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
         if let Some(qm) = smf.qos_monitoring {
             config.qos_monitoring_method = qm.method;
             config.qos_monitoring_pcc = qm.pcc;
+        }
+        // #2208: an unusable I-UPF address fails startup.
+        if let Some(i) = smf.intermediate_upf {
+            let spec = pfcp_path::parse_upf_peer(&i.pfcp, 8805)
+                .map_err(|e| anyhow::anyhow!("smf.intermediate_upf.pfcp: {e}"))?;
+            config.intermediate_upf = Some((spec, i.dnns));
         }
 
         // S5/S8 bind address (#52). Only the first entry is bound; a second is named
@@ -1508,6 +1520,23 @@ async fn main() -> Result<()> {
     // Installs the whole pool and pool slot 0 as the process-wide default
     // client (the legacy single-client paths keep working unchanged).
     pfcp_path::set_global_pool(pfcp_clients.clone());
+    // #2208: the I-UPF is not a PSA candidate, so not in the pool; its answers are
+    // received and its association kept like the pool's.
+    let mut n4_clients = pfcp_clients.clone();
+    if let Some((spec, dnns)) = config.intermediate_upf.take() {
+        let client =
+            Arc::new(pfcp_path::client_for_peer(pfcp_socket.clone(), &spec, &n4_identity).await);
+        log::info!(
+            "I-UPF {spec:?} inserted on N9 for {} (smf.intermediate_upf, TS 23.502 §4.3.5.4)",
+            if dnns.is_empty() {
+                "every DNN".to_string()
+            } else {
+                format!("DNNs {dnns:?}")
+            }
+        );
+        n4_clients.push(client.clone());
+        iupf::set(Some((client, dnns)));
+    }
 
     // Recovery counter for S5/S8. Derived from the process start rather than persisted:
     // smfd has no restart-counter file, and inventing one here would be a second answer
@@ -1525,7 +1554,7 @@ async fn main() -> Result<()> {
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
     // the engine; Session Report Requests are handled here.
-    let pfcp_listener_handle = spawn_pfcp_listener(pfcp_socket.clone(), pfcp_clients.clone());
+    let pfcp_listener_handle = spawn_pfcp_listener(pfcp_socket.clone(), n4_clients.clone());
 
     // N4 association maintenance: establish the PFCP association at startup
     // (Node ID + Recovery Time Stamp, TS 29.244 6.2.6) and keep it alive
@@ -1533,7 +1562,7 @@ async fn main() -> Result<()> {
     // Stamp tears the association down (stale sessions flushed) and
     // triggers re-association.
     let shutdown_assoc = shutdown.clone();
-    let clients_assoc = pfcp_clients.clone();
+    let clients_assoc = n4_clients.clone();
     let pfcp_assoc_handle = tokio::spawn(async move {
         pfcp_path::run_association_loop(
             clients_assoc,
@@ -3760,6 +3789,12 @@ async fn pfcp_session_establish(
     // SMF-side SEID: UPF-chosen SEIDs collide across a multi-UPF pool.
     pfcp_path::record_session_upf(smf_n4_seid, &client);
 
+    // #2208: an I-UPF on N9 when one is configured for the DNN (TS 23.502
+    // §4.3.5.4): the NG-RAN is then given the I-UPF's N3 F-TEID.
+    if let Some(leg) = iupf::insert(smf_n4_seid, dnn, flow_qfi, (upf_teid, upf_ip)).await {
+        (upf_teid, upf_ip) = leg.n3;
+    }
+
     Ok(PfcpSessionResult {
         upf_seid,
         upf_teid,
@@ -4412,6 +4447,14 @@ async fn split_pdu_session_modification(
     sess: Option<context::SmfSess>,
 ) -> std::result::Result<SbiResponse, (n2_transfer::SmfCause, String)> {
     use n2_transfer::SmfCause;
+    // #2208: additional NG-RAN tunnels are not carried across an I-UPF.
+    if !indication.additional.is_empty() && iupf::leg_of(smf_n4_seid_for(sm_context_ref)).is_some()
+    {
+        return Err((
+            SmfCause::TransportResourceUnavailable,
+            "a split PDU session over an I-UPF is not supported".to_string(),
+        ));
+    }
     let mut tunnels = vec![(
         indication.dl.teid,
         ipv4_of(&indication.dl),
@@ -13885,6 +13928,9 @@ mod tests {
     }
 
     use super::*;
+    // #2208: the in-process end to end with two real UPFs (upfd's library),
+    // in `src/tests/iupf_e2e_tests.rs`.
+    mod iupf_e2e_tests;
 
     /// #718 (revising #677): a graceful shutdown keeps the PFCP association only
     /// when durable state hands the sessions on. Without it the next incarnation
