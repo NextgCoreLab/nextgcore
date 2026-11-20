@@ -15,8 +15,8 @@
 //!
 //! 1. the NF Instance ID in the URI SAN of the verified client certificate
 //!    ([`SbiRequest::peer_cert_nf_instance_id`], TS 33.310 §6.1.3c), unless that
-//!    certificate names a relay type ([`RELAY_NF_TYPES`]: an SCP or SEPP is not
-//!    the consumer), else
+//!    certificate names relay types only ([`is_relay_certificate`]: an SCP or
+//!    SEPP is not the consumer; one also naming a consumer type is, #2113), else
 //! 2. the `sub` of the verified OAuth2 access token
 //!    ([`SbiRequest::oauth2_subject`], TS 29.510 `AccessTokenClaims.sub`, the
 //!    consumer's NF Instance ID), which survives an SCP hop (TS 33.501 §13.3).
@@ -82,6 +82,22 @@ use crate::security::SbiProfile;
 /// Certificate NF types that identify a relay rather than the consumer.
 pub const RELAY_NF_TYPES: &[&str] = &["SCP", "SEPP"];
 
+/// #2113: whether a certificate naming `nf_types` (RFC 9310 NFTypes) is a
+/// relay's: it names at least one type and every one is a relay type
+/// ([`RELAY_NF_TYPES`]). A certificate that also names a consumer type -- say
+/// `[SCP, PCF]` -- is that consumer's, not a relay's: its holder is identified
+/// and typed by it, so it cannot borrow another NF's token by calling itself an
+/// SCP. A certificate naming no types is not a relay's either (see the module
+/// docs: it fails closed).
+pub fn is_relay_certificate<S: AsRef<str>>(nf_types: &[S]) -> bool {
+    !nf_types.is_empty()
+        && nf_types.iter().all(|t| {
+            RELAY_NF_TYPES
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(t.as_ref().trim()))
+        })
+}
+
 /// NF Instance IDs are UUIDs (TS 29.571 `NfInstanceId`), compared without case.
 pub fn same_nf_instance_id(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
@@ -97,10 +113,7 @@ pub fn identity_required() -> bool {
 /// The caller's verified NF Instance ID: `Ok(None)` when it proved none,
 /// `Err(detail)` when its certificate and token name different NF instances.
 pub fn verified_consumer_id(request: &SbiRequest) -> Result<Option<String>, String> {
-    let relay = request
-        .peer_cert_nf_types
-        .iter()
-        .any(|t| RELAY_NF_TYPES.iter().any(|r| r.eq_ignore_ascii_case(t)));
+    let relay = is_relay_certificate(&request.peer_cert_nf_types);
     let cert = request
         .peer_cert_nf_instance_id
         .as_deref()
@@ -364,8 +377,9 @@ async fn cached_nrf_lists_nf_type_at(
 ///
 /// - the caller's identity is [`verified_consumer_id`]'s; none, or a
 ///   certificate/token mismatch, refuses;
-/// - the consumer's own client certificate (not a relay's, [`RELAY_NF_TYPES`])
-///   naming NF types (RFC 9310, TS 33.310 §6.1.3c) must name `expected`;
+/// - the consumer's own client certificate (not a relay's: one naming relay
+///   types only, [`is_relay_certificate`]; a certificate naming a relay type
+///   and a consumer type is the consumer's, #2113) naming NF types (RFC 9310, TS 33.310 §6.1.3c) must name `expected`;
 /// - otherwise -- a token alone, a token through an SCP or SEPP, or a
 ///   certificate without NF types plus a token -- the NRF must list the
 ///   token's verified subject as an `expected` ([`nrf_lists_nf_type_at`],
@@ -384,9 +398,7 @@ pub async fn verified_nf_type(
         None => return Err("the requester has no verified identity".to_string()),
     }
     let types = &request.peer_cert_nf_types;
-    let relay = types
-        .iter()
-        .any(|t| RELAY_NF_TYPES.iter().any(|r| r.eq_ignore_ascii_case(t)));
+    let relay = is_relay_certificate(types);
     let cert = request
         .peer_cert_nf_instance_id
         .as_deref()
@@ -598,6 +610,59 @@ mod tests {
             ok(caller(Some(AMF), Some(AMF), &[])).await,
             Ok(()),
             "typeless certificate plus its token"
+        );
+    }
+
+    /// **#2113**: a certificate naming a relay type AND a consumer type is the
+    /// consumer's, not a relay's. `[SCP, PCF]` relaying an AMF's token (seeded
+    /// in the NRF as an AMF) is refused: its own id disagrees with the token's,
+    /// and carrying the AMF's own id it is still typed by its certificate, which
+    /// names no AMF. A relay-only certificate (`[SCP]`, `[SCP, SEPP]`) still
+    /// lets the token decide.
+    ///
+    /// REVERT-VERIFIED: with `is_relay_certificate` back to "any type is a
+    /// relay type", the `[SCP, PCF]` cases resolve to the AMF's token and the
+    /// `mixed certificate` assertions fail.
+    #[tokio::test]
+    async fn a_certificate_naming_a_relay_and_a_consumer_type_is_the_consumers_2113() {
+        const AMF: &str = "aaaaaaaa-2113-4000-8000-0000000000a3";
+        const MIXED: &str = "cccccccc-2113-4000-8000-0000000000c3";
+        seed_nf_type_for_test(AMF, NfType::Amf);
+        let ok = |r: SbiRequest| async move { verified_nf_type(&r, NfType::Amf).await };
+        assert!(is_relay_certificate(&["SCP"]));
+        assert!(is_relay_certificate(&["scp", "SEPP"]));
+        assert!(!is_relay_certificate(&["SCP", "PCF"]));
+        assert!(!is_relay_certificate::<&str>(&[]));
+        assert_eq!(
+            verified_consumer_id(&caller(Some(MIXED), None, &["SCP", "PCF"])),
+            Ok(Some(MIXED.into())),
+            "mixed certificate: its own id is the identity"
+        );
+        assert!(
+            verified_consumer_id(&caller(Some(MIXED), Some(AMF), &["SCP", "PCF"])).is_err(),
+            "mixed certificate: it cannot relay another NF's token"
+        );
+        let refused = ok(caller(Some(MIXED), Some(AMF), &["SCP", "PCF"])).await;
+        assert!(
+            refused.is_err(),
+            "mixed certificate + AMF token: {refused:?}"
+        );
+        let refused = ok(caller(Some(AMF), Some(AMF), &["PCF", "SCP"]))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("not AMF"),
+            "mixed certificate typed: {refused}"
+        );
+        assert_eq!(
+            ok(caller(Some(MIXED), Some(AMF), &["SCP", "SEPP"])).await,
+            Ok(()),
+            "relay-only certificate: the token decides"
+        );
+        assert_eq!(
+            ok(caller(Some(AMF), None, &["AMF", "SCP"])).await,
+            Ok(()),
+            "a mixed certificate naming AMF is an AMF"
         );
     }
 
