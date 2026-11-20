@@ -1,5 +1,5 @@
 //! #417 stage B3.3: the NGAP PDUs amfd's tests stand in for a gNB or a CBCF
-//! with. They are octets derived by hand from the TS 38.413 V17.9 ASN.1 and
+//! with. They are octets derived by hand from the TS 38.413 ASN.1 and
 //! X.691 ALIGNED, through [`crate::aper_golden::Bits`], with the derivation
 //! written beside each builder. They used to come from the hand-written
 //! `nextgcore-ngap` builders.
@@ -7,6 +7,12 @@
 //! Each builder is pinned twice in this module's tests: by a vector worked out
 //! octet by octet in the test, and by the generated codec's strict decode,
 //! which has to read those octets as the PDU the builder says they are.
+//!
+//! Which release: the ASN.1 is V17.9.0, the module vendored at
+//! `libs/nextgcore-ngap-gen/asn/ngap-17.9.asn` (see its `PROVENANCE.md`), which
+//! is what the generated codec is compiled from. The § numbers cite the prose
+//! of TS 38.413 V19.3.0 (`38413-j30`), the text kept with the specs; the message
+//! and IE sections cited here carry the same numbers there.
 
 use crate::aper_golden::{pdu, Bits};
 
@@ -386,7 +392,7 @@ pub(crate) fn global_ran_node_id(b: &mut Bits, id: &t::GlobalRanNodeId) {
     }
 }
 
-/// NgENB-ID (§9.3.1.8): CHOICE of four (not extensible), macroNgENB-ID `00`
+/// NgENB-ID (within Global ng-eNB ID, §9.3.1.8): CHOICE of four (not extensible), macroNgENB-ID `00`
 /// `BIT STRING (SIZE(20))`, shortMacroNgENB-ID `01` `(SIZE(18))`,
 /// longMacroNgENB-ID `10` `(SIZE(21))`; each fixed and longer than sixteen
 /// bits, so aligned with no length (§16.10).
@@ -552,7 +558,7 @@ pub(crate) fn handover_failure(m: &t::HandoverFailure) -> Vec<u8> {
     )
 }
 
-/// HANDOVER NOTIFY (§9.2.3.8): initiatingMessage, id-HandoverNotification 11,
+/// HANDOVER NOTIFY (§9.2.3.7): initiatingMessage, id-HandoverNotification 11,
 /// ignore; ids 10, 85 (reject); id 121 UserLocationInformation (ignore).
 pub(crate) fn handover_notify(m: &t::HandoverNotify) -> Vec<u8> {
     pdu(
@@ -567,7 +573,7 @@ pub(crate) fn handover_notify(m: &t::HandoverNotify) -> Vec<u8> {
     )
 }
 
-/// PATH SWITCH REQUEST (§9.2.3.9): initiatingMessage, id-PathSwitchRequest
+/// PATH SWITCH REQUEST (§9.2.3.8): initiatingMessage, id-PathSwitchRequest
 /// 25, reject:
 /// - id 85 RAN-UE-NGAP-ID, id 100 SourceAMF-UE-NGAP-ID (reject);
 /// - id 121 UserLocationInformation (ignore);
@@ -638,7 +644,7 @@ fn global_ran_node_id_value(id: &t::GlobalRanNodeId) -> Vec<u8> {
     b.finish()
 }
 
-/// PWS RESTART INDICATION (§9.2.8.4) from a gNB: initiatingMessage,
+/// PWS RESTART INDICATION (§9.2.8.5) from a gNB: initiatingMessage,
 /// id-PWSRestartIndication 34, ignore:
 /// - id 16 CellIDListForRestart (reject): CHOICE of three (not extensible)
 ///   nR-CGIListforRestart `01`, padded, then [`nr_cgi_list`];
@@ -789,7 +795,7 @@ pub(crate) fn pdu_session_resource_setup_response(
     pdu(1, 29, 0, &ies)
 }
 
-/// PDU SESSION RESOURCE MODIFY RESPONSE (§9.2.1.4): successfulOutcome,
+/// PDU SESSION RESOURCE MODIFY RESPONSE (§9.2.1.6): successfulOutcome,
 /// id-PDUSessionResourceModify 26, reject; ids 10, 85 (ignore); id 65
 /// PDUSessionResourceModifyListModRes and id 54
 /// PDUSessionResourceFailedToModifyListModRes (ignore).
@@ -808,7 +814,7 @@ pub(crate) fn pdu_session_resource_modify_response(
     pdu(1, 26, 0, &ies)
 }
 
-/// PDU SESSION RESOURCE RELEASE RESPONSE (§9.2.1.6): successfulOutcome,
+/// PDU SESSION RESOURCE RELEASE RESPONSE (§9.2.1.4): successfulOutcome,
 /// id-PDUSessionResourceRelease 28, reject; ids 10, 85 (ignore); id 70
 /// PDUSessionResourceReleasedListRelRes (ignore, mandatory).
 pub(crate) fn pdu_session_resource_release_response(
@@ -1539,5 +1545,81 @@ mod tests {
             ]
         );
         assert_eq!(ids(&failure), (14, vec![10, 85, 15]));
+    }
+
+    /// R44 on #2213: Handover Required with Direct Forwarding Path
+    /// Availability. IE 22 (ignore) goes between TargetID and the session list
+    /// as `ENUMERATED {direct-path-available, ...}`: one extension bit,
+    /// padded, `00`.
+    #[test]
+    fn handover_required_with_direct_forwarding_is_the_worked_octets() {
+        let mut m = required(t::TargetId::TargetRanNodeId {
+            global_ran_node_id: t::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: plmn(),
+                gnb_id: 0x7_4402,
+                gnb_id_len: 22,
+            },
+            selected_tai: t::TaiListItem {
+                tai_plmn: plmn(),
+                tai_tac: [0x00, 0x00, 0x01],
+            },
+        });
+        let without = handover_required(&m);
+        m.direct_forwarding_path_availability =
+            Some(t::DirectForwardingPathAvailability::DirectPathAvailable);
+        let with = handover_required(&m);
+        // The TargetID IE is the last of the first 48 octets of `without`
+        // (header 4 + count 3 + ids 12 + type 5 + cause 6 + target 18): the
+        // DFPA IE `00 16 40 01 00` follows it, the IE count goes 7 -> 8 and
+        // the PDU length 60 -> 65.
+        let mut expected = without.clone();
+        expected[3] = 0x41;
+        expected[6] = 0x08;
+        expected.splice(48..48, [0x00, 0x16, 0x40, 0x01, 0x00]);
+        assert_eq!(with, expected);
+        assert_eq!(ids(&with), (12, vec![10, 85, 29, 15, 105, 22, 61, 101]));
+        let crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } =
+            crate::ngap_asn1::decode_handover_required_asn1(&with)
+        else {
+            panic!("the derived Handover Required decodes");
+        };
+        assert!(message.direct_forwarding_path_availability.is_some());
+    }
+
+    /// R44 on #2213: the shortMacro (`01`, 18 bits) and longMacro (`10`, 21
+    /// bits) ng-eNB ID arms, as the TargetID IE value of a Handover Required:
+    /// `01 00 00` + pad -> `40`; PLMN; the arm's index, padded; the ID bits
+    /// aligned; EPS-TAI `00`; padded; PLMN; EPS-TAC `00 07`.
+    #[test]
+    fn the_short_and_long_macro_ng_enb_ids_are_the_worked_octets() {
+        let target = |id| {
+            let pdu = handover_required(&required(t::TargetId::TargetGlobalNgEnbId {
+                plmn_identity: plmn(),
+                ng_enb_id: id,
+                selected_eps_tai: t::EpsTai {
+                    plmn_identity: plmn(),
+                    tac: [0x00, 0x07],
+                },
+            }));
+            assert_eq!(ids(&pdu), (12, vec![10, 85, 29, 15, 105, 61, 101]));
+            let at = pdu
+                .windows(2)
+                .position(|w| w == [0x00, 0x69])
+                .expect("TargetID");
+            let len = pdu[at + 3] as usize;
+            pdu[at + 4..at + 4 + len].to_vec()
+        };
+        // shortMacro 0x2ABCD in 18 bits `10 1010 1011 1100 1101`, then EPS-TAI
+        // `00`: `1010 1010 1111 0011 0100` -> `aa f3 40`.
+        assert_eq!(
+            target(t::NgEnbId::ShortMacro(0x2_ABCD)),
+            [0x40, 0x00, 0xf1, 0x10, 0x40, 0xaa, 0xf3, 0x40, 0x00, 0xf1, 0x10, 0x00, 0x07]
+        );
+        // longMacro 0x1ABCDE in 21 bits `1 1010 1011 1100 1101 1110`, then
+        // EPS-TAI `00`: `1101 0101 1110 0110 1111 0000` -> `d5 e6 f0`.
+        assert_eq!(
+            target(t::NgEnbId::LongMacro(0x1A_BCDE)),
+            [0x40, 0x00, 0xf1, 0x10, 0x80, 0xd5, 0xe6, 0xf0, 0x00, 0xf1, 0x10, 0x00, 0x07]
+        );
     }
 }

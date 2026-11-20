@@ -2,8 +2,9 @@
 //! NGAP goldens in amfd's tests.
 //!
 //! The goldens that replace the hand-written `nextgcore-ngap` codec are derived
-//! by hand from the TS 38.413 V17.9 ASN.1 (`libs/nextgcore-ngap-gen/asn`) and
-//! X.691. Where a PDU's width depends on its values (lists, long integers), the
+//! by hand from the TS 38.413 V17.9.0 ASN.1 (`libs/nextgcore-ngap-gen/asn`,
+//! the module the generated codec is compiled from) and X.691; § numbers in
+//! the derivations cite the V19.3.0 prose (`38413-j30`). Where a PDU's width depends on its values (lists, long integers), the
 //! derivation drives this sink. The sink knows bits, bit-fields, alignment and
 //! the open-type length determinant, and nothing about the schema. Each test
 //! that uses it says, beside the calls, which schema member each call encodes
