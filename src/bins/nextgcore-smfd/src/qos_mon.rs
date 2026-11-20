@@ -101,6 +101,8 @@ struct SessionMon {
     /// #2208: the preceding UL GTP-U peer the PSA's UL PDR holds in its Transport
     /// Delay Reporting (IE 271), `None` when it holds none.
     tdr_peer: Option<std::net::IpAddr>,
+    /// #2208: the same for the session's I-UPF's UL PDR.
+    tdr_iupf_peer: Option<std::net::IpAddr>,
     /// A task owns the IE 271 leg ([`sync_transport_delay`]).
     tdr_busy: bool,
     /// The access peer or the SRRs changed while [`Self::tdr_busy`]: its owner
@@ -168,6 +170,7 @@ fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
             && !s.n2_busy
             && s.n2_retransmit.is_none()
             && s.tdr_peer.is_none()
+            && s.tdr_iupf_peer.is_none()
             && !s.tdr_busy
     }) {
         m.remove(r);
@@ -1074,63 +1077,57 @@ pub async fn sync_transport_delay(r: &str) {
         return;
     }
     loop {
-        let peer = crate::lookup_upf_seid(r)
-            .map(|_| crate::smf_n4_seid_for(r))
-            .and_then(preceding_peer);
+        let psa_seid = crate::lookup_upf_seid(r).map(|_| crate::smf_n4_seid_for(r));
+        let peer = psa_seid.and_then(preceding_peer);
+        // #2208: an I-UPF on N9 measures the N3 delay toward the NG-RAN with its own
+        // IE 271 (TS 29.244 §5.24.5.3: "the SMF shall include ... in the UL Create
+        // PDR ... of the PSA and of each I-UPF"); the PSA's preceding peer is then
+        // the I-UPF, the peer its FAR 2 forwards to.
+        let leg = psa_seid.and_then(crate::iupf::leg_of);
+        let iupf_peer = leg.and_then(|l| preceding_peer(l.smf_seid));
         let step = with(|m| {
             let s = m.get_mut(r)?;
             s.tdr_dirty = false;
             let want = transport_delay_wanted(s, peer);
-            if want == s.tdr_peer {
+            let want_iupf = if leg.is_some() {
+                transport_delay_wanted(s, iupf_peer)
+            } else {
+                None
+            };
+            let psa = (want != s.tdr_peer).then_some(want);
+            let iupf = (want_iupf != s.tdr_iupf_peer).then_some(want_iupf);
+            if psa.is_none() && iupf.is_none() {
                 s.tdr_busy = false;
                 tidy(m, r);
                 return None;
             }
-            Some(want)
+            Some((psa, iupf))
         });
-        let Some(want) = step else {
+        let Some((psa, iupf)) = step else {
             return;
         };
-        let Some(upf_seid) = crate::lookup_upf_seid(r) else {
-            with(|m| {
-                if let Some(s) = m.get_mut(r) {
-                    s.tdr_busy = false;
-                }
-            });
-            return;
-        };
-        let ie = want.map(
-            |ip| nextgcore_pfcp::qos_monitoring::TransportDelayReporting {
-                preceding_ul_gtpu_peer: crate::n4_build::remote_gtpu_peer(ip),
-                ..Default::default()
-            },
-        );
-        let params = crate::n4_build::SessionModificationParams {
-            update_pdr_transport_delay: vec![(crate::UL_PDR_ID, ie)],
-            ..Default::default()
-        };
-        let ok = match crate::pfcp_modify_with(crate::smf_n4_seid_for(r), upf_seid, &params).await {
-            Ok(_) => {
-                log::info!(
-                    "ref={r}: PSA UL PDR Transport Delay Reporting {} (TS 29.244 §5.24.5.3)",
-                    match want {
-                        Some(ip) => format!("with preceding UL GTP-U peer {ip}"),
-                        None => "deactivated".into(),
-                    }
-                );
-                true
+        let mut sent_psa = None;
+        let mut sent_iupf = None;
+        if let (Some(want), Some(upf_seid)) = (psa, crate::lookup_upf_seid(r)) {
+            if send_transport_delay(r, crate::smf_n4_seid_for(r), upf_seid, want, "PSA").await {
+                sent_psa = Some(want);
             }
-            Err(e) => {
-                log::warn!("ref={r}: Update PDR with Transport Delay Reporting failed: {e}");
-                false
+        }
+        if let (Some(want), Some(l)) = (iupf, leg) {
+            if send_transport_delay(r, l.smf_seid, l.upf_seid, want, "I-UPF").await {
+                sent_iupf = Some(want);
             }
-        };
+        }
+        let ok = sent_psa.is_some() || sent_iupf.is_some();
         let again = with(|m| {
             let Some(s) = m.get_mut(r) else {
                 return false;
             };
-            if ok {
-                s.tdr_peer = want;
+            if let Some(w) = sent_psa {
+                s.tdr_peer = w;
+            }
+            if let Some(w) = sent_iupf {
+                s.tdr_iupf_peer = w;
             }
             // A failed request is retried only when something changes again.
             if ok || std::mem::take(&mut s.tdr_dirty) {
@@ -1146,10 +1143,49 @@ pub async fn sync_transport_delay(r: &str) {
     }
 }
 
+/// Send the UL PDR's Transport Delay Reporting `want` (or its deactivation) to
+/// the UPF of N4 session (`smf_seid`, `upf_seid`), the `role` of session `r`.
+async fn send_transport_delay(
+    r: &str,
+    smf_seid: u64,
+    upf_seid: u64,
+    want: Option<std::net::IpAddr>,
+    role: &str,
+) -> bool {
+    let ie = want.map(
+        |ip| nextgcore_pfcp::qos_monitoring::TransportDelayReporting {
+            preceding_ul_gtpu_peer: crate::n4_build::remote_gtpu_peer(ip),
+            ..Default::default()
+        },
+    );
+    let params = crate::n4_build::SessionModificationParams {
+        update_pdr_transport_delay: vec![(crate::UL_PDR_ID, ie)],
+        ..Default::default()
+    };
+    match crate::pfcp_modify_with(smf_seid, upf_seid, &params).await {
+        Ok(_) => {
+            log::info!(
+                "ref={r}: {role} UL PDR Transport Delay Reporting {} (TS 29.244 §5.24.5.3)",
+                match want {
+                    Some(ip) => format!("with preceding UL GTP-U peer {ip}"),
+                    None => "deactivated".into(),
+                }
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("ref={r}: {role} Update PDR with Transport Delay Reporting failed: {e}");
+            false
+        }
+    }
+}
+
 /// A Session Establishment or Modification of SEID `smf_seid` was accepted
 /// (#2208): if it moved the access-side FAR of a session whose PSA measures by
 /// GTP-U path, its IE 271 follows the new peer.
 pub fn on_session_request(smf_seid: u64) {
+    // #2208: an I-UPF leg's request moves the I-UPF's NG-RAN peer.
+    let smf_seid = crate::iupf::psa_seid_of(smf_seid);
     let r = with(|m| {
         m.iter()
             .find(|(_, s)| s.gtpupm && s.smf_seid == Some(smf_seid))
