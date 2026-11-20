@@ -3147,6 +3147,53 @@ pub fn pcf_self_info_for(
     })
 }
 
+/// #2157: the `resourceUri` a test should expect the PCF to emit for `path`:
+/// the complete URI (`{apiRoot}{path}`, TS 29.501 §4.4.1) once an identity is
+/// published, else the bare path.
+///
+/// [`PCF_SELF_INFO`] is set-once, and
+/// `a_binding_that_lands_after_its_policy_went_is_deregistered_1877` publishes
+/// it (the BSF binding needs it), so it cannot be cleared again. Tests that
+/// pinned the bare path failed whenever they ran after that one: 2 under
+/// shuffle seed 7, 7 under 42. The expectation follows the global instead. It
+/// is checked against an independent spelling: with no identity it is exactly
+/// `path`; with one it is `http://` + host + `:` + port + `path`.
+///
+/// #2214: the scheme is pinned, not "http or https". It is the one this PCF
+/// advertises (`advertised_sbi_scheme`, #92), and in the unit-test binary
+/// that is `http`: only `run` turns TLS on (`set_sbi_tls_active`). The helper
+/// asserts that premise too, so a test that ever turns TLS on fails here,
+/// naming the reason, instead of being matched by the wrong scheme.
+#[cfg(test)]
+pub(crate) fn expected_resource_uri_for_test(path: &str) -> String {
+    expected_resource_uri_with(pcf_self_info(), &pcf_resource_uri(path), path)
+}
+
+/// [`expected_resource_uri_for_test`]'s checks of `uri` against `info`, apart
+/// from the set-once global (#2237): the plaintext premise is asserted on every
+/// call, and both branches are tested in every order
+/// (`the_resource_uri_expectation_checks_both_branches_2237`), not only when a
+/// sibling test has happened to publish an identity first.
+#[cfg(test)]
+fn expected_resource_uri_with(info: Option<&PcfSelfInfo>, uri: &str, path: &str) -> String {
+    assert!(
+        !SBI_TLS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+        "the unit tests advertise plaintext SBI; a test turned TLS on"
+    );
+    match info {
+        None => assert_eq!(uri, path),
+        Some(info) => {
+            let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
+            assert_eq!(
+                uri,
+                format!("http://{host}:{}{path}", info.sbi_port),
+                "the apiRoot of {info:?} followed by {path}"
+            );
+        }
+    }
+    uri.to_string()
+}
+
 /// The published PCF identity, if `main` (or a test) has set it.
 pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
     PCF_SELF_INFO.get()
@@ -3453,6 +3500,40 @@ pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
 mod tests {
     use super::*;
 
+    /// #2237 (R45 on #2233): the resource-URI expectation's checks run in every
+    /// order, not only after a sibling published the PCF identity: with none,
+    /// the bare path; with one, `http://` + host + port + path, the FQDN when
+    /// there is one; and a TLS listener (an `https` apiRoot) is refused.
+    ///
+    /// REVERT-VERIFIED: with the helper's scheme check accepting `https`
+    /// ("the apiRoot of .."), the https case does not panic and this fails.
+    #[test]
+    fn the_resource_uri_expectation_checks_both_branches_2237() {
+        let path = "/npcf-smpolicycontrol/v1/sm-policies/7";
+        let info = PcfSelfInfo {
+            sbi_addr: "10.0.0.7".to_string(),
+            sbi_port: 7777,
+            fqdn: None,
+            nf_instance_id: "pcf-2237".to_string(),
+        };
+        let named = PcfSelfInfo {
+            fqdn: Some("pcf.example.org".to_string()),
+            ..info.clone()
+        };
+        assert_eq!(expected_resource_uri_with(None, path, path), path);
+        let plain = format!("http://10.0.0.7:7777{path}");
+        assert_eq!(expected_resource_uri_with(Some(&info), &plain, path), plain);
+        let fqdn = format!("http://pcf.example.org:7777{path}");
+        assert_eq!(expected_resource_uri_with(Some(&named), &fqdn, path), fqdn);
+        let tls = format!("https://10.0.0.7:7777{path}");
+        let refused =
+            std::panic::catch_unwind(|| expected_resource_uri_with(Some(&info), &tls, path));
+        assert!(
+            refused.is_err(),
+            "an https apiRoot is not the plaintext one"
+        );
+    }
+
     // ── #193: the boot-time SM policy termination reaches the SMF ──
 
     /// The wire assertion for #193's PCF half: a salvaged association produces a
@@ -3529,7 +3610,8 @@ mod tests {
             "the SMF must receive a terminate for an association the PCF cannot serve"
         );
         assert_eq!(
-            seen_bodies[0]["resourceUri"], "/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire",
+            seen_bodies[0]["resourceUri"],
+            expected_resource_uri_for_test("/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire"),
             "TS 29.512 TerminationNotification names the resource the SMF holds, body was {:?}",
             seen_bodies[0]
         );
@@ -3763,6 +3845,11 @@ mod tests {
     /// SmPolicyNotification body (bounded timeouts both directions).
     #[tokio::test]
     async fn notification_post_round_trip() {
+        // #2157: the stub SMF is a loopback PLAINTEXT peer and the notification
+        // client follows the SBI profile, so this is a dev deployment. Declared
+        // rather than inherited: alone, under the default production profile, the
+        // POST failed on the missing client certificate before reaching the stub.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;

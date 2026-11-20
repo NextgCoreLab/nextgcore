@@ -72,7 +72,10 @@ helm template nextg deploy/helm/nextgcore -n nextg-system --set global.siteId=<s
   identity at the NRF before NFRegister, and that proof is this certificate, so
   each NF needs its own: URI SAN `urn:uuid:<nfInstanceId>` of its line,
   RFC 9310 NFTypes `<nfType>`, keyUsage digitalSignature, EKU serverAuth and
-  clientAuth, validity 3 years or less. Set `global.nrfTls.serverName` to
+  clientAuth, validity 3 years or less. (An EES is not one of this chart's NFs.
+  One that registers at a nextgcore ECS needs NFTypes `EES`, a nextgcore
+  convention: TS 29.510 has no EES `NFType`. See the EES configuration page,
+  #2226.) Set `global.nrfTls.serverName` to
   `""` so each NF verifies the NRF as the Service FQDN it dials, and issue the
   NRF's certificate for that FQDN: the dev default `nrf` accepts any NRF
   certificate of your CA that names `DNS:nrf`, which with one CA across sites

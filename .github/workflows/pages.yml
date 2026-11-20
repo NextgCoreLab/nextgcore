@@ -22,16 +22,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Update API index
         run: bash docs/scripts/update-api-docs.sh
 
+      # #2168: the book is built here from docs-book/ rather than committed, so
+      # the published book cannot drift from its sources (it once did for 127
+      # commits). mdBook is pinned: 0.5.4 reproduces the last committed build
+      # byte for byte (#2167). `--locked` takes its dependency versions from the
+      # crate's own lockfile, checked against crates.io's checksums.
+      - name: Install mdBook 0.5.4
+        run: cargo install mdbook --version 0.5.4 --locked
+
+      - name: Build the book
+        run: mdbook build docs-book
+
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: docs
 
@@ -44,4 +55,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

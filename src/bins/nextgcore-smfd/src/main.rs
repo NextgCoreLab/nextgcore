@@ -16480,29 +16480,9 @@ mod tests {
             .remove(sm_context_ref);
     }
 
+    /// The NG-RAN's Modify Indication Transfer, as hand-derived octets (#417).
     fn indication(dl: [u8; 4], teid: u32, qfis: &[u8]) -> Vec<u8> {
-        use nextgcore_ngap::transfer::{
-            AssociatedQosFlowItem, GtpTunnel, PduSessionResourceModifyIndicationTransfer,
-            QosFlowPerTnlInformation, TransportLayerAddress, UpTransportLayerInformation,
-        };
-        PduSessionResourceModifyIndicationTransfer {
-            dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
-                up_transport_layer_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                    transport_layer_address: TransportLayerAddress::from_ipv4(dl),
-                    gtp_teid: teid.to_be_bytes(),
-                }),
-                associated_qos_flow_list: qfis
-                    .iter()
-                    .map(|&q| AssociatedQosFlowItem {
-                        qos_flow_identifier: q,
-                        qos_flow_mapping_indication: None,
-                    })
-                    .collect(),
-            },
-            additional_dl_qos_flow_per_tnl_information: Vec::new(),
-        }
-        .encode()
-        .expect("encode Modify Indication Transfer")
+        n2_transfer::golden::modify_indication_octets((teid, dl), qfis, &[])
     }
 
     fn answer(resp: &SbiResponse) -> (String, Vec<u8>) {
@@ -16529,9 +16509,6 @@ mod tests {
     /// confirming the reported flows and re-stating the UPF's UL N3 endpoint.
     #[tokio::test]
     async fn an_initiated_modification_switches_the_dl_far_and_confirms() {
-        use nextgcore_ngap::transfer::{
-            PduSessionResourceModifyConfirmTransfer, UpTransportLayerInformation,
-        };
         // #779 review m1: process-wide SMF context state, ambient lock first.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
@@ -16545,11 +16522,16 @@ mod tests {
         unseed_session(r);
         let (ty, n2) = answer(&resp);
         assert_eq!(ty, "PDU_RES_MOD_CFM");
-        let confirm = PduSessionResourceModifyConfirmTransfer::decode(&n2).expect("decode");
-        assert_eq!(confirm.qos_flow_modify_confirm_list, vec![1, 2]);
-        let UpTransportLayerInformation::GtpTunnel(ul) = confirm.ul_ngu_up_tnl_information;
-        assert_eq!(u32::from_be_bytes(ul.gtp_teid), upf.upf_teid);
-        assert_eq!(ul.transport_layer_address.octets, upf.upf_ip.to_vec());
+        // The whole transfer, against the octets derived from the schema (#417).
+        assert_eq!(
+            n2,
+            n2_transfer::golden::modify_confirm_octets(
+                &[1, 2],
+                (upf.upf_teid, upf.upf_ip),
+                &[],
+                &[]
+            )
+        );
 
         let bodies = upf.modification_bodies();
         assert_eq!(bodies.len(), 1, "exactly one Session Modification");
@@ -16566,9 +16548,6 @@ mod tests {
     /// the F-TEID the UPF chose.
     #[tokio::test]
     async fn an_initiated_modification_recovers_a_missing_endpoint() {
-        use nextgcore_ngap::transfer::{
-            PduSessionResourceModifyConfirmTransfer, UpTransportLayerInformation,
-        };
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
@@ -16602,10 +16581,11 @@ mod tests {
         let (ty, n2) = answer(&resp);
         assert_eq!(ty, "PDU_RES_MOD_CFM");
         assert_recovery_mods(&mods);
-        let (teid, _) = recovered.expect("recorded");
-        let confirm = PduSessionResourceModifyConfirmTransfer::decode(&n2).expect("decode");
-        let UpTransportLayerInformation::GtpTunnel(ul) = confirm.ul_ngu_up_tnl_information;
-        assert_eq!(u32::from_be_bytes(ul.gtp_teid), teid);
+        let recovered = recovered.expect("recorded");
+        assert_eq!(
+            n2,
+            n2_transfer::golden::modify_confirm_octets(&[1], recovered, &[], &[])
+        );
     }
 
     /// No N4 session, or an undecodable transfer: the SMF answers
@@ -16613,8 +16593,7 @@ mod tests {
     /// why, and sends nothing to the UPF.
     #[tokio::test]
     async fn an_initiated_modification_it_cannot_carry_out_is_answered_ind_fail() {
-        use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc, CauseProtocol};
-        use nextgcore_ngap::transfer::PduSessionResourceModifyIndicationUnsuccessfulTransfer as Unsuccessful;
+        use n2_transfer::{golden::cause_transfer_octets, SmfCause};
         // #779 review m1: process-wide SMF context state, ambient lock first.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
@@ -16628,17 +16607,14 @@ mod tests {
         .await;
         let (ty, n2) = answer(&resp);
         assert_eq!(ty, "PDU_RES_MOD_IND_FAIL");
-        assert_eq!(
-            Unsuccessful::decode(&n2).expect("decode").cause,
-            Cause::Misc(CauseMisc::Unspecified)
-        );
+        assert_eq!(n2, cause_transfer_octets(SmfCause::MiscUnspecified));
 
         let resp = an_initiated_modification("525-garbage", &[0xff]).await;
         let (ty, n2) = answer(&resp);
         assert_eq!(ty, "PDU_RES_MOD_IND_FAIL");
         assert_eq!(
-            Unsuccessful::decode(&n2).expect("decode").cause,
-            Cause::Protocol(CauseProtocol::AbstractSyntaxErrorFalselyConstructedMessage)
+            n2,
+            cause_transfer_octets(SmfCause::ProtocolFalselyConstructedMessage)
         );
         assert!(
             upf.modification_bodies().is_empty(),
@@ -17393,35 +17369,21 @@ mod tests {
 
     #[test]
     fn setup_request_transfer_self_roundtrips() {
-        use nextgcore_ngap::transfer::{
-            PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
-        };
         let bytes =
             build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], default_flow(1, 9, 8), 0, 0)
                 .unwrap();
-        let t = PduSessionResourceSetupRequestTransfer::decode(&bytes).expect("decode");
-        let UpTransportLayerInformation::GtpTunnel(tun) = &t.ul_ngu_up_tnl_information;
-        assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x0001_0001);
-        assert_eq!(tun.transport_layer_address.octets, vec![10, 45, 0, 1]);
-        assert_eq!(t.qos_flow_setup_request_list.len(), 1);
-        assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 1);
+        let t = n2_transfer::test_view::setup_request(&bytes);
+        assert_eq!(t.ul.teid, 0x0001_0001);
+        assert_eq!(t.ul.ipv4(), Some([10, 45, 0, 1]));
+        assert_eq!(t.qfis(), vec![1]);
     }
 
     #[test]
     fn modify_request_transfer_self_roundtrips() {
-        use nextgcore_ngap::transfer::PduSessionResourceModifyRequestTransfer;
         let bytes = build_modify_request_transfer(1, 200_000_000, 100_000_000).unwrap();
-        let t = PduSessionResourceModifyRequestTransfer::decode(&bytes).expect("decode");
-        assert_eq!(
-            t.pdu_session_aggregate_maximum_bit_rate
-                .map(|a| (a.dl, a.ul)),
-            Some((200_000_000, 100_000_000))
-        );
-        assert_eq!(t.qos_flow_add_or_modify_request_list.len(), 1);
-        assert_eq!(
-            t.qos_flow_add_or_modify_request_list[0].qos_flow_identifier,
-            1
-        );
+        let t = n2_transfer::test_view::modify_request(&bytes);
+        assert_eq!(t.ambr, Some((200_000_000, 100_000_000)));
+        assert_eq!(t.flows, vec![(1, None)]);
     }
 
     // ------------------------------------------------------------------
@@ -27264,18 +27226,13 @@ mod tests {
         side_effects_settled().await;
 
         assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-        let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(
-            &n2.expect("n2SmInfo"),
-        )
-        .expect("decode");
-        let ambr = t
-            .pdu_session_aggregate_maximum_bit_rate
-            .expect("the Session-AMBR is in the transfer");
+        let t = n2_transfer::test_view::setup_request(&n2.expect("n2SmInfo"));
+        let (ambr_dl, ambr_ul) = t.ambr.expect("the Session-AMBR is in the transfer");
         // No PCF here: the config-default decision's 100 Mbit/s each way.
-        assert_eq!((ambr.dl, ambr.ul), (100_000_000, 100_000_000));
+        assert_eq!((ambr_dl, ambr_ul), (100_000_000, 100_000_000));
         // The accept's Session-AMBR LV (TS 24.501 §9.11.4.14), as its builder writes it.
-        let (dl_unit, dl_val) = policy::encode_ambr_component(ambr.dl);
-        let (ul_unit, ul_val) = policy::encode_ambr_component(ambr.ul);
+        let (dl_unit, dl_val) = policy::encode_ambr_component(ambr_dl);
+        let (ul_unit, ul_val) = policy::encode_ambr_component(ambr_ul);
         let mut n1_ambr = vec![0x06, dl_unit];
         n1_ambr.extend_from_slice(&dl_val.to_be_bytes());
         n1_ambr.push(ul_unit);
@@ -27438,12 +27395,10 @@ mod tests {
             .iter()
             .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
             .expect("n2SmInfo part");
-        assert!(
-            nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer::decode(
-                &n2_part.data
-            )
-            .is_ok(),
-            "the N2 transfer must be decodable APER, not placeholder bytes"
+        assert_eq!(
+            n2_part.data.as_ref(),
+            n2_transfer::golden::cause_transfer_octets(n2_transfer::SmfCause::NasNormalRelease),
+            "the N2 transfer is the Release Command Transfer, nas/normal-release (#417 golden)"
         );
 
         // T3592 is now supervising the command, and RELEASE COMPLETE stops it.
@@ -28967,6 +28922,17 @@ mod tests {
         );
     }
 
+    /// #2162: the exact refusal of a certificate naming no NF types and no
+    /// token under the `dev` profile (#2099's typeless check, `owner_binding`).
+    /// Production's sentence (#2065) is pinned in owner_binding's own tests,
+    /// which pass the profile explicitly.
+    fn typeless_reason_2162(want: &str) -> String {
+        format!(
+            "the requester's certificate names no NF types and it sent no access token, \
+             so it cannot be shown to be an {want}"
+        )
+    }
+
     /// **#2078**: an AMF change is admitted only from a caller shown to be an AMF
     /// (CONVENTIONS: the verified NF type), never assumed from a token or a
     /// certificate without NF types. On one context, owned by A:
@@ -28991,6 +28957,12 @@ mod tests {
     /// check reverted, "refused: direct non-AMF" fails.
     #[tokio::test]
     async fn an_amf_change_needs_a_verified_amf_2078() {
+        // #2162 (R42 on #2173): the profile is set at the start, not read: sibling tests
+        // set the Dev override concurrently (none sets production), so a
+        // reading taken here could differ from the handler's. Under dev the
+        // handler applies #2099's typeless check, whose exact sentence this
+        // pins; production's is pinned in owner_binding's tests.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
@@ -29029,12 +29001,10 @@ mod tests {
         let scp = with_cert(as_nf_1860(change(NOT_AMF), Some(NOT_AMF)), SCP, &["SCP"]);
         // #2097: the new AMF's own id, but a certificate naming another type.
         let direct_smf = with_cert(change(DIRECT), DIRECT, &["SMF"]);
+        let typeless_reason = typeless_reason_2162("AMF");
         for (what, req, expect) in [
             ("direct non-AMF", direct_smf, "not AMF"),
-            // #2089: under production #2065 refuses it as no identity ("names
-            // no NF type (RFC 9310 NFTypes)"), under dev the type check does
-            // ("names no NF types"); refused either way.
-            ("typeless", typeless, "names no NF type"),
+            ("typeless", typeless, typeless_reason.as_str()),
             ("token only", token_only, "does not list"),
             ("SCP", scp, "does not list"),
         ] {
@@ -31051,8 +31021,8 @@ mod tests {
             .expect("HANDOVER_PREP_FAIL n2SmInfo");
         assert_eq!(
             nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
-            Some(nextgcore_ngap::types::Cause::RadioNetwork(
-                nextgcore_ngap::types::CauseRadioNetwork::RadioResourcesNotAvailable
+            Some(nextgcore_amfd::ngap_types::Cause::RadioNetwork(
+                nextgcore_amfd::ngap_types::CauseRadioNetwork::RadioResourcesNotAvailable
             )),
             "the target's cause"
         );
@@ -31561,6 +31531,12 @@ mod tests {
         // writer (the #308 rule); `smf_context_init` checks that it is held.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
+        // #2157: the seeded context has no serving-AMF binding and the calls are
+        // anonymous, i.e. a context created under `dev`. Under production an
+        // ownerless context is frozen to an anonymous caller (#1899 review M2,
+        // `refuse_ownerless_sm_context_caller`), so alone, before any sibling had
+        // set the override, the retrieve was 403. Declared rather than inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve
@@ -31786,22 +31762,12 @@ mod tests {
             part.content_type.as_deref(),
             Some(nextgcore_sbi::constants::content_type::APPLICATION_NGAP)
         );
-        let t =
-            nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&part.data)
-                .expect("a PDUSessionResourceSetupRequestTransfer");
-        let nextgcore_ngap::transfer::UpTransportLayerInformation::GtpTunnel(tun) =
-            &t.ul_ngu_up_tnl_information;
-        assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x1162_0001);
-        assert_eq!(tun.transport_layer_address.octets, vec![10, 45, 0, 7]);
-        let qfis: Vec<u8> = t
-            .qos_flow_setup_request_list
-            .iter()
-            .map(|f| f.qos_flow_identifier)
-            .collect();
-        assert_eq!(qfis, vec![5, 7], "every flow the session holds (#992)");
+        let t = n2_transfer::test_view::setup_request(&part.data);
+        assert_eq!(t.ul.teid, 0x1162_0001);
+        assert_eq!(t.ul.ipv4(), Some([10, 45, 0, 7]));
+        assert_eq!(t.qfis(), vec![5, 7], "every flow the session holds (#992)");
         assert_eq!(
-            t.pdu_session_aggregate_maximum_bit_rate
-                .map(|a| (a.dl, a.ul)),
+            t.ambr,
             Some((200_000_000, 100_000_000)),
             "the Session-AMBR, as ACTIVATING's (#992)"
         );
@@ -35263,31 +35229,15 @@ mod tests {
 
     /// The N2 transfer's (Session-AMBR DL/UL, the default flow's (QFI, 5QI, ARP PL)).
     fn decode_modify_transfer_1385(n2: &[u8]) -> ((u64, u64), Vec<(u8, u16, u8)>) {
-        use nextgcore_ngap::transfer::{
-            PduSessionResourceModifyRequestTransfer, QosCharacteristics,
-        };
-        let t = PduSessionResourceModifyRequestTransfer::decode(n2).expect("N2 decodes");
-        let ambr = t
-            .pdu_session_aggregate_maximum_bit_rate
-            .map(|a| (a.dl, a.ul))
-            .expect("Session-AMBR");
+        let t = n2_transfer::test_view::modify_request(n2);
+        let ambr = t.ambr.expect("Session-AMBR");
         let flows = t
-            .qos_flow_add_or_modify_request_list
-            .iter()
-            .map(|i| {
-                let q = i
-                    .qos_flow_level_qos_parameters
-                    .as_ref()
-                    .expect("the modified flow carries its QoS profile");
-                let five_qi = match &q.qos_characteristics {
-                    QosCharacteristics::NonDynamic5qi(d) => d.five_qi,
-                    other => panic!("non-dynamic 5QI expected, got {other:?}"),
-                };
-                (
-                    i.qos_flow_identifier,
-                    five_qi,
-                    q.allocation_and_retention_priority.priority_level_arp,
-                )
+            .flows
+            .into_iter()
+            .map(|(qfi, q)| {
+                let q = q.expect("the modified flow carries its QoS profile");
+                let five_qi = q.five_qi.expect("non-dynamic 5QI expected");
+                (qfi, u16::from(five_qi), q.priority_level_arp)
             })
             .collect();
         (ambr, flows)
@@ -36434,20 +36384,14 @@ mod tests {
             ][..],
             "a GBR flow description carries all four bit rates (§6.3.2.4 a) case 8)"
         );
-        let t = nextgcore_ngap::transfer::PduSessionResourceModifyRequestTransfer::decode(n2)
-            .expect("N2 decodes");
-        let gbr = t.qos_flow_add_or_modify_request_list[0]
-            .qos_flow_level_qos_parameters
+        let t = n2_transfer::test_view::modify_request(n2);
+        let (mfbr_dl, mfbr_ul, gfbr_dl, gfbr_ul) = t.flows[0]
+            .1
             .as_ref()
-            .and_then(|q| q.gbr_qos_information.as_ref())
+            .and_then(|q| q.gbr)
             .expect("GBR QoS Flow Information for a GBR flow");
         assert_eq!(
-            (
-                gbr.guaranteed_flow_bit_rate_ul,
-                gbr.guaranteed_flow_bit_rate_dl,
-                gbr.maximum_flow_bit_rate_ul,
-                gbr.maximum_flow_bit_rate_dl
-            ),
+            (gfbr_ul, gfbr_dl, mfbr_ul, mfbr_dl),
             (2_000_000, 4_000_000, 6_000_000, 8_000_000)
         );
 
@@ -38299,7 +38243,7 @@ mod tests {
         await_n1n2_1385(&posts, 1).await;
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
 
-        let transfer = n2_transfer::oracle_tests::generated_path_switch_request(
+        let transfer = n2_transfer::golden::path_switch_request_octets(
             (0x0000_1390, [127, 0, 0, 10]),
             &[9],
             false,
@@ -38557,17 +38501,14 @@ mod path_switch_ack_tests {
     }
 
     /// The PDUSessionResourceSetupRequestTransfer in an SM Context Update answer.
-    fn setup_transfer_of(
-        resp: &SbiResponse,
-    ) -> nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer {
+    fn setup_transfer_of(resp: &SbiResponse) -> n2_transfer::test_view::SetupRequestView {
         let n2 = resp
             .http
             .parts
             .iter()
             .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
             .expect("n2SmInfo part");
-        nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&n2.data)
-            .expect("decode")
+        n2_transfer::test_view::setup_request(&n2.data)
     }
 
     /// #992, TS 38.413 §9.3.4.1: the transfers the SMF rebuilds for a session carry
@@ -38609,24 +38550,15 @@ mod path_switch_ack_tests {
             ctx.bearer_update(&dedicated);
         }
 
-        let check = |t: nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer,
-                     what: &str| {
+        let check = |t: n2_transfer::test_view::SetupRequestView, what: &str| {
             let ambr = t
-                .pdu_session_aggregate_maximum_bit_rate
+                .ambr
                 .unwrap_or_else(|| panic!("{what}: the Session-AMBR is present"));
-            assert_eq!((ambr.dl, ambr.ul), (200_000_000, 100_000_000), "{what}");
+            assert_eq!(ambr, (200_000_000, 100_000_000), "{what}");
             let flows: Vec<(u8, Option<u64>)> = t
-                .qos_flow_setup_request_list
+                .flows
                 .iter()
-                .map(|f| {
-                    (
-                        f.qos_flow_identifier,
-                        f.qos_flow_level_qos_parameters
-                            .gbr_qos_information
-                            .as_ref()
-                            .map(|g| g.guaranteed_flow_bit_rate_dl),
-                    )
-                })
+                .map(|(qfi, q, _)| (*qfi, q.gbr.map(|g| g.2)))
                 .collect();
             assert_eq!(
                 flows,
@@ -38642,7 +38574,7 @@ mod path_switch_ack_tests {
         check(setup_transfer_of(&handover), "HANDOVER_REQUIRED");
 
         // Establishment: the default flow, with the AMBR.
-        let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(
+        let t = n2_transfer::test_view::setup_request(
             &build_setup_request_transfer(
                 0x0001_0001,
                 [10, 45, 0, 1],
@@ -38651,12 +38583,8 @@ mod path_switch_ack_tests {
                 100_000_000,
             )
             .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            t.pdu_session_aggregate_maximum_bit_rate.is_some(),
-            "establishment"
         );
+        assert!(t.ambr.is_some(), "establishment");
 
         let ctx = smf_self();
         let ctx = ctx.read().expect("ctx");
@@ -38714,8 +38642,8 @@ mod path_switch_ack_tests {
             .expect("HANDOVER_PREP_FAIL n2SmInfo");
         assert_eq!(
             nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
-            Some(nextgcore_ngap::types::Cause::RadioNetwork(
-                nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+            Some(nextgcore_amfd::ngap_types::Cause::RadioNetwork(
+                nextgcore_amfd::ngap_types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
             ))
         );
 
@@ -38731,7 +38659,7 @@ mod path_switch_ack_tests {
     /// 4000000000000 used to go out as an extension value of BitRate, and past
     /// `i64::MAX` neither decoder could read it back ("Invalid unconstrained
     /// integer length: 9"). It is now sent as 4000000000000, a root value
-    /// every receiver decodes, here through both codecs.
+    /// every receiver decodes, read back here by the generated codec (#417).
     #[tokio::test]
     async fn a_bit_rate_past_the_ngap_root_is_sent_as_its_maximum() {
         const MAX: u64 = 4_000_000_000_000;
@@ -38770,20 +38698,9 @@ mod path_switch_ack_tests {
         ] {
             assert_eq!(response.status, 200, "{what}: {:?}", response.http.content);
             let t = setup_transfer_of(&response);
-            let ambr = t.pdu_session_aggregate_maximum_bit_rate.expect("AMBR");
-            assert_eq!((ambr.dl, ambr.ul), (MAX, MAX), "{what}: the Session-AMBR");
-            let gbr = t.qos_flow_setup_request_list[1]
-                .qos_flow_level_qos_parameters
-                .gbr_qos_information
-                .clone()
-                .expect("GBR");
+            assert_eq!(t.ambr, Some((MAX, MAX)), "{what}: the Session-AMBR");
             assert_eq!(
-                (
-                    gbr.maximum_flow_bit_rate_dl,
-                    gbr.maximum_flow_bit_rate_ul,
-                    gbr.guaranteed_flow_bit_rate_dl,
-                    gbr.guaranteed_flow_bit_rate_ul,
-                ),
+                t.flows[1].1.gbr.expect("GBR"),
                 (MAX, MAX - 1, MAX, MAX),
                 "{what}: the GBR flow"
             );
@@ -38925,9 +38842,6 @@ mod path_switch_ack_tests {
     /// no N2 part, and the returning UE's user plane never came back.
     #[tokio::test]
     async fn an_activating_update_returns_the_sessions_setup_transfer() {
-        use nextgcore_ngap::transfer::{
-            PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
-        };
         // #779 review m1: process-wide SMF context state, ambient lock first.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
@@ -38972,10 +38886,9 @@ mod path_switch_ack_tests {
             build_setup_request_transfer(0x0005_0007, [10, 45, 0, 9], default_flow(5, 7, 3), 0, 0)
                 .unwrap()
         );
-        let t = PduSessionResourceSetupRequestTransfer::decode(&n2.data).expect("decode");
-        let UpTransportLayerInformation::GtpTunnel(tun) = &t.ul_ngu_up_tnl_information;
-        assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x0005_0007);
-        assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 5);
+        let t = n2_transfer::test_view::setup_request(&n2.data);
+        assert_eq!(t.ul.teid, 0x0005_0007);
+        assert_eq!(t.qfis(), vec![5]);
 
         // A context with no recorded user plane has nothing to activate.
         assert_eq!(activation_response("act-518-none").status, 500);

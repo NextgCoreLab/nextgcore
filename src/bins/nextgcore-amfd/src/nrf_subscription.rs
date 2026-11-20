@@ -1019,6 +1019,62 @@ mod tests {
         ctx.remove_nf_instance("smf-2172-other").await;
     }
 
+    /// **#2179** (R41 on #2177): an SCP relaying the NRF is admitted on the
+    /// subscription's own token and the notification acts (204, evicted). An SCP
+    /// presenting another subscription's token acts only within that
+    /// subscription: on the AUSF subscription's token an SMF is not evicted, and
+    /// on a token this AMF does not hold (a lapsed or forged one) it is 404.
+    ///
+    /// REVERT-VERIFIED: with the relay arm removed from
+    /// `is_nrf_or_relaying_scp`, the SCP on the right token is 403 and "an SCP
+    /// with the subscription's own token evicts" fails.
+    #[tokio::test]
+    async fn an_scp_acts_only_on_its_subscriptions_token_2179() {
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let smf = register_token("SMF");
+        let ausf = register_token("AUSF");
+        let ctx = global_context();
+        ctx.add_nf_instance(cached("smf-2179-target", 42179)).await;
+        ctx.add_nf_instance(cached("smf-2179-other", 42180)).await;
+        let body = json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": uri("smf-2179-target") });
+        let scp = |token: &str| {
+            let mut r = notify_on(token, body.clone());
+            r.peer_cert_present = true;
+            r.peer_cert_nf_instance_id = Some("eeeeeeee-2179-4000-8000-0000000000e1".to_string());
+            r.peer_cert_nf_types = vec!["SCP".to_string()];
+            r
+        };
+        let call = |token: String| {
+            let req = scp(&token);
+            async move {
+                crate::namf_server::handle_nf_status_notify_callback_in(&token, &req, true)
+                    .await
+                    .status
+            }
+        };
+
+        // Another subscription's token: within that subscription only.
+        assert_eq!(call(ausf.clone()).await, 204);
+        assert!(
+            ctx.get_nf_instance("smf-2179-target").await.is_some(),
+            "the AUSF subscription's token evicts no SMF"
+        );
+        let lapsed = register_token("SMF");
+        unregister_token(&lapsed);
+        assert_eq!(call(lapsed).await, 404, "a token this AMF does not hold");
+        assert!(ctx.get_nf_instance("smf-2179-target").await.is_some());
+
+        // The subscription's own token: admitted, and it acts.
+        assert_eq!(call(smf.clone()).await, 204);
+        assert!(
+            ctx.get_nf_instance("smf-2179-target").await.is_none(),
+            "an SCP with the subscription's own token evicts"
+        );
+        unregister_token(&smf);
+        unregister_token(&ausf);
+        ctx.remove_nf_instance("smf-2179-other").await;
+    }
+
     /// #1421: behind an OAuth2-required listener, the NRF's token-less
     /// NFStatusNotify on a token this AMF holds reaches the handler and acts; on
     /// a token it does not hold it is refused 401 and acts on nothing, as is a

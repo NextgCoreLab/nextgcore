@@ -4670,6 +4670,47 @@ mod tests {
         );
     }
 
+    /// #2184: releasing a session takes its S5/S8-C TEID out of the index
+    /// itself, not merely out of reach of a lookup (which misses once the
+    /// session is gone whether or not the index leaks); and once the SEID
+    /// counter wraps onto that TEID's low 32 bits, a new session gets it again.
+    /// A leaked entry would grow the index without bound and keep the released
+    /// TEID allocated forever.
+    ///
+    /// REVERT-VERIFIED: with `sess_remove` leaving the TEID in the index, "the
+    /// index no longer holds it" fails (a lookup-miss assertion would not:
+    /// the session itself is gone either way).
+    #[test]
+    fn a_released_sessions_teid_leaves_the_index_and_is_reusable_2184() {
+        let mut ctx = SmfContext::new();
+        ctx.init(16, 16, 16);
+        let ue = ctx.ue_add_by_supi("imsi-001010000002184").unwrap();
+        let released = ctx.sess_add_by_apn(ue.id, "internet", 6).unwrap();
+        let kept = ctx.sess_add_by_apn(ue.id, "ims", 6).unwrap();
+        let teid = released.smf_n4_teid;
+        assert_eq!(
+            ctx.s5c_teid_hash.read().unwrap().get(&teid),
+            Some(&released.id),
+            "indexed while live"
+        );
+        ctx.sess_remove(released.id);
+        {
+            let index = ctx.s5c_teid_hash.read().unwrap();
+            assert!(!index.contains_key(&teid), "the index no longer holds it");
+            assert_eq!(index.get(&kept.smf_n4_teid), Some(&kept.id));
+            assert_eq!(index.len(), 1, "only the live session is indexed");
+        }
+        // The counter wraps onto the released TEID's low 32 bits: it is free.
+        ctx.n4_seid_generator
+            .store(released.smf_n4_seid + (1 << 32), Ordering::SeqCst);
+        let reused = ctx.sess_add_by_apn(ue.id, "internet", 6).unwrap();
+        assert_eq!(
+            reused.smf_n4_teid, teid,
+            "a released TEID is allocated again"
+        );
+        assert_eq!(ctx.sess_find_by_teid(teid).map(|s| s.id), Some(reused.id));
+    }
+
     /// #2164: two live sessions never share an S5/S8-C TEID, even when their
     /// SEIDs are 2^32 apart (the same low 32 bits), and a removed session's
     /// TEID stops resolving.

@@ -757,12 +757,15 @@ const UDM_CONTEXT_WRITER_NF_TYPES: &[&str] = &["UDM"];
 /// 2. a verified access token's scope must carry the resource scope
 ///    (`token_grants`), which the NRF grants to the UDM alone
 ///    (`UDR_RESOURCE_SCOPES`, TS 29.510 NOTE 11): else 403 `insufficient_scope`;
+/// 3. and 4. are the shared NF-type gate, `owner_binding::nf_type_refusal_with(..,
+///    Udm, .., production)` (#2082, #2210: called, not copied):
 /// 3. under the `dev` SBI profile (plaintext, nothing to verify) a caller with
 ///    no token and no certificate typing it is admitted;
 /// 4. otherwise the shared rule `owner_binding::verified_nf_type(.., Udm)`
-///    (#2099, #2113) decides: the consumer's own certificate naming NF types
-///    must name UDM -- a certificate naming a relay type plus another type,
-///    `[SCP, PCF]`, is that consumer's and not a relay's -- else the NRF must
+///    (#2099, #2113, #2210) decides: the consumer's own certificate naming NF
+///    types must name UDM as its one NF type -- a certificate naming a relay
+///    type plus another type, `[SCP, PCF]`, is that consumer's and not a
+///    relay's, and one naming two consumer types is refused -- else the NRF must
 ///    list the verified token subject (direct, or relayed by an SCP or SEPP,
 ///    TS 33.501 §13.3) as a UDM, and a typeless certificate with no token, an
 ///    anonymous caller or a failed lookup is refused.
@@ -779,13 +782,10 @@ async fn udm_context_write_refusal(request: &SbiRequest, production: bool) -> Op
         Some(s) if s == NUDR_DR_SUBSCRIPTION_DATA || s == NUDR_DR_REGISTRATIONS_WRITE => s,
         _ => return None,
     };
-    let refuse = |detail: String| {
+    if let Err(why) = owner_binding::verified_consumer_id_with(request, production) {
         // debug, not warn: a peer can send these at will (#1620 review m7).
-        log::debug!("UDM context write refused: {detail}");
-        Some(nextgcore_sbi::server::send_forbidden(&detail, None))
-    };
-    if let Err(why) = owner_binding::verified_consumer_id(request) {
-        return refuse(why);
+        log::debug!("UDM context write refused: {why}");
+        return Some(nextgcore_sbi::server::send_forbidden(&why, None));
     }
     if let Some(granted) = request.oauth2_scope.as_deref() {
         if !token_grants(granted, scope) {
@@ -804,21 +804,16 @@ async fn udm_context_write_refusal(request: &SbiRequest, production: bool) -> Op
             );
         }
     }
-    let types = &request.peer_cert_nf_types;
-    let typed_certificate = !types.is_empty() && !owner_binding::is_relay_certificate(types);
-    let token = request
-        .oauth2_subject
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty());
-    if !production && !token && !typed_certificate {
-        return None;
-    }
-    match owner_binding::verified_nf_type(request, nextgcore_sbi::types::NfType::Udm).await {
-        Ok(()) => None,
-        Err(why) => refuse(format!(
-            "only the UDM writes this subscription-data context resource (TS 29.505): {why}"
-        )),
-    }
+    // #2210: steps 3 and 4 are the shared NF-type gate, not a copy of it, so
+    // this write follows every change to that rule. One `production` decides
+    // the identity and the type check alike.
+    owner_binding::nf_type_refusal_with(
+        request,
+        nextgcore_sbi::types::NfType::Udm,
+        "only the UDM writes this subscription-data context resource (TS 29.505)",
+        production,
+    )
+    .await
 }
 
 /// SBI request handler for UDR
@@ -7830,12 +7825,12 @@ udr:
     #[tokio::test]
     async fn wsb6_auth_status_put_delete_no_sqn_side_effect() {
         let _store = DbiTestStore::enable().await;
-        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
-        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
-        udr.start(udr_sbi_request_handler)
-            .await
-            .expect("UDR SBI server starts");
-        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        // #2157: through `start_udr`, which declares the dev profile. The
+        // auth-status PUT/DELETE is a write of the UDM's context data, admitted
+        // under production only from a verified UDM (#2079), and this loopback
+        // peer proves no identity; alone the PUT was 403, and it passed only
+        // after a sibling had set Dev.
+        let (udr, client) = start_udr().await;
         let supi = "imsi-999990000000602";
         let s0: u64 = 0x40;
         wsb6_provision(&client, supi, s0).await;
@@ -7890,12 +7885,12 @@ udr:
     #[tokio::test]
     async fn wsb6_udm_av_flow_advances_sqn_one_step_per_av() {
         let _store = DbiTestStore::enable().await;
-        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
-        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
-        udr.start(udr_sbi_request_handler)
-            .await
-            .expect("UDR SBI server starts");
-        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        // #2157: through `start_udr`, which declares the dev profile. The
+        // auth-status PUT/DELETE is a write of the UDM's context data, admitted
+        // under production only from a verified UDM (#2079), and this loopback
+        // peer proves no identity; alone the PUT was 403, and it passed only
+        // after a sibling had set Dev.
+        let (udr, client) = start_udr().await;
         let supi = "imsi-999990000000603";
         let s0: u64 = 0x20;
         let auth_path = wsb6_provision(&client, supi, s0).await;
@@ -8530,6 +8525,19 @@ udr:
             ),
             None
         );
+        // #2210: the shared gate's rule, inherited rather than copied: a
+        // certificate naming UDM and a second consumer type describes no single
+        // NF instance (TS 33.310 §6.1.3c.3) and is refused, token or not.
+        for production in [true, false] {
+            assert_eq!(
+                refused(
+                    &req("PUT", Some((udm, &["UDM", "PCF"])), Some((udm, &udm_scope))),
+                    production
+                ),
+                Some(403),
+                "a [UDM, PCF] certificate is not a UDM's (production {production})"
+            );
+        }
         // Behind an SCP: the relayed consumer's token.
         assert_eq!(
             refused(

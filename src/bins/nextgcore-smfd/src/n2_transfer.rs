@@ -8,12 +8,12 @@
 //! DL endpoint the SMF acts on, and no generated type leaks past it.
 //!
 //! Before #417 these went through `nextgcore-ngap`'s hand-written transfer
-//! codec. The bytes are unchanged for every transfer but one -- the oracle
-//! tests below pin each builder against the hand-written encoder, and each
-//! parser against the hand-written decoder -- and the one is a fix: the
-//! hand-written `PathSwitchRequestAcknowledgeTransfer` carried two presence
-//! bits for members the Rel-17 SEQUENCE does not have, see
-//! [`path_switch_request_acknowledge_transfer`].
+//! codec. The bytes are unchanged for every transfer but one, and the one is a
+//! fix: the hand-written `PathSwitchRequestAcknowledgeTransfer` carried two
+//! presence bits for members the Rel-17 SEQUENCE does not have, see
+//! [`path_switch_request_acknowledge_transfer`]. The golden tests below pin
+//! each builder, and each parser's input, against octets derived by hand from
+//! the schema and X.691 (`golden.rs`), not against either codec.
 //!
 //! The parsers skip protocol extensions the schema does not know unless they
 //! are marked `reject`, which refuses the transfer -- what the hand-written
@@ -890,4 +890,8 @@ pub(crate) fn parse_handover_request_acknowledge_transfer(
 }
 
 #[cfg(test)]
-pub(crate) mod oracle_tests;
+pub(crate) mod golden;
+#[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
+pub(crate) mod test_view;

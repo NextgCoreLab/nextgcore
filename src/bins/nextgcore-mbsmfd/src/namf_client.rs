@@ -970,6 +970,10 @@ mod tests {
             deletes.load(Ordering::SeqCst) == 3
         })
         .await;
+        // #2236: the AMF has the third delete, but the retry task is still
+        // awaiting its answer; returning now dropped it at runtime shutdown,
+        // after the lock, and its drop parked the delete into the next test's set.
+        crate::reconcile::retries_settled().await;
     }
 
     /// #1817: an AMF that comes back AFTER the retry budget still gets the delete.
@@ -989,14 +993,22 @@ mod tests {
         let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &refusals).await;
         let before = crate::reconcile::RECONCILED.get(&["deleted"]);
         assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        // #2236: this record, not the set's size: another test's retry task
+        // could park into the set (fixed by `retries_settled`, asserted per
+        // record all the same).
         eventually("the record is parked after the budget", || {
-            crate::reconcile::pending_count() == 1
+            crate::reconcile::is_parked(&context)
         })
         .await;
+        crate::reconcile::retries_settled().await;
         assert_eq!(deletes.load(Ordering::SeqCst), budget);
 
         assert_eq!(crate::reconcile::reconcile_once().await, 0, "still refused");
-        assert_eq!(crate::reconcile::pending_count(), 1, "kept, not dropped");
+        assert_eq!(
+            crate::reconcile::parked_copies(&context),
+            1,
+            "kept, not dropped"
+        );
         // #1961: the AMF that refused is backing off; the next pass is after it.
         tokio::time::sleep(crate::reconcile::BACKOFF_BASE + std::time::Duration::from_millis(50))
             .await;
@@ -1007,7 +1019,7 @@ mod tests {
             "the AMF accepts"
         );
         assert_eq!(deletes.load(Ordering::SeqCst), budget + 2);
-        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert!(!crate::reconcile::is_parked(&context));
         assert_eq!(crate::reconcile::RECONCILED.get(&["deleted"]), before + 1);
     }
 
@@ -1046,9 +1058,8 @@ mod tests {
             .read()
             .unwrap()
             .record_amf_context(b.id, context.clone()));
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            0,
+        assert!(
+            !crate::reconcile::is_parked(&context),
             "recording the reused context unparks its delete"
         );
 
@@ -1061,7 +1072,7 @@ mod tests {
             "the live context is not deleted"
         );
         assert_eq!(accepted, 0);
-        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert!(!crate::reconcile::is_parked(&context));
         assert_eq!(crate::reconcile::RECONCILED.get(&["reused"]), before + 2);
         ctx.read().unwrap().take_amf_contexts(b.id);
         ctx.read().unwrap().session_remove(b.id);
@@ -1094,13 +1105,15 @@ mod tests {
             .read()
             .unwrap()
             .record_amf_context(b.id, context.clone()));
-        tokio::time::sleep(crate::AMF_RELEASE_RETRY_DELAYS[0] * 10).await;
+        // #2236: the retry task ends at its first retry (the context is in
+        // use); wait for that rather than a fixed sleep.
+        crate::reconcile::retries_settled().await;
         assert_eq!(
             deletes.load(Ordering::SeqCst),
             1,
             "no retry deletes the reused context"
         );
-        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert!(!crate::reconcile::is_parked(&context));
         ctx.read().unwrap().take_amf_contexts(b.id);
         ctx.read().unwrap().session_remove(b.id);
     }
@@ -1124,20 +1137,26 @@ mod tests {
             context_ref: "8".to_string(),
             ..context.clone()
         };
-        let retries = crate::release_retries(vec![context, second]);
+        let retries = crate::release_retries(vec![context.clone(), second.clone()]);
         tokio::time::timeout(Duration::from_secs(5), arrived.notified())
             .await
             .expect("the first retry reaches the AMF");
+        let parked = || {
+            (
+                crate::reconcile::is_parked(&context),
+                crate::reconcile::is_parked(&second),
+            )
+        };
         assert_eq!(
-            crate::reconcile::pending_count(),
-            0,
+            parked(),
+            (false, false),
             "nothing is parked while the retries run"
         );
         retries.abort();
         assert!(retries.await.expect_err("aborted").is_cancelled());
         assert_eq!(
-            crate::reconcile::pending_count(),
-            2,
+            parked(),
+            (true, true),
             "the aborted retries park both deletes"
         );
         crate::reconcile::clear_for_test();
@@ -1172,7 +1191,7 @@ mod tests {
                 tmgi: None,
             })
             .collect();
-        crate::reconcile::park(parked);
+        crate::reconcile::park(parked.clone());
         let started = std::time::Instant::now();
         assert_eq!(crate::reconcile::reconcile_once().await, 0);
         assert!(
@@ -1180,9 +1199,8 @@ mod tests {
             "the pass is bounded: {:?}",
             started.elapsed()
         );
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            8,
+        assert!(
+            parked.iter().all(crate::reconcile::is_parked),
             "every record re-parked"
         );
         crate::reconcile::clear_for_test();
@@ -1401,6 +1419,10 @@ mod tests {
             deletes.load(Ordering::SeqCst) == 2
         })
         .await;
+        // #2236: the retry has reached the AMF, not yet its answer. Returning now
+        // dropped the task at runtime shutdown, after the lock was released, and
+        // its drop (#2075) parked the delete into the next lock holder's set.
+        crate::reconcile::retries_settled().await;
     }
 
     /// The `mbsServiceId` is 6 hex digits, which is what the OpenAPI's
@@ -1895,11 +1917,13 @@ mod tests {
         let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
         let a_token = a_contexts[0].notify_token.clone();
         // Unscoped: no access token, so every delete is refused and it is parked.
+        let a_context = a_contexts[0].clone();
         assert!(!crate::release_amf_contexts(a_contexts).await);
         eventually("A's delete is parked after the budget", || {
-            crate::reconcile::pending_count() == 1
+            crate::reconcile::is_parked(&a_context)
         })
         .await;
+        crate::reconcile::retries_settled().await;
         assert!(amf_holds(&a_ref), "the AMF still holds A's context");
         assert!(admitted(&a_token), "a parked delete keeps the token");
 
@@ -1916,9 +1940,8 @@ mod tests {
             .await
             .expect("B's context");
         assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            0,
+        assert!(
+            !crate::reconcile::is_parked(&a_context),
             "B's record unparks it"
         );
         assert_eq!(
@@ -1957,22 +1980,24 @@ mod tests {
         let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &statuses).await;
         let (record, token) = released_record_1985(context, [0x0a, 0x19, 0x85]);
         assert!(!crate::release_amf_contexts(vec![record.clone()]).await);
+        // #2236: about this record, not the set's size (another test's retry
+        // task parked into the set: "parked once" read 2).
         eventually("parked after the budget", || {
-            crate::reconcile::pending_count() == 1
+            crate::reconcile::is_parked(&record)
         })
         .await;
+        crate::reconcile::retries_settled().await;
         assert!(admitted(&token), "a parked delete keeps the token");
-        crate::reconcile::park(vec![record]);
-        assert_eq!(crate::reconcile::pending_count(), 1, "parked once");
+        crate::reconcile::park(vec![record.clone()]);
+        assert_eq!(crate::reconcile::parked_copies(&record), 1, "parked once");
 
         assert_eq!(crate::reconcile::reconcile_once().await, 0, "refused");
         assert!(admitted(&token), "a refused pass applies nothing");
         // #1961: the refusal backs the AMF off; a pass inside the backoff sends
         // nothing and keeps the record (and its token).
         assert_eq!(crate::reconcile::reconcile_once().await, 0, "backing off");
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            1,
+        assert!(
+            crate::reconcile::is_parked(&record),
             "kept through the backoff"
         );
         assert!(admitted(&token), "the backoff keeps the token");
@@ -1985,7 +2010,7 @@ mod tests {
             budget + 2,
             "one delete a pass"
         );
-        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert!(!crate::reconcile::is_parked(&record));
     }
 
     /// **#1985**: the reconciler's 204 ends a parked context's token after the
@@ -2004,11 +2029,12 @@ mod tests {
         let (_server, context, _deletes, _arrived, _release) =
             scripted_amf(false, &vec![503u16; budget]).await;
         let (record, token) = released_record_1985(context, [0x0b, 0x19, 0x85]);
-        assert!(!crate::release_amf_contexts(vec![record]).await);
+        assert!(!crate::release_amf_contexts(vec![record.clone()]).await);
         eventually("parked after the budget", || {
-            crate::reconcile::pending_count() == 1
+            crate::reconcile::is_parked(&record)
         })
         .await;
+        crate::reconcile::retries_settled().await;
         assert_eq!(crate::reconcile::reconcile_once().await, 1, "204");
         assert!(admitted(&token), "admitted through the grace");
         eventually("gone after the grace", || !admitted(&token)).await;
@@ -2060,13 +2086,13 @@ mod tests {
             tmgi: None,
         };
         let (record, token) = released_record_1985(blank, [0x0e, 0x19, 0x85]);
-        crate::reconcile::park(vec![record]);
+        crate::reconcile::park(vec![record.clone()]);
         assert!(admitted(&token), "kept while it is parked");
         crate::reconcile::backdate_for_test(
             crate::reconcile::MAX_AGE + std::time::Duration::from_secs(1),
         );
         assert_eq!(crate::reconcile::reconcile_once().await, 0);
-        let left = crate::reconcile::pending_count();
+        let left = crate::reconcile::parked_copies(&record);
         let kept = admitted(&token);
         crate::reconcile::clear_for_test();
         assert_eq!(left, 0, "expired");
@@ -2300,20 +2326,25 @@ mod tests {
             tmgi: None,
         };
         let (record, token) = released_record_1985(context, [0x0d, 0x19, 0x85]);
-        crate::reconcile::park(vec![record]);
+        crate::reconcile::park(vec![record.clone()]);
         let pass = tokio::spawn(crate::reconcile::reconcile_once());
         accepted.notified().await;
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            0,
-            "drained into the pass"
+        // #2175: about this record, not the whole pending set: a sibling
+        // session's detached release-retry task parks its own failures into the
+        // same set on its own schedule (it outlives the test that started it,
+        // and so the lock), which made a count of 0 / 1 fail about 1 run in 4
+        // under load.
+        assert!(
+            !crate::reconcile::is_parked(&record),
+            "drained into the pass (pending: {})",
+            crate::reconcile::pending_count()
         );
         pass.abort();
         let _ = pass.await;
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            1,
-            "a cancelled pass re-parks its in-flight delete"
+        assert!(
+            crate::reconcile::is_parked(&record),
+            "a cancelled pass re-parks its in-flight delete (pending: {})",
+            crate::reconcile::pending_count()
         );
         assert!(admitted(&token), "and its token");
         crate::reconcile::clear_for_test();

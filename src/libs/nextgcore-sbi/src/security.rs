@@ -2716,7 +2716,8 @@ mod audience_binding_guards {
             ("nextgcore-easdfd/src/main.rs", "fn build_nf_profile("),
             ("nextgcore-lmfd/src/main.rs", "fn build_lmf_nf_profile("),
             ("nextgcore-mbsmfd/src/main.rs", "fn build_mbsmf_nf_profile("),
-            ("nextgcore-nefd/src/main.rs", "fn build_nf_profile("),
+            // #2178: nefd's profile is built by the shared
+            // `nextgcore_sbi::nf_profiles::nef` (checked below).
             ("nextgcore-nefd/src/ueid.rs", "pub fn nf_service("),
             ("nextgcore-nsacfd/src/main.rs", "fn build_nsacf_nf_profile("),
             ("nextgcore-nssfd/src/main.rs", "fn build_nssf_nf_profile("),
@@ -2749,6 +2750,22 @@ mod audience_binding_guards {
                 "{rel} `{builder}` must advertise the listener's scheme, not a literal (#1791)"
             );
         }
+        // #2178: the NEF profile nefd registers, now shared in nextgcore-sbi; and
+        // nefd passes its listener's scheme to it.
+        let shared = include_str!("nf_profiles.rs");
+        let nef = &shared[shared.find("pub fn nef(").expect("nf_profiles::nef")..];
+        let nef = &nef[..nef.find("\n}\n").expect("fn end")];
+        assert!(
+            !nef.contains("\"scheme\": \"http\"") && nef.contains("\"scheme\": scheme.as_str()"),
+            "nf_profiles::nef must advertise the listener's scheme, not a literal (#1791)"
+        );
+        let nefd = read("nextgcore-nefd/src/main.rs");
+        assert!(
+            nefd.contains(
+                "nextgcore_sbi::nf_profiles::nef(nf_instance_id, sbi_addr, sbi_port, scheme)"
+            ),
+            "nefd's build_nf_profile passes the listener's scheme to nf_profiles::nef (#1791)"
+        );
     }
 
     /// Issue #64 gaps 1+2: every NF acquires its OAuth2 client through
