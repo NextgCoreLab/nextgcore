@@ -6,72 +6,10 @@
 //! [`crate::amf_pdus`] for the release and the method.
 //!
 //! Every open type and OCTET STRING here may pass 16K octets (a NAS-PDU of
-//! 70000 octets is in the Downlink NAS matrix), so the length determinant is
-//! derived with its fragmentation, [`unconstrained`], instead of
-//! [`Bits::open`], which stops at 16383.
+//! 70000 octets is in the Downlink NAS matrix); [`Bits::open`] derives the
+//! fragmented length determinant (X.691 §11.9.3.8).
 
 use crate::aper_golden::{amf_ue_ngap_id, ran_ue_ngap_id, Bits};
-
-/// X.691 §11.9.3.8, the unconstrained length determinant (ALIGNED, so the
-/// length octets are aligned) and the octets it counts:
-/// - below 128: one octet `0` + seven bits of length (§11.9.3.6);
-/// - below 16K: two octets `10` + fourteen bits (§11.9.3.7);
-/// - from 16K: fragments. Each is one octet `11` + six bits m, m in 1..=4
-///   the number of 16K blocks, then 16K x m octets; m is the largest that
-///   fits what is left (§11.9.3.8.1). What remains after the last full
-///   fragment, fewer than 16K octets, follows as a short- or long-form
-///   length and its octets, so an exact multiple of 16K ends in the
-///   zero-length octet `00` (§11.9.3.8.2-.4).
-pub(crate) fn unconstrained(b: &mut Bits, inner: &[u8]) {
-    const K16: usize = 16384;
-    let mut rest = inner;
-    while rest.len() >= K16 {
-        let m = (rest.len() / K16).min(4);
-        b.octets(&[0xC0 | m as u8]).octets(&rest[..m * K16]);
-        rest = &rest[m * K16..];
-    }
-    if rest.len() < 128 {
-        b.octets(&[rest.len() as u8]);
-    } else {
-        b.octets(&(0x8000 | rest.len() as u16).to_be_bytes());
-    }
-    b.octets(rest);
-}
-
-/// An unconstrained OCTET STRING (NAS-PDU, a transfer, a container) as a
-/// whole IE value or list member: [`unconstrained`].
-pub(crate) fn octet_string(o: &[u8]) -> Vec<u8> {
-    let mut b = Bits::default();
-    unconstrained(&mut b, o);
-    b.finish()
-}
-
-/// [`crate::aper_golden::pdu`] with every open type through
-/// [`unconstrained`]: extension `0`, the CHOICE index in two bits, the
-/// procedure code octet, the criticality in two bits, the message value as an
-/// open type; the value is extension `0`, the IE count in two aligned octets,
-/// then per IE its id in two aligned octets, its criticality in two bits and
-/// its value as an open type.
-pub(crate) fn pdu(
-    choice: u64,
-    procedure: u8,
-    criticality: u8,
-    ies: &[(u16, u8, Vec<u8>)],
-) -> Vec<u8> {
-    let mut value = Bits::default();
-    value.bit(false).octets(&(ies.len() as u16).to_be_bytes());
-    for (id, c, v) in ies {
-        value.octets(&id.to_be_bytes()).field(u64::from(*c), 2);
-        unconstrained(&mut value, v);
-    }
-    let mut b = Bits::default();
-    b.bit(false)
-        .field(choice, 2)
-        .octets(&[procedure])
-        .field(u64::from(criticality), 2);
-    unconstrained(&mut b, &value.finish());
-    b.finish()
-}
 
 /// AMF-UE-NGAP-ID `INTEGER (0..1099511627775)`: anything past it has no
 /// encoding, so a derivation is never asked for one.
@@ -85,14 +23,14 @@ fn amf_id(v: u64) -> Vec<u8> {
 /// RAN-UE-NGAP-ID and id 38 NAS-PDU, all reject
 /// (`DownlinkNASTransport-IEs`); none of the optional IEs.
 pub(crate) fn downlink_nas_transport(amf: u64, ran: u32, nas: &[u8]) -> Vec<u8> {
-    pdu(
+    crate::aper_golden::pdu(
         0,
         4,
         1,
         &[
             (10, 0, amf_id(amf)),
             (85, 0, ran_ue_ngap_id(ran)),
-            (38, 0, octet_string(nas)),
+            (38, 0, crate::aper_golden::open_value(nas)),
         ],
     )
 }
@@ -120,10 +58,10 @@ pub(crate) fn pdu_session_resource_modify_request(
         .bit(false)
         .octets(&[psi]);
     if let Some(nas) = nas {
-        unconstrained(&mut list, nas);
+        list.open(nas);
     }
-    unconstrained(&mut list, transfer);
-    pdu(
+    list.open(transfer);
+    crate::aper_golden::pdu(
         0,
         26,
         0,
@@ -165,19 +103,6 @@ pub(crate) fn allowed_nssai(slices: &[crate::context::SNssai]) -> Vec<u8> {
     b.finish()
 }
 
-/// BitRate `INTEGER (0..4000000000000, ...)`: the extension bit `0`, then a
-/// range past 64K, so the octet count n (1..=6, as 4e12 needs 42 bits) as
-/// n-1 in three bits, then the value in its minimal n octets, aligned
-/// (§12.1, §11.5.7.4).
-fn bit_rate(b: &mut Bits, v: u64) {
-    assert!(v <= 4_000_000_000_000, "past the root, not derived here");
-    let be = v.to_be_bytes();
-    let skip = be.iter().take_while(|o| **o == 0).count().min(7);
-    b.bit(false)
-        .field((8 - skip) as u64 - 1, 3)
-        .octets(&be[skip..]);
-}
-
 /// The NGAP 16-bit algorithm bitmap (§9.3.1.86) for a NAS UE security
 /// capability octet (TS 24.501 §9.11.3.54). NAS bit 8 is the null algorithm,
 /// which has no NGAP bit; NAS bits 7, 6, 5 (algorithms 1, 2, 3) are NGAP's
@@ -201,7 +126,7 @@ pub(crate) fn ngap_algorithms(nas_octet: u8) -> u16 {
 ///   CauseRadioNetwork extension `0` + six bits (45 root values),
 ///   handover-desirable-for-radio-reason index 16: `000 0 010000` -> `04 00`;
 /// - id 110 UEAggregateMaximumBitRate (reject): extension `0`,
-///   iE-Extensions `0`, DL then UL [`bit_rate`];
+///   iE-Extensions `0`, DL then UL [`crate::aper_golden::bit_rate`];
 /// - id 119 UESecurityCapabilities (reject): extension `0`, iE-Extensions
 ///   `0`, then four `BIT STRING (SIZE(16, ...))`, each the size extension bit
 ///   `0` and sixteen bits, not aligned (a fixed size of at most 16 bits,
@@ -237,8 +162,8 @@ pub(crate) fn eps_to_5gs_handover_request(
 
     let mut ambr = Bits::default();
     ambr.bit(false).bit(false);
-    bit_rate(&mut ambr, ue_ambr.0);
-    bit_rate(&mut ambr, ue_ambr.1);
+    crate::aper_golden::bit_rate(&mut ambr, ue_ambr.0);
+    crate::aper_golden::bit_rate(&mut ambr, ue_ambr.1);
 
     let caps = &r.ue_security_capability;
     let mut sec = Bits::default();
@@ -260,7 +185,7 @@ pub(crate) fn eps_to_5gs_handover_request(
     for s in &r.sessions {
         sessions.bit(false).bit(false).octets(&[s.pdu_session_id]);
         s_nssai(&mut sessions, &s.s_nssai);
-        unconstrained(&mut sessions, &s.transfer);
+        sessions.open(&s.transfer);
     }
 
     let (plmn, region, set, pointer) = guami;
@@ -272,7 +197,7 @@ pub(crate) fn eps_to_5gs_handover_request(
         .field(u64::from(set), 10)
         .field(u64::from(pointer), 6);
 
-    pdu(
+    crate::aper_golden::pdu(
         0,
         13,
         0,
@@ -284,10 +209,14 @@ pub(crate) fn eps_to_5gs_handover_request(
             (119, 0, sec.finish()),
             (93, 0, context.finish()),
             (41, 0, vec![0x00]),
-            (37, 0, octet_string(&r.nas_container)),
+            (37, 0, crate::aper_golden::open_value(&r.nas_container)),
             (73, 0, sessions.finish()),
             (0, 0, allowed_nssai(&r.allowed_nssai)),
-            (101, 0, octet_string(&r.source_to_target_container)),
+            (
+                101,
+                0,
+                crate::aper_golden::open_value(&r.source_to_target_container),
+            ),
             (28, 0, g.finish()),
         ],
     )
@@ -311,14 +240,14 @@ pub(crate) fn initial_ue_message_mo_signalling(
 ) -> Vec<u8> {
     let mut ies = vec![
         (85, 0, ran_ue_ngap_id(ran)),
-        (38, 0, octet_string(nas)),
+        (38, 0, crate::aper_golden::open_value(nas)),
         (121, 0, location.to_vec()),
         (90, 1, vec![0x18]),
     ];
     if !slices.is_empty() {
         ies.push((0, 0, allowed_nssai(slices)));
     }
-    pdu(0, 15, 1, &ies)
+    crate::aper_golden::pdu(0, 15, 1, &ies)
 }
 
 /// UPLINK NAS TRANSPORT (§9.2.5.3) through the fragmenting [`pdu`], for a
@@ -327,14 +256,14 @@ pub(crate) fn initial_ue_message_mo_signalling(
 /// (reject); id 121 UserLocationInformation (ignore), `location` the IE
 /// value.
 pub(crate) fn uplink_nas_transport(amf: u64, ran: u32, nas: &[u8], location: &[u8]) -> Vec<u8> {
-    pdu(
+    crate::aper_golden::pdu(
         0,
         46,
         1,
         &[
             (10, 0, amf_id(amf)),
             (85, 0, ran_ue_ngap_id(ran)),
-            (38, 0, octet_string(nas)),
+            (38, 0, crate::aper_golden::open_value(nas)),
             (121, 1, location.to_vec()),
         ],
     )
@@ -352,7 +281,7 @@ mod tests {
     /// octets.
     #[test]
     fn the_length_determinant_fragments_from_16k() {
-        let lens = |n: usize| octet_string(&vec![0xa5; n]);
+        let lens = |n: usize| crate::aper_golden::open_value(&vec![0xa5; n]);
         assert_eq!(lens(0), [0x00]);
         assert_eq!(lens(127)[0], 0x7f);
         assert_eq!(lens(128)[..2], [0x80, 0x80]);
@@ -531,7 +460,7 @@ mod tests {
             [0x02, 0x01, 0x00, 0x00, 0x01]
         );
         let mut b = Bits::default();
-        bit_rate(&mut b, 100_000_000);
+        crate::aper_golden::bit_rate(&mut b, 100_000_000);
         assert_eq!(b.finish(), [0x30, 0x05, 0xf5, 0xe1, 0x00]);
         assert_eq!(ngap_algorithms(0xE0), 0xC000);
         assert_eq!(ngap_algorithms(0x60), 0xC000);

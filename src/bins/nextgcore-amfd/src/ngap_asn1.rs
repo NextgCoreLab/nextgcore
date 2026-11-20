@@ -26,10 +26,6 @@ use nextgcore_ngap::types::*;
 use nextgcore_ngap::types::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
-// Only the hand-written oracles the tests compare the generated codec with:
-// since #417's Overload stage no production builder here is hand-written.
-#[cfg(test)]
-use nextgcore_ngap::{builder, parser, NgapMessage};
 
 use nextgcore_ngap_gen::generated as ngap_gen;
 
@@ -6929,15 +6925,8 @@ pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint>
 pub(crate) mod tests {
     use super::*;
     use crate::context::{AmfId, Guami, PlmnId, PlmnSupport, SNssai};
-    use nextgcore_ngap::transfer::{
-        AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
-        PduSessionResourceSetupRequestTransfer, PduSessionResourceSetupResponseTransfer,
-        PduSessionType, PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
-        QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
-        UpTransportLayerInformation,
-    };
 
-    fn create_test_context() -> AmfContext {
+    pub(crate) fn create_test_context() -> AmfContext {
         let mut ctx = AmfContext::new();
         ctx.amf_name = Some("AMF-Test".to_string());
         ctx.relative_capacity = 255;
@@ -6957,639 +6946,6 @@ pub(crate) mod tests {
             s_nssai: vec![SNssai { sst: 1, sd: None }],
         });
         ctx
-    }
-
-    /// The hand-written NG Setup encoders exactly as they were before #417
-    /// stage 2 moved the family onto the generated codec, and the decoder as it
-    /// was before stage 3 -- kept verbatim as the ORACLE the generated output is
-    /// compared against.
-    mod hand_written_oracle {
-        use super::super::*;
-
-        /// Convert an AMF-context S-NSSAI (SD packed as a u32) to the nextgcore-ngap wire
-        /// S-NSSAI (SD as a 3-byte big-endian array).
-        fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
-            SNssai {
-                sst: s.sst,
-                sd: s.sd.map(|sd_val| {
-                    [
-                        ((sd_val >> 16) & 0xFF) as u8,
-                        ((sd_val >> 8) & 0xFF) as u8,
-                        (sd_val & 0xFF) as u8,
-                    ]
-                }),
-            }
-        }
-
-        /// The Initial Context Setup Request encoder and Response/Failure parsers as
-        /// they were before #417 stage 7 moved the family onto the generated codec.
-        #[allow(clippy::too_many_arguments)]
-        pub(crate) fn hand_written_initial_context_setup_request(
-            ctx: &AmfContext,
-            amf_ue_ngap_id: u64,
-            ran_ue_ngap_id: u32,
-            allowed_nssai: &[crate::context::SNssai],
-            ue_security_capability: &crate::context::UeSecurityCapability,
-            security_key: &[u8; 32],
-            nas_pdu: Option<&[u8]>,
-            ue_ambr: Option<(u64, u64)>,
-        ) -> Option<Vec<u8>> {
-            // GUAMI (mandatory): the AMF's first served GUAMI.
-            let served = ctx.served_guami.first()?;
-            let guami = Guami {
-                plmn_identity: encode_plmn_id(&served.plmn_id),
-                amf_region_id: served.amf_id.region,
-                amf_set_id: served.amf_id.set,
-                amf_pointer: served.amf_id.pointer,
-            };
-
-            let allowed: Vec<SNssai> = allowed_nssai.iter().map(amf_snssai_to_ngap).collect();
-
-            // Replayed UE security capabilities (TS 38.413 §9.3.1.86). 5G fields carry
-            // the verbatim NAS algorithm octets; E-UTRA fields carry the EEA/EIA octets.
-            let ue_security_capabilities = UeSecurityCapabilities {
-                nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ea),
-                nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ia),
-                eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(
-                    ue_security_capability.eea,
-                ),
-                eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eia),
-            };
-
-            let msg = InitialContextSetupRequest {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id,
-                guami,
-                allowed_nssai: allowed,
-                ue_security_capabilities,
-                security_key: *security_key,
-                nas_pdu: nas_pdu.map(|p| p.to_vec()),
-                ue_ambr: ue_ambr.map(|(dl, ul)| UeAmbrInfo { dl, ul }),
-            };
-
-            match builder::build_initial_context_setup_request(&msg) {
-                Ok(bytes) => {
-                    log::debug!(
-                        "Built Initial Context Setup Request: {} bytes, amf_ue_ngap_id={amf_ue_ngap_id}, \
-                         ran_ue_ngap_id={ran_ue_ngap_id}, allowed_nssai={}, nas_pdu={}",
-                        bytes.len(),
-                        allowed_nssai.len(),
-                        nas_pdu.map(|p| p.len()).unwrap_or(0)
-                    );
-                    Some(bytes)
-                }
-                Err(e) => {
-                    log::error!("Failed to encode Initial Context Setup Request: {e:?}");
-                    None
-                }
-            }
-        }
-
-        /// Decode an Initial Context Setup Response (gNB -> AMF, TS 38.413 §9.2.2.2).
-        /// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
-        pub(crate) fn hand_written_parse_initial_context_setup_response(
-            data: &[u8],
-        ) -> Option<(u64, u32)> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::InitialContextSetupResponse(resp)) => {
-                    Some((resp.amf_ue_ngap_id, resp.ran_ue_ngap_id))
-                }
-                Ok(other) => {
-                    log::warn!("Expected InitialContextSetupResponse, got {other:?}");
-                    None
-                }
-                Err(e) => {
-                    log::warn!("Failed to decode Initial Context Setup Response: {e:?}");
-                    None
-                }
-            }
-        }
-
-        /// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
-        /// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
-        pub(crate) fn hand_written_parse_initial_context_setup_failure(
-            data: &[u8],
-        ) -> Option<(u64, u32)> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::InitialContextSetupFailure(fail)) => {
-                    Some((fail.amf_ue_ngap_id, fail.ran_ue_ngap_id))
-                }
-                Ok(other) => {
-                    log::warn!("Expected InitialContextSetupFailure, got {other:?}");
-                    None
-                }
-                Err(e) => {
-                    log::warn!("Failed to decode Initial Context Setup Failure: {e:?}");
-                    None
-                }
-            }
-        }
-
-        /// The PDU Session Resource Setup Request encoder as it was before
-        /// #417 stage 6 moved it onto the generated codec.
-        pub(crate) fn hand_written_pdu_session_resource_setup_request(
-            amf_ue_ngap_id: u64,
-            ran_ue_ngap_id: u32,
-            pdu_session_id: u8,
-            s_nssai_sst: u8,
-            s_nssai_sd: Option<u32>,
-            nas_pdu: Option<&[u8]>,
-            n2_sm_transfer: &[u8],
-        ) -> Option<Vec<u8>> {
-            let sd = s_nssai_sd.map(|sd_val| {
-                [
-                    ((sd_val >> 16) & 0xFF) as u8,
-                    ((sd_val >> 8) & 0xFF) as u8,
-                    (sd_val & 0xFF) as u8,
-                ]
-            });
-            let item = PduSessionResourceSetupItem {
-                pdu_session_id,
-                nas_pdu: None,
-                s_nssai: SNssai {
-                    sst: s_nssai_sst,
-                    sd,
-                },
-                transfer: n2_sm_transfer.to_vec(),
-            };
-            let msg = PduSessionResourceSetupRequest {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id,
-                pdu_session_list: vec![item],
-                nas_pdu: nas_pdu.map(|p| p.to_vec()),
-            };
-            builder::build_pdu_session_resource_setup_request(&msg).ok()
-        }
-
-        /// The PDU Session Resource Setup Response decode as the handler did it
-        /// before #417 stage 6: the UE, the set-up and the failed sessions with
-        /// their transfers, or nothing when the parser refused the message.
-        #[allow(clippy::type_complexity)]
-        pub(crate) fn hand_written_parse_pdu_session_resource_setup_response(
-            data: &[u8],
-        ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::PduSessionResourceSetupResponse(r)) => Some((
-                    r.amf_ue_ngap_id,
-                    r.ran_ue_ngap_id,
-                    r.setup_list
-                        .into_iter()
-                        .map(|i| (i.pdu_session_id, i.transfer))
-                        .collect(),
-                    r.failed_list
-                        .into_iter()
-                        .map(|i| (i.pdu_session_id, i.transfer))
-                        .collect(),
-                )),
-                _ => None,
-            }
-        }
-
-        /// `build_n2_sm_setup_request_transfer` as it was before #417 stage 6.
-        pub(crate) fn hand_written_n2_sm_setup_request_transfer(
-            upf_teid: u32,
-            upf_addr: [u8; 4],
-            qfi: u8,
-            five_qi: u16,
-            arp_priority_level: u8,
-        ) -> Option<Vec<u8>> {
-            use nextgcore_ngap::transfer::{
-                AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
-                PduSessionResourceSetupRequestTransfer, PduSessionType, PreEmptionCapability,
-                PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
-                QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
-            };
-            PduSessionResourceSetupRequestTransfer {
-                pdu_session_aggregate_maximum_bit_rate: None,
-                ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                    transport_layer_address: TransportLayerAddress::from_ipv4(upf_addr),
-                    gtp_teid: upf_teid.to_be_bytes(),
-                }),
-                data_forwarding_not_possible: false,
-                direct_forwarding_path_availability: false,
-                pdu_session_type: PduSessionType::Ipv4,
-                security_indication: None,
-                network_instance: None,
-                qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
-                    qos_flow_identifier: qfi,
-                    qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                        qos_characteristics: QosCharacteristics::NonDynamic5qi(
-                            NonDynamic5qiDescriptor::new(five_qi),
-                        ),
-                        allocation_and_retention_priority: AllocationAndRetentionPriority {
-                            priority_level_arp: arp_priority_level,
-                            pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
-                            pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
-                        },
-                        gbr_qos_information: None,
-                        reflective_qos_attribute: false,
-                        additional_qos_flow_information: false,
-                    },
-                    e_rab_id: None,
-                }],
-            }
-            .encode()
-            .ok()
-        }
-
-        /// `parse_n2_sm_setup_response_transfer` as it was before #417 stage 6.
-        pub(crate) fn hand_written_parse_n2_sm_setup_response_transfer(
-            data: &[u8],
-        ) -> Option<GnbN3Endpoint> {
-            use nextgcore_ngap::transfer::{
-                PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation,
-            };
-            let transfer = PduSessionResourceSetupResponseTransfer::decode(data).ok()?;
-            let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer
-                .dl_qos_flow_per_tnl_information
-                .up_transport_layer_information;
-            Some(GnbN3Endpoint {
-                teid: u32::from_be_bytes(tunnel.gtp_teid),
-                address: tunnel.transport_layer_address.octets.clone(),
-                qfis: transfer
-                    .dl_qos_flow_per_tnl_information
-                    .associated_qos_flow_list
-                    .iter()
-                    .map(|f| f.qos_flow_identifier)
-                    .collect(),
-            })
-        }
-
-        /// The UE Context Release Command encoder as it was before #417 stage 4
-        /// moved it onto the generated codec.
-        pub(crate) fn hand_written_ue_context_release_command(
-            amf_ue_ngap_id: u64,
-            ran_ue_ngap_id: u32,
-            cause_group: u8,
-            cause_value: i64,
-        ) -> Option<Vec<u8>> {
-            let msg = UeContextReleaseCommand {
-                ue_ngap_ids: UeNgapIds::Pair {
-                    amf_ue_ngap_id,
-                    ran_ue_ngap_id,
-                },
-                cause: build_cause(cause_group, cause_value),
-            };
-            builder::build_ue_context_release_command(&msg).ok()
-        }
-
-        /// The PDU Session Resource Release Command encoder as it was before
-        /// #417 stage 5 moved it onto the generated codec.
-        pub(crate) fn hand_written_pdu_session_resource_release_command(
-            amf_ue_ngap_id: u64,
-            ran_ue_ngap_id: u32,
-            pdu_session_ids: &[u8],
-        ) -> Option<Vec<u8>> {
-            use nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer;
-            let release_transfer = PduSessionResourceReleaseCommandTransfer {
-                cause: Cause::Nas(CauseNas::NormalRelease),
-            };
-            let transfer_bytes = release_transfer.encode().ok()?;
-            let pdu_session_list = pdu_session_ids
-                .iter()
-                .map(|&psi| PduSessionResourceReleaseItem {
-                    pdu_session_id: psi,
-                    transfer: transfer_bytes.clone(),
-                })
-                .collect();
-            let msg = PduSessionResourceReleaseCommand {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id,
-                nas_pdu: None,
-                pdu_session_list,
-            };
-            builder::build_pdu_session_resource_release_command(&msg).ok()
-        }
-
-        /// The PDU Session Resource Release Response decode as the handler did
-        /// it before #417 stage 5: the UE, and each released session with its
-        /// transfer, or nothing when the parser refused the message.
-        pub(crate) fn hand_written_parse_pdu_session_resource_release_response(
-            data: &[u8],
-        ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>)> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::PduSessionResourceReleaseResponse(r)) => Some((
-                    r.amf_ue_ngap_id,
-                    r.ran_ue_ngap_id,
-                    r.released_list
-                        .into_iter()
-                        .map(|i| (i.pdu_session_id, i.transfer))
-                        .collect(),
-                )),
-                _ => None,
-            }
-        }
-
-        /// The UE Context Release Complete decoder as it was before #417 stage 4.
-        pub(crate) fn hand_written_parse_ue_context_release_complete(data: &[u8]) -> Option<u64> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::UeContextReleaseComplete(complete)) => {
-                    Some(complete.amf_ue_ngap_id)
-                }
-                _ => None,
-            }
-        }
-
-        /// The AMF UE NGAP ID extraction as it was before #447 made the production
-        /// extractor procedure-agnostic. Kept because it is half of what the
-        /// pre-stage-4 Release Request path could read, which stage 4's equivalence
-        /// tests compare against: it only answers for a request the hand-written
-        /// parser accepted.
-        pub(crate) fn hand_written_extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::UeContextReleaseRequest(req)) => Some(req.amf_ue_ngap_id),
-                _ => None,
-            }
-        }
-
-        /// The RAN UE NGAP ID counterpart of [`hand_written_extract_amf_ue_ngap_id`].
-        pub(crate) fn hand_written_extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
-            match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::UeContextReleaseRequest(req)) => Some(req.ran_ue_ngap_id),
-                _ => None,
-            }
-        }
-
-        /// The UE Context Release Request Cause extraction as it was before #417
-        /// stage 4.
-        pub(crate) fn hand_written_extract_release_request_cause(data: &[u8]) -> Option<(u8, i64)> {
-            let cause = match parser::decode_ngap_pdu(data) {
-                Ok(NgapMessage::UeContextReleaseRequest(req)) => req.cause,
-                _ => return None,
-            };
-            Some(match cause {
-                Cause::RadioNetwork(v) => {
-                    (crate::ngap_handler::cause_group::RADIO_NETWORK, v as i64)
-                }
-                Cause::Transport(v) => (crate::ngap_handler::cause_group::TRANSPORT, v as i64),
-                Cause::Nas(v) => (crate::ngap_handler::cause_group::NAS, v as i64),
-                Cause::Protocol(v) => (crate::ngap_handler::cause_group::PROTOCOL, v as i64),
-                Cause::Misc(v) => (crate::ngap_handler::cause_group::MISC, v as i64),
-            })
-        }
-
-        /// The NG Setup Request decoder as it was before #417 stage 3 moved it
-        /// onto the generated codec.
-        pub(super) fn hand_written_parse_ng_setup_request(
-            data: &[u8],
-        ) -> Option<crate::ngap_handler::NgSetupRequest> {
-            let decoded = match parser::decode_ngap_pdu(data) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    log::error!("Failed to decode NGAP PDU: {e:?}");
-                    return None;
-                }
-            };
-
-            let req = match decoded {
-                NgapMessage::NgSetupRequest(r) => r,
-                _ => {
-                    log::error!("Expected NgSetupRequest");
-                    return None;
-                }
-            };
-
-            let mut result = crate::ngap_handler::NgSetupRequest::default();
-            result.global_ran_node_id_present = true;
-
-            match &req.global_ran_node_id {
-                GlobalRanNodeId::GlobalGnbId {
-                    plmn_identity,
-                    gnb_id,
-                    gnb_id_len,
-                } => {
-                    result.plmn_id = decode_plmn_id(plmn_identity);
-                    result.gnb_id = *gnb_id;
-                    result.gnb_id_len = *gnb_id_len;
-                }
-                GlobalRanNodeId::GlobalNgEnbId {
-                    plmn_identity,
-                    ng_enb_id,
-                } => {
-                    result.plmn_id = decode_plmn_id(plmn_identity);
-                    result.ng_enb_id = Some(*ng_enb_id);
-                }
-            }
-
-            if let Some(name) = req.ran_node_name {
-                result.ran_node_name = Some(name);
-            }
-
-            result.supported_ta_list = req
-                .supported_ta_list
-                .iter()
-                .map(|ta_item| {
-                    let tac = ((ta_item.tac[0] as u32) << 16)
-                        | ((ta_item.tac[1] as u32) << 8)
-                        | (ta_item.tac[2] as u32);
-
-                    let bplmn_list: Vec<crate::context::BplmnEntry> = ta_item
-                        .broadcast_plmn_list
-                        .iter()
-                        .map(|bp| {
-                            let plmn_id = decode_plmn_id(&bp.plmn_identity);
-                            let s_nssai: Vec<crate::context::SNssai> = bp
-                                .tai_slice_support_list
-                                .iter()
-                                .map(|slice| crate::context::SNssai {
-                                    sst: slice.sst,
-                                    sd: slice.sd.map(|sd| {
-                                        ((sd[0] as u32) << 16)
-                                            | ((sd[1] as u32) << 8)
-                                            | (sd[2] as u32)
-                                    }),
-                                })
-                                .collect();
-                            crate::context::BplmnEntry {
-                                plmn_id,
-                                num_of_s_nssai: s_nssai.len(),
-                                s_nssai,
-                            }
-                        })
-                        .collect();
-
-                    crate::context::SupportedTa {
-                        tac,
-                        num_of_bplmn_list: bplmn_list.len(),
-                        bplmn_list,
-                    }
-                })
-                .collect();
-
-            result.default_paging_drx = req.default_paging_drx as u8;
-
-            Some(result)
-        }
-
-        /// An NG Setup Failure carrying a Criticality Diagnostics IE, built by
-        /// the hand-written `builder::build_ng_setup_failure` -- the oracle for
-        /// the stage 3 diagnostics. (Until #445 that builder dropped
-        /// `criticality_diagnostics`, and this oracle assembled the PDU from the
-        /// IE encoders instead.)
-        pub(super) fn hand_written_ng_setup_failure_with_diagnostics(
-            cause_group: u8,
-            cause_value: i64,
-            diagnostics: &[IeDiagnostic],
-        ) -> Vec<u8> {
-            use nextgcore_asn1c::ngap::types::Criticality;
-
-            let ies = diagnostics
-                .iter()
-                .map(|d| IeCriticalityDiagnostics {
-                    ie_criticality: match d.criticality {
-                        0 => Criticality::Reject,
-                        1 => Criticality::Ignore,
-                        _ => Criticality::Notify,
-                    },
-                    ie_id: d.ie_id,
-                    type_of_error: match d.type_of_error {
-                        0 => TypeOfError::NotUnderstood,
-                        _ => TypeOfError::Missing,
-                    },
-                })
-                .collect();
-            builder::build_ng_setup_failure(&NgSetupFailure {
-                cause: build_cause(cause_group, cause_value),
-                time_to_wait: Some(TimeToWait::V1s),
-                criticality_diagnostics: Some(CriticalityDiagnostics {
-                    ies,
-                    ..Default::default()
-                }),
-            })
-            .expect("hand-written NG Setup Failure")
-        }
-
-        /// Build an NG Setup Response PDU with proper ASN.1 APER encoding
-        ///
-        /// This is sent by AMF to gNB in response to a successful NG Setup Request.
-        /// The message follows 3GPP TS 38.413 Section 9.2.6.2.
-        pub(super) fn hand_written_ng_setup_response(ctx: &AmfContext) -> Option<Vec<u8>> {
-            let amf_name = ctx.amf_name.as_deref().unwrap_or("AMF").to_string();
-
-            let served_guami_list = ctx
-                .served_guami
-                .iter()
-                .take(ctx.num_of_served_guami)
-                .map(|guami| {
-                    let plmn_bytes = encode_plmn_id(&guami.plmn_id);
-                    ServedGuamiItem {
-                        guami: Guami {
-                            plmn_identity: plmn_bytes,
-                            amf_region_id: guami.amf_id.region,
-                            amf_set_id: guami.amf_id.set,
-                            amf_pointer: guami.amf_id.pointer,
-                        },
-                        backup_amf_name: None,
-                    }
-                })
-                .collect();
-
-            let plmn_support_list = ctx
-                .plmn_support
-                .iter()
-                .take(ctx.num_of_plmn_support)
-                .map(|plmn_support| {
-                    let plmn_bytes = encode_plmn_id(&plmn_support.plmn_id);
-                    let slice_support_list = plmn_support
-                        .s_nssai
-                        .iter()
-                        .take(plmn_support.num_of_s_nssai)
-                        .map(|s_nssai| {
-                            let sd = s_nssai.sd.map(|sd_val| {
-                                [
-                                    ((sd_val >> 16) & 0xFF) as u8,
-                                    ((sd_val >> 8) & 0xFF) as u8,
-                                    (sd_val & 0xFF) as u8,
-                                ]
-                            });
-                            SNssai {
-                                sst: s_nssai.sst,
-                                sd,
-                            }
-                        })
-                        .collect();
-                    PlmnSupportItem {
-                        plmn_identity: plmn_bytes,
-                        slice_support_list,
-                    }
-                })
-                .collect();
-
-            // amfd-09 (TS 38.413 §9.2.6.2): a strict-peer gNB needs a non-empty
-            // PLMNSupportList with slice support for load-balancing / slice selection.
-            // An empty list is an AMF misconfiguration; surface it loudly at build time
-            // rather than letting the gNB reject the response on the wire.
-            if ctx.num_of_plmn_support == 0 {
-                log::error!(
-                    "NG Setup Response built with an EMPTY PLMNSupportList \
-                     (num_of_plmn_support=0); check AMF slice configuration"
-                );
-                debug_assert!(
-                    ctx.num_of_plmn_support > 0,
-                    "NGSetupResponse PLMNSupportList must not be empty (TS 38.413 §9.2.6.2)"
-                );
-            }
-
-            let msg = NgSetupResponse {
-                amf_name,
-                served_guami_list,
-                relative_amf_capacity: ctx.relative_capacity,
-                plmn_support_list,
-            };
-
-            match builder::build_ng_setup_response(&msg) {
-                Ok(bytes) => {
-                    log::debug!(
-                        "Built NG Setup Response: {} bytes, hex: {:02x?}",
-                        bytes.len(),
-                        &bytes[..bytes.len().min(32)]
-                    );
-                    Some(bytes)
-                }
-                Err(e) => {
-                    log::error!("Failed to encode NG Setup Response: {e:?}");
-                    None
-                }
-            }
-        }
-
-        /// Build an NG Setup Failure PDU with proper ASN.1 APER encoding
-        ///
-        /// This is sent by AMF to gNB when NG Setup fails.
-        /// The message follows 3GPP TS 38.413 Section 9.2.6.3.
-        pub(super) fn hand_written_ng_setup_failure(
-            cause_group: u8,
-            cause_value: i64,
-            time_to_wait: Option<u8>,
-        ) -> Vec<u8> {
-            let cause = build_cause(cause_group, cause_value);
-
-            let ttw = time_to_wait.map(|ttw| match ttw {
-                0 => TimeToWait::V1s,
-                1 => TimeToWait::V2s,
-                2 => TimeToWait::V5s,
-                3 => TimeToWait::V10s,
-                4 => TimeToWait::V20s,
-                _ => TimeToWait::V60s,
-            });
-
-            let msg = NgSetupFailure {
-                cause,
-                time_to_wait: ttw,
-                criticality_diagnostics: None,
-            };
-
-            match builder::build_ng_setup_failure(&msg) {
-                Ok(bytes) => {
-                    log::debug!("Built NG Setup Failure: {} bytes", bytes.len());
-                    bytes
-                }
-                Err(e) => {
-                    log::error!("Failed to encode NG Setup Failure: {e:?}");
-                    Vec::new()
-                }
-            }
-        }
     }
 
     /// A context exercising every field the Response encodes: several GUAMIs
@@ -7881,7 +7237,7 @@ pub(crate) mod tests {
 
     /// The Paging matrix: every field the hand-written `Paging` carries, one
     /// varied at a time against a 5G-S-TMSI baseline.
-    fn paging_cases() -> Vec<Paging> {
+    pub(crate) fn paging_cases() -> Vec<Paging> {
         let tai = |n: u8| TaiListItem {
             tai_plmn: [0x00, 0xf1, 0x10],
             tai_tac: [0x00, n, 0x01],
@@ -11044,13 +10400,6 @@ pub(crate) mod tests {
     // #417 stage 6: the PDU Session Resource Setup pair, and its transfers,
     // on the generated codec
     // ====================================================================
-
-    use hand_written_oracle::{
-        hand_written_n2_sm_setup_request_transfer,
-        hand_written_parse_n2_sm_setup_response_transfer,
-        hand_written_parse_pdu_session_resource_setup_response,
-        hand_written_pdu_session_resource_setup_request,
-    };
 
     /// N2 SM transfers at every length determinant boundary of an unconstrained
     /// OCTET STRING -- empty, one octet, the short form's 127 and the long
@@ -14955,7 +14304,7 @@ mod handover_3b_ii_tests {
     use super::tests::with_unknown_ie;
     use super::*;
 
-    fn request(
+    pub(super) fn request(
         handover_type: HandoverType,
         sessions: u8,
         nssai: &[SNssai],
@@ -15043,7 +14392,7 @@ mod handover_3b_ii_tests {
         assert_eq!(build_handover_request_generated(&over), None);
     }
 
-    fn command(sessions: u8, release: u8, nas: bool) -> HandoverCommand {
+    pub(super) fn command(sessions: u8, release: u8, nas: bool) -> HandoverCommand {
         HandoverCommand {
             amf_ue_ngap_id: 0x1_0000_0001,
             ran_ue_ngap_id: 0x7,
@@ -15621,7 +14970,7 @@ mod path_switch_tests {
         ));
     }
 
-    fn ack(switched: u8, released: u8, caps_on: bool) -> PathSwitchRequestAcknowledge {
+    pub(super) fn ack(switched: u8, released: u8, caps_on: bool) -> PathSwitchRequestAcknowledge {
         PathSwitchRequestAcknowledge {
             amf_ue_ngap_id: 0x1_0000_0001,
             ran_ue_ngap_id: 0x42,
@@ -16701,6 +16050,383 @@ mod ue_association_key_tests {
             ue_association_key(&build_paging_asn1(1, 1, 0x0813, &plmn, 1).unwrap()),
             None,
             "Paging"
+        );
+    }
+}
+
+#[cfg(test)]
+mod object_set_conformance_tests {
+    //! #417 stage B3.2: the schema id/criticality check that
+    //! `libs/nextgcore-ngap/tests/builder_conformance.rs` ran against the
+    //! hand-written builders, re-targeted at amfd's production builders before
+    //! that crate is deleted. For each AMF->gNB message, built with its
+    //! optional IEs present:
+    //!
+    //! 1. every IE's (id, criticality) is the pair the message's object set in
+    //!    `ngap-17.9.asn` declares (TS 38.413 V17.9.0 §9.4, prose §9.2 of
+    //!    V19.3.0). The table is parsed from the schema text at test time, so it
+    //!    shares nothing with the generated codec;
+    //! 2. the IEs the test asks for are all there, so the optional ones under
+    //!    test were really emitted;
+    //! 3. the generated codec decodes the PDU and re-encodes it byte for byte.
+    //!
+    //! The IEs are read off the PDU framing alone
+    //! ([`crate::amf_pdus::session::fields`]), not through a codec.
+    use super::handover_3b_ii_tests::{command, request};
+    use super::path_switch_tests::ack as path_switch_ack;
+    use super::tests::{create_test_context, paging_cases};
+    use super::*;
+    use std::collections::HashMap;
+
+    const SCHEMA: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../libs/nextgcore-ngap-gen/asn/ngap-17.9.asn"
+    ));
+
+    /// `id-Foo ProtocolIE-ID ::= n` for every IE id in the schema.
+    fn schema_ids() -> HashMap<String, u16> {
+        SCHEMA
+            .lines()
+            .filter_map(|line| {
+                let (name, rest) = line.trim().split_once(char::is_whitespace)?;
+                let n = rest.trim().strip_prefix("ProtocolIE-ID ::=")?.trim();
+                Some((name.to_string(), n.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// The `{ ID id-x CRITICALITY c ... }` entries of `set_name
+    /// NGAP-PROTOCOL-IES`, criticality as its index (0 reject, 1 ignore,
+    /// 2 notify).
+    fn object_set(set_name: &str) -> HashMap<u16, u8> {
+        let ids = schema_ids();
+        let header = format!("{set_name} NGAP-PROTOCOL-IES ::= {{");
+        let start = SCHEMA
+            .find(&header)
+            .unwrap_or_else(|| panic!("object set {set_name} not in the schema"));
+        let body = &SCHEMA[start + header.len()..];
+        let body = &body[..body.find("\n}").expect("object set closes")];
+        body.split("{ ID")
+            .skip(1)
+            .map(|entry| {
+                let mut words = entry.split_whitespace();
+                let id_name = words.next().expect("IE id name");
+                assert_eq!(words.next(), Some("CRITICALITY"), "{set_name}: {id_name}");
+                let crit = match words.next() {
+                    Some("reject") => 0,
+                    Some("ignore") => 1,
+                    Some("notify") => 2,
+                    other => panic!("{set_name}: {id_name}: criticality {other:?}"),
+                };
+                (ids[id_name], crit)
+            })
+            .collect()
+    }
+
+    fn check(name: &str, set_name: &str, bytes: Option<Vec<u8>>, expect_ids: &[u16]) {
+        let bytes = bytes.unwrap_or_else(|| panic!("{name}: the builder refused"));
+        let set = object_set(set_name);
+        let (_, _, _, ies) = crate::amf_pdus::session::fields(&bytes);
+        for (id, criticality, _) in &ies {
+            let want = set
+                .get(id)
+                .unwrap_or_else(|| panic!("{name}: IE id {id} is not in {set_name}"));
+            assert_eq!(
+                criticality, want,
+                "{name}: IE id {id} criticality (TS 38.413 {set_name})"
+            );
+        }
+        for id in expect_ids {
+            assert!(
+                ies.iter().any(|(i, _, _)| i == id),
+                "{name}: IE id {id} was not emitted"
+            );
+        }
+        let generated = nextgcore_ngap_gen::decode(&bytes)
+            .unwrap_or_else(|e| panic!("{name}: generated codec rejected it: {e:?}"));
+        assert_eq!(
+            nextgcore_ngap_gen::encode(&generated).expect("re-encode"),
+            bytes,
+            "{name}: generated re-encoding must be byte-identical"
+        );
+    }
+
+    fn notify() -> Vec<IeDiagnostic> {
+        vec![IeDiagnostic {
+            ie_id: 999,
+            criticality: 2,
+            type_of_error: 0,
+        }]
+    }
+
+    /// The schema's id table itself: a few ids pinned by value, so a parse
+    /// slip cannot make every check below vacuous.
+    #[test]
+    fn the_schema_ids_are_read() {
+        let ids = schema_ids();
+        assert_eq!(ids["id-AMF-UE-NGAP-ID"], 10);
+        assert_eq!(ids["id-RAN-UE-NGAP-ID"], 85);
+        assert_eq!(ids["id-NAS-PDU"], 38);
+        assert_eq!(ids["id-Cause"], 15);
+        assert_eq!(ids["id-CriticalityDiagnostics"], 19);
+        assert_eq!(object_set("DownlinkNASTransport-IEs")[&38], 0);
+        assert_eq!(object_set("PagingIEs")[&115], 1);
+    }
+
+    #[test]
+    fn ng_setup_and_non_ue_messages_are_the_object_sets() {
+        let ctx = create_test_context();
+        check(
+            "NG Setup Response",
+            "NGSetupResponseIEs",
+            build_ng_setup_response_with_diagnostics_asn1(&ctx, &notify()),
+            &[1, 96, 86, 80, 19],
+        );
+        check(
+            "NG Setup Failure",
+            "NGSetupFailureIEs",
+            Some(build_ng_setup_failure_with_diagnostics_asn1(
+                0,
+                0,
+                Some(2),
+                &notify(),
+            )),
+            &[15, 107, 19],
+        );
+        check(
+            "NG Reset Acknowledge",
+            "NGResetAcknowledgeIEs",
+            build_ng_reset_acknowledge_asn1(
+                Some(vec![UeAssociatedLogicalNgConnectionItem {
+                    amf_ue_ngap_id: Some(1),
+                    ran_ue_ngap_id: Some(2),
+                }]),
+                &notify(),
+            ),
+            &[111, 19],
+        );
+        check(
+            "Overload Start",
+            "OverloadStartIEs",
+            build_overload_start_asn1(50),
+            &[9],
+        );
+        check(
+            "Overload Stop",
+            "OverloadStopIEs",
+            build_overload_stop_asn1(),
+            &[],
+        );
+        check(
+            "RAN Configuration Update Acknowledge",
+            "RANConfigurationUpdateAcknowledgeIEs",
+            build_ran_configuration_update_acknowledge_generated(&notify()),
+            &[19],
+        );
+        check(
+            "RAN Configuration Update Failure",
+            "RANConfigurationUpdateFailureIEs",
+            build_ran_configuration_update_failure_generated(
+                Cause::Misc(CauseMisc::Unspecified),
+                Some(1),
+                &notify(),
+            ),
+            &[15, 107, 19],
+        );
+        check(
+            "Downlink Non-UE NRPPa Transport",
+            "DownlinkNonUEAssociatedNRPPaTransportIEs",
+            build_downlink_non_ue_nrppa_transport_asn1(&[0x01, 0x02], &[0xAA]),
+            &[89, 46],
+        );
+        check(
+            "Error Indication",
+            "ErrorIndicationIEs",
+            build_error_indication_generated(
+                Some(1),
+                Some(2),
+                ngap_gen::Cause::Misc(ngap_gen::CauseMisc(ngap_gen::CauseMisc::UNSPECIFIED)),
+            ),
+            &[10, 85, 15],
+        );
+    }
+
+    #[test]
+    fn paging_is_the_object_set() {
+        for (i, msg) in paging_cases().iter().enumerate() {
+            if let Some(bytes) = build_paging_generated(msg) {
+                check(
+                    &format!("Paging case {i}"),
+                    "PagingIEs",
+                    Some(bytes),
+                    &[115, 103],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ue_associated_messages_are_the_object_sets() {
+        let ctx = create_test_context();
+        check(
+            "Downlink NAS Transport",
+            "DownlinkNASTransport-IEs",
+            build_downlink_nas_transport_asn1(1, 2, &[0x7E, 0x00]),
+            &[10, 85, 38],
+        );
+        check(
+            "PDU Session Resource Setup Request",
+            "PDUSessionResourceSetupRequestIEs",
+            build_pdu_session_resource_setup_request_with_nas_asn1(
+                1,
+                2,
+                5,
+                1,
+                Some(0x010203),
+                Some(&[0x7E]),
+                Some(&[0x7E, 0x01]),
+                &[0x00],
+            ),
+            &[10, 85, 38, 74],
+        );
+        check(
+            "Initial Context Setup Request",
+            "InitialContextSetupRequestIEs",
+            build_initial_context_setup_request_with_sessions_asn1(
+                &ctx,
+                1,
+                2,
+                &[crate::context::SNssai { sst: 1, sd: None }],
+                &crate::context::UeSecurityCapability::default(),
+                &[0x11; 32],
+                Some(&[0x7E]),
+                Some((1_000_000, 500_000)),
+                &[CxtReqSession {
+                    pdu_session_id: 5,
+                    s_nssai: crate::context::SNssai { sst: 1, sd: None },
+                    transfer: vec![0x00],
+                }],
+            ),
+            &[10, 85, 110, 28, 71, 0, 119, 94, 38],
+        );
+        check(
+            "PDU Session Resource Release Command",
+            "PDUSessionResourceReleaseCommandIEs",
+            build_pdu_session_resource_release_command_relayed(1, 2, 5, &[0x00], Some(&[0x7E])),
+            &[10, 85, 38, 79],
+        );
+        check(
+            "PDU Session Resource Modify Request",
+            "PDUSessionResourceModifyRequestIEs",
+            build_pdu_session_resource_modify_request_asn1(1, 2, 5, Some(&[0x7E]), &[0x00]),
+            &[10, 85, 64],
+        );
+        check(
+            "PDU Session Resource Modify Confirm",
+            "PDUSessionResourceModifyConfirmIEs",
+            build_pdu_session_resource_modify_confirm_asn1(
+                1,
+                2,
+                &[ModifyPduSession {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00],
+                }],
+                &[ModifyPduSession {
+                    pdu_session_id: 6,
+                    transfer: vec![0x00],
+                }],
+                &notify(),
+            ),
+            &[10, 85, 62, 131, 19],
+        );
+        check(
+            "UE Context Release Command",
+            "UEContextReleaseCommand-IEs",
+            build_ue_context_release_command_asn1(1, 2, 0, 0),
+            &[114, 15],
+        );
+        check(
+            "UE Context Modification Request",
+            "UEContextModificationRequestIEs",
+            build_ue_context_modification_request_asn1(1, 2, (1_000_000, 500_000)),
+            &[10, 85, 110],
+        );
+        check(
+            "Downlink UE NRPPa Transport",
+            "DownlinkUEAssociatedNRPPaTransportIEs",
+            build_downlink_ue_nrppa_transport_asn1(1, 2, &[0x01, 0x02], &[0xAA]),
+            &[10, 85, 89, 46],
+        );
+        check(
+            "5GS->EPS Handover Command",
+            "HandoverCommandIEs",
+            build_fivegs_to_eps_handover_command_asn1(1, 2, 3, &[0xAB; 4]),
+            &[10, 85, 29, 106],
+        );
+    }
+
+    #[test]
+    fn handover_and_path_switch_messages_are_the_object_sets() {
+        let nssai = [SNssai {
+            sst: 1,
+            sd: Some([0, 0, 1]),
+        }];
+        check(
+            "Handover Request",
+            "HandoverRequestIEs",
+            build_handover_request_generated(&request(HandoverType::Intra5gs, 2, &nssai, 3, 1000)),
+            &[10, 29, 15, 110, 119, 93, 73, 101, 0, 28],
+        );
+        check(
+            "Handover Command",
+            "HandoverCommandIEs",
+            build_handover_command_generated(&command(2, 1, true)),
+            &[10, 85, 29, 39, 59, 106],
+        );
+        check(
+            "Handover Preparation Failure",
+            "HandoverPreparationFailureIEs",
+            build_handover_preparation_failure_asn1(&HandoverPreparationFailure {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 2,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+                criticality_diagnostics: Some(CriticalityDiagnostics {
+                    procedure_code: Some(12),
+                    triggering_message: Some(0),
+                    procedure_criticality: Some(0),
+                    ies: vec![],
+                }),
+            }),
+            &[10, 85, 15, 19],
+        );
+        check(
+            "Handover Cancel Acknowledge",
+            "HandoverCancelAcknowledgeIEs",
+            build_handover_cancel_acknowledge_asn1(1, 2, &notify()),
+            &[10, 85, 19],
+        );
+        check(
+            "Path Switch Request Acknowledge",
+            "PathSwitchRequestAcknowledgeIEs",
+            build_path_switch_request_acknowledge_generated(
+                &path_switch_ack(2, 1, true),
+                &notify(),
+            ),
+            &[10, 85, 119, 77, 19],
+        );
+        check(
+            "Path Switch Request Failure",
+            "PathSwitchRequestFailureIEs",
+            build_path_switch_request_failure_generated(
+                1,
+                2,
+                &[PduSessionResourceReleasedItem {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00],
+                }],
+                &notify(),
+            ),
+            &[10, 85, 69, 19],
         );
     }
 }

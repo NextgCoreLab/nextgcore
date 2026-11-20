@@ -211,13 +211,6 @@ pub(crate) fn user_location(loc: &t::UserLocationInformation) -> Vec<u8> {
     b.finish()
 }
 
-/// NAS-PDU `OCTET STRING`, unconstrained: the aligned length, the octets.
-fn octet_string(o: &[u8]) -> Vec<u8> {
-    let mut b = Bits::default();
-    b.open(o);
-    b.finish()
-}
-
 /// INITIAL UE MESSAGE (§9.2.5.1): initiatingMessage, id-InitialUEMessage 15,
 /// ignore; id 85 RAN-UE-NGAP-ID (reject); id 38 NAS-PDU (reject); id 121
 /// UserLocationInformation (reject); id 90 RRCEstablishmentCause (ignore):
@@ -253,7 +246,7 @@ pub(crate) fn initial_ue_message(m: &t::InitialUeMessage) -> Vec<u8> {
     };
     let mut ies = vec![
         (85, 0, crate::aper_golden::ran_ue_ngap_id(m.ran_ue_ngap_id)),
-        (38, 0, octet_string(&m.nas_pdu)),
+        (38, 0, crate::aper_golden::open_value(&m.nas_pdu)),
         (121, 0, user_location(&m.user_location_info)),
         (90, 1, rrc.finish()),
     ];
@@ -274,7 +267,7 @@ pub(crate) fn uplink_nas_transport(m: &t::UplinkNasTransport) -> Vec<u8> {
         &[
             (10, 0, crate::aper_golden::amf_ue_ngap_id(m.amf_ue_ngap_id)),
             (85, 0, crate::aper_golden::ran_ue_ngap_id(m.ran_ue_ngap_id)),
-            (38, 0, octet_string(&m.nas_pdu)),
+            (38, 0, crate::aper_golden::open_value(&m.nas_pdu)),
             (121, 1, user_location(&m.user_location_info)),
         ],
     )
@@ -496,7 +489,11 @@ pub(crate) fn handover_required(m: &t::HandoverRequired) -> Vec<u8> {
         ies.push((22, 1, vec![0x00]));
     }
     ies.push((61, 0, session_list(&sessions)));
-    ies.push((101, 0, octet_string(&m.source_to_target_container)));
+    ies.push((
+        101,
+        0,
+        crate::aper_golden::open_value(&m.source_to_target_container),
+    ));
     pdu(0, 12, 0, &ies)
 }
 
@@ -523,7 +520,11 @@ pub(crate) fn handover_request_acknowledge(m: &t::HandoverRequestAcknowledge) ->
             .collect();
         ies.push((56, 1, session_list(&failed)));
     }
-    ies.push((106, 0, octet_string(&m.target_to_source_container)));
+    ies.push((
+        106,
+        0,
+        crate::aper_golden::open_value(&m.target_to_source_container),
+    ));
     pdu(1, 13, 0, &ies)
 }
 
@@ -1028,8 +1029,8 @@ pub(crate) fn uplink_ue_associated_nrppa_transport(
         &[
             (10, 0, crate::aper_golden::amf_ue_ngap_id(amf_ue_ngap_id)),
             (85, 0, crate::aper_golden::ran_ue_ngap_id(ran_ue_ngap_id)),
-            (89, 0, octet_string(routing_id)),
-            (46, 0, octet_string(nrppa_pdu)),
+            (89, 0, crate::aper_golden::open_value(routing_id)),
+            (46, 0, crate::aper_golden::open_value(nrppa_pdu)),
         ],
     )
 }
@@ -1046,8 +1047,8 @@ pub(crate) fn uplink_non_ue_associated_nrppa_transport(
         47,
         1,
         &[
-            (89, 0, octet_string(routing_id)),
-            (46, 0, octet_string(nrppa_pdu)),
+            (89, 0, crate::aper_golden::open_value(routing_id)),
+            (46, 0, crate::aper_golden::open_value(nrppa_pdu)),
         ],
     )
 }

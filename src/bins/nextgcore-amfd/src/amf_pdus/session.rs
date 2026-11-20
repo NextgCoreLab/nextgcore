@@ -24,59 +24,6 @@ use crate::aper_golden::Bits;
 /// AMF-UE-NGAP-ID `INTEGER (0..1099511627775)` (§9.3.3.1).
 pub(crate) const MAX_AMF_UE_NGAP_ID: u64 = (1 << 40) - 1;
 
-/// An unconstrained length determinant and its octets, fragmented from 16384
-/// octets on (X.691 §11.9.3.6-§11.9.3.8). The fragment size is the largest
-/// m x 16K (m at most 4) the remaining octets fill.
-pub(crate) fn open(b: &mut Bits, inner: &[u8]) {
-    const K16: usize = 16384;
-    let mut rest = inner;
-    while rest.len() >= K16 {
-        let m = (rest.len() / K16).min(4);
-        b.octets(&[0xC0 | m as u8]).octets(&rest[..m * K16]);
-        rest = &rest[m * K16..];
-    }
-    if rest.len() < 128 {
-        b.octets(&[rest.len() as u8]);
-    } else {
-        b.octets(&(0x8000 | rest.len() as u16).to_be_bytes());
-    }
-    b.octets(rest);
-}
-
-/// `inner` as an open type / unconstrained OCTET STRING, on its own.
-pub(crate) fn open_value(inner: &[u8]) -> Vec<u8> {
-    let mut b = Bits::default();
-    open(&mut b, inner);
-    b.finish()
-}
-
-/// An NGAP-PDU as in [`crate::aper_golden::pdu`], with every open type
-/// through [`open`], so a message past 16K octets is derivable too:
-/// extension `0`, the CHOICE index in two bits, the aligned procedure code,
-/// the criticality in two bits, then the value: extension `0`, the IE count in
-/// two aligned octets, each IE id (two aligned octets), criticality (two
-/// bits), value (open type).
-pub(crate) fn envelope(
-    choice: u64,
-    procedure: u8,
-    criticality: u8,
-    ies: &[(u16, u8, Vec<u8>)],
-) -> Vec<u8> {
-    let mut value = Bits::default();
-    value.bit(false).octets(&(ies.len() as u16).to_be_bytes());
-    for (id, c, v) in ies {
-        value.octets(&id.to_be_bytes()).field(u64::from(*c), 2);
-        open(&mut value, v);
-    }
-    let mut b = Bits::default();
-    b.bit(false)
-        .field(choice, 2)
-        .octets(&[procedure])
-        .field(u64::from(criticality), 2);
-    open(&mut b, &value.finish());
-    b.finish()
-}
-
 /// `INTEGER (0..ub)` with ub past 64K, into a running sink: the octet count
 /// n-1 in `width` bits, unaligned, then n aligned octets, n minimal
 /// (§11.5.7.4). AMF-UE-NGAP-ID has `width` 3, RAN-UE-NGAP-ID 2.
@@ -186,7 +133,7 @@ pub(crate) fn ue_context_release_command(
     group: u8,
     value: u8,
 ) -> Option<Vec<u8>> {
-    Some(envelope(
+    Some(crate::aper_golden::pdu(
         0,
         41,
         0,
@@ -227,9 +174,9 @@ pub(crate) fn pdu_session_resource_release_command(
     list.octets(&[(psis.len() - 1) as u8]);
     for psi in psis {
         list.field(0, 2).octets(&[*psi]);
-        open(&mut list, &transfer);
+        list.open(&transfer);
     }
-    Some(envelope(
+    Some(crate::aper_golden::pdu(
         0,
         28,
         0,
@@ -269,13 +216,13 @@ pub(crate) fn pdu_session_resource_setup_request(
     if let Some(sd) = sd {
         list.octets(&(sd & 0xFF_FFFF).to_be_bytes()[1..]);
     }
-    open(&mut list, transfer);
+    list.open(transfer);
     let mut ies = vec![(10, 0, amf_ue_ngap_id(amf)?), (85, 0, ran_ue_ngap_id(ran))];
     if let Some(nas) = nas {
-        ies.push((38, 0, open_value(nas)));
+        ies.push((38, 0, crate::aper_golden::open_value(nas)));
     }
     ies.push((74, 0, list.finish()));
-    Some(envelope(0, 29, 0, &ies))
+    Some(crate::aper_golden::pdu(0, 29, 0, &ies))
 }
 
 /// UE CONTEXT RELEASE REQUEST (§9.2.2.4) from a gNB, with the Cause given by
@@ -284,7 +231,7 @@ pub(crate) fn pdu_session_resource_setup_request(
 /// id-UEContextReleaseRequest 42, ignore; ids 10 and 85 (reject); id 15 Cause
 /// (ignore).
 pub(crate) fn ue_context_release_request(amf: u64, ran: u32, group: u8, value: u8) -> Vec<u8> {
-    envelope(
+    crate::aper_golden::pdu(
         0,
         42,
         1,
@@ -307,7 +254,7 @@ fn session_list(items: &[(u8, Vec<u8>)]) -> Vec<u8> {
     b.octets(&[(items.len() - 1) as u8]);
     for (psi, transfer) in items {
         b.field(0, 2).octets(&[*psi]);
-        open(&mut b, transfer);
+        b.open(transfer);
     }
     b.finish()
 }
@@ -332,7 +279,7 @@ pub(crate) fn pdu_session_resource_setup_response(
             ies.push((id, 1, session_list(items)));
         }
     }
-    envelope(1, 29, 0, &ies)
+    crate::aper_golden::pdu(1, 29, 0, &ies)
 }
 
 /// PDUSessionResourceSetupResponseTransfer (§9.3.4.2) as a gNB sends it with
@@ -366,7 +313,7 @@ pub(crate) fn setup_response_transfer(teid: u32, address: [u8; 4], qfis: &[u8]) 
 }
 
 /// The IE fields of an NGAP-PDU, read at the framing level alone -- the
-/// envelope [`envelope`] writes -- as `(choice, procedure, criticality, IEs)`.
+/// envelope [`crate::aper_golden::pdu`] writes -- as `(choice, procedure, criticality, IEs)`.
 /// Schema-blind: it never interprets an IE value, so the tests can put a wire
 /// form back in that no encoder produces.
 #[allow(clippy::type_complexity)]
@@ -410,7 +357,7 @@ pub(crate) fn fields(pdu: &[u8]) -> (u64, u8, u8, Vec<(u16, u8, Vec<u8>)>) {
 }
 
 /// `pdu` with the value of its protocol IE `id` replaced by `value`, every
-/// other octet of the framing re-derived through [`envelope`].
+/// other octet of the framing re-derived through [`crate::aper_golden::pdu`].
 pub(crate) fn with_ie_value(pdu: &[u8], id: u16, value: Vec<u8>) -> Vec<u8> {
     let (choice, procedure, criticality, mut ies) = fields(pdu);
     let ie = ies
@@ -418,7 +365,7 @@ pub(crate) fn with_ie_value(pdu: &[u8], id: u16, value: Vec<u8>) -> Vec<u8> {
         .find(|(i, _, _)| *i == id)
         .expect("IE present");
     ie.2 = value;
-    envelope(choice, procedure, criticality, &ies)
+    crate::aper_golden::pdu(choice, procedure, criticality, &ies)
 }
 
 #[cfg(test)]
@@ -432,13 +379,13 @@ mod tests {
         // `c1` + 16K, then `01` + one; 70000 = 4 x 16K + 4464 are `c4` + 64K,
         // then `91 70` + 4464.
         let k = vec![0xEE; 16384];
-        let o = open_value(&k);
+        let o = crate::aper_golden::open_value(&k);
         assert_eq!((o[0], o.len(), o[16385]), (0xC1, 16386, 0x00));
         let mut k1 = k.clone();
         k1.push(0x11);
-        let o = open_value(&k1);
+        let o = crate::aper_golden::open_value(&k1);
         assert_eq!((o[16385], o[16386], o.len()), (0x01, 0x11, 16387));
-        let o = open_value(&vec![0; 70_000]);
+        let o = crate::aper_golden::open_value(&vec![0; 70_000]);
         assert_eq!((o[0], o[65537], o[65538]), (0xC4, 0x91, 0x70));
 
         // Cause: radioNetwork/user-inactivity 20: `000 0 010100` -> `05 00`;
@@ -543,7 +490,7 @@ mod tests {
         );
     }
 
-    /// The framing reader reads back what [`envelope`] writes, fragments
+    /// The framing reader reads back what [`crate::aper_golden::pdu`] writes, fragments
     /// included, and [`with_ie_value`] changes only the IE it names.
     #[test]
     fn the_framing_reader_inverts_the_envelope() {
@@ -552,7 +499,7 @@ mod tests {
             (74, 0, vec![0x5a; 20_000]),
             (85, 1, vec![0x00, 0x09]),
         ];
-        let pdu = envelope(1, 29, 0, &ies);
+        let pdu = crate::aper_golden::pdu(1, 29, 0, &ies);
         assert_eq!(fields(&pdu), (1, 29, 0, ies.clone()));
         let spliced = with_ie_value(&pdu, 85, vec![0x40, 0x01, 0x02]);
         let (_, _, _, back) = fields(&spliced);

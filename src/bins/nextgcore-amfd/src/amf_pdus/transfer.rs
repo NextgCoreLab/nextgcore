@@ -28,51 +28,6 @@ pub(crate) fn encoding(f: impl FnOnce(&mut Bits)) -> Vec<u8> {
     b.finish()
 }
 
-/// An unconstrained length determinant and its octets, fragmented past 16K
-/// (X.691 §11.9.3.8, ALIGNED so the determinant is octet-aligned):
-/// - below 16384 octets: [`Bits::open`] (`0xxxxxxx` below 128, `10xxxxxx
-///   xxxxxxxx` below 16384);
-/// - otherwise, while 16384 or more remain: one octet `11` + m in six bits,
-///   m the number of 16K blocks in this fragment, as many as fit and at most
-///   4, then those m x 16384 octets; then the remainder with its own
-///   determinant as above, a remainder of zero included, written `00`: a
-///   length that is a multiple of 16K still ends in a final, empty part.
-pub(crate) fn open_any(b: &mut Bits, inner: &[u8]) {
-    const K16: usize = 16 * 1024;
-    let mut rest = inner;
-    while rest.len() >= K16 {
-        let m = (rest.len() / K16).min(4);
-        b.octets(&[0xC0 | m as u8]);
-        b.octets(&rest[..m * K16]);
-        rest = &rest[m * K16..];
-    }
-    b.open(rest);
-}
-
-/// An NGAP-PDU as [`crate::aper_golden::pdu`] writes it, but with every open
-/// type and the message value through [`open_any`], so any length frames.
-pub(crate) fn pdu_any(
-    choice: u64,
-    procedure: u8,
-    criticality: u8,
-    ies: &[(u16, u8, Vec<u8>)],
-) -> Vec<u8> {
-    let value = encoding(|v| {
-        v.bit(false).octets(&(ies.len() as u16).to_be_bytes());
-        for (id, c, value) in ies {
-            v.octets(&id.to_be_bytes()).field(u64::from(*c), 2);
-            open_any(v, value);
-        }
-    });
-    encoding(|b| {
-        b.bit(false)
-            .field(choice, 2)
-            .octets(&[procedure])
-            .field(u64::from(criticality), 2);
-        open_any(b, &value);
-    })
-}
-
 /// The vendored schema, the one the generated codec is compiled from.
 const SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -167,18 +122,6 @@ pub(crate) fn cause_numbers(c: &t::Cause) -> (u8, i64) {
 /// count range 1..6), then the value in its minimal n octets, aligned
 /// (§11.5.7.4, §13.2.6). A value past the root is not derived.
 pub(crate) const BIT_RATE_MAX: u64 = 4_000_000_000_000;
-pub(crate) fn bit_rate(b: &mut Bits, v: u64) {
-    assert!(
-        v <= BIT_RATE_MAX,
-        "a BitRate extension value is not derived"
-    );
-    let be = v.to_be_bytes();
-    let skip = be.iter().take_while(|o| **o == 0).count().min(7);
-    b.bit(false)
-        .field((8 - skip) as u64 - 1, 3)
-        .octets(&be[skip..]);
-}
-
 /// A GTP tunnel endpoint: `bits` address bits taken MSB first from `address`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Tunnel {
@@ -400,7 +343,7 @@ fn qos_parameters(b: &mut Bits, f: &Flow) {
             .bit(g.loss_ul.is_some())
             .bit(false);
         for r in [g.mfbr_dl, g.mfbr_ul, g.gfbr_dl, g.gfbr_ul] {
-            bit_rate(b, r);
+            crate::aper_golden::bit_rate(b, r);
         }
         if g.notification {
             b.bit(false);
@@ -448,8 +391,8 @@ pub(crate) fn setup_request_transfer(r: &SetupRequestTransfer) -> Vec<u8> {
             0,
             encoding(|b| {
                 b.bit(false).bit(false);
-                bit_rate(b, dl);
-                bit_rate(b, ul);
+                crate::aper_golden::bit_rate(b, dl);
+                crate::aper_golden::bit_rate(b, ul);
             }),
         ));
     }
@@ -680,9 +623,8 @@ pub(crate) fn s_nssai(b: &mut Bits, s: &crate::context::SNssai) {
 /// so count-1 in one aligned octet (range 256); the item extension `0`,
 /// presence pDUSessionNAS-PDU `0`, iE-Extensions `0`; PDUSessionID one
 /// aligned octet; the [`s_nssai`]; the transfer `OCTET STRING (CONTAINING
-/// ...)`, an unconstrained length, so [`open_any`] -- the reason this lives
-/// beside the transfers: past 16K both the transfer and the message value
-/// fragment.
+/// ...)`, an unconstrained length, so it fragments
+/// past 16K ([`Bits::open`]), as does the message value.
 pub(crate) fn pdu_session_resource_setup_request(
     amf: u64,
     ran: u32,
@@ -694,9 +636,9 @@ pub(crate) fn pdu_session_resource_setup_request(
         b.octets(&[0]);
         b.bit(false).bit(false).bit(false).octets(&[psi]);
         s_nssai(b, s);
-        open_any(b, transfer);
+        b.open(transfer);
     });
-    pdu_any(
+    crate::aper_golden::pdu(
         0,
         29,
         0,
@@ -713,7 +655,7 @@ pub(crate) fn pdu_session_resource_setup_request(
 /// 85 (ignore); id 75 PDUSessionResourceSetupListSURes and id 58
 /// PDUSessionResourceFailedToSetupListSURes (ignore), each `SIZE(1..256)`,
 /// count-1 in one aligned octet; per item extension `0`, iE-Extensions `0`,
-/// PDUSessionID one aligned octet, the transfer through [`open_any`].
+/// PDUSessionID one aligned octet, the transfer through [`Bits::open`](crate::aper_golden::Bits::open).
 pub(crate) fn pdu_session_resource_setup_response(
     amf: u64,
     ran: u32,
@@ -725,7 +667,7 @@ pub(crate) fn pdu_session_resource_setup_response(
             b.octets(&[(items.len() - 1) as u8]);
             for (psi, transfer) in items {
                 b.bit(false).bit(false).octets(&[*psi]);
-                open_any(b, transfer);
+                b.open(transfer);
             }
         })
     };
@@ -736,7 +678,7 @@ pub(crate) fn pdu_session_resource_setup_response(
     if !failed.is_empty() {
         ies.push((58, 1, list(failed)));
     }
-    pdu_any(1, 29, 0, &ies)
+    crate::aper_golden::pdu(1, 29, 0, &ies)
 }
 
 /// The first served GUAMI of the context (§9.3.3.3): extension `0`,
@@ -790,9 +732,9 @@ fn algorithms(octet: u8) -> u64 {
 /// - id 94 SecurityKey (reject) `BIT STRING (SIZE(256))`: fixed and past
 ///   sixteen bits, so aligned with no length (§16.10): the 32 key octets;
 /// - id 38 NAS-PDU (ignore), when given: unconstrained OCTET STRING,
-///   [`open_any`].
+///   [`Bits::open`](crate::aper_golden::Bits::open).
 ///
-/// The whole PDU frames through [`pdu_any`], so a NAS-PDU near 16K fragments
+/// The whole PDU frames through [`crate::aper_golden::pdu`], so a NAS-PDU near 16K fragments
 /// the message value too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn initial_context_setup_request(
@@ -819,8 +761,8 @@ pub(crate) fn initial_context_setup_request(
             0,
             encoding(|b| {
                 b.bit(false).bit(false);
-                bit_rate(b, dl);
-                bit_rate(b, ul);
+                crate::aper_golden::bit_rate(b, dl);
+                crate::aper_golden::bit_rate(b, ul);
             }),
         ));
     }
@@ -854,9 +796,9 @@ pub(crate) fn initial_context_setup_request(
         }),
     ));
     if let Some(nas) = nas {
-        ies.push((38, 1, encoding(|b| open_any(b, nas))));
+        ies.push((38, 1, crate::aper_golden::open_value(nas)));
     }
-    Some(pdu_any(0, 14, 0, &ies))
+    Some(crate::aper_golden::pdu(0, 14, 0, &ies))
 }
 
 /// An NGAP-PDU split along its framing alone (the NGAP-PDU envelope and
@@ -864,49 +806,13 @@ pub(crate) fn initial_context_setup_request(
 /// criticality, the protocol IEs as (id, criticality, value octets)).
 pub(crate) type Envelope = (u64, u8, u8, Vec<(u16, u8, Vec<u8>)>);
 
-/// One aligned length determinant at `at`, short or two-octet form; a
-/// fragmented one is not read here.
-fn length(bytes: &[u8], at: &mut usize) -> usize {
-    let first = bytes[*at];
-    assert!(first & 0xC0 != 0xC0, "fragmented lengths are not read here");
-    if first & 0x80 == 0 {
-        *at += 1;
-        usize::from(first)
-    } else {
-        let n = usize::from(u16::from_be_bytes([first & 0x3F, bytes[*at + 1]]));
-        *at += 2;
-        n
-    }
-}
+/// See [`Envelope`]: the framing reader is
+/// [`crate::amf_pdus::session::fields`], which also reads fragmented lengths.
+pub(crate) use crate::amf_pdus::session::fields as split;
 
-/// See [`Envelope`]. Octet 0 is the PDU's extension bit, the two-bit choice
-/// and padding; octet 1 the procedure code; octet 2 the criticality in its
-/// top two bits and padding; then the open type holding the message value:
-/// its extension bit and padding, the IE count in two octets, then per IE
-/// two id octets, a criticality octet, and the value as an open type.
-pub(crate) fn split(bytes: &[u8]) -> Envelope {
-    let choice = u64::from(bytes[0] >> 5 & 0b11);
-    let (procedure, criticality) = (bytes[1], bytes[2] >> 6);
-    let mut at = 3;
-    let len = length(bytes, &mut at);
-    assert_eq!(at + len, bytes.len(), "one PDU, nothing after it");
-    let count = u16::from_be_bytes([bytes[at + 1], bytes[at + 2]]);
-    at += 3;
-    let mut ies = Vec::new();
-    for _ in 0..count {
-        let id = u16::from_be_bytes([bytes[at], bytes[at + 1]]);
-        let c = bytes[at + 2] >> 6;
-        at += 3;
-        let n = length(bytes, &mut at);
-        ies.push((id, c, bytes[at..at + n].to_vec()));
-        at += n;
-    }
-    (choice, procedure, criticality, ies)
-}
-
-/// The [`Envelope`] framed again, as [`pdu_any`] frames.
+/// The [`Envelope`] framed again, as [`crate::aper_golden::pdu`] frames.
 pub(crate) fn join((choice, procedure, criticality, ies): &Envelope) -> Vec<u8> {
-    pdu_any(*choice, *procedure, *criticality, ies)
+    crate::aper_golden::pdu(*choice, *procedure, *criticality, ies)
 }
 
 #[cfg(test)]
@@ -919,19 +825,19 @@ mod tests {
     fn the_framing_and_causes_are_the_hand_worked_octets() {
         // 16,385 octets: `C1` + 16,384 octets, then `01` + the last one.
         let long: Vec<u8> = (0..16_385).map(|i| i as u8).collect();
-        let framed = encoding(|b| open_any(b, &long));
+        let framed = crate::aper_golden::open_value(&long);
         assert_eq!(
             (framed[0], framed[16_385], framed.len()),
             (0xC1, 0x01, 16_387)
         );
         // Exactly 4 x 16K: `C4`, the octets, then the empty final part `00`.
-        let framed = encoding(|b| open_any(b, &[0; 65_536]));
+        let framed = crate::aper_golden::open_value(&[0; 65_536]);
         assert_eq!(
             (framed[0], framed[65_537], framed.len()),
             (0xC4, 0x00, 65_538)
         );
         // 70,000 = 4 x 16K + 4,464 (0x1170): `C4`, then `91 70`.
-        let framed = encoding(|b| open_any(b, &[0; 70_000]));
+        let framed = crate::aper_golden::open_value(&[0; 70_000]);
         assert_eq!(&framed[65_537..65_539], &[0x91, 0x70]);
 
         // radioNetwork handover-cancelled, index 5 of 45: `000` `0` `000101`

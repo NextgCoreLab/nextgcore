@@ -3987,7 +3987,7 @@ impl NgapServer {
                     };
                     // #406, the THIRD instance of the class: store the cell identity too.
                     //
-                    // `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+                    // `decode_initial_ue_message_asn1` decodes `nr_cell_identity` off the
                     // InitialUEMessage's own `UserLocationInformation`
                     // (`ngap_asn1.rs:357-368`); before this it was LOGGED at `:1602-1607` and
                     // then dropped, so `amf_ue.nr_cgi` had exactly one production writer
@@ -4186,7 +4186,7 @@ impl NgapServer {
         //    already-validated location, and a UE whose PDU session signalling arrives
         //    from a new cell has still moved.
         // 3. The IE's validity does not depend on the NAS payload: it was decoded and
-        //    accepted before `parse_uplink_nas_transport_asn1` returned. Nothing below can
+        //    accepted before `decode_uplink_nas_transport_asn1` returned. Nothing below can
         //    make it untrue.
         //
         // Safe despite the security-decode block's `remove`/`insert` round-trip further
@@ -23538,7 +23538,7 @@ fn plmn_id_from_ngap_bytes(bytes: &[u8; 3]) -> PlmnId {
 /// Callers: `handle_uplink_nas_transport` (the SERVICE REQUEST and every other UL
 /// NAS message), `handle_path_switch_request` (Xn handover) and
 /// `handle_handover_notify` (N2 handover). `handle_initial_ue_message` does not use
-/// it because `parse_initial_ue_message_asn1` has already flattened the IE into
+/// it because `decode_initial_ue_message_asn1` has already flattened the IE into
 /// `InitialUeMessageData`'s own fields, so no `UserLocationInformation` survives to
 /// that site.
 ///
@@ -43232,7 +43232,7 @@ mod tests {
     /// #406 criterion 7, the THIRD instance of the class: registration stores the cell
     /// identity it already parsed.
     ///
-    /// `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+    /// `decode_initial_ue_message_asn1` decodes `nr_cell_identity` off the
     /// InitialUEMessage's own `UserLocationInformation`; `handle_initial_ue_message`
     /// LOGGED it and dropped it, storing only the TAI. So `amf_ue.nr_cgi` had one
     /// production writer (`handle_handover_notify`) and an `ncgiList` Area of Interest

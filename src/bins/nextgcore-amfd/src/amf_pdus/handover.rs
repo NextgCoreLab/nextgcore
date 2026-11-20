@@ -175,13 +175,6 @@ pub(crate) fn criticality_diagnostics(
     b.finish()
 }
 
-/// An unconstrained OCTET STRING (or `CONTAINING`) IE value.
-fn octet_string(o: &[u8]) -> Vec<u8> {
-    let mut b = Bits::default();
-    b.open(o);
-    b.finish()
-}
-
 /// A `SEQUENCE (SIZE(1..256)) OF` list whose items are { pDUSessionID, an
 /// `OCTET STRING (CONTAINING ...)` transfer, iE-Extensions OPTIONAL, ... }
 /// -- the handover, to-release, switched, released and failed lists: count-1
@@ -210,17 +203,6 @@ fn handover_type(h: t::HandoverType) -> Vec<u8> {
         2,
     );
     b.finish()
-}
-
-/// BitRate `INTEGER (0..4000000000000, ...)`: extension `0`, then a range
-/// past 64K, so the octet count: 4*10^12 < 2^48 needs at most six octets,
-/// n-1 in 0..5 takes three bits; then the minimal n octets, aligned
-/// (§12.1, §11.5.7.4).
-fn bit_rate(b: &mut Bits, v: u64) {
-    b.bit(false);
-    let be = v.to_be_bytes();
-    let skip = be.iter().take_while(|o| **o == 0).count().min(7);
-    b.field((8 - skip) as u64 - 1, 3).octets(&be[skip..]);
 }
 
 /// S-NSSAI (§9.3.1.24): extension `0`, presence of sD, iE-Extensions `0`;
@@ -297,7 +279,7 @@ fn guami(gu: &t::Guami) -> Vec<u8> {
 /// - id 10 AMF-UE-NGAP-ID (reject); id 29 HandoverType (reject); id 15
 ///   Cause (ignore);
 /// - id 110 UEAggregateMaximumBitRate (reject): extension `0`,
-///   iE-Extensions `0`, DL then UL [`bit_rate`];
+///   iE-Extensions `0`, DL then UL [`crate::aper_golden::bit_rate`];
 /// - id 119 UESecurityCapabilities (reject); id 93 SecurityContext (reject);
 /// - id 73 PDUSessionResourceSetupListHOReq (reject): `SIZE(1..256)` count-1
 ///   in one aligned octet; per item extension `0`, iE-Extensions `0`, the
@@ -308,8 +290,8 @@ fn guami(gu: &t::Guami) -> Vec<u8> {
 pub(crate) fn handover_request(m: &t::HandoverRequest) -> Vec<u8> {
     let mut ambr = Bits::default();
     ambr.field(0, 2);
-    bit_rate(&mut ambr, m.ue_ambr.dl);
-    bit_rate(&mut ambr, m.ue_ambr.ul);
+    crate::aper_golden::bit_rate(&mut ambr, m.ue_ambr.dl);
+    crate::aper_golden::bit_rate(&mut ambr, m.ue_ambr.ul);
     assert!((1..=256).contains(&m.pdu_session_list.len()));
     let mut sessions = Bits::default();
     sessions.octets(&[(m.pdu_session_list.len() - 1) as u8]);
@@ -335,7 +317,11 @@ pub(crate) fn handover_request(m: &t::HandoverRequest) -> Vec<u8> {
             (93, 0, security_context(&m.security_context)),
             (73, 0, sessions.finish()),
             (0, 0, allowed_nssai(&m.allowed_nssai)),
-            (101, 0, octet_string(&m.source_to_target_container)),
+            (
+                101,
+                0,
+                crate::aper_golden::open_value(&m.source_to_target_container),
+            ),
             (28, 0, guami(&m.guami)),
         ],
     )
@@ -355,7 +341,7 @@ pub(crate) fn handover_command(m: &t::HandoverCommand) -> Vec<u8> {
         (29, 0, handover_type(m.handover_type)),
     ];
     if let Some(p) = &m.nas_security_parameters_from_ngran {
-        ies.push((39, 0, octet_string(p)));
+        ies.push((39, 0, crate::aper_golden::open_value(p)));
     }
     if !m.pdu_session_list.is_empty() {
         let items: Vec<(u8, &[u8])> = m
@@ -372,7 +358,11 @@ pub(crate) fn handover_command(m: &t::HandoverCommand) -> Vec<u8> {
             .collect();
         ies.push((78, 1, session_items(&items)));
     }
-    ies.push((106, 0, octet_string(&m.target_to_source_container)));
+    ies.push((
+        106,
+        0,
+        crate::aper_golden::open_value(&m.target_to_source_container),
+    ));
     pdu(1, 12, 0, &ies)
 }
 
