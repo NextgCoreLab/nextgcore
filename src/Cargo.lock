@@ -2738,6 +2738,7 @@ name = "nextgcore-lmfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asn1-codecs",
  "base64 0.22.1",
  "bitvec",
  "bytes",
@@ -2752,6 +2753,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-nrppa-gen",
  "nextgcore-sbi",
+ "nextgcore-slpp-gen",
  "p256",
  "proptest",
  "serde",

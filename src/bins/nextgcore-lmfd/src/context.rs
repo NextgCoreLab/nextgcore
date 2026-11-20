@@ -559,16 +559,6 @@ pub struct LmfContext {
     /// not asked again, and a late answer is still found by the request's
     /// correlation or transaction.
     capability_unanswered: RwLock<HashMap<String, UnansweredExchange>>,
-    /// Sidelink ranges reported by each UE (TS 23.586 §5.3.3, nextgsim #138), keyed
-    /// by SUPI. The LATEST report per UE replaces the previous one: a range is a
-    /// snapshot, and accumulating them would make an LMF answer with a distance the
-    /// UE has since re-measured.
-    ///
-    /// Held separately from `cell_registry` and from the positioning sessions, and
-    /// not fed to any solver: a range to a peer UE is not a measurement of a cell,
-    /// and this LMF has no coordinates for peer UEs, so a position derived from it
-    /// would be invented. Lock discipline: taken alone, like every map here.
-    sidelink_ranges: RwLock<HashMap<String, Vec<crate::codec_glue::SidelinkRange>>>,
     /// Registered deferred/periodic/triggered LDR sessions (ldrReference -> ctx). lmfd#1.
     ldr_sessions: RwLock<HashMap<String, LdrContext>>,
     /// A8: running EventNotify trigger tasks (ldrReference -> abort handle). A
@@ -679,7 +669,6 @@ impl LmfContext {
             ue_capabilities: RwLock::new(HashMap::new()),
             capability_exchanges: RwLock::new(HashMap::new()),
             capability_unanswered: RwLock::new(HashMap::new()),
-            sidelink_ranges: RwLock::new(HashMap::new()),
             up_subscriptions: RwLock::new(HashMap::new()),
             up_configs: RwLock::new(HashMap::new()),
             exposure_subscriptions: RwLock::new(HashMap::new()),
@@ -1987,6 +1976,17 @@ impl LmfContext {
         found
     }
 
+    /// The AMF holding `ue_context_id`'s N1N2 subscription, its serving AMF, when
+    /// there is one (#557, R45 m1 on #2254: an answer to a UE's unsolicited
+    /// SLPP message goes there, not to any AMF the NRF lists).
+    pub fn amf_for_ue(&self, ue_context_id: &str) -> Option<crate::namf_client::DiscoveredAmf> {
+        let subs = self.amf_subscriptions.read().ok()?;
+        subs.values()
+            .filter(|s| s.ue_context_id.as_deref() == Some(ue_context_id))
+            .max_by_key(|s| s.seq)
+            .map(|s| s.amf.clone())
+    }
+
     /// Whether `key` holds a subscription, created or in flight.
     pub fn amf_subscription_holds(&self, key: &str) -> bool {
         self.amf_subscriptions
@@ -2254,33 +2254,6 @@ impl LmfContext {
                 },
             );
             // The waiters' senders drop here: each wait ends at once.
-        }
-    }
-
-    /// The sidelink ranges this LMF holds for `supi` (nextgsim #138).
-    ///
-    /// Empty when the UE has reported none — which is every UE that does not do
-    /// sidelink ranging, so empty is the normal answer and not a failure.
-    pub fn sidelink_ranges(&self, supi: &str) -> Vec<crate::codec_glue::SidelinkRange> {
-        self.sidelink_ranges
-            .read()
-            .ok()
-            .and_then(|r| r.get(supi).cloned())
-            .unwrap_or_default()
-    }
-
-    /// Record the ranges a UE reported (nextgsim #138), replacing any previous set.
-    ///
-    /// An EMPTY report clears the entry rather than being ignored: a UE that reports
-    /// no ranges has told the LMF it no longer holds any, and keeping the old ones
-    /// would have the LMF answer with a distance to a peer that may be gone.
-    pub fn note_sidelink_ranges(&self, supi: &str, ranges: Vec<crate::codec_glue::SidelinkRange>) {
-        if let Ok(mut map) = self.sidelink_ranges.write() {
-            if ranges.is_empty() {
-                map.remove(supi);
-            } else {
-                map.insert(supi.to_string(), ranges);
-            }
         }
     }
 
@@ -3944,6 +3917,32 @@ mod tests_real_solve {
     ///
     /// REVERT-VERIFIED: with the cap check removed the store grows past it; with
     /// the in-flight filter removed, an in-flight entry is evicted.
+    /// R45 m1 on #2254: a UE's serving AMF is the one its subscription is on,
+    /// the latest when it has moved.
+    #[test]
+    fn a_ue_s_serving_amf_is_its_subscription_s_557() {
+        let ctx = LmfContext::new();
+        let amf = |h: &str| crate::namf_client::DiscoveredAmf {
+            host: h.into(),
+            port: 80,
+            scheme: "http".into(),
+            nf_instance_id: None,
+        };
+        assert_eq!(ctx.amf_for_ue("imsi-1"), None);
+        ctx.amf_subscription_begin("a|imsi-1", &amf("10.0.0.1"), Some("imsi-1"))
+            .unwrap();
+        ctx.amf_subscription_begin("b|imsi-2", &amf("10.0.0.2"), Some("imsi-2"))
+            .unwrap();
+        assert_eq!(ctx.amf_for_ue("imsi-1"), Some(amf("10.0.0.1")));
+        ctx.amf_subscription_begin("c|imsi-1", &amf("10.0.0.3"), Some("imsi-1"))
+            .unwrap();
+        assert_eq!(
+            ctx.amf_for_ue("imsi-1"),
+            Some(amf("10.0.0.3")),
+            "the latest"
+        );
+    }
+
     #[test]
     fn the_subscription_store_is_capped_and_evicts_the_oldest_created_1518() {
         let ctx = LmfContext::new();

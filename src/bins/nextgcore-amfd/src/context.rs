@@ -751,6 +751,13 @@ pub enum PositioningDlKind {
     },
     /// LPP message → UE (N1, DL NAS Transport with payload container type LPP).
     LppToUe { lpp_pdu: Vec<u8> },
+    /// SLPP message -> UE (N1, DL NAS Transport with payload container type
+    /// "SLPP message container" 12 and the LMF's LCS correlation id in
+    /// Additional information, TS 24.501 k00 §5.4.5.3.2 c1, #557).
+    SlppToUe {
+        slpp_pdu: Vec<u8>,
+        lcs_correlation_id: Option<String>,
+    },
     /// UPDP message (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) → UE
     /// (N1, DL NAS Transport with payload container type "UE policy
     /// container" 0x05, TS 24.501 §9.11.3.40). Wave-6 E5: the PCF pushes it
@@ -3752,6 +3759,26 @@ impl AmfContext {
                 })
                 .cloned()
         })
+    }
+
+    /// The subscription an uplink positioning N1 message of `class` goes to
+    /// (#557).
+    ///
+    /// An exact-class subscription wins. SLPP without one goes to the UE's
+    /// "LPP" subscriber, which is the serving LMF: TS 24.501 k00 §5.4.5.2.5 c1
+    /// sends SLPP to "the LMF", and TS 29.518 defines no SLPP class an LMF could
+    /// subscribe to. LPP itself never falls back to anything.
+    pub fn n1n2_subscription_find_positioning(
+        &self,
+        ue_context_id: &str,
+        class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscription_find_n1(ue_context_id, class)
+            .or_else(|| {
+                (class == crate::namf_server::N1_MESSAGE_CLASS_SLPP)
+                    .then(|| self.n1n2_subscription_find_n1(ue_context_id, "LPP"))
+                    .flatten()
+            })
     }
 
     /// Find the subscription registered for an N2 information class on a UE
@@ -7901,6 +7928,51 @@ mod tests {
             other => panic!("expected UePolicyToUe, got {other:?}"),
         }
         assert!(ctx.positioning_dl_drain().is_empty());
+    }
+
+    /// #557: SLPP goes to the UE's serving LMF. That is an "SLPP" subscriber
+    /// when one exists, else the "LPP" one. No other class falls back, and with
+    /// no positioning subscriber at all nothing is found.
+    #[test]
+    fn test_slpp_uplink_goes_to_the_serving_lmf() {
+        let ctx = AmfContext::new();
+        let supi = "imsi-001010000070557";
+        let sub = |id: &str, class: &str, uri: &str| UeN1N2InfoSubscription {
+            owner: None,
+            subscription_id: id.to_string(),
+            n1_message_class: Some(class.to_string()),
+            n1_notify_callback_uri: Some(uri.to_string()),
+            n2_information_class: None,
+            n2_notify_callback_uri: None,
+            lcs_correlation_id: None,
+        };
+        assert!(ctx
+            .n1n2_subscription_find_positioning(supi, "SLPP")
+            .is_none());
+        assert!(ctx.n1n2_subscription_add(supi, sub("lpp", "LPP", "http://lmf/lpp")));
+        let found = ctx
+            .n1n2_subscription_find_positioning(supi, "SLPP")
+            .expect("the LPP subscriber is the serving LMF");
+        assert_eq!(found.subscription_id, "lpp");
+        assert!(
+            ctx.n1n2_subscription_find_positioning(supi, "UPDP")
+                .is_none(),
+            "only SLPP falls back"
+        );
+        assert!(ctx.n1n2_subscription_add(supi, sub("slpp", "SLPP", "http://lmf/slpp")));
+        assert_eq!(
+            ctx.n1n2_subscription_find_positioning(supi, "SLPP")
+                .expect("exact")
+                .subscription_id,
+            "slpp",
+            "an exact SLPP subscriber wins"
+        );
+        assert_eq!(
+            ctx.n1n2_subscription_find_positioning(supi, "LPP")
+                .expect("exact")
+                .subscription_id,
+            "lpp"
+        );
     }
 
     /// Two N1N2 subscriptions on one UE coexist; lookup by (ueContextId,

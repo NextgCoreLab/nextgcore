@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 nextgcore-nrppa-gen = { workspace = true }
 nextgcore-lpp-gen = { workspace = true }
+nextgcore-slpp-gen = { workspace = true }
+# Named directly: slpp.rs bounds a helper on the generated types' UperCodec trait.
+asn1-codecs = { workspace = true }
 bitvec = { workspace = true }
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
