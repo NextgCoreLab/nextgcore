@@ -781,7 +781,7 @@ pub fn build_downlink_nas_transport_asn1(
 /// SMF's, carried as the item's `OCTET STRING (CONTAINING ...)` without being
 /// re-encoded. The bytes are the hand-written encoder's for every request the
 /// AMF sends (no message-level NAS-PDU) --
-/// `pdu_session_resource_setup_request_generated_matches_hand_written` pins it.
+/// `pdu_session_resource_setup_request_is_the_derived_octets` pins it.
 /// A message-level NAS-PDU now goes where §9.4.1 puts it, before the session
 /// list in object-set order; the hand-written encoder appended it after, which
 /// a receiver must treat as an abstract syntax error (§10.3.6).
@@ -1689,7 +1689,7 @@ fn release_command_transfer(cause: Cause) -> Option<Vec<u8>> {
 ///
 /// #417 stage 5: encoded by the generated codec, every session's transfer
 /// carrying Cause nas/normal-release as before. The bytes are unchanged --
-/// `pdu_session_resource_release_command_generated_matches_hand_written` pins
+/// `pdu_session_resource_release_command_is_the_derived_octets` pins
 /// that -- and an empty or over-long session list (SIZE(1..256)) is refused,
 /// as the hand-written encoder refused it.
 pub fn build_pdu_session_resource_release_command_asn1(
@@ -1885,7 +1885,7 @@ pub enum PduSessionResourceReleaseResponseDecode {
 /// and on any not-comprehended IE marked reject, and ignored one marked notify
 /// without reporting it. Every response it accepted decodes to the same UE and
 /// the same sessions and transfers:
-/// `pdu_session_resource_release_response_generated_decode_matches_hand_written`.
+/// `pdu_session_resource_release_response_decodes_the_derived_octets`.
 ///
 /// A released item's `iE-Extensions` entries are not-comprehended IEs like any
 /// other: the item's extension object set is empty in Rel-17, so every entry
@@ -2018,7 +2018,7 @@ pub enum PduSessionResourceSetupResponseDecode {
 /// and on any not-comprehended IE marked reject, and ignored one marked notify
 /// without reporting it. Every response it accepted decodes to the same UE and
 /// the same sessions and transfers, in both lists:
-/// `pdu_session_resource_setup_response_generated_decode_matches_hand_written`.
+/// `pdu_session_resource_setup_response_decodes_the_derived_octets`.
 ///
 /// An item's `iE-Extensions` entries are handled as a released item's are
 /// (stage 5): both extension object sets are empty in Rel-17, so every entry
@@ -3387,7 +3387,7 @@ pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
 /// #417 stage 4: encoded by the generated codec. The (group, value) -> Cause
 /// mapping is still [`build_cause`], shared with NG Setup Failure, so an
 /// out-of-range value clamps exactly as before; the bytes are unchanged --
-/// `ue_context_release_command_generated_matches_hand_written` pins that.
+/// `ue_context_release_command_is_the_derived_octets` pins that.
 pub fn build_ue_context_release_command_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
@@ -3875,7 +3875,7 @@ pub enum UeContextReleaseRequestDecode {
 /// was released and nothing told the gNB -- on an IE marked "reject", on a
 /// missing IE, and on the optional PDU Session Resource List, which it did not
 /// comprehend and which carries criticality reject. Every request it accepted
-/// decodes identically: `ue_context_release_request_generated_decode_matches_hand_written`.
+/// decodes identically: `ue_context_release_request_decodes_the_derived_octets`.
 pub fn decode_ue_context_release_request_asn1(data: &[u8]) -> UeContextReleaseRequestDecode {
     use ngap_gen::{InitiatingMessageValue, UEContextReleaseRequestProtocolIEs_EntryValue as Ie};
     use UeContextReleaseRequestDecode::{Proceed, Reject, Undecodable};
@@ -4052,7 +4052,7 @@ pub(crate) const NEXTGSIM_RELEASE_COMPLETE_WITH_RECOMMENDATION: [u8; 63] = [
 /// Session Resource List, which it did not comprehend and which carries
 /// criticality reject -- each of which made the AMF fall back to supervising
 /// every UE of the association. Every message it accepted decodes identically:
-/// `ue_context_release_complete_generated_decode_matches_hand_written`.
+/// `ue_context_release_complete_decodes_the_derived_octets`.
 pub fn decode_ue_context_release_complete_asn1(data: &[u8]) -> UeContextReleaseCompleteDecode {
     use ngap_gen::{SuccessfulOutcomeValue, UEContextReleaseCompleteProtocolIEs_EntryValue as Ie};
     use UeContextReleaseCompleteDecode::{Complete, Failed, Undecodable};
@@ -9324,94 +9324,125 @@ pub(crate) mod tests {
         ));
     }
 
+    /// The transfer the AMF builds for an EPS->5GS handover, read back VALUE
+    /// by value through the generated strict decode (#417 stage B3.2; it was
+    /// read by the hand-written transfer parser).
     #[test]
     fn test_n2_sm_setup_request_transfer_roundtrip() {
+        use ngap_gen::PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue as Ie;
         let bytes = build_n2_sm_setup_request_transfer(0x0000_0001, [127, 0, 0, 1], 9, 9, 8)
             .expect("build");
-        let decoded =
-            PduSessionResourceSetupRequestTransfer::decode(&bytes).expect("transfer decode");
+        let decoded = nextgcore_ngap_gen::decode_contained::<
+            ngap_gen::PDUSessionResourceSetupRequestTransfer,
+        >(&bytes)
+        .expect("transfer decode");
 
-        let UpTransportLayerInformation::GtpTunnel(tunnel) = &decoded.ul_ngu_up_tnl_information;
-        assert_eq!(tunnel.gtp_teid, [0, 0, 0, 1]);
-        assert_eq!(tunnel.transport_layer_address.octets, vec![127, 0, 0, 1]);
-        assert_eq!(tunnel.transport_layer_address.bit_len, 32);
-        assert_eq!(decoded.pdu_session_type, PduSessionType::Ipv4);
-        assert_eq!(decoded.qos_flow_setup_request_list.len(), 1);
-        let flow = &decoded.qos_flow_setup_request_list[0];
-        assert_eq!(flow.qos_flow_identifier, 9);
-        match &flow.qos_flow_level_qos_parameters.qos_characteristics {
-            QosCharacteristics::NonDynamic5qi(desc) => assert_eq!(desc.five_qi, 9),
-            other => panic!("Expected NonDynamic5qi, got {other:?}"),
+        let (mut tunnel, mut session_type, mut flows) = (None, None, None);
+        for entry in decoded.protocol_i_es.0 {
+            match entry.value {
+                Ie::Id_UL_NGU_UP_TNLInformation(
+                    ngap_gen::UPTransportLayerInformation::GTPTunnel(t),
+                ) => tunnel = Some(t),
+                Ie::Id_PDUSessionType(t) => session_type = Some(t.0),
+                Ie::Id_QosFlowSetupRequestList(l) => flows = Some(l.0),
+                _ => {}
+            }
         }
+        let tunnel = tunnel.expect("UL NG-U tunnel");
+        assert_eq!(tunnel.gtp_teid.0, vec![0, 0, 0, 1]);
+        assert_eq!(tunnel.transport_layer_address.0.len(), 32);
+        assert_eq!(
+            tunnel.transport_layer_address.0.as_raw_slice(),
+            [127, 0, 0, 1]
+        );
+        assert_eq!(session_type, Some(ngap_gen::PDUSessionType::IPV4));
+        let flows = flows.expect("QoS flow list");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].qos_flow_identifier.0, 9);
+        match &flows[0].qos_flow_level_qos_parameters.qos_characteristics {
+            ngap_gen::QosCharacteristics::NonDynamic5QI(desc) => assert_eq!(desc.five_qi.0, 9),
+            other => panic!("Expected NonDynamic5QI, got {other:?}"),
+        }
+        assert_eq!(
+            flows[0]
+                .qos_flow_level_qos_parameters
+                .allocation_and_retention_priority
+                .priority_level_arp
+                .0,
+            8
+        );
     }
 
+    /// The Setup Response Transfer a gNB sends, as the hand-derived octets of
+    /// [`crate::amf_pdus::session::setup_response_transfer`], read by the
+    /// production parser to its TEID, address and QFIs.
     #[test]
     fn test_parse_n2_sm_setup_response_transfer() {
-        use nextgcore_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
-
-        let response = PduSessionResourceSetupResponseTransfer {
-            dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
-                up_transport_layer_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                    transport_layer_address: TransportLayerAddress::from_ipv4([10, 45, 0, 3]),
-                    gtp_teid: [0xde, 0xad, 0xbe, 0xef],
-                }),
-                associated_qos_flow_list: vec![AssociatedQosFlowItem {
-                    qos_flow_identifier: 9,
-                    qos_flow_mapping_indication: None,
-                }],
-            },
-            additional_dl_qos_flow_per_tnl_information: Vec::new(),
-            security_result: None,
-            qos_flow_failed_to_setup_list: Vec::new(),
-        };
-        let bytes = response.encode().expect("encode");
-
+        let bytes =
+            crate::amf_pdus::session::setup_response_transfer(0xdead_beef, [10, 45, 0, 3], &[9]);
         let endpoint = parse_n2_sm_setup_response_transfer(&bytes).expect("parse");
         assert_eq!(endpoint.teid, 0xdeadbeef);
         assert_eq!(endpoint.address, vec![10, 45, 0, 3]);
         assert_eq!(endpoint.qfis, vec![9]);
 
+        let several =
+            crate::amf_pdus::session::setup_response_transfer(1, [192, 168, 1, 2], &[0, 1, 63]);
+        let endpoint = parse_n2_sm_setup_response_transfer(&several).expect("parse");
+        assert_eq!(
+            (endpoint.teid, endpoint.address, endpoint.qfis),
+            (1, vec![192, 168, 1, 2], vec![0, 1, 63])
+        );
+
         // Strict: garbage bytes are rejected, not best-effort parsed
         assert!(parse_n2_sm_setup_response_transfer(&[0x09, 0x00, 0x00]).is_none());
     }
 
+    /// The Release Command is the derived octets, and the generated decode
+    /// reads its one session and that session's transfer back to Cause
+    /// nas/normal-release.
     #[test]
     fn test_release_command_carries_release_transfer() {
-        use nextgcore_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
+        use ngap_gen::PDUSessionResourceReleaseCommandProtocolIEs_EntryValue as Ie;
         let bytes = build_pdu_session_resource_release_command_asn1(42, 1001, &[5]).expect("build");
+        assert_eq!(
+            Some(bytes.clone()),
+            crate::amf_pdus::session::pdu_session_resource_release_command(42, 1001, &[5])
+        );
 
-        // nextgcore-asn1c maps InitiatingMessage procedure code 28 to the generic
-        // `Other` container and the nextgcore-ngap dispatch does not cover it (lib
-        // gap, reported); re-tag the value so the typed release-command parse
-        // path is exercised via decode_ngap_pdu_raw.
-        let mut decoder = AperDecoder::new(&bytes);
-        let pdu = NgapPdu::decode_aper(&mut decoder).expect("pdu decode");
-        let pdu = match pdu {
-            NgapPdu::InitiatingMessage(mut msg) => {
-                if let InitiatingMessageValue::Other(ies) = msg.value {
-                    msg.value = InitiatingMessageValue::PduSessionResourceReleaseCommand(ies);
-                }
-                NgapPdu::InitiatingMessage(msg)
-            }
-            other => other,
+        let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+            nextgcore_ngap_gen::decode(&bytes).expect("decode")
+        else {
+            panic!("initiatingMessage");
         };
-
-        match parser::decode_ngap_pdu_raw(pdu).expect("decode") {
-            NgapMessage::PduSessionResourceReleaseCommand(cmd) => {
-                assert_eq!(cmd.pdu_session_list.len(), 1);
-                let item = &cmd.pdu_session_list[0];
-                assert_eq!(item.pdu_session_id, 5);
-                let transfer =
-                    nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer::decode(
-                        &item.transfer,
-                    )
-                    .expect("transfer decode");
-                assert_eq!(transfer.cause, Cause::Nas(CauseNas::NormalRelease));
+        assert_eq!(
+            msg.procedure_code.0,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASE
+        );
+        let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceRelease(cmd) = msg.value else {
+            panic!("PDU Session Resource Release Command");
+        };
+        let mut ids = (None, None);
+        let mut items = None;
+        for entry in cmd.protocol_i_es.0 {
+            match entry.value {
+                Ie::Id_AMF_UE_NGAP_ID(v) => ids.0 = Some(v.0),
+                Ie::Id_RAN_UE_NGAP_ID(v) => ids.1 = Some(v.0),
+                Ie::Id_PDUSessionResourceToReleaseListRelCmd(l) => items = Some(l.0),
+                other => panic!("unexpected {other:?}"),
             }
-            other => panic!("Expected PduSessionResourceReleaseCommand, got {other:?}"),
         }
+        assert_eq!(ids, (Some(42), Some(1001)));
+        let items = items.expect("To Release list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].pdu_session_id.0, 5);
+        let transfer = nextgcore_ngap_gen::decode_contained::<
+            ngap_gen::PDUSessionResourceReleaseCommandTransfer,
+        >(&items[0].pdu_session_resource_release_command_transfer.0)
+        .expect("transfer decode");
+        assert_eq!(
+            transfer.cause,
+            ngap_gen::Cause::Nas(ngap_gen::CauseNas(ngap_gen::CauseNas::NORMAL_RELEASE))
+        );
     }
 
     // ========================================================================
@@ -9451,44 +9482,72 @@ pub(crate) mod tests {
         .expect("build ICS request");
         assert!(!bytes.is_empty());
 
-        // Strict peer: the gNB-side parser must accept it and recover every IE.
-        let decoded = parser::decode_ngap_pdu(&bytes).expect("decode ICS request");
-        let req = match decoded {
-            NgapMessage::InitialContextSetupRequest(r) => r,
-            other => panic!("Expected InitialContextSetupRequest, got {other:?}"),
+        // Strict peer: the generated decode must accept it and give back every
+        // IE's VALUE (#417 stage B3.2: this was the hand-written parser).
+        use ngap_gen::InitialContextSetupRequestProtocolIEs_EntryValue as Ie;
+        fn bits(b: &bitvec::prelude::BitSlice<u8, bitvec::prelude::Msb0>) -> u64 {
+            b.iter().fold(0, |v, bit| v << 1 | u64::from(*bit))
+        }
+        let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+            nextgcore_ngap_gen::decode(&bytes).expect("decode ICS request")
+        else {
+            panic!("initiatingMessage");
         };
+        let ngap_gen::InitiatingMessageValue::Id_InitialContextSetup(req) = msg.value else {
+            panic!("Expected InitialContextSetupRequest");
+        };
+        let (mut amf, mut ran, mut guami, mut allowed_nssai) = (None, None, None, None);
+        let (mut caps, mut key, mut nas, mut ambr) = (None, None, None, None);
+        for entry in req.protocol_i_es.0 {
+            match entry.value {
+                Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+                Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+                Ie::Id_GUAMI(v) => guami = Some(v),
+                Ie::Id_AllowedNSSAI(v) => allowed_nssai = Some(v.0),
+                Ie::Id_UESecurityCapabilities(v) => caps = Some(v),
+                Ie::Id_SecurityKey(v) => key = Some(v.0),
+                Ie::Id_NAS_PDU(v) => nas = Some(v.0),
+                Ie::Id_UEAggregateMaximumBitRate(v) => ambr = Some(v),
+                _ => {}
+            }
+        }
 
         // Mandatory IEs
-        assert_eq!(req.amf_ue_ngap_id, 1);
-        assert_eq!(req.ran_ue_ngap_id, 2);
+        assert_eq!((amf, ran), (Some(1), Some(2)));
         // GUAMI from the AMF's served GUAMI (region 2, set 1, pointer 0)
-        assert_eq!(req.guami.amf_region_id, 2);
-        assert_eq!(req.guami.amf_set_id, 1);
-        assert_eq!(req.guami.amf_pointer, 0);
+        let guami = guami.expect("GUAMI");
+        assert_eq!(bits(&guami.amf_region_id.0), 2);
+        assert_eq!(bits(&guami.amf_set_id.0), 1);
+        assert_eq!(bits(&guami.amf_pointer.0), 0);
         assert_eq!(
-            req.guami.plmn_identity,
+            guami.plmn_identity.0,
             encode_plmn_id(&PlmnId::new("999", "70"))
         );
         // Allowed NSSAI round-trips with the SD packed as 3 bytes
-        assert_eq!(req.allowed_nssai.len(), 1);
-        assert_eq!(req.allowed_nssai[0].sst, 1);
-        assert_eq!(req.allowed_nssai[0].sd, Some([0x01, 0x02, 0x03]));
+        let allowed_nssai = allowed_nssai.expect("Allowed NSSAI");
+        assert_eq!(allowed_nssai.len(), 1);
+        assert_eq!(allowed_nssai[0].s_nssai.sst.0, vec![1]);
+        assert_eq!(
+            allowed_nssai[0].s_nssai.sd.as_ref().map(|sd| sd.0.clone()),
+            Some(vec![0x01, 0x02, 0x03])
+        );
         // Replayed UE security capabilities: NGAP §9.3.1.86 drops the null
         // algorithm (NAS 0xF0 = EA0|EA1|EA2|EA3 -> NEA1|NEA2|NEA3 = 0xE000).
-        assert_eq!(
-            req.ue_security_capabilities.nr_encryption_algorithms,
-            0xE000
-        );
-        assert_eq!(req.ue_security_capabilities.nr_integrity_algorithms, 0xE000);
+        let caps = caps.expect("UE Security Capabilities");
+        assert_eq!(bits(&caps.n_rencryption_algorithms.0), 0xE000);
+        assert_eq!(bits(&caps.n_rintegrity_protection_algorithms.0), 0xE000);
+        assert_eq!(bits(&caps.eutr_aencryption_algorithms.0), 0);
+        assert_eq!(bits(&caps.eutr_aintegrity_protection_algorithms.0), 0);
         // UE Security Key = KgNB, non-zero and exactly the derived value
-        assert_eq!(req.security_key, kgnb);
-        assert_ne!(req.security_key, [0u8; 32]);
+        let key = key.expect("Security Key");
+        assert_eq!(key.len(), 256);
+        assert_eq!(key.as_raw_slice(), kgnb);
         // Piggybacked Registration Accept survives the round-trip
-        assert_eq!(req.nas_pdu.as_deref(), Some(nas_pdu.as_slice()));
+        assert_eq!(nas.as_deref(), Some(nas_pdu.as_slice()));
         // UE-AMBR survives the round-trip
-        let ambr = req.ue_ambr.expect("UE-AMBR present");
-        assert_eq!(ambr.dl, 1_000_000_000);
-        assert_eq!(ambr.ul, 500_000_000);
+        let ambr = ambr.expect("UE-AMBR present");
+        assert_eq!(ambr.ue_aggregate_maximum_bit_rate_dl.0, 1_000_000_000);
+        assert_eq!(ambr.ue_aggregate_maximum_bit_rate_ul.0, 500_000_000);
     }
 
     #[test]
@@ -9579,31 +9638,40 @@ pub(crate) mod tests {
     #[test]
     fn test_out_of_range_cause_value_encodes_and_decodes_safely() {
         // End-to-end: an out-of-range RadioNetwork value must not UB; it
-        // degrades to Unspecified and still round-trips through the encoder.
+        // degrades to Unspecified and still round-trips through the encoder,
+        // read back by the generated decode (#417 stage B3.2).
         let bytes = build_ng_setup_failure_asn1(0, 250, Some(0));
-        match parser::decode_ngap_pdu(&bytes).expect("decode") {
-            NgapMessage::NgSetupFailure(f) => {
-                assert_eq!(f.cause, Cause::RadioNetwork(CauseRadioNetwork::Unspecified));
-            }
-            other => panic!("Expected NgSetupFailure, got {other:?}"),
-        }
+        let ngap_gen::NGAP_PDU::UnsuccessfulOutcome(msg) =
+            nextgcore_ngap_gen::decode(&bytes).expect("decode")
+        else {
+            panic!("unsuccessfulOutcome");
+        };
+        let ngap_gen::UnsuccessfulOutcomeValue::Id_NGSetup(f) = msg.value else {
+            panic!("Expected NgSetupFailure");
+        };
+        let cause = f.protocol_i_es.0.into_iter().find_map(|e| match e.value {
+            ngap_gen::NGSetupFailureProtocolIEs_EntryValue::Id_Cause(c) => Some(c),
+            _ => None,
+        });
+        assert_eq!(
+            cause,
+            Some(ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(
+                ngap_gen::CauseRadioNetwork::UNSPECIFIED
+            )))
+        );
     }
 
     #[test]
     fn test_initial_context_setup_response_failure_roundtrip() {
-        // Build a Response/Failure with the nextgcore-ngap builder, then ensure the
-        // AMF-side parse helpers recover the UE NGAP IDs (used to gate the
-        // registration on the ICS Response).
-        let resp = builder::build_initial_context_setup_response(
+        // A Response/Failure as the hand-derived gNB stand-ins (#417 stage
+        // B3.2: they were the hand-written builders), then the AMF-side
+        // decoders must recover the UE NGAP IDs (used to gate the registration
+        // on the ICS Response).
+        let resp = crate::gnb_pdus::initial_context_setup_response(
             &nextgcore_ngap::types::InitialContextSetupResponse {
                 amf_ue_ngap_id: 7,
                 ran_ue_ngap_id: 9,
             },
-        )
-        .expect("build ICS response");
-        assert_eq!(
-            hand_written_oracle::hand_written_parse_initial_context_setup_response(&resp),
-            Some((7, 9))
         );
         assert!(matches!(
             decode_initial_context_setup_response_asn1(&resp),
@@ -9616,17 +9684,12 @@ pub(crate) mod tests {
             }
         ));
 
-        let fail = builder::build_initial_context_setup_failure(
+        let fail = crate::gnb_pdus::initial_context_setup_failure(
             &nextgcore_ngap::types::InitialContextSetupFailure {
                 amf_ue_ngap_id: 11,
                 ran_ue_ngap_id: 13,
                 cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
             },
-        )
-        .expect("build ICS failure");
-        assert_eq!(
-            hand_written_oracle::hand_written_parse_initial_context_setup_failure(&fail),
-            Some((11, 13))
         );
         assert!(matches!(
             decode_initial_context_setup_failure_asn1(&fail),
@@ -9643,12 +9706,6 @@ pub(crate) mod tests {
     // ====================================================================
     // #417 stage 4: the UE Context Release family on the generated codec
     // ====================================================================
-
-    use hand_written_oracle::{
-        hand_written_extract_amf_ue_ngap_id, hand_written_extract_ran_ue_ngap_id,
-        hand_written_extract_release_request_cause, hand_written_parse_ue_context_release_complete,
-        hand_written_ue_context_release_command,
-    };
 
     /// The upper bound of AMF-UE-NGAP-ID, INTEGER (0..1099511627775) (TS 38.413
     /// §9.3.3.1).
@@ -9674,19 +9731,42 @@ pub(crate) mod tests {
     /// RAN UE NGAP IDs at every APER length boundary of INTEGER (0..2^32-1).
     const RAN_IDS: [u32; 8] = [0, 1, 255, 256, 65_535, 65_536, 16_777_216, u32::MAX];
 
-    /// #417 stage 4: the generated UE Context Release Command is byte for byte
-    /// the hand-written one -- every cause group and value the AMF can be
-    /// handed (out-of-range ones included, which both clamp through
-    /// `build_cause`), and every ID length -- and both refuse the same
-    /// out-of-range AMF UE NGAP ID.
+    /// The `(group, value)` the AMF's [`build_cause`] turns a requested
+    /// `(group, value)` into, as wire numbers: the value cut to a `u8`; a
+    /// value the AMF's Cause type has no member for becomes the group's
+    /// "unspecified" (radioNetwork 0, transport 1, nas 3, protocol 6, misc 5);
+    /// an unknown group becomes misc/unspecified. This is the AMF's own
+    /// policy (T1.7), restated so the encoding of its result can be checked
+    /// against [`crate::amf_pdus::session`]; the radioNetwork member set ends
+    /// at release-due-to-pre-emption (46), the second V17.9 addition.
+    fn clamped_cause(group: u8, value: i64) -> (u8, u8) {
+        let v = value as u8;
+        match group {
+            0 if v <= 46 => (0, v),
+            0 => (0, 0),
+            1 => (1, u8::from(v != 0)),
+            2 => (2, v.min(3)),
+            3 => (3, v.min(6)),
+            4 => (4, v.min(5)),
+            _ => (4, 5),
+        }
+    }
+
+    /// #417 stage B3.2: the UE Context Release Command is the hand-derived
+    /// octets of [`crate::amf_pdus::session::ue_context_release_command`] --
+    /// every cause group and value the AMF can be handed (out-of-range ones
+    /// included, which clamp through `build_cause`), and every ID length --
+    /// and an out-of-range AMF UE NGAP ID is refused.
     #[test]
-    fn ue_context_release_command_generated_matches_hand_written() {
+    fn ue_context_release_command_is_the_derived_octets() {
+        use crate::amf_pdus::session::ue_context_release_command as derived;
         let mut compared = 0;
         for group in 0..=5u8 {
             for value in -1..=1000i64 {
+                let (g, v) = clamped_cause(group, value);
                 assert_eq!(
                     build_ue_context_release_command_asn1(42, 1001, group, value),
-                    hand_written_ue_context_release_command(42, 1001, group, value),
+                    derived(42, Some(1001), g, v),
                     "group {group} value {value}"
                 );
                 compared += 1;
@@ -9695,14 +9775,21 @@ pub(crate) mod tests {
         for amf in AMF_IDS {
             for ran in RAN_IDS {
                 for (group, value) in [(2u8, 0i64), (0, 20), (0, 46), (3, 1), (4, 0)] {
+                    let (g, v) = clamped_cause(group, value);
                     assert_eq!(
                         build_ue_context_release_command_asn1(amf, ran, group, value),
-                        hand_written_ue_context_release_command(amf, ran, group, value),
+                        derived(amf, Some(ran), g, v),
                         "AMF {amf} RAN {ran} group {group} value {value}"
                     );
                     compared += 1;
                 }
             }
+            // The AMF-UE-NGAP-ID-only arm (#592).
+            assert_eq!(
+                build_ue_context_release_command_ids_asn1(amf, None, 0, 20),
+                derived(amf, None, 0, 20),
+                "AMF {amf} alone"
+            );
         }
         assert_eq!(compared, 6 * 1002 + 12 * 8 * 5);
         assert_eq!(
@@ -9727,6 +9814,12 @@ pub(crate) mod tests {
         );
     }
 
+    // Derived as in `crate::amf_pdus::session`'s worked vector: `00 29 00`,
+    // length 17, `00 00 02`; IE 114 reject, length 5, `00 2a 40 03 e9` (the
+    // ID pair, AMF 42, RAN 1001); IE 15 ignore, length 1: nas `010`, `0`,
+    // normal-release `00` -> `40`. Pre-emption: the Cause is radioNetwork
+    // `000`, extension `1`, addition 1 as `0 000001` -> `10 20`, so the IE is
+    // two octets and the PDU one longer.
     const GOLDEN_RELEASE_COMMAND_NAS_NORMAL: &[u8] = &[
         0x00, 0x29, 0x00, 0x11, 0x00, 0x00, 0x02, 0x00, 0x72, 0x00, 0x05, 0x00, 0x2a, 0x40, 0x03,
         0xe9, 0x00, 0x0f, 0x40, 0x01, 0x40,
@@ -9736,23 +9829,19 @@ pub(crate) mod tests {
         0xe9, 0x00, 0x0f, 0x40, 0x02, 0x10, 0x20,
     ];
 
-    /// A UE Context Release Request built by the hand-written encoder.
-    fn release_request(amf: u64, ran: u32, group: u8, value: i64) -> Vec<u8> {
-        nextgcore_ngap::builder::build_ue_context_release_request(&UeContextReleaseRequest {
-            amf_ue_ngap_id: amf,
-            ran_ue_ngap_id: ran,
-            cause: build_cause(group, value),
-        })
-        .expect("encode")
+    /// A UE Context Release Request from a gNB, hand-derived with the Cause
+    /// at its wire numbers ([`crate::amf_pdus::session::ue_context_release_request`]).
+    fn release_request(amf: u64, ran: u32, group: u8, value: u8) -> Vec<u8> {
+        crate::amf_pdus::session::ue_context_release_request(amf, ran, group, value)
     }
 
-    /// A UE Context Release Complete built by the hand-written encoder.
+    /// A UE Context Release Complete from a gNB, hand-derived
+    /// ([`crate::gnb_pdus::ue_context_release_complete`]).
     fn release_complete(amf: u64, ran: u32) -> Vec<u8> {
-        nextgcore_ngap::builder::build_ue_context_release_complete(&UeContextReleaseComplete {
+        crate::gnb_pdus::ue_context_release_complete(&UeContextReleaseComplete {
             amf_ue_ngap_id: amf,
             ran_ue_ngap_id: ran,
         })
-        .expect("encode")
     }
 
     /// A UE Context Release Request built by the generated encoder from `ies`.
@@ -9833,18 +9922,8 @@ pub(crate) mod tests {
         .expect("encode")
     }
 
-    /// What the hand-written Release Request path could say: the three things
-    /// the handler read, each `None` when the message was refused.
-    fn hand_written_request_view(data: &[u8]) -> Option<(u64, u32, Option<(u8, i64)>)> {
-        Some((
-            hand_written_extract_amf_ue_ngap_id(data)?,
-            hand_written_extract_ran_ue_ngap_id(data)?,
-            hand_written_extract_release_request_cause(data),
-        ))
-    }
-
-    /// The new decode flattened to the same view. A `Reject` never comes out
-    /// of a request the old parser accepted, so it is a failure here.
+    /// The decode flattened to the three things the handler reads, `None`
+    /// when undecodable. A `Reject` is a failure here.
     fn generated_request_view(data: &[u8]) -> Option<(u64, u32, Option<(u8, i64)>)> {
         match decode_ue_context_release_request_asn1(data) {
             UeContextReleaseRequestDecode::Proceed {
@@ -9860,49 +9939,54 @@ pub(crate) mod tests {
         }
     }
 
-    /// The request corpus both decoders are compared over: every ID length,
-    /// every cause the AMF's `build_cause` can produce (extension values
-    /// included), and requests carrying a not-comprehended IE marked ignore or
-    /// notify, which the old parser accepted.
-    fn release_request_corpus() -> Vec<Vec<u8>> {
+    /// The request corpus, each with the values the decode must read from it:
+    /// every ID length, every Cause value V17.9 defines in every group (root
+    /// and extension additions, [`crate::amf_pdus::session::cause_values`]),
+    /// and requests carrying a not-comprehended IE marked ignore or notify.
+    #[allow(clippy::type_complexity)]
+    fn release_request_corpus() -> Vec<(Vec<u8>, (u64, u32, Option<(u8, i64)>))> {
         let mut corpus = Vec::new();
         for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for ran in RAN_IDS {
-                corpus.push(release_request(*amf, ran, 0, 21));
+                corpus.push((
+                    release_request(*amf, ran, 0, 21),
+                    (*amf, ran, Some((0, 21))),
+                ));
             }
         }
         for group in 0..=4u8 {
-            for value in 0..=50i64 {
-                corpus.push(release_request(7, 9, group, value));
+            for value in crate::amf_pdus::session::cause_values(group) {
+                corpus.push((
+                    release_request(7, 9, group, value),
+                    (7, 9, Some((group, i64::from(value)))),
+                ));
             }
         }
         let base = release_request(7, 9, 0, 21);
         for criticality in [0x40, 0x80] {
-            corpus.push(with_unknown_ie(&base, 9999, criticality));
+            corpus.push((
+                with_unknown_ie(&base, 9999, criticality),
+                (7, 9, Some((0, 21))),
+            ));
         }
         corpus
     }
 
-    /// #417 stage 4: for every request the hand-written path accepted, the
-    /// generated decode yields the same AMF UE NGAP ID, RAN UE NGAP ID and
-    /// Cause; and what it refused as malformed is still undecodable.
+    /// #417 stage B3.2: every request in the corpus decodes to the AMF UE
+    /// NGAP ID, RAN UE NGAP ID and Cause it was derived with; a malformed one
+    /// is undecodable.
     #[test]
-    fn ue_context_release_request_generated_decode_matches_hand_written() {
+    fn ue_context_release_request_decodes_the_derived_octets() {
         let corpus = release_request_corpus();
-        for data in &corpus {
-            let old = hand_written_request_view(data);
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted requests: {data:02x?}"
-            );
-            assert_eq!(generated_request_view(data), old, "{data:02x?}");
+        for (data, expected) in &corpus {
+            assert_eq!(generated_request_view(data), Some(*expected), "{data:02x?}");
         }
-        assert_eq!(corpus.len(), 11 * 8 + 5 * 51 + 2);
+        // radioNetwork 57, nas 5, transport 2, protocol 7, misc 6.
+        assert_eq!(corpus.len(), 11 * 8 + 57 + 5 + 2 + 7 + 6 + 2);
 
         // Malformed: truncated, and an empty buffer.
         let base = release_request(7, 9, 0, 21);
         for data in [&base[..base.len() - 1], &base[..4], &[][..]] {
-            assert_eq!(hand_written_request_view(data), None);
             assert_eq!(generated_request_view(data), None, "{data:02x?}");
         }
     }
@@ -9966,7 +10050,6 @@ pub(crate) mod tests {
         };
 
         let unknown_reject = with_unknown_ie(&release_request(7, 9, 0, 21), 9999, 0x00);
-        assert_eq!(hand_written_request_view(&unknown_reject), None);
         let UeContextReleaseRequestDecode::Reject(report) =
             decode_ue_context_release_request_asn1(&unknown_reject)
         else {
@@ -9991,7 +10074,6 @@ pub(crate) mod tests {
             Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
             Ie::Id_Cause(ngap_gen::Cause::Nas(ngap_gen::CauseNas(0))),
         ]);
-        assert_eq!(hand_written_request_view(&no_amf_id), None);
         let UeContextReleaseRequestDecode::Reject(report) =
             decode_ue_context_release_request_asn1(&no_amf_id)
         else {
@@ -10030,7 +10112,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Two requests the hand-written parser refused that the AMF must act on:
+    /// Two requests the old hand-written parser refused that the AMF must act on:
     /// one without a Cause (mandatory, criticality ignore -- its absence is
     /// ignored, §10.3.5), and one carrying the optional PDU Session Resource
     /// List, which the old parser did not comprehend and, its criticality
@@ -10042,7 +10124,6 @@ pub(crate) mod tests {
             Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
             Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
         ]);
-        assert_eq!(hand_written_request_view(&no_cause), None);
         assert_eq!(generated_request_view(&no_cause), Some((7, 9, None)));
 
         let with_sessions = generated_release_request(vec![
@@ -10058,15 +10139,13 @@ pub(crate) mod tests {
                 21,
             ))),
         ]);
-        assert_eq!(hand_written_request_view(&with_sessions), None);
         assert_eq!(
             generated_request_view(&with_sessions),
             Some((7, 9, Some((0, 21))))
         );
     }
 
-    /// The new Release Complete decode flattened to what the hand-written
-    /// parser could say: the AMF UE NGAP ID, or nothing.
+    /// The Release Complete decode flattened to the UE it names, or nothing.
     fn generated_complete_view(data: &[u8]) -> Option<u64> {
         match decode_ue_context_release_complete_asn1(data) {
             UeContextReleaseCompleteDecode::Complete { amf_ue_ngap_id, .. } => amf_ue_ngap_id,
@@ -10075,35 +10154,36 @@ pub(crate) mod tests {
         }
     }
 
-    /// #417 stage 4: for every Release Complete the hand-written parser
-    /// accepted, the generated decode names the same UE; what it refused as
-    /// malformed, or over a not-comprehended IE marked reject, still names none.
+    /// #417 stage B3.2: every derived Release Complete names the UE it was
+    /// derived for, ID lengths and ignore/notify IEs included; a truncated
+    /// one, or one with a not-comprehended IE marked reject, names none.
     #[test]
-    fn ue_context_release_complete_generated_decode_matches_hand_written() {
+    fn ue_context_release_complete_decodes_the_derived_octets() {
         let mut corpus = Vec::new();
         for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for ran in RAN_IDS {
-                corpus.push(release_complete(*amf, ran));
+                corpus.push((release_complete(*amf, ran), *amf));
             }
         }
         let base = release_complete(7, 9);
         for criticality in [0x40, 0x80] {
-            corpus.push(with_unknown_ie(&base, 9999, criticality));
+            corpus.push((with_unknown_ie(&base, 9999, criticality), 7));
         }
-        for data in &corpus {
-            let old = hand_written_parse_ue_context_release_complete(data);
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted messages: {data:02x?}"
-            );
-            assert_eq!(generated_complete_view(data), old, "{data:02x?}");
+        for (data, amf) in &corpus {
+            assert_eq!(generated_complete_view(data), Some(*amf), "{data:02x?}");
+            assert!(matches!(
+                decode_ue_context_release_complete_asn1(data),
+                UeContextReleaseCompleteDecode::Complete {
+                    ran_ue_ngap_id: Some(_),
+                    ..
+                }
+            ));
         }
         let refused = [
             base[..base.len() - 1].to_vec(),
             with_unknown_ie(&base, 9999, 0x00),
         ];
         for data in &refused {
-            assert_eq!(hand_written_parse_ue_context_release_complete(data), None);
             assert_eq!(generated_complete_view(data), None, "{data:02x?}");
         }
         assert!(matches!(
@@ -10260,7 +10340,7 @@ pub(crate) mod tests {
         assert_eq!(report.diagnostics[0].ie_id, 9999);
     }
 
-    /// Two Release Completes the hand-written parser refused -- one missing the
+    /// Two Release Completes the old hand-written parser refused -- one missing the
     /// RAN UE NGAP ID (criticality ignore, so its absence is ignored), one
     /// carrying the optional PDU Session Resource List (criticality reject, not
     /// comprehended by the old parser) -- now name their UE.
@@ -10269,10 +10349,6 @@ pub(crate) mod tests {
         use ngap_gen::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
         let no_ran_id =
             generated_release_complete(vec![Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7))]);
-        assert_eq!(
-            hand_written_parse_ue_context_release_complete(&no_ran_id),
-            None
-        );
         assert!(matches!(
             decode_ue_context_release_complete_asn1(&no_ran_id),
             UeContextReleaseCompleteDecode::Complete {
@@ -10293,16 +10369,12 @@ pub(crate) mod tests {
                 }],
             )),
         ]);
-        assert_eq!(
-            hand_written_parse_ue_context_release_complete(&with_sessions),
-            None
-        );
         assert_eq!(generated_complete_view(&with_sessions), Some(7));
     }
 
-    /// The criticality Error Indication decodes, under the generated codec and
-    /// the hand-written parser alike, to exactly what was reported: both IDs,
-    /// the protocol Cause, and Criticality Diagnostics with all four members
+    /// The criticality Error Indication is the derived octets below, and the
+    /// generated decode reads back exactly what was reported: both IDs, the
+    /// protocol Cause, and Criticality Diagnostics with all four members
     /// §10.3.4.2 requires for an Error Indication.
     #[test]
     fn the_criticality_error_indication_carries_the_whole_report() {
@@ -10354,20 +10426,24 @@ pub(crate) mod tests {
         let items = d.i_es_criticality_diagnostics.expect("IE list").0;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].ie_id.0, 9999);
-
-        match parser::decode_ngap_pdu(&bytes).expect("hand-written decode") {
-            NgapMessage::ErrorIndication(ei) => {
-                assert_eq!(ei.amf_ue_ngap_id, Some(7));
-                assert_eq!(ei.ran_ue_ngap_id, Some(9));
-                assert_eq!(
-                    ei.cause,
-                    Some(Cause::Protocol(CauseProtocol::AbstractSyntaxErrorReject))
-                );
-            }
-            other => panic!("Expected ErrorIndication, got {other:?}"),
-        }
     }
 
+    // ERROR INDICATION (§9.2.7.1), derived from X.691: initiatingMessage `00`,
+    // id-ErrorIndication 9 `09`, ignore `40`, length 32; extension, four IEs
+    // `00 00 04`. Every IE is ignore (`40`):
+    // - id 10 AMF-UE-NGAP-ID 7, length 2: n-1 `000`, pad, `07` -> `00 07`;
+    // - id 85 RAN-UE-NGAP-ID 9, length 2: n-1 `00`, pad, `09` -> `00 09`;
+    // - id 15 Cause, length 1: protocol `011`, extension `0`,
+    //   abstract-syntax-error-reject index 1 of seven `001`, pad -> `62`;
+    // - id 19 CriticalityDiagnostics, length 8: extension `0`, presence
+    //   procedureCode, triggeringMessage, procedureCriticality,
+    //   iEsCriticalityDiagnostics `1111`, iE-Extensions `0`, pad -> `78`;
+    //   ProcedureCode 42 `2a`; TriggeringMessage initiating-message `00` of
+    //   three (not extensible), Criticality ignore `01`, pad -> `10`;
+    //   CriticalityDiagnostics-IE-List SIZE(1..256) count-1 `00` (one aligned
+    //   octet, range 256); the item's extension `0`, iE-Extensions `0`,
+    //   iECriticality reject `00`, pad -> `00`; iE-ID 9999 `27 0f`;
+    //   TypeOfError not-understood: extension `0` + one bit `0`, pad -> `00`.
     const GOLDEN_CRITICALITY_ERROR_INDICATION: &[u8] = &[
         0x00, 0x09, 0x40, 0x20, 0x00, 0x00, 0x04, 0x00, 0x0a, 0x40, 0x02, 0x00, 0x07, 0x00, 0x55,
         0x40, 0x02, 0x00, 0x09, 0x00, 0x0f, 0x40, 0x01, 0x62, 0x00, 0x13, 0x40, 0x08, 0x78, 0x2a,
@@ -10379,11 +10455,6 @@ pub(crate) mod tests {
     // codec
     // ====================================================================
 
-    use hand_written_oracle::{
-        hand_written_parse_pdu_session_resource_release_response,
-        hand_written_pdu_session_resource_release_command,
-    };
-
     /// PDU Session ID lists at every length boundary of
     /// PDUSessionResourceToReleaseListRelCmd, SIZE(1..maxnoofPDUSessions = 256),
     /// and one past each end.
@@ -10394,18 +10465,21 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// #417 stage 5: the generated PDU Session Resource Release Command is byte
-    /// for byte the hand-written one -- every PDU Session ID, every list length
-    /// SIZE(1..256) allows, every UE NGAP ID length -- and both refuse the same
-    /// inputs: an empty or 257-entry list, and an AMF UE NGAP ID past 2^40-1.
+    /// #417 stage B3.2: the PDU Session Resource Release Command is the
+    /// hand-derived octets of
+    /// [`crate::amf_pdus::session::pdu_session_resource_release_command`] --
+    /// every PDU Session ID, every list length SIZE(1..256) allows, every UE
+    /// NGAP ID length -- and the builder refuses what no encoding carries: an
+    /// empty or 257-entry list, and an AMF UE NGAP ID past 2^40-1.
     #[test]
-    fn pdu_session_resource_release_command_generated_matches_hand_written() {
+    fn pdu_session_resource_release_command_is_the_derived_octets() {
         let mut compared = 0;
         let mut refused = 0;
         let mut check = |amf: u64, ran: u32, psis: &[u8]| {
             let new = build_pdu_session_resource_release_command_asn1(amf, ran, psis);
-            let old = hand_written_pdu_session_resource_release_command(amf, ran, psis);
-            assert_eq!(new, old, "AMF {amf} RAN {ran} PSIs {psis:?}");
+            let derived =
+                crate::amf_pdus::session::pdu_session_resource_release_command(amf, ran, psis);
+            assert_eq!(new, derived, "AMF {amf} RAN {ran} PSIs {psis:?}");
             if new.is_none() {
                 refused += 1;
             }
@@ -10436,8 +10510,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// The bytes themselves, so the generated and hand-written encoders cannot
-    /// drift together: one session, and two.
+    /// The bytes themselves, worked out below without the derivation: one
+    /// session, and two.
     #[test]
     fn pdu_session_resource_release_command_golden_bytes() {
         assert_eq!(
@@ -10466,22 +10540,24 @@ pub(crate) mod tests {
     ];
 
     /// The transfer helper on its own: for every cause the AMF's `build_cause`
-    /// can produce, the generated PDUSessionResourceReleaseCommandTransfer is
-    /// the hand-written one, and it decodes back through
-    /// [`nextgcore_ngap_gen::decode_contained`] to the same Cause -- the round
-    /// trip the Setup and Modify transfers will rely on.
+    /// can produce, the PDUSessionResourceReleaseCommandTransfer is the
+    /// hand-derived octets of
+    /// [`crate::amf_pdus::session::release_command_transfer`], and it decodes
+    /// back through [`nextgcore_ngap_gen::decode_contained`] to the same Cause
+    /// -- the round trip the Setup and Modify transfers rely on.
     #[test]
-    fn release_command_transfer_generated_matches_hand_written() {
-        use nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer;
+    fn release_command_transfer_is_the_derived_octets() {
         let mut compared = 0;
         for group in 0..=4u8 {
             for value in 0..=46i64 {
                 let cause = build_cause(group, value);
                 let new = release_command_transfer(cause).expect("encode");
-                let old = PduSessionResourceReleaseCommandTransfer { cause }
-                    .encode()
-                    .expect("hand-written encode");
-                assert_eq!(new, old, "group {group} value {value}");
+                let (g, v) = clamped_cause(group, value);
+                assert_eq!(
+                    new,
+                    crate::amf_pdus::session::release_command_transfer(g, v),
+                    "group {group} value {value}"
+                );
                 let back = nextgcore_ngap_gen::decode_contained::<
                     ngap_gen::PDUSessionResourceReleaseCommandTransfer,
                 >(&new)
@@ -10497,23 +10573,20 @@ pub(crate) mod tests {
         assert_eq!(compared, 5 * 47);
     }
 
-    /// A PDU Session Resource Release Response built by the hand-written
-    /// encoder.
+    /// A PDU Session Resource Release Response from a gNB, hand-derived
+    /// ([`crate::gnb_pdus::pdu_session_resource_release_response`]).
     pub(crate) fn release_response(amf: u64, ran: u32, released: &[(u8, Vec<u8>)]) -> Vec<u8> {
-        nextgcore_ngap::builder::build_pdu_session_resource_release_response(
-            &PduSessionResourceReleaseResponse {
-                amf_ue_ngap_id: amf,
-                ran_ue_ngap_id: ran,
-                released_list: released
-                    .iter()
-                    .map(|(psi, transfer)| PduSessionResourceReleasedItem {
-                        pdu_session_id: *psi,
-                        transfer: transfer.clone(),
-                    })
-                    .collect(),
-            },
-        )
-        .expect("encode")
+        crate::gnb_pdus::pdu_session_resource_release_response(&PduSessionResourceReleaseResponse {
+            amf_ue_ngap_id: amf,
+            ran_ue_ngap_id: ran,
+            released_list: released
+                .iter()
+                .map(|(psi, transfer)| PduSessionResourceReleasedItem {
+                    pdu_session_id: *psi,
+                    transfer: transfer.clone(),
+                })
+                .collect(),
+        })
     }
 
     /// A PDU Session Resource Release Response built by the generated encoder
@@ -10578,9 +10651,8 @@ pub(crate) mod tests {
         )
     }
 
-    /// The new decode flattened to what the hand-written path could say. A
-    /// response the old parser accepted always names both IDs, so a missing
-    /// one here is `None` too.
+    /// The decode flattened to the UE and the released sessions; a response
+    /// missing either ID is `None` here.
     fn generated_response_view(data: &[u8]) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>)> {
         match decode_pdu_session_resource_release_response_asn1(data) {
             PduSessionResourceReleaseResponseDecode::Released {
@@ -10615,36 +10687,36 @@ pub(crate) mod tests {
         ]
     }
 
-    /// #417 stage 5: for every Release Response the hand-written parser
-    /// accepted -- every ID length, lists of 1, 2 and 256 sessions, every
-    /// transfer length form, a not-comprehended IE marked ignore or notify,
-    /// and the optional User Location Information and Criticality Diagnostics
-    /// it skipped as unknown -- the generated decode names the same UE and the
-    /// same sessions with the same transfer octets; what it refused as
-    /// malformed, or over a not-comprehended IE marked reject, still yields
-    /// nothing to relay.
+    /// #417 stage B3.2: every derived Release Response -- every ID length,
+    /// lists of 1, 2 and 256 sessions, every transfer length form, a
+    /// not-comprehended IE marked ignore or notify, and one from the generated
+    /// encoder with the optional User Location Information and Criticality
+    /// Diagnostics -- decodes to the UE and the sessions, with their transfer
+    /// octets, it was derived with; a truncated one, or one with a
+    /// not-comprehended IE marked reject, yields nothing to relay.
     #[test]
-    fn pdu_session_resource_release_response_generated_decode_matches_hand_written() {
+    fn pdu_session_resource_release_response_decodes_the_derived_octets() {
         use ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie;
         let mut corpus = Vec::new();
+        let mut push = |amf: u64, ran: u32, released: Vec<(u8, Vec<u8>)>| {
+            corpus.push((release_response(amf, ran, &released), (amf, ran, released)));
+        };
         for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for ran in RAN_IDS {
-                corpus.push(release_response(*amf, ran, &[(5, vec![0x00])]));
+                push(*amf, ran, vec![(5, vec![0x00])]);
             }
         }
         for transfer in response_transfers() {
-            corpus.push(release_response(7, 9, &[(3, transfer.clone())]));
-            corpus.push(release_response(
-                7,
-                9,
-                &[(3, transfer.clone()), (4, vec![0x00])],
-            ));
+            push(7, 9, vec![(3, transfer.clone())]);
+            push(7, 9, vec![(3, transfer), (4, vec![0x00])]);
         }
-        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
-        corpus.push(release_response(7, 9, &all));
+        push(7, 9, (0..=255u8).map(|psi| (psi, vec![psi])).collect());
         let base = release_response(7, 9, &[(5, vec![0x00])]);
         for criticality in [0x40, 0x80] {
-            corpus.push(with_unknown_ie(&base, 9999, criticality));
+            corpus.push((
+                with_unknown_ie(&base, 9999, criticality),
+                (7, 9, vec![(5, vec![0x00])]),
+            ));
         }
         let uli = ngap_gen::UserLocationInformation::UserLocationInformationNR(
             ngap_gen::UserLocationInformationNR {
@@ -10662,24 +10734,26 @@ pub(crate) mod tests {
                 ie_extensions: None,
             },
         );
-        corpus.push(generated_release_response(vec![
-            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
-            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
-            generated_released_list(&[(5, vec![0x00])]),
-            Ie::Id_UserLocationInformation(uli),
-            Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(&[IeDiagnostic {
-                ie_id: 9999,
-                criticality: ngap_gen::Criticality::IGNORE,
-                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
-            }])),
-        ]));
-        for data in &corpus {
-            let old = hand_written_parse_pdu_session_resource_release_response(data);
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted messages: {data:02x?}"
+        corpus.push((
+            generated_release_response(vec![
+                Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+                Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+                generated_released_list(&[(5, vec![0x00])]),
+                Ie::Id_UserLocationInformation(uli),
+                Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(&[IeDiagnostic {
+                    ie_id: 9999,
+                    criticality: ngap_gen::Criticality::IGNORE,
+                    type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+                }])),
+            ]),
+            (7, 9, vec![(5, vec![0x00])]),
+        ));
+        for (data, expected) in &corpus {
+            assert_eq!(
+                generated_response_view(data).as_ref(),
+                Some(expected),
+                "{data:02x?}"
             );
-            assert_eq!(generated_response_view(data), old, "{data:02x?}");
         }
         assert_eq!(corpus.len(), 11 * 8 + 6 * 2 + 1 + 2 + 1);
 
@@ -10688,10 +10762,6 @@ pub(crate) mod tests {
             with_unknown_ie(&base, 9999, 0x00),
         ];
         for data in &refused {
-            assert_eq!(
-                hand_written_parse_pdu_session_resource_release_response(data),
-                None
-            );
             assert_eq!(generated_response_view(data), None, "{data:02x?}");
         }
         assert!(matches!(
@@ -10756,7 +10826,7 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Responses the hand-written parser refused although every IE of a
+    /// Responses the old hand-written parser refused although every IE of a
     /// Release Response has criticality ignore (§9.2.1.4), so a missing one is
     /// ignored (§10.3.5): one with no RAN UE NGAP ID still releases its
     /// sessions, and one with no AMF UE NGAP ID decodes with `None` -- which
@@ -10768,10 +10838,6 @@ pub(crate) mod tests {
             Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
             generated_released_list(&[(5, vec![0x00])]),
         ]);
-        assert_eq!(
-            hand_written_parse_pdu_session_resource_release_response(&no_ran_id),
-            None
-        );
         let PduSessionResourceReleaseResponseDecode::Released {
             amf_ue_ngap_id: Some(7),
             ran_ue_ngap_id: None,
@@ -10787,10 +10853,6 @@ pub(crate) mod tests {
             Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
             generated_released_list(&[(5, vec![0x00])]),
         ]);
-        assert_eq!(
-            hand_written_parse_pdu_session_resource_release_response(&no_amf_id),
-            None
-        );
         assert!(matches!(
             decode_pdu_session_resource_release_response_asn1(&no_amf_id),
             PduSessionResourceReleaseResponseDecode::Released {
@@ -10801,37 +10863,11 @@ pub(crate) mod tests {
         ));
     }
 
-    /// `base` with the value of its protocol IE `id` replaced by `value`,
-    /// re-encoded by the hand-written PER layer -- for wire forms neither
-    /// encoder produces.
+    /// `base` with the value of its protocol IE `id` replaced by `value`, the
+    /// framing re-derived by hand ([`crate::amf_pdus::session::with_ie_value`])
+    /// -- for wire forms no encoder produces.
     fn with_ie_value(base: &[u8], id: u16, value: Vec<u8>) -> Vec<u8> {
-        use nextgcore_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu, SuccessfulOutcomeValue};
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
-        let mut decoder = AperDecoder::new(base);
-        let mut pdu = NgapPdu::decode_aper(&mut decoder).expect("decode");
-        let container = match &mut pdu {
-            NgapPdu::SuccessfulOutcome(msg) => match &mut msg.value {
-                SuccessfulOutcomeValue::PduSessionResourceReleaseResponse(c)
-                | SuccessfulOutcomeValue::PduSessionResourceSetupResponse(c)
-                | SuccessfulOutcomeValue::Other(c) => c,
-                other => panic!("unexpected {other:?}"),
-            },
-            NgapPdu::InitiatingMessage(msg) => match &mut msg.value {
-                InitiatingMessageValue::NgSetupRequest(c) => c,
-                other => panic!("unexpected {other:?}"),
-            },
-            other => panic!("unexpected {other:?}"),
-        };
-        let field = container
-            .ies
-            .iter_mut()
-            .find(|f| f.id.0 == id)
-            .expect("IE present");
-        field.value = value;
-        let mut encoder = AperEncoder::new();
-        pdu.encode_aper(&mut encoder).expect("encode");
-        encoder.align();
-        encoder.into_bytes().to_vec()
+        crate::amf_pdus::session::with_ie_value(base, id, value)
     }
 
     /// A PSI item list whose first item (PSI 5) carries an iE-Extensions
@@ -10875,8 +10911,8 @@ pub(crate) mod tests {
     /// notify relays them and reports the IE in an Error Indication, reject
     /// fails the procedure. Before #218 the codec decoded the entry as zero bits
     /// and returned a session 9 the gNB never named, so stage 5 refused the
-    /// message; the hand-written parser, which never read the presence bit,
-    /// misread the list as sessions 5 and 0 whatever the criticality.
+    /// message; the old hand-written parser, which never read the presence
+    /// bit, misread the list as sessions 5 and 0 whatever the criticality.
     #[test]
     fn a_released_item_extension_is_classified_by_its_criticality() {
         use PduSessionResourceReleaseResponseDecode::{Failed, Released};
@@ -10942,22 +10978,11 @@ pub(crate) mod tests {
             other => panic!("reject: {other:?}"),
         }
 
-        assert_eq!(
-            hand_written_parse_pdu_session_resource_release_response(&splice(
-                psi_list_with_item_extension(ngap_gen::Criticality::IGNORE)
-            )),
-            Some((7, 9, vec![(5, vec![0x00]), (0, vec![])])),
-            "the old parser's misread"
-        );
-        // The same splice without the extension decodes identically on both
-        // paths, so the splicing itself is sound.
+        // The same splice without the extension decodes to both sessions, so
+        // the splicing itself is sound.
         let plain = splice(PLAIN_PSI_LIST.to_vec());
         assert_eq!(
             generated_response_view(&plain),
-            Some((7, 9, vec![(5, vec![0x00]), (6, vec![0x00])]))
-        );
-        assert_eq!(
-            hand_written_parse_pdu_session_resource_release_response(&plain),
             Some((7, 9, vec![(5, vec![0x00]), (6, vec![0x00])]))
         );
     }
@@ -10994,25 +11019,27 @@ pub(crate) mod tests {
         ]
     }
 
-    /// #417 stage 6: the generated PDU Session Resource Setup Request is byte
-    /// for byte the hand-written one for every request the AMF sends -- no
-    /// message-level NAS-PDU, as the only caller passes `None` -- across every
-    /// PDU Session ID, every SST with and without an SD (24-bit SD extremes,
-    /// and a u32 past 24 bits that both encoders mask), every transfer length
-    /// form, and every UE NGAP ID length; and both refuse the same out-of-range
-    /// AMF UE NGAP IDs.
+    /// #417 stage B3.2: the PDU Session Resource Setup Request is the
+    /// hand-derived octets of
+    /// [`crate::amf_pdus::session::pdu_session_resource_setup_request`] for
+    /// every request the AMF sends -- no message-level NAS-PDU, as the only
+    /// caller passes `None` -- across every PDU Session ID, every SST with and
+    /// without an SD (24-bit SD extremes, and a u32 past 24 bits the AMF
+    /// masks), every transfer length form (fragmented ones included), and
+    /// every UE NGAP ID length; and an out-of-range AMF UE NGAP ID is refused.
     #[test]
-    fn pdu_session_resource_setup_request_generated_matches_hand_written() {
+    fn pdu_session_resource_setup_request_is_the_derived_octets() {
         let mut compared = 0;
         let mut refused = 0;
         let mut check = |amf: u64, ran: u32, psi: u8, sst: u8, sd: Option<u32>, t: &[u8]| {
             let new =
                 build_pdu_session_resource_setup_request_asn1(amf, ran, psi, sst, sd, None, t);
-            let old =
-                hand_written_pdu_session_resource_setup_request(amf, ran, psi, sst, sd, None, t);
+            let derived = crate::amf_pdus::session::pdu_session_resource_setup_request(
+                amf, ran, psi, sst, sd, None, t,
+            );
             assert_eq!(
                 new,
-                old,
+                derived,
                 "AMF {amf} RAN {ran} PSI {psi} SST {sst} SD {sd:?} T {}",
                 t.len()
             );
@@ -11051,27 +11078,15 @@ pub(crate) mod tests {
 
     /// A message-level NAS-PDU goes where §9.4.1 puts it -- the IEs "in the
     /// order they appear in object set definitions": AMF UE NGAP ID, RAN UE
-    /// NGAP ID, NAS-PDU, then the session list. The hand-written encoder
+    /// NGAP ID, NAS-PDU, then the session list. (The hand-written encoder
     /// appended it after the list, which a receiver must treat as an abstract
-    /// syntax error (§10.3.6). No caller sends one today, so nothing on the
-    /// wire changes; the IEs themselves are the same either way. (The
-    /// hand-written parser cannot say: it has no arm for a Setup Request.)
+    /// syntax error, §10.3.6.) No caller sends one today. The bytes are the
+    /// derivation's, which puts IE 38 ahead of IE 74, and the generated decode
+    /// reads the NAS-PDU back.
     #[test]
     fn pdu_session_resource_setup_request_nas_pdu_is_in_object_set_order() {
         let nas = [0x7e, 0x00, 0x68, 0x01];
         let transfer = [0x00];
-        let ie_order = |data: &[u8]| -> Vec<u16> {
-            let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
-                nextgcore_ngap_gen::decode(data).expect("decode")
-            else {
-                panic!("initiatingMessage");
-            };
-            let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = msg.value
-            else {
-                panic!("PDU Session Resource Setup Request");
-            };
-            req.protocol_i_es.0.iter().map(|e| e.id.0).collect()
-        };
         let new = build_pdu_session_resource_setup_request_asn1(
             42,
             1001,
@@ -11082,44 +11097,39 @@ pub(crate) mod tests {
             &transfer,
         )
         .expect("encode");
-        let old = hand_written_pdu_session_resource_setup_request(
-            42,
-            1001,
-            5,
-            1,
-            None,
-            Some(&nas),
-            &transfer,
-        )
-        .expect("encode");
-        assert_eq!(ie_order(&new), vec![10, 85, 38, 74]);
-        assert_eq!(ie_order(&old), vec![10, 85, 74, 38], "the old order");
-        assert_ne!(new, old);
-        // The IEs, keyed by id: the same set either way.
-        let content = |data: &[u8]| {
-            let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
-                nextgcore_ngap_gen::decode(data).expect("decode")
-            else {
-                panic!("initiatingMessage");
-            };
-            let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = msg.value
-            else {
-                panic!("PDU Session Resource Setup Request");
-            };
-            let mut ies = req.protocol_i_es.0;
-            ies.sort_by_key(|e| e.id.0);
-            ies
+        assert_eq!(
+            Some(new.clone()),
+            crate::amf_pdus::session::pdu_session_resource_setup_request(
+                42,
+                1001,
+                5,
+                1,
+                None,
+                Some(&nas),
+                &transfer,
+            )
+        );
+        let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+            nextgcore_ngap_gen::decode(&new).expect("decode")
+        else {
+            panic!("initiatingMessage");
         };
-        assert_eq!(content(&new), content(&old));
-        assert!(content(&new).iter().any(|e| matches!(
+        let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = msg.value else {
+            panic!("PDU Session Resource Setup Request");
+        };
+        let ies = req.protocol_i_es.0;
+        assert_eq!(
+            ies.iter().map(|e| e.id.0).collect::<Vec<_>>(),
+            vec![10, 85, 38, 74]
+        );
+        assert!(ies.iter().any(|e| matches!(
             &e.value,
             ngap_gen::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(n)
                 if n.0 == nas
         )));
     }
 
-    /// The bytes themselves, so the generated and hand-written encoders cannot
-    /// drift together.
+    /// The bytes themselves, worked out below without the derivation.
     #[test]
     fn pdu_session_resource_setup_request_golden_bytes() {
         assert_eq!(
@@ -11150,35 +11160,17 @@ pub(crate) mod tests {
         0x01, 0x02, 0x02, 0xab, 0xcd,
     ];
 
-    /// A PDU Session Resource Setup Response built by the hand-written encoder;
-    /// an empty list is left out, as that encoder leaves it out.
+    /// A PDU Session Resource Setup Response from a gNB, hand-derived for any
+    /// transfer length
+    /// ([`crate::amf_pdus::session::pdu_session_resource_setup_response`]);
+    /// an empty list is left out.
     pub(crate) fn setup_response(
         amf: u64,
         ran: u32,
         setup: &[(u8, Vec<u8>)],
         failed: &[(u8, Vec<u8>)],
     ) -> Vec<u8> {
-        nextgcore_ngap::builder::build_pdu_session_resource_setup_response(
-            &PduSessionResourceSetupResponse {
-                amf_ue_ngap_id: amf,
-                ran_ue_ngap_id: ran,
-                setup_list: setup
-                    .iter()
-                    .map(|(psi, transfer)| PduSessionResourceSetupResponseItem {
-                        pdu_session_id: *psi,
-                        transfer: transfer.clone(),
-                    })
-                    .collect(),
-                failed_list: failed
-                    .iter()
-                    .map(|(psi, transfer)| PduSessionResourceFailedItem {
-                        pdu_session_id: *psi,
-                        transfer: transfer.clone(),
-                    })
-                    .collect(),
-            },
-        )
-        .expect("encode")
+        crate::amf_pdus::session::pdu_session_resource_setup_response(amf, ran, setup, failed)
     }
 
     /// A PDU Session Resource Setup Response built by the generated encoder
@@ -11267,9 +11259,8 @@ pub(crate) mod tests {
         )
     }
 
-    /// The new decode flattened to what the hand-written path could say. A
-    /// response the old parser accepted always names both IDs, so a missing
-    /// one here is `None` too.
+    /// The decode flattened to the UE and both session lists; a response
+    /// missing either ID is `None` here.
     #[allow(clippy::type_complexity)]
     fn generated_setup_response_view(
         data: &[u8],
@@ -11297,58 +11288,64 @@ pub(crate) mod tests {
         }
     }
 
-    /// #417 stage 6: for every Setup Response the hand-written parser accepted
-    /// -- every ID length, set-up and failed lists of 1, 2 and 256 sessions
-    /// alone and together, neither list, every transfer length form, a
-    /// not-comprehended IE marked ignore or notify, and the optional User
-    /// Location Information and Criticality Diagnostics it skipped as unknown
-    /// -- the generated decode names the same UE and the same sessions with the
-    /// same transfer octets; what it refused as malformed, or over a
-    /// not-comprehended IE marked reject, still yields nothing to relay.
+    /// #417 stage B3.2: every derived Setup Response -- every ID length,
+    /// set-up and failed lists of 1, 2 and 256 sessions alone and together,
+    /// neither list, every transfer length form, a not-comprehended IE marked
+    /// ignore or notify, and one from the generated encoder with Criticality
+    /// Diagnostics -- decodes to the UE and the sessions, with their transfer
+    /// octets, it was derived with; a truncated one, or one with a
+    /// not-comprehended IE marked reject, yields nothing to relay.
     #[test]
-    fn pdu_session_resource_setup_response_generated_decode_matches_hand_written() {
+    fn pdu_session_resource_setup_response_decodes_the_derived_octets() {
         use ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie;
+        type Sessions = Vec<(u8, Vec<u8>)>;
         let mut corpus = Vec::new();
+        let mut push = |amf: u64, ran: u32, setup: Sessions, failed: Sessions| {
+            corpus.push((
+                setup_response(amf, ran, &setup, &failed),
+                (amf, ran, setup, failed),
+            ));
+        };
         for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for ran in RAN_IDS {
-                corpus.push(setup_response(*amf, ran, &[(5, vec![0x00])], &[]));
+                push(*amf, ran, vec![(5, vec![0x00])], vec![]);
             }
         }
         for t in response_transfers() {
-            corpus.push(setup_response(7, 9, &[(3, t.clone())], &[]));
-            corpus.push(setup_response(7, 9, &[], &[(3, t.clone())]));
-            corpus.push(setup_response(
-                7,
-                9,
-                &[(3, t.clone()), (4, vec![0x00])],
-                &[(6, t)],
-            ));
+            push(7, 9, vec![(3, t.clone())], vec![]);
+            push(7, 9, vec![], vec![(3, t.clone())]);
+            push(7, 9, vec![(3, t.clone()), (4, vec![0x00])], vec![(6, t)]);
         }
-        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
-        corpus.push(setup_response(7, 9, &all, &[]));
-        corpus.push(setup_response(7, 9, &[], &all));
-        corpus.push(setup_response(7, 9, &[], &[]));
+        let all: Sessions = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
+        push(7, 9, all.clone(), vec![]);
+        push(7, 9, vec![], all);
+        push(7, 9, vec![], vec![]);
         let base = setup_response(7, 9, &[(5, vec![0x00])], &[(6, vec![0x01])]);
         for criticality in [0x40, 0x80] {
-            corpus.push(with_unknown_ie(&base, 9999, criticality));
+            corpus.push((
+                with_unknown_ie(&base, 9999, criticality),
+                (7, 9, vec![(5, vec![0x00])], vec![(6, vec![0x01])]),
+            ));
         }
-        corpus.push(generated_setup_response(vec![
-            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
-            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
-            generated_setup_list(&[(5, vec![0x00])]),
-            Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(&[IeDiagnostic {
-                ie_id: 9999,
-                criticality: ngap_gen::Criticality::IGNORE,
-                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
-            }])),
-        ]));
-        for data in &corpus {
-            let old = hand_written_parse_pdu_session_resource_setup_response(data);
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted messages: {data:02x?}"
+        corpus.push((
+            generated_setup_response(vec![
+                Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+                Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+                generated_setup_list(&[(5, vec![0x00])]),
+                Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(&[IeDiagnostic {
+                    ie_id: 9999,
+                    criticality: ngap_gen::Criticality::IGNORE,
+                    type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+                }])),
+            ]),
+            (7, 9, vec![(5, vec![0x00])], vec![]),
+        ));
+        for (data, expected) in &corpus {
+            assert_eq!(
+                generated_setup_response_view(data).as_ref(),
+                Some(expected),
+                "{data:02x?}"
             );
-            assert_eq!(generated_setup_response_view(data), old, "{data:02x?}");
         }
         assert_eq!(corpus.len(), 11 * 8 + 6 * 3 + 3 + 2 + 1);
 
@@ -11357,10 +11354,6 @@ pub(crate) mod tests {
             with_unknown_ie(&base, 9999, 0x00),
         ];
         for data in &refused {
-            assert_eq!(
-                hand_written_parse_pdu_session_resource_setup_response(data),
-                None
-            );
             assert_eq!(generated_setup_response_view(data), None, "{data:02x?}");
         }
         assert!(matches!(
@@ -11431,7 +11424,7 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Responses the hand-written parser refused although every IE of a Setup
+    /// Responses the old hand-written parser refused although every IE of a Setup
     /// Response has criticality ignore (§9.2.1.2), so a missing one is ignored
     /// (§10.3.5): one with no RAN UE NGAP ID still yields its sessions, and one
     /// with no AMF UE NGAP ID decodes with `None` -- which the handler then
@@ -11443,10 +11436,6 @@ pub(crate) mod tests {
             Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
             generated_setup_list(&[(5, vec![0x00])]),
         ]);
-        assert_eq!(
-            hand_written_parse_pdu_session_resource_setup_response(&no_ran_id),
-            None
-        );
         let PduSessionResourceSetupResponseDecode::Decoded {
             amf_ue_ngap_id: Some(7),
             ran_ue_ngap_id: None,
@@ -11463,10 +11452,6 @@ pub(crate) mod tests {
             Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
             generated_setup_list(&[(5, vec![0x00])]),
         ]);
-        assert_eq!(
-            hand_written_parse_pdu_session_resource_setup_response(&no_amf_id),
-            None
-        );
         assert!(matches!(
             decode_pdu_session_resource_setup_response_asn1(&no_amf_id),
             PduSessionResourceSetupResponseDecode::Decoded {
@@ -11483,9 +11468,9 @@ pub(crate) mod tests {
     /// Indication, reject fails the procedure. Before nextgsim #218 the codec
     /// decoded the entry as zero bits, and the misparse could surface as a
     /// phantom "IE 256 marked reject" read from the next item, so stage 6
-    /// refused the message ahead of classifying unknown IEs. The hand-written
-    /// parser never read the presence bit and misread the list as sessions 5
-    /// and 0.
+    /// refused the message ahead of classifying unknown IEs. The old
+    /// hand-written parser never read the presence bit and misread the list as
+    /// sessions 5 and 0.
     #[test]
     fn a_setup_response_item_extension_is_classified_by_its_criticality() {
         use PduSessionResourceSetupResponseDecode::{Decoded, Failed};
@@ -11560,24 +11545,22 @@ pub(crate) mod tests {
                 other => panic!("reject, IE {id}: {other:?}"),
             }
 
-            let old = hand_written_parse_pdu_session_resource_setup_response(&splice(
-                ngap_gen::Criticality::IGNORE,
-            ))
-            .expect("old");
-            let misread = vec![(5, vec![0x00]), (0, vec![])];
-            assert!(
-                old.2 == misread || old.3 == misread,
-                "the old parser's misread: {old:?}"
-            );
-            // The same splice without the extension decodes identically on
-            // both paths, so the splicing itself is sound.
+            // The same splice without the extension decodes to both sessions
+            // in the spliced list and the base's one in the other, so the
+            // splicing itself is sound.
             let ok = with_ie_value(&base, id, PLAIN_PSI_LIST.to_vec());
+            let pair = vec![(5, vec![0x00]), (6, vec![0x00])];
+            let one = vec![(5, vec![0x00])];
+            let expected = if id == ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_RES {
+                (7, 9, pair, one)
+            } else {
+                (7, 9, one, pair)
+            };
             assert_eq!(
                 generated_setup_response_view(&ok),
-                hand_written_parse_pdu_session_resource_setup_response(&ok),
+                Some(expected),
                 "IE {id}"
             );
-            assert!(generated_setup_response_view(&ok).is_some());
         }
     }
 
