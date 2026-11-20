@@ -69,6 +69,7 @@ pub mod pubsub;
 pub mod resource_scope; // resource/operation-level OAuth2 scopes, both ends (#1811)
 pub mod scp;
 pub mod security;
+pub mod sweep; // one bounded per-peer sweep for refresh/renew/release passes (#2186)
 pub mod test_support; // Shared test helpers (NOT cfg(test): other crates' tests use it)
 pub mod tls;
 pub mod types; // Event-driven pub-sub (B6.1)

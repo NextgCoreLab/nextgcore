@@ -583,7 +583,7 @@ fn evict_unsubscribes(set: &mut std::collections::VecDeque<ParkedUnsubscribe>) {
 }
 
 /// Park an AMF unsubscribe that failed. One already parked is not added twice.
-fn park_unsubscribe(subscription_uri: &str) {
+pub(crate) fn park_unsubscribe(subscription_uri: &str) {
     let mut set = lock_parked();
     if set.iter().any(|p| p.uri == subscription_uri) {
         return;
@@ -653,62 +653,69 @@ pub async fn reconcile_unsubscribes_once() -> usize {
         lanes[lane].1.push((place, parked));
     }
 
-    let gate = Arc::new(tokio::sync::Semaphore::new(UNSUBSCRIBE_MAX_LANES));
-    let mut sending = tokio::task::JoinSet::new();
+    // #2186: the shared bounded per-peer sweep: one in flight per AMF, up to
+    // UNSUBSCRIBE_MAX_LANES AMFs at once, an AMF that fails parked for the rest
+    // of the pass, nothing new after the pass deadline. #2029: an AMF that is
+    // backing off is not tried, and takes no slot.
     let mut outcomes: Vec<(usize, ParkedUnsubscribe, UnsubscribeOutcome)> = Vec::new();
+    let mut items = Vec::new();
     for (amf, lane) in lanes {
-        // #2029: an AMF that is backing off is not tried, and takes no slot. Any
-        // other lane waits for a free slot, in turn order; one that gets none
-        // before the deadline is not tried this pass.
-        let slot = if UNSUBSCRIBE_BACKOFF.backing_off(&amf) {
-            None
-        } else {
-            tokio::time::timeout_at(deadline, gate.clone().acquire_owned())
-                .await
-                .ok()
-                .and_then(Result::ok)
-        };
-        let Some(slot) = slot else {
+        if UNSUBSCRIBE_BACKOFF.backing_off(&amf) {
             outcomes.extend(
                 lane.into_iter()
                     .map(|(place, p)| (place, p, UnsubscribeOutcome::Untried)),
             );
-            continue;
-        };
-        sending.spawn(async move {
-            let _slot = slot;
-            let mut failed = false;
-            let mut out = Vec::with_capacity(lane.len());
-            for (place, parked) in lane {
-                let outcome = if failed || tokio::time::Instant::now() >= deadline {
-                    UnsubscribeOutcome::Untried
-                } else if try_amf_unsubscribe(&parked.uri).await {
-                    UnsubscribeOutcome::Delivered
-                } else {
-                    failed = true;
-                    UnsubscribeOutcome::Failed
-                };
-                out.push((place, parked, outcome));
-            }
-            // A lane that failed backs its AMF off; one that delivered and did
-            // not fail clears it.
-            if failed {
-                UNSUBSCRIBE_BACKOFF.note_failure(&amf);
-            } else if out
-                .iter()
-                .any(|(_, _, o)| matches!(o, UnsubscribeOutcome::Delivered))
-            {
-                UNSUBSCRIBE_BACKOFF.note_success(&amf);
-            }
-            out
-        });
-    }
-    while let Some(lane) = sending.join_next().await {
-        // A lane cannot panic short of a bug; what it held is then lost, as a
-        // dropped pass loses its batch.
-        if let Ok(lane) = lane {
-            outcomes.extend(lane);
+        } else {
+            items.extend(lane.into_iter().map(|e| (amf.clone(), e)));
         }
+    }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: UNSUBSCRIBE_MAX_LANES,
+        budget: deadline.saturating_duration_since(tokio::time::Instant::now()),
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        items,
+        || (),
+        |_amf, (place, parked): (usize, ParkedUnsubscribe), ()| async move {
+            if try_amf_unsubscribe(&parked.uri).await {
+                (
+                    nextgcore_sbi::sweep::Verdict::Answered,
+                    (place, parked, UnsubscribeOutcome::Delivered),
+                )
+            } else {
+                (
+                    nextgcore_sbi::sweep::Verdict::PeerDown,
+                    (place, parked, UnsubscribeOutcome::Failed),
+                )
+            }
+        },
+    )
+    .await;
+    // A lane that failed backs its AMF off; one that delivered and did not fail
+    // clears it.
+    let mut failed_amfs: Vec<String> = Vec::new();
+    let mut delivered_amfs: Vec<String> = Vec::new();
+    for (amf, (place, parked, outcome)) in report.done {
+        let list = if matches!(outcome, UnsubscribeOutcome::Failed) {
+            &mut failed_amfs
+        } else {
+            &mut delivered_amfs
+        };
+        if !list.contains(&amf) {
+            list.push(amf);
+        }
+        outcomes.push((place, parked, outcome));
+    }
+    for (_, (place, parked), _) in report.skipped {
+        outcomes.push((place, parked, UnsubscribeOutcome::Untried));
+    }
+    for amf in &failed_amfs {
+        UNSUBSCRIBE_BACKOFF.note_failure(amf);
+    }
+    for amf in delivered_amfs.iter().filter(|a| !failed_amfs.contains(a)) {
+        UNSUBSCRIBE_BACKOFF.note_success(amf);
     }
     outcomes.sort_by_key(|(place, _, _)| *place);
 
@@ -1003,8 +1010,9 @@ pub fn on_amf_registered(supi: &str) {
 /// AMF refuses (404: it no longer holds it) is dropped and subscribed afresh.
 /// Returns how many were renewed.
 ///
-/// #2182 (R42 on #2156), the #2128 / #2149 shape: legs are renewed per AMF, in
-/// the order they lapse, up to [`LEG_RENEW_MAX_AMFS`] AMFs at once, and an AMF
+/// #2182 (R42 on #2156), the #2128 / #2149 shape, on the shared sweep since
+/// #2186: legs are renewed per AMF, in the order they lapse, up to
+/// [`LEG_RENEW_MAX_AMFS`] AMFs at once, and an AMF
 /// that does not answer one renewal (no answer, a 5xx) is not tried again this
 /// pass; its legs stay and are tried on the next one. So a dead AMF with many
 /// due legs costs one call timeout per pass, and other AMFs' legs are renewed
@@ -1030,33 +1038,31 @@ pub async fn renew_amf_legs(now: u64) -> usize {
             .collect()
     };
     due.sort_by_key(|(_, granted, _)| *granted);
-    let mut by_amf: std::collections::BTreeMap<Option<String>, Vec<String>> = Default::default();
-    for (amf, _, id) in due {
-        by_amf.entry(amf).or_default().push(id);
-    }
-    let slots = Arc::new(tokio::sync::Semaphore::new(LEG_RENEW_MAX_AMFS));
-    let mut workers = tokio::task::JoinSet::new();
-    for (_, ids) in by_amf {
-        let slots = slots.clone();
-        workers.spawn(async move {
-            let _slot = slots.acquire_owned().await;
-            let mut renewed = 0usize;
-            for id in ids {
-                match renew_one(&id, now).await {
-                    Modify::Granted(_) => renewed += 1,
-                    Modify::Refused => {}
-                    // This AMF is not answering: its other legs wait for the next pass.
-                    Modify::Unreachable => break,
-                }
+    // #2186: on the shared sweep: one renewal in flight per AMF, up to
+    // LEG_RENEW_MAX_AMFS AMFs at once, an unreachable AMF parked for the rest of
+    // the pass (its legs stay for the next one), nothing new after one tick, and
+    // the time read per leg (`now` plus the time the pass has run).
+    let started = tokio::time::Instant::now();
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: LEG_RENEW_MAX_AMFS,
+        budget: LEG_RENEW_TICK,
+    };
+    let report = nextgcore_sbi::sweep::sweep(
+        limits,
+        due.into_iter().map(|(amf, _, id)| (amf, id)),
+        move || now.saturating_add(started.elapsed().as_secs()),
+        |_amf, id: String, at| async move {
+            match renew_one(&id, at).await {
+                Modify::Granted(_) => (nextgcore_sbi::sweep::Verdict::Answered, true),
+                Modify::Refused => (nextgcore_sbi::sweep::Verdict::Answered, false),
+                // This AMF is not answering: its other legs wait for the next pass.
+                Modify::Unreachable => (nextgcore_sbi::sweep::Verdict::PeerDown, false),
             }
-            renewed
-        });
-    }
-    let mut renewed = 0;
-    while let Some(done) = workers.join_next().await {
-        renewed += done.unwrap_or(0);
-    }
-    renewed
+        },
+    )
+    .await;
+    report.done.iter().filter(|(_, renewed)| *renewed).count()
 }
 
 /// #2182: at most this many AMFs have legs renewed at once in a pass.
@@ -2066,6 +2072,116 @@ mod tests {
         );
         assert!(!still.contains(&live));
         assert_eq!(still.len(), 8, "the dead AMFs' stay parked: {still:?}");
+    }
+
+    /// **#2186** (R44 minor 3): a release sweep dropped mid-pass (shutdown) parks
+    /// every leg it had not settled, the one in flight included, for the
+    /// unsubscribe reconciler: the records are already gone, so nothing else
+    /// would release them.
+    ///
+    /// REVERT-VERIFIED: without `UnsettledLegs`' drop parking them, the legs
+    /// behind the one in flight are lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_cancelled_release_sweep_parks_what_it_had_not_settled_2186() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        AMF_CALL_TIMEOUT_MS.store(2_000, Ordering::Relaxed);
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = hole.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = hole.accept().await {
+                conns.push(c);
+            }
+        });
+        let now = crate::context::now_unix_secs();
+        let mut uris = Vec::new();
+        for n in 0..3 {
+            let uri = format!("http://{addr}/namf-evts/v1/subscriptions/cancel-2186-{n}");
+            let mut sub = UdmEeSubscription::for_ue(
+                "imsi-001010000021860",
+                "http://nef.example.org/ee-notify",
+                json!({
+                    "callbackReference": "http://nef.example.org/ee-notify",
+                    "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}},
+                    "reportingOptions": {
+                        "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now - 1)
+                    },
+                })
+                .to_string(),
+            );
+            sub.amf_leg = Some(AmfEeLeg {
+                subscription_uri: uri.clone(),
+                change_token: "t".to_string(),
+                amf_instance_id: Some("amf".to_string()),
+                notify_uri: "http://nef.example.org/ee-notify".to_string(),
+                events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+                expiry: Some(now - 1),
+                amf_expiry: Some(now - 1),
+            });
+            udm_self().read().unwrap().ee_subscription_insert(sub);
+            uris.push(uri);
+        }
+        let pass = crate::app::sweep_expired_ee_subscriptions(now);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), pass)
+                .await
+                .is_err(),
+            "the pass is still in flight when dropped"
+        );
+        // The aborted tasks drop their state on the runtime; give it a moment.
+        let mut parked = 0;
+        for _ in 0..50 {
+            parked = lock_parked()
+                .iter()
+                .filter(|p| uris.contains(&p.uri))
+                .count();
+            if parked == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        clear_parked_unsubscribes_for_test();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        held.abort();
+        assert_eq!(parked, 3, "every unsettled leg is parked");
+    }
+
+    /// **#2186.** The unsubscribe reconciler runs on the shared sweep: an AMF that
+    /// fails one DELETE (a 503 here) is parked for the rest of the pass, so its
+    /// other parked unsubscribes are not sent this pass and stay parked.
+    ///
+    /// REVERT-VERIFIED: with a failed DELETE answered `Verdict::Answered` (no
+    /// parking), all three are sent in the pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_failing_amf_is_parked_for_the_rest_of_the_pass_2186() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_amf, failing, seen) = recorder(|_| SbiResponse::with_status(503)).await;
+        let uris: Vec<String> = (0..3)
+            .map(|n| format!("http://{failing}/namf-evts/v1/subscriptions/park-2186-{n}"))
+            .collect();
+        for uri in &uris {
+            park_unsubscribe(uri);
+        }
+        reconcile_unsubscribes_once().await;
+        let sent = seen.lock().unwrap().len();
+        let still = lock_parked()
+            .iter()
+            .filter(|p| uris.contains(&p.uri))
+            .count();
+        clear_parked_unsubscribes_for_test();
+        assert_eq!(sent, 1, "one DELETE, then the AMF is parked for the pass");
+        assert_eq!(still, 3, "all three stay parked");
     }
 
     /// An AMF that accepts connections and never answers, counting them: its
