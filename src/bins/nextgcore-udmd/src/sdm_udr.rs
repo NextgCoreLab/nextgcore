@@ -380,6 +380,10 @@ fn record_op(rec: Rec<'_>) -> Value {
                 .as_ref()
                 .and_then(|m| m.get(supi).cloned())
                 .filter(|q| !q.is_empty());
+            #[cfg(test)]
+            if q.is_none() {
+                note_queue_removal_for_test(supi);
+            }
             ("queue", supi, q.map(serde_json::to_value))
         }
         Rec::Told(supi) => ("told", supi, told(supi).map(serde_json::to_value)),
@@ -1606,6 +1610,34 @@ async fn drain(supi: &str, generation: u64) {
     }
 }
 
+/// #2211: every queue removal written to the state file, with where it was
+/// written from (tests): a test that finds a queue gone from the file can say
+/// who removed it instead of only that it is gone.
+#[cfg(test)]
+static QUEUE_REMOVALS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_queue_removal_for_test(supi: &str) {
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let mut removals = QUEUE_REMOVALS.lock().unwrap_or_else(|e| e.into_inner());
+    removals.push((supi.to_string(), trace));
+    if removals.len() > 64 {
+        removals.remove(0);
+    }
+}
+
+/// The queue removals [`note_queue_removal_for_test`] saw for `supi` (tests).
+#[cfg(test)]
+pub(crate) fn queue_removals_for_test(supi: &str) -> Vec<String> {
+    QUEUE_REMOVALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(s, _)| s == supi)
+        .map(|(_, t)| t.clone())
+        .collect()
+}
+
 /// Forget every leg, queue and told am-data, and stop every worker (tests).
 #[cfg(test)]
 pub(crate) fn clear_legs() {
@@ -2360,15 +2392,20 @@ mod tests {
         }
     }
 
+    /// #2211: a state file in a directory of its own, so nothing else in the
+    /// shared temporary directory (another test's file, a store's sweep of stale
+    /// temporaries) can touch it.
     fn temp_state_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "udm-{tag}-{}-{}.json",
+        let dir = std::env::temp_dir().join(format!(
+            "udm-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
-        ))
+        ));
+        std::fs::create_dir_all(&dir).expect("state directory");
+        dir.join("state.json")
     }
 
     /// A UDM crash: every worker stops, and everything in memory is gone.
@@ -3017,13 +3054,18 @@ mod tests {
     async fn a_1836_snapshot_is_migrated_to_the_log_1896() {
         let (_udr, udr_base, _udr_state) = programmable_udr(gpsis(1)).await;
         let _locks = setup(&udr_base).await;
+        // #2211: a consumer of this test's own that answers every notification 503,
+        // so the queued change is resent and stays queued, whatever happens to be
+        // listening (or not) at a fixed address on the host running the test.
+        let (_amf, amf_base, _seen) =
+            scripted_consumer(vec![], Arc::new(std::sync::atomic::AtomicU16::new(503))).await;
         let supi = "imsi-001010000018961";
         let sub = SavedSdmSubscription {
             id: "sdm-1896".to_string(),
             supi: supi.to_string(),
             nf_instance_id: Some("amf-1896".to_string()),
-            // Nothing listens there: the queued change stays queued.
-            callback_reference: Some("http://127.0.0.1:9/cb/sdm-notify/m".to_string()),
+            // Answers 503: the queued change stays queued.
+            callback_reference: Some(format!("{amf_base}/cb/sdm-notify/m")),
             monitored_resource_uris: vec![format!("/nudm-sdm/v2/{supi}/am-data")],
             // A #1836 snapshot predates #1865: no owner.
             owner: None,
@@ -3069,19 +3111,30 @@ mod tests {
         assert_eq!(held_ids(supi), vec!["sdm-1896".to_string()]);
         // A change after the migration is appended to the log.
         assert_eq!(
-            try_sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/m2")
+            try_sdm_subscribe(supi, &format!("{amf_base}/cb/sdm-notify/m2"))
                 .await
                 .0,
             201
         );
 
+        let before_crash = lock(&QUEUES).as_ref().and_then(|m| m.get(supi).cloned());
         crash().await;
         // What the log holds, as the next start replays it.
-        let persisted = match crate::state_log::StateLog::open(&path).expect("opens").1 {
-            crate::state_log::Opened::Log { ops, .. } => replay(ops).expect("replays"),
+        let ops = match crate::state_log::StateLog::open(&path).expect("opens").1 {
+            crate::state_log::Opened::Log { ops, .. } => ops,
             crate::state_log::Opened::Legacy(_) => panic!("rewritten as a log"),
         };
-        assert!(persisted.queues.contains_key(supi), "the queue");
+        let mine: Vec<&Value> = ops.iter().filter(|op| op["k"] == supi).collect();
+        let persisted = replay(ops.clone()).expect("replays");
+        // #2211: should this fail again, say what the queue was before the crash,
+        // what the log holds for this SUPI, and where every removal of its queue
+        // was written from.
+        assert!(
+            persisted.queues.contains_key(supi),
+            "the queue: in memory before the crash {before_crash:?}; the log's records \
+             for {supi}: {mine:?}; its queue removals were written from: {:#?}",
+            queue_removals_for_test(supi)
+        );
         assert_eq!(
             persisted.legs.get(supi).map(|l| l.token.as_str()),
             Some(token)
