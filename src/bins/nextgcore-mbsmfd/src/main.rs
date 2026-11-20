@@ -4496,7 +4496,7 @@ mod tests {
 
     /// The G1-1 golden `MBS-DistributionSetupRequestTransfer` APER vector
     /// (TS 38.413 §9.3.5.7), hand-derived independently in
-    /// `libs/nextgcore-ngap/src/mbs_transfer.rs` (GOLDEN_SETUP_REQ):
+    /// `n2_mbs_transfer/golden.rs` (`setup_request_area_tunnel_octets`):
     /// TMGI = PLMN 208/93 (BCD `02 F8 39`) + service id `00 00 01`,
     /// areaSessionId=1, sharedNGU-UnicastTNLInformation = GTP tunnel
     /// 10.1.2.3 / TEID 0x00003039, no iE-Extensions.

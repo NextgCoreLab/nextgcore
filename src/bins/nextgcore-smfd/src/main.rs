@@ -7822,8 +7822,8 @@ async fn handle_sm_context_update_inner(sm_context_ref: &str, request: &SbiReque
                 return missing_or_erroneous(&req_body["n2SmInfo"], "n2SmInfo", "N2_SM_ERROR");
             };
 
-            // Real-APER decode of the gNB DL N3 endpoint via the nextgcore-ngap
-            // transfer codec (the gNB now emits real APER, not legacy bytes).
+            // Real-APER decode of the gNB DL N3 endpoint with the generated codec
+            // (`n2_transfer`; the gNB emits real APER, not legacy bytes).
             let endpoint = if n2_sm_info_type == "PATH_SWITCH_REQ" {
                 decode_path_switch_dl_endpoint(&n2_bytes)
             } else {
@@ -17337,8 +17337,8 @@ mod tests {
     // ------------------------------------------------------------------
     //
     // The smfd builds the N2 SM PDUSessionResourceSetupRequestTransfer with the
-    // real-APER nextgcore-ngap codec and decodes the gNB's SetupResponseTransfer with
-    // it. These pin the wire bytes against the independent nextgsim-ngap codec
+    // generated codec (`n2_transfer`) and decodes the gNB's SetupResponseTransfer
+    // with it. These pin the wire bytes against the independent nextgsim-ngap codec
     // (the gNB), mirroring the NG-Setup/ICS reconciliation: the request
     // bytes are byte-identical to the gNB's decoder vector, and the gNB's
     // response bytes decode here.

@@ -1887,7 +1887,7 @@ fn parse_event_area(v: &Value, presence_info_key: Option<&str>) -> Option<EventA
         }
         // `ecgiList` / `globalRanNodeIdList` / `globaleNbIdList` are deliberately NOT
         // parsed. E-UTRAN cell ids and eNodeB ids describe an EPS access this AMF's N2
-        // never carries (`UserLocationInformation` in `nextgcore-ngap` has exactly one
+        // never carries (`ngap_types::UserLocationInformation` has exactly one
         // variant, `Nr`), and the AMF stores no NG-RAN node identity per UE:
         // `AmfContext::gnb_list` has ZERO production writers, since `gnb_add`'s only
         // callers are inside `mod tests`. An area of those kinds therefore has no
