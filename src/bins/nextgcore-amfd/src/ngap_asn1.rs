@@ -647,65 +647,6 @@ pub struct InitialUeMessageData {
     pub ue_context_request: bool,
 }
 
-/// Parse an Initial UE Message with the HAND-WRITTEN codec: the pre-#417
-/// path, kept as the oracle `decode_initial_ue_message_asn1` is checked against.
-#[cfg(test)]
-pub(crate) fn parse_initial_ue_message_asn1(data: &[u8]) -> Option<InitialUeMessageData> {
-    let decoded = match parser::decode_ngap_pdu(data) {
-        Ok(msg) => msg,
-        Err(e) => {
-            log::error!("Failed to decode NGAP PDU: {e:?}");
-            return None;
-        }
-    };
-
-    let msg = match decoded {
-        NgapMessage::InitialUeMessage(m) => m,
-        _ => {
-            log::error!("Expected InitialUEMessage");
-            return None;
-        }
-    };
-
-    let (plmn_id, nr_cell_identity, tac) = match &msg.user_location_info {
-        UserLocationInformation::Nr {
-            nr_cgi_plmn,
-            nr_cell_identity,
-            tai_tac,
-            ..
-        } => {
-            let plmn_id = decode_plmn_id(nr_cgi_plmn);
-            let tac =
-                ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | (tai_tac[2] as u32);
-            (plmn_id, *nr_cell_identity, tac)
-        }
-    };
-
-    let rrc_establishment_cause = msg.rrc_establishment_cause as u8;
-    let ue_context_request = msg.ue_context_request.unwrap_or(false);
-
-    log::info!(
-        "Parsed Initial UE Message: ran_ue_ngap_id={}, nas_pdu_len={}, plmn={}{}{}-{}{}{}, nci=0x{:x}, tac={}, cause={}",
-        msg.ran_ue_ngap_id,
-        msg.nas_pdu.len(),
-        plmn_id.mcc1, plmn_id.mcc2, plmn_id.mcc3,
-        plmn_id.mnc1, plmn_id.mnc2, if plmn_id.mnc3 == 0xF { "".to_string() } else { format!("{}", plmn_id.mnc3) },
-        nr_cell_identity,
-        tac,
-        rrc_establishment_cause
-    );
-
-    Some(InitialUeMessageData {
-        ran_ue_ngap_id: msg.ran_ue_ngap_id,
-        nas_pdu: msg.nas_pdu,
-        plmn_id,
-        nr_cell_identity,
-        tac,
-        rrc_establishment_cause,
-        ue_context_request,
-    })
-}
-
 /// Build a Downlink NAS Transport PDU with proper ASN.1 APER encoding
 ///
 /// This is sent by AMF to gNB to deliver NAS messages to the UE.
@@ -2114,8 +2055,8 @@ pub fn decode_pdu_session_resource_setup_response_asn1(
 ///
 /// Sent to modify PDU session resources (e.g. a QoS change the SMF decided).
 /// IE order and criticalities are the PDUSessionResourceModifyRequestIEs object
-/// set's; the AMF sends no RAN Paging Priority. The bytes are the hand-written
-/// encoder's: `pdu_session_resource_modify_request_generated_matches_hand_written`.
+/// set's; the AMF sends no RAN Paging Priority. The bytes are the ones derived
+/// by hand from X.691: `pdu_session_resource_modify_request_is_the_derived_octets`.
 pub fn build_pdu_session_resource_modify_request_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
@@ -2225,8 +2166,8 @@ pub enum PduSessionResourceModifyResponseDecode {
 /// §9.2.1.6) with the GENERATED codec (#417), applying the §10.3.4.2 and
 /// §10.3.5 rules for a RESPONSE message.
 ///
-/// Every response the hand-written parser accepted decodes to the same UE and
-/// sessions: `pdu_session_resource_modify_response_generated_decode_matches_hand_written`.
+/// Every hand-derived response decodes to the UE and sessions it carries:
+/// `pdu_session_resource_modify_response_decode_reads_the_derived_octets`.
 pub fn decode_pdu_session_resource_modify_response_asn1(
     data: &[u8],
 ) -> PduSessionResourceModifyResponseDecode {
@@ -2342,8 +2283,8 @@ pub enum PduSessionResourceModifyIndicationDecode {
 /// Decode a PDU Session Resource Modify Indication (gNB -> AMF, TS 38.413
 /// §9.2.1.7) with the GENERATED codec (#417), applying §10.3.4.2 and §10.3.5.
 ///
-/// Every indication the hand-written parser accepted decodes to the same UE and
-/// sessions: `pdu_session_resource_modify_indication_generated_decode_matches_hand_written`.
+/// Every hand-derived indication decodes to the UE and sessions it carries:
+/// `pdu_session_resource_modify_indication_decode_reads_the_derived_octets`.
 pub fn decode_pdu_session_resource_modify_indication_asn1(
     data: &[u8],
 ) -> PduSessionResourceModifyIndicationDecode {
@@ -2586,42 +2527,6 @@ pub struct UplinkNasTransportData {
     pub user_location_info: Option<UserLocationInformation>,
 }
 
-/// Parse an Uplink NAS Transport with the HAND-WRITTEN codec: the pre-#417
-/// path, kept as the oracle `decode_uplink_nas_transport_asn1` is checked
-/// against.
-#[cfg(test)]
-pub(crate) fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransportData> {
-    let decoded = match parser::decode_ngap_pdu(data) {
-        Ok(msg) => msg,
-        Err(e) => {
-            log::error!("Failed to decode NGAP PDU: {e:?}");
-            return None;
-        }
-    };
-
-    let msg = match decoded {
-        NgapMessage::UplinkNasTransport(m) => m,
-        _ => {
-            log::error!("Expected UplinkNASTransport");
-            return None;
-        }
-    };
-
-    log::info!(
-        "Parsed Uplink NAS Transport: amf_ue_ngap_id={}, ran_ue_ngap_id={}, nas_pdu_len={}",
-        msg.amf_ue_ngap_id,
-        msg.ran_ue_ngap_id,
-        msg.nas_pdu.len()
-    );
-
-    Some(UplinkNasTransportData {
-        amf_ue_ngap_id: msg.amf_ue_ngap_id,
-        ran_ue_ngap_id: msg.ran_ue_ngap_id,
-        nas_pdu: msg.nas_pdu,
-        user_location_info: Some(msg.user_location_info),
-    })
-}
-
 /// A generated NR [`ngap_gen::UserLocationInformation`] as the hand-written
 /// one. `None` for an E-UTRA, N3IWF or choice-extension location, which this
 /// AMF has no representation for, or for a field of the wrong size.
@@ -2686,8 +2591,8 @@ fn missing_ie(ie_id: u16) -> IeDiagnostic {
 /// "reject" -- 5G-S-TMSI, IAB Node Indication, CE-mode-B Support Indicator,
 /// NPN Access Information -- it treated as not comprehended and refused the
 /// whole message, dropping the UE's registration or service request without
-/// telling the gNB. Those are comprehended here. Every message it accepted
-/// decodes identically: `initial_ue_message_generated_decode_matches_hand_written`.
+/// telling the gNB. Those are comprehended here. Hand-derived messages decode to
+/// the values they carry: `initial_ue_message_decode_reads_the_derived_octets`.
 pub fn decode_initial_ue_message_asn1(data: &[u8]) -> NasTransportDecode<InitialUeMessageData> {
     use ngap_gen::{InitialUEMessageProtocolIEs_EntryValue as Ie, InitiatingMessageValue};
     use NasTransportDecode::{Proceed, Reject, Undecodable};
@@ -2804,9 +2709,9 @@ pub fn decode_initial_ue_message_asn1(data: &[u8]) -> NasTransportDecode<Initial
 /// NAS PDU -- when User Location Information was absent (it is mandatory with
 /// criticality ignore, so its absence is to be ignored), when it was not an NR
 /// location, and on the W-AGF / TNGF / TWIF Identity Information IEs, which it
-/// did not comprehend and which carry criticality reject. Every message it
-/// accepted decodes identically:
-/// `uplink_nas_transport_generated_decode_matches_hand_written`.
+/// did not comprehend and which carry criticality reject. Hand-derived messages
+/// decode to the values they carry:
+/// `uplink_nas_transport_decode_reads_the_derived_octets`.
 pub fn decode_uplink_nas_transport_asn1(data: &[u8]) -> NasTransportDecode<UplinkNasTransportData> {
     use ngap_gen::{InitiatingMessageValue, UplinkNASTransportProtocolIEs_EntryValue as Ie};
     use NasTransportDecode::{Proceed, Reject, Undecodable};
@@ -13428,78 +13333,72 @@ pub(crate) mod tests {
         // (id-HandoverResourceAllocation), criticality reject (0).
         assert_eq!(&bytes[..3], &[0x00, 0x0D, 0x00]);
 
-        // The independent half: `nextgcore-ngap`'s hand-written ENCODER, fed the same
-        // fields, must produce exactly these bytes once the two IEs it has no member for
-        // (NSCI, id 41; NASC, id 37) are taken out of the generated PDU. The hand-written
-        // parser cannot be the oracle here: it correctly refuses NSCI, a not-comprehended
-        // IE marked reject (TS 38.413 §10.3.4).
-        let hand_written = builder::build_handover_request(&HandoverRequest {
-            amf_ue_ngap_id: 0x418,
-            handover_type: HandoverType::EpsTo5gs,
-            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
-            ue_ambr: UeAmbrInfo {
-                dl: 100_000_000,
-                ul: 50_000_000,
-            },
-            ue_security_capabilities: UeSecurityCapabilities {
-                nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(0xE0),
-                nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(0x60),
-                eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(0xF0),
-                eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(0x70),
-            },
-            security_context: SecurityContext {
-                next_hop_chaining_count: 0,
-                next_hop: [0x7A; 32],
-            },
-            pdu_session_list: vec![PduSessionResourceSetupItemHoReq {
-                pdu_session_id: 5,
-                s_nssai: nextgcore_ngap::types::SNssai {
-                    sst: 1,
-                    sd: Some([0, 0, 1]),
-                },
-                transfer: vec![0x00, 0x00, 0x04, 0x00, 0x82, 0x00, 0x0A],
-            }],
-            allowed_nssai: vec![nextgcore_ngap::types::SNssai {
-                sst: 1,
-                sd: Some([0, 0, 1]),
-            }],
-            source_to_target_container: vec![0x40, 0x41, 0x42],
-            guami: nextgcore_ngap::types::Guami {
-                plmn_identity: encode_plmn_id(&PlmnId::new("999", "70")),
-                amf_region_id: 2,
-                amf_set_id: 1,
-                amf_pointer: 0,
-            },
-        })
-        .expect("hand-written encode");
-        let mut stripped = nextgcore_ngap_gen::decode(&bytes).expect("generated decode");
-        if let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut init) = stripped {
-            if let ngap_gen::InitiatingMessageValue::Id_HandoverResourceAllocation(ref mut req) =
-                init.value
-            {
-                req.protocol_i_es.0.retain(|ie| {
-                    ie.id.0 != ngap_gen::ID_NEW_SECURITY_CONTEXT_IND && ie.id.0 != ngap_gen::ID_NASC
-                });
+        // The independent half: the octets derived by hand from the ASN.1 and
+        // X.691 (`amf_pdus::ue::eps_to_5gs_handover_request`), every IE in
+        // object-set order including NSCI (id 41) and NASC (id 37), GUAMI
+        // 999/70 region 2 set 1 pointer 0 from the context.
+        assert_eq!(
+            bytes,
+            crate::amf_pdus::ue::eps_to_5gs_handover_request(
+                &request,
+                (100_000_000, 50_000_000),
+                ([0x99, 0xf9, 0x07], 2, 1, 0),
+            ),
+            "type, cause, UE-AMBR, capabilities, NCC 0 and the NH, NSCI, NASC, the session \
+             and its transfer, NSSAI, container, GUAMI"
+        );
+        // Read back through the generated decoder, value by value.
+        let ngap_gen::NGAP_PDU::InitiatingMessage(init) =
+            nextgcore_ngap_gen::decode(&bytes).expect("generated decode")
+        else {
+            panic!("initiating message expected");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_HandoverResourceAllocation(req) = init.value
+        else {
+            panic!("HandoverRequest expected");
+        };
+        let ids: Vec<u16> = req.protocol_i_es.0.iter().map(|ie| ie.id.0).collect();
+        assert_eq!(ids, [10, 29, 15, 110, 119, 93, 41, 37, 73, 0, 101, 28]);
+        for ie in &req.protocol_i_es.0 {
+            use ngap_gen::HandoverRequestProtocolIEs_EntryValue as Ie;
+            match &ie.value {
+                Ie::Id_AMF_UE_NGAP_ID(v) => assert_eq!(v.0, 0x418),
+                Ie::Id_HandoverType(v) => assert_eq!(
+                    v.0,
+                    ngap_gen::HandoverType::EPS_TO_5GS,
+                    "eps-to-5gs (§9.3.1.22)"
+                ),
+                Ie::Id_UEAggregateMaximumBitRate(v) => assert_eq!(
+                    (
+                        v.ue_aggregate_maximum_bit_rate_dl.0,
+                        v.ue_aggregate_maximum_bit_rate_ul.0
+                    ),
+                    (100_000_000, 50_000_000)
+                ),
+                Ie::Id_SecurityContext(v) => {
+                    assert_eq!(v.next_hop_chaining_count.0, 0, "§8.4.2 step 4: NCC = 0");
+                    assert_eq!(v.next_hop_nh.0.as_raw_slice(), [0x7A; 32]);
+                }
+                Ie::Id_PDUSessionResourceSetupListHOReq(l) => {
+                    assert_eq!(l.0.len(), 1);
+                    assert_eq!(l.0[0].pdu_session_id.0, 5);
+                    assert_eq!(l.0[0].s_nssai.sst.0, [1]);
+                    assert_eq!(
+                        l.0[0].s_nssai.sd.as_ref().map(|d| d.0.clone()),
+                        Some(vec![0, 0, 1])
+                    );
+                    assert_eq!(
+                        l.0[0].handover_request_transfer.0,
+                        [0x00, 0x00, 0x04, 0x00, 0x82, 0x00, 0x0A]
+                    );
+                }
+                Ie::Id_SourceToTarget_TransparentContainer(v) => {
+                    assert_eq!(v.0, [0x40, 0x41, 0x42])
+                }
+                Ie::Id_GUAMI(v) => assert_eq!(v.plmn_identity.0, [0x99, 0xf9, 0x07]),
+                _ => {}
             }
         }
-        assert_eq!(
-            nextgcore_ngap_gen::encode(&stripped).expect("re-encode"),
-            hand_written,
-            "every IE both encoders model -- type, cause, UE-AMBR, capabilities, NCC 0 and the \
-             NH, the session and its transfer, NSSAI, container, GUAMI -- is byte-identical to \
-             the independent hand-written encoder"
-        );
-        // The hand-written parser reads the stripped form, naming the values §8.4.2 step 4
-        // fixes.
-        let hr = match parser::decode_ngap_pdu(&hand_written) {
-            Ok(NgapMessage::HandoverRequest(hr)) => hr,
-            other => panic!("hand-written parse: {other:?}"),
-        };
-        assert_eq!(hr.handover_type as u8, 2, "eps-to-5gs (§9.3.1.22)");
-        assert_eq!(
-            hr.security_context.next_hop_chaining_count, 0,
-            "§8.4.2 step 4: NCC = 0"
-        );
 
         // The two IEs the hand-written types lack, through the generated decoder.
         let pdu = nextgcore_ngap_gen::decode(&bytes).expect("generated decode");
@@ -13571,12 +13470,12 @@ pub(crate) mod tests {
         ][usize::from(v)]
     }
 
-    /// Initial UE Messages the hand-written encoder builds, varied one field at
-    /// a time around a baseline: every RAN UE NGAP ID length, NAS-PDU length
-    /// forms, both MNC lengths, NR cell identity and TAC edges, every RRC
-    /// Establishment Cause, UE Context Request on and off, Allowed NSSAI of 0, 1
-    /// and 3 slices with and without an SD.
-    pub(crate) fn initial_ue_corpus() -> Vec<Vec<u8>> {
+    /// Initial UE Messages varied one field at a time around a baseline:
+    /// every RAN UE NGAP ID length, NAS-PDU length forms, both MNC lengths,
+    /// NR cell identity and TAC edges, every RRC Establishment Cause, UE
+    /// Context Request on and off, Allowed NSSAI of 0, 1 and 3 slices with and
+    /// without an SD.
+    fn initial_ue_cases() -> Vec<HwInitialUe> {
         let base = HwInitialUe {
             ran_ue_ngap_id: 77,
             nas_pdu: vec![0x7e, 0x00, 0x41, 0x09, 0x00],
@@ -13646,49 +13545,127 @@ pub(crate) mod tests {
             });
         }
         variants
-            .iter()
-            .map(|m| nextgcore_ngap::builder::build_initial_ue_message(m).expect("build"))
-            .collect()
     }
 
-    /// The generated decode flattened to what the hand-written parser could
-    /// say. A `Reject` or a report never comes out of a message the old parser
-    /// accepted, so either is a test failure here.
-    fn generated_initial_ue_view(data: &[u8]) -> Option<String> {
-        match decode_initial_ue_message_asn1(data) {
-            NasTransportDecode::Proceed {
+    /// The Initial UE Message `m` as a gNB sends it: hand-derived octets,
+    /// `gnb_pdus::initial_ue_message`, or, with an Allowed NSSAI or a NAS-PDU
+    /// whose IE passes 16K, `amf_pdus::ue::initial_ue_message_mo_signalling`.
+    fn initial_ue_bytes(m: &HwInitialUe) -> Vec<u8> {
+        if m.allowed_nssai.is_empty() && m.nas_pdu.len() < 16_000 {
+            return crate::gnb_pdus::initial_ue_message(m);
+        }
+        assert!(matches!(m.rrc_establishment_cause, HwCause::MoSignalling));
+        assert_eq!(m.ue_context_request, None);
+        let slices: Vec<SNssai> = m
+            .allowed_nssai
+            .iter()
+            .map(|s| SNssai {
+                sst: s.sst,
+                sd: s.sd.map(|d| u32::from_be_bytes([0, d[0], d[1], d[2]])),
+            })
+            .collect();
+        crate::amf_pdus::ue::initial_ue_message_mo_signalling(
+            m.ran_ue_ngap_id,
+            &m.nas_pdu,
+            &crate::gnb_pdus::user_location(&m.user_location_info),
+            &slices,
+        )
+    }
+
+    /// The derived Initial UE Messages, the baseline first: the criticality
+    /// tests edit `corpus[0]`.
+    pub(crate) fn initial_ue_corpus() -> Vec<Vec<u8>> {
+        initial_ue_cases().iter().map(initial_ue_bytes).collect()
+    }
+
+    /// PLMNIdentity (§9.3.3.5) read by hand: digit pairs, low nibble first --
+    /// MCC1|MCC2, MCC3|MNC3 (F for a two-digit MNC), MNC1|MNC2.
+    fn bcd_plmn(o: [u8; 3]) -> PlmnId {
+        PlmnId {
+            mcc1: o[0] & 0x0f,
+            mcc2: o[0] >> 4,
+            mcc3: o[1] & 0x0f,
+            mnc3: o[1] >> 4,
+            mnc1: o[2] & 0x0f,
+            mnc2: o[2] >> 4,
+        }
+    }
+
+    /// RRC Establishment Cause as the decode carries it, its wire value: the
+    /// root index (§9.3.1.111 order, emergency 0 .. mcs-PriorityAccess 9),
+    /// then the extension additions numbered on, notAvailable 10.
+    fn rrc_value(c: HwCause) -> u8 {
+        use HwCause::*;
+        match c {
+            Emergency => 0,
+            HighPriorityAccess => 1,
+            MtAccess => 2,
+            MoSignalling => 3,
+            MoData => 4,
+            MoVoiceCall => 5,
+            MoVideoCall => 6,
+            MoSms => 7,
+            MpsPriorityAccess => 8,
+            McsPriorityAccess => 9,
+            NotAvailable => 10,
+        }
+    }
+
+    /// Every derived Initial UE Message decodes, with no report, to the values
+    /// it was derived from, field by field; every truncation is refused.
+    #[test]
+    fn initial_ue_message_decode_reads_the_derived_octets() {
+        let cases = initial_ue_cases();
+        assert_eq!(cases.len(), 1 + 8 + 8 + 4 + 4 + 11 + 1 + 2);
+        for m in &cases {
+            let data = initial_ue_bytes(m);
+            let NasTransportDecode::Proceed {
                 message,
                 error_indication: None,
-            } => Some(format!("{message:?}")),
-            NasTransportDecode::Undecodable => None,
-            other => panic!("unexpected {other:?} for {data:02x?}"),
-        }
-    }
-
-    #[test]
-    fn initial_ue_message_generated_decode_matches_hand_written() {
-        let corpus = initial_ue_corpus();
-        assert_eq!(corpus.len(), 1 + 8 + 8 + 4 + 4 + 11 + 1 + 2);
-        for data in &corpus {
-            let old = parse_initial_ue_message_asn1(data).map(|m| format!("{m:?}"));
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted messages: {data:02x?}"
+            } = decode_initial_ue_message_asn1(&data)
+            else {
+                panic!("a clean decode of {data:02x?}");
+            };
+            let HwUli::Nr {
+                nr_cgi_plmn,
+                nr_cell_identity,
+                tai_tac,
+                ..
+            } = &m.user_location_info;
+            assert_eq!(message.ran_ue_ngap_id, m.ran_ue_ngap_id);
+            assert_eq!(message.nas_pdu, m.nas_pdu);
+            assert_eq!(message.plmn_id, bcd_plmn(*nr_cgi_plmn));
+            assert_eq!(message.nr_cell_identity, *nr_cell_identity);
+            assert_eq!(
+                message.tac,
+                u32::from_be_bytes([0, tai_tac[0], tai_tac[1], tai_tac[2]])
             );
-            assert_eq!(generated_initial_ue_view(data), old, "{data:02x?}");
+            assert_eq!(
+                message.rrc_establishment_cause,
+                rrc_value(m.rrc_establishment_cause)
+            );
+            assert_eq!(
+                message.ue_context_request,
+                m.ue_context_request == Some(true)
+            );
         }
-        // Every truncation of a valid message, and junk, is refused by both.
-        let base = &corpus[0];
+        // Every truncation of a valid message is refused.
+        let base = &initial_ue_corpus()[0];
         for cut in 0..base.len() {
             let data = &base[..cut];
-            assert!(parse_initial_ue_message_asn1(data).is_none(), "{data:02x?}");
-            assert_eq!(generated_initial_ue_view(data), None, "{data:02x?}");
+            assert!(
+                matches!(
+                    decode_initial_ue_message_asn1(data),
+                    NasTransportDecode::Undecodable
+                ),
+                "{data:02x?}"
+            );
         }
     }
 
-    /// Uplink NAS Transports the hand-written encoder builds: AMF and RAN UE
-    /// NGAP ID lengths, NAS-PDU length forms, and location edges.
-    fn uplink_nas_corpus() -> Vec<Vec<u8>> {
+    /// Uplink NAS Transports varied around a baseline: AMF and RAN UE NGAP ID
+    /// lengths, NAS-PDU length forms, and location edges.
+    fn uplink_nas_cases() -> Vec<HwUplinkNas> {
         let base = HwUplinkNas {
             amf_ue_ngap_id: 9,
             ran_ue_ngap_id: 77,
@@ -13721,58 +13698,89 @@ pub(crate) mod tests {
             });
         }
         variants
-            .iter()
-            .map(|m| nextgcore_ngap::builder::build_uplink_nas_transport(m).expect("build"))
-            .collect()
     }
 
-    fn generated_uplink_nas_view(data: &[u8]) -> Option<String> {
-        match decode_uplink_nas_transport_asn1(data) {
-            NasTransportDecode::Proceed {
+    /// The Uplink NAS Transport `m` as a gNB sends it: hand-derived octets,
+    /// `gnb_pdus::uplink_nas_transport`, or, for a NAS-PDU whose IE passes
+    /// 16K, `amf_pdus::ue::uplink_nas_transport`.
+    fn uplink_nas_bytes(m: &HwUplinkNas) -> Vec<u8> {
+        if m.nas_pdu.len() < 16_000 {
+            return crate::gnb_pdus::uplink_nas_transport(m);
+        }
+        crate::amf_pdus::ue::uplink_nas_transport(
+            m.amf_ue_ngap_id,
+            m.ran_ue_ngap_id,
+            &m.nas_pdu,
+            &crate::gnb_pdus::user_location(&m.user_location_info),
+        )
+    }
+
+    /// The derived Uplink NAS Transports, the baseline first.
+    fn uplink_nas_corpus() -> Vec<Vec<u8>> {
+        uplink_nas_cases().iter().map(uplink_nas_bytes).collect()
+    }
+
+    /// Every derived Uplink NAS Transport decodes, with no report, to the
+    /// values it was derived from, its location field by field; every
+    /// truncation is refused.
+    #[test]
+    fn uplink_nas_transport_decode_reads_the_derived_octets() {
+        let cases = uplink_nas_cases();
+        assert_eq!(cases.len(), 1 + 7 + 4 + 4 + 2);
+        for m in &cases {
+            let data = uplink_nas_bytes(m);
+            let NasTransportDecode::Proceed {
                 message,
                 error_indication: None,
-            } => Some(format!("{message:?}")),
-            NasTransportDecode::Undecodable => None,
-            other => panic!("unexpected {other:?} for {data:02x?}"),
-        }
-    }
-
-    #[test]
-    fn uplink_nas_transport_generated_decode_matches_hand_written() {
-        let corpus = uplink_nas_corpus();
-        assert_eq!(corpus.len(), 1 + 7 + 4 + 4 + 2);
-        for data in &corpus {
-            let old = parse_uplink_nas_transport_asn1(data).map(|m| format!("{m:?}"));
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted messages: {data:02x?}"
+            } = decode_uplink_nas_transport_asn1(&data)
+            else {
+                panic!("a clean decode of {data:02x?}");
+            };
+            assert_eq!(message.amf_ue_ngap_id, m.amf_ue_ngap_id);
+            assert_eq!(message.ran_ue_ngap_id, m.ran_ue_ngap_id);
+            assert_eq!(message.nas_pdu, m.nas_pdu);
+            let HwUli::Nr {
+                nr_cgi_plmn,
+                nr_cell_identity,
+                tai_plmn,
+                tai_tac,
+            } = &m.user_location_info;
+            let Some(HwUli::Nr {
+                nr_cgi_plmn: got_cgi_plmn,
+                nr_cell_identity: got_nci,
+                tai_plmn: got_tai_plmn,
+                tai_tac: got_tac,
+            }) = message.user_location_info
+            else {
+                panic!("an NR location for {data:02x?}");
+            };
+            assert_eq!(
+                (got_cgi_plmn, got_nci, got_tai_plmn, got_tac),
+                (*nr_cgi_plmn, *nr_cell_identity, *tai_plmn, *tai_tac)
             );
-            assert_eq!(generated_uplink_nas_view(data), old, "{data:02x?}");
         }
-        let base = &corpus[0];
+        let base = &uplink_nas_corpus()[0];
         for cut in 0..base.len() {
             let data = &base[..cut];
             assert!(
-                parse_uplink_nas_transport_asn1(data).is_none(),
+                matches!(
+                    decode_uplink_nas_transport_asn1(data),
+                    NasTransportDecode::Undecodable
+                ),
                 "{data:02x?}"
             );
-            assert_eq!(generated_uplink_nas_view(data), None, "{data:02x?}");
         }
     }
 
-    /// The generated Downlink NAS Transport is the hand-written one byte for
-    /// byte: every AMF and RAN UE NGAP ID length, and NAS-PDU lengths across
-    /// every length-determinant form, past 16K into fragmentation (X.691
-    /// §11.9.3.8). Both refuse an AMF UE NGAP ID past 2^40-1.
+    /// The Downlink NAS Transport is the hand-derived octets
+    /// (`amf_pdus::ue::downlink_nas_transport`): every AMF and RAN UE NGAP ID
+    /// length, and NAS-PDU lengths across every length-determinant form, past
+    /// 16K into fragmentation (X.691 §11.9.3.8). An AMF UE NGAP ID past 2^40-1
+    /// has no encoding and is refused.
     #[test]
-    fn downlink_nas_transport_generated_matches_hand_written() {
-        let hand_written = |amf: u64, ran: u32, nas: &[u8]| {
-            nextgcore_ngap::builder::build_downlink_nas_transport(&DownlinkNasTransport {
-                amf_ue_ngap_id: amf,
-                ran_ue_ngap_id: ran,
-                nas_pdu: nas.to_vec(),
-            })
-            .ok()
+    fn downlink_nas_transport_is_the_derived_octets() {
+        let derived = |amf: u64, ran: u32, nas: &[u8]| {
+            (amf < 1 << 40).then(|| crate::amf_pdus::ue::downlink_nas_transport(amf, ran, nas))
         };
         let mut compared = 0;
         let nas = [0x7e, 0x00, 0x42];
@@ -13791,7 +13799,7 @@ pub(crate) mod tests {
             for ran in [0u32, 1, 255, 256, 65_536, u32::MAX] {
                 assert_eq!(
                     build_downlink_nas_transport_asn1(amf, ran, &nas),
-                    hand_written(amf, ran, &nas),
+                    derived(amf, ran, &nas),
                     "amf={amf} ran={ran}"
                 );
                 compared += 1;
@@ -13803,7 +13811,7 @@ pub(crate) mod tests {
             let nas = vec![0xa5; len];
             let new = build_downlink_nas_transport_asn1(7, 9, &nas);
             assert!(new.is_some(), "len={len}");
-            assert_eq!(new, hand_written(7, 9, &nas), "len={len}");
+            assert_eq!(new, derived(7, 9, &nas), "len={len}");
             compared += 1;
         }
         assert_eq!(compared, 10 * 6 + 13);
@@ -13863,10 +13871,6 @@ pub(crate) mod tests {
                 ),
             })
         });
-        assert!(
-            parse_initial_ue_message_asn1(&data).is_none(),
-            "the oracle refuses it: that is the defect"
-        );
         let NasTransportDecode::Proceed {
             message,
             error_indication: None,
@@ -13989,11 +13993,6 @@ pub(crate) mod tests {
             panic!("decodes");
         };
         assert_eq!(message.rrc_establishment_cause, 11);
-        assert_eq!(
-            parse_initial_ue_message_asn1(&data).map(|m| m.rrc_establishment_cause),
-            Some(10),
-            "the oracle folded it into notAvailable"
-        );
     }
 
     /// §10.3.4.2 and §10.3.5 for the Uplink NAS Transport. Its User Location
@@ -14017,10 +14016,6 @@ pub(crate) mod tests {
 
         let no_uli =
             edited(&|ies| ies.retain(|e| e.id.0 != ngap_gen::ID_USER_LOCATION_INFORMATION));
-        assert!(
-            parse_uplink_nas_transport_asn1(&no_uli).is_none(),
-            "the oracle refuses it"
-        );
         let NasTransportDecode::Proceed {
             message,
             error_indication: None,
@@ -14067,36 +14062,34 @@ pub(crate) mod tests {
         modified: &[(u8, Vec<u8>)],
         failed: &[(u8, Vec<u8>)],
     ) -> Vec<u8> {
-        nextgcore_ngap::builder::build_pdu_session_resource_modify_response(
-            &PduSessionResourceModifyResponse {
-                amf_ue_ngap_id: amf,
-                ran_ue_ngap_id: ran,
-                modify_list: modified
-                    .iter()
-                    .map(|(psi, t)| PduSessionResourceModifyResponseItem {
-                        pdu_session_id: *psi,
-                        transfer: t.clone(),
-                    })
-                    .collect(),
-                failed_list: failed
-                    .iter()
-                    .map(|(psi, t)| PduSessionResourceFailedItem {
-                        pdu_session_id: *psi,
-                        transfer: t.clone(),
-                    })
-                    .collect(),
-            },
-        )
-        .expect("build Modify Response")
+        crate::gnb_pdus::pdu_session_resource_modify_response(&PduSessionResourceModifyResponse {
+            amf_ue_ngap_id: amf,
+            ran_ue_ngap_id: ran,
+            modify_list: modified
+                .iter()
+                .map(|(psi, t)| PduSessionResourceModifyResponseItem {
+                    pdu_session_id: *psi,
+                    transfer: t.clone(),
+                })
+                .collect(),
+            failed_list: failed
+                .iter()
+                .map(|(psi, t)| PduSessionResourceFailedItem {
+                    pdu_session_id: *psi,
+                    transfer: t.clone(),
+                })
+                .collect(),
+        })
     }
 
-    /// A Modify Indication built by the hand-written builder (a gNB stand-in).
+    /// A Modify Indication as a gNB sends it: hand-derived octets,
+    /// `gnb_pdus::pdu_session_resource_modify_indication`.
     pub(crate) fn modify_indication_bytes(
         amf: u64,
         ran: u32,
         sessions: &[(u8, Vec<u8>)],
     ) -> Vec<u8> {
-        nextgcore_ngap::builder::build_pdu_session_resource_modify_indication(
+        crate::gnb_pdus::pdu_session_resource_modify_indication(
             &PduSessionResourceModifyIndication {
                 amf_ue_ngap_id: amf,
                 ran_ue_ngap_id: ran,
@@ -14109,36 +14102,15 @@ pub(crate) mod tests {
                     .collect(),
             },
         )
-        .expect("build Modify Indication")
     }
 
-    /// The Modify Request the hand-written encoder produced before #417 moved it.
-    fn hand_written_modify_request(
-        amf: u64,
-        ran: u32,
-        psi: u8,
-        nas: Option<&[u8]>,
-        transfer: &[u8],
-    ) -> Option<Vec<u8>> {
-        nextgcore_ngap::builder::build_pdu_session_resource_modify_request(
-            &PduSessionResourceModifyRequest {
-                amf_ue_ngap_id: amf,
-                ran_ue_ngap_id: ran,
-                pdu_session_list: vec![PduSessionResourceModifyItem {
-                    pdu_session_id: psi,
-                    nas_pdu: nas.map(<[u8]>::to_vec),
-                    transfer: transfer.to_vec(),
-                }],
-            },
-        )
-        .ok()
-    }
-
-    /// The generated Modify Request is byte for byte the hand-written one: every
-    /// PSI, every ID length, NAS-PDU absent or at each length form, and each
-    /// transfer length form; both refuse the out-of-range AMF UE NGAP ID.
+    /// The Modify Request is the hand-derived octets
+    /// (`amf_pdus::ue::pdu_session_resource_modify_request`): every PSI, every
+    /// ID length, NAS-PDU absent or at each length form (16K fragments), and
+    /// each transfer length form; the out-of-range AMF UE NGAP ID, which has
+    /// no encoding, is refused.
     #[test]
-    fn pdu_session_resource_modify_request_generated_matches_hand_written() {
+    fn pdu_session_resource_modify_request_is_the_derived_octets() {
         let nas_forms: [Option<Vec<u8>>; 5] = [
             None,
             Some(vec![0x7e]),
@@ -14150,7 +14122,9 @@ pub(crate) mod tests {
         let mut refused = 0;
         let mut check = |amf: u64, ran: u32, psi: u8, nas: Option<&[u8]>, t: &[u8]| {
             let new = build_pdu_session_resource_modify_request_asn1(amf, ran, psi, nas, t);
-            let old = hand_written_modify_request(amf, ran, psi, nas, t);
+            let old = (amf <= MAX_AMF_UE_NGAP_ID).then(|| {
+                crate::amf_pdus::ue::pdu_session_resource_modify_request(amf, ran, psi, nas, t)
+            });
             assert_eq!(
                 new,
                 old,
@@ -14203,28 +14177,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// `(amf, ran, modified, failed)` from the hand-written Modify Response parser.
-    #[allow(clippy::type_complexity)]
-    fn hand_written_modify_response_view(
-        data: &[u8],
-    ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
-        match parser::decode_ngap_pdu(data) {
-            Ok(NgapMessage::PduSessionResourceModifyResponse(r)) => Some((
-                r.amf_ue_ngap_id,
-                r.ran_ue_ngap_id,
-                r.modify_list
-                    .into_iter()
-                    .map(|i| (i.pdu_session_id, i.transfer))
-                    .collect(),
-                r.failed_list
-                    .into_iter()
-                    .map(|i| (i.pdu_session_id, i.transfer))
-                    .collect(),
-            )),
-            _ => None,
-        }
-    }
-
     #[allow(clippy::type_complexity)]
     fn generated_modify_response_view(
         data: &[u8],
@@ -14252,31 +14204,33 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every Modify Response the hand-written parser accepted decodes to the
-    /// same UE and sessions, in both lists.
+    /// Every derived Modify Response (`gnb_pdus`) decodes to the UE and the
+    /// sessions it was derived from, in both lists: every ID length, every
+    /// transfer length form, lists of 256 sessions.
     #[test]
-    fn pdu_session_resource_modify_response_generated_decode_matches_hand_written() {
-        let mut corpus = Vec::new();
+    fn pdu_session_resource_modify_response_decode_reads_the_derived_octets() {
+        type Sessions = Vec<(u8, Vec<u8>)>;
+        let mut corpus: Vec<(u64, u32, Sessions, Sessions)> = Vec::new();
         for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for ran in RAN_IDS {
-                corpus.push(modify_response_bytes(*amf, ran, &[(5, vec![0x00])], &[]));
+                corpus.push((*amf, ran, vec![(5, vec![0x00])], vec![]));
             }
         }
         for t in response_transfers() {
-            corpus.push(modify_response_bytes(7, 9, &[(3, t.clone())], &[]));
-            corpus.push(modify_response_bytes(7, 9, &[], &[(4, t.clone())]));
-            corpus.push(modify_response_bytes(7, 9, &[(3, t.clone())], &[(4, t)]));
+            corpus.push((7, 9, vec![(3, t.clone())], vec![]));
+            corpus.push((7, 9, vec![], vec![(4, t.clone())]));
+            corpus.push((7, 9, vec![(3, t.clone())], vec![(4, t)]));
         }
-        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
-        corpus.push(modify_response_bytes(7, 9, &all, &[]));
-        corpus.push(modify_response_bytes(7, 9, &[], &all));
-        for data in &corpus {
-            let old = hand_written_modify_response_view(data);
-            assert!(
-                old.is_some(),
-                "the corpus holds accepted messages: {data:02x?}"
+        let all: Sessions = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
+        corpus.push((7, 9, all.clone(), vec![]));
+        corpus.push((7, 9, vec![], all));
+        for (amf, ran, modified, failed) in corpus {
+            let data = modify_response_bytes(amf, ran, &modified, &failed);
+            assert_eq!(
+                generated_modify_response_view(&data),
+                Some((amf, ran, modified, failed)),
+                "{data:02x?}"
             );
-            assert_eq!(generated_modify_response_view(data), old, "{data:02x?}");
         }
     }
 
@@ -14317,27 +14271,22 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Every Modify Indication the hand-written parser accepted decodes to the
-    /// same UE and sessions.
+    /// Every derived Modify Indication (`gnb_pdus`) decodes to the UE and the
+    /// sessions it was derived from.
     #[test]
-    fn pdu_session_resource_modify_indication_generated_decode_matches_hand_written() {
-        let mut corpus = Vec::new();
+    fn pdu_session_resource_modify_indication_decode_reads_the_derived_octets() {
+        let mut corpus: Vec<(u64, u32, Vec<(u8, Vec<u8>)>)> = Vec::new();
         for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for ran in RAN_IDS {
-                corpus.push(modify_indication_bytes(*amf, ran, &[(5, vec![0x00])]));
+                corpus.push((*amf, ran, vec![(5, vec![0x00])]));
             }
         }
         for t in response_transfers() {
-            corpus.push(modify_indication_bytes(7, 9, &[(3, t)]));
+            corpus.push((7, 9, vec![(3, t)]));
         }
-        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
-        corpus.push(modify_indication_bytes(7, 9, &all));
-        for data in &corpus {
-            let Ok(NgapMessage::PduSessionResourceModifyIndication(old)) =
-                parser::decode_ngap_pdu(data)
-            else {
-                panic!("the corpus holds accepted messages: {data:02x?}");
-            };
+        corpus.push((7, 9, (0..=255u8).map(|psi| (psi, vec![psi])).collect()));
+        for (amf, ran, expected) in &corpus {
+            let data = &modify_indication_bytes(*amf, *ran, expected);
             let PduSessionResourceModifyIndicationDecode::Proceed {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
@@ -14348,20 +14297,12 @@ pub(crate) mod tests {
                 panic!("generated decode refused {data:02x?}");
             };
             assert!(notify.is_empty());
-            assert_eq!(
-                (amf_ue_ngap_id, ran_ue_ngap_id),
-                (old.amf_ue_ngap_id, old.ran_ue_ngap_id)
-            );
-            let old: Vec<(u8, Vec<u8>)> = old
-                .modify_list
-                .into_iter()
-                .map(|i| (i.pdu_session_id, i.transfer))
-                .collect();
+            assert_eq!((amf_ue_ngap_id, ran_ue_ngap_id), (*amf, *ran));
             let new: Vec<(u8, Vec<u8>)> = sessions
                 .into_iter()
                 .map(|s| (s.pdu_session_id, s.transfer))
                 .collect();
-            assert_eq!(new, old);
+            assert_eq!(&new, expected);
         }
     }
 
