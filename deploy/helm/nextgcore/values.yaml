@@ -67,6 +67,11 @@ global:
   # (/etc/nextgcore/tls/{client.crt,client.key}), since under mTLS an NF is both
   # server and client. Override any path with NEXTGCORE_SBI_TLS_CERT / _KEY / _CA
   # / _CLIENT_CERT / _CLIENT_KEY.
+  #
+  # #2136: write the value out. A bare `sbiProfile:` (null) in an override file
+  # renders dev, not production: helm drops a null key before the chart sees it,
+  # so it reads as absent and takes this default. An operator who means
+  # production must write `sbiProfile: production`.
   sbiProfile: dev
   logLevel: info
   max:
