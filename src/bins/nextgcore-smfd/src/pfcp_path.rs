@@ -1278,6 +1278,14 @@ impl PfcpClient {
         self
     }
 
+    /// Test-only: shorten Session Deletion's T1/N1 so a silent peer fails fast.
+    #[cfg(test)]
+    pub(crate) fn with_deletion_timer_for_test(mut self, t1: Duration, n1: u32) -> Self {
+        self.timers.pfcp_no_deletion_response.duration = t1;
+        self.timers.pfcp_no_deletion_response.max_count = n1;
+        self
+    }
+
     /// Test-only: shorten Association Setup's T1/N1 so a silent peer fails fast.
     #[cfg(test)]
     pub(crate) fn with_association_timer_for_test(mut self, t1: Duration, n1: u32) -> Self {
@@ -2264,7 +2272,8 @@ impl PfcpClient {
         // function deleted the sessions, or never had them. Believing them anyway
         // would leave every one dead until the UE noticed, so release them as a
         // restart would.
-        if retention_requested && !sessions_retained(&resp_body) {
+        let retained = retention_requested && sessions_retained(&resp_body);
+        if retention_requested && !retained {
             log::warn!(
                 "UPF {} did not retain the PFCP sessions this SMF holds (no PSREI in the \
                  Association Setup Response)",
@@ -2280,9 +2289,17 @@ impl PfcpClient {
             assoc.peer_recovery_time_stamp = None;
             assoc.up_function_features = resp.up_function_features;
             self.publish_associated(&assoc);
-            // #2225: the I-UPF sessions whose deletion found it unreachable.
+            // #2225: the I-UPF sessions whose deletion found it unreachable. Resent
+            // only when the I-UPF kept its sessions (R45 M1 on #2268): one that did
+            // not holds none of them, and may have given their SEIDs to new ones.
             if crate::iupf::is_client(self) {
-                crate::iupf::retry_pending_deletions();
+                if retained {
+                    crate::iupf::retry_pending_deletions();
+                } else {
+                    crate::iupf::drop_pending_deletions(
+                        "did not retain its sessions in the new association",
+                    );
+                }
             }
             log::info!(
                 "PFCP association established with {} (UP features={:?})",
@@ -2759,7 +2776,9 @@ fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
 fn holds_pfcp_sessions_on(client: &PfcpClient) -> bool {
     // #2225: the I-UPF holds the legs, which no PSA routing names.
     if crate::iupf::is_client(client) {
-        return crate::iupf::has_legs();
+        // R45 M1 on #2268: and while deletions are queued, so its answer says
+        // whether they still name its sessions.
+        return crate::iupf::has_legs() || crate::iupf::pending_deletions() > 0;
     }
     let routing = SessionRouting::now();
     held_session_seids()

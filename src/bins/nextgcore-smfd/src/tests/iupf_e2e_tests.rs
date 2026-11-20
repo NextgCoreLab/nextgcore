@@ -639,17 +639,39 @@ async fn session_with_refusing_psa(
     iupf::IupfLeg,
     tokio::task::JoinHandle<()>,
 ) {
+    let (psa, reference, seid, leg, listener, _, _) =
+        session_with_refusing_psa_on(iupf_upf, supi, psi, None).await;
+    (psa, reference, seid, leg, listener)
+}
+
+/// [`session_with_refusing_psa`], with the I-UPF client's Session Deletion
+/// timer shortened when given, and its socket and client returned too.
+#[allow(clippy::type_complexity)]
+async fn session_with_refusing_psa_on(
+    iupf_upf: &Upf,
+    supi: &str,
+    psi: u8,
+    deletion_timer: Option<(std::time::Duration, u32)>,
+) -> (
+    pfcp_path::stand_in::StandInUpf,
+    String,
+    u64,
+    iupf::IupfLeg,
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::net::UdpSocket>,
+    Arc<pfcp_path::PfcpClient>,
+) {
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let psa = pfcp_path::stand_in::associated_upf().await;
     smf_context_init(64, 256, 512);
     std::env::remove_var("PCF_URI");
     let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let client = Arc::new(pfcp_path::PfcpClient::new(
-        sock.clone(),
-        iupf_upf.pfcp,
-        [127, 0, 0, 1],
-    ));
-    let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+    let mut client = pfcp_path::PfcpClient::new(sock.clone(), iupf_upf.pfcp, [127, 0, 0, 1]);
+    if let Some((t1, n1)) = deletion_timer {
+        client = client.with_deletion_timer_for_test(t1, n1);
+    }
+    let client = Arc::new(client);
+    let listener = spawn_pfcp_listener(sock.clone(), vec![client.clone()]);
     iupf::set(Some((client.clone(), Vec::new())));
     client.associate().await.expect("the I-UPF associates");
     let n1_msg = n1(
@@ -665,7 +687,7 @@ async fn session_with_refusing_psa(
     let reference = root["smContextRef"].as_str().unwrap().to_string();
     let seid = smf_n4_seid_for(&reference);
     let leg = iupf::leg_of(seid).expect("the I-UPF is inserted");
-    (psa, reference, seid, leg, listener)
+    (psa, reference, seid, leg, listener, sock, client)
 }
 
 /// R43 M1 on #2243, failure-path properties 1 and 3: a split modification the
@@ -1182,4 +1204,223 @@ async fn an_i_upf_downlink_data_report_pages_for_its_psa_session_2225() {
     forget_seeded_session(&reference);
     iupf::set(None);
     drop(psa);
+}
+
+/// R45 M1 on #2268: a restarted I-UPF holds none of the old sessions, and counts
+/// its SEIDs from the start again. The deletion queued at the loss names an old
+/// I-UPF SEID that a new session's leg can now have. The new association does
+/// not confirm retention, so the queue is dropped unsent, no resend pass starts,
+/// and the new leg survives.
+///
+/// REVERT-VERIFIED: see the PR.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_i_upf_gets_no_stale_deletion_and_its_new_leg_survives_2225() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _q = qos_mon::TEST_LOCK.lock().await;
+    let _seeded = crate::context::SeededState::track();
+    iupf::clear_pending_deletions();
+    let old = upf(34).await;
+    let (psa, reference, _seid, leg, listener, _, client) =
+        session_with_refusing_psa_on(&old, "imsi-001010000022254", 5, None).await;
+    client
+        .teardown_association("test: the I-UPF's Recovery Time Stamp changed")
+        .await;
+    assert_eq!(
+        iupf::pending_deletion_list(),
+        vec![(leg.smf_seid, leg.upf_seid)],
+        "queued at the loss"
+    );
+
+    // The restarted I-UPF: a fresh upfd, whose SEIDs start again.
+    let fresh = upf(35).await;
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let restarted = Arc::new(pfcp_path::PfcpClient::new(
+        sock.clone(),
+        fresh.pfcp,
+        [127, 0, 0, 1],
+    ));
+    let fresh_listener = spawn_pfcp_listener(sock, vec![restarted.clone()]);
+    iupf::set(Some((restarted.clone(), Vec::new())));
+    let passes = iupf::RETRY_PASSES.load(Ordering::SeqCst);
+    let hold = iupf::BeforeRetry::arm();
+    restarted
+        .associate()
+        .await
+        .expect("the restarted I-UPF associates");
+    assert_eq!(iupf::pending_deletions(), 0, "dropped: not retained");
+    assert_eq!(
+        iupf::RETRY_PASSES.load(Ordering::SeqCst),
+        passes,
+        "no deletion is resent to a restarted I-UPF"
+    );
+
+    // A new session's leg on the restarted I-UPF has the old leg's I-UPF SEID.
+    let n1_msg = n1(
+        6,
+        1,
+        gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+        &[0x91, 0x00],
+    );
+    let resp = handle_sm_context_create(&create_request("imsi-001010000022255", 6, &n1_msg)).await;
+    assert_eq!(resp.status, 201, "created");
+    let root: serde_json::Value =
+        serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+    let reference_b = root["smContextRef"].as_str().unwrap().to_string();
+    let leg_b = iupf::leg_of(smf_n4_seid_for(&reference_b)).expect("a new leg");
+    assert_eq!(leg_b.upf_seid, leg.upf_seid, "the SEID is reused");
+    drop(hold);
+    iupf::retry_pending_deletions();
+    assert!(!iupf::retry_running(), "nothing to resend");
+    assert_eq!(
+        fresh.sessions.load(Ordering::SeqCst),
+        1,
+        "the new leg survives"
+    );
+
+    fresh_listener.abort();
+    listener.abort();
+    for r in [&reference, &reference_b] {
+        iupf::forget(smf_n4_seid_for(r));
+        cancel_gsm_timer_for_test(r);
+        forget_seeded_session(r);
+    }
+    iupf::set(None);
+    drop(psa);
+}
+
+/// R45 M2 on #2268 (R43's note on #2243): an ordinary leg deletion the I-UPF
+/// does not answer is queued. At the next association, which confirms retention,
+/// it is resent and reaches the I-UPF.
+///
+/// REVERT-VERIFIED: see the PR.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unanswered_leg_deletion_is_queued_and_resent_once_retained_2225() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _q = qos_mon::TEST_LOCK.lock().await;
+    let _seeded = crate::context::SeededState::track();
+    iupf::clear_pending_deletions();
+    let iupf_upf = upf(36).await;
+    let (psa, reference, seid, leg, listener, sock, client) = session_with_refusing_psa_on(
+        &iupf_upf,
+        "imsi-001010000022256",
+        5,
+        Some((std::time::Duration::from_millis(50), 1)),
+    )
+    .await;
+    let upf_seid = lookup_upf_seid(&reference).unwrap();
+    // The I-UPF's answers are no longer read: its deletion goes unanswered.
+    listener.abort();
+    let _ = listener.await;
+    let _ = pfcp_session_delete(seid, upf_seid).await;
+    assert_eq!(
+        iupf::pending_deletion_list(),
+        vec![(leg.smf_seid, leg.upf_seid)],
+        "queued"
+    );
+    // The I-UPF may have acted on it; only its answer went unread.
+
+    let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+    let passes = iupf::RETRY_PASSES.load(Ordering::SeqCst);
+    client
+        .associate()
+        .await
+        .expect("the I-UPF associates again");
+    assert_eq!(
+        iupf::RETRY_PASSES.load(Ordering::SeqCst),
+        passes + 1,
+        "the retaining I-UPF is sent the queue"
+    );
+    // Resent: the entry goes only when the I-UPF answers it.
+    wait_until(|| iupf::pending_deletions() == 0).await;
+    assert_eq!(iupf::pending_deletions(), 0, "resent and answered");
+    assert_eq!(iupf_upf.sessions.load(Ordering::SeqCst), 0);
+
+    listener.abort();
+    cancel_gsm_timer_for_test(&reference);
+    forget_seeded_session(&reference);
+    iupf::set(None);
+    drop(psa);
+}
+
+/// R45 M2 on #2268: the queue holds MAX_PENDING_DELETIONS, drops the oldest
+/// beyond that, and takes each SMF SEID once.
+#[tokio::test]
+async fn the_deletion_queue_is_bounded_and_drops_the_oldest_2225() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    iupf::clear_pending_deletions();
+    for i in 0..=iupf::MAX_PENDING_DELETIONS as u64 {
+        iupf::queue_deletion(i, 100 + i);
+    }
+    let q = iupf::pending_deletion_list();
+    assert_eq!(q.len(), iupf::MAX_PENDING_DELETIONS);
+    assert_eq!(q.first(), Some(&(1, 101)), "the oldest went");
+    assert_eq!(q.last(), Some(&(4096, 4196)));
+    iupf::queue_deletion(5, 999);
+    assert_eq!(
+        iupf::pending_deletions(),
+        iupf::MAX_PENDING_DELETIONS,
+        "once"
+    );
+    iupf::queue_deletion(0, 100);
+    assert_eq!(
+        iupf::pending_deletion_list().first(),
+        Some(&(2, 102)),
+        "an evicted SEID can be queued again"
+    );
+    iupf::clear_pending_deletions();
+}
+
+/// R45 m1 on #2268: one resend pass at a time, and a pass stops at the first
+/// deletion the I-UPF does not answer, leaving it and the rest queued in order.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    iupf::clear_pending_deletions();
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+    let heard = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = heard.clone();
+    let ear = tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        while silent.recv(&mut buf).await.is_ok() {
+            h.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let client = Arc::new(
+        pfcp_path::PfcpClient::new(sock, silent_addr, [127, 0, 0, 1])
+            .with_deletion_timer_for_test(std::time::Duration::from_millis(50), 0),
+    );
+    client.set_assoc_state_for_test(true, None, None).await;
+    iupf::set(Some((client.clone(), Vec::new())));
+    for i in 1..=3u64 {
+        iupf::queue_deletion(iupf::leg_seid(i << 4), i);
+    }
+    let passes = iupf::RETRY_PASSES.load(Ordering::SeqCst);
+    let hold = iupf::BeforeRetry::arm();
+    iupf::retry_pending_deletions();
+    hold.reached.notified().await;
+    iupf::retry_pending_deletions();
+    assert_eq!(
+        iupf::RETRY_PASSES.load(Ordering::SeqCst),
+        passes + 1,
+        "a second setup starts no second pass"
+    );
+    drop(hold);
+    wait_until(|| !iupf::retry_running()).await;
+    assert!(!iupf::retry_running());
+    assert_eq!(heard.load(Ordering::SeqCst), 1, "stopped at the first");
+    assert_eq!(
+        iupf::pending_deletion_list(),
+        (1..=3u64)
+            .map(|i| (iupf::leg_seid(i << 4), i))
+            .collect::<Vec<_>>(),
+        "all three still queued, in order"
+    );
+    ear.abort();
+    iupf::clear_pending_deletions();
+    iupf::set(None);
 }

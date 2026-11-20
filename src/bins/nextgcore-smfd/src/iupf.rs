@@ -48,9 +48,14 @@
 //!   Downlink Data Reports page the UE, and Error Indication Reports deactivate the
 //!   user plane (TS 23.527 §5.3.3.2).
 //! - **A leg deletion the I-UPF did not answer** is queued (at most
-//!   [`MAX_PENDING_DELETIONS`]) and sent again once the I-UPF is associated again.
-//!   An answer of any cause ends it, since a restarted I-UPF answers "Session
-//!   context not found".
+//!   [`MAX_PENDING_DELETIONS`], the oldest dropped first). While the queue is not
+//!   empty, the next Association Setup asks the I-UPF to retain its sessions
+//!   (TS 29.244 §6.2.6.2.1).
+//!   - When the I-UPF confirms retention (PSREI), the queue is resent, one pass at
+//!     a time, stopping at the first unanswered deletion.
+//!   - When it does not, it holds none of those sessions, and the queue is dropped
+//!     unsent (R45 M1 on #2268). A restarted I-UPF counts its SEIDs from the start
+//!     again, so a queued SEID could otherwise delete a new session's leg.
 //!
 //! Not done, stated: an I-UPF chosen per location (one configured I-UPF serves
 //! every session it applies to), relocation or removal of the I-UPF mid-session
@@ -257,32 +262,62 @@ pub fn release_sessions_of_lost_iupf(reason: &str) -> tokio::task::JoinHandle<()
 pub const MAX_PENDING_DELETIONS: usize = 4096;
 
 /// I-UPF sessions whose deletion the I-UPF did not answer: `(SMF SEID, I-UPF
-/// SEID)`.
-static PENDING_DELETIONS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
+/// SEID)` in queue order, and the SMF SEIDs queued, for an O(1) duplicate check
+/// (R45 m2 on #2268).
+#[derive(Default)]
+struct PendingDeletions {
+    queue: std::collections::VecDeque<(u64, u64)>,
+    queued: std::collections::HashSet<u64>,
+}
+
+static PENDING_DELETIONS: std::sync::Mutex<Option<PendingDeletions>> = std::sync::Mutex::new(None);
+
+fn with_pending<T>(f: impl FnOnce(&mut PendingDeletions) -> T) -> T {
+    let mut g = PENDING_DELETIONS.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(PendingDeletions::default))
+}
 
 pub(crate) fn queue_deletion(smf_seid: u64, upf_seid: u64) {
-    let mut q = PENDING_DELETIONS.lock().unwrap_or_else(|e| e.into_inner());
-    if q.iter().any(|(s, _)| *s == smf_seid) {
-        return;
-    }
-    if q.len() >= MAX_PENDING_DELETIONS {
-        if let Some((s, _)) = q.pop_front() {
-            log::warn!(
-                "I-UPF deletion queue full: the session of SEID 0x{s:016x} is no longer \
-                 retried"
-            );
+    with_pending(|p| {
+        if !p.queued.insert(smf_seid) {
+            return;
         }
-    }
-    q.push_back((smf_seid, upf_seid));
+        if p.queue.len() >= MAX_PENDING_DELETIONS {
+            if let Some((s, _)) = p.queue.pop_front() {
+                p.queued.remove(&s);
+                log::warn!(
+                    "I-UPF deletion queue full: the session of SEID 0x{s:016x} is no longer \
+                     retried"
+                );
+            }
+        }
+        p.queue.push_back((smf_seid, upf_seid));
+    });
 }
 
 /// How many I-UPF session deletions wait for the I-UPF.
 pub fn pending_deletions() -> usize {
-    PENDING_DELETIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len()
+    with_pending(|p| p.queue.len())
+}
+
+/// The queued deletions in order (tests).
+#[cfg(test)]
+pub(crate) fn pending_deletion_list() -> Vec<(u64, u64)> {
+    with_pending(|p| p.queue.iter().copied().collect())
+}
+
+/// Drop every queued deletion (R45 M1 on #2268): the I-UPF did not retain its
+/// sessions across the new association (TS 29.244 §6.2.6.2.2), so it holds none
+/// of them, and a queued I-UPF SEID may by now name a new session that the
+/// restarted I-UPF gave the same SEID.
+pub fn drop_pending_deletions(why: &str) {
+    let n = with_pending(|p| {
+        p.queued.clear();
+        std::mem::take(&mut p.queue).len()
+    });
+    if n > 0 {
+        log::warn!("I-UPF {why}: {n} queued session deletion(s) dropped, never resent");
+    }
 }
 
 /// Delete the I-UPF session `(smf_seid, upf_seid)`. True when the I-UPF answered,
@@ -309,44 +344,115 @@ async fn delete_on_iupf(client: &PfcpClient, smf_seid: u64, upf_seid: u64) -> bo
     }
 }
 
-/// Send the queued I-UPF session deletions again (#2225), after the I-UPF
-/// associated. One that goes unanswered again stays queued.
+/// Whether a resend pass is running: one at a time (R45 m1 on #2268).
+static RETRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct RetryingGuard;
+
+impl Drop for RetryingGuard {
+    fn drop(&mut self) {
+        RETRYING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How many resend passes started (tests).
+#[cfg(test)]
+pub(crate) static RETRY_PASSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A test seam: the next resend pass stops before its first deletion, signals
+/// `reached`, and waits for `proceed`; `done` is signalled when it ends.
+#[cfg(test)]
+pub(crate) struct BeforeRetry {
+    pub(crate) reached: Arc<tokio::sync::Notify>,
+    pub(crate) proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+type RetryHold = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+#[cfg(test)]
+static BEFORE_RETRY: std::sync::Mutex<Option<RetryHold>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+impl BeforeRetry {
+    pub(crate) fn arm() -> Self {
+        let h = Self {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            proceed: Arc::new(tokio::sync::Notify::new()),
+        };
+        *BEFORE_RETRY.lock().unwrap() = Some((h.reached.clone(), h.proceed.clone()));
+        h
+    }
+}
+
+#[cfg(test)]
+impl Drop for BeforeRetry {
+    fn drop(&mut self) {
+        BEFORE_RETRY.lock().unwrap().take();
+        self.proceed.notify_one();
+    }
+}
+
+/// Send the queued I-UPF session deletions again (#2225), after an association
+/// setup in which the I-UPF confirmed it retained its sessions (R45 M1 on
+/// #2268). One pass at a time. A pass stops at the first deletion the I-UPF does
+/// not answer, and that one and the rest stay queued (R45 m1).
 pub fn retry_pending_deletions() {
-    let queued: Vec<(u64, u64)> = PENDING_DELETIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect();
-    if queued.is_empty() {
+    if pending_deletions() == 0 {
         return;
     }
     let (Some(client), Ok(rt)) = (client(), tokio::runtime::Handle::try_current()) else {
-        PENDING_DELETIONS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(queued);
         return;
     };
-    log::info!(
-        "I-UPF associated: retrying {} session deletion(s) it did not answer",
-        queued.len()
-    );
+    if RETRYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        log::info!("I-UPF deletion resend already running");
+        return;
+    }
+    let guard = RetryingGuard;
+    #[cfg(test)]
+    RETRY_PASSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     rt.spawn(async move {
-        for (smf_seid, upf_seid) in queued {
-            if !delete_on_iupf(&client, smf_seid, upf_seid).await {
-                queue_deletion(smf_seid, upf_seid);
+        let _guard = guard;
+        #[cfg(test)]
+        {
+            let hold = BEFORE_RETRY.lock().unwrap().take();
+            if let Some((reached, proceed)) = hold {
+                reached.notify_one();
+                proceed.notified().await;
             }
         }
+        log::info!(
+            "I-UPF associated with its sessions retained: resending {} session deletion(s)",
+            pending_deletions()
+        );
+        while let Some((smf_seid, upf_seid)) = with_pending(|p| p.queue.front().copied()) {
+            if !delete_on_iupf(&client, smf_seid, upf_seid).await {
+                break;
+            }
+            with_pending(|p| {
+                if p.queue.front() == Some(&(smf_seid, upf_seid)) {
+                    p.queue.pop_front();
+                    p.queued.remove(&smf_seid);
+                }
+            });
+        }
     });
+}
+
+/// Whether a resend pass is running (tests).
+#[cfg(test)]
+pub(crate) fn retry_running() -> bool {
+    RETRYING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Forget every queued deletion (tests).
 #[cfg(test)]
 pub(crate) fn clear_pending_deletions() {
-    PENDING_DELETIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    with_pending(|p| {
+        p.queue.clear();
+        p.queued.clear();
+    });
 }
 
 /// Whether a session on `dnn` gets the I-UPF.
