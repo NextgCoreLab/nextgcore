@@ -5132,17 +5132,14 @@ mod tests {
     }
 
     /// #2162: the exact refusal of a certificate naming no NF types and no
-    /// token, by the rule the profile applies (`owner_binding`): under
-    /// production #2065's no-identity rule, under dev #2099's typeless check.
-    fn typeless_reason_2162(production: bool, want: &str) -> String {
-        if production {
-            "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it cannot be told from a relay's, and it presented no access token".to_string()
-        } else {
-            format!(
-                "the requester's certificate names no NF types and it sent no access token, \
-                 so it cannot be shown to be an {want}"
-            )
-        }
+    /// token under the `dev` profile (#2099's typeless check, `owner_binding`).
+    /// Production's sentence (#2065) is pinned in owner_binding's own tests,
+    /// which pass the profile explicitly.
+    fn typeless_reason_2162(want: &str) -> String {
+        format!(
+            "the requester's certificate names no NF types and it sent no access token, \
+             so it cannot be shown to be an {want}"
+        )
     }
 
     /// **#2077** (R31 M1 on #2094): a LocationContextTransfer comes from the old
@@ -5165,6 +5162,12 @@ mod tests {
     /// test's LMF is refused its own transfer).
     #[tokio::test]
     async fn a_location_context_transfer_needs_a_verified_lmf_2077() {
+        // #2162 (R42 on #2173): the profile is set at the start, not read: sibling tests
+        // set the Dev override concurrently (none sets production), so a
+        // reading taken here could differ from the handler's. Under dev the
+        // handler applies #2099's typeless check, whose exact sentence this
+        // pins; production's is pinned in owner_binding's tests.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         const DIRECT: &str = "dddddddd-2077-4000-8000-00000000000d";
@@ -5186,11 +5189,7 @@ mod tests {
             req.oauth2_subject = token.map(str::to_string);
             req
         };
-        // #2162: the profile is read once, before any request, and the typeless
-        // case asserts the exact reason of the rule that profile applies: under
-        // production #2065's (no identity at all), under dev #2099's typeless
-        // check. A substring both share could not tell which rule refused.
-        let typeless_reason = typeless_reason_2162(owner_binding::identity_required(), "LMF");
+        let typeless_reason = typeless_reason_2162("LMF");
         for (what, req, expect) in [
             (
                 "token only",

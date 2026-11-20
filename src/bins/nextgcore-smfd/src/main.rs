@@ -28968,17 +28968,14 @@ mod tests {
     }
 
     /// #2162: the exact refusal of a certificate naming no NF types and no
-    /// token, by the rule the profile applies (`owner_binding`): under
-    /// production #2065's no-identity rule, under dev #2099's typeless check.
-    fn typeless_reason_2162(production: bool, want: &str) -> String {
-        if production {
-            "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it cannot be told from a relay's, and it presented no access token".to_string()
-        } else {
-            format!(
-                "the requester's certificate names no NF types and it sent no access token, \
-                 so it cannot be shown to be an {want}"
-            )
-        }
+    /// token under the `dev` profile (#2099's typeless check, `owner_binding`).
+    /// Production's sentence (#2065) is pinned in owner_binding's own tests,
+    /// which pass the profile explicitly.
+    fn typeless_reason_2162(want: &str) -> String {
+        format!(
+            "the requester's certificate names no NF types and it sent no access token, \
+             so it cannot be shown to be an {want}"
+        )
     }
 
     /// **#2078**: an AMF change is admitted only from a caller shown to be an AMF
@@ -29005,6 +29002,12 @@ mod tests {
     /// check reverted, "refused: direct non-AMF" fails.
     #[tokio::test]
     async fn an_amf_change_needs_a_verified_amf_2078() {
+        // #2162 (R42 on #2173): the profile is set at the start, not read: sibling tests
+        // set the Dev override concurrently (none sets production), so a
+        // reading taken here could differ from the handler's. Under dev the
+        // handler applies #2099's typeless check, whose exact sentence this
+        // pins; production's is pinned in owner_binding's tests.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
@@ -29043,12 +29046,7 @@ mod tests {
         let scp = with_cert(as_nf_1860(change(NOT_AMF), Some(NOT_AMF)), SCP, &["SCP"]);
         // #2097: the new AMF's own id, but a certificate naming another type.
         let direct_smf = with_cert(change(DIRECT), DIRECT, &["SMF"]);
-        // #2162: the profile is read once, before any request, and the typeless
-        // case asserts the exact reason of the rule that profile applies: under
-        // production #2065's (no identity at all), under dev #2099's typeless
-        // check. A substring both share could not tell which rule refused.
-        let typeless_reason =
-            typeless_reason_2162(nextgcore_sbi::owner_binding::identity_required(), "AMF");
+        let typeless_reason = typeless_reason_2162("AMF");
         for (what, req, expect) in [
             ("direct non-AMF", direct_smf, "not AMF"),
             ("typeless", typeless, typeless_reason.as_str()),

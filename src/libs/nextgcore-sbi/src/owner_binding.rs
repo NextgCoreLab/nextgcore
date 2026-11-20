@@ -822,6 +822,41 @@ mod tests {
         assert_eq!(new_seen.lock().unwrap().len(), 1, "the new NRF was asked");
     }
 
+    /// **#2162** (R42 on #2173): the two rules that refuse a certificate naming
+    /// no NF types with no token, each pinned by its exact sentence with the
+    /// profile passed explicitly, so both run on every run whatever the
+    /// process-wide profile: under production #2065's (no identity at all),
+    /// under dev #2099's typeless check. The lmfd/smfd tests assert dev's
+    /// through their handlers.
+    ///
+    /// REVERT-VERIFIED: with `verified_consumer_id_with`'s untyped rule applied
+    /// under dev too (`if untyped` without `required`), the dev case yields
+    /// production's sentence and the `dev` assertion fails.
+    #[tokio::test]
+    async fn a_typeless_certificate_is_refused_by_the_profiles_rule_2162() {
+        let typeless = caller(Some(A), None, &[]);
+        let production = verified_nf_type_with(&typeless, NfType::Lmf, true).await;
+        let dev = verified_nf_type_with(&typeless, NfType::Lmf, false).await;
+        assert_eq!(
+            production,
+            Err::<(), String>(
+                "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it \
+                 cannot be told from a relay's, and it presented no access token"
+                    .to_string()
+            ),
+            "production"
+        );
+        assert_eq!(
+            dev,
+            Err::<(), String>(
+                "the requester's certificate names no NF types and it sent no access token, so it \
+                 cannot be shown to be an LMF"
+                    .to_string()
+            ),
+            "dev"
+        );
+    }
+
     /// **#2099**: the caller-side rule. A certificate of the consumer naming NF
     /// types decides alone (no NRF); a certificate without NF types and no
     /// token, an anonymous caller and a certificate/token mismatch refuse; a
