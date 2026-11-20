@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -215,6 +215,10 @@ amf:
     integrity_order: ["NIA2", "NIA1", "NIA0"]
     ciphering_order: ["NEA2", "NEA1", "NEA0"]
 
+  # Which gNBs a CM-IDLE UE is paged on; see "Paging strategy" below.
+  # paging:
+  #   strategy: registration-area
+
   # REGULATORY switch, default true. Read "Unauthenticated emergency service"
   # below before changing it: this key decides whether an emergency call
   # connects when the AUSF is unreachable, and the correct value is a matter of
@@ -233,8 +237,8 @@ amf:
 <tr><td><code>amf_name</code></td><td>string</td><td>none</td><td>Human-readable AMF name, stored in the AMF context and logged at startup.</td></tr>
 <tr><td><code>network_name.full</code></td><td>string</td><td>empty (<code>NetworkName::default()</code>)</td><td>Full network name presented to UEs.</td></tr>
 <tr><td><code>network_name.short</code></td><td>string</td><td>empty</td><td>Short network name presented to UEs.</td></tr>
-<tr><td><code>guami</code></td><td>list</td><td>empty list</td><td>Served GUAMI list. Entries without a resolvable <code>plmn_id</code> are silently skipped.</td></tr>
-<tr><td><code>guami[].plmn_id.mcc</code> / <code>.mnc</code></td><td>string or int</td><td>required per entry</td><td>PLMN identity; accepts quoted strings (<code>"999"</code>) or bare integers — both are normalized.</td></tr>
+<tr><td><code>guami</code></td><td>list</td><td>empty list</td><td>Served GUAMI list. An entry with no <code>plmn_id</code>, or one leaving its <code>mcc</code> or <code>mnc</code> out, is skipped; a malformed <code>mcc</code> or <code>mnc</code> fails the load (#2115).</td></tr>
+<tr><td><code>guami[].plmn_id.mcc</code> / <code>.mnc</code></td><td>string</td><td>required per entry</td><td>PLMN identity, as quoted digit strings: an MCC is 3 digits and an MNC 2 or 3 (TS 23.003 §2.2). A YAML number (<code>mcc: 999</code>) or a string of the wrong length fails the load (#2115); see the PLMN note below. The same rule applies to <code>tai[]</code> and <code>plmn_support[]</code>.</td></tr>
 <tr><td><code>guami[].amf_id.region</code></td><td>u8</td><td><code>0</code></td><td>AMF Region ID.</td></tr>
 <tr><td><code>guami[].amf_id.set</code></td><td>u16</td><td><code>0</code></td><td>AMF Set ID.</td></tr>
 <tr><td><code>guami[].amf_id.pointer</code></td><td>u8</td><td><code>0</code></td><td>AMF Pointer.</td></tr>
@@ -254,6 +258,8 @@ amf:
 <tr><td><code>time.t3512.value</code></td><td>u64 (seconds)</td><td><code>540</code></td><td>Periodic registration update timer sent to the UE in the Registration Accept (GPRS Timer 3). The mobile-reachable timer is derived from it (T3512 + 240 s) unless <code>AMF_MOBILE_REACHABLE_SECS</code> overrides it.</td></tr>
 <tr><td><code>time.t3502.value</code></td><td>u64 (seconds)</td><td>none</td><td>Parsed and stored, but not yet signalled to the UE.</td></tr>
 <tr><td><code>emergency.allow_unauthenticated</code></td><td>bool</td><td><strong><code>true</code></strong></td><td>Whether an EMERGENCY registration the network could not authenticate (e.g. the AUSF is unreachable) proceeds as an unauthenticated, emergency-only registration, or is refused. <strong>This is a regulatory setting</strong> — see <a href="#unauthenticated-emergency-service">Unauthenticated emergency service</a> below. <code>AMF_EMERGENCY_ALLOW_UNAUTHENTICATED</code> overrides it.</td></tr>
+<tr><td><code>emergency.s_nssai</code></td><td><code>{ sst, sd }</code></td><td>the default S-NSSAI</td><td>The S-NSSAI of the AMF’s Emergency Configuration Data (TS 23.501 §5.16.4.1). An unauthenticated emergency registration has no Allowed NSSAI, and its NAS Registration Accept carries none (TS 23.502 §4.12.2.3). The NGAP Initial Context Setup Request and Handover Request still need one (TS 38.413, mandatory, 1 to 8 entries), so they name this S-NSSAI (#2033). Without that, the Accept never reached the UE. When unset, the first configured <code>plmn_support</code> S-NSSAI is used, else SST 1. Under the production SBI profile, startup logs a warning naming the fallback (#2041). The key is not required: an AMF that offers no emergency service still starts. SST 0 <strong>fails startup</strong>. Emergency requests also go to the SMF on this S-NSSAI (#2041).</td></tr>
+<tr><td><code>paging.strategy</code></td><td><code>registration-area</code>, <code>recommended-first</code> or <code>nwdaf-mobility</code></td><td><code>registration-area</code></td><td>Which gNBs a CM-IDLE UE is paged on (#1442, nextgsim#464). <code>registration-area</code> pages every gNB serving the UE’s registration area on every attempt. <code>recommended-first</code> first pages the gNBs the RAN recommended at the UE’s last release. <code>nwdaf-mobility</code> first pages the gNB of the cell the NWDAF predicts and the gNB of the UE’s last known cell. See <a href="#paging-strategy">Paging strategy</a>. Any other value fails startup. Read at startup only: a change needs a restart.</td></tr>
 </tbody>
 </table>
 </div>
@@ -295,13 +301,14 @@ amf:
 <tr><td><code>AMF_RESTART_COUNTER</code></td><td>TS 23.007 restart counter sent on N26 (u8, default <code>0</code> = not available).</td></tr>
 <tr><td><code>AMF_PEER_SBI_ADDR</code> / <code>AMF_PEER_SBI_PORT</code></td><td>Fallback peer AMF (UE context transfer by 5G-GUTI) when the NRF cannot discover one. Port default <code>7777</code>.</td></tr>
 <tr><td><code>LMF_SBI_ADDR</code> / <code>LMF_SBI_PORT</code></td><td>Fallback LMF when none is discoverable via the NRF.</td></tr>
+<tr><td><code>NWDAF_SBI_ADDR</code> / <code>NWDAF_SBI_PORT</code></td><td>Fallback NWDAF for <code>paging.strategy: nwdaf-mobility</code> when none serving <code>nnwdaf-analyticsinfo</code> is discoverable via the NRF (logged when used). Port default <code>7777</code>.</td></tr>
 <tr><td><code>UCMF_SBI_ADDR</code> / <code>UCMF_SBI_PORT</code></td><td>Fallback UCMF for RACS (UE Radio Capability ID resolution) when none is discoverable via the NRF. Port default <code>7777</code>.</td></tr>
 <tr><td><code>AMF_NAMF_LOC_LMF</code></td><td><code>off</code>/<code>0</code>/<code>false</code> makes Namf_Location answer from the stored NGAP cell identity with no LMF round trip. Default on.</td></tr>
 <tr><td><code>AMF_UE_POLICY_ASSOC</code></td><td><code>off</code>/<code>0</code>/<code>false</code> disables the Npcf_UEPolicyControl association at registration. Default on.</td></tr>
 <tr><td><code>AMF_PRIORITY_MESSAGE_PRIORITY</code></td><td>The <code>3gpp-Sbi-Message-Priority</code> (0-31, 0 highest; TS 29.500 §6.8.4) put on the CreateSMContext of a UE that connected with RRC cause mps-PriorityAccess, mcs-PriorityAccess or highPriorityAccess, or holds an MPS/MCX subscription (TS 23.502 §4.3.2.2.1 step 3). Default <code>8</code>. Read once; an invalid value is logged and the default used.</td></tr>
 <tr><td><code>AMF_GUTI_REALLOCATION</code></td><td>Truthy (<code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code>) enables NAS 5G-GUTI reallocation (UE Configuration Update). Default off.</td></tr>
 <tr><td><code>AMF_T3513_SECS</code></td><td>Paging timer T3513, default <code>5</code> s.</td></tr>
-<tr><td><code>AMF_MOBILE_REACHABLE_SECS</code> / <code>AMF_IMPLICIT_DEREG_SECS</code></td><td>Override the mobile-reachable timer (default T3512 + 240 s) and implicit-deregistration timer (default 240 s).</td></tr>
+<tr><td><code>AMF_MOBILE_REACHABLE_SECS</code> / <code>AMF_IMPLICIT_DEREG_SECS</code></td><td>Override the mobile-reachable timer (default T3512 + 240 s) and implicit-deregistration timer (default 240 s). <code>0</code> disables a timer. A disabled mobile-reachable timer arms no supervision at a release, but the CM-IDLE <code>CONNECTIVITY_STATE_REPORT</code> still fires (#1701).</td></tr>
 <tr><td><code>AMF_NAS_CONGESTION_THRESHOLD</code> / <code>AMF_T3346_SECS</code></td><td>Registered-UE count above which NAS congestion is declared (unset or <code>0</code> = off), and the T3346 back-off imposed while congested.</td></tr>
 <tr><td><code>AMF_OVERLOAD_REDUCE_PERCENT</code></td><td>Traffic reduction requested in NGAP Overload Start while congested, default <code>50</code>.</td></tr>
 <tr><td><code>AMF_SNPN_ALLOWED_NIDS</code> / <code>AMF_UAV_GEOFENCE</code></td><td>Rel-17/18 knobs: served SNPN NIDs, and the UAV geofence (see <code>docker/rust/README.md</code>).</td></tr>
@@ -314,17 +321,108 @@ amf:
 </div>
 <h2 id="behavior-notes-and-caveats"><a class="header" href="#behavior-notes-and-caveats">Behavior notes and caveats</a></h2>
 <ul>
-<li><strong>Lenient loading:</strong> a missing config file, YAML parse error, or missing <code>amf:</code> section logs a warning and starts the AMF with defaults — it does not abort. Typos in key names are therefore silently ignored; check the startup log lines (<code>Configured GUAMI: ...</code>, <code>AMF configuration loaded: N GUAMI, N TAI, N PLMN support</code>) to confirm what was actually applied. Two exceptions abort start-up, and a refused file applies nothing:
+<li><strong>Lenient loading:</strong> a missing config file, YAML parse error, or missing <code>amf:</code> section logs a warning and starts the AMF with defaults — it does not abort. Typos in key names are therefore silently ignored; check the startup log lines (<code>Configured GUAMI: ...</code>, <code>AMF configuration loaded: N GUAMI, N TAI, N PLMN support</code>) to confirm what was actually applied. Three exceptions abort start-up, and a refused file applies nothing:
 <ul>
 <li>a <code>plmn_support</code> entry left with no usable S-NSSAI (none listed, or every one SST 0, which is refused as no slice — TS 23.501 §5.15.2.2). The NG Setup Response’s Slice Support List must hold at least one (TS 38.413 §9.3.1.17).</li>
 <li>a <code>plmn_support</code> or <code>guami</code> list that resolves to nothing (empty, or no entry with a usable PLMN ID). The NG Setup Response’s PLMN Support List and Served GUAMI List must each hold at least one (TS 38.413 §9.2.6.2). Each list the file names (<code>guami</code>, <code>tai</code>, <code>plmn_support</code>, <code>security.integrity_order</code>, <code>security.ciphering_order</code>) replaces the AMF’s list; a list the file leaves out keeps its default.</li>
+<li>a malformed <code>mcc</code> or <code>mnc</code> in any <code>guami</code>, <code>tai</code> or <code>plmn_support</code> entry: a YAML number, or a string that is not 3 (MCC) or 2-3 (MNC) digits (#2115). The error names the entry, e.g. <code>amf.guami[0].plmn_id.mcc=1 reached the configuration as a number, not a string</code>.</li>
 </ul>
 </li>
-<li><strong>PLMN flexibility:</strong> <code>mcc</code>/<code>mnc</code> accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.</li>
+<li><strong>PLMN digits are strings (#2115):</strong> write <code>mcc</code> and <code>mnc</code> quoted (<code>mcc: "001"</code>, <code>mnc: "070"</code>). A YAML number is refused at load, even one that lost nothing (<code>mcc: 999</code>): once a value is a number its leading zeros are gone (a YAML 1.1 re-dump turns <code>"001"</code> into <code>1</code>), the AMF cannot know which PLMN was meant, and MNC 70 and 070 are different PLMNs (TS 23.003 §2.2). The AMF used to accept the number and read its digits from the left, so <code>mcc: 1</code> configured MCC 100. A 2-digit MNC is encoded with the filler digit per standard PLMN encoding. The Helm chart refuses a numeric <code>global.plmn</code> on the deploy side with the same rule and renders it quoted (#2069).</li>
 <li><strong>Empty security lists:</strong> if <code>security</code> is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.</li>
 <li><strong>Multiple NRF entries</strong> in <code>sbi.client.nrf</code> are parsed but only the first is used — additional entries are currently inert.</li>
 <li><code>amf.ngap.server[0]</code> and <code>amf.sbi.server[0]</code> are the NGAP and SBI listen addresses (#1311). <code>--ngap-addr</code> and <code>AMF_SBI_ADDR</code>/<code>AMF_SBI_PORT</code> override them; with neither, loopback (#1308). There is no <code>amf.metrics.server</code> (#1312); the metrics endpoint is <code>NEXTGCORE_METRICS_BIND</code>:<code>AMF_METRICS_PORT</code>.</li>
 </ul>
+<h2 id="network-slice-admission-control-1876"><a class="header" href="#network-slice-admission-control-1876">Network Slice Admission Control (#1876)</a></h2>
+<p>With an NSACF configured or discoverable, a registering UE is counted in on each Allowed S-NSSAI with Nnsacf_NSAC_NumOfUEsUpdate INCREASE, and counted out again with DECREASE (TS 23.502 §4.2.11.2). Before #1876 the AMF only ever sent the INCREASE.</p>
+<ul>
+<li><strong>Count-in.</strong> One INCREASE per Allowed S-NSSAI. A denied S-NSSAI (maximum number of UEs reached) is rejected and the registration goes on with the others (#1942, TS 23.502 §4.2.11.2): it leaves the Allowed NSSAI and goes in the Registration Accept’s Rejected NSSAI with cause “S-NSSAI not available in the current registration area”. That is the cause TS 24.501 §5.5.1.2.4 gives a UE without Extended rejected NSSAI support, and this AMF does not offer Extended rejected NSSAI. Only when every S-NSSAI is rejected is the registration rejected, with 5GMM #62 “No network slices available” and the S-NSSAIs in the reject’s Rejected NSSAI (§5.5.1.2.5). An NSACF that is absent, unreachable or answers unexpectedly degrades open: the UE is admitted, but nothing was counted, so nothing is recorded. An INCREASE that got no answer at all may have been applied, so a precautionary DECREASE follows. That DECREASE is not retried.</li>
+<li><strong>Count-out.</strong> A DECREASE on every S-NSSAI the NSACF admitted the UE to, sent to the NSACF that granted it under the same nfId. This happens on every deregistration (UE-initiated, network-initiated, local, implicit), for an S-NSSAI dropped from the Allowed NSSAI by a later registration, and for every admission of a UE whose registration is rejected because no S-NSSAI was admitted.</li>
+<li><strong>Reconciler.</strong> A DECREASE that fails (no answer, a 5xx, a refused token) is parked and retried every 30 s until the NSACF accepts it; a 404 counts as accepted. At most 4096 are kept, and the oldest is evicted and counted <code>abandoned</code>. A parked DECREASE for an (SUPI, access type, S-NSSAI) that has been admitted again since is <code>superseded</code> and not sent: the NSACF counts a UE once, so it would count the live registration out. The set is memory-only, like amfd’s UE contexts. #1945: a DECREASE is bounded by its own 2 s connect and 5 s request timeouts, and an INCREASE waits up to 10 s for one in flight for the same UE and S-NSSAI, so ordinarily the DECREASE lands first. If the NSACF applies it later anyway, for example after the INCREASE stopped waiting, the AMF sends the INCREASE again once the DECREASE ends (<code>amf_nsac_ue_recounts_total</code>); an INCREASE of a UE the NSACF already counts is idempotent. Every DECREASE (immediate, precautionary or reconciled) is registered as in flight in the same step as its check, so a quick re-registration’s INCREASE for the same UE and S-NSSAI waits for it to land first. A DECREASE that finds an INCREASE being decided is not sent: that INCREASE takes the count over and sends the DECREASE afterwards if it does not count the UE (#1940 review). Every DECREASE (immediate, precautionary or reconciled) is registered as in flight in the same step as its check, so a quick re-registration’s INCREASE for the same UE and S-NSSAI waits for it to land first. A DECREASE that finds an INCREASE being decided is not sent: that INCREASE takes the count over and sends the DECREASE afterwards if it does not count the UE (#1940 review).</li>
+</ul>
+<h3 id="nsacf-unreachable-degrade-open-operator-policy-1999"><a class="header" href="#nsacf-unreachable-degrade-open-operator-policy-1999">NSACF unreachable: degrade open (operator policy, #1999)</a></h3>
+<p>TS 23.502 §4.2.11.2 leaves the AMF’s behaviour toward an NSACF that does not answer to operator policy. This AMF’s policy is to <strong>degrade open</strong>: if no NSACF is discoverable, the INCREASE gets no answer (transport error or timeout), the NSACF answers an unexpected status, or it refuses the AMF’s access token, the S-NSSAI is admitted. Nothing was counted, so nothing is counted out later. An INCREASE that may have been applied without an answer gets one precautionary DECREASE. There is no setting to fail closed. An operator that must never exceed a quota while its NSACF is down needs the NSACF to be highly available. Only an explicit denial from the NSACF (403, or a 200 listing the UE in <code>acuFailureList</code>) rejects an S-NSSAI. The rejection is reported once, in that registration’s Accept or Reject: a later Registration Accept that ran no NSAC does not repeat it.</p>
+<h2 id="paging-strategy"><a class="header" href="#paging-strategy">Paging strategy</a></h2>
+<p><code>amf.paging.strategy</code> decides which NG-RAN nodes receive the NGAP PAGING for a CM-IDLE UE. TS 23.501 §5.4.3.1 leaves this to local configuration. The AMF logs the value in effect at startup, as <code>Paging strategy: &lt;value&gt;</code>.</p>
+<ul>
+<li>
+<p><strong><code>registration-area</code></strong> (the default) sends the PAGING to every gNB whose Supported TA List serves the UE’s registration area, on the first attempt and on every T3513 retransmission. This is the behaviour before #1442. The Information on Recommended Cells and RAN Nodes for Paging IE is decoded and not stored. TS 38.413 §8.3.3.2 makes storing it optional (“shall, if supported, store it”), so this is conformant.</p>
+</li>
+<li>
+<p><strong><code>recommended-first</code></strong>:</p>
+<ul>
+<li><strong>Storing.</strong> The AMF stores the <em>Recommended RAN Nodes for Paging</em> (TS 38.413 §9.3.1.101) from the UE CONTEXT RELEASE COMPLETE that moves the UE to CM-IDLE. They are kept in the RAN’s order: visited nodes, most recent first, each followed by its associated non-visited nodes.</li>
+<li><strong>Matching.</strong> A RAN node matches a gNB or ng-eNB by the whole Global RAN Node ID (PLMN, gNB ID and its bit length) it gave at NG Setup. A TAI entry matches the nodes serving that TAI. An N3IWF entry is ignored.</li>
+<li><strong>First attempt.</strong> The PAGING goes only to the recommended nodes that also serve the registration area, in that order. A recommended node outside the area is not paged, because the PAGING names the area’s TAI. TS 23.502 §4.2.3.3: when the information is available the AMF “shall take that information into account”.</li>
+<li><strong>Retransmissions.</strong> Every T3513 retransmission (<code>AMF_T3513_SECS</code>) widens to the whole registration area.</li>
+<li><strong>Falling back.</strong> If the recommendation matches no connected node in the area, the first attempt already pages the whole area. The same applies when the RAN sent no recommendation, and when the release or its IE was unusable.</li>
+<li><strong>Clearing.</strong> The stored list belongs to one idle period. A release whose Complete carries no IE clears it. A CM-IDLE entry with no UE CONTEXT RELEASE COMPLETE also clears it: NG Reset, loss of the gNB’s association, or an Initial Context Setup Failure.</li>
+<li>The <em>Recommended Cells for Paging</em> are transparent to the 5GC (§9.3.1.71) and are not kept. Assistance Data for Recommended Cells is not sent. Paging Attempt Information is sent; see <a href="#paging-attempt-information">Paging Attempt Information</a>.</li>
+</ul>
+</li>
+<li>
+<p><strong><code>nwdaf-mobility</code></strong> (nextgsim#464). TS 23.501 §5.4.3.1: “If NWDAF is deployed, the AMF may also use analytics … on the UE’s mobility as provided by NWDAF”. The AMF is the UE Mobility consumer of TS 23.288 §6.7.2.</p>
+<ul>
+<li><strong>Asking.</strong> When a page is queued for a UE with a SUPI, the AMF sends <code>Nnwdaf_AnalyticsInfo_Request</code> to an NWDAF: <code>GET /nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY&amp;tgt-ue={"supis":[..]}&amp;ana-req={"endTs":now+30s}</code> (TS 29.520 §4.3.2.2.2). Because the window is in the future, the NWDAF returns a prediction.
+<ul>
+<li>There is no <code>startTs</code> (#1504). When it is absent, the period starts at the present time at the NWDAF (TS 29.520 Table 5.1.6.2.7-1), so the window starts at the NWDAF’s present and is a prediction, unless the NWDAF’s clock runs 30 s or more ahead of the AMF’s. In that case <code>endTs</code> is already past at the NWDAF, and it answers statistics, which the AMF does not page as a prediction (see the statistics case under <strong>Falling back</strong>). A <code>startTs</code> of the AMF’s now would be wrong. It is written in whole seconds and is already past when the request arrives. With a future <code>endTs</code>, that period starts in the past and ends in the future. TS 29.520 §4.3.2.2.2 requires the NWDAF to reject such a period with <code>400 BOTH_STAT_PRED_NOT_ALLOWED</code>.</li>
+<li>The NWDAF is found in the discovery cache, then by NRF discovery for <code>nnwdaf-analyticsinfo</code>, then through <code>NWDAF_SBI_ADDR</code>/<code>NWDAF_SBI_PORT</code>.</li>
+<li>The request carries an OAuth2 token when <code>sbi.oauth2</code> is configured.</li>
+<li>The query runs off the NGAP task.</li>
+</ul>
+</li>
+<li><strong>The NWDAF must serve UE Mobility.</strong> In this repository that means nwdafd built with <code>--features amf-mobility</code> and run with <code>nwdaf.amf_mobility.enabled: true</code> (or demo <code>d441c-amf-mobility</code> mode <code>on</code>). It learns cells from this AMF’s LOCATION_REPORT events, sent on Handover Notify and Path Switch. Without it, nwdafd answers 204 and every page falls back to the registration area, after up to 300 ms.</li>
+<li><strong>Holding.</strong> Only that UE’s <em>first</em> PAGING waits for the answer, for at most <strong>300 ms</strong>, NRF discovery included. The pump does not wait on the NWDAF, and every other page goes out as usual. At most <strong>64</strong> queries are in flight. Past that, a page is released at once to the registration area. A warning is logged at most once every 10 s, with the count of pages it covers.</li>
+<li><strong>First attempt.</strong> The PAGING goes to the connected gNBs that own the predicted cell, then to the gNB that owns the UE’s last known cell, each once and only if it serves the registration area. A gNB owns a cell when its Global gNB ID (PLMN, and gNB ID at its own bit length) equals the NCGI’s PLMN and the leftmost gNB-ID-length bits of the NCI (TS 38.413 §9.3.1.7). The last known cell is paged as well because the NWDAF predicts the most likely <em>next</em> cell: a UE that has not moved since it went idle is still where the AMF last saw it.</li>
+<li><strong>Retransmissions.</strong> Every T3513 retransmission widens to the whole registration area.</li>
+<li><strong>Falling back.</strong> In each of these cases the first attempt pages the whole registration area:
+<ul>
+<li>the UE has no SUPI;</li>
+<li>the 64-query cap is full;</li>
+<li>no NWDAF is found;</li>
+<li>the connection is refused, or there is no answer within 300 ms;</li>
+<li>the answer is not 200 (204: no data);</li>
+<li>the body names no NR cell;</li>
+<li>the body is statistics, not a prediction: no <code>locInfos</code> entry carries a <code>confidence</code>, which TS 29.520 Table 5.1.6.2.11-1 requires of a prediction (#1508). The NWDAF answers statistics when its clock reads the requested period as already past, that is when the AMF’s clock runs 30 s or more behind the NWDAF’s. Keep the two within a few seconds (NTP); a skewed pair counts every page as <code>no_prediction</code>;</li>
+<li>neither the predicted cell nor the last known one is owned by a connected gNB in the area;</li>
+<li>the answer arrives after the first PAGING. A late answer is not used for that page.</li>
+</ul>
+</li>
+<li><strong>RAN sharing.</strong> A cell whose NCGI carries a broadcast PLMN other than the Global gNB ID’s PLMN matches no gNB, so it falls back as above.</li>
+<li><strong>Observability.</strong> <code>amf_paging_nwdaf_hints_total{outcome}</code>, with outcome <code>predicted</code>, <code>no_prediction</code>, <code>error</code>, <code>timeout</code>, <code>cap_full</code> or <code>late</code>, is exported only under this strategy. The info lines <code>NWDAF UE mobility: ue=&lt;supi&gt; predicted=(&lt;plmn&gt;, 0x&lt;nci&gt;) confidence=&lt;n&gt;%</code> and <code>... &lt;role&gt; cell 0x.. is served by gNB 0x..</code> show the prediction and the gNBs it mapped to.</li>
+<li>Assistance Data for Recommended Cells is not sent. Paging Attempt Information is sent; see <a href="#paging-attempt-information">Paging Attempt Information</a>.</li>
+</ul>
+</li>
+</ul>
+<p>The paging log line keeps its prefix in every mode:</p>
+<ul>
+<li><code>Paging sent to N/M gNB(s) serving the registration area: ...</code>;</li>
+<li><code>... recommended by the RAN in the registration area: ...</code> for a recommended first attempt;</li>
+<li><code>... predicted by NWDAF UE mobility in the registration area: ...</code> for an NWDAF-steered first attempt that pages a predicted gNB;</li>
+<li><code>... at the UE's last known cell in the registration area (no gNB owns the NWDAF prediction): ...</code> when no gNB in the area owns the prediction and only the last known cell’s gNB is paged.</li>
+</ul>
+<h3 id="paging-attempt-information"><a class="header" href="#paging-attempt-information">Paging Attempt Information</a></h3>
+<p>Under <code>recommended-first</code> and <code>nwdaf-mobility</code>, every PAGING carries an <em>Assistance Data for Paging</em> IE holding only <em>Paging Attempt Information</em> (TS 38.413 §9.3.1.69, §9.3.1.72; nextgsim#464). Its fields are:</p>
+<ul>
+<li><strong>Paging Attempt Count</strong>: the attempt number, 1 for the first PAGING. Each T3513 retransmission adds one (TS 38.300 §9.2.5).</li>
+<li><strong>Intended Number of Paging Attempts</strong>: the first attempt plus the T3513 retransmissions (5 by default).</li>
+<li><strong>Next Paging Area Scope</strong>: <code>changed</code> when this attempt pages fewer gNBs than the registration area (a recommended or predicted first attempt), since the next attempt pages the whole area. Otherwise <code>same</code>. It is left out on the last attempt, after which there is no next one.</li>
+</ul>
+<p>Each attempt is a single PDU sent to every gNB paged in that attempt, so they all receive the same value (TS 23.502 §4.2.3.3). Both values stay within INTEGER (1..16). The default <code>registration-area</code> strategy sends no Assistance Data for Paging, and its PAGING is unchanged.</p>
+<h2 id="demo-block"><a class="header" href="#demo-block">Demo block</a></h2>
+<p>amfd reads the shared <code>demo:</code> block at the root of its config file (nextgsim#458). Its <code>enabled</code> key is the process kill switch, and each demo is configured under its own key with <code>enabled</code> and <code>mode</code>. The block is checked against the demos the binary was built with. An unknown key fails startup, as does an unknown mode or a demo whose cargo feature is not built. A default build registers no demo, so any <code>demo.&lt;key&gt;</code> entry there fails startup. With no demo active, amfd is unchanged.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Cargo feature</th><th>Modes</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>d440a-ai-paging</code> (nextgsim#462)</td><td><code>demo-d440a-ai-paging</code></td><td><code>page-all</code>, <code>last-served</code>, <code>ct</code>, <code>lsq</code>, <code>onnx</code> (the gNB’s modes, so one block names the arm in every NF)</td><td>Every mode forces the effective strategy to <code>recommended-first</code> and supersedes <code>paging.strategy</code>; amfd logs <code>[demo:d440a-ai-paging] Paging strategy: ...</code> at startup. The prediction is the gNB’s: amfd follows the RAN’s recommendation, and under <code>page-all</code> the gNB sends none, so the area is paged from attempt 1. Adds <code>[demo:d440a-ai-paging] Paging sent to N/M ue=&lt;supi&gt; scope=&lt;recommended|registration-area&gt; targets=[gNB 0x..] attempt K</code> and <code>... page answered ue=&lt;supi&gt; via gNB 0x.. attempt K</code> lines, and <code>amf_paging_attempts_total{scope}</code>. It cannot run beside <code>d440c-nwdaf-paging</code>: both at once fail startup (<code>PagingDemoConflict</code>).</td></tr>
+<tr><td><code>d440c-nwdaf-paging</code> (nextgsim#464)</td><td><code>demo-d440c-nwdaf-paging</code></td><td><code>nwdaf-mobility</code>, <code>registration-area</code></td><td>The mode sets the effective paging strategy and supersedes <code>paging.strategy</code>; amfd logs <code>[demo:d440c-nwdaf-paging] Paging strategy: ...</code> at startup. Adds <code>[demo:d440c-nwdaf-paging] Paging sent to N/M ue=&lt;supi&gt; scope=&lt;scope&gt; targets=[gNB 0x..] attempt K</code> and <code>... page answered ue=&lt;supi&gt; via gNB 0x.. attempt K</code> lines. On an NWDAF-steered first attempt, the PAGING carries the last known cell (as visited) and then the predicted cell as Assistance Data for Recommended Cells. When the AMF knows no last cell, the list holds only the predicted cell: a non-visited cell with no visited cell before it, which §9.3.1.71 does not describe. This is <strong>non-normative</strong>: TS 38.413 §9.3.1.71 makes that IE transparent to the 5GC. <code>ran-recommendation</code> is not accepted yet (<code>UnknownMode</code>).</td></tr>
+</tbody>
+</table>
+</div>
+<p>When a demo is active, amfd logs <code>WARN DEMO MODE ACTIVE: &lt;key&gt;=&lt;mode&gt;</code> and exports <code>nextg_demo_enabled{demo,mode} 1</code> on <code>/metrics</code>. The demo switches only by config plus restart.</p>
 <h2 id="unauthenticated-emergency-service"><a class="header" href="#unauthenticated-emergency-service">Unauthenticated emergency service</a></h2>
 <blockquote>
 <p><strong>Set this key deliberately.</strong> <code>amf.emergency.allow_unauthenticated</code> decides whether an emergency call connects when the AMF cannot authenticate the caller. In some jurisdictions the answer is legally mandatory; in others the feature is forbidden. The shipped default is <code>true</code>, and it is not the right value everywhere.</p>
@@ -338,7 +436,7 @@ amf:
 <li><strong>No UDM, PCF or NSACF interaction.</strong> TS 23.502 §4.12.2.3: “if the UE was not successfully authenticated, the AMF shall not update the UDM … the AMF shall not check for access restrictions, regional restrictions or subscription restrictions”, and AM/UE policy “are not required for Emergency Registration”. So no subscription is fetched and no SUPI is registered at the UECM.</li>
 <li><strong>No Allowed NSSAI</strong> is sent in the Registration Accept (same clause).</li>
 <li>The Registration Accept reports the UE <strong>Emergency registered</strong> (TS 24.501 §9.11.3.6 octet 3 bit 6).</li>
-<li><strong>Only the emergency DNN is reachable.</strong> A PDU session request on any other DNN is refused with 5GMM/5GSM cause #29, per TS 23.501 §5.16.4.9a (“the network shall reject any PDU Session Establishment request for normal service from the UE on this Access Type”).</li>
+<li><strong>Only emergency PDU sessions.</strong> A UE registered for emergency services, authenticated or not, may establish only emergency PDU sessions (TS 23.501 §5.16.4.9a: “the network shall reject any PDU Session Establishment request for normal service from the UE on this Access Type”). A request whose Request type is not “initial emergency request” or “existing emergency PDU session” is sent back before an SMF is selected. The answer is a DL NAS TRANSPORT carrying the 5GSM message and 5GMM cause #90 “payload was not forwarded” (TS 24.501 §5.4.5.2.5 a) 20), §5.4.5.3.1 case e); #2041). An emergency request, “initial emergency request” or “existing emergency PDU session”, goes to the SMF on the emergency DNN and <code>emergency.s_nssai</code>, whatever the UE named (§5.4.5.2.5 a) v), vii), viii)).</li>
 <li>The UE security capabilities conveyed to the gNB are <strong>narrowed to the null set</strong> (TS 33.501 §6.7.3.6).</li>
 </ul>
 <p><strong><code>false</code>: refuse.</strong> The registration is rejected and the UE released, exactly as an ordinary registration with an unreachable AUSF would be. Set this where local regulation forbids unauthenticated emergency service — TS 33.501 §5.1.2: “Serving networks located in regions where unauthenticated emergency services are forbidden shall not support this feature.”</p>

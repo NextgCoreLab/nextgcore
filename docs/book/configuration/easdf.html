@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -259,6 +259,20 @@ refused</strong>, with a warning: the EASDF would have to ask a resolver to find
 <code>-m/--no-color</code>, <code>--sbi-addr</code>, <code>--sbi-port</code>, <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code>, <code>--nrf-uri</code>,
 <code>--nf-instance-id</code>, <code>--enabled</code>, <code>--max-dns-contexts</code> (default 4096, and also the ceiling on stored
 baseline patterns), and — with <code>dns-udp</code> — <code>--dns-udp-addr</code> and <code>--dns-udp-port</code>.</p>
+<h2 id="sbi-security-profile-1677"><a class="header" href="#sbi-security-profile-1677">SBI security profile (#1677)</a></h2>
+<p>The SBI listener follows <code>NEXTGCORE_SBI_PROFILE</code>, as the core NFs do. The default is <code>production</code>.</p>
+<ul>
+<li><strong><code>production</code>:</strong> the listener uses TLS with the profile’s certificate (<code>NEXTGCORE_SBI_TLS_CERT</code>, <code>_KEY</code>, <code>_CA</code>).
+<ul>
+<li>It requires a client certificate signed by that CA (mTLS), and an NRF-issued access token whose <code>aud</code> is <code>EASDF</code> (TS 33.501 §13.1.0, §13.4.1). The token is checked against the NRF’s JWKS.</li>
+<li>A missing certificate file is a startup error that names the path. The EASDF never falls back to cleartext.</li>
+<li><code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> are overridden by the profile’s paths.</li>
+<li>This is what smfd dials under the same profile, since #1669.</li>
+</ul>
+</li>
+<li><strong><code>dev</code>:</strong> cleartext h2c, with no client-certificate or token check. <code>--tls</code> still serves TLS with <code>--tls-cert</code>/<code>--tls-key</code> (default <code>/etc/nextgcore/tls/server.{crt,key}</code>), still without mTLS or tokens.</li>
+</ul>
+<p>The EASDF’s own NRF calls (registration and heartbeat) carry an access token for the NRF under <code>production</code>.</p>
 <h2 id="port-53-needs-a-capability"><a class="header" href="#port-53-needs-a-capability">Port 53 needs a capability</a></h2>
 <p>Binding UDP/53 requires <code>CAP_NET_BIND_SERVICE</code> or root. A <strong>bind failure is fatal</strong>: the operator
 compiled the feature in and named the port, so starting without the listener would be an EASDF that

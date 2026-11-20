@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -214,7 +214,7 @@ hss:
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>db_uri</code> (top level)</td><td>string</td><td>none</td><td>MongoDB URI of the subscriber store, used when <code>--db-uri</code> is not given. Connection is retried 5 times, 2 s apart, then startup fails.</td></tr>
+<tr><td><code>db_uri</code> (top level)</td><td>string</td><td>none</td><td>MongoDB URI of the subscriber store, used when <code>--db-uri</code> is not given. Connection is retried 5 times, 2 s apart, then startup fails (about 13 s). When the URI sets no <code>serverSelectionTimeoutMS</code> / <code>connectTimeoutMS</code>, nextgcore-dbi sets each to 1000 ms instead of the driver’s 30 s (#1462), so each attempt, and each runtime read against a store that has gone away, fails within about 1 s; a value the URI sets is kept.</td></tr>
 <tr><td><code>hss.diameter.identity</code></td><td>string</td><td><code>hss.epc.mnc001.mcc001.3gppnetwork.org</code></td><td>Origin-Host.</td></tr>
 <tr><td><code>hss.diameter.realm</code></td><td>string</td><td><code>epc.mnc001.mcc001.3gppnetwork.org</code></td><td>Origin-Realm (TS 23.003 §19.2 format).</td></tr>
 <tr><td><code>hss.diameter.addr</code> / <code>.port</code></td><td>string / u16</td><td><code>0.0.0.0</code> / <code>3868</code></td><td>S6a listen address and port.</td></tr>

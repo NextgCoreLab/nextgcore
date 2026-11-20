@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -206,7 +206,7 @@ scp:
         port: 7777
     client:
       nrf:
-        - uri: http://172.22.0.10:7777
+        - uri: https://172.22.0.10:7777
     # TLS configuration (G36: SBI TLS)
     tls:
       enabled: false
@@ -278,6 +278,9 @@ scp:
 <p><strong>Routing precedence</strong> (<code>ScpProxy::route</code>, TS 29.500 §6.10.2 per code comment): a <code>3gpp-Sbi-Callback</code> notification wins first (see below); then a valid <code>3gpp-Sbi-Target-apiRoot</code> (Model C); otherwise a <code>3gpp-Sbi-Routing-Binding</code> matching a cached <code>3gpp-Sbi-Binding</code> learnt from an earlier producer response (§6.12 stickiness, with NF-set-level reselection per §5.2.3.2.6); otherwise any <code>3gpp-Sbi-Discovery-*</code> header triggers Model D. A request with none of these — or an unparsable Target-apiRoot — is rejected <strong>400</strong> ProblemDetails, cause <code>MANDATORY_IE_MISSING</code>.</p>
 </li>
 <li>
+<p><strong>Caller-identity headers are the SCP’s own</strong> (#2080). <code>x-forwarded-client-cert</code> and <code>x-caller-supi</code> are never forwarded as the consumer sent them. <code>3gpp-Sbi-Consumer-Info</code> is not one of them: it is TS 29.500 §5.2.3.3.7 consumer information (supported services, API versions and features, accepted encodings, callback roots), not an identity claim, and is forwarded as sent (#2103). When the consumer presented a client certificate that the SCP verified, the SCP sets <code>x-forwarded-client-cert: Hash=&lt;SHA-256&gt;;Cert="&lt;URL-encoded PEM&gt;"</code> for that certificate, which is the form nrfd believes from a declared terminator (#1990). Without one, no XFCC is sent.</p>
+</li>
+<li>
 <p><strong>Callbacks / notifications</strong> (TS 29.500 §6.10.7 per code comment): a request carrying <code>3gpp-Sbi-Callback</code> is routed straight to its callback URI with <strong>no discovery query and no access-token acquisition</strong> — the destination is fixed by the consumer that registered the callback, so discovering a producer for it would address the wrong node and minting a token would be an NRF round-trip for a credential the callback target never asked for. The header outranks <code>Routing-Binding</code> and the <code>Discovery-*</code> headers; it is <em>not</em> in competition with <code>Target-apiRoot</code>, which supplies the address while the callback header decides the mode. The <code>3gpp-Sbi-Callback</code> header itself is forwarded to the target (it identifies the message as a notification), and a callback is not treated as retargeting, so no <code>Location</code> fix-up is applied.</p>
 <blockquote>
 <p><strong>Conveyance limitation.</strong> In practice the callback destination must come from <code>3gpp-Sbi-Target-apiRoot</code>: the shared SBI server records only the request <em>path</em>, so an absolute callback URI does not survive the hop into the SCP’s routing. A callback naming no resolvable destination logs a warning and falls through to ordinary routing rather than being rejected, so a deployment whose notifications currently reach their target via the Discovery headers is not regressed. Tracked as issue #259.</p>
@@ -321,7 +324,13 @@ scp:
 <p>A reselected producer reports <strong>its own</strong> <code>3gpp-Sbi-Producer-Id</code>, not the originally selected one’s. Model C and binding-stickiness forwarding have no alternates, so a single pinned target keeps its previous mapping (<strong>502</strong> refused / <strong>504</strong> timeout).</p>
 </li>
 <li>
+<p><strong>Forwarding transport follows <code>NEXTGCORE_SBI_PROFILE</code></strong> (#1868, TS 33.501 §13.1.0). Under <strong>production</strong> (the default) every forwarded request goes over <code>https</code>: the producer is verified against the profile CA (<code>NEXTGCORE_SBI_TLS_CA</code>) and the SCP presents its own client certificate (<code>NEXTGCORE_SBI_TLS_CLIENT_CERT</code> / <code>_KEY</code>), so an mTLS producer accepts it. An <code>http</code> target is never dialled: a pinned one (Model C <code>3gpp-Sbi-Target-apiRoot</code>, a callback URI, a learnt binding) is <strong>400</strong> <code>MANDATORY_IE_INCORRECT</code>, and a discovered one (Model D) is skipped so reselection moves to the next candidate. A callback addressed by a bare authority is dialled over <code>https</code>. The consumer’s <code>Authorization</code> in Model C (TS 33.501 §13.4.1.2) and a delegated token in Model D therefore only travel over TLS. Under <strong>dev</strong> each target’s own scheme is used, as before, and the startup log says a bearer can then be forwarded in cleartext.</p>
+</li>
+<li>
 <p><strong>Delegated OAuth2</strong>: when an NRF URI is known, the SCP acts as an OAuth2 client of NF type <code>SCP</code> and attaches producer-scoped access tokens on the Model D path; a token the NRF refuses yields <strong>403</strong> <code>ACCESS_TOKEN_DENIED</code>, and a producer <code>401</code> with a Bearer <code>WWW-Authenticate</code> challenge triggers one token-retry (TS 29.500 §6.10.11.2.3 per code comment). Model C requests are forwarded with the consumer’s own <code>Authorization</code> untouched.</p>
+</li>
+<li>
+<p><strong>Delegated tokens and resource scopes</strong> (#1811): with no <code>3gpp-Sbi-Access-Scope</code>, the SCP asks for the service scope plus the resource scope the operation needs (e.g. <code>nudr-dr:subscription-data:authentication-subscription:read</code>). A token minted for the consumer’s own CCA-attested identity carries what the NRF grants that consumer. An SCP-attested token, used when the consumer sends no <code>3gpp-Sbi-Client-Credentials</code>, carries what the NRF grants the SCP. The UDR grants the SCP <code>nudr-dr</code> only, so a UDM reaching the UDR’s AuthenticationSubscription through Model D without its own CCA is refused 403. No shipped stack does this, since udmd calls the UDR directly. <code>ScpProxyConfig::trust_requester_identity</code> (code-only, default off, no YAML or CLI knob) would name the consumer in the token request unattested. That lets any SCP client claim to be a UDM and obtain a K-read token, so it must stay off wherever the NRF does not authenticate token requesters.</p>
 </li>
 <li>
 <p><strong>Response relay</strong> (TS 29.500 §6.10.3.4 / §6.10.4 per code comments): on a <strong>2xx</strong>, the SCP surfaces the producer it selected in <code>3gpp-Sbi-Producer-Id</code> (<code>nfinst=&lt;uuid&gt;[; nfset=&lt;set-id&gt;]</code>) and its NF group in <code>3gpp-Sbi-Target-Nf-Group-Id</code>. Three properties worth knowing:</p>
