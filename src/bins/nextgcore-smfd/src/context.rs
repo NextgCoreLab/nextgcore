@@ -2089,6 +2089,13 @@ pub struct SmfContext {
     ipv6_hash: RwLock<HashMap<[u8; 8], u64>>,
     /// SMF N4 SEID -> Session ID hash
     smf_n4_seid_hash: RwLock<HashMap<u64, u64>>,
+    /// The S5/S8-C TEID this node advertised (`SmfSess::smf_n4_teid`) -> Session
+    /// ID (#2157). A GTPv2-C TEID is 32 bits and the N4 SEID 64: once a boot
+    /// epoch moves `n4_seid_generator` past 2^32 (`begin_boot_epoch`, whenever
+    /// durable state is armed) the TEID is the SEID's low half, so looking the
+    /// TEID up as a SEID found no session and every S5/S8 request after Create
+    /// Session was answered Context Not Found. Lock order: after `smf_n4_seid_hash`.
+    smf_n4_teid_hash: RwLock<HashMap<u32, u64>>,
     /// N1N2 message location -> Session ID hash
     n1n2message_hash: RwLock<HashMap<String, u64>>,
     /// TMGI -> MBS Session ID hash - Rel-17
@@ -2300,6 +2307,7 @@ impl SmfContext {
             ipv4_hash: RwLock::new(HashMap::new()),
             ipv6_hash: RwLock::new(HashMap::new()),
             smf_n4_seid_hash: RwLock::new(HashMap::new()),
+            smf_n4_teid_hash: RwLock::new(HashMap::new()),
             n1n2message_hash: RwLock::new(HashMap::new()),
             tmgi_hash: RwLock::new(HashMap::new()),
             next_ue_id: AtomicUsize::new(1),
@@ -3120,6 +3128,7 @@ impl SmfContext {
         heal(&self.ipv4_hash, "ipv4_hash");
         heal(&self.ipv6_hash, "ipv6_hash");
         heal(&self.smf_n4_seid_hash, "smf_n4_seid_hash");
+        heal(&self.smf_n4_teid_hash, "smf_n4_teid_hash");
         heal(&self.n1n2message_hash, "n1n2message_hash");
         heal(&self.tmgi_hash, "tmgi_hash");
         heal(&self.pfcp_sessions, "pfcp_sessions");
@@ -3140,6 +3149,20 @@ impl SmfContext {
     /// Generate next N4 SEID
     fn next_n4_seid(&self) -> u64 {
         self.n4_seid_generator.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// The next N4 SEID whose low 32 bits make a usable S5/S8-C TEID (#2157):
+    /// not 0, which TS 29.274 §5.5.2 reserves for a message whose peer TEID is
+    /// not yet known (and which a boot epoch's first SEID, `epoch << 32`, would
+    /// otherwise yield), and not one a live session already advertises.
+    fn next_n4_seid_with_teid(&self, teids: &HashMap<u32, u64>) -> u64 {
+        loop {
+            let seid = self.next_n4_seid();
+            let teid = seid as u32;
+            if teid != 0 && !teids.contains_key(&teid) {
+                return seid;
+            }
+        }
     }
 
     // ========================================================================
@@ -3261,6 +3284,9 @@ impl SmfContext {
         if let Ok(mut smf_n4_seid_hash) = self.smf_n4_seid_hash.write() {
             smf_n4_seid_hash.clear();
         }
+        if let Ok(mut smf_n4_teid_hash) = self.smf_n4_teid_hash.write() {
+            smf_n4_teid_hash.clear();
+        }
         if let Ok(mut n1n2message_hash) = self.n1n2message_hash.write() {
             n1n2message_hash.clear();
         }
@@ -3330,6 +3356,7 @@ impl SmfContext {
     pub fn sess_add_by_psi(&self, smf_ue_id: u64, psi: u8) -> Option<SmfSess> {
         let mut sess_list = self.sess_list.write().ok()?;
         let mut smf_n4_seid_hash = self.smf_n4_seid_hash.write().ok()?;
+        let mut smf_n4_teid_hash = self.smf_n4_teid_hash.write().ok()?;
         let mut smf_ue_list = self.smf_ue_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
@@ -3342,7 +3369,7 @@ impl SmfContext {
 
         let id = self.next_sess_id.fetch_add(1, Ordering::SeqCst) as u64;
         let index = self.sess_index.fetch_add(1, Ordering::SeqCst) as u32;
-        let n4_seid = self.next_n4_seid();
+        let n4_seid = self.next_n4_seid_with_teid(&smf_n4_teid_hash);
 
         let mut sess = SmfSess::new(id, index, smf_ue_id);
         sess.psi = psi;
@@ -3352,6 +3379,7 @@ impl SmfContext {
         sess.charging.id = index;
 
         smf_n4_seid_hash.insert(n4_seid, id);
+        smf_n4_teid_hash.insert(sess.smf_n4_teid, id);
         sess_list.insert(id, sess.clone());
 
         // Add session ID to UE
@@ -3367,6 +3395,7 @@ impl SmfContext {
     pub fn sess_add_by_apn(&self, smf_ue_id: u64, apn: &str, rat_type: u8) -> Option<SmfSess> {
         let mut sess_list = self.sess_list.write().ok()?;
         let mut smf_n4_seid_hash = self.smf_n4_seid_hash.write().ok()?;
+        let mut smf_n4_teid_hash = self.smf_n4_teid_hash.write().ok()?;
         let mut smf_ue_list = self.smf_ue_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
@@ -3379,7 +3408,7 @@ impl SmfContext {
 
         let id = self.next_sess_id.fetch_add(1, Ordering::SeqCst) as u64;
         let index = self.sess_index.fetch_add(1, Ordering::SeqCst) as u32;
-        let n4_seid = self.next_n4_seid();
+        let n4_seid = self.next_n4_seid_with_teid(&smf_n4_teid_hash);
 
         let mut sess = SmfSess::new(id, index, smf_ue_id);
         sess.epc = true;
@@ -3390,6 +3419,7 @@ impl SmfContext {
         sess.charging.id = index;
 
         smf_n4_seid_hash.insert(n4_seid, id);
+        smf_n4_teid_hash.insert(sess.smf_n4_teid, id);
         sess_list.insert(id, sess.clone());
 
         // Add session ID to UE
@@ -3415,6 +3445,7 @@ impl SmfContext {
             // Now remove the session itself
             let mut sess_list = self.sess_list.write().ok()?;
             let mut smf_n4_seid_hash = self.smf_n4_seid_hash.write().ok()?;
+            let mut smf_n4_teid_hash = self.smf_n4_teid_hash.write().ok()?;
             let mut ipv4_hash = self.ipv4_hash.write().ok()?;
             let mut ipv6_hash = self.ipv6_hash.write().ok()?;
             let mut n1n2message_hash = self.n1n2message_hash.write().ok()?;
@@ -3423,6 +3454,9 @@ impl SmfContext {
             match sess_list.remove(&id) {
                 Some(sess) => {
                     smf_n4_seid_hash.remove(&sess.smf_n4_seid);
+                    if smf_n4_teid_hash.get(&sess.smf_n4_teid) == Some(&id) {
+                        smf_n4_teid_hash.remove(&sess.smf_n4_teid);
+                    }
 
                     if let Some(addr) = sess.ipv4_addr {
                         ipv4_hash.remove(&u32::from(addr));
@@ -3486,8 +3520,16 @@ impl SmfContext {
     }
 
     /// Find session by TEID
+    /// Find the session that advertised `teid` as its S5/S8-C TEID (#2157: by the
+    /// TEID itself, not as a SEID, which differs from it once a boot epoch has
+    /// moved the SEIDs past 2^32).
     pub fn sess_find_by_teid(&self, teid: u32) -> Option<SmfSess> {
-        self.sess_find_by_seid(teid as u64)
+        // Lock order sess_list < smf_n4_teid_hash (matches sess_add_*/sess_remove).
+        let sess_list = self.sess_list.read().ok()?;
+        let smf_n4_teid_hash = self.smf_n4_teid_hash.read().ok()?;
+        smf_n4_teid_hash
+            .get(&teid)
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     /// Find session by SEID
@@ -4672,6 +4714,52 @@ mod tests {
 
         ctx.sess_remove(sess.id);
         assert_eq!(ctx.sess_count(), 0);
+    }
+
+    /// **#2157**: after a boot epoch (`begin_boot_epoch`, run whenever durable
+    /// state is armed) the N4 SEIDs sit above 2^32, so the S5/S8-C TEID a PGW-C
+    /// session advertises is the SEID's low half. The session must still be found
+    /// by that TEID, the epoch's first SEID (`epoch << 32`, low half 0) must not
+    /// hand out TEID 0, and the TEID index must follow removal.
+    ///
+    /// Found by shuffle seed 7: `a_restored_session_without_its_endpoint_recovers
+    /// _it_from_the_upf` arms durable state, and every PGW-C test after it got
+    /// "the established session must be findable by the TEID it advertised".
+    ///
+    /// REVERT-VERIFIED: with `sess_find_by_teid` looking the TEID up as a SEID
+    /// again, "found by its advertised TEID" fails; with `next_n4_seid_with_teid`
+    /// not skipping a zero low half, "never TEID 0" fails.
+    #[test]
+    fn an_epc_session_is_found_by_its_teid_after_a_boot_epoch_2157() {
+        let mut ctx = SmfContext::new();
+        ctx.init(100, 200, 400);
+        ctx.begin_boot_epoch(0);
+        let ue = ctx.ue_add_by_imsi(&[0x00, 0x10, 0x10]).unwrap();
+        let first = ctx.sess_add_by_apn(ue.id, "internet", 6).unwrap();
+        let second = ctx.sess_add_by_apn(ue.id, "ims", 6).unwrap();
+        assert!(
+            first.smf_n4_seid > u64::from(u32::MAX),
+            "the epoch is in the high half"
+        );
+        assert_ne!(first.smf_n4_teid, 0, "never TEID 0");
+        assert_eq!(first.smf_n4_teid, first.smf_n4_seid as u32);
+        for sess in [&first, &second] {
+            assert_eq!(
+                ctx.sess_find_by_teid(sess.smf_n4_teid).map(|s| s.id),
+                Some(sess.id),
+                "found by its advertised TEID"
+            );
+            assert_eq!(
+                ctx.sess_find_by_seid(sess.smf_n4_seid).map(|s| s.id),
+                Some(sess.id)
+            );
+        }
+        ctx.sess_remove(first.id);
+        assert!(ctx.sess_find_by_teid(first.smf_n4_teid).is_none());
+        assert_eq!(
+            ctx.sess_find_by_teid(second.smf_n4_teid).map(|s| s.id),
+            Some(second.id)
+        );
     }
 
     #[test]

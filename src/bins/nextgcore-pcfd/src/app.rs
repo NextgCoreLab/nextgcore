@@ -8249,9 +8249,9 @@ mod tests {
         );
         assert_eq!(
             body["resourceUri"],
-            serde_json::json!(format!(
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
                 "/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}"
-            )),
+            ))),
             "and names the association it re-authorises"
         );
         let chg = body["smPolicyDecision"]["chgDecs"]
@@ -10720,7 +10720,9 @@ mod tests {
         // triggers: []} with no resourceUri at all.
         assert_eq!(
             update["resourceUri"],
-            format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-am-policy-control/v1/policies/{pol_id}"
+            )),
             "PolicyUpdate.resourceUri: {update}"
         );
         assert_eq!(
@@ -12426,7 +12428,9 @@ mod tests {
         );
         assert_eq!(
             got[0].1["resourceUri"],
-            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{ims}"))
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{ims}"
+            )))
         );
 
         assert_eq!(
@@ -12524,7 +12528,9 @@ mod tests {
         );
         assert_eq!(
             got[0].1["resourceUri"],
-            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{v6_only}"))
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{v6_only}"
+            )))
         );
 
         assert_eq!(
@@ -15017,7 +15023,9 @@ mod tests {
         assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/13/update");
         assert_eq!(
             got[0].1["resourceUri"],
-            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"))
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{pol}"
+            )))
         );
         assert_eq!(
             sess_rule_1383(&got[0].1["smPolicyDecision"]),
@@ -15119,7 +15127,9 @@ mod tests {
         assert_eq!(
             got[0].1,
             serde_json::json!({
-                "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+                "resourceUri": crate::sbi_path::expected_resource_uri_for_test(&format!(
+                    "/npcf-smpolicycontrol/v1/sm-policies/{pol}"
+                )),
                 "smPolicyDecision": { "pcscfRestIndication": true },
             }),
             "the restoration request, and no re-sent policy"

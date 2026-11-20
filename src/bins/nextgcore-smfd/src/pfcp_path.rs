@@ -5483,9 +5483,15 @@ mod tests {
     async fn the_smf_recovery_time_stamp_is_ntp_seconds() {
         let (client, _upf) = make_client_with_peer().await;
         let now = nextgcore_pfcp::recovery_time::now();
+        // The stamp is the process's, taken at its first use (#974 review m7), so
+        // it is not "within a minute of now": #2157, under shuffle seed 7 that first
+        // use came from a sibling more than 60 s before this ran. What is NTP-era
+        // here is the epoch: Unix seconds are 2_208_988_800 behind, so a day's
+        // slack still tells the two apart.
+        assert_eq!(client.recovery_time_stamp, smf_recovery_time_stamp());
         assert!(
-            now.wrapping_sub(client.recovery_time_stamp) < 60,
-            "{}",
+            now.wrapping_sub(client.recovery_time_stamp) < 86_400,
+            "{} is not NTP-era seconds of this run (now {now})",
             client.recovery_time_stamp
         );
     }

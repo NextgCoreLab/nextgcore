@@ -3147,6 +3147,34 @@ pub fn pcf_self_info_for(
     })
 }
 
+/// #2157: the `resourceUri` a test should expect the PCF to emit for `path`:
+/// the complete URI (`{apiRoot}{path}`, TS 29.501 §4.4.1) once an identity is
+/// published, else the bare path.
+///
+/// [`PCF_SELF_INFO`] is set-once, and
+/// `a_binding_that_lands_after_its_policy_went_is_deregistered_1877` publishes
+/// it (the BSF binding needs it), so it cannot be cleared again. Tests that
+/// pinned the bare path failed whenever they ran after that one: 2 under
+/// shuffle seed 7, 7 under 42. The expectation follows the global instead. It
+/// is checked against an independent spelling: with no identity it is exactly
+/// `path`; with one it is `http(s)://` + host + `:` + port + `path`.
+#[cfg(test)]
+pub(crate) fn expected_resource_uri_for_test(path: &str) -> String {
+    let uri = pcf_resource_uri(path);
+    match pcf_self_info() {
+        None => assert_eq!(uri, path),
+        Some(info) => {
+            let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
+            let rest = format!("://{host}:{}{path}", info.sbi_port);
+            assert!(
+                uri == format!("http{rest}") || uri == format!("https{rest}"),
+                "{uri} is not the apiRoot of {info:?} followed by {path}"
+            );
+        }
+    }
+    uri
+}
+
 /// The published PCF identity, if `main` (or a test) has set it.
 pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
     PCF_SELF_INFO.get()
@@ -3529,7 +3557,8 @@ mod tests {
             "the SMF must receive a terminate for an association the PCF cannot serve"
         );
         assert_eq!(
-            seen_bodies[0]["resourceUri"], "/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire",
+            seen_bodies[0]["resourceUri"],
+            expected_resource_uri_for_test("/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire"),
             "TS 29.512 TerminationNotification names the resource the SMF holds, body was {:?}",
             seen_bodies[0]
         );

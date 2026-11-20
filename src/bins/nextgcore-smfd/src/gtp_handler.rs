@@ -1906,21 +1906,21 @@ async fn create_session(
 ///
 /// GTPv2-C addresses a session by the TEID in the header, which the peer learned from the
 /// F-TEID this node sent in its Create Session Response — and that F-TEID carries
-/// `sess.smf_n4_teid`, which `sess_add_by_*` sets equal to the N4 SEID. So the lookup is by
-/// SEID, via `sess_find_by_teid`.
+/// `sess.smf_n4_teid`, which `sess_add_by_*` sets to the N4 SEID's low 32 bits. The lookup
+/// is by that TEID, via `sess_find_by_teid`'s own index (#2157: not as a SEID, which differs
+/// from it once a boot epoch has moved the SEIDs past 2^32).
 ///
 /// The TEID is `Option` because TS 29.274 §5.5.1 makes it absent on the path-management
 /// messages (Echo, Version Not Supported). A session procedure that arrives without one is
 /// malformed and names no session, so `None` propagates rather than being defaulted to 0.
 ///
-/// **What that guard is and is not worth.** It is defence in depth, not a live fix: SEID 0 is
-/// never handed out, because `context.rs`'s `n4_seid_generator` starts at 1, so today a
-/// defaulted 0 would fail to match anyway. It is written this way because the safety of
-/// `unwrap_or(0)` rests on that initial value, and a generator that ever started at 0 would
-/// silently turn a malformed request into a teardown of an unrelated subscriber. Stated
-/// rather than tested: a test would have to reach into a private field to occupy SEID 0, and
-/// asserting on a state the allocator cannot produce would be asserting on the test's own
-/// fixture.
+/// **What that guard is and is not worth.** It is defence in depth, not a live fix: TEID 0 is
+/// never handed out (`context.rs`'s `next_n4_seid_with_teid` skips it; before #2157 a boot
+/// epoch's first SEID, `epoch << 32`, did yield it), so today a defaulted 0 would fail to
+/// match anyway. It is written this way because the safety of `unwrap_or(0)` rests on that
+/// allocator rule, and an allocator that ever handed out 0 would silently turn a malformed
+/// request into a teardown of an unrelated subscriber. The allocator rule is tested in
+/// `context.rs` (`an_epc_session_is_found_by_its_teid_after_a_boot_epoch_2157`).
 ///
 /// `None` means this PGW-C holds no such session: TS 29.274 §7.7's `ContextNotFound` is the
 /// answer, not a drop.
