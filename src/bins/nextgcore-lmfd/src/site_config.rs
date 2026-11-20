@@ -111,14 +111,17 @@ fn parse_ng_ran_node(entry: &serde_yaml::Value) -> Result<NgRanNode, String> {
             })
             .map(|s| s.trim().to_string())
     };
-    let mcc = text("mcc").ok_or("missing 'mcc'")?;
-    let mnc = text("mnc").ok_or("missing 'mnc'")?;
-    if mcc.len() != 3 || !mcc.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!("mcc '{mcc}' is not three digits"));
-    }
-    if !(2..=3).contains(&mnc.len()) || !mnc.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!("mnc '{mnc}' is not two or three digits"));
-    }
+    // #2115: the PLMN digits must be quoted strings. A YAML number has lost any
+    // leading zeros it had (a YAML 1.1 re-dump turns "070" into 56), so it is
+    // refused rather than read: the node would be addressed in the wrong PLMN.
+    let plmn = |part: nextgcore_core::plmn::PlmnPart| {
+        let value = entry
+            .get(part.key())
+            .ok_or_else(|| format!("missing '{}'", part.key()))?;
+        nextgcore_core::plmn::config_digits(part.key(), part, value)
+    };
+    let mcc = plmn(nextgcore_core::plmn::PlmnPart::Mcc)?;
+    let mnc = plmn(nextgcore_core::plmn::PlmnPart::Mnc)?;
     let gnb = text("gnbId").ok_or("missing 'gnbId'")?;
     let gnb_id = u32::from_str_radix(&gnb, 16).map_err(|_| format!("gnbId '{gnb}' is not hex"))?;
     let bit_length = entry
@@ -409,6 +412,44 @@ lmf:
 
     /// A bad entry is rejected INDIVIDUALLY and named; the rest still load.
     /// Rejecting the file would make one typo cost every cell.
+    /// **#2115** (R41 on #2127): an `ngRanNodes` PLMN must be quoted digits. A
+    /// YAML number is refused even when its length is right (`999`, or `56`
+    /// from a YAML 1.1 re-dump of "070"): its leading zeros are gone. The entry
+    /// is named in `rejected`, and the quoted sibling still loads as written.
+    ///
+    /// REVERT-VERIFIED: with the number read as its digits again
+    /// (`as_u64().map(to_string)`), the `999` and `56` nodes load and the
+    /// `ng_ran_nodes` assertion fails.
+    #[test]
+    fn an_ng_ran_node_plmn_must_be_quoted_digits_2115() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            "lmf:\n  positioning:\n    ngRanNodes:\n      \
+             - { mcc: 999, mnc: \"70\", gnbId: \"000001\" }\n      \
+             - { mcc: \"999\", mnc: 56, gnbId: \"000002\" }\n      \
+             - { mcc: \"1\", mnc: \"01\", gnbId: \"000003\" }\n      \
+             - { mcc: \"001\", mnc: \"070\", gnbId: \"000004\" }\n",
+        )
+        .expect("yaml");
+        let cfg = parse_site_config(&doc);
+        let nodes: Vec<(String, String, u32)> = cfg
+            .ng_ran_nodes
+            .iter()
+            .map(|n| (n.mcc.clone(), n.mnc.clone(), n.gnb_id))
+            .collect();
+        assert_eq!(nodes, [("001".to_string(), "070".to_string(), 4)]);
+        for want in [
+            "lmf.positioning.ngRanNodes[0]: mcc=999 reached the configuration as a number",
+            "lmf.positioning.ngRanNodes[1]: mnc=56 reached the configuration as a number",
+            "lmf.positioning.ngRanNodes[2]: mcc=\"1\": an MCC is 3 digits",
+        ] {
+            assert!(
+                cfg.rejected.iter().any(|r| r.starts_with(want)),
+                "{want}: {:?}",
+                cfg.rejected
+            );
+        }
+    }
+
     #[test]
     fn a_bad_entry_is_named_and_the_rest_still_load() {
         let cfg = parse_site_config(&doc(r#"

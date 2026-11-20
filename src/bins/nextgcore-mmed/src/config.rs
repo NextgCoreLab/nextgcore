@@ -194,11 +194,24 @@ struct MmeYaml {
 /// config cannot take the daemon down. The warning names the file, because the
 /// previous silence is what let this go unnoticed.
 pub fn load_config(ctx: &mut MmeContext, path: &str) -> bool {
+    load_config_checked(ctx, path).unwrap_or_else(|why| {
+        log::error!("{why}");
+        true
+    })
+}
+
+/// [`load_config`], refusing the one outcome its fail-soft contract must not
+/// cover (#2115, R41 on #2127): a file whose `mme.gummei` entries were ALL
+/// dropped, a malformed PLMN among the reasons. The MME would start serving no
+/// GUMMEI and answer every S1 Setup with S1 Setup Failure (TS 36.413
+/// §8.7.3.4). `Err` fails start-up; a file that names no GUMMEI at all is
+/// still accepted, as before.
+pub fn load_config_checked(ctx: &mut MmeContext, path: &str) -> Result<bool, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) => {
             log::warn!("Could not read config file '{path}': {e}. Using defaults.");
-            return false;
+            return Ok(false);
         }
     };
 
@@ -206,21 +219,30 @@ pub fn load_config(ctx: &mut MmeContext, path: &str) -> bool {
         Ok(yaml) => yaml,
         Err(e) => {
             log::warn!("Failed to parse YAML config '{path}': {e}. Using defaults.");
-            return false;
+            return Ok(false);
         }
     };
 
     let Some(mme) = yaml.mme else {
         log::warn!("Config '{path}' has no 'mme' section. Using defaults.");
-        return false;
+        return Ok(false);
     };
 
-    apply(ctx, mme);
+    let dropped_gummei = apply(ctx, mme);
+    if dropped_gummei > 0 && ctx.served_gummei.is_empty() {
+        return Err(format!(
+            "{path}: all {dropped_gummei} mme.gummei entries were refused (no usable PLMN), so \
+             the MME would serve no GUMMEI and fail every S1 Setup (TS 36.413 §8.7.3.4)"
+        ));
+    }
     log::info!("Configuration loaded from {path}");
-    true
+    Ok(true)
 }
 
-fn apply(ctx: &mut MmeContext, mme: MmeSection) {
+/// Apply `mme` to `ctx`. Returns how many GUMMEI entries were dropped for
+/// having no usable PLMN (#2115).
+fn apply(ctx: &mut MmeContext, mme: MmeSection) -> usize {
+    let mut dropped_gummei = 0usize;
     if let Some(name) = mme.mme_name {
         log::info!("MME name: {name}");
         ctx.mme_name = Some(name);
@@ -403,6 +425,7 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
     // Setup (TS 36.413 §8.7.3.4), which is the headline defect in #157.
     for (index, entry) in mme.gummei.unwrap_or_default().into_iter().enumerate() {
         let Some(plmn_id) = usable_plmn_id(&format!("mme.gummei[{index}]"), entry.plmn_id) else {
+            dropped_gummei += 1;
             continue;
         };
         let mme_gid = entry.mme_gid.unwrap_or(0);
@@ -468,6 +491,7 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
             ctx.time.t3423 = value;
         }
     }
+    dropped_gummei
 }
 
 /// Read the freeDiameter `.conf` at `path` into the S6a fields of the context.
@@ -903,6 +927,47 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("mme.tai[1].plmn_id.mcc=\"9999\"")),
             "an ERROR names the 4-digit MCC: {lengths:?}"
+        );
+    }
+
+    /// #2115 (R41 on #2127): when every GUMMEI the file names is refused for its
+    /// PLMN, the checked load (start-up) fails, naming the count and the
+    /// consequence. One usable GUMMEI among refused ones loads as before, and a
+    /// file naming no GUMMEI at all is still accepted.
+    ///
+    /// REVERT-VERIFIED: with the empty-after-refusal check removed, the
+    /// all-refused file loads and the `expect_err` panics.
+    #[test]
+    fn test_a_file_whose_every_gummei_is_refused_fails_start_up_2115() {
+        let refused = write_temp(
+            "nextgcore-mmed-2115-no-gummei.yaml",
+            "mme:\n  gummei:\n    - plmn_id: { mcc: 1, mnc: \"01\" }\n    \
+             - plmn_id: { mcc: \"999\", mnc: 70 }\n",
+        );
+        let err = load_config_checked(&mut MmeContext::new(), refused.to_str().unwrap())
+            .expect_err("no GUMMEI left");
+        assert!(
+            err.contains("all 2 mme.gummei entries were refused (no usable PLMN)"),
+            "{err}"
+        );
+        assert!(err.contains("fail every S1 Setup"), "{err}");
+
+        let one_left = write_temp(
+            "nextgcore-mmed-2115-one-gummei.yaml",
+            "mme:\n  gummei:\n    - plmn_id: { mcc: 1, mnc: \"01\" }\n    \
+             - plmn_id: { mcc: \"999\", mnc: \"70\" }\n",
+        );
+        let mut ctx = MmeContext::new();
+        assert_eq!(
+            load_config_checked(&mut ctx, one_left.to_str().unwrap()),
+            Ok(true)
+        );
+        assert_eq!(ctx.served_gummei[0].plmn_id[0].to_bcd(), "99970");
+
+        let none = write_temp("nextgcore-mmed-2115-none.yaml", "mme:\n  mme_name: x\n");
+        assert_eq!(
+            load_config_checked(&mut MmeContext::new(), none.to_str().unwrap()),
+            Ok(true)
         );
     }
 

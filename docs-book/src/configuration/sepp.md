@@ -102,7 +102,7 @@ From the clap `Args` struct in `src/bins/nextgcore-seppd/src/main.rs`:
 | `--sender` | string | unset | This SEPP's FQDN; when set it is sent as `3gpp-sbi-sender-sepp` on N32-f, otherwise the header is omitted. |
 | `--max-node` | usize | `16` | Maximum peer SEPP nodes in the context pool. |
 | `--max-assoc` | usize | `8192` | Maximum associations in the context pool. |
-| `--serving-plmn` | string, repeatable | empty | Serving PLMN as `mcc:mnc` (e.g. `999:70`); malformed values are warned about and ignored. Used to decide whether a target FQDN is in a *visited* PLMN. |
+| `--serving-plmn` | string, repeatable | empty | Serving PLMN as `mcc:mnc` (e.g. `999:70`): a 3-digit MCC and a 2-3 digit MNC (TS 23.003 §2.2). A malformed value fails the command line (#2115); it used to be warned about and ignored. Used to decide whether a target FQDN is in a *visited* PLMN. |
 | `--prins` | flag | off | Advertise the PRINS security capability in addition to TLS. |
 | `--peer-sepp` | string, repeatable | empty | Peer SEPP as `fqdn=apiroot` (e.g. `sepp.visited.com=http://10.0.0.2:7778`); one N32-c handshake is initiated per entry at startup. Under the `production` SBI profile every apiroot must be `https` (else startup fails), and peers are dialled with this SEPP's client certificate (`--n32-client-cert`/`--n32-client-key`, else `NEXTGCORE_SBI_TLS_CLIENT_*`) verified against `--n32-ca-cert`, else the profile CA, and never the public web roots (#1848). |
 | `--n32-mtls-cacert` | path | unset | CA bundle for verifying peer-SEPP *client* certificates on the N32 listener (mTLS). Falls back to `--n32-ca-cert` if unset. |
