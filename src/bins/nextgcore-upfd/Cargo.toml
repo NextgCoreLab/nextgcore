@@ -6,6 +6,11 @@ authors.workspace = true
 license.workspace = true
 description = "NextGCore UPF (User Plane Function)"
 
+[lib]
+# #2208: the UPF as a library, so other crates' tests can run it in-process.
+name = "nextgcore_upfd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nextgcore-upfd"
 path = "src/main.rs"
