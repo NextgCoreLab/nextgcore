@@ -1752,62 +1752,79 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
     let now = now_unix_secs();
     let mut report = ReconcileReport::default();
 
+    // #2223: the shared bounded per-peer sweep: one leg in flight per producer,
+    // REFRESH_MAX_PRODUCERS producers at once, a producer that does not answer
+    // parked for the rest of the pass, nothing new started after one tick. So a
+    // blackholed AMF costs one request timeout per pass, and the UDM's legs
+    // queued behind it are retried regardless.
+    let mut legs = Vec::new();
     for sub in pending {
         let Some(leg) = sub.pending.clone() else {
             continue;
         };
-        let producer_uri = match leg.producer {
+        let peer = match leg.producer {
             SouthboundProducer::Amf => amf_uri.clone(),
             SouthboundProducer::Udm => udm_uri.clone(),
-        };
-        let req = SouthboundSubscribe {
-            producer: leg.producer,
-            path: leg.path.clone(),
-            body: leg.body.clone(),
-        };
-        match attempt_southbound_subscribe(producer_uri, &req).await {
-            SouthboundOutcome::Live(reference, expiry) => {
-                if let Ok(c) = ctx.read() {
-                    if c.subscription_promote(&sub.id, reference.clone(), Some(expiry)) {
-                        log::info!(
-                            "deferred southbound leg promoted to live: sub={} producer={}",
-                            sub.id,
-                            leg.producer.as_str()
-                        );
-                        report.promoted += 1;
-                        continue;
-                    }
-                }
-                // The AF deleted the subscription while this retry was in flight;
-                // tear the producer-side subscription down rather than orphan it.
-                log::info!(
-                    "subscription {} vanished mid-retry; unsubscribing the producer leg",
-                    sub.id
-                );
-                let uri = match reference.producer {
-                    SouthboundProducer::Amf => amf_uri.clone(),
-                    SouthboundProducer::Udm => udm_uri.clone(),
-                };
-                southbound_unsubscribe(uri, reference).await;
+        }
+        .unwrap_or_else(|| format!("{} (no URI)", leg.producer.as_str()));
+        legs.push((peer, (sub, leg)));
+    }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: REFRESH_MAX_PRODUCERS,
+        budget: refresh_pass_budget(),
+    };
+    let uris = Arc::new((amf_uri, udm_uri));
+    let tried = nextgcore_sbi::sweep::sweep(
+        limits,
+        legs,
+        || (),
+        move |_peer, (sub, leg): (NefMonitoringSubscription, PendingSouthbound), ()| {
+            let uris = uris.clone();
+            async move { retry_pending_leg(&uris, sub, leg).await }
+        },
+    )
+    .await;
+    let mut still_failing: Vec<(NefMonitoringSubscription, PendingSouthbound, String)> = Vec::new();
+    for (_, retried) in tried.done {
+        match retried {
+            RetriedLeg::Promoted => report.promoted += 1,
+            RetriedLeg::Vanished => {}
+            RetriedLeg::NotLive(failing) => still_failing.push(*failing),
+        }
+    }
+    for (_, (sub, leg), why) in tried.skipped {
+        match why {
+            // Its producer did not answer in this pass: as good as tried.
+            nextgcore_sbi::sweep::Skip::PeerParked => {
+                still_failing.push((sub, leg, "its producer did not answer".to_string()))
             }
-            outcome => {
-                // Still unreachable, or now failing outright. Either way the clock
-                // that matters is how long the AF has held an un-notifiable
-                // subscription, so both are treated the same by the deadline.
-                if now.saturating_sub(leg.since) >= deadline {
-                    log::warn!(
-                        "expiring subscription {} after {}s with no southbound leg ({outcome:?})",
-                        sub.id,
-                        now.saturating_sub(leg.since)
-                    );
-                    // #2133: and the AF is told (cancelInd).
-                    remove_and_tell_af(&sub.id);
-                    report.expired += 1;
-                } else {
-                    log::debug!("southbound leg for {} still deferred ({outcome:?})", sub.id);
-                    report.still_pending += 1;
-                }
+            // #2223 (R48): not reached in this pass's budget. Its deadline is
+            // still checked: expiry is local and needs no request, and the pass
+            // order is stable, so a leg at the tail of a slow producer could
+            // otherwise be skipped pass after pass past its deadline, the AF
+            // never told.
+            nextgcore_sbi::sweep::Skip::Budget => {
+                still_failing.push((sub, leg, "not reached within the pass budget".to_string()))
             }
+        }
+    }
+    for (sub, leg, outcome) in still_failing {
+        // Still unreachable, or now failing outright. Either way the clock
+        // that matters is how long the AF has held an un-notifiable
+        // subscription, so both are treated the same by the deadline.
+        if now.saturating_sub(leg.since) >= deadline {
+            log::warn!(
+                "expiring subscription {} after {}s with no southbound leg ({outcome})",
+                sub.id,
+                now.saturating_sub(leg.since)
+            );
+            // #2133: and the AF is told (cancelInd).
+            remove_and_tell_af(&sub.id);
+            report.expired += 1;
+        } else {
+            log::debug!("southbound leg for {} still deferred ({outcome})", sub.id);
+            report.still_pending += 1;
         }
     }
     if report != ReconcileReport::default() {
@@ -1819,6 +1836,71 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
         );
     }
     report
+}
+
+/// #2223: what retrying one deferred leg came to.
+enum RetriedLeg {
+    /// Live at its producer, and promoted.
+    Promoted,
+    /// Live at its producer, but the AF deleted the subscription meanwhile: the
+    /// producer-side subscription was torn down.
+    Vanished,
+    /// Not live: why, for the deadline check.
+    NotLive(Box<(NefMonitoringSubscription, PendingSouthbound, String)>),
+}
+
+/// #111, #2223: one deferred leg's retry, as [`reconcile_pending_subscriptions`]'s
+/// sweep runs it: a producer that did not answer (a transport failure) is
+/// [`nextgcore_sbi::sweep::Verdict::PeerDown`]; one that answered, even
+/// unusably, or none configured, is `Answered`.
+async fn retry_pending_leg(
+    uris: &(Option<String>, Option<String>),
+    sub: NefMonitoringSubscription,
+    leg: PendingSouthbound,
+) -> (nextgcore_sbi::sweep::Verdict, RetriedLeg) {
+    use nextgcore_sbi::sweep::Verdict;
+    let (amf_uri, udm_uri) = uris;
+    let uri_of = |producer| match producer {
+        SouthboundProducer::Amf => amf_uri.clone(),
+        SouthboundProducer::Udm => udm_uri.clone(),
+    };
+    let req = SouthboundSubscribe {
+        producer: leg.producer,
+        path: leg.path.clone(),
+        body: leg.body.clone(),
+    };
+    match attempt_southbound_subscribe(uri_of(leg.producer), &req).await {
+        SouthboundOutcome::Live(reference, expiry) => {
+            if let Ok(c) = nef_self().read() {
+                if c.subscription_promote(&sub.id, reference.clone(), Some(expiry)) {
+                    log::info!(
+                        "deferred southbound leg promoted to live: sub={} producer={}",
+                        sub.id,
+                        leg.producer.as_str()
+                    );
+                    return (Verdict::Answered, RetriedLeg::Promoted);
+                }
+            }
+            // The AF deleted the subscription while this retry was in flight;
+            // tear the producer-side subscription down rather than orphan it.
+            log::info!(
+                "subscription {} vanished mid-retry; unsubscribing the producer leg",
+                sub.id
+            );
+            southbound_unsubscribe(uri_of(reference.producer), reference).await;
+            (Verdict::Answered, RetriedLeg::Vanished)
+        }
+        outcome => {
+            let verdict = match outcome {
+                SouthboundOutcome::Failed {
+                    retryable: true, ..
+                } => Verdict::PeerDown,
+                _ => Verdict::Answered,
+            };
+            let why = format!("{outcome:?}");
+            (verdict, RetriedLeg::NotLive(Box::new((sub, leg, why))))
+        }
+    }
 }
 
 /// #2102: the lifetime asked for every southbound subscription, and granted
@@ -5593,6 +5675,78 @@ mod tests {
         reset_context();
     }
 
+    /// **#2223** (the blackholed-peer test): a parked unsubscribe toward a
+    /// blackholed producer AHEAD of one toward a healthy producer does not hold
+    /// it back: the healthy DELETE is delivered in the FIRST pass, before the
+    /// blackholed one's 3 s request timeout, and the blackholed one stays parked
+    /// with its producer backing off.
+    ///
+    /// REVERT-VERIFIED: with the serial loop restored (one DELETE at a time, in
+    /// queue order), the first pass spends its 2 s test `MAX_PASS` on the
+    /// blackholed DELETE and never reaches the healthy one: "delivered in the
+    /// first pass" fails.
+    #[test]
+    fn a_blackholed_producer_ahead_does_not_hold_back_a_healthy_one_2223() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hole = blackhole.local_addr().unwrap();
+            let held = tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((c, _)) = blackhole.accept().await {
+                    conns.push(c);
+                }
+            });
+            let arrived: Arc<std::sync::Mutex<Option<std::time::Instant>>> = Arc::default();
+            let at = arrived.clone();
+            let (amf, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                    let at = at.clone();
+                    async move {
+                        at.lock()
+                            .unwrap()
+                            .get_or_insert_with(std::time::Instant::now);
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            let at = |base: String, id: &str| SouthboundRef {
+                producer: SouthboundProducer::Amf,
+                subscription_id: id.to_string(),
+                delete_path: format!("/namf-evts/v1/subscriptions/{id}"),
+                producer_base: Some(base),
+            };
+            let dead = format!("http://{hole}");
+            southbound_reconcile::park(at(dead.clone(), "dead-2223"));
+            southbound_reconcile::park(at(format!("http://{addr}"), "s-2223"));
+
+            let started = std::time::Instant::now();
+            let ended = southbound_reconcile::reconcile_once().await;
+            let waited = arrived.lock().unwrap().map(|t| t - started);
+            let left: Vec<String> = southbound_reconcile::parked()
+                .iter()
+                .map(|r| r.subscription_id.clone())
+                .collect();
+            let backoff = southbound_reconcile::backoff_of(&dead);
+            held.abort();
+            amf.stop().await.ok();
+            assert_eq!(ended, 1, "delivered in the first pass");
+            assert!(
+                waited.is_some_and(|w| w < Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS)),
+                "not held back by the blackholed producer: arrived after {waited:?}"
+            );
+            assert_eq!(left, ["dead-2223"], "the blackholed one stays parked");
+            assert!(backoff.is_some(), "the blackholed producer backs off");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
     /// #1877 (R27 #1972): several unsubscribes toward one failing producer cost one
     /// attempt per pass, not one each (the rest of that producer's are skipped for
     /// the pass), and a healthy producer behind them is still served in that pass.
@@ -6315,6 +6469,165 @@ mod tests {
             block_on(reconcile_pending_subscriptions()),
             ReconcileReport::default()
         );
+    }
+
+    /// **#2223** (the blackholed-peer test): a deferred leg toward a blackholed
+    /// AMF, older (so retried first) than one toward a healthy UDM, does not
+    /// hold it back: the UDM leg is promoted in the FIRST pass, before the
+    /// AMF's 3 s request timeout, and the AMF leg stays pending.
+    ///
+    /// REVERT-VERIFIED: with the serial loop restored (one leg at a time,
+    /// oldest first), the UDM's subscribe is sent only once the AMF's times
+    /// out: "not held back by the blackholed AMF" fails.
+    #[test]
+    fn a_blackholed_producer_ahead_does_not_hold_back_a_healthy_leg_2223() {
+        let _guard = lock_globals();
+        reset_context();
+        set_producers(None, None);
+        std::env::set_var("NEF_PENDING_LEG_DEADLINE_SECS", "3600");
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let mut ids = Vec::new();
+            for monitoring_type in ["LOCATION_REPORTING", "LOSS_OF_CONNECTIVITY"] {
+                let mut body = valid_monitoring_body();
+                body["monitoringType"] = serde_json::json!(monitoring_type);
+                let created = handle_monitoring_subscription_create(
+                    "af1",
+                    &monitoring_request(body),
+                    NorthboundApi::T8MonitoringEvent,
+                )
+                .await;
+                ids.push(created_subscription_id(&created).expect("id"));
+            }
+            let (amf_sub, udm_sub) = (ids[0].clone(), ids[1].clone());
+            // The AMF leg is the older one, so a serial pass tries it first.
+            {
+                let ctx = nef_self();
+                let c = ctx.read().unwrap();
+                let mut sub = c.subscription_find(&amf_sub).expect("held");
+                sub.pending.as_mut().expect("deferred").since -= 10;
+                c.subscription_insert(sub).unwrap();
+            }
+
+            let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hole = blackhole.local_addr().unwrap();
+            let held = tokio::spawn(async move {
+                let mut conns = Vec::new();
+                while let Ok((c, _)) = blackhole.accept().await {
+                    conns.push(c);
+                }
+            });
+            let arrived: Arc<std::sync::Mutex<Option<std::time::Instant>>> = Arc::default();
+            let at = arrived.clone();
+            let (udm, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                    let at = at.clone();
+                    async move {
+                        at.lock()
+                            .unwrap()
+                            .get_or_insert_with(std::time::Instant::now);
+                        SbiResponse::with_status(201).with_header(
+                            "location",
+                            "/nudm-ee/v1/imsi-001010000000001/ee-subscriptions/ee-2223",
+                        )
+                    }
+                })
+                .await;
+            set_producers(
+                Some(&format!("http://{hole}")),
+                Some(&format!("http://{addr}")),
+            );
+
+            let started = std::time::Instant::now();
+            let report = reconcile_pending_subscriptions().await;
+            let waited = arrived.lock().unwrap().map(|t| t - started);
+            let (udm_live, amf_pending) = {
+                let ctx = nef_self();
+                let c = ctx.read().unwrap();
+                (
+                    c.subscription_find(&udm_sub)
+                        .is_some_and(|s| s.southbound.is_some()),
+                    c.subscription_find(&amf_sub)
+                        .is_some_and(|s| s.pending.is_some()),
+                )
+            };
+            held.abort();
+            udm.stop().await.ok();
+            assert_eq!(
+                report,
+                ReconcileReport {
+                    promoted: 1,
+                    expired: 0,
+                    still_pending: 1
+                }
+            );
+            assert!(udm_live, "the UDM leg is promoted in the first pass");
+            assert!(amf_pending, "the AMF leg stays pending");
+            assert!(
+                waited.is_some_and(|w| w < Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS)),
+                "not held back by the blackholed AMF: the UDM subscribe arrived after {waited:?}"
+            );
+        });
+        std::env::remove_var("NEF_PENDING_LEG_DEADLINE_SECS");
+        reset_context();
+    }
+
+    /// **#2223** (R48 on #2255): a deferred leg the pass does not reach within
+    /// its budget still gets its deadline check. Two legs at an AMF that answers
+    /// each subscribe only after 1.5 s (a refusal, so it is not parked), a
+    /// one-second pass budget, and a deadline already passed: the first leg is
+    /// tried, the second is not started, and both are expired (the AF told).
+    ///
+    /// REVERT-VERIFIED: with the budget-skipped leg counted still pending
+    /// without the check, as on #2255's first head, "both legs expire" fails
+    /// (1 expired, 1 still pending).
+    #[test]
+    fn a_leg_skipped_for_the_budget_still_expires_2223() {
+        let _guard = lock_globals();
+        reset_context();
+        set_producers(None, None);
+        std::env::set_var("NEF_PENDING_LEG_DEADLINE_SECS", "0");
+        std::env::set_var("NEF_RECONCILE_INTERVAL_SECS", "1");
+        let report = block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            for _ in 0..2 {
+                let created = handle_monitoring_subscription_create(
+                    "af1",
+                    &monitoring_request(valid_monitoring_body()),
+                    NorthboundApi::T8MonitoringEvent,
+                )
+                .await;
+                created_subscription_id(&created).expect("id");
+            }
+            let (amf, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    SbiResponse::with_status(403)
+                })
+                .await;
+            set_producers(Some(&format!("http://{addr}")), None);
+            let report = reconcile_pending_subscriptions().await;
+            amf.stop().await.ok();
+            report
+        });
+        std::env::remove_var("NEF_RECONCILE_INTERVAL_SECS");
+        std::env::remove_var("NEF_PENDING_LEG_DEADLINE_SECS");
+        let left = nef_self().read().unwrap().subscription_count();
+        reset_context();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                promoted: 0,
+                expired: 2,
+                still_pending: 0
+            },
+            "both legs expire"
+        );
+        assert_eq!(left, 0, "and are removed");
     }
 
     #[test]

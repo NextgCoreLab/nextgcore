@@ -53,6 +53,14 @@ nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }
 nextgcore-sbi = { path = "../libs/nextgcore-sbi" }
 nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
 nextgcore-app = { path = "../libs/nextgcore-app" }
+# #2222: the stand-in AMF decodes the SMF's PDUSessionResourceSetupRequestTransfer.
+nextgcore-ngap-gen = { workspace = true }
+
+# #2222: the stand-in AMF, PCF and GTP-U gNB of the nightly real-binary
+# smfd + I-UPF/PSA upfd per-flow delay run (docker/iupf-delay-e2e/run.sh).
+[[bin]]
+name = "iupf-delay-harness"
+path = "e2e/iupf_delay_harness.rs"
 
 [[test]]
 name = "integration"

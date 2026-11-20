@@ -539,6 +539,17 @@ fn unsubscribe_backoff_now() -> tokio::time::Instant {
 /// failure to pass 2 outran the 300 ms test base. A backoff now ends only when a
 /// test says time has passed.
 ///
+/// **The contract (#2217, R41): manual only, for every udmd test.** An AMF that
+/// fails in a test stays backing off however long the test sleeps (udmd's tests
+/// cannot pause time: its dev-dependencies do not enable tokio `test-util`). A
+/// test that
+/// needs the AMF tried again advances this clock past the wait
+/// ([`UNSUBSCRIBE_BACKOFF_BASE`] after a first failure, doubled after each
+/// further one), or starts clean with `clear_parked_unsubscribes_for_test`,
+/// which forgets every backoff. It is not opt-in on purpose: falling back to
+/// real time when a test does not opt in would put the wall-clock window back
+/// for any test that forgets to, which is the #2196 flake.
+///
 /// Part of the backoff's state, so guarded like it: by
 /// `crate::test_support::CONTEXT_GUARD`.
 #[cfg(test)]
@@ -553,6 +564,7 @@ fn unsubscribe_backoff_now() -> tokio::time::Instant {
 }
 
 /// Move [`UNSUBSCRIBE_BACKOFF`]'s clock on by `by` (tests; hold `CONTEXT_GUARD`).
+/// The only thing that moves it: see [`UNSUBSCRIBE_BACKOFF_CLOCK_MS`].
 #[cfg(test)]
 fn advance_unsubscribe_backoff_clock_for_test(by: std::time::Duration) {
     let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
@@ -2383,6 +2395,44 @@ mod tests {
         assert_eq!(second, first, "not tried while backing off");
         assert!(third > second, "tried again once its wait ran out");
         assert_eq!(still, vec![dead], "and still parked");
+    }
+
+    /// **#2217** (R41): the test backoff clock's contract, pinned. An AMF that
+    /// failed stays backing off through a sleep (the clock does not move), and
+    /// its wait ends once a test advances the clock past it, with no real time
+    /// passing.
+    ///
+    /// REVERT-VERIFIED: with the test clock reading the runtime's
+    /// `tokio::time::Instant::now()` (the production clock), and with
+    /// `advance_unsubscribe_backoff_clock_for_test` a no-op, "advancing the
+    /// clock past the wait ends it" fails; with R41's opt-in alternative (the
+    /// real clock plus the advanced offset), "a sleep does not move the clock"
+    /// fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn the_test_backoff_clock_moves_only_when_a_test_advances_it_2217() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        let amf = amf_of("http://127.0.0.1:22170/namf-evts/v1/subscriptions/clock-2217");
+        UNSUBSCRIBE_BACKOFF.note_failure(&amf);
+        // R48: the clock itself, not the backoff, which a 20 ms sleep against a
+        // 30 s base could not end under any clock.
+        let t0 = unsubscribe_backoff_now();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let clock_after_sleep = unsubscribe_backoff_now();
+        let after_sleep = UNSUBSCRIBE_BACKOFF.backing_off(&amf);
+        advance_unsubscribe_backoff_clock_for_test(UNSUBSCRIBE_BACKOFF_BASE);
+        let after_clock_advance = UNSUBSCRIBE_BACKOFF.backing_off(&amf);
+        clear_parked_unsubscribes_for_test();
+
+        assert_eq!(clock_after_sleep, t0, "a sleep does not move the clock");
+        assert!(after_sleep, "a sleep does not end it");
+        assert!(
+            !after_clock_advance,
+            "advancing the clock past the wait ends it"
+        );
     }
 
     /// #2029: a pass forgets the backoff of an AMF with nothing parked, and keeps

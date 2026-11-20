@@ -27,7 +27,7 @@
 use crate::context::AmfMbsContext;
 use crate::namf_client::ContextDeleteOutcome;
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Records parked before the oldest is abandoned.
@@ -299,19 +299,28 @@ pub const MAX_PASS: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub const MAX_PASS: Duration = Duration::from_millis(500);
 
+/// #2223: how many AMFs one pass sends to at once (one delete in flight per
+/// AMF), so dead AMFs cost a timeout each in parallel rather than in turn.
+pub const MAX_PEERS_AT_ONCE: usize = 16;
+
 /// One reconcile pass: retry parked deletes, oldest first, for at most
 /// [`MAX_PASS`]. A 2xx or 404 ends one; a record a live session holds again is
 /// dropped, not sent (R24); one older than [`MAX_AGE`] ends as `expired`.
 ///
-/// #1961: once a delete to an AMF fails, that AMF backs off and its other records
-/// are not tried this pass (nor until the backoff ends); a record tried and failed
+/// #2223: on the shared bounded per-peer sweep (`nextgcore_sbi::sweep::retry_parked`):
+/// one delete in flight per AMF, up to [`MAX_PEERS_AT_ONCE`] AMFs at once,
+/// nothing new started after [`MAX_PASS`]. An AMF backing off is not tried and
+/// takes no slot; once a delete to an AMF fails, that AMF backs off and its
+/// other records are not tried this pass (#1961). A record tried and failed
 /// goes to the BACK of the queue, one not reached keeps its place at the FRONT.
 /// Returns how many the AMF accepted.
 ///
 /// #1985 (cancellation): the batch is held by a [`Repark`] guard, so a pass dropped
-/// mid-way (its task aborted) re-parks every record it had not ended, including
-/// the one in flight -- whose context still exists at the AMF and whose notify
-/// tokens are still held. If that delete did land, the next pass's 404 ends it.
+/// mid-way (its task aborted, which aborts the sweep's deletes too) re-parks every
+/// record it had not ended, the ones in flight included -- whose contexts still
+/// exist at the AMF and whose notify tokens are still held. If a delete did land,
+/// the next pass's 404 ends it. A record ended in the pass (`settled`) is not
+/// re-parked.
 pub async fn reconcile_once() -> usize {
     let batch: VecDeque<Parked> = match pending().lock() {
         Ok(mut set) => set.drain(..).collect(),
@@ -319,14 +328,12 @@ pub async fn reconcile_once() -> usize {
     };
     let mut pass = Repark {
         untried: Vec::new(),
-        inflight: None,
-        rest: batch,
+        rest: VecDeque::new(),
+        settled: Arc::default(),
         failed: Vec::new(),
         expired: Vec::new(),
     };
-    let deadline = tokio::time::Instant::now() + MAX_PASS;
-    let mut ended = 0;
-    while let Some(p) = pass.rest.pop_front() {
+    for p in batch {
         if p.since.elapsed().unwrap_or_default() > MAX_AGE {
             log::error!(
                 "MBS: the ContextDelete of AMF {}:{} MBS context {} expired after {MAX_AGE:?}",
@@ -340,66 +347,101 @@ pub async fn reconcile_once() -> usize {
             pass.expired.push(p.ctx);
             continue;
         }
-        let peer = peer_of(&p.ctx);
-        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
-            pass.untried.push(p);
-            continue;
-        }
-        let c = p.ctx.clone();
-        pass.inflight = Some(p);
-        // #1854: in the (AMF, TMGI) lane, the in-use check and the send together.
-        let outcome = crate::delete_in_lane(&c).await;
-        let p = pass.inflight.take();
+        pass.rest.push_back(p);
+    }
+    let live: Vec<(String, Parked)> = pass
+        .rest
+        .iter()
+        .map(|p| (peer_of(&p.ctx), p.clone()))
+        .collect();
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: MAX_PEERS_AT_ONCE,
+        budget: MAX_PASS,
+    };
+    let settled = pass.settled.clone();
+    let tried =
+        nextgcore_sbi::sweep::retry_parked(&BACKOFF, limits, live, move |_peer, p: Parked| {
+            let settled = settled.clone();
+            async move {
+                use nextgcore_sbi::sweep::Verdict;
+                let c = &p.ctx;
+                // #1854: in the (AMF, TMGI) lane, the in-use check and the send together.
+                let outcome = crate::delete_in_lane(c).await;
+                let verdict = match outcome {
+                    None => {
+                        RECONCILED.inc(&["reused"]);
+                        None
+                    }
+                    Some(
+                        outcome @ (ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone),
+                    ) => {
+                        log::info!(
+                            "MBS: reconciler released AMF {}:{} MBS context {}",
+                            c.host,
+                            c.port,
+                            c.context_ref
+                        );
+                        // #1985: the context ends here, so do its notify tokens: at once
+                        // on a 404, after the grace on a 204 (late NG-RAN answers).
+                        crate::retire_amf_notify_token(c, outcome);
+                        RECONCILED.inc(&["deleted"]);
+                        Some(Verdict::Answered)
+                    }
+                    Some(ContextDeleteOutcome::Failed) => Some(Verdict::PeerDown),
+                };
+                if verdict != Some(Verdict::PeerDown) {
+                    lock_settled(&settled).push(c.clone());
+                }
+                (verdict, p, outcome)
+            }
+        })
+        .await;
+    pass.rest.clear();
+    let mut ended = 0;
+    for (p, outcome) in tried {
         match outcome {
-            None => {
-                RECONCILED.inc(&["reused"]);
-            }
-            Some(outcome @ (ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone)) => {
-                BACKOFF.note_success(&peer);
-                log::info!(
-                    "MBS: reconciler released AMF {}:{} MBS context {}",
-                    c.host,
-                    c.port,
-                    c.context_ref
-                );
-                // #1985: the context ends here, so do its notify tokens: at once
-                // on a 404, after the grace on a 204 (late NG-RAN answers).
-                crate::retire_amf_notify_token(&c, outcome);
-                RECONCILED.inc(&["deleted"]);
-                ended += 1;
-            }
-            Some(ContextDeleteOutcome::Failed) => {
-                BACKOFF.note_failure(&peer);
-                pass.failed.extend(p);
-            }
+            None => pass.untried.push(p),
+            Some(None) => {}
+            Some(Some(ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone)) => ended += 1,
+            Some(Some(ContextDeleteOutcome::Failed)) => pass.failed.push(p),
         }
     }
     drop(pass);
     ended
 }
 
+fn lock_settled(
+    settled: &Mutex<Vec<AmfMbsContext>>,
+) -> std::sync::MutexGuard<'_, Vec<AmfMbsContext>> {
+    settled.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// #1985: the records of one [`reconcile_once`] pass it has not ended. Dropping
 /// it -- at the end of the pass, or when the pass is cancelled -- puts them back:
-/// those not reached (`untried`), the one in flight and the rest of the batch at
-/// the FRONT, in order (they are older than anything parked while the pass ran,
-/// and eviction takes the oldest); those tried and failed at the BACK (#1961).
-/// The notify tokens of evicted and `expired` records are forgotten with the
-/// pending set unlocked.
+/// those not reached (`untried`) and, if the pass was cancelled, the rest of the
+/// batch not `settled` (the ones in flight included) at the FRONT, in order (they
+/// are older than anything parked while the pass ran, and eviction takes the
+/// oldest); those tried and failed at the BACK (#1961). The notify tokens of
+/// evicted and `expired` records are forgotten with the pending set unlocked.
 struct Repark {
     untried: Vec<Parked>,
-    inflight: Option<Parked>,
     rest: VecDeque<Parked>,
+    /// #2223: the contexts the pass ended (deleted, gone or reused), recorded
+    /// by the sweep's work as each ends, so a cancelled pass does not re-park
+    /// them.
+    settled: Arc<Mutex<Vec<AmfMbsContext>>>,
     failed: Vec<Parked>,
     expired: Vec<AmfMbsContext>,
 }
 
 impl Drop for Repark {
     fn drop(&mut self) {
+        let settled = lock_settled(&self.settled).clone();
         let front: Vec<Parked> = self
             .untried
             .drain(..)
-            .chain(self.inflight.take())
-            .chain(self.rest.drain(..))
+            .chain(self.rest.drain(..).filter(|p| !settled.contains(&p.ctx)))
             .collect();
         let failed: Vec<Parked> = self.failed.drain(..).collect();
         let mut gone: Vec<AmfMbsContext> = self.expired.drain(..).collect();
@@ -645,6 +687,101 @@ mod tests {
         assert_eq!(delivered, 1, "the healthy AMF gets its delete");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(left.len(), 3, "the blackholed ones stay parked: {left:?}");
+    }
+
+    /// **#2223** (the blackholed-peer test): a delete toward a blackholed AMF
+    /// parked AHEAD of one toward a healthy AMF does not hold it back: the
+    /// healthy one is delivered in the FIRST pass, before the blackholed one's
+    /// 3 s request timeout, and the blackholed ones stay parked with their AMF
+    /// backing off.
+    ///
+    /// REVERT-VERIFIED: with the serial loop restored (one delete at a time, in
+    /// queue order), the first pass spends its 500 ms test [`MAX_PASS`] on the
+    /// blackholed delete and never reaches the healthy one: "delivered in the
+    /// first pass" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_peer_ahead_does_not_hold_back_a_healthy_one_2223() {
+        const DEAD_TIMEOUT: Duration = Duration::from_secs(3);
+        let _g = PENDING_TEST_LOCK.lock().await;
+        clear_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let arrived: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+        let at = arrived.clone();
+        let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let at = at.clone();
+                async move {
+                    at.lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            },
+        )
+        .await;
+        let dead = blackhole_1961();
+        let dead_ctxs: Vec<AmfMbsContext> = (0..3).map(|n| ctx_at(dead, 22230 + n)).collect();
+        park(dead_ctxs.clone());
+        let healthy = ctx_at(addr.port(), 22239);
+        park(vec![healthy.clone()]);
+        let started = std::time::Instant::now();
+        let ended = reconcile_once().await;
+        let waited = arrived.lock().unwrap().map(|t| t - started);
+        let healthy_parked = is_parked(&healthy);
+        let dead_parked = dead_ctxs.iter().filter(|c| is_parked(c)).count();
+        let backing_off = BACKOFF.backing_off(&peer_of(&dead_ctxs[0]));
+        clear_for_test();
+        srv.stop().await.ok();
+        assert_eq!(ended, 1, "delivered in the first pass");
+        assert!(!healthy_parked, "delivered, not re-parked");
+        assert!(
+            waited.is_some_and(|w| w < DEAD_TIMEOUT),
+            "not held back by the blackholed AMF: arrived after {waited:?}"
+        );
+        assert_eq!(dead_parked, 3, "the blackholed ones stay parked");
+        assert!(backing_off, "the blackholed AMF backs off");
+    }
+
+    /// **#2223** (#1985 with deletes in flight at once): a pass cancelled while a
+    /// blackholed AMF's delete is in flight, after a healthy AMF's delete of the
+    /// same pass was delivered, re-parks the blackholed one and NOT the
+    /// delivered one (whose context is gone at the AMF and whose token is
+    /// retired).
+    ///
+    /// REVERT-VERIFIED: with `Repark::drop` ignoring `settled`, "the delivered
+    /// one is not re-parked" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_pass_re_parks_only_what_it_did_not_end_2223() {
+        let _g = PENDING_TEST_LOCK.lock().await;
+        clear_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            |_req: nextgcore_sbi::message::SbiRequest| async {
+                nextgcore_sbi::message::SbiResponse::with_status(204)
+            },
+        )
+        .await;
+        let dead = ctx_at(blackhole_1961(), 22240);
+        let healthy = ctx_at(addr.port(), 22241);
+        park(vec![dead.clone(), healthy.clone()]);
+        let before = RECONCILED.get(&["deleted"]);
+        let pass = tokio::spawn(reconcile_once());
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        while RECONCILED.get(&["deleted"]) == before && tokio::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let delivered = RECONCILED.get(&["deleted"]) - before;
+        pass.abort();
+        let _ = pass.await;
+        let (dead_parked, healthy_parked) = (is_parked(&dead), is_parked(&healthy));
+        clear_for_test();
+        srv.stop().await.ok();
+        assert_eq!(
+            delivered, 1,
+            "the healthy delete is delivered before the cancel"
+        );
+        assert!(dead_parked, "the one in flight is re-parked");
+        assert!(!healthy_parked, "the delivered one is not re-parked");
     }
 
     /// **#2015** (#1961's order, untested until now): after a pass, a record that

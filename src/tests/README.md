@@ -7,6 +7,11 @@ the real NF binaries. They check message sequencing and state bookkeeping for
 each flow. Tests that drive the real daemons over the wire are the Docker E2E
 stages in `docker/rust/` (see `docker/rust/CI.md` and `docs/ci-and-release.md`).
 
+The crate also builds one binary, `iupf-delay-harness` (`e2e/`): the stand-in
+AMF, PCF and GTP-U gNB of the nightly real-binary smfd + I-UPF/PSA upfd
+per-flow delay run, `docker/iupf-delay-e2e/run.sh` (#2222). It is not a test;
+that script runs it against the real daemons.
+
 ## Test Categories (`integration/`)
 
 | Module | Covers |

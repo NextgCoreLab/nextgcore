@@ -556,17 +556,24 @@ mod tests {
     /// lane's 3 s, not on a short pass budget, so a stalled runtime under a
     /// loaded suite does not fail it.
     ///
-    /// REVERT-VERIFIED: with the lanes run in turn (no `JoinSet`), the healthy
-    /// DELETE arrives only after the blackholed one times out, and "the healthy
-    /// AMF is not starved" fails.
+    /// #2223 (R41 on #2240): two blackholed AMFs, and the sweep's start order
+    /// pinned (`with_start_offset`) so both dead lanes start before the healthy
+    /// one. Under #2216's randomly rotated start order a single dead lane was
+    /// ahead only about half the time, so the revert below failed only then.
+    ///
+    /// REVERT-VERIFIED: with the lanes run in turn (`MAX_LANES` 1), the healthy
+    /// DELETE arrives only after the blackholed ones time out, and "the healthy
+    /// AMF is not starved" fails on every run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blackholed_amf_does_not_starve_a_healthy_one_2085() {
         let _g = TEST_LOCK.lock().await;
         clear_for_test();
         const DEAD_LANE: Duration = Duration::from_secs(3);
         let (dead, _accepted, hole) = blackholed_amf().await;
+        let (dead2, _accepted2, hole2) = blackholed_amf().await;
         for n in 0..3 {
             park(&dead, &subscription_path(None, &format!("hole-{n}")));
+            park(&dead2, &subscription_path(None, &format!("hole2-{n}")));
         }
         let arrived: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
         let at = arrived.clone();
@@ -586,9 +593,16 @@ mod tests {
         let ok = subscription_path(None, "healthy-2085");
         park(&healthy, &ok);
 
+        // The sweep starts its lanes in key order from `offset`: start right
+        // after the healthy AMF's key, so it starts last.
+        let mut keys = [peer_of(&dead), peer_of(&dead2), peer_of(&healthy)];
+        keys.sort();
+        let healthy_at = keys.iter().position(|k| *k == peer_of(&healthy)).unwrap();
+        let offset = (healthy_at + 1) % keys.len();
+
         let started = std::time::Instant::now();
         assert_eq!(
-            reconcile_once().await,
+            nextgcore_sbi::sweep::with_start_offset(offset, reconcile_once()).await,
             1,
             "the healthy AMF is delivered in the first pass"
         );
@@ -596,6 +610,7 @@ mod tests {
         let still_parked = is_parked(&ok);
         clear_for_test();
         hole.abort();
+        hole2.abort();
 
         assert!(!still_parked, "delivered, not re-parked");
         assert!(
