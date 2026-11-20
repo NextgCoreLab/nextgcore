@@ -4059,7 +4059,7 @@ pub fn fire_loss_of_connectivity(ue: &AmfUe, reason: &str) {
 /// `ranReleaseCode` as an `NgApCause` holding *"the decimal value of the NG AP cause
 /// code values as specified in TS 38.413"* — group and value, both `required`
 /// (`TS29571_CommonData.yaml:2562-2564`). The NGAP Cause is already decoded into
-/// `UeContextReleaseRequest.cause` by `nextgcore_ngap::parser` and was simply
+/// `UeContextReleaseRequest.cause` by the NGAP decoder (`decode_ue_context_release_request_asn1`) and was simply
 /// discarded; it is the real release code, not a placeholder.
 ///
 /// `nasReleaseCode` is NOT set: its pattern is `^(MM|SM)-[0-9]{1,3}$`

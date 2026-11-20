@@ -515,7 +515,7 @@
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">AMF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, paging and Service Request, N2/Xn handover, N26 toward an MME, PWS, RACS via the UCMF. NGAP is encoded and decoded by the generated codec (nextgcore-ngap-gen); the hand-written nextgcore-ngap types are still used beside it (#417).</div>
+        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, paging and Service Request, N2/Xn handover, N26 toward an MME, PWS, RACS via the UCMF. NGAP is encoded and decoded by the generated codec (nextgcore-ngap-gen) alone.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">SMF</span><span class="component-badge badge-core">Core</span></div>
@@ -658,10 +658,6 @@
         <div class="component-desc">5G NAS codec — registration, auth, session messages.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">nextgcore-ngap</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">Hand-written NGAP message types and builders for AMF-gNB signaling, on top of nextgcore-asn1c. Being replaced by nextgcore-ngap-gen (#417).</div>
-      </div>
-      <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-pfcp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">PFCP for SMF-UPF session management.</div>
       </div>
@@ -696,10 +692,6 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-sctp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">SCTP transport for NGAP/S1AP: userspace sctp-proto over UDP (default) and native Linux kernel SCTP (<code>kernel</code> feature).</div>
-      </div>
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">nextgcore-asn1c</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">Hand-written APER engine and NGAP codec under nextgcore-ngap. Its S1AP, NRPPa, LPP, E1AP, F1AP and XnAP modules were deleted in favour of the generated codecs; the rest goes with #417.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-ipfw</span><span class="component-badge badge-lib">Lib</span></div>

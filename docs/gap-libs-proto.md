@@ -111,7 +111,7 @@ At the 2026-02-07 snapshot: no transport layer and no peer state machine. Both e
 
 ## 9. nextgcore-asn1c (ASN.1 Codec)
 
-Full APER encoder/decoder (`per.rs`) and the hand-written NGAP module (`src/ngap/`). Its S1AP module is gone (#555), as is the NRPPa module (#527). Production code no longer calls it directly (#576); it is reached through `nextgcore-ngap` and as a test dependency, until #417 deletes it.
+Full APER encoder/decoder (`per.rs`) and the hand-written NGAP module (`src/ngap/`). Its S1AP module is gone (#555), as is the NRPPa module (#527). Production code no longer calls it directly (#576); it was reached through `nextgcore-ngap` and as a test dependency until #417 deleted both crates.
 
 Missing: XnAP/F1AP/E1AP codecs.
 
