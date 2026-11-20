@@ -2804,7 +2804,9 @@ async fn a_setup_requests_n1_rides_the_items_pdu_session_nas_pdu() {
 pub(super) struct ServeOneGuami(Vec<crate::context::Guami>);
 
 impl ServeOneGuami {
+    #[track_caller]
     pub(super) fn install() -> Self {
+        crate::test_support::assert_context_guard_held("ServeOneGuami::install");
         let ctx = crate::context::amf_self();
         let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
         let previous = std::mem::replace(
@@ -6355,8 +6357,12 @@ async fn an_idle_ues_deregistration_request_deregisters_it_1691() {
 /// again, no Initial Context Setup Request is sent and the first assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unauthenticated_emergency_registration_gets_its_accept_2033() {
-    crate::context::amf_context_init(64, 1024, 4096);
     let _policy = crate::emergency::emergency_policy_test_guard().await;
+    // #2039: it replaces the process-wide served GUAMIs, which every GUTI test
+    // reads under CONTEXT_GUARD; without it, its restore emptied them mid-test.
+    // After the emergency-policy guard, the order lib.rs's config tests use.
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     struct EmergencySlice(Option<crate::context::SNssai>);
     impl Drop for EmergencySlice {
