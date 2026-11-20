@@ -1543,29 +1543,95 @@ fn device_triggering_caller(
     Ok(verified)
 }
 
-/// Table 5.7.2.1.2-1's mandatory IEs this NEF checks: a target UE (NOTE 2:
-/// externalId or msisdn; supi accepted as an internal extension) and the
-/// trigger payload.
-fn device_triggering_body_error(data: &serde_json::Value) -> Option<SbiResponse> {
-    let has_target = ["msisdn", "externalId", "supi"].iter().any(|key| {
-        data.get(*key)
+/// TS 29.122 Table 5.7.2.1.2-1's mandatory (cardinality 1) members of
+/// `DeviceTriggering`, with their types: `validityPeriod` (DurationSec, an
+/// unsigned integer), `priority` (Priority), `applicationPortId` (Port, 0..65535),
+/// `triggerPayload` (Bytes) and `notificationDestination` (Link). NOTE 2 also
+/// requires one of `externalId` or `msisdn`; `supi` is accepted as an internal
+/// extension.
+fn device_triggering_invalid_params(data: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut bad = |param: &str, reason: &str| out.push((format!("/{param}"), reason.to_string()));
+    let nonempty_str = |k: &str| {
+        data.get(k)
             .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    });
-    if !has_target {
-        return Some(send_bad_request(
-            "target UE identifier (msisdn / externalId) is mandatory",
-            Some("MANDATORY_IE_MISSING"),
-        ));
+            .is_some_and(|s| !s.is_empty())
+    };
+    if !["msisdn", "externalId", "supi"]
+        .iter()
+        .any(|k| nonempty_str(k))
+    {
+        bad(
+            "externalId",
+            "one of externalId or msisdn is mandatory (Table 5.7.2.1.2-1 NOTE 2)",
+        );
     }
-    match data.get("triggerPayload").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => None,
-        _ => Some(send_bad_request(
-            "triggerPayload is mandatory",
-            Some("MANDATORY_IE_MISSING"),
-        )),
+    match data.get("validityPeriod") {
+        None => bad("validityPeriod", "mandatory"),
+        Some(v) if v.as_u64().is_none() => bad(
+            "validityPeriod",
+            "must be a DurationSec: an unsigned integer",
+        ),
+        _ => {}
     }
+    match data.get("priority") {
+        None => bad("priority", "mandatory"),
+        Some(v) if v.as_str().is_none_or(|s| s.is_empty()) => {
+            bad("priority", "must be a Priority (NO_PRIORITY or PRIORITY)")
+        }
+        _ => {}
+    }
+    match data.get("applicationPortId") {
+        None => bad("applicationPortId", "mandatory"),
+        Some(v) if v.as_u64().is_none_or(|p| p > 65535) => bad(
+            "applicationPortId",
+            "must be a Port: an unsigned integer in 0..65535",
+        ),
+        _ => {}
+    }
+    for (k, ty) in [
+        ("triggerPayload", "Bytes"),
+        ("notificationDestination", "Link"),
+    ] {
+        match data.get(k) {
+            None => bad(k, "mandatory"),
+            Some(_) if !nonempty_str(k) => bad(k, &format!("must be a non-empty {ty}")),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A 400 for a `DeviceTriggering` that lacks a mandatory member or has one of
+/// the wrong type: a ProblemDetails naming each in `invalidParams` (TS 29.122
+/// §5.2.6, TS 29.571 `InvalidParam`).
+fn device_triggering_body_error(data: &serde_json::Value) -> Option<SbiResponse> {
+    let params = device_triggering_invalid_params(data);
+    if params.is_empty() {
+        return None;
+    }
+    let missing = params
+        .iter()
+        .any(|(_, r)| r.starts_with("mandatory") || r.starts_with("one of"));
+    let problem = nextgcore_sbi::message::ProblemDetails::with_status(400)
+        .with_title("Bad Request")
+        .with_detail("the DeviceTriggering lacks or misstates a mandatory member (TS 29.122 Table 5.7.2.1.2-1)")
+        .with_cause(if missing {
+            "MANDATORY_IE_MISSING"
+        } else {
+            "MANDATORY_IE_INCORRECT"
+        });
+    let mut problem = problem;
+    problem.invalid_params = Some(
+        params
+            .into_iter()
+            .map(|(param, reason)| nextgcore_sbi::message::InvalidParam {
+                param,
+                reason: Some(reason),
+            })
+            .collect(),
+    );
+    Some(SbiResponse::with_status(400).with_problem(&problem))
 }
 
 /// A stored transaction as TS 29.122 `DeviceTriggering`: the stored JSON with
@@ -3838,6 +3904,95 @@ mod tests {
         location.rsplit('/').next().unwrap().to_string()
     }
 
+    /// #2276: create enforces TS 29.122 Table 5.7.2.1.2-1. Each mandatory member,
+    /// left out, gives a 400 whose ProblemDetails `invalidParams` names it, and so
+    /// does one of the wrong type. Nothing is stored.
+    #[test]
+    fn each_missing_mandatory_ie_is_a_400_naming_it_2276() {
+        let _guard = lock_globals();
+        reset_context();
+        let create = |body: serde_json::Value| {
+            let r = SbiRequest::post("/3gpp-device-triggering/v1/scs-a/transactions")
+                .with_json_body(&body)
+                .unwrap();
+            as_scs_as(handle_device_triggering_create(
+                "scs-a",
+                &verified(r, "scs-a"),
+            ))
+        };
+        let params = |r: &SbiResponse| -> (String, Vec<String>) {
+            let v: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            (
+                v["cause"].as_str().unwrap_or_default().to_string(),
+                v["invalidParams"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|p| p["param"].as_str().unwrap().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        for missing in [
+            "validityPeriod",
+            "priority",
+            "applicationPortId",
+            "triggerPayload",
+            "notificationDestination",
+        ] {
+            let mut body = trigger_body();
+            body.as_object_mut().unwrap().remove(missing);
+            let r = create(body);
+            assert_eq!(r.status, 400, "{missing} left out");
+            assert_eq!(
+                params(&r),
+                (
+                    "MANDATORY_IE_MISSING".to_string(),
+                    vec![format!("/{missing}")]
+                ),
+                "{missing}"
+            );
+        }
+        // NOTE 2: one of externalId or msisdn.
+        let mut body = trigger_body();
+        body.as_object_mut().unwrap().remove("msisdn");
+        let r = create(body);
+        assert_eq!(r.status, 400);
+        assert_eq!(params(&r).1, vec!["/externalId".to_string()]);
+        // The wrong type.
+        for (k, v) in [
+            ("validityPeriod", serde_json::json!(-1)),
+            ("applicationPortId", serde_json::json!(70000)),
+            ("priority", serde_json::json!(1)),
+            ("notificationDestination", serde_json::json!("")),
+        ] {
+            let mut body = trigger_body();
+            body[k] = v;
+            let r = create(body);
+            assert_eq!(r.status, 400, "{k} of the wrong type");
+            assert_eq!(
+                params(&r),
+                ("MANDATORY_IE_INCORRECT".to_string(), vec![format!("/{k}")]),
+                "{k}"
+            );
+        }
+        // Every problem at once is named.
+        let r = create(serde_json::json!({"msisdn": "491700002276"}));
+        assert_eq!(params(&r).1.len(), 5, "each missing member is named");
+        assert_eq!(
+            nef_self().read().unwrap().transaction_count(),
+            0,
+            "nothing stored"
+        );
+        assert_eq!(
+            create(trigger_body()).status,
+            201,
+            "the complete body is taken"
+        );
+    }
+
     /// #2276 criteria 1 and 4: every device triggering verb needs a verified
     /// SCS/AS identity, and the `{scsAsId}` must be that identity. An anonymous
     /// caller and a verified caller naming another SCS/AS are refused with 403,
@@ -4547,6 +4702,7 @@ mod tests {
                 "validityPeriod": 3600,
                 "priority": "NO_PRIORITY",
                 "applicationPortId": 5000,
+                "notificationDestination": "http://127.0.0.1:9/af1/notify",
                 "triggerPayload": "cGF5bG9hZA==",
             }))
             .expect("serialize test body");
