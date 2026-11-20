@@ -1229,6 +1229,41 @@ mod tests {
             ]
         );
         assert_eq!(ids(&gnb), (12, vec![10, 85, 29, 15, 105, 61, 101]));
+        // The same, with DirectForwardingPathAvailability (22, ignore): in the
+        // object-set order (`HandoverRequiredIEs`) it follows TargetID and
+        // precedes the session list. ENUMERATED {direct-path-available, ...}:
+        // extension bit `0`, a one-value root needs no index bits, pad -> one
+        // octet `00`. Count 8, length 65.
+        let mut with_dfpa = required(t::TargetId::TargetRanNodeId {
+            global_ran_node_id: t::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: plmn(),
+                gnb_id: 0x7_4402,
+                gnb_id_len: 22,
+            },
+            selected_tai: t::TaiListItem {
+                tai_plmn: plmn(),
+                tai_tac: [0x00, 0x00, 0x01],
+            },
+        });
+        with_dfpa.direct_forwarding_path_availability =
+            Some(t::DirectForwardingPathAvailability::DirectPathAvailable);
+        assert_eq!(
+            handover_required(&with_dfpa),
+            [
+                0x00, 0x0c, 0x00, 0x41, // initiatingMessage, 12, reject, length 65
+                0x00, 0x00, 0x08, //
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x02, //
+                0x00, 0x1d, 0x00, 0x01, 0x00, //
+                0x00, 0x0f, 0x40, 0x02, 0x04, 0x00, //
+                0x00, 0x69, 0x00, 0x0e, //
+                0x00, 0x00, 0xf1, 0x10, 0x00, 0x1d, 0x10, 0x08, 0x00, 0xf1, 0x10, 0x00, 0x00,
+                0x01, //
+                0x00, 0x16, 0x40, 0x01, 0x00, // DirectForwardingPathAvailability
+                0x00, 0x3d, 0x00, 0x05, 0x00, 0x00, 0x05, 0x01, 0x00, //
+                0x00, 0x65, 0x00, 0x03, 0x02, 0xab, 0xcd, //
+            ]
+        );
         // targeteNB-ID: `01 00 00` padded -> `40`; PLMN; macro `00` padded; 20
         // bits 0x12345 + EPS-TAI `00` -> `12 34 50`; PLMN; EPS-TAC unaligned,
         // here already on a boundary, `00 07`.
@@ -1406,10 +1441,64 @@ mod tests {
                     nr_cell_identity: 2,
                 },
             ]),
-            global_ran_node_id: gnb,
+            global_ran_node_id: gnb.clone(),
         });
-        assert_eq!(&failure[11..14], [0x40, 0x00, 0x01]);
+        // The whole PDU (R44 on #2219: a slice let a body byte or an IE
+        // criticality go unchecked): initiatingMessage, 33 `21`, ignore, 40.
+        // PWSFailedCellIDList (81, reject, 20): CHOICE nR index 1 of 3 `01` +
+        // pad -> `40`; NR-CGIList SIZE(1..16384), count-1 = 1 in two aligned
+        // octets `00 01`; NR-CGI ext/opt `00` + pad, PLMN, NCI 1 in 36 bits:
+        // `00 00 00 00` then the nibble `0001`, and the second NR-CGI's
+        // ext/opt bits `00` + pad share that octet -> `10`; PLMN, NCI 2:
+        // `00 00 00 00`, `0010` + pad -> `20`. GlobalRANNodeID (27, reject, 9)
+        // as in the restart above.
+        assert_eq!(
+            failure,
+            [
+                0x00, 0x21, 0x40, 0x28, 0x00, 0x00, 0x02, //
+                0x00, 0x51, 0x00, 0x14, 0x40, 0x00, 0x01, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00,
+                0x00, 0x10, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x00, 0x20, //
+                0x00, 0x1b, 0x00, 0x09, 0x00, 0x00, 0xf1, 0x10, 0x50, 0x00, 0x00, 0x06, 0x86,
+            ]
+        );
         assert_eq!(ids(&failure), (33, vec![81, 27]));
+        // Read back through the generated decoder, cell for cell.
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_PWSFailureIndication(read),
+            ..
+        }) = nextgcore_ngap_gen::decode(&failure).expect("decode")
+        else {
+            panic!("PWS Failure Indication");
+        };
+        let cells: Vec<u64> = read
+            .protocol_i_es
+            .0
+            .iter()
+            .flat_map(|ie| match &ie.value {
+                g::PWSFailureIndicationProtocolIEs_EntryValue::Id_PWSFailedCellIDList(
+                    g::PWSFailedCellIDList::NR_CGI_PWSFailedList(list),
+                ) => list
+                    .0
+                    .iter()
+                    .map(|c| {
+                        assert_eq!(c.plmn_identity.0, plmn());
+                        c.nr_cell_identity
+                            .0
+                            .iter()
+                            .fold(0u64, |v, b| v << 1 | u64::from(*b))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(cells, [1, 2]);
+        let crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } =
+            crate::ngap_asn1::decode_pws_indication_asn1(&failure)
+        else {
+            panic!("the production decoder refused it");
+        };
+        assert!(!message.restart);
+        assert_eq!(message.global_ran_node_id, gnb);
         let cancel = pws_cancel_response(&t::PwsCancelResponse {
             message_identifier: 0xB399,
             serial_number: 0xC399,
@@ -1484,23 +1573,81 @@ mod tests {
             }],
             failed_list: Vec::new(),
         });
-        assert_eq!(&modify[..4], [0x20, 0x1a, 0x00, 0x18]);
+        // successfulOutcome, 26 `1a`, reject, 24; ids 10, 85 at ignore; id 65
+        // PDUSessionResourceModifyListModRes (ignore, 5): SIZE(1..256) count-1
+        // `00`, item ext/opt `00` + pad, PSI `02`, transfer length `01`, `21`.
+        assert_eq!(
+            modify,
+            [
+                0x20, 0x1a, 0x00, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x41, 0x40, 0x05, 0x00, 0x00, 0x02, 0x01, 0x21, // id 65
+            ]
+        );
         assert_eq!(ids(&modify), (26, vec![10, 85, 65]));
+        let crate::ngap_asn1::PduSessionResourceModifyResponseDecode::Decoded {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            modified,
+            failed,
+            error_indication: None,
+        } = crate::ngap_asn1::decode_pdu_session_resource_modify_response_asn1(&modify)
+        else {
+            panic!("the production decoder refused it");
+        };
+        assert_eq!((amf_ue_ngap_id, ran_ue_ngap_id), (Some(1), Some(2)));
+        assert_eq!(
+            modified
+                .iter()
+                .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                .collect::<Vec<_>>(),
+            [(2, vec![0x21])]
+        );
+        assert!(failed.is_empty());
         let release =
             pdu_session_resource_release_response(&t::PduSessionResourceReleaseResponse {
                 amf_ue_ngap_id: 1,
                 ran_ue_ngap_id: 2,
                 released_list: vec![t::PduSessionResourceReleasedItem {
                     pdu_session_id: 3,
-                    transfer: Vec::new(),
+                    // The minimal PDUSessionResourceReleaseResponseTransfer
+                    // (§9.3.4.21): SEQUENCE {iE-Extensions OPTIONAL, ...},
+                    // extension `0` and presence `0` + pad -> `00`. A
+                    // CONTAINING value is never zero octets.
+                    transfer: vec![0x00],
                 }],
             });
-        // An empty transfer is its zero length octet.
+        // successfulOutcome, 28 `1c`, reject, 24; ids 10, 85 at ignore; id 70
+        // PDUSessionResourceReleasedListRelRes (ignore, 5): count-1 `00`, item
+        // ext/opt `00`, PSI `03`, transfer length `01`, `00`.
         assert_eq!(
-            &release[release.len() - 8..],
-            [0x00, 0x46, 0x40, 0x04, 0x00, 0x00, 0x03, 0x00]
+            release,
+            [
+                0x20, 0x1c, 0x00, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x46, 0x40, 0x05, 0x00, 0x00, 0x03, 0x01, 0x00, // id 70
+            ]
         );
         assert_eq!(ids(&release), (28, vec![10, 85, 70]));
+        let crate::ngap_asn1::PduSessionResourceReleaseResponseDecode::Released {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            released,
+            error_indication: None,
+        } = crate::ngap_asn1::decode_pdu_session_resource_release_response_asn1(&release)
+        else {
+            panic!("the production decoder refused it");
+        };
+        assert_eq!((amf_ue_ngap_id, ran_ue_ngap_id), (Some(1), Some(2)));
+        assert_eq!(
+            released
+                .iter()
+                .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                .collect::<Vec<_>>(),
+            [(3, vec![0x00])]
+        );
         let indication =
             pdu_session_resource_modify_indication(&t::PduSessionResourceModifyIndication {
                 amf_ue_ngap_id: 1,
@@ -1510,8 +1657,37 @@ mod tests {
                     transfer: vec![0x61],
                 }],
             });
-        assert_eq!(&indication[..4], [0x00, 0x1b, 0x00, 0x18]);
+        // initiatingMessage, 27 `1b`, reject, 24; ids 10, 85 at reject; id 63
+        // PDUSessionResourceModifyListModInd (reject, 5): count-1 `00`, item
+        // ext/opt `00`, PSI `06`, transfer length `01`, `61`.
+        assert_eq!(
+            indication,
+            [
+                0x00, 0x1b, 0x00, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x02, //
+                0x00, 0x3f, 0x00, 0x05, 0x00, 0x00, 0x06, 0x01, 0x61, // id 63
+            ]
+        );
         assert_eq!(ids(&indication), (27, vec![10, 85, 63]));
+        let crate::ngap_asn1::PduSessionResourceModifyIndicationDecode::Proceed {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            sessions,
+            notify,
+        } = crate::ngap_asn1::decode_pdu_session_resource_modify_indication_asn1(&indication)
+        else {
+            panic!("the production decoder refused it");
+        };
+        assert_eq!((amf_ue_ngap_id, ran_ue_ngap_id), (1, 2));
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                .collect::<Vec<_>>(),
+            [(6, vec![0x61])]
+        );
+        assert!(notify.is_empty());
     }
 
     #[test]
@@ -1551,6 +1727,10 @@ mod tests {
     /// Availability. IE 22 (ignore) goes between TargetID and the session list
     /// as `ENUMERATED {direct-path-available, ...}`: one extension bit,
     /// padded, `00`.
+    /// The DFPA delta, relative to the same builder's bytes without it. It is
+    /// not a duplicate: `handover_required_is_the_worked_octets` pins both
+    /// shapes absolutely, and this one also reads IE 22 back through the
+    /// production decoder.
     #[test]
     fn handover_required_with_direct_forwarding_is_the_worked_octets() {
         let mut m = required(t::TargetId::TargetRanNodeId {
