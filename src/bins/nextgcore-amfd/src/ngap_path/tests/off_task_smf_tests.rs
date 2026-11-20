@@ -1499,7 +1499,7 @@ async fn a_release_of_an_unregistered_ue_does_not_wait_for_a_blackholed_smf() {
     server.ue_auth_state.with_mut(ue, |s| s.registered = false);
     hold_blackholed(&mut server, ue, 1, "rel-922-dead");
     hold_session(&mut server, ue, 2, "rel-922-live", port);
-    let request = nextgcore_ngap::builder::build_ue_context_release_request(
+    let request = crate::gnb_pdus::ue_context_release_request(
         &nextgcore_ngap::types::UeContextReleaseRequest {
             amf_ue_ngap_id: ue,
             ran_ue_ngap_id: ran,
@@ -1507,8 +1507,7 @@ async fn a_release_of_an_unregistered_ue_does_not_wait_for_a_blackholed_smf() {
                 nextgcore_ngap::types::CauseRadioNetwork::UserInactivity,
             ),
         },
-    )
-    .expect("encode");
+    );
 
     let started = Instant::now();
     server
