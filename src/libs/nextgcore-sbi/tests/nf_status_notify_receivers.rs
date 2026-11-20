@@ -10,12 +10,19 @@
 //!    use of a module-scoped `const` holding one), whatever its syntax, is
 //!    listed: as a route arm in [`ROUTES`] with the handler it dispatches to,
 //!    or in [`NOT_ROUTES`] with why it is not one. Both lists name the WHOLE
-//!    trimmed line, and each entry must match exactly as many lines as it
-//!    declares (a route: one), so an entry that went stale or that would also
-//!    cover a new line fails (#2187, R41). A new line that is not listed fails.
-//! 2. The listed handler is called in that arm, and its body reaches the
-//!    shared check: it calls `nf_status_notify::refuse_notifier` itself, or
-//!    calls a function of the same crate that does (followed transitively).
+//!    trimmed line and its enclosing `fn`, and each entry must match exactly
+//!    as many lines as it declares (a route: one), so an entry that went
+//!    stale, that would also cover a new line, or whose line moved to another
+//!    `fn` fails (#2187, R41). A new line that is not listed fails.
+//! 2. A route is listed as its whole arm, from the line naming the path to the
+//!    handler call, and the tree must match it line for line. Before the
+//!    handler call the arm may only dispatch (no `;`, no call outside a match
+//!    guard), so the guarded handler is the first thing the arm runs (#2187,
+//!    R41: a side effect before it passed the old "called within 8 lines").
+//!    The handler reaches the shared check: it calls
+//!    `nf_status_notify::refuse_notifier` itself, or calls a function of the
+//!    same crate that does (followed transitively). What the handler does
+//!    BEFORE the check is not read here; the runtime backstops pin it.
 //! 3. A receiver under another path is caught by what it must do to receive:
 //!    any crate other than the sender (nrfd) that subscribes at
 //!    `nnrf-nfm/v1/subscriptions` or builds an `nfStatusNotificationUri` (in
@@ -25,7 +32,9 @@
 //! (a second, unchecked route in a receiver crate; a receiver under a renamed
 //! path in another crate), and R41's evasions on #2187 (a nested match arm; a
 //! route that ends a call with the same const as an exempted line; an exempted
-//! line duplicated; a stale entry), and requires each to fail.
+//! line duplicated; a stale entry; an exempted line moved into the router; a
+//! side effect before the guarded call, with and without `;`; a line slipped
+//! into a listed arm), and requires each to fail.
 //!
 //! **Known limits** (#2187, R41). This is a text scan, so a path that never
 //! appears whole in one literal or one const is not found:
@@ -40,55 +49,88 @@
 //! `bins/nextgcore-amfd/tests/nf_status_notify_sender_backstop_2179.rs`: it
 //! subscribes at a stand-in NRF, then sends a forged NFStatusNotify to every
 //! `nfStatusNotificationUri` the subscriptions advertised, through amfd's
-//! router under the production profile, and requires 403. nwdafd is a
+//! router under the production profile, and requires 403, with two SMFs cached
+//! so an NRF control on the SMF subscription really evicts (and so a forged
+//! one acting before the check would be seen). nwdafd is a
 //! binary-only crate whose unit tests share the process's Dev override, so its
 //! backstop is #2215.
 
 use std::collections::{BTreeSet, HashMap};
 
-/// (crate, file under src/, the route arm's whole trimmed line, the handler the
-/// arm calls). Each must be exactly one non-comment, non-test line of its file.
-const ROUTES: &[(&str, &str, &str, &str)] = &[
+/// (crate, file under src/, the enclosing `fn`, the route arm, the handler the
+/// arm calls). The arm is its whole trimmed code lines, from the line that
+/// names the path (exactly one such line, in that `fn`) to the line that calls
+/// the handler. The lines after the first must follow it exactly, and before
+/// the handler call the arm may only dispatch: no `;` (so no statement runs
+/// first) and no call outside a match guard (#2187, R41: an arm that acted on
+/// the request before calling the guarded handler passed the old "called within
+/// 8 lines" check).
+type Route<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a str);
+
+const ROUTES: &[Route] = &[
     (
         "nextgcore-amfd",
         "namf_server.rs",
-        r#"if parts.len() == 4 && parts[2] == "nf-status-notify" && method == "POST" =>"#,
+        "namf_request_handler",
+        &[
+            r#"if parts.len() == 4 && parts[2] == "nf-status-notify" && method == "POST" =>"#,
+            "{",
+            "handle_nf_status_notify_callback(parts[3], &request).await",
+        ],
         "handle_nf_status_notify_callback",
     ),
     (
         "nextgcore-nwdafd",
         "main.rs",
-        "if *segment == nrf_collector::CALLBACK_SEGMENT =>",
+        "nwdaf_sbi_request_handler",
+        &[
+            "if *segment == nrf_collector::CALLBACK_SEGMENT =>",
+            "{",
+            "match method {",
+            r#""POST" if nrf_collector::holds_callback_token(token) => {"#,
+            "nrf_collector::handle_nf_status_notify_from(&request, true).await",
+        ],
         "handle_nf_status_notify_from",
     ),
     (
         "nextgcore-nwdafd",
         "main.rs",
-        r#"["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {"#,
+        "nwdaf_sbi_request_handler",
+        &[
+            r#"["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {"#,
+            r#""POST" => nrf_collector::handle_nf_status_notify_from(&request, false).await,"#,
+        ],
         "handle_nf_status_notify_from",
     ),
 ];
 
 /// Lines that name an NFStatusNotify path and are NOT a route, with why:
-/// (crate, file, the whole trimmed line, how many lines of that file it is).
+/// (crate, file, the enclosing `fn` or "" at module level, the whole trimmed
+/// line, how many lines of that `fn` it is).
 ///
 /// #2187 (R41): matched against the WHOLE trimmed line, not a substring, and
 /// the number of lines it matches must be exactly the count given. A substring
 /// entry such as `crate::nrf_subscription::NOTIFY_PATH)` also exempted a new
 /// route `parts[2].starts_with(crate::nrf_subscription::NOTIFY_PATH) => ...`;
 /// now any new line naming the path has to be listed deliberately, and an entry
-/// that matches nothing (stale) or more lines than it declares fails.
-const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
+/// that matches nothing (stale) or more lines than it declares fails. Pinned to
+/// the enclosing `fn`, so an exempted line moved into a router is not the
+/// listed one.
+type NotRoute<'a> = (&'a str, &'a str, &'a str, &'a str, usize);
+
+const NOT_ROUTES: &[NotRoute] = &[
     // The constants that hold the paths.
     (
         "nextgcore-amfd",
         "nrf_subscription.rs",
+        "",
         r#"pub const NOTIFY_PATH: &str = "/namf-callback/v1/nf-status-notify";"#,
         1,
     ),
     (
         "nextgcore-nwdafd",
         "nrf_collector.rs",
+        "",
         r#"pub const CALLBACK_SEGMENT: &str = "nf-status-notify";"#,
         1,
     ),
@@ -96,12 +138,14 @@ const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
     (
         "nextgcore-amfd",
         "nrf_subscription.rs",
+        "notification_uri",
         r#"format!("{}{NOTIFY_PATH}", advertised_sbi_base())"#,
         1,
     ),
     (
         "nextgcore-nwdafd",
         "nrf_collector.rs",
+        "callback_path_for",
         r#"format!("/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/{token}")"#,
         1,
     ),
@@ -109,6 +153,7 @@ const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
     (
         "nextgcore-nwdafd",
         "nrf_collector.rs",
+        "callback_uri_with_token",
         r#"let marker = format!("/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/");"#,
         1,
     ),
@@ -116,6 +161,7 @@ const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
     (
         "nextgcore-nwdafd",
         "nrf_collector.rs",
+        "subscribe_nf_status",
         r#"{CALLBACK_SEGMENT}/ token segment, so its notifications could name no \"#,
         1,
     ),
@@ -124,12 +170,14 @@ const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
     (
         "nextgcore-amfd",
         "namf_server.rs",
+        "oauth2_callback_exemptions",
         r#"format!("{}/{{token}}", crate::nrf_subscription::NOTIFY_PATH),"#,
         1,
     ),
     (
         "nextgcore-nwdafd",
         "main.rs",
+        "oauth2_callback_exemptions_from",
         "route(nrf_collector::CALLBACK_SEGMENT),",
         1,
     ),
@@ -137,6 +185,7 @@ const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
     (
         "nextgcore-nwdafd",
         "main.rs",
+        "nwdaf_sbi_request_handler",
         r#"_ => send_method_not_allowed(method, "nf-status-notify/{token}"),"#,
         1,
     ),
@@ -145,24 +194,28 @@ const NOT_ROUTES: &[(&str, &str, &str, usize)] = &[
     (
         "nextgcore-bsfd",
         "bsf_sm.rs",
+        "handle_nnrf_nfm_request",
         r#"Some("nf-status-notify") => match method {"#,
         1,
     ),
     (
         "nextgcore-nssfd",
         "nssf_sm.rs",
+        "handle_nnrf_nfm_request",
         r#"Some("nf-status-notify") => match method {"#,
         1,
     ),
     (
         "nextgcore-seppd",
         "sepp_sm.rs",
+        "handle_nnrf_nfm_request",
         r#"Some("nf-status-notify") => match method {"#,
         1,
     ),
     (
         "nextgcore-udrd",
         "udr_sm.rs",
+        "handle_nnrf_nfm_request",
         r#"Some("nf-status-notify") => {"#,
         1,
     ),
@@ -212,13 +265,13 @@ fn names_notify_path(s: &str) -> bool {
 }
 
 /// Every non-comment line of `sources` that names an NFStatusNotify path, as
-/// (file, trimmed line), whatever its syntax: a string literal containing
+/// (file, enclosing fn, trimmed line), whatever its syntax: a string literal containing
 /// `nf-status-notify` or `nfstatus-notify` (a match arm, a slice pattern, an
 /// `==`, a `format!`), or a use of a `const` holding such a path (`NAME` in the
 /// file that defines it, `module::NAME` anywhere; another module's const of the
 /// same name is not). #2187 (R41): a nested `"nf-status-notify" => ...` arm is
 /// such a line, so it is found without recognising match shapes.
-fn path_mentions(sources: &Sources) -> Vec<(String, String)> {
+fn path_mentions(sources: &Sources) -> Vec<(String, String, String)> {
     let consts: Vec<(String, String, String)> = sources
         .iter()
         .flat_map(|(file, t)| {
@@ -239,18 +292,66 @@ fn path_mentions(sources: &Sources) -> Vec<(String, String)> {
         .collect();
     let mut out = Vec::new();
     for (file, text) in sources {
-        for line in code_lines(text) {
+        let spans = fn_spans(text);
+        for (at, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
             let l = line.trim();
             let uses_const = consts.iter().any(|(def_file, module, name)| {
                 l.contains(&format!("{module}::{name}"))
                     || (def_file == file && contains_word(l, name))
             });
             if names_notify_path(l) || uses_const {
-                out.push((file.clone(), l.to_string()));
+                out.push((file.clone(), enclosing_fn(&spans, at), l.to_string()));
             }
         }
     }
     out
+}
+
+/// Every `fn` in `text`: (first line, last line, name). A body ends at the
+/// closing brace at the definition's indentation, or on its own line when the
+/// definition opens and closes there.
+fn fn_spans(text: &str) -> Vec<(usize, usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(at) = trimmed.find("fn ") else {
+            continue;
+        };
+        let keywords_only = trimmed[..at]
+            .split_whitespace()
+            .all(|w| ["pub", "pub(crate)", "async", "const", "unsafe"].contains(&w));
+        let name: String = trimmed[at + 3..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !keywords_only || name.is_empty() {
+            continue;
+        }
+        let opens = line.matches('{').count();
+        let end = if opens > 0 && opens == line.matches('}').count() {
+            i
+        } else {
+            let close = format!("{}}}", " ".repeat(line.len() - trimmed.len()));
+            (i..lines.len())
+                .find(|&k| lines[k] == close)
+                .unwrap_or(lines.len() - 1)
+        };
+        out.push((i, end, name));
+    }
+    out
+}
+
+/// The innermost `fn` of `spans` containing line `at`, or "" at module level.
+fn enclosing_fn(spans: &[(usize, usize, String)], at: usize) -> String {
+    spans
+        .iter()
+        .filter(|(start, end, _)| *start <= at && at <= *end)
+        .max_by_key(|(start, _, _)| *start)
+        .map_or_else(String::new, |(_, _, name)| name.clone())
 }
 
 fn contains_word(line: &str, word: &str) -> bool {
@@ -284,39 +385,31 @@ fn functions(sources: &Sources) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for (_, text) in sources {
         let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            let Some(at) = trimmed.find("fn ") else {
-                continue;
-            };
-            let head = &trimmed[..at];
-            let keywords_only = head
-                .split_whitespace()
-                .all(|w| ["pub", "pub(crate)", "async", "const", "unsafe"].contains(&w));
-            if !keywords_only {
-                continue;
-            }
-            let name: String = trimmed[at + 3..]
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if name.is_empty() {
-                continue;
-            }
-            let indent = line.len() - trimmed.len();
-            let close = format!("{}}}", " ".repeat(indent));
-            let mut body = String::new();
-            for l in &lines[i..] {
-                body.push_str(l);
-                body.push('\n');
-                if *l == close {
-                    break;
-                }
-            }
-            out.entry(name).or_insert(body);
+        for (start, end, name) in fn_spans(text) {
+            out.entry(name)
+                .or_insert_with(|| lines[start..=end].join("\n") + "\n");
         }
     }
     out
+}
+
+/// Whether, in `arm` (its lines joined), the handler call is the first thing
+/// that runs: before `handler(` there is no `;` and, outside match guards
+/// (`if ... =>`), no call. The text before the arm's first `=>` is the pattern
+/// line and is not looked at here (it is listed whole).
+fn handler_runs_first(arm: &str, handler: &str) -> bool {
+    let Some(call) = arm.find(&format!("{handler}(")) else {
+        return false;
+    };
+    let after_pattern = arm[..call].find("=>").map_or(0, |at| at + 2);
+    let mut prelude = arm[after_pattern..call].to_string();
+    while let Some(at) = prelude.find(" if ") {
+        let Some(len) = prelude[at..].find("=>") else {
+            break;
+        };
+        prelude.replace_range(at..at + len + 2, " ");
+    }
+    !prelude.contains(';') && !prelude.contains('(')
 }
 
 /// Whether `name`'s body reaches the shared check, through functions of the
@@ -344,12 +437,13 @@ fn reaches_check(fns: &HashMap<String, String>, name: &str) -> bool {
 }
 
 /// Every problem the guard finds in `crates` (name -> sources), for `routes`
-/// and `not_routes`. Both lists are matched against whole trimmed lines, and
-/// each entry must match exactly as many lines as it declares (a route: one).
+/// and `not_routes`. Both lists are matched against whole trimmed lines within
+/// their enclosing `fn`, and each entry must match exactly as many lines as it
+/// declares (a route: one).
 fn problems(
     crates: &[(String, Sources)],
-    routes: &[(&str, &str, &str, &str)],
-    not_routes: &[(&str, &str, &str, usize)],
+    routes: &[Route],
+    not_routes: &[NotRoute],
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut route_hits = vec![0usize; routes.len()];
@@ -358,38 +452,41 @@ fn problems(
         if SENDERS.contains(&name.as_str()) {
             continue;
         }
-        for (file, line) in path_mentions(sources) {
-            let at = |c: &str, f: &str, l: &str| c == name && f == file && l == line;
-            let route = routes.iter().position(|r| at(r.0, r.1, r.2));
-            let not_route = not_routes.iter().position(|n| at(n.0, n.1, n.2));
+        for (file, func, line) in path_mentions(sources) {
+            let at = |c: &str, f: &str, g: &str, l: &str| {
+                c == name && f == file && g == func && l == line
+            };
+            let route = routes.iter().position(|r| at(r.0, r.1, r.2, r.3[0]));
+            let not_route = not_routes.iter().position(|n| at(n.0, n.1, n.2, n.3));
             match (route, not_route) {
                 (Some(i), _) => route_hits[i] += 1,
                 (None, Some(i)) => not_route_hits[i] += 1,
                 (None, None) => out.push(format!(
-                    "{name}/{file}: unlisted NFStatusNotify route arm `{line}`"
+                    "{name}/{file}: unlisted NFStatusNotify route arm `{line}` in fn `{func}`"
                 )),
             }
         }
         let listed: Vec<_> = routes.iter().filter(|r| r.0 == name).collect();
         let fns = functions(sources);
-        for (_, file, marker, handler) in &listed {
+        for (_, file, _, arm, handler) in &listed {
             let Some((_, text)) = sources.iter().find(|(f, _)| f == file) else {
                 out.push(format!("{name}/{file}: listed route file is missing"));
                 continue;
             };
-            let lines: Vec<&str> = code_lines(text).collect();
-            let Some(at) = lines.iter().position(|l| l.trim() == *marker) else {
+            let lines: Vec<&str> = code_lines(text).map(str::trim).collect();
+            let Some(at) = lines.iter().position(|l| *l == arm[0]) else {
                 continue; // reported below as matching no line
             };
-            let arm = lines[at..]
-                .iter()
-                .take(8)
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !arm.contains(&format!("{handler}(")) {
+            let found = lines.get(at..at + arm.len()).unwrap_or_default();
+            if found != *arm {
                 out.push(format!(
-                    "{name}/{file}: route `{marker}` does not call {handler}"
+                    "{name}/{file}: route `{}` is no longer the listed arm: {found:?}",
+                    arm[0]
+                ));
+            } else if !handler_runs_first(&arm.join("\n"), handler) {
+                out.push(format!(
+                    "{name}/{file}: in route `{}`, {handler} is not the arm's first statement",
+                    arm[0]
                 ));
             }
             if !reaches_check(&fns, handler) {
@@ -409,17 +506,17 @@ fn problems(
     let counted = routes
         .iter()
         .zip(&route_hits)
-        .map(|(r, n)| ((r.0, r.1, r.2), 1, *n))
+        .map(|(r, n)| ((r.0, r.1, r.2, r.3[0]), 1, *n))
         .chain(
             not_routes
                 .iter()
                 .zip(&not_route_hits)
-                .map(|(e, n)| ((e.0, e.1, e.2), e.3, *n)),
+                .map(|(e, n)| ((e.0, e.1, e.2, e.3), e.4, *n)),
         );
-    for ((name, file, line), declared, found) in counted {
+    for ((name, file, func, line), declared, found) in counted {
         if found == 0 {
             out.push(format!(
-                "{name}/{file}: stale entry, it matches no line: `{line}`"
+                "{name}/{file}: stale entry, it matches no line in fn `{func}`: `{line}`"
             ));
         } else if found != declared {
             out.push(format!(
@@ -430,7 +527,7 @@ fn problems(
     out
 }
 
-fn problems3(crates: &[(String, Sources)], routes: &[(&str, &str, &str, &str)]) -> Vec<String> {
+fn problems3(crates: &[(String, Sources)], routes: &[Route]) -> Vec<String> {
     problems(crates, routes, &[])
 }
 
@@ -481,12 +578,8 @@ fn route(parts: &[&str]) {
 fn on_notify(t: &str) { inner(t) }
 fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p); }
 "#;
-    let routes = [(
-        "x-amfd",
-        "server.rs",
-        r#""cb" if parts[2] == "nf-status-notify" => { on_notify(parts[3]) }"#,
-        "on_notify",
-    )];
+    let arm: &[&str] = &[r#""cb" if parts[2] == "nf-status-notify" => { on_notify(parts[3]) }"#];
+    let routes = [("x-amfd", "server.rs", "route", arm, "on_notify")];
     let one = |name: &str, file: &str, text: &str| vec![(name.to_string(), src(&[(file, text)]))];
     assert_eq!(
         problems3(&one("x-amfd", "server.rs", guarded), &routes),
@@ -548,10 +641,11 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
         (
             "x-amfd",
             "paths.rs",
+            "",
             r#"pub const NOTIFY_PATH: &str = "/cb/v1/nf-status-notify";"#,
             1,
         ),
-        ("x-amfd", "server.rs", exempt, 1),
+        ("x-amfd", "server.rs", "exemptions", exempt, 1),
     ];
     assert_eq!(
         problems(&exempting(guarded), &routes, &not_routes),
@@ -567,7 +661,13 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
     // names one whole line, so neither spelling of the entry exempts it.
     let as_substring = [
         not_routes[0],
-        ("x-amfd", "server.rs", "crate::paths::NOTIFY_PATH)", 1),
+        (
+            "x-amfd",
+            "server.rs",
+            "exemptions",
+            "crate::paths::NOTIFY_PATH)",
+            1,
+        ),
     ];
     for entries in [&not_routes, &as_substring] {
         let found = problems(&exempting(&starts_with), &routes, entries);
@@ -577,11 +677,20 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
                 .any(|p| p.contains("unlisted NFStatusNotify route arm")
                     && p.contains("starts_with(crate::paths::NOTIFY_PATH)")),
             "a route ending a call with an exempted line's const fails ({:?}): {found:?}",
-            entries[1].2
+            entries[1].3
         );
     }
-    let twice = format!("{guarded}fn again() {{\n    {exempt}\n}}\n");
-    let found = problems(&exempting(&twice), &routes, &not_routes);
+    let twice = vec![(
+        "x-amfd".to_string(),
+        src(&[
+            ("paths.rs", paths),
+            (
+                "server.rs",
+                &format!("{guarded}fn exemptions() {{\n    vec![\n        {exempt}\n        {exempt}\n    ]\n}}\n"),
+            ),
+        ]),
+    )];
+    let found = problems(&twice, &routes, &not_routes);
     assert!(
         found
             .iter()
@@ -591,7 +700,13 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
     let gone = [
         not_routes[0],
         not_routes[1],
-        ("x-amfd", "server.rs", "let gone = NOTIFY_PATH;", 1),
+        (
+            "x-amfd",
+            "server.rs",
+            "exemptions",
+            "let gone = NOTIFY_PATH;",
+            1,
+        ),
     ];
     let found = problems(&exempting(guarded), &routes, &gone);
     assert!(
@@ -599,6 +714,91 @@ fn inner(t: &str) { nextgcore_sbi::nf_status_notify::refuse_notifier(r, true, p)
             .iter()
             .any(|p| p.contains("stale entry, it matches no line")),
         "an entry that matches nothing fails: {found:?}"
+    );
+
+    // #2187 (R41, second round): an exempted line moved out of its `fn` into
+    // the router is not the listed line, though the file still has one copy.
+    let moved = vec![(
+        "x-amfd".to_string(),
+        src(&[
+            ("paths.rs", paths),
+            (
+                "server.rs",
+                &format!(
+                    "{}fn exemptions() {{\n    vec![]\n}}\n",
+                    guarded.replace(
+                        "    }\n}\nfn on_notify",
+                        &format!("        p if template_matches(p,\n            {exempt}\n        ) => act(p),\n    }}\n}}\nfn on_notify"),
+                    )
+                ),
+            ),
+        ]),
+    )];
+    let found = problems(&moved, &routes, &not_routes);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("unlisted NFStatusNotify route arm") && p.contains("in fn `route`")),
+        "an exempted line moved into the router fails: {found:?}"
+    );
+
+    // #2187 (R41, second round): a side effect before the guarded call. Even
+    // listed as the arm, the handler is then not the arm's first statement.
+    let acting_arm: &[&str] =
+        &[r#""cb" if parts[2] == "nf-status-notify" => { act(&parts); on_notify(parts[3]) }"#];
+    let acting = guarded.replace(arm[0], acting_arm[0]);
+    let found = problems3(
+        &one("x-amfd", "server.rs", &acting),
+        &[("x-amfd", "server.rs", "route", acting_arm, "on_notify")],
+    );
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("on_notify is not the arm's first statement")),
+        "an arm acting before the guarded call fails: {found:?}"
+    );
+    // ...and a call with no `;` (a tuple whose second half is the handler).
+    let tupled_arm: &[&str] =
+        &[r#""cb" if parts[2] == "nf-status-notify" => { (act(&parts), on_notify(parts[3])).1 }"#];
+    let found = problems3(
+        &one(
+            "x-amfd",
+            "server.rs",
+            &guarded.replace(arm[0], tupled_arm[0]),
+        ),
+        &[("x-amfd", "server.rs", "route", tupled_arm, "on_notify")],
+    );
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("on_notify is not the arm's first statement")),
+        "a call before the guarded call fails: {found:?}"
+    );
+    // A multi-line arm with a line slipped in is no longer the listed arm.
+    let multi = guarded.replace(
+        arm[0],
+        "\"cb\" if parts[2] == \"nf-status-notify\" => {\n            on_notify(parts[3])\n        }",
+    );
+    let multi_arm: &[&str] = &[
+        r#""cb" if parts[2] == "nf-status-notify" => {"#,
+        "on_notify(parts[3])",
+    ];
+    let multi_routes = [("x-amfd", "server.rs", "route", multi_arm, "on_notify")];
+    assert_eq!(
+        problems3(&one("x-amfd", "server.rs", &multi), &multi_routes),
+        Vec::<String>::new(),
+        "the multi-line guarded arm passes"
+    );
+    let slipped = multi.replace(
+        "=> {\n            on_notify",
+        "=> {\n            act(&parts);\n            on_notify",
+    );
+    let found = problems3(&one("x-amfd", "server.rs", &slipped), &multi_routes);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("is no longer the listed arm")),
+        "a line slipped into a listed arm fails: {found:?}"
     );
 
     // #2187 (R41): a renamed receiver built from a serde field and a split path.

@@ -84,6 +84,10 @@ fn path_of(uri: &str) -> &str {
     &rest[rest.find('/').expect("an absolute URI with a path")..]
 }
 
+/// REVERT-VERIFIED: with `refuse_notifier` given `production = false`, the
+/// forged `[AMF]` sender is 204 (`left: 204, right: 403`). With amfd's route
+/// arm acting first (`apply_notification("SMF", ..)` before the guarded
+/// handler, R41's plant on #2187), "a forged sender evicted the SMF" fails.
 #[tokio::test]
 async fn every_advertised_nf_status_notify_path_refuses_a_forged_sender_2179() {
     // Subscribing goes out over loopback plaintext: dev for this half only.
@@ -124,7 +128,12 @@ async fn every_advertised_nf_status_notify_path_refuses_a_forged_sender_2179() {
     // Everything below is the receiving side, under production.
     set_sbi_profile_override(SbiProfile::Production);
     let ctx = global_context();
+    // #2187 (R41): two SMFs, so a notification on the SMF subscription really
+    // evicts the target. With only one, the last of its type is re-discovered
+    // instead, and "a forged sender evicts nothing" could not fail.
     ctx.add_nf_instance(cached_smf("smf-2179-backstop", 42190))
+        .await;
+    ctx.add_nf_instance(cached_smf("smf-2179-backstop-other", 42191))
         .await;
     let body = json!({
         "event": "NF_DEREGISTERED",
@@ -161,9 +170,11 @@ async fn every_advertised_nf_status_notify_path_refuses_a_forged_sender_2179() {
         );
     }
 
-    // Control: the same paths from the NRF's certificate get past the check, so
-    // the 403s above are the sender check and not some earlier refusal. On a
-    // subscription other than the SMF's, nothing is evicted.
+    // Controls: the same paths from the NRF's certificate get past the check,
+    // so the 403s above are the sender check and not some earlier refusal. On
+    // a subscription other than the SMF's, nothing is evicted; on the SMF's,
+    // the target is, which is what makes "a forged sender evicted the SMF"
+    // above able to fail (R41's act-before-check plant on #2187).
     for (nf_type, uri) in advertised.iter().filter(|(t, _)| t != "SMF") {
         let resp =
             nextgcore_amfd::namf_server::namf_request_handler(from(path_of(uri), &["NRF"])).await;
@@ -173,6 +184,20 @@ async fn every_advertised_nf_status_notify_path_refuses_a_forged_sender_2179() {
             resp.http.content
         );
     }
-    assert!(ctx.get_nf_instance("smf-2179-backstop").await.is_some());
-    ctx.remove_nf_instance("smf-2179-backstop").await;
+    assert!(
+        ctx.get_nf_instance("smf-2179-backstop").await.is_some(),
+        "another subscription's notification evicts no SMF"
+    );
+    let (_, smf_uri) = advertised
+        .iter()
+        .find(|(t, _)| t == "SMF")
+        .expect("an SMF subscription");
+    let resp =
+        nextgcore_amfd::namf_server::namf_request_handler(from(path_of(smf_uri), &["NRF"])).await;
+    assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+    assert!(
+        ctx.get_nf_instance("smf-2179-backstop").await.is_none(),
+        "the NRF's notification on the SMF subscription evicts the target"
+    );
+    ctx.remove_nf_instance("smf-2179-backstop-other").await;
 }
