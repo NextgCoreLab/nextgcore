@@ -250,8 +250,9 @@ fn refuse_unbound_peer(
     operation: &str,
 ) -> Option<HttpResponse> {
     let claimed = claimed.trim().trim_end_matches('.').to_ascii_lowercase();
-    if !request.peer_cert_present {
-        if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+    match peer_binding(request, &claimed) {
+        PeerBinding::Bound => return None,
+        PeerBinding::NoCertificate => {
             log::warn!("{operation} from [{claimed}] refused: no verified peer SEPP certificate");
             return Some(send_error(
                 403,
@@ -260,10 +261,7 @@ fn refuse_unbound_peer(
                 None,
             ));
         }
-        return None;
-    }
-    if request.peer_cert_dns_sans.contains(&claimed) {
-        return None;
+        PeerBinding::OtherPeer => {}
     }
     log::warn!(
         "{operation} refused: it claims SEPP [{claimed}], but the peer certificate names {:?}",
@@ -275,6 +273,38 @@ fn refuse_unbound_peer(
         &format!("{operation}: the peer certificate does not name SEPP [{claimed}]"),
         None,
     ))
+}
+
+/// [`refuse_unbound_peer`]'s decision, without its log line or its refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerBinding {
+    /// The connection's verified certificate names the claimed SEPP, or there
+    /// is no certificate and the `dev` profile admits that.
+    Bound,
+    /// No verified peer certificate, under the `production` profile.
+    NoCertificate,
+    /// The verified certificate names another SEPP.
+    OtherPeer,
+}
+
+/// Whether the SEPP on the other end of this connection is SEPP `claimed`
+/// (#2076; see [`refuse_unbound_peer`] for the rule). Logs nothing and builds
+/// nothing, so a caller that must answer a refusal exactly as another outcome
+/// (#2112: a foreign `n32f-terminate` as an unknown context) can.
+fn peer_binding(request: &HttpRequest, claimed: &str) -> PeerBinding {
+    let claimed = claimed.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !request.peer_cert_present {
+        return if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+            PeerBinding::NoCertificate
+        } else {
+            PeerBinding::Bound
+        };
+    }
+    if request.peer_cert_dns_sans.contains(&claimed) {
+        PeerBinding::Bound
+    } else {
+        PeerBinding::OtherPeer
+    }
 }
 
 fn handle_exchange_capability(body: &str, cid: &str, request: &HttpRequest) -> HttpResponse {
@@ -713,9 +743,17 @@ fn handle_n32f_terminate(body: &str, request: &HttpRequest) -> HttpResponse {
     // #2076: only the SEPP whose context it is tears it down, before its keys go.
     // #2096 (R30 on #2092): and another peer's context is answered exactly as an
     // unknown one, so the answer does not tell a peer which context ids exist.
-    let Some(mut node) = found
-        .filter(|node| refuse_unbound_peer(request, &node.receiver, "n32f-terminate").is_none())
+    // #2112: through the same code, too. The binding check is the quiet
+    // `peer_binding`: no refusal is built and nothing is logged at WARN, so the
+    // two cases take the same path and leave the same log line, and a peer
+    // cannot fill the log by asking about other peers' contexts.
+    let Some(mut node) =
+        found.filter(|node| peer_binding(request, &node.receiver) == PeerBinding::Bound)
     else {
+        log::debug!(
+            "n32f-terminate of {context_id} answered 404: the calling SEPP has no N32-f \
+             context with that id"
+        );
         return send_error(
             404,
             "Not Found",
@@ -2491,6 +2529,80 @@ mod tests {
         );
         assert_eq!(rsp.status, 400, "{:?}", rsp.http.content);
         assert!(n32c_handler::take_n32c_tls_exporter_secret(peer).is_none());
+    }
+
+    /// **#2112** (R31 on #2110): a foreign `n32f-terminate` takes the unknown
+    /// context's path, not just its answer: the same status and body, and the
+    /// same log line, at DEBUG. Before, the foreign case built and discarded a
+    /// 403 and logged a WARN naming both SEPPs, a timing and log-volume
+    /// difference a peer could also use to fill the log.
+    ///
+    /// REVERT-VERIFIED: with the filter back on `refuse_unbound_peer`, the
+    /// WARN naming SEPP A is logged and "no WARN" fails.
+    #[test]
+    fn a_foreign_n32f_terminate_is_answered_and_logged_as_an_unknown_context_2112() {
+        nextgcore_core::test_log::init();
+        let a = "sepp-a-2112.example.com";
+        let node_id = tls_peer_with_context(a, "ctx-2112-a");
+        let from_b = from_sepp(HttpRequest::default(), &["sepp-b-2112.example.com"]);
+        let terminate = |id: &str| {
+            handle_n32f_terminate(
+                &serde_json::json!({ "n32fContextId": id }).to_string(),
+                &from_b,
+            )
+        };
+        let about_a = nextgcore_core::test_log::watch(a);
+        let foreign_log = nextgcore_core::test_log::watch("ctx-2112-a");
+        let unknown_log = nextgcore_core::test_log::watch("ctx-2112-none");
+
+        let foreign = terminate("ctx-2112-a");
+        let unknown = terminate("ctx-2112-none");
+
+        let answer = |r: &HttpResponse, id: &str| {
+            (
+                r.status,
+                r.http.content.as_deref().map(|c| c.replace(id, "ID")),
+            )
+        };
+        assert_eq!(answer(&foreign, "ctx-2112-a").0, 404);
+        assert_eq!(
+            answer(&foreign, "ctx-2112-a"),
+            answer(&unknown, "ctx-2112-none"),
+            "the same answer"
+        );
+        let lines = |w: &nextgcore_core::test_log::Watch, id: &str| {
+            w.records()
+                .iter()
+                .map(|r| r.replace(id, "ID"))
+                .collect::<Vec<_>>()
+        };
+        let unknown_lines = lines(&unknown_log, "ctx-2112-none");
+        assert_eq!(
+            unknown_lines,
+            [
+                "DEBUG nextgcore_seppd::n32_server: n32f-terminate of ID answered 404: the \
+                 calling SEPP has no N32-f context with that id"
+            ],
+            "an unknown context leaves one DEBUG line"
+        );
+        assert_eq!(
+            lines(&foreign_log, "ctx-2112-a"),
+            unknown_lines,
+            "and a foreign one the same line"
+        );
+        let warns: Vec<String> = about_a
+            .records()
+            .into_iter()
+            .filter(|r| r.starts_with("WARN"))
+            .collect();
+        assert_eq!(warns, Vec::<String>::new(), "no WARN names SEPP A");
+
+        let ctx = sepp_self();
+        let c = ctx.read().unwrap();
+        assert!(
+            c.node_find(node_id).unwrap().n32f_security.is_some(),
+            "A's context is untouched"
+        );
     }
 
     /// #2076 (R32's audit): N32-c claims are bound to the SEPP on the other end
