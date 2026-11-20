@@ -853,6 +853,13 @@ pub struct MbSmfContext {
     /// #1796: `{scheme}://{advertised host:port}`, the base of the `notifyUri`s
     /// this MB-SMF gives the AMF; `None` until startup sets it.
     amf_notify_base: RwLock<Option<String>>,
+    /// #2266: this context's [`MAX_AMF_NOTIFY_TOKENS`] and
+    /// [`MAX_PENDING_NOTIFY_TOKENS`]. Always those constants, except in a test
+    /// that builds its context with [`Self::with_notify_token_caps_for_test`]:
+    /// the cap rules do not depend on the bound's size, and filling 4096 + 4096
+    /// tokens one record at a time costs a debug build half a minute.
+    notify_token_cap: usize,
+    pending_notify_token_cap: usize,
 }
 
 impl MbSmfContext {
@@ -871,6 +878,19 @@ impl MbSmfContext {
             amf_contexts: Mutex::new(HashMap::new()),
             amf_notify_tokens: Mutex::new(HashMap::new()),
             amf_notify_base: RwLock::new(None),
+            notify_token_cap: MAX_AMF_NOTIFY_TOKENS,
+            pending_notify_token_cap: MAX_PENDING_NOTIFY_TOKENS,
+        }
+    }
+
+    /// #2266: a context whose notify-token caps are `live` and `pending`
+    /// instead of [`MAX_AMF_NOTIFY_TOKENS`] and [`MAX_PENDING_NOTIFY_TOKENS`].
+    #[cfg(test)]
+    pub(crate) fn with_notify_token_caps_for_test(live: usize, pending: usize) -> Self {
+        Self {
+            notify_token_cap: live,
+            pending_notify_token_cap: pending,
+            ..Self::new()
         }
     }
 
@@ -898,14 +918,14 @@ impl MbSmfContext {
     pub fn mint_amf_notify_token(&self, id: u64) -> Option<String> {
         let contexts = self.amf_contexts.lock().ok()?;
         let mut tokens = self.amf_notify_tokens.lock().ok()?;
-        if tokens.len() >= MAX_AMF_NOTIFY_TOKENS {
+        if tokens.len() >= self.notify_token_cap {
             let held = held_contexts(&contexts);
             #[cfg(test)]
             mint_seam::fire(self);
-            if !Self::make_room(&mut tokens, &held) {
+            if !self.make_room(&mut tokens, &held) {
                 log::warn!(
-                    "MBS: {MAX_AMF_NOTIFY_TOKENS} AMF notification tokens held by live \
-                     sessions; none minted"
+                    "MBS: {} AMF notification tokens held by live sessions; none minted",
+                    self.notify_token_cap
                 );
                 return None;
             }
@@ -930,17 +950,21 @@ impl MbSmfContext {
     /// refused rather than take a pending context's. Pending tokens are capped
     /// separately at [`MAX_PENDING_NOTIFY_TOKENS`]: past it the oldest pending
     /// context's tokens go, so they never starve a live create.
-    fn make_room(tokens: &mut HashMap<String, NotifyToken>, held: &HashSet<ContextKey>) -> bool {
+    fn make_room(
+        &self,
+        tokens: &mut HashMap<String, NotifyToken>,
+        held: &HashSet<ContextKey>,
+    ) -> bool {
         let counted = tokens
             .values()
             .filter(|t| token_class(t, held) != TokenClass::Pending)
             .count();
-        if counted >= MAX_AMF_NOTIFY_TOKENS
+        if counted >= self.notify_token_cap
             && !Self::forget_oldest(tokens, held, TokenClass::Released)
         {
             return false;
         }
-        if tokens.len() >= MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS {
+        if tokens.len() >= self.notify_token_cap + self.pending_notify_token_cap {
             Self::forget_oldest(tokens, held, TokenClass::Pending);
         }
         true
@@ -2029,6 +2053,26 @@ mod tests {
         tokens
     }
 
+    /// #2266: the caps the #2015 cap tests run at. The cap rules do not depend
+    /// on the bound's size; filling the production 4096 + 4096 one record at a
+    /// time took 34 s of a debug build, and a loaded host tripped the 120 s
+    /// deadlock guard of `a_record_racing_the_mint_keeps_its_token_2015`. Equal,
+    /// as the production caps are.
+    const LIVE_CAP_2266: usize = 8;
+    const PENDING_CAP_2266: usize = 8;
+
+    /// #2266: a context built normally has the production caps, so the small
+    /// caps of the #2015 tests are theirs alone.
+    #[test]
+    fn a_context_has_the_production_token_caps_2266() {
+        let ctx = MbSmfContext::new();
+        assert_eq!(
+            (ctx.notify_token_cap, ctx.pending_notify_token_cap),
+            (MAX_AMF_NOTIFY_TOKENS, MAX_PENDING_NOTIFY_TOKENS)
+        );
+        assert_eq!(MAX_PENDING_NOTIFY_TOKENS, crate::reconcile::MAX_PENDING);
+    }
+
     /// **#2015** (item 1): at [`MAX_AMF_NOTIFY_TOKENS`] a mint reclaims only the
     /// tokens of a context the AMF released (204, in its grace), never those of a
     /// context whose delete is pending -- the AMF still holds that context and a
@@ -2044,25 +2088,26 @@ mod tests {
     /// starved by parked tokens" fails.
     #[test]
     fn the_token_cap_never_reclaims_a_parked_contexts_token_2015() {
-        let mut ctx = MbSmfContext::new();
+        let mut ctx =
+            MbSmfContext::with_notify_token_caps_for_test(LIVE_CAP_2266, PENDING_CAP_2266);
         ctx.init(8);
-        // 4096 contexts whose deletes are parked; the AMF then answers 204 for
+        // A full cap of contexts whose deletes are parked; the AMF then answers 204 for
         // context 0, so only its token is in a grace.
-        let parked = pending_contexts_2015(&ctx, 0x51, 0, MAX_PENDING_NOTIFY_TOKENS);
+        let parked = pending_contexts_2015(&ctx, 0x51, 0, PENDING_CAP_2266);
         ctx.mark_amf_context_released(&cap_record_2015(0, parked[0].clone()));
         let live = ctx
             .session_add(make_tmgi(0x52), MbsSessionType::Broadcast)
             .expect("live");
         // Live tokens up to the cap (one released token counts too).
-        for _ in 0..MAX_AMF_NOTIFY_TOKENS - 1 {
+        for _ in 0..LIVE_CAP_2266 - 1 {
             assert!(
                 ctx.mint_amf_notify_token(live.id).is_some(),
                 "a live create is not starved by parked tokens"
             );
         }
         let full = ctx.amf_notify_token_count();
-        // The cap: 4095 live + 1 released; 4095 more parked beside it.
-        assert_eq!(full, MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS - 1);
+        // The cap: all live but 1 released; the pending cap less one parked beside it.
+        assert_eq!(full, LIVE_CAP_2266 + PENDING_CAP_2266 - 1);
 
         assert!(
             ctx.mint_amf_notify_token(live.id).is_some(),
@@ -2096,8 +2141,9 @@ mod tests {
         }
 
         // Control: creates in flight are never reclaimed either.
-        let inflight = MbSmfContext::new();
-        for _ in 0..MAX_AMF_NOTIFY_TOKENS {
+        let inflight =
+            MbSmfContext::with_notify_token_caps_for_test(LIVE_CAP_2266, PENDING_CAP_2266);
+        for _ in 0..LIVE_CAP_2266 {
             inflight.mint_amf_notify_token(1).expect("minted");
         }
         assert!(
@@ -2116,10 +2162,11 @@ mod tests {
     /// from `token_class`, "a held context's token is kept" fails.
     #[test]
     fn past_the_pending_bound_a_mint_forgets_the_oldest_parked_context_2015() {
-        let mut ctx = MbSmfContext::new();
+        let mut ctx =
+            MbSmfContext::with_notify_token_caps_for_test(LIVE_CAP_2266, PENDING_CAP_2266);
         ctx.init(8);
-        let a = pending_contexts_2015(&ctx, 0x53, 0, MAX_AMF_NOTIFY_TOKENS);
-        let b = pending_contexts_2015(&ctx, 0x54, MAX_AMF_NOTIFY_TOKENS, MAX_AMF_NOTIFY_TOKENS);
+        let a = pending_contexts_2015(&ctx, 0x53, 0, LIVE_CAP_2266);
+        let b = pending_contexts_2015(&ctx, 0x54, LIVE_CAP_2266, LIVE_CAP_2266);
         let live = ctx
             .session_add(make_tmgi(0x55), MbsSessionType::Broadcast)
             .expect("live");
@@ -2131,7 +2178,7 @@ mod tests {
         );
         assert_eq!(
             ctx.amf_notify_token_count(),
-            MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS,
+            LIVE_CAP_2266 + PENDING_CAP_2266,
             "never more than both caps"
         );
         assert_eq!(
@@ -2186,23 +2233,19 @@ mod tests {
     }
 
     fn a_record_racing_the_mint_body_2015() {
-        let mut ctx = MbSmfContext::new();
+        let mut ctx =
+            MbSmfContext::with_notify_token_caps_for_test(LIVE_CAP_2266, PENDING_CAP_2266);
         ctx.init(8);
         // One under both caps, from two released sessions (each held up to the cap).
-        let parked = pending_contexts_2015(&ctx, 0x56, 0, MAX_AMF_NOTIFY_TOKENS);
-        pending_contexts_2015(
-            &ctx,
-            0x59,
-            MAX_AMF_NOTIFY_TOKENS,
-            MAX_PENDING_NOTIFY_TOKENS - 1,
-        );
+        let parked = pending_contexts_2015(&ctx, 0x56, 0, LIVE_CAP_2266);
+        pending_contexts_2015(&ctx, 0x59, LIVE_CAP_2266, PENDING_CAP_2266 - 1);
         let b = ctx
             .session_add(make_tmgi(0x57), MbsSessionType::Broadcast)
             .expect("B");
         let tb = ctx.mint_amf_notify_token(b.id).expect("B's token");
         assert_eq!(
             ctx.amf_notify_token_count(),
-            MAX_AMF_NOTIFY_TOKENS + MAX_PENDING_NOTIFY_TOKENS
+            LIVE_CAP_2266 + PENDING_CAP_2266
         );
         let k = cap_record_2015(0, tb.clone());
         let landed = std::rc::Rc::new(std::cell::Cell::new(false));
