@@ -2855,7 +2855,6 @@ dependencies = [
  "log",
  "nextgcore-amfd",
  "nextgcore-app",
- "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-crypt",
  "nextgcore-diameter",
