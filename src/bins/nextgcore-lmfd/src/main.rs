@@ -501,13 +501,15 @@ async fn main() -> Result<()> {
     // #2085: unsubscribe at the AMFs before the context is cleared. amfd's
     // non-UE N2 subscriptions never expire, so each one left here would outlive
     // this LMF, one per AMF per restart.
+    // #2104 (R30 on #2111): the parked unsubscribes too, even when no live one is
+    // held, so the pass runs when either set is not empty.
     let held = lmf_self()
         .read()
         .map(|c| c.amf_subscriptions_take_created())
         .unwrap_or_default();
-    if !held.is_empty() {
-        let n = held.len();
-        let done = amf_unsubscribe::unsubscribe_all(held, SHUTDOWN_UNSUBSCRIBE_BUDGET).await;
+    if let Some((done, n)) =
+        amf_unsubscribe::unsubscribe_at_shutdown(held, SHUTDOWN_UNSUBSCRIBE_BUDGET).await
+    {
         log::info!("Unsubscribed {done} of {n} AMF subscription(s) at shutdown");
     }
     sbi_server

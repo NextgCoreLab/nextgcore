@@ -426,7 +426,11 @@ async fn create_n1n2_subscription(
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
-            let sub_id = created_subscription_id(&resp, "n1n2NotifySubscriptionId");
+            let sub_id = created_subscription_id(
+                &resp,
+                "n1n2NotifySubscriptionId",
+                &crate::amf_unsubscribe::subscription_path(Some(ue_context_id), ""),
+            );
             if sub_id.is_none() {
                 log::warn!(
                     "A2: N1N2 subscription 201 without n1n2NotifySubscriptionId or Location (not cached)"
@@ -532,12 +536,18 @@ fn spawn_unsubscribe_id(amf: &DiscoveredAmf, ue_context_id: Option<&str>, id: &s
 }
 
 /// #2085: the AMF's id for a subscription it answered 201 to: `field` of the
-/// body, else the last segment of the `Location` header (TS 29.518: the created
-/// resource's URI, `.../subscriptions/{subscriptionId}`). A 201 whose id was
-/// only in `Location` used to be left unrecorded, and so never unsubscribed.
+/// body, else the id in the `Location` header (TS 29.518: the created resource's
+/// URI, `.../subscriptions/{subscriptionId}`). A 201 whose id was only in
+/// `Location` used to be left unrecorded, and so never unsubscribed.
+///
+/// #2104 (R32 on #2098): `Location` must name the resource this create made, at
+/// `expected_prefix` (see [`subscription_id_from_location`]). Its last segment
+/// was taken whatever the path, so a wrong one, or a `?query`, was recorded and
+/// later unsubscribed at a path the AMF never created.
 fn created_subscription_id(
     resp: &nextgcore_sbi::message::SbiResponse,
     field: &str,
+    expected_prefix: &str,
 ) -> Option<String> {
     resp.http
         .content
@@ -545,12 +555,38 @@ fn created_subscription_id(
         .and_then(|b| serde_json::from_str::<Value>(b).ok())
         .and_then(|v| v.get(field).and_then(Value::as_str).map(String::from))
         .or_else(|| {
-            resp.http
-                .get_header("Location")
-                .and_then(|l| l.trim_end_matches('/').rsplit('/').next())
-                .filter(|id| !id.is_empty())
-                .map(String::from)
+            let location = resp.http.get_header("Location")?;
+            let id = subscription_id_from_location(location, expected_prefix);
+            if id.is_none() {
+                log::warn!(
+                    "A2: subscription 201 Location {location:?} is not a resource under \
+                     {expected_prefix}; not recorded"
+                );
+            }
+            id
         })
+}
+
+/// #2104: the subscription id in `location`, an absolute URI or an absolute path
+/// whose path is `expected_prefix` (`.../subscriptions/`) followed by one
+/// non-empty segment, with no query or fragment. `None` for anything else.
+fn subscription_id_from_location(location: &str, expected_prefix: &str) -> Option<String> {
+    let location = location.trim();
+    if location.contains(['?', '#']) {
+        return None;
+    }
+    let path = match location.find("://") {
+        Some(scheme_end) => {
+            let rest = &location[scheme_end + 3..];
+            &rest[rest.find('/')?..]
+        }
+        None => location,
+    };
+    let id = path.strip_prefix(expected_prefix)?;
+    // R30 on #2111: not a dot segment, plain or percent-encoded (RFC 3986 §5.2.4
+    // would resolve it to another resource).
+    let dot_segment = matches!(id, "." | "..") || id.to_ascii_lowercase().contains("%2e");
+    (!id.is_empty() && !id.contains('/') && !dot_segment).then(|| id.to_string())
 }
 
 /// POST the multipart N1N2MessageTransfer to the serving AMF
@@ -738,7 +774,11 @@ async fn create_non_ue_nrppa_subscription(
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
-            let id = created_subscription_id(&resp, "n2NotifySubscriptionId");
+            let id = created_subscription_id(
+                &resp,
+                "n2NotifySubscriptionId",
+                &crate::amf_unsubscribe::subscription_path(None, ""),
+            );
             if id.is_none() {
                 log::warn!("Multi-RTT: NonUeN2InfoSubscribe 201 without n2NotifySubscriptionId or Location");
             }
@@ -1057,6 +1097,64 @@ mod tests {
             nf_instance_id: None,
         };
         (server, amf)
+    }
+
+    /// **#2104** (R32 on #2098): a `Location`-derived subscription id is taken only
+    /// from the resource this create made: the expected path, then one non-empty
+    /// segment, no query or fragment. Anything else is refused, not recorded.
+    ///
+    /// REVERT-VERIFIED: with the last segment taken whatever the path (as #2098 had
+    /// it), this fails: the wrong path and the `?query` yield ids.
+    #[test]
+    fn a_location_id_is_taken_only_from_the_expected_path_2104() {
+        let non_ue = crate::amf_unsubscribe::subscription_path(None, "");
+        let ue = crate::amf_unsubscribe::subscription_path(Some("imsi-001010000021040"), "");
+        let id = |l: &str, prefix: &str| subscription_id_from_location(l, prefix);
+
+        assert_eq!(
+            id(
+                "http://amf:7777/namf-comm/v1/non-ue-n2-messages/subscriptions/s-1",
+                &non_ue
+            ),
+            Some("s-1".to_string())
+        );
+        assert_eq!(
+            id(
+                "/namf-comm/v1/non-ue-n2-messages/subscriptions/s-2",
+                &non_ue
+            ),
+            Some("s-2".to_string()),
+            "an absolute path"
+        );
+        assert_eq!(
+            id(
+                "https://amf/namf-comm/v1/ue-contexts/imsi-001010000021040/n1-n2-messages/subscriptions/n-3",
+                &ue
+            ),
+            Some("n-3".to_string())
+        );
+        for refused in [
+            "http://amf/namf-comm/v1/other/subscriptions/s-1",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/s-1?x=1",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/s-1#f",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/s-1/",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/a/b",
+            "http://amf",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/..",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/.",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/%2E%2E",
+        ] {
+            assert_eq!(id(refused, &non_ue), None, "{refused}");
+        }
+        assert_eq!(
+            id(
+                "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/s-1",
+                &ue
+            ),
+            None,
+            "a non-UE resource is not the UE's"
+        );
     }
 
     /// **#2085**: a 201 whose subscription id is only in `Location` (TS 29.518:
