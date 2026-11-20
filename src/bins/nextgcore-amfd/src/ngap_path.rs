@@ -10856,7 +10856,19 @@ impl NgapServer {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,
                     container_type,
+                    "LPP",
                     lpp,
+                )
+                .await?;
+            }
+            Ok(crate::gmm_handler::UlTransportAction::ForwardSlppToLmf { slpp }) => {
+                self.forward_ul_lpp_to_lmf(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    container_type,
+                    crate::namf_server::N1_MESSAGE_CLASS_SLPP,
+                    slpp,
                 )
                 .await?;
             }
@@ -10898,6 +10910,7 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         container_type: u8,
+        class: &'static str,
         lpp: Vec<u8>,
     ) -> Result<()> {
         // Resolve the UE's ueContextId (SUPI) — the N1N2 subscription registry
@@ -10923,8 +10936,11 @@ impl NgapServer {
                 return Ok(());
             };
             match supi.as_deref() {
+                // #557: SLPP goes to the serving LMF
+                // (n1n2_subscription_find_positioning), and the notification
+                // still says "SLPP", so the LMF never reads SLPP as LPP.
                 Some(s) => (
-                    guard.n1n2_subscription_find_n1(s, "LPP"),
+                    guard.n1n2_subscription_find_positioning(s, class),
                     guard.lcs_correlation_find(s),
                 ),
                 None => (None, None),
@@ -10947,7 +10963,7 @@ impl NgapServer {
             crate::namf_server::send_n1_message_notify(
                 callback_uri,
                 Some(sub.subscription_id),
-                "LPP".to_string(),
+                class.to_string(),
                 lcs_correlation_id,
                 supi,
                 lpp,
@@ -14063,6 +14079,34 @@ impl NgapServer {
                             item.amf_ue_ngap_id
                         ),
                         Err(e) => log::warn!("LCS positioning DL NRPPa send failed: {e}"),
+                    }
+                }
+                crate::context::PositioningDlKind::SlppToUe {
+                    slpp_pdu,
+                    lcs_correlation_id,
+                } => {
+                    let Some(plain) = crate::positioning::build_slpp_dl_nas(
+                        &slpp_pdu,
+                        lcs_correlation_id.as_deref(),
+                    ) else {
+                        log::warn!(
+                            "LCS positioning DL SLPP build failed for UE {}",
+                            item.amf_ue_ngap_id
+                        );
+                        continue;
+                    };
+                    let nas = self
+                        .protect_nas(item.amf_ue_ngap_id, &plain)
+                        .unwrap_or(plain);
+                    match self
+                        .send_nas_pdu(association_id, item.amf_ue_ngap_id, ran_ue_ngap_id, &nas)
+                        .await
+                    {
+                        Ok(_) => log::info!(
+                            "LCS: delivered SLPP DL NAS Transport to UE {}",
+                            item.amf_ue_ngap_id
+                        ),
+                        Err(e) => log::warn!("LCS positioning DL SLPP send failed: {e}"),
                     }
                 }
                 crate::context::PositioningDlKind::LppToUe { lpp_pdu } => {

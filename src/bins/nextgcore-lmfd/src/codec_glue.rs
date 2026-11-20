@@ -27,7 +27,6 @@
 //! [`decode_lpp_multi_rtt_report`] — are used by the inbound SBI handlers in
 //! `main.rs`.
 
-pub use crate::sidelink_epdu::SidelinkRangingMethod;
 use crate::CellMeasurement;
 use nextgcore_lpp_gen::generated as lpp;
 
@@ -1383,64 +1382,6 @@ pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
 // ---------------------------------------------------------------------------
 // Sidelink ranging adapter (TS 23.586 §5.3.3, nextgsim #138)
 // ---------------------------------------------------------------------------
-
-/// One sidelink range the LMF holds for a UE.
-///
-/// Deliberately NOT a [`CellMeasurement`]: a sidelink range is a distance to another
-/// UE, not a measurement of a cell, and feeding it into the E-CID/Multi-RTT
-/// multilateration would put a peer UE's identity where a cell's global id belongs
-/// and produce a position from an anchor set the LMF has no coordinates for. The
-/// service is separate for that reason (see the issue: "distinct from
-/// `Nlmf_Location`").
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SidelinkRange {
-    /// The ranged peer's PC5 Layer-2 identity.
-    pub peer_layer2_id: u32,
-    /// Distance to that peer, in metres.
-    pub range_m: f64,
-    /// Reported accuracy, in metres.
-    pub accuracy_m: f64,
-    /// How it was measured, as the UE reported it.
-    pub method: SidelinkRangingMethod,
-    /// How many measurements the estimate rests on.
-    pub measurement_count: u16,
-}
-
-impl SidelinkRange {
-    fn from_result(result: &crate::sidelink_epdu::SidelinkRangingResult) -> Self {
-        Self {
-            peer_layer2_id: result.peer_layer2_id,
-            range_m: f64::from(result.range_cm) / 100.0,
-            accuracy_m: f64::from(result.accuracy_cm) / 100.0,
-            method: result.method,
-            measurement_count: result.measurement_count,
-        }
-    }
-}
-
-/// Decode raw LPP UPER bytes and adapt any sidelink ranging report.
-///
-/// The report rides in `epdu-ProvideLocationInformation` (TS 37.355 §6.5.7) under
-/// nextg's non-standard EPDU identifier; see [`crate::sidelink_epdu`]. The message
-/// is decoded with the generated codec. An empty `Vec` is the normal answer for a
-/// UE that does no sidelink ranging.
-///
-/// Separate from [`decode_lpp_provide_report`] because the two answer different
-/// questions: that one produces cell measurements a solver consumes, this one
-/// produces ranges to peer UEs that no solver can consume.
-pub fn decode_lpp_sidelink_ranging(bytes: &[u8]) -> Result<(u64, Vec<SidelinkRange>), String> {
-    let msg = decode_lpp(bytes)?;
-    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
-    let ranges = match provide_location_r9(&msg).and_then(crate::sidelink_epdu::report_in) {
-        Some(report) => report?
-            .results
-            .iter()
-            .map(SidelinkRange::from_result)
-            .collect(),
-        None => vec![],
-    };
-    Ok((request_id, ranges))
-}
 
 // ---------------------------------------------------------------------------
 // Tests

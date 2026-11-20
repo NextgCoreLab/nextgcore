@@ -5764,18 +5764,26 @@ pub fn send_n1_message_notify(
 /// (`process_positioning_downlinks`) resolves the serving association and
 /// delivers. The opaque NRPPa/LPP payloads are carried verbatim — the AMF is a
 /// transparent relay. The `Nlmf` uplink callback (UE/gNB→LMF) is `lmfd-07`.
+/// `n1MessageClass` for SLPP (#557). TS 29.518 defines no SLPP value
+/// (TS29518_Namf_Communication.yaml:4511-4523), and the enum is
+/// `anyOf [enum, string]`. TS 24.501 k00 §5.4.5.2.5 c1 has the AMF tell the LMF
+/// the payload container type, and this class is how it does so. lmfd spells
+/// it the same way.
+pub const N1_MESSAGE_CLASS_SLPP: &str = "SLPP";
+
 fn try_positioning_relay(
     ue_context_id: &str,
     ue: &AmfUe,
     request: &SbiRequest,
     body: &Value,
 ) -> Option<SbiResponse> {
-    let is_lpp = body
+    let class = body
         .pointer("/n1MessageContainer/n1MessageClass")
-        .and_then(Value::as_str)
-        == Some("LPP");
+        .and_then(Value::as_str);
+    let is_lpp = class == Some("LPP");
+    let is_slpp = class == Some(N1_MESSAGE_CLASS_SLPP);
     let nrppa_info = body.pointer("/n2InfoContainer/nrppaInfo");
-    if !is_lpp && nrppa_info.is_none() {
+    if !is_lpp && !is_slpp && nrppa_info.is_none() {
         return None; // not a positioning transfer — fall through to SM handling
     }
 
@@ -5826,6 +5834,30 @@ fn try_positioning_relay(
         downlinks.push(PendingPositioningDl {
             amf_ue_ngap_id: ue.id,
             kind: PositioningDlKind::LppToUe { lpp_pdu },
+        });
+    }
+
+    // SLPP → UE (N1, DL NAS Transport, payload container type 12, #557).
+    if is_slpp {
+        let Some(slpp_pdu) = body
+            .pointer("/n1MessageContainer/n1MessageContent/contentId")
+            .and_then(Value::as_str)
+            .and_then(|cid| find_binary_part(request, cid))
+        else {
+            return Some(mandatory_ie_incorrect(
+                "n1MessageContainer.n1MessageContent.contentId",
+                "no binary part for the SLPP payload",
+            ));
+        };
+        downlinks.push(PendingPositioningDl {
+            amf_ue_ngap_id: ue.id,
+            kind: PositioningDlKind::SlppToUe {
+                slpp_pdu,
+                lcs_correlation_id: body
+                    .get("lcsCorrelationId")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            },
         });
     }
 
@@ -5944,6 +5976,7 @@ fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> 
                 nrppa_pdu,
             } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
             PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+            PositioningDlKind::SlppToUe { slpp_pdu, .. } => (3u8, slpp_pdu).hash(&mut h),
         }
     }
     format!("lcs-{:016x}", h.finish())
@@ -10383,6 +10416,46 @@ mod tests {
             over.map(|r| r.status)
         );
         server.stop().await.expect("stop");
+    }
+
+    /// #557: an LMF's SLPP transfer becomes a type 12 DL NAS Transport, and the
+    /// downlink carries the LMF's LCS correlation id for the Additional
+    /// information IE (TS 24.501 k00 §5.4.5.3.2 c1). It is never queued as LPP.
+    #[tokio::test]
+    async fn test_n1n2_slpp_to_connected_ue_relays_as_slpp() {
+        let _q = updp_queue_test_lock().lock().await;
+        let supi = "imsi-001010000060557";
+        let ue = setup_ue(supi, true, true);
+        let slpp = [0x44u8, 0x02, 0x00, 0x40, 0x04, 0x00];
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "SLPP",
+                "n1MessageContent": { "contentId": "slpp-req" }
+            },
+            "lcsCorrelationId": "slpp-1-imsi"
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "slpp-req",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::copy_from_slice(&slpp),
+            ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        let drained = drain_downlinks_for(ue.id);
+        assert_eq!(drained.len(), 1, "this transfer's one downlink");
+        match &drained[0].kind {
+            PositioningDlKind::SlppToUe {
+                slpp_pdu,
+                lcs_correlation_id,
+            } => {
+                assert_eq!(slpp_pdu.as_slice(), slpp);
+                assert_eq!(lcs_correlation_id.as_deref(), Some("slpp-1-imsi"));
+            }
+            other => panic!("SLPP queued as {other:?}"),
+        }
     }
 
     /// LCS: an LMF push of LPP (n1MessageClass "LPP", no PDU session) to a

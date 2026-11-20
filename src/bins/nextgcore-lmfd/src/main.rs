@@ -46,8 +46,8 @@ mod nrppa_uplink; // #515: E-CID Measurement Report on the generated codec, TS 3
                   // Wired into `context::compute_location`; solve_tdoa remains available for
                   // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
-mod sidelink_epdu; // #542: sidelink ranging in an LPP EPDU (TS 37.355 §6.5.7)
-mod site_config; // #103: cell/TRP coordinates from configuration
+mod site_config;
+mod slpp; // #557: SLPP sidelink positioning (TS 38.355, TS 38.305 §8.15.2) // #103: cell/TRP coordinates from configuration
 
 pub use context::*;
 
@@ -1481,6 +1481,273 @@ async fn request_ue_capabilities(
     }
 }
 
+// ---------------------------------------------------------------------------
+// #557: SLPP sidelink ranging (TS 38.355, TS 38.305 §8.15.2, TS 23.586)
+// ---------------------------------------------------------------------------
+
+/// Whether `input` asks for a sidelink range, and to which UE: the request
+/// must name `RANGING` in `requestedRangingSlResult` and at least one
+/// `relatedUes` entry (TS 29.572 InputData, TS29572_Nlmf_Location.yaml:574-583).
+fn sl_ranging_peer(input: &nlmf::InputData) -> Option<&str> {
+    input
+        .requested_ranging_sl_result
+        .as_ref()?
+        .iter()
+        .any(|r| r == nlmf::RANGING_SL_RESULT_RANGING)
+        .then_some(())?;
+    input
+        .related_ues
+        .as_ref()?
+        .first()
+        .map(|u| u.applicationlayer_id.as_str())
+}
+
+/// One SLPP transaction to `target`: send what `build` makes on a fresh
+/// transaction and wait until `deadline` for the UE's answer on it. Nothing is
+/// left waiting on any exit: the exchange guard removes the waiter when this
+/// future ends or is dropped.
+async fn slpp_exchange(
+    amf: &namf_client::DiscoveredAmf,
+    target: &str,
+    lmf_id: &str,
+    build: fn(u8, Option<u8>) -> Result<Vec<u8>, String>,
+    deadline: tokio::time::Instant,
+) -> Option<slpp::Uplink> {
+    let tid = slpp::next_transaction();
+    let Some((_guard, rx)) = slpp::exchanges().begin(target, tid) else {
+        log::warn!("SLPP: no exchange slot for {target} transaction {tid}");
+        return None;
+    };
+    let pdu = match build(tid, slpp::sequences().next_sequence(target)) {
+        Ok(pdu) => pdu,
+        Err(e) => {
+            log::warn!("SLPP: {e}");
+            return None;
+        }
+    };
+    let corr = format!("slpp-{tid}-{target}");
+    let outcome =
+        namf_client::send_n1_transfer(amf, target, &corr, lmf_id, namf_client::N1Class::Slpp, pdu)
+            .await;
+    if outcome != namf_client::TransferOutcome::Initiated {
+        log::warn!("SLPP to {target} (transaction {tid}) not delivered: {outcome:?}");
+        return None;
+    }
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(answer)) => Some(answer),
+        _ => {
+            log::warn!("SLPP: no answer from {target} on transaction {tid}");
+            None
+        }
+    }
+}
+
+/// SL-RTT ranging between the target UE and `peer` (TS 38.305 §8.15.2.2):
+/// - capability transfer (TS 38.355 §5.1), which needs SL-RTT in the
+///   sl-TargetUE-Assisted mode;
+/// - location information transfer (§5.3) for range measurements;
+/// - the range, from the target's half and the peer's (held from the peer's
+///   own report).
+///
+/// `None` when any step fails or the peer's half is not held, and why is logged.
+async fn sl_rtt_range(input: &nlmf::InputData, peer: &str, budget: Duration) -> Option<f64> {
+    let target = input
+        .supi
+        .as_deref()
+        .or(input.gpsi.as_deref())
+        .or(input.pei.as_deref())?;
+    if budget.is_zero() {
+        log::warn!("SLPP ranging for {target}: no response-time budget left");
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    let amf = namf_client::discover_amf(input.amf_id.as_deref()).await?;
+    let lmf_id = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.nf_instance_id())
+        .unwrap_or_else(|| "nextgcore-lmf".to_string());
+    namf_client::ensure_n1n2_subscription(&amf, target).await;
+
+    match slpp_exchange(
+        &amf,
+        target,
+        &lmf_id,
+        slpp::build_request_capabilities,
+        deadline,
+    )
+    .await?
+    {
+        slpp::Uplink::Capabilities {
+            sl_rtt_ue_assisted: true,
+            ..
+        } => {}
+        other => {
+            log::warn!("SLPP ranging for {target}: no UE-assisted SL-RTT capability ({other:?})");
+            return None;
+        }
+    }
+    let reporter = match slpp_exchange(
+        &amf,
+        target,
+        &lmf_id,
+        slpp::build_request_location_information,
+        deadline,
+    )
+    .await?
+    {
+        slpp::Uplink::Location {
+            app_id: Some(app_id),
+            ..
+        } => app_id,
+        other => {
+            log::warn!("SLPP ranging for {target}: no SL-RTT report with an ID ({other:?})");
+            return None;
+        }
+    };
+    let range = slpp::sl_rtt_store().range_between(&reporter, peer.as_bytes());
+    if range.is_none() {
+        log::warn!(
+            "SLPP ranging for {target}: SL-RTT needs both UEs' Rx-Tx (TS 38.305 §8.15.2); \
+             the half measured by {peer} on this UE is not held"
+        );
+    }
+    range
+}
+
+/// Add the SL-RTT range to a 200 LocationData when `input` asks for one
+/// (TS 29.572 LocationData `relatedApplicationlayerId` and
+/// `distanceDirection.distance`, TS29572_Nlmf_Location.yaml:785-788, 1848-1857).
+/// A range that cannot be measured leaves the location result as it was:
+/// locationEstimate is the mandatory part of LocationData, and a missing
+/// distance is reported by its absence, never by an invented value.
+async fn with_sl_ranging(
+    input: &nlmf::InputData,
+    resp: SbiResponse,
+    budget: Duration,
+) -> SbiResponse {
+    let Some(peer) = sl_ranging_peer(input) else {
+        return resp;
+    };
+    if resp.status != 200 {
+        return resp;
+    }
+    let Some(distance) = sl_rtt_range(input, peer, budget).await else {
+        return resp;
+    };
+    let Some(mut body) = resp
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    else {
+        return resp;
+    };
+    body["relatedApplicationlayerId"] = serde_json::Value::String(peer.to_string());
+    body["distanceDirection"] = serde_json::json!({ "distance": distance });
+    SbiResponse::with_status(200)
+        .with_json_body(&body)
+        .unwrap_or(resp)
+}
+
+/// An uplink SLPP message (#557), on `owner`'s N1 subscription.
+///
+/// - SL-RTT halves are recorded under the reporter's applicationLayerID.
+/// - An answer completes the exchange waiting on its transaction.
+/// - A RequestAssistanceData is answered with ProvideAssistanceData (TS 38.355
+///   §5.2.1).
+/// - An undecodable message is answered with Error (§5.4.3).
+async fn handle_slpp_uplink(
+    owner: &context::NotifyOwner,
+    lcs_correlation_id: Option<&str>,
+    bytes: Vec<u8>,
+) -> SbiResponse {
+    let Some(ue) = owner.ue_context_id.clone() else {
+        return problem(
+            404,
+            nlmf::cause::LOCATION_SESSION_UNKNOWN,
+            "SLPP arrived on a subscription that belongs to no UE",
+        );
+    };
+    let corr = lcs_correlation_id.map(str::to_string);
+    let decoded = slpp::decode_uplink_with_sequence(&bytes);
+    // TS 38.355 §4.3.2: a repeat of the last sequence number is discarded.
+    if let Ok((_, seq)) = &decoded {
+        if slpp::sequences().is_duplicate(&ue, *seq) {
+            log::info!("SLPP from {ue}: duplicate sequence number {seq:?} discarded");
+            return SbiResponse::no_content();
+        }
+    }
+    let seq = slpp::sequences().next_sequence(&ue);
+    match decoded.map(|(u, _)| u) {
+        Err(e) => {
+            log::warn!(
+                "SLPP from {ue}: {} -- answering Error {:?}",
+                e.detail,
+                e.cause
+            );
+            if let Ok(pdu) = slpp::build_error(e.tid, seq, e.cause) {
+                spawn_slpp_downlink(ue, corr, pdu);
+            }
+        }
+        Ok(slpp::Uplink::AssistanceRequest { tid }) => {
+            match slpp::build_provide_assistance_data(tid.unwrap_or(0), seq) {
+                Ok(pdu) => spawn_slpp_downlink(ue, corr, pdu),
+                Err(e) => log::warn!("SLPP ProvideAssistanceData for {ue}: {e}"),
+            }
+        }
+        Ok(uplink) => {
+            if let slpp::Uplink::Location {
+                app_id: Some(app_id),
+                halves,
+                ..
+            } = &uplink
+            {
+                if !halves.is_empty() {
+                    log::info!(
+                        "SLPP SL-RTT report from {ue}: {} peer measurement(s) held",
+                        halves.len()
+                    );
+                    slpp::sl_rtt_store().note(app_id, halves);
+                }
+            }
+            if !slpp::exchanges().complete(&ue, uplink.clone()) {
+                log::info!("SLPP from {ue} answers no waiting transaction: {uplink:?}");
+            }
+        }
+    }
+    SbiResponse::no_content()
+}
+
+/// Send an SLPP answer to `ue` on its own task, so the notification is
+/// acknowledged without waiting for the AMF.
+fn spawn_slpp_downlink(ue: String, corr: Option<String>, pdu: Vec<u8>) {
+    tokio::spawn(async move {
+        let Some(amf) = namf_client::discover_amf(None).await else {
+            log::warn!("SLPP answer to {ue}: no AMF discoverable");
+            return;
+        };
+        let lmf_id = lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.nf_instance_id())
+            .unwrap_or_else(|| "nextgcore-lmf".to_string());
+        let corr = corr.unwrap_or_else(|| format!("slpp-answer-{ue}"));
+        let outcome = namf_client::send_n1_transfer(
+            &amf,
+            &ue,
+            &corr,
+            &lmf_id,
+            namf_client::N1Class::Slpp,
+            pdu,
+        )
+        .await;
+        if outcome != namf_client::TransferOutcome::Initiated {
+            log::warn!("SLPP answer to {ue} not delivered: {outcome:?}");
+        }
+    });
+}
+
 /// NRPPa through the serving AMF (#807): UE-associated over N1N2MessageTransfer,
 /// non-UE-associated over NonUeN2MessageTransfer.
 struct AmfNrppa {
@@ -1886,7 +2153,8 @@ async fn handle_determine_location_with(request: &SbiRequest, production: bool) 
     if let Some(supi) = input.supi.as_deref() {
         if let Some(fix) = lmf_self().read().ok().and_then(|c| c.stored_fix(supi)) {
             if let Some(age_min) = age_of_fix_minutes(fix.timestamp) {
-                return encode_location_response(&input, &fix, age_min);
+                let resp = encode_location_response(&input, &fix, age_min);
+                return with_sl_ranging(&input, resp, wait_budget(&input)).await;
             }
             log::debug!(
                 "stored fix for [{supi}] has no capture timestamp; \
@@ -1903,7 +2171,9 @@ async fn handle_determine_location_with(request: &SbiRequest, production: bool) 
         Err(resp) => return *resp,
     };
     let left = wait_budget(&input).saturating_sub(started.elapsed());
-    await_positioning_outcome_within(&input, corr, rx, left).await
+    let resp = await_positioning_outcome_within(&input, corr, rx, left).await;
+    let left = wait_budget(&input).saturating_sub(started.elapsed());
+    with_sl_ranging(&input, resp, left).await
 }
 
 /// A5: whether the `DetermineLocation` request body media type is supported.
@@ -3490,7 +3760,7 @@ async fn send_nrppa_error_indication(lcs_correlation_id: Option<&str>, pdu: Vec<
 ///
 /// #1518: reached only on a token a subscription holds, and `owner` is that
 /// subscription. A report acts only for its UE: a session, capability exchange or
-/// sidelink report of another UE is not touched.
+/// SLPP exchange of another UE is not touched.
 async fn handle_n1_message_notify(
     request: &SbiRequest,
     owner: &context::NotifyOwner,
@@ -3534,50 +3804,21 @@ async fn handle_n1_message_notify(
         .get("lcsCorrelationId")
         .and_then(serde_json::Value::as_str);
 
+    // #557: SLPP (TS 38.355) arrives on the same N1 callback, typed by
+    // n1MessageClass "SLPP" (payload container type 12, TS 24.501 k00
+    // §5.4.5.2.5 c1). It is never decoded as LPP.
+    if notification
+        .pointer("/n1MessageContainer/n1MessageClass")
+        .and_then(serde_json::Value::as_str)
+        == Some(slpp::N1_MESSAGE_CLASS_SLPP)
+    {
+        return handle_slpp_uplink(owner, lcs_correlation_id, lpp_bytes).await;
+    }
+
     // Decode the uplink LPP; keep the result so its transactionID can seed the
     // correlation fallback.
     let decoded = codec_glue::decode_lpp_provide_report(&lpp_bytes);
     let lpp_txn = decoded.as_ref().ok().map(|(rid, _)| *rid as u8);
-
-    // The sidelink ranging report (TS 23.586 §5.3.3, nextgsim #138) is stored
-    // against the UE, not against the positioning session: it is a distance to a
-    // peer UE, and this LMF has no coordinates for peer UEs, so no solver can turn
-    // it into a position. Read BEFORE the session lookup because a report is worth
-    // keeping even when it arrives outside a session -- the alternative is dropping
-    // a measurement the UE went to the trouble of making.
-    let sidelink_supi = resolve_notify_supi(lcs_correlation_id, lpp_txn, owner);
-    match codec_glue::decode_lpp_sidelink_ranging(&lpp_bytes) {
-        Ok((_txn, ranges)) if !ranges.is_empty() => match sidelink_supi.as_deref() {
-            Some(supi) => {
-                if let Ok(context) = lmf_self().read() {
-                    log::info!(
-                        "Sidelink ranging report from {supi}: {} range(s) held \
-                         (nearest {:.2} m)",
-                        ranges.len(),
-                        ranges
-                            .iter()
-                            .map(|r| r.range_m)
-                            .fold(f64::INFINITY, f64::min)
-                    );
-                    context.note_sidelink_ranges(supi, ranges);
-                }
-            }
-            // Honest rather than fabricated: without a SUPI there is no UE to file
-            // the ranges against, and inventing a key would make them unfindable and
-            // indistinguishable from another UE's.
-            None => log::warn!(
-                "Sidelink ranging report with {} range(s) cannot be stored: the \
-                 notification names no SUPI (lcsCorrelationId={lcs_correlation_id:?}, \
-                 lppTxn={lpp_txn:?})",
-                ranges.len()
-            ),
-        },
-        Ok(_) => {}
-        // A group-4 body that does not parse means the two ends have diverged, which
-        // is worth a line: the E-CID half of the same message may still be fine, so
-        // this does not fail the notification.
-        Err(e) => log::warn!("Sidelink ranging report present but undecodable: {e}"),
-    }
 
     // #998: an LPP Abort or Error on a RequestCapabilities transaction ends that
     // Capability Transfer at once (TS 37.355 §5.4), rather than letting the
@@ -7589,22 +7830,6 @@ lmf:
         crate::lpp_fixtures::ecid_lpp(pci, rsrp_result, ue_rx_tx, txn)
     }
 
-    /// The golden sidelink report (nextgsim #137): 50.00 m to 0xA5A5A5, carrier phase.
-    fn epdu_golden_report() -> crate::sidelink_epdu::SidelinkRangingReport {
-        use crate::sidelink_epdu::{
-            SidelinkRangingMethod, SidelinkRangingReport, SidelinkRangingResult,
-        };
-        SidelinkRangingReport {
-            results: vec![SidelinkRangingResult {
-                peer_layer2_id: 0x00A5_A5A5,
-                range_cm: 5_000,
-                accuracy_cm: 1,
-                method: SidelinkRangingMethod::CarrierPhase,
-                measurement_count: 3,
-            }],
-        }
-    }
-
     /// Encode an NRPPa E-CID Measurement Report (serving cell + TA + RSRP), on the
     /// generated codec.
     fn build_nrppa_ecid_report() -> Vec<u8> {
@@ -7755,145 +7980,6 @@ lmf:
         );
         let v = body_json(&resp);
         assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
-    }
-
-    // -- Sidelink ranging (TS 23.586 §5.3.3, nextgsim #138): the report is stored
-    // against the UE, and NOT fed to any positioning solver.
-    #[tokio::test]
-    async fn test_sidelink_ranging_report_is_stored_against_the_ue() {
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
-        lmf_context_init(1024);
-        let supi = "imsi-001010000000701";
-        let ctx = lmf_self();
-        let corr = {
-            let guard = ctx.read().unwrap();
-            let req = guard
-                .measurement_request(
-                    0,
-                    PositioningMethod::Ecid,
-                    None,
-                    None,
-                    PositioningQos::BestEffort,
-                )
-                .expect("measurement request");
-            guard
-                .positioning_session_register(Some(supi.to_string()), 181, req.request_id)
-                .0
-        };
-        assert!(
-            ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
-            "precondition: the LMF holds no ranges for this UE"
-        );
-
-        let lpp = crate::sidelink_epdu::build_message(181, &epdu_golden_report());
-        let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
-            "/nlmf-loc/v1/notify/n1-message-notify/test",
-            Some("sub-sidelink"),
-            "LPP",
-            Some(&corr),
-            Some(supi),
-            &lpp,
-        )
-        .expect("amfd builds N1MessageNotify");
-        assert_eq!(notify_n1(&notify).await.status, 204);
-
-        let held = ctx.read().unwrap().sidelink_ranges(supi);
-        assert_eq!(held.len(), 1, "the report must be stored");
-        let range = held[0];
-        assert_eq!(range.peer_layer2_id, 0x00A5_A5A5);
-        assert!(
-            (range.range_m - 50.0).abs() < 0.001,
-            "50.00 m, as the UE measured it -- got {:.3}",
-            range.range_m
-        );
-        assert!((range.accuracy_m - 0.01).abs() < 0.0001, "1 cm");
-        assert_eq!(
-            range.method,
-            crate::sidelink_epdu::SidelinkRangingMethod::CarrierPhase,
-            "the method the UE reported, not one this LMF inferred"
-        );
-        assert_eq!(range.measurement_count, 3);
-    }
-
-    // -- A report that names no UE cannot be filed: the LMF says so and stores
-    // nothing, rather than inventing a key.
-    #[tokio::test]
-    async fn test_sidelink_ranging_report_without_a_supi_is_not_stored() {
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
-        lmf_context_init(1024);
-        let supi = "imsi-001010000000702";
-
-        // A session exists for a DIFFERENT correlation, so the notification below
-        // resolves to no SUPI at all.
-        {
-            let ctx = lmf_self();
-            let guard = ctx.read().unwrap();
-            let req = guard
-                .measurement_request(
-                    0,
-                    PositioningMethod::Ecid,
-                    None,
-                    None,
-                    PositioningQos::BestEffort,
-                )
-                .expect("measurement request");
-            guard.positioning_session_register(Some(supi.to_string()), 182, req.request_id);
-        }
-
-        // txn 250 matches no session, and a fresh correlation matches none either.
-        let lpp = crate::sidelink_epdu::build_message(250, &epdu_golden_report());
-        let json = format!(
-            "{{\"n1MessageContainer\":{{\"n1MessageClass\":\"LPP\",\
-             \"n1MessageContent\":{{\"contentId\":\"n1-lpp\"}}}},\
-             \"lcsCorrelationId\":\"{}\"}}",
-            uuid::Uuid::new_v4()
-        );
-        let req = notify_request(
-            "/nlmf-loc/v1/notify/n1",
-            &json,
-            "n1-lpp",
-            "application/vnd.3gpp.5gnas",
-            lpp,
-        );
-        // The notification itself is still refused for the unknown session (404) --
-        // that behaviour is unchanged -- and no ranges are filed anywhere.
-        assert_eq!(notify_n1(&req).await.status, 404);
-        let ctx = lmf_self();
-        assert!(
-            ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
-            "a report that resolves to no SUPI must not be filed against some \
-             other UE"
-        );
-    }
-
-    // -- An empty report CLEARS what the LMF held: a UE that reports no ranges has
-    // said it no longer holds any.
-    #[tokio::test]
-    async fn test_an_empty_sidelink_report_clears_the_stored_ranges() {
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
-        lmf_context_init(1024);
-        let supi = "imsi-001010000000703";
-        let ctx = lmf_self();
-        {
-            let guard = ctx.read().unwrap();
-            guard.note_sidelink_ranges(
-                supi,
-                vec![crate::codec_glue::SidelinkRange {
-                    peer_layer2_id: 1,
-                    range_m: 12.0,
-                    accuracy_m: 1.0,
-                    method: crate::sidelink_epdu::SidelinkRangingMethod::Rtt,
-                    measurement_count: 1,
-                }],
-            );
-            assert_eq!(guard.sidelink_ranges(supi).len(), 1, "precondition");
-            guard.note_sidelink_ranges(supi, vec![]);
-        }
-        assert!(
-            ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
-            "an empty report must clear the entry, not be ignored -- otherwise the \
-             LMF answers with a distance to a peer that may be gone"
-        );
     }
 
     // -- A4: jsonData references a contentId with no matching part → 400.
@@ -8859,11 +8945,16 @@ mod positioning_chain_strict_peer {
                                 Ok(g) => {
                                     let corr =
                                         g.lcs_correlation_find(&supi).map(|r| r.lcs_correlation_id);
+                                    // #557: an SLPP downlink is captured the same way;
+                                    // its first octets tell the two apart.
                                     let lpp =
                                         g.positioning_dl_drain().into_iter().find_map(|d| match d
                                             .kind
                                         {
                                             PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
+                                            PositioningDlKind::SlppToUe { slpp_pdu, .. } => {
+                                                Some(slpp_pdu)
+                                            }
                                             _ => None,
                                         });
                                     corr.zip(lpp)
@@ -9151,6 +9242,180 @@ mod positioning_chain_strict_peer {
         // E-UTRA E-CID (TS 29.572 ECID, #715) + honest freshly-computed age.
         assert_eq!(v["positioningDataList"][0]["method"], "ECID");
         assert_eq!(v["ageOfLocationEstimate"], 0);
+
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// The scripted UE's SLPP answer, given as `golden` (an UPER SLPP-Message from
+    /// nextgcore-slpp-gen's hand-derived vectors), moved onto transaction `tid`
+    /// and sent through amfd's real N1MessageNotify producer with class "SLPP".
+    async fn answer_slpp(corr: &str, supi: &str, golden: &[u8], tid: u8) {
+        let mut msg = nextgcore_slpp_gen::decode(golden).expect("golden decodes");
+        msg.transaction_id = Some(nextgcore_slpp_gen::generated::SLPP_MessageTransactionID(
+            tid,
+        ));
+        let ul = nextgcore_slpp_gen::encode(&msg).expect("re-encodes");
+        let amf_req = nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            "/nlmf-loc/v1/notify/n1-message-notify/test",
+            Some("sub-strict-peer"),
+            nextgcore_amfd::namf_server::N1_MESSAGE_CLASS_SLPP,
+            Some(corr),
+            Some(supi),
+            &ul,
+        )
+        .expect("amfd builds N1MessageNotify");
+        let boundary = multipart::generate_boundary();
+        let wire = multipart::encode(
+            amf_req.http.content.as_deref(),
+            &amf_req.http.parts,
+            &boundary,
+        );
+        let ct = multipart::content_type_with_boundary(&boundary);
+        let decoded = multipart::decode(&ct, &wire).expect("multipart decode");
+        assert_eq!(decoded.parts[0].data.as_ref(), ul, "relayed byte-exact");
+        let mut req = SbiRequest::post("/nlmf-loc/v1/notify/n1-message-notify/test");
+        req.http.set_content(decoded.json.expect("jsonData root"));
+        req.http.set_header("Content-Type", ct);
+        for p in decoded.parts {
+            req.http.add_part(p);
+        }
+        assert_eq!(notify_n1(&req).await.status, 204);
+    }
+
+    /// #557, the acceptance criterion: a sidelink range reaches the LMF via SLPP.
+    ///
+    /// DetermineLocation asks for RANGING to related UE "ZZZ" (octets 5A 5A 5A).
+    /// After the E-CID fix, lmfd runs SLPP through amfd's REAL Namf handler.
+    /// RequestCapabilities, then RequestLocationInformation, are relayed
+    /// byte-exact as SLPP downlinks, each with its own sequence number
+    /// (TS 38.355 §4.3.2). The UE answers with the octets nextgsim's UE
+    /// produces for them, which nextgsim #592 pins in
+    /// `nas::slpp::tests::the_lmf_*_is_answered_with_the_hand_derived_octets`.
+    /// The answer carries its SL-RTT half on 5A5A5A for a 50 m peer.
+    ///
+    /// The peer's half, 326 Tc measured by 5A5A5A on A5A5A5, is seeded as the
+    /// peer's own report would have left it. The range is c * (sum) / 2, about
+    /// 50 m.
+    ///
+    /// What this does not prove: that a running nextgsim UE emits those octets
+    /// over NAS and the RAN. The nightly cross-repo E2E covers that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_sl_rtt_range_reaches_the_lmf_via_slpp_through_real_amfd() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _slpp = crate::slpp::SLPP_GLOBALS_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000557".to_string();
+        lmf_context_init(1024);
+        prime_lmf_self();
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_cell_coord(
+                "pci-77".to_string(),
+                crate::positioning::TrpCoord::new(40.1, -74.5, 0.0),
+            );
+        }
+        seed_amf_connected_ue(&supi);
+        crate::slpp::sl_rtt_store().note(
+            b"ZZZ",
+            &[crate::slpp::SlRttHalf {
+                peer: vec![0xA5, 0xA5, 0xA5],
+                rx_tx_tc: 326.0,
+            }],
+        );
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        let body = format!(
+            r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "ecgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"eutraCellId":"0000001"}},
+                "maxRespTime":20,
+                "requestedRangingSlResult":["RANGING"],
+                "relatedUes":[{{"applicationlayerId":"ZZZ","relatedUeType":"REFERENCE_UE"}}]}}"#
+        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+
+        answer_capability_request(&mut tap_rx, &supi, true, false).await;
+        let (corr, _dl, txn) = next_downlink(&mut tap_rx).await;
+        let ul_lpp = build_ecid_lpp(77, 60, 800, txn);
+        assert_eq!(
+            notify_n1(&amfd_notify_request(&corr, &supi, &ul_lpp))
+                .await
+                .status,
+            204
+        );
+
+        // SLPP capability transfer (TS 38.355 §5.1).
+        let slpp_dl = |dl: &[u8]| {
+            let msg = nextgcore_slpp_gen::decode(dl).expect("an SLPP downlink");
+            msg.transaction_id.expect("a transactionID").0
+        };
+        let (corr, dl) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("lmfd sent SLPP RequestCapabilities")
+            .expect("captured");
+        let tid = slpp_dl(&dl);
+        let seq_of = |dl: &[u8]| {
+            nextgcore_slpp_gen::decode(dl)
+                .unwrap()
+                .sequence_number
+                .map(|s| s.0)
+        };
+        let seq = seq_of(&dl);
+        assert!(
+            seq.is_some(),
+            "TS 38.355 §4.3.2: every SLPP message carries one"
+        );
+        assert_eq!(
+            dl,
+            crate::slpp::build_request_capabilities(tid, seq).unwrap(),
+            "amfd relays lmfd's SLPP RequestCapabilities byte-exact"
+        );
+        answer_slpp(
+            &corr,
+            &supi,
+            &crate::slpp::golden::NEXTGSIM_UE_PROVIDE_CAPABILITIES,
+            tid,
+        )
+        .await;
+
+        // SLPP location information transfer (TS 38.355 §5.3).
+        let (corr, dl) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("lmfd sent SLPP RequestLocationInformation")
+            .expect("captured");
+        let tid = slpp_dl(&dl);
+        let seq2 = seq_of(&dl);
+        assert_ne!(seq2, seq, "a distinct sequence number per message");
+        assert_eq!(
+            dl,
+            crate::slpp::build_request_location_information(tid, seq2).unwrap()
+        );
+        answer_slpp(
+            &corr,
+            &supi,
+            &crate::slpp::golden::NEXTGSIM_UE_PROVIDE_LOCATION_INFORMATION,
+            tid,
+        )
+        .await;
+
+        let resp = tokio::time::timeout(Duration::from_secs(20), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("no panic");
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert!(v["locationEstimate"].is_object(), "the location is kept");
+        assert_eq!(v["relatedApplicationlayerId"], "ZZZ");
+        let d = v["distanceDirection"]["distance"]
+            .as_f64()
+            .expect("an SL-RTT distance");
+        // The UE's half is the 38.133 bin of a 50 m flight time and the peer's is
+        // 326 Tc, so the sum resolves to within one 4 Tc step (0.3 m) of 50 m.
+        assert!((d - 50.0).abs() < 0.5, "distance {d}");
 
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
