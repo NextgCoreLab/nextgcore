@@ -8,14 +8,12 @@ members = [
     # Library crates (mirrors lib/)
     "libs/nextgcore-core",
     "libs/nextgcore-crypt",
-    "libs/nextgcore-asn1c",
     "libs/nextgcore-gtp",
     "libs/nextgcore-pfcp",
     "libs/nextgcore-nas",
     "libs/nextgcore-sbi",
     "libs/nextgcore-diameter",
     "libs/nextgcore-sctp",
-    "libs/nextgcore-ngap",
     "libs/nextgcore-ngap-gen",
     "libs/nextgcore-lpp-gen",
     "libs/nextgcore-slpp-gen",
@@ -199,14 +197,12 @@ mime_guess = "2"
 # Internal crates
 nextgcore-core = { path = "libs/nextgcore-core" }
 nextgcore-crypt = { path = "libs/nextgcore-crypt" }
-nextgcore-asn1c = { path = "libs/nextgcore-asn1c" }
 nextgcore-gtp = { path = "libs/nextgcore-gtp" }
 nextgcore-pfcp = { path = "libs/nextgcore-pfcp" }
 nextgcore-nas = { path = "libs/nextgcore-nas" }
 nextgcore-sbi = { path = "libs/nextgcore-sbi" }
 nextgcore-diameter = { path = "libs/nextgcore-diameter" }
 nextgcore-sctp = { path = "libs/nextgcore-sctp" }
-nextgcore-ngap = { path = "libs/nextgcore-ngap" }
 nextgcore-ngap-gen = { path = "libs/nextgcore-ngap-gen" }
 nextgcore-lpp-gen = { path = "libs/nextgcore-lpp-gen" }
 nextgcore-slpp-gen = { path = "libs/nextgcore-slpp-gen" }

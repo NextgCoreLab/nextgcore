@@ -158,11 +158,62 @@ pub fn build_n1n2_transfer_request(
     serving_lmf_identification: &str,
     lpp_pdu: Vec<u8>,
 ) -> SbiRequest {
+    build_n1_transfer_request(
+        ue_context_id,
+        lcs_correlation_id,
+        serving_lmf_identification,
+        N1Class::Lpp,
+        lpp_pdu,
+    )
+}
+
+/// The positioning protocol an N1 transfer carries, and so its `n1MessageClass`
+/// and the payload container type the AMF frames it in (TS 24.501 §9.11.3.40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N1Class {
+    /// LPP (TS 37.355), class "LPP", payload container type 3.
+    Lpp,
+    /// SLPP (TS 38.355), payload container type 12 "SLPP message container"
+    /// (TS 24.501 k00 §9.11.3.40). TS 29.518 has no SLPP `N1MessageClass` value
+    /// yet (TS29518_Namf_Communication.yaml:4511-4523), and the enum is
+    /// `anyOf [enum, string]`, so the class is spelled "SLPP" (#557).
+    Slpp,
+}
+
+impl N1Class {
+    /// The `n1MessageClass` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lpp => "LPP",
+            Self::Slpp => crate::slpp::N1_MESSAGE_CLASS_SLPP,
+        }
+    }
+
+    fn content_id(self) -> &'static str {
+        match self {
+            Self::Lpp => LPP_CONTENT_ID,
+            Self::Slpp => SLPP_CONTENT_ID,
+        }
+    }
+}
+
+/// Content-Id of the SLPP binary part of an N1N2MessageTransfer (#557).
+pub const SLPP_CONTENT_ID: &str = "slpp-req";
+
+/// [`build_n1n2_transfer_request`] for either positioning protocol.
+pub fn build_n1_transfer_request(
+    ue_context_id: &str,
+    lcs_correlation_id: &str,
+    serving_lmf_identification: &str,
+    class: N1Class,
+    pdu: Vec<u8>,
+) -> SbiRequest {
+    let lpp_pdu = pdu;
     let req_data = N1N2MessageTransferReqData {
         n1_message_container: N1MessageContainer {
-            n1_message_class: "LPP",
+            n1_message_class: class.as_str(),
             n1_message_content: RefToBinaryData {
-                content_id: LPP_CONTENT_ID,
+                content_id: class.content_id(),
             },
         },
         lcs_correlation_id,
@@ -175,7 +226,7 @@ pub fn build_n1n2_transfer_request(
     ))
     .with_body(json, "application/json")
     .with_part(SbiPart::with_content(
-        LPP_CONTENT_ID,
+        class.content_id(),
         N1_CONTENT_TYPE,
         Bytes::from(lpp_pdu),
     ))
@@ -809,12 +860,33 @@ pub async fn send_n1n2_transfer(
     serving_lmf_identification: &str,
     lpp_pdu: Vec<u8>,
 ) -> TransferOutcome {
+    send_n1_transfer(
+        amf,
+        ue_context_id,
+        lcs_correlation_id,
+        serving_lmf_identification,
+        N1Class::Lpp,
+        lpp_pdu,
+    )
+    .await
+}
+
+/// [`send_n1n2_transfer`] for either positioning protocol (#557).
+pub async fn send_n1_transfer(
+    amf: &DiscoveredAmf,
+    ue_context_id: &str,
+    lcs_correlation_id: &str,
+    serving_lmf_identification: &str,
+    class: N1Class,
+    lpp_pdu: Vec<u8>,
+) -> TransferOutcome {
     let client = client_for(amf);
     for attempt in 0..2u8 {
-        let request = build_n1n2_transfer_request(
+        let request = build_n1_transfer_request(
             ue_context_id,
             lcs_correlation_id,
             serving_lmf_identification,
+            class,
             lpp_pdu.clone(),
         );
         match client.send_request(request).await {

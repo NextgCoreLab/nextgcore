@@ -149,7 +149,27 @@ pub struct InputData {
     pub lpp_message_ext: Option<Vec<RefToBinaryData>>,
     #[serde(rename = "supportedFeatures", skip_serializing_if = "Option::is_none")]
     pub supported_features: Option<String>,
+    /// #557: the ranging / sidelink positioning results asked for
+    /// (TS29572_Nlmf_Location.yaml:574-578, `RangingSlResult`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_ranging_sl_result: Option<Vec<String>>,
+    /// #557: the UEs the result is relative to (yaml:579-583, `RelatedUe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_ues: Option<Vec<RelatedUe>>,
 }
+
+/// `RelatedUe` (TS29572_Nlmf_Location.yaml:1805-1815). Both members are
+/// required, and the spec spells the first one `applicationlayerId`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RelatedUe {
+    #[serde(rename = "applicationlayerId")]
+    pub applicationlayer_id: String,
+    #[serde(rename = "relatedUeType")]
+    pub related_ue_type: String,
+}
+
+/// `RangingSlResult` value `RANGING` (yaml:2517-2529).
+pub const RANGING_SL_RESULT_RANGING: &str = "RANGING";
 
 /// `RefToBinaryData` (TS 29.571 §5.2.4.6) — references a multipart/related
 /// binary body part by the value of its `Content-Id` header (TS 29.500 §6.2).

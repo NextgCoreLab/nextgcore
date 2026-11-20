@@ -1397,6 +1397,12 @@ impl PfcpServer {
 
     /// Set the CP-function addresses an Association Setup Request is accepted from
     /// (`--pfcp-allowed-peers`, security #968).
+    /// The address the PFCP socket is bound to (#2208: an in-process user binds
+    /// port 0 and needs to know where to send).
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     pub fn set_allowed_peers(&self, allowlist: PeerAllowlist) {
         if let Ok(mut a) = self.allowed_peers.write() {
             *a = allowlist;

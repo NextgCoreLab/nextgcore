@@ -297,6 +297,12 @@ mod proc_code {
 pub(crate) static UL_NRPPA_DROPPED_NO_CONSUMER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The `n1NotifySubscriptionId` / `n2NotifySubscriptionId` of a notification
+/// sent to an NRF default notification subscription: "If the notification is
+/// due to an implicit subscription via NRF, then the value shall be set as
+/// "implicit"" (TS 29.518 Tables 6.1.6.2.14-1 and 6.1.6.2.16-1, #2256).
+pub(crate) const IMPLICIT_SUBSCRIPTION_ID: &str = "implicit";
+
 // ============================================================================
 // NGAP Server State
 // ============================================================================
@@ -10866,7 +10872,20 @@ impl NgapServer {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,
                     container_type,
+                    "LPP",
                     lpp,
+                    additional_information.as_deref(),
+                )
+                .await?;
+            }
+            Ok(crate::gmm_handler::UlTransportAction::ForwardSlppToLmf { slpp }) => {
+                self.forward_ul_lpp_to_lmf(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    container_type,
+                    crate::namf_server::N1_MESSAGE_CLASS_SLPP,
+                    slpp,
                     additional_information.as_deref(),
                 )
                 .await?;
@@ -10927,6 +10946,7 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         container_type: u8,
+        class: &'static str,
         lpp: Vec<u8>,
         additional_information: Option<&[u8]>,
     ) -> Result<()> {
@@ -10949,7 +10969,11 @@ impl NgapServer {
         // A3 registry lookup (exact-class "LPP", fail-closed), routed by the
         // LMF the Additional information names (#2256), + the fallback LCS
         // correlation captured from the latest N1N2MessageTransfer.
-        let (sub, fallback_corr, named_lmf) = {
+        // With no subscription to notify, the LMF whose NRF default
+        // notification subscription is tried (TS 29.518 §5.2.2.3.5.3 step 1):
+        // the one the routing information names, else the LMF of the UE's
+        // latest positioning transfer; with the correlation to tag it with.
+        let (sub, fallback_corr, named_lmf, default_target) = {
             let ctx = crate::context::amf_self();
             let Ok(guard) = ctx.read() else {
                 return Ok(());
@@ -10960,13 +10984,29 @@ impl NgapServer {
                         .as_deref()
                         .and_then(|corr| guard.lcs_uplink_route_find(s, corr))
                         .and_then(|route| route.lmf_id);
+                    let default_target = match &named_lmf {
+                        Some(lmf) => Some((lmf.clone(), routing.clone())),
+                        None => guard.lcs_uplink_route_latest(s).and_then(|route| {
+                            route
+                                .lmf_id
+                                .map(|lmf| (lmf, Some(route.lcs_correlation_id)))
+                        }),
+                    };
+                    // #557: SLPP goes to the serving LMF's SLPP subscription,
+                    // else its LPP one, and the notification still says
+                    // "SLPP", so the LMF never reads SLPP as LPP.
                     (
-                        guard.n1n2_subscription_find_n1_routed(s, "LPP", named_lmf.as_deref()),
+                        guard.n1n2_subscription_find_positioning_routed(
+                            s,
+                            class,
+                            named_lmf.as_deref(),
+                        ),
                         guard.lcs_correlation_find(s),
                         named_lmf,
+                        default_target,
                     )
                 }
-                None => (None, None, None),
+                None => (None, None, None, None),
             }
         };
 
@@ -10988,11 +11028,58 @@ impl NgapServer {
             crate::namf_server::send_n1_message_notify(
                 callback_uri,
                 Some(sub.subscription_id),
-                "LPP".to_string(),
+                class.to_string(),
                 lcs_correlation_id,
                 supi,
                 lpp,
             );
+            return Ok(());
+        }
+
+        // #2256, TS 29.518 §5.2.2.3.5.3 step 1: no N1 notification URI, so the
+        // LMF's default notification subscription from its NRF profile (its LPP
+        // one for SLPP too, which TS 29.518 k00 defines no class for, as the
+        // subscription lookup falls back for #557). Looked
+        // up off the NGAP task; when there is none the UE gets the #90 below,
+        // queued for the positioning pump.
+        if let Some((lmf, lcs_correlation_id)) = default_target {
+            log::info!(
+                "UL LPP ({} B, amf_ue_ngap_id {amf_ue_ngap_id}): no 'LPP' subscription for \
+                 LMF {lmf}; trying its NRF default notification subscription",
+                lpp.len()
+            );
+            tokio::spawn(async move {
+                match crate::sbi_path::lmf_default_notification_uri(
+                    &lmf,
+                    crate::sbi_path::LmfDefaultNotification::N1Lpp,
+                )
+                .await
+                {
+                    Some(callback_uri) => crate::namf_server::send_n1_message_notify(
+                        callback_uri,
+                        Some(IMPLICIT_SUBSCRIPTION_ID.to_string()),
+                        class.to_string(),
+                        lcs_correlation_id,
+                        supi,
+                        lpp,
+                    ),
+                    None => {
+                        log::info!(
+                            "UL LPP (amf_ue_ngap_id {amf_ue_ngap_id}): LMF {lmf} has no default \
+                             'LPP' notification subscription; replying 5GMM #90"
+                        );
+                        if let Ok(guard) = crate::context::amf_self().read() {
+                            guard.positioning_dl_add(crate::context::PendingPositioningDl {
+                                amf_ue_ngap_id,
+                                kind: crate::context::PositioningDlKind::PayloadNotForwarded {
+                                    payload_container_type: container_type,
+                                    payload: lpp,
+                                },
+                            });
+                        }
+                    }
+                }
+            });
             return Ok(());
         }
 
@@ -14110,6 +14197,34 @@ impl NgapServer {
                         Err(e) => log::warn!("LCS positioning DL NRPPa send failed: {e}"),
                     }
                 }
+                crate::context::PositioningDlKind::SlppToUe {
+                    slpp_pdu,
+                    lcs_correlation_id,
+                } => {
+                    let Some(plain) = crate::positioning::build_slpp_dl_nas(
+                        &slpp_pdu,
+                        lcs_correlation_id.as_deref(),
+                    ) else {
+                        log::warn!(
+                            "LCS positioning DL SLPP build failed for UE {}",
+                            item.amf_ue_ngap_id
+                        );
+                        continue;
+                    };
+                    let nas = self
+                        .protect_nas(item.amf_ue_ngap_id, &plain)
+                        .unwrap_or(plain);
+                    match self
+                        .send_nas_pdu(association_id, item.amf_ue_ngap_id, ran_ue_ngap_id, &nas)
+                        .await
+                    {
+                        Ok(_) => log::info!(
+                            "LCS: delivered SLPP DL NAS Transport to UE {}",
+                            item.amf_ue_ngap_id
+                        ),
+                        Err(e) => log::warn!("LCS positioning DL SLPP send failed: {e}"),
+                    }
+                }
                 crate::context::PositioningDlKind::LppToUe {
                     lpp_pdu,
                     lcs_correlation_id,
@@ -14143,6 +14258,33 @@ impl NgapServer {
                 // Wave-6 E5: UPDP (UE policy) downlink — DL NAS Transport with
                 // payload container type "UE policy container" (0x05), same
                 // protect + send flow as the LPP leg (TS 24.501 §5.4.5).
+                crate::context::PositioningDlKind::PayloadNotForwarded {
+                    payload_container_type,
+                    payload,
+                } => {
+                    let plain = gmm_build::build_dl_nas_transport(
+                        None,
+                        payload_container_type,
+                        &payload,
+                        Some(GmmCause::PayloadWasNotForwarded),
+                        None,
+                    )
+                    .unwrap_or_default();
+                    let Some(protected) = self.protect_nas(item.amf_ue_ngap_id, &plain) else {
+                        continue;
+                    };
+                    if let Err(e) = self
+                        .send_nas_pdu(
+                            association_id,
+                            item.amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            &protected,
+                        )
+                        .await
+                    {
+                        log::warn!("5GMM #90 DL NAS send failed: {e}");
+                    }
+                }
                 crate::context::PositioningDlKind::UePolicyToUe { updp_pdu } => {
                     let Some(plain) = crate::gmm_build::build_ue_policy_dl_nas(&updp_pdu) else {
                         log::warn!(
@@ -14177,10 +14319,15 @@ impl NgapServer {
     /// **verbatim** to the LMF that registered an `n2InformationClass ==
     /// "NRPPa"` callback for this UE via Namf N1N2MessageSubscribe, as a
     /// multipart Namf N2InfoNotify POST (TS 29.518 Section 5.2.2.3.3). The
-    /// notification's `lcsCorrelationId` comes from the subscription, falling
-    /// back to the correlation captured from the originating
-    /// N1N2MessageTransfer; the `nrppaInfo.nfId` is recovered from the NGAP
-    /// RoutingID echo (our downlink seeds the RoutingID from the LMF's nfId).
+    /// #2256: the gNB echoes the NGAP Routing ID of the downlink it answers
+    /// (TS 38.413 §8.15.3, §9.3.3.13: it identifies an LMF), which our downlink
+    /// seeds from the LMF's identity. The answer goes to that LMF's subscription
+    /// ([`crate::context::AmfContext::n1n2_subscription_find_n2_routed`]), never
+    /// one another LMF owns, and carries the subscription's `lcsCorrelationId`,
+    /// else the one that LMF last used for the UE. The Routing ID is the
+    /// notification's `nfId`. With no Routing ID to go by, the single-session
+    /// fallback: the most recent NRPPa subscription and the UE's last
+    /// correlation.
     ///
     /// Fail-closed: with no registered consumer the PDU is dropped with a
     /// WARN and counted in [`UL_NRPPA_DROPPED_NO_CONSUMER`] — a relay with no
@@ -14242,47 +14389,92 @@ impl NgapServer {
                     .and_then(|ue| ue.supi.clone())
             });
 
-        // A3 registry lookup (exact-class, fail-closed) + fallback LCS
-        // correlation captured from the originating N1N2MessageTransfer.
-        let (sub, fallback_corr) = {
+        // #2256, TS 38.413 §9.3.3.13: the Routing ID "identifies an LMF". Our
+        // downlink seeds it from the LMF's identity (verified, else the declared
+        // nrppaInfo.nfId) and the gNB echoes it, so it names the LMF whose
+        // subscription gets the answer and whose correlation tags it. An empty or
+        // non-UTF-8 Routing ID names none: the single-session fallback (most
+        // recent subscription, last correlation), as before #2256.
+        let named_lmf = String::from_utf8(ul.routing_id.clone())
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        // A3 registry lookup (exact-class, fail-closed), routed by the Routing
+        // ID, + the correlation that LMF last used (else the UE's last one).
+        let (sub, lmf_corr, fallback_corr) = {
             let ctx = crate::context::amf_self();
             let Ok(guard) = ctx.read() else {
                 return Ok(());
             };
             match supi.as_deref() {
                 Some(s) => (
-                    guard.n1n2_subscription_find_n2(s, "NRPPa"),
+                    guard.n1n2_subscription_find_n2_routed(s, "NRPPa", named_lmf.as_deref()),
+                    named_lmf
+                        .as_deref()
+                        .and_then(|l| guard.lcs_uplink_route_latest_for_lmf(s, l)),
                     guard.lcs_correlation_find(s),
                 ),
-                None => (None, None),
+                None => (None, None, None),
             }
         };
         let Some(callback_uri) = sub.as_ref().and_then(|s| s.n2_notify_callback_uri.clone()) else {
+            // #2256, TS 29.518 §5.2.2.3.6.3 step 1: no N2 notification URI, so
+            // the default notification subscription in the NRF profile of the
+            // LMF the Routing ID names, looked up off the NGAP task.
+            if let (Some(lmf), true) = (named_lmf, supi.is_some()) {
+                tokio::spawn(async move {
+                    match crate::sbi_path::lmf_default_notification_uri(
+                        &lmf,
+                        crate::sbi_path::LmfDefaultNotification::N2Nrppa,
+                    )
+                    .await
+                    {
+                        Some(callback_uri) => crate::namf_server::send_n2_info_notify(
+                            callback_uri,
+                            IMPLICIT_SUBSCRIPTION_ID.to_string(),
+                            lmf_corr,
+                            Some(lmf),
+                            ul.nrppa_pdu,
+                        ),
+                        None => {
+                            UL_NRPPA_DROPPED_NO_CONSUMER
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            log::warn!(
+                                "Uplink UE-associated NRPPa (amf_ue_ngap_id {amf_ue_ngap_id}) \
+                                 dropped: LMF {lmf}, which its Routing ID names, has no 'NRPPa' \
+                                 subscription and no default one in its NRF profile (no \
+                                 ErrorIndication sent — transparent relay)"
+                            );
+                        }
+                    }
+                });
+                return Ok(());
+            }
             UL_NRPPA_DROPPED_NO_CONSUMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "Uplink UE-associated NRPPa (association {association_id}, \
-                 amf_ue_ngap_id {amf_ue_ngap_id}, supi {supi:?}) dropped: no \
-                 LMF N2 'NRPPa' subscription registered (no ErrorIndication \
-                 sent — transparent relay, TS 23.273 Section 6.11)"
+                 amf_ue_ngap_id {amf_ue_ngap_id}, supi {supi:?}) dropped: no LMF N2 \
+                 'NRPPa' subscription registered and no Routing ID naming an LMF \
+                 (no ErrorIndication sent — transparent relay, TS 23.273 Section 6.11)"
             );
             return Ok(());
         };
         let sub = sub.expect("callback_uri implies subscription");
 
-        let lcs_correlation_id = sub
-            .lcs_correlation_id
-            .clone()
-            .or_else(|| fallback_corr.map(|r| r.lcs_correlation_id));
-        // The RoutingID is the opaque LMF identity echo (seeded from
-        // nrppaInfo.nfId on the downlink leg); recover it as nfId when it is
-        // printable, never fabricate one.
-        let nf_id = String::from_utf8(ul.routing_id.clone())
-            .ok()
-            .filter(|s| !s.is_empty());
+        // The UE's last correlation may be another LMF's: it is used only when
+        // the Routing ID names no LMF.
+        let lcs_correlation_id = sub.lcs_correlation_id.clone().or(lmf_corr).or_else(|| {
+            named_lmf
+                .is_none()
+                .then(|| fallback_corr.map(|r| r.lcs_correlation_id))
+                .flatten()
+        });
+        // The Routing ID is the LMF identity: it is the notification's nfId.
+        let nf_id = named_lmf.clone();
 
         log::info!(
             "LCS: relaying uplink UE-associated NRPPa ({} B, amf_ue_ngap_id \
-             {amf_ue_ngap_id}) to LMF callback {callback_uri} (sub={})",
+             {amf_ue_ngap_id}) to LMF callback {callback_uri} (sub={}, LMF {named_lmf:?})",
             ul.nrppa_pdu.len(),
             sub.subscription_id,
             callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
@@ -32119,12 +32311,19 @@ mod tests {
         ngap.process_ngap_message(1, &bytes)
             .await
             .expect("no-consumer uplink NRPPa must NOT attempt an ErrorIndication");
-        let dropped_after = UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            dropped_after - dropped_before,
-            1,
-            "the fail-closed drop is counted"
-        );
+        // #2256: the Routing ID names an LMF, so the drop is counted once its NRF
+        // default notification subscription turns out not to exist, off the
+        // NGAP task (TS 29.518 §5.2.2.3.6.3 step 1).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed)
+            == dropped_before
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fail-closed drop is counted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// #807: the pump sends each queued non-UE NRPPa PDU as a DOWNLINK NON UE
@@ -47445,7 +47644,7 @@ mod tests {
     /// RAN sent — not a placeholder.
     ///
     /// The issue says *"Neither release code is plumbed anywhere the event could read
-    /// it"*. The RAN one was: `nextgcore_ngap::parser::parse_ue_context_release_request`
+    /// it"*. The RAN one was: the hand-written `nextgcore-ngap` parser's `parse_ue_context_release_request`
     /// decodes Cause as a mandatory IE and refuses the message without it, then the
     /// value was discarded. So this test builds a REAL UEContextReleaseRequest PDU and
     /// lets the production decoder recover the cause — asserting on a value that only

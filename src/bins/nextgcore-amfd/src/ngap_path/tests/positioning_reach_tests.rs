@@ -1188,3 +1188,448 @@ async fn two_lmfs_sessions_for_one_ue_each_get_their_own_uplink() {
     sink_b.stop().await.expect("stop");
     server.forget_ue(ue);
 }
+
+/// An LMF's N1N2MessageSubscribe for the UE's uplink NRPPa, as LMF `lmf`, with
+/// its notify callback on `port`.
+fn nrppa_subscription_as(supi: &str, lmf: &str, port: u16) -> nextgcore_sbi::SbiRequest {
+    let mut req = nextgcore_sbi::SbiRequest::post(format!(
+        "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions"
+    ))
+    .with_json_body(&serde_json::json!({
+        "n2InformationClass": "NRPPa",
+        "n2NotifyCallbackUri": format!("http://127.0.0.1:{port}/nlmf-loc/v1/n2-notify"),
+    }))
+    .expect("json");
+    req.oauth2_subject = Some(lmf.to_string());
+    req
+}
+
+/// An LMF's NRPPa-only N1N2MessageTransfer as LMF `lmf`, declaring `nf_id` as
+/// its nrppaInfo.nfId, for LCS correlation `correlation`.
+fn nrppa_transfer_as(
+    supi: &str,
+    lmf: &str,
+    nf_id: &str,
+    correlation: &str,
+) -> nextgcore_sbi::SbiRequest {
+    let mut req =
+        nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&serde_json::json!({
+                "n2InfoContainer": {
+                    "n2InformationClass": "NRPPa",
+                    "nrppaInfo": {
+                        "nfId": nf_id,
+                        "nrppaPdu": {
+                            "ngapIeType": "NRPPA_PDU",
+                            "ngapData": { "contentId": "nrppa-pdu" }
+                        }
+                    }
+                },
+                "lcsCorrelationId": correlation,
+            }))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "nrppa-pdu",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from_static(&[0x00, 0x22, 0x56, 0x00]),
+            ));
+    req.oauth2_subject = Some(lmf.to_string());
+    req
+}
+
+/// #2256, TS 38.413 §8.15.3 / §9.3.3.13 and TS 29.518 §5.2.2.3.3: two LMFs run
+/// an NRPPa session each for one UE. Each UE-associated NRPPa downlink's Routing
+/// ID names its LMF by verified identity, even when that LMF declares another
+/// LMF's nfId. The gNB's answer, echoing the Routing ID, reaches that LMF,
+/// tagged with that LMF's correlation and nfId, whichever LMF spoke last. An
+/// empty Routing ID keeps the single-session fallback. (A Routing ID naming an
+/// LMF with no subscription is never handed to another LMF: see
+/// `an_lmf_without_a_subscription_gets_its_uplink_at_its_nrf_default`.)
+///
+/// Revert-verified: with the uplink routed as before (the most recent NRPPa
+/// subscription), A's answer reaches B and the wait on A's sink times out; with
+/// the Routing ID seeded from the declared nfId, A's downlink names B and its
+/// assertion fails; with the notification tagged with the UE's last correlation,
+/// A's `lcsCorrelationId` assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_lmfs_nrppa_sessions_for_one_ue_each_get_their_own_uplink() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_225_602u64, 97, "imsi-001010022560002");
+    live_ue(&mut server, ue, ran, supi);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (sink_a, port_a, mut rx_a) = super::start_lmf_callback_sink().await;
+    let (sink_b, port_b, mut rx_b) = super::start_lmf_callback_sink().await;
+
+    for (lmf, port) in [(LMF_A_2256, port_a), (LMF_B_2256, port_b)] {
+        let resp =
+            crate::namf_server::test_namf_request_handler(nrppa_subscription_as(supi, lmf, port))
+                .await;
+        assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    }
+    // A declares B's nfId; B's transfer comes last, so B is the last writer.
+    for (lmf, nf_id, corr) in [
+        (LMF_A_2256, LMF_B_2256, "corr-nrppa-a"),
+        (LMF_B_2256, LMF_B_2256, "corr-nrppa-b"),
+    ] {
+        let resp = crate::namf_server::test_namf_request_handler(nrppa_transfer_as(
+            supi, lmf, nf_id, corr,
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{}", cause_of(&resp));
+    }
+
+    // Each downlink's Routing ID names the LMF that sent it.
+    server.process_positioning_downlinks().await;
+    let downlinks: Vec<Vec<u8>> = take_sent_ngap(&mut server)
+        .into_iter()
+        .filter_map(|(_, pdu)| matches!(decode_sent(&pdu), Sent::Other(Some(8))).then_some(pdu))
+        .collect();
+    assert_eq!(downlinks.len(), 2, "one NRPPa downlink per transfer");
+    let names = |pdu: &[u8], lmf: &str| pdu.windows(lmf.len()).any(|w| w == lmf.as_bytes());
+    assert!(
+        names(&downlinks[0], LMF_A_2256) && !names(&downlinks[0], LMF_B_2256),
+        "A's Routing ID is A's verified identity, not the nfId it declared"
+    );
+    assert!(names(&downlinks[1], LMF_B_2256));
+
+    // The gNB answers A's request, then B's, each echoing its Routing ID.
+    let answers = [
+        (LMF_A_2256, [0xA1u8, 0x01], &mut rx_a, "corr-nrppa-a"),
+        (LMF_B_2256, [0xB2u8, 0x02], &mut rx_b, "corr-nrppa-b"),
+    ];
+    for (lmf, nrppa, rx, corr) in answers {
+        let ul =
+            crate::gnb_pdus::uplink_ue_associated_nrppa_transport(ue, ran, lmf.as_bytes(), &nrppa);
+        server
+            .process_ngap_message(ASSOC, &ul)
+            .await
+            .expect("handled");
+        let (_uri, json, parts) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an N2InfoNotify arrives")
+            .expect("sink open");
+        let json: serde_json::Value = serde_json::from_str(&json).expect("json root");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].data.as_ref(),
+            nrppa,
+            "LMF {lmf} gets its own answer"
+        );
+        assert_eq!(json["lcsCorrelationId"], corr, "LMF {lmf}: {json}");
+        assert_eq!(json["n2InfoContainer"]["nrppaInfo"]["nfId"], lmf);
+        assert_eq!(json["n2InfoContainer"]["n2InformationClass"], "NRPPa");
+    }
+
+    // An empty Routing ID names no LMF: the most recent subscription (B's) with
+    // the UE's last correlation (B's).
+    let ul = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(ue, ran, b"", &[0xC3, 0x03]);
+    server
+        .process_ngap_message(ASSOC, &ul)
+        .await
+        .expect("handled");
+    let (_uri, json, parts) = tokio::time::timeout(Duration::from_secs(10), rx_b.recv())
+        .await
+        .expect("the fallback N2InfoNotify arrives")
+        .expect("sink open");
+    let json: serde_json::Value = serde_json::from_str(&json).expect("json root");
+    assert_eq!(parts[0].data.as_ref(), [0xC3, 0x03]);
+    assert_eq!(json["lcsCorrelationId"], "corr-nrppa-b", "{json}");
+
+    assert!(rx_a.try_recv().is_err(), "LMF A got only its own answer");
+    assert!(rx_b.try_recv().is_err(), "LMF B got only its own answers");
+    sink_a.stop().await.expect("stop");
+    sink_b.stop().await.expect("stop");
+    server.forget_ue(ue);
+}
+
+/// #2256: a third LMF, with no subscription of its own, and a fourth, unknown
+/// to the NRF.
+const LMF_C_2256: &str = "6f1d0a52-2256-4c00-8000-00000000000c";
+const LMF_D_2256: &str = "6f1d0a52-2256-4d00-8000-00000000000d";
+
+/// #2256, TS 29.518 §5.2.2.3.5.3 and §5.2.2.3.6.3 step 1: an LMF that never
+/// subscribed gets the UE's LPP answer and the gNB's NRPPa answer at the default
+/// notification subscriptions in its NRF profile, with `"implicit"` as the
+/// subscription id (Tables 6.1.6.2.14-1, 6.1.6.2.16-1) and its own correlation;
+/// the other LMF's subscription is not used. For an LMF with no default, the
+/// UE's LPP comes back with 5GMM #90 and the NRPPa is dropped and counted.
+///
+/// Revert-verified: with the default lookup answering nothing, the first wait
+/// on the default sink times out; with the queued #90 not sent by the pump, the
+/// #90 wait times out; with the subscription id not "implicit", that assertion
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_lmf_without_a_subscription_gets_its_uplink_at_its_nrf_default() {
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_225_603u64, 98, "imsi-001010022560003");
+    live_ue(&mut server, ue, ran, supi);
+    let (sink_c, port_c, mut rx_c) = super::start_lmf_callback_sink().await;
+    let (sink_b, port_b, mut rx_b) = super::start_lmf_callback_sink().await;
+
+    // A stand-in NRF that knows LMF C, with both default subscriptions, only.
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let nrf_port = addr.port();
+    let nrf = SbiServer::on_listener(
+        SbiServerConfig::new(format!("127.0.0.1:{nrf_port}").parse().expect("addr")),
+        listener,
+    );
+    nrf.start(move |req: nextgcore_sbi::SbiRequest| async move {
+        let asked = req.http.get_param("target-nf-instance-id").cloned();
+        let instances = if asked.as_deref() == Some(LMF_C_2256) {
+            serde_json::json!([{
+                "nfInstanceId": LMF_C_2256,
+                "nfType": "LMF",
+                "nfStatus": "REGISTERED",
+                "defaultNotificationSubscriptions": [
+                    { "notificationType": "N1_MESSAGES", "n1MessageClass": "SM",
+                      "callbackUri": format!("http://127.0.0.1:{port_c}/wrong-class") },
+                    { "notificationType": "N1_MESSAGES", "n1MessageClass": "LPP",
+                      "callbackUri": format!("http://127.0.0.1:{port_c}/default-n1") },
+                    { "notificationType": "N2_INFORMATION", "n2InformationClass": "NRPPa",
+                      "callbackUri": format!("http://127.0.0.1:{port_c}/default-n2") },
+                ],
+                "nfServices": [{
+                    "serviceInstanceId": "nlmf-loc-c",
+                    "serviceName": "nlmf-loc",
+                    "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                    "scheme": "http",
+                    "nfServiceStatus": "REGISTERED",
+                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port_c }],
+                }],
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        nextgcore_sbi::SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({ "validityPeriod": 60, "nfInstances": instances }))
+            .expect("json")
+    })
+    .await
+    .expect("stand-in NRF start");
+    crate::sbi_path::set_lmf_instance_discovery_nrf_for_test(Some(format!(
+        "http://127.0.0.1:{nrf_port}"
+    )));
+
+    // Only LMF B subscribes; C and D only transfer, C last.
+    let resp = crate::namf_server::test_namf_request_handler(lpp_subscription_as(
+        supi, LMF_B_2256, port_b,
+    ))
+    .await;
+    assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    let resp = crate::namf_server::test_namf_request_handler(nrppa_subscription_as(
+        supi, LMF_B_2256, port_b,
+    ))
+    .await;
+    assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    for (lmf, corr) in [(LMF_D_2256, "corr-d"), (LMF_C_2256, "corr-c")] {
+        let resp =
+            crate::namf_server::test_namf_request_handler(lpp_transfer_as(supi, lmf, corr)).await;
+        assert_eq!(resp.status, 200, "{}", cause_of(&resp));
+    }
+    server.process_positioning_downlinks().await;
+    let _ = take_sent_ngap(&mut server);
+
+    // C's LPP session: the UE's answer goes to C's default N1 subscription.
+    let ul = ul_lpp(&[0xC1, 0x01], Some(b"corr-c"), 0);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ul))
+        .await
+        .expect("handled");
+    let (uri, json, parts) = tokio::time::timeout(Duration::from_secs(10), rx_c.recv())
+        .await
+        .expect("an N1MessageNotify at C's default")
+        .expect("sink open");
+    let json: serde_json::Value = serde_json::from_str(&json).expect("json root");
+    assert_eq!(uri, "/default-n1");
+    assert_eq!(json["n1NotifySubscriptionId"], "implicit", "{json}");
+    assert_eq!(json["lcsCorrelationId"], "corr-c");
+    assert!(parts.iter().any(|p| p.data.as_ref() == [0xC1, 0x01]));
+
+    // C's NRPPa: the gNB's answer, Routing ID C, goes to C's default N2 one,
+    // with the correlation C last used.
+    let ul = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+        ue,
+        ran,
+        LMF_C_2256.as_bytes(),
+        &[0xC2, 0x02],
+    );
+    server
+        .process_ngap_message(ASSOC, &ul)
+        .await
+        .expect("handled");
+    let (uri, json, parts) = tokio::time::timeout(Duration::from_secs(10), rx_c.recv())
+        .await
+        .expect("an N2InfoNotify at C's default")
+        .expect("sink open");
+    let json: serde_json::Value = serde_json::from_str(&json).expect("json root");
+    assert_eq!(uri, "/default-n2");
+    assert_eq!(json["n2NotifySubscriptionId"], "implicit", "{json}");
+    assert_eq!(json["n2InfoContainer"]["nrppaInfo"]["nfId"], LMF_C_2256);
+    assert_eq!(json["lcsCorrelationId"], "corr-c");
+    assert_eq!(parts[0].data.as_ref(), [0xC2, 0x02]);
+
+    // D has no default: its NRPPa answer is dropped and counted ...
+    let dropped = || UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed);
+    let before = dropped();
+    let ul = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+        ue,
+        ran,
+        LMF_D_2256.as_bytes(),
+        &[0xD2],
+    );
+    server
+        .process_ngap_message(ASSOC, &ul)
+        .await
+        .expect("handled");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while dropped() == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "D's NRPPa is counted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // ... and the UE's LPP answer to D comes back with 5GMM #90.
+    let ul = ul_lpp(&[0xD1, 0x01], Some(b"corr-d"), 1);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ul))
+        .await
+        .expect("handled");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let echoed = loop {
+        server.process_positioning_downlinks().await;
+        let nas = take_sent_ngap(&mut server)
+            .into_iter()
+            .find_map(|(_, pdu)| match decode_sent(&pdu) {
+                Sent::DownlinkNas {
+                    amf_ue_ngap_id,
+                    nas_pdu,
+                } if amf_ue_ngap_id == ue => Some(nas_pdu),
+                _ => None,
+            });
+        if let Some(nas) = nas {
+            break nas;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a #90 DL NAS Transport"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // NEA0: the plain DL NAS TRANSPORT follows the 7-octet security header.
+    let plain = &echoed[7..];
+    assert_eq!(&plain[..3], [0x7E, 0x00, 0x68]);
+    assert!(
+        plain.windows(2).any(|w| w == [0x58, 90]),
+        "5GMM cause #90: {plain:02x?}"
+    );
+    assert!(
+        plain.windows(2).any(|w| w == [0xD1, 0x01]),
+        "the payload echoed"
+    );
+
+    assert!(
+        rx_b.try_recv().is_err(),
+        "LMF B's subscriptions are not used"
+    );
+    assert!(rx_c.try_recv().is_err());
+    crate::sbi_path::set_lmf_instance_discovery_nrf_for_test(None);
+    let sbi_ctx = nextgcore_sbi::context::global_context();
+    sbi_ctx.remove_nf_instance(LMF_C_2256).await;
+    sbi_ctx.remove_nf_instance(LMF_D_2256).await;
+    nrf.stop().await.expect("stop");
+    sink_b.stop().await.expect("stop");
+    sink_c.stop().await.expect("stop");
+    server.forget_ue(ue);
+}
+
+/// An LMF's SLPP N1N2MessageTransfer as LMF `lmf`, for LCS correlation
+/// `correlation` (#557).
+fn slpp_transfer_as(supi: &str, lmf: &str, correlation: &str) -> nextgcore_sbi::SbiRequest {
+    let mut req =
+        nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&serde_json::json!({
+                "n1MessageContainer": {
+                    "n1MessageClass": "SLPP",
+                    "n1MessageContent": { "contentId": "slpp-pdu" }
+                },
+                "lcsCorrelationId": correlation,
+            }))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "slpp-pdu",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::from_static(&[0x44, 0x22, 0x56]),
+            ));
+    req.oauth2_subject = Some(lmf.to_string());
+    req
+}
+
+/// #2256 on #557, TS 24.501 §5.4.5.2.5 case c1: the UE's uplink SLPP is routed
+/// by its Additional information exactly as LPP is. Two LMFs, each with only
+/// an LPP subscription (which SLPP falls back to), run an SLPP session each;
+/// each answer reaches the LMF whose correlation it names, still as "SLPP".
+///
+/// Revert-verified: with the SLPP arm passing no Additional information, A's
+/// answer reaches B (the most recent subscription) and A's wait times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_lmfs_slpp_sessions_for_one_ue_each_get_their_own_uplink() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_225_604u64, 99, "imsi-001010022560004");
+    live_ue(&mut server, ue, ran, supi);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (sink_a, port_a, mut rx_a) = super::start_lmf_callback_sink().await;
+    let (sink_b, port_b, mut rx_b) = super::start_lmf_callback_sink().await;
+    for (lmf, port) in [(LMF_A_2256, port_a), (LMF_B_2256, port_b)] {
+        let resp =
+            crate::namf_server::test_namf_request_handler(lpp_subscription_as(supi, lmf, port))
+                .await;
+        assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    }
+    for (lmf, corr) in [(LMF_A_2256, "slpp-corr-a"), (LMF_B_2256, "slpp-corr-b")] {
+        let resp =
+            crate::namf_server::test_namf_request_handler(slpp_transfer_as(supi, lmf, corr)).await;
+        assert_eq!(resp.status, 200, "{}", cause_of(&resp));
+    }
+    server.process_positioning_downlinks().await;
+    let _ = take_sent_ngap(&mut server);
+
+    let answers = [
+        (&b"slpp-corr-a"[..], [0xA5u8, 0x05], &mut rx_a, "A"),
+        (&b"slpp-corr-b"[..], [0xB6u8, 0x06], &mut rx_b, "B"),
+    ];
+    for (count, (corr, slpp, rx, lmf)) in (0u8..).zip(answers) {
+        // UL NAS TRANSPORT, payload container type 12 (SLPP), with Additional
+        // information.
+        let mut inner = vec![0x7E, 0x00, 0x67, 0x0C];
+        inner.extend_from_slice(&(slpp.len() as u16).to_be_bytes());
+        inner.extend_from_slice(&slpp);
+        inner.extend_from_slice(&[0x24, corr.len() as u8]);
+        inner.extend_from_slice(corr);
+        let ul = ue_protect(&inner, count);
+        server
+            .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ul))
+            .await
+            .expect("handled");
+        let (json, n1) = next_notify(rx).await;
+        assert_eq!(n1, slpp, "LMF {lmf} gets its own session's answer");
+        assert_eq!(
+            json["lcsCorrelationId"].as_str().map(str::as_bytes),
+            Some(corr),
+            "LMF {lmf}: {json}"
+        );
+        assert_eq!(json["n1MessageContainer"]["n1MessageClass"], "SLPP");
+    }
+    assert!(rx_a.try_recv().is_err());
+    assert!(rx_b.try_recv().is_err());
+    sink_a.stop().await.expect("stop");
+    sink_b.stop().await.expect("stop");
+    server.forget_ue(ue);
+}

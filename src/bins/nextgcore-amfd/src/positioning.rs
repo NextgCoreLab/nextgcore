@@ -135,6 +135,52 @@ pub fn build_lpp_dl_nas(lpp_pdu: &[u8], lcs_correlation_id: Option<&str>) -> Opt
     Some(nas)
 }
 
+/// NAS payload container type "SLPP message container" (TS 24.501 k00
+/// §9.11.3.40, value `1100`, #557).
+pub const PAYLOAD_CONTAINER_TYPE_SLPP: u8 = 0x0C;
+
+/// Additional information IEI in DL NAS TRANSPORT (TS 24.501 §8.2.11.1,
+/// §9.11.2.1, a type 4 TLV).
+pub const IEI_ADDITIONAL_INFORMATION: u8 = 0x24;
+
+/// Build a DL NAS Transport carrying an LMF-provided SLPP message (TS 24.501
+/// k00 §5.4.5.3.2 case c1, #557). The AMF:
+/// a) sets the Payload container type IE to "SLPP message container";
+/// b) sets the Payload container IE to the SLPP message payload received from
+///    the LMF;
+/// c) sets the Additional information IE to the LCS correlation identifier
+///    received from that LMF.
+///
+/// Additional information is the only optional IE present, so it comes right
+/// after the payload container, which is where TS 24.501 Table 8.2.11.1.1
+/// orders it. A correlation identifier that does not fit the IE's one-octet
+/// length is left out and logged rather than truncated: a cut identifier
+/// would route the UE's answer to no LMF at all.
+pub fn build_slpp_dl_nas(slpp_pdu: &[u8], lcs_correlation_id: Option<&str>) -> Option<Vec<u8>> {
+    let mut nas = crate::gmm_build::build_dl_nas_transport(
+        None,
+        PAYLOAD_CONTAINER_TYPE_SLPP,
+        slpp_pdu,
+        None,
+        None,
+    )?;
+    if let Some(corr) = lcs_correlation_id.filter(|c| !c.is_empty()) {
+        match u8::try_from(corr.len()) {
+            Ok(len) => {
+                nas.push(IEI_ADDITIONAL_INFORMATION);
+                nas.push(len);
+                nas.extend_from_slice(corr.as_bytes());
+            }
+            Err(_) => log::warn!(
+                "SLPP DL NAS Transport: LCS correlation id of {} octets does not fit the \
+                 Additional information IE (max 255); sent without it",
+                corr.len()
+            ),
+        }
+    }
+    Some(nas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +221,34 @@ mod tests {
             .expect("build non-UE-associated NRPPa transport");
         assert_eq!(bytes, DL_NON_UE_GOLDEN.to_vec());
         assert_eq!(crate::ngap_asn1::extract_amf_ue_ngap_id(&bytes), None);
+    }
+
+    #[test]
+    fn slpp_dl_nas_frames_the_slpp_container_and_the_correlation_id() {
+        // TS 24.501 k00: type 12 "SLPP message container" (§9.11.3.40) and
+        // the LCS correlation id in Additional information (§5.4.5.3.2 c1).
+        assert_eq!(PAYLOAD_CONTAINER_TYPE_SLPP, 0b1100);
+        assert_eq!(IEI_ADDITIONAL_INFORMATION, 0x24);
+        assert_ne!(PAYLOAD_CONTAINER_TYPE_SLPP, PAYLOAD_CONTAINER_TYPE_LPP);
+        let slpp = [0x44u8, 0x02, 0x00, 0x40, 0x04, 0x00];
+        let nas = build_slpp_dl_nas(&slpp, Some("corr-1")).expect("builds");
+        // 7E 00 68 | type 0C | LV-E 00 06 + payload | 24 06 "corr-1"
+        let mut want = vec![0x7E, 0x00, 0x68, 0x0C, 0x00, 0x06];
+        want.extend_from_slice(&slpp);
+        want.extend_from_slice(&[0x24, 0x06]);
+        want.extend_from_slice(b"corr-1");
+        assert_eq!(nas, want);
+        // No correlation id, so no Additional information.
+        assert_eq!(
+            build_slpp_dl_nas(&slpp, None).expect("builds").len(),
+            6 + slpp.len()
+        );
+        // One that cannot fit is left out, not truncated.
+        let long = "x".repeat(256);
+        assert_eq!(
+            build_slpp_dl_nas(&slpp, Some(&long)).expect("builds").len(),
+            6 + slpp.len()
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! decode each one and re-encode it byte for byte.
 //!
 //! #417: these used to take PDUs from the hand-written `nextgcore-ngap`
-//! builders. Those cross-checks moved to `nextgcore-ngap/tests/`, with their
-//! subject; nothing here depends on that crate or on `nextgcore-asn1c`.
+//! builders. Those cross-checks moved into that crate's tests, with their
+//! subject, and went when #417 deleted it and `nextgcore-asn1c`.
 
 use super::*;
 use bitvec::field::BitField;
@@ -18,8 +18,8 @@ fn unhex(hex: &str) -> Vec<u8> {
 }
 
 /// The nextgsim gNB's InitialUEMessage without and with AllowedNSSAI (IE 0).
-/// The same captures pin `nextgcore-ngap`'s parser in
-/// `nextgcore-ngap/tests/decode_sim_initial_ue.rs`.
+/// amfd's decoder reads the same captures to their values
+/// (`ngap_asn1::tests::the_nextgsim_initial_ue_captures_decode_to_their_values`).
 const SIM_INITIAL_UE: &str = "000f404200000500550002000100260018177e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e0079000f4099f907000000010099f907000001005a4001180070400100";
 const SIM_INITIAL_UE_WITH_ALLOWED_NSSAI: &str = "000f404800000600550002000100260018177e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e0079000f4099f907000000010099f907000001005a4001180070400100000000020001";
 
@@ -291,9 +291,6 @@ fn ng_setup_failure_with_diagnostics_matches_hand_derived_octets() {
 /// - IE 103 `00 67`, ignore `40`, length `07`: list count 1 in 1..16 -> `0000`,
 ///   item ext/iE-Extensions `0 0`, TAI ext/iE-Extensions `0 0` = 8 bits `00`;
 ///   PLMN `00 f1 10`; TAC `00 00 01`.
-///
-/// The same octets pin the hand-written builder in
-/// `nextgcore-ngap/tests/builder_conformance.rs`.
 #[test]
 fn paging_as_amfd_sends_it_round_trips() {
     let paging: [u8; 29] = [
@@ -333,9 +330,8 @@ fn security_context_key_is_octet_aligned() {
 /// constraint not visible): a length octet and the minimal two's-complement
 /// octets, so 65535 takes three.
 ///
-/// #417: the hand-written cross-check that covered this boundary moved to
-/// `nextgcore-ngap/tests/hand_written_transfer_cross_check.rs`; this pins the
-/// generated codec alone.
+/// #417: this pins the generated codec alone; the hand-written cross-check that
+/// also covered this boundary was deleted with the hand-written crate.
 #[test]
 fn maximum_data_burst_volume_matches_hand_derived_octets() {
     for (v, octets) in [

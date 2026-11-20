@@ -62,7 +62,7 @@ enum SrrState {
     /// Update or Remove). When that returns, the owner reconciles it with the
     /// subscription as it is then ([`settle`]); nobody else sends N4 for it.
     Pending,
-    /// At the UPF with `period`; no N4 request in flight.
+    /// At the UPF with `sent`; no N4 request in flight.
     Installed,
     /// Its Remove SRR is in flight (#1390 review round 2). The entry keeps its
     /// SRR ID until the Remove returns, so no install can reuse the ID and have
@@ -70,13 +70,14 @@ enum SrrState {
     Removing,
 }
 
-/// One SRR of a session: the subscription it serves.
+/// One SRR of a session: the requester it serves, a QOS_MON subscription (its
+/// ID) or a PCF QoS monitoring decision (`pcc:<qmId>`, #2208).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Srr {
     sub: String,
     id: u8,
-    /// The Measurement Period last sent to the UPF, in seconds.
-    period: u32,
+    /// The QoS Monitoring per QoS flow Control Information last sent to the UPF.
+    sent: Controls,
     state: SrrState,
     /// The subscription changed (PUT, DELETE) while the SRR was [`Pending`]:
     /// its owner looks again before settling it.
@@ -85,10 +86,28 @@ struct Srr {
     recheck: bool,
 }
 
+/// The IE 242s of one SRR.
+type Controls = Vec<QosMonitoringPerQosFlowControlInformation>;
+
 /// The monitoring of one session: its SRRs, one per subscription.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionMon {
     srrs: Vec<Srr>,
+    /// #2208: the PSA advertised GPQM and the method is `gtpu_path`: the SRRs ask
+    /// for GTPUPM, and the UL PDR gets Transport Delay Reporting.
+    gtpupm: bool,
+    /// The SMF-side SEID of the session's N4 session at the PSA.
+    smf_seid: Option<u64>,
+    /// #2208: the preceding UL GTP-U peer the PSA's UL PDR holds in its Transport
+    /// Delay Reporting (IE 271), `None` when it holds none.
+    tdr_peer: Option<std::net::IpAddr>,
+    /// #2208: the same for the session's I-UPF's UL PDR.
+    tdr_iupf_peer: Option<std::net::IpAddr>,
+    /// A task owns the IE 271 leg ([`sync_transport_delay`]).
+    tdr_busy: bool,
+    /// The access peer or the SRRs changed while [`Self::tdr_busy`]: its owner
+    /// looks again.
+    tdr_dirty: bool,
     /// The NG-RAN was last asked to measure (`both`), not to stop.
     ran_on: bool,
     /// An N2 QoS Monitoring Request was held back by another 5GSM procedure:
@@ -145,7 +164,14 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
 /// Drop a session's entry once it holds nothing.
 fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
     if m.get(r).is_some_and(|s| {
-        s.srrs.is_empty() && !s.ran_on && !s.n2_deferred && !s.n2_busy && s.n2_retransmit.is_none()
+        s.srrs.is_empty()
+            && !s.ran_on
+            && !s.n2_deferred
+            && !s.n2_busy
+            && s.n2_retransmit.is_none()
+            && s.tdr_peer.is_none()
+            && s.tdr_iupf_peer.is_none()
+            && !s.tdr_busy
     }) {
         m.remove(r);
     }
@@ -360,13 +386,38 @@ fn period_of(sub: &EventSubscription) -> u32 {
     event_exposure::periodic_rep_period(sub).unwrap_or(DEFAULT_PERIOD_SECS)
 }
 
-/// What the SRR serving `sub_id` on `r` should be now: its Measurement Period,
-/// or `None` when it should not exist (the subscription is gone, no longer asks
-/// for QoS monitoring, or no longer covers the session).
-fn desired(sub_id: &str, r: &str) -> Option<u32> {
+/// What the SRR serving `sub_id` on `r` should be now: its IE 242s, or `None`
+/// when it should not exist (the subscription is gone, no longer asks for QoS
+/// monitoring, or no longer covers the session; the PCF's decision is removed or
+/// no PCC rule references it, #2208).
+fn desired(sub_id: &str, r: &str) -> Option<Controls> {
+    let qfi = crate::lookup_policy_binding(r)?.qfi;
+    let gtpupm = with(|m| m.get(r).is_some_and(|s| s.gtpupm));
+    if let Some(qm_id) = sub_id.strip_prefix(crate::pcc_qos_mon::REQUESTER_PREFIX) {
+        return crate::pcc_qos_mon::policy(r, qm_id).map(|p| vec![p.control(qfi, gtpupm)]);
+    }
     event_exposure::find(sub_id)
         .filter(|sub| covers(sub, r))
-        .map(|sub| period_of(&sub))
+        .map(|sub| {
+            let mut c = control_for(qfi, period_of(&sub));
+            c.requested_qos_monitoring.gtpupm = gtpupm;
+            vec![c]
+        })
+}
+
+/// A short description of `c` for logs.
+fn describe(c: &Controls) -> String {
+    c.iter()
+        .map(|c| {
+            let q = &c.requested_qos_monitoring;
+            let f = &c.reporting_frequency;
+            format!(
+                "QFI {:?} DL={} UL={} RP={} GTPUPM={} event={} periodic={} period={:?}",
+                c.qfis, q.dlpd, q.ulpd, q.rppd, q.gtpupm, f.evett, f.perio, c.measurement_period
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The sessions (SM context references, sorted) a QOS_MON subscription covers.
@@ -406,7 +457,7 @@ pub async fn subscribed(sub: &EventSubscription) {
         return;
     }
     for r in sessions_for(sub) {
-        install(&r, sub).await;
+        install(&r, &sub.id).await;
         want_ran(&r, false);
     }
 }
@@ -430,7 +481,7 @@ pub async fn unsubscribed(sub_id: &str) {
 /// An SRR another task owns ([`SrrState::Pending`]) is flagged for its owner to
 /// look again; the rest are taken over and settled here.
 async fn reconcile(sub_id: &str) {
-    let mine: Vec<(String, u8, u32)> = with(|m| {
+    let mine: Vec<(String, u8, Controls)> = with(|m| {
         let mut out = Vec::new();
         for (r, s) in m.iter_mut() {
             for e in s.srrs.iter_mut().filter(|e| e.sub == sub_id) {
@@ -438,7 +489,7 @@ async fn reconcile(sub_id: &str) {
                     SrrState::Pending => e.recheck = true,
                     SrrState::Installed => {
                         e.state = SrrState::Pending;
-                        out.push((r.clone(), e.id, e.period));
+                        out.push((r.clone(), e.id, e.sent.clone()));
                     }
                     SrrState::Removing => {}
                 }
@@ -446,9 +497,43 @@ async fn reconcile(sub_id: &str) {
         }
         out
     });
-    for (r, id, period) in mine {
-        settle(&r, sub_id, id, period).await;
+    for (r, id, sent) in mine {
+        settle(&r, sub_id, id, sent).await;
+        sync_transport_delay(&r).await;
     }
+}
+
+/// The PCF's QoS monitoring policy of session `r` changed (#2208): the SRRs of
+/// the PCF's decisions are brought in line with it (installed where a PCC rule
+/// now references a decision, updated or removed where the decision changed or
+/// is no longer referenced), and the NG-RAN told.
+pub async fn on_policy_changed(r: &str) {
+    let prefix = crate::pcc_qos_mon::REQUESTER_PREFIX;
+    let mine: Vec<(String, u8, Controls)> = with(|m| {
+        let mut out = Vec::new();
+        if let Some(s) = m.get_mut(r) {
+            for e in s.srrs.iter_mut().filter(|e| e.sub.starts_with(prefix)) {
+                match e.state {
+                    SrrState::Pending => e.recheck = true,
+                    SrrState::Installed => {
+                        e.state = SrrState::Pending;
+                        out.push((e.sub.clone(), e.id, e.sent.clone()));
+                    }
+                    SrrState::Removing => {}
+                }
+            }
+        }
+        out
+    });
+    for (key, id, sent) in mine {
+        settle(r, &key, id, sent).await;
+    }
+    let mut any = false;
+    for key in crate::pcc_qos_mon::requesters(r) {
+        any |= install(r, &key).await;
+    }
+    sync_transport_delay(r).await;
+    want_ran(r, any);
 }
 
 /// The session's user plane is active (a PDU Session Resource Setup Response):
@@ -458,21 +543,26 @@ pub fn on_user_plane_active(sm_context_ref: &str) {
     let Some(b) = crate::lookup_policy_binding(sm_context_ref) else {
         return;
     };
-    let subs: Vec<EventSubscription> =
+    // #2208: the PCF's QoS monitoring decisions the session's PCC rules
+    // reference, beside the QOS_MON subscriptions covering it.
+    let keys: Vec<String> =
         event_exposure::matching(event_exposure::event::QOS_MON, &b.supi, b.psi)
             .into_iter()
             .filter(monitors)
+            .map(|s| s.id)
+            .chain(crate::pcc_qos_mon::requesters(sm_context_ref))
             .collect();
-    if subs.is_empty() {
+    if keys.is_empty() {
         return;
     }
     let r = sm_context_ref.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(AFTER_ACTIVATION).await;
         let mut any = false;
-        for sub in &subs {
-            any |= install(&r, sub).await;
+        for key in &keys {
+            any |= install(&r, key).await;
         }
+        sync_transport_delay(&r).await;
         want_ran(&r, any);
     });
 }
@@ -678,15 +768,16 @@ pub fn on_gsm_idle(sm_context_ref: &str) {
     }
 }
 
-/// Install `sub`'s SRR on the session, unless it has one already. Returns
-/// whether it was newly installed.
-async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
-    if with(|m| m.get(sm_context_ref).is_some_and(|s| s.serves(&sub.id))) {
+/// Install the SRR of requester `key` (a QOS_MON subscription's ID, or
+/// `pcc:<qmId>`) on the session, unless it has one already. Returns whether it
+/// was newly installed.
+async fn install(sm_context_ref: &str, key: &str) -> bool {
+    if with(|m| m.get(sm_context_ref).is_some_and(|s| s.serves(key))) {
         return false;
     }
-    let Some(b) = crate::lookup_policy_binding(sm_context_ref) else {
+    if crate::lookup_policy_binding(sm_context_ref).is_none() {
         return false;
-    };
+    }
     let Some(upf_seid) = crate::lookup_upf_seid(sm_context_ref) else {
         log::info!("ref={sm_context_ref}: no N4 session yet; QoS monitoring waits for it");
         return false;
@@ -695,27 +786,43 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
     let Some(client) = crate::pfcp_path::client_for_session(smf_seid) else {
         return false;
     };
-    if !client
-        .association()
-        .await
-        .up_function_features
-        .is_some_and(|f| f.qfqm)
-    {
+    let features = client.association().await.up_function_features;
+    if !features.is_some_and(|f| f.qfqm) {
         log::warn!(
-            "ref={sm_context_ref}: QOS_MON subscription {} but {} did not advertise QFQM \
+            "ref={sm_context_ref}: QoS monitoring for {key} but {} did not advertise QFQM \
              (TS 29.244 §5.24.4.1): no QoS monitoring requested",
-            sub.id,
             client.peer()
         );
         return false;
     }
-    let period = period_of(sub);
+    // #2208: GTP-U path measurement (TS 23.501 §5.33.3.3) when the operator
+    // configured it and the PSA can do it (GPQM, TS 29.244 §5.24.5); otherwise the
+    // per QoS flow method, which a QFQM PSA always can.
+    let gtpupm = crate::pcc_qos_mon::method() == crate::pcc_qos_mon::Method::GtpuPath
+        && features.is_some_and(|f| f.gpqm);
+    if crate::pcc_qos_mon::method() == crate::pcc_qos_mon::Method::GtpuPath && !gtpupm {
+        log::warn!(
+            "ref={sm_context_ref}: smf.qos_monitoring.method is gtpu_path but {} did not \
+             advertise GPQM (TS 29.244 §5.24.5): per QoS flow measurement requested instead",
+            client.peer()
+        );
+    }
+    let smf_seid = crate::smf_n4_seid_for(sm_context_ref);
+    with(|m| {
+        let s = m.entry(sm_context_ref.to_string()).or_default();
+        s.gtpupm = gtpupm;
+        s.smf_seid = Some(smf_seid);
+    });
+    let Some(want) = desired(key, sm_context_ref) else {
+        with(|m| tidy(m, sm_context_ref));
+        return false;
+    };
     // #1390 review M1: the SRR ID is reserved under the lock, before the N4
     // request is awaited, so a concurrent install on the session (another
     // subscription, or the same one from a PDU_RES_SETUP_RSP) picks another.
     let reserved = with(|m| {
         let s = m.entry(sm_context_ref.to_string()).or_default();
-        if s.serves(&sub.id) {
+        if s.serves(key) {
             return Err(None);
         }
         // An ID whose Remove SRR is still in flight (Removing) is not free.
@@ -723,9 +830,9 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
             .find(|id| !s.srrs.iter().any(|e| e.id == *id))
             .ok_or(Some(()))?;
         s.srrs.push(Srr {
-            sub: sub.id.clone(),
+            sub: key.to_string(),
             id,
-            period,
+            sent: want.clone(),
             state: SrrState::Pending,
             recheck: false,
         });
@@ -735,44 +842,41 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
         Ok(id) => id,
         Err(None) => return false,
         Err(Some(())) => {
-            log::warn!(
-                "ref={sm_context_ref}: no free SRR ID for subscription {}",
-                sub.id
-            );
+            log::warn!("ref={sm_context_ref}: no free SRR ID for {key}");
             return false;
         }
     };
+    // #2208: the PSA's UL PDR names its preceding UL GTP-U peer before the GTPUPM
+    // SRR asks it to measure (TS 29.244 §5.24.5.3).
+    sync_transport_delay(sm_context_ref).await;
     n4_hold(SrrOp::Create).await;
     let params = crate::n4_build::SessionModificationParams {
-        create_srrs: vec![(srr_id, vec![control_for(b.qfi, period)])],
+        create_srrs: vec![(srr_id, want.clone())],
         ..Default::default()
     };
     match crate::pfcp_modify_with(smf_seid, upf_seid, &params).await {
         Ok(_) => {
             log::info!(
-                "ref={sm_context_ref}: QoS monitoring of QFI {} requested from the UPF: SRR \
-                 {srr_id}, Periodic every {period} s (QOS_MON subscription {})",
-                b.qfi,
-                sub.id
+                "ref={sm_context_ref}: QoS monitoring requested from the UPF for {key}: SRR \
+                 {srr_id}, {}",
+                describe(&want)
             );
             // #1390 review M3: a DELETE (or a PUT) may have come while the Create
             // was in flight: settle against the subscription as it is now.
-            settle(sm_context_ref, &sub.id, srr_id, period).await
+            settle(sm_context_ref, key, srr_id, want).await
         }
         Err(e) => {
-            log::warn!(
-                "ref={sm_context_ref}: Create SRR for QOS_MON subscription {} failed: {e}",
-                sub.id
-            );
+            log::warn!("ref={sm_context_ref}: Create SRR for {key} failed: {e}");
             // The reservation is rolled back.
             with(|m| {
                 if let Some(s) = m.get_mut(sm_context_ref) {
-                    if let Some(i) = s.position(&sub.id, srr_id) {
+                    if let Some(i) = s.position(key, srr_id) {
                         s.srrs.remove(i);
                     }
                 }
                 tidy(m, sm_context_ref);
             });
+            sync_transport_delay(sm_context_ref).await;
             // Another removal may have held back its `stop` for this install.
             if with(|m| m.get(sm_context_ref).is_some_and(|s| s.ran_on)) {
                 want_ran(sm_context_ref, false);
@@ -786,8 +890,8 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
 enum Next {
     /// It matches the subscription: installed.
     Done,
-    /// The subscription wants another period.
-    Update(u32),
+    /// The requester wants other IE 242s.
+    Update(Controls),
     /// The subscription no longer wants it: Remove SRR (the entry is
     /// [`SrrState::Removing`] until it returns).
     Remove,
@@ -804,7 +908,7 @@ const SETTLE_PASSES: usize = 8;
 /// while the subscription wants another period, Remove SRR (and `stop` to the
 /// NG-RAN when the session has no other SRR installed or being installed) when
 /// it wants none. Returns whether the SRR ends installed.
-async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
+async fn settle(r: &str, sub_id: &str, id: u8, mut sent: Controls) -> bool {
     for pass in 0..=SETTLE_PASSES {
         let want = desired(sub_id, r);
         let last_pass = pass == SETTLE_PASSES;
@@ -818,14 +922,14 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
             let e = &mut s.srrs[i];
             if std::mem::take(&mut e.recheck) && !last_pass {
                 // The subscription changed after `want` was read: read it again.
-                return Next::Update(sent);
+                return Next::Update(sent.clone());
             }
             match want {
                 // The last pass settles on what the UPF holds (review round 2
                 // minor: but never keeps an SRR nobody wants).
                 Some(p) if p == sent || last_pass => {
                     e.state = SrrState::Installed;
-                    e.period = sent;
+                    e.sent = sent.clone();
                     Next::Done
                 }
                 Some(p) => Next::Update(p),
@@ -840,10 +944,10 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
             Next::Gone => return false,
             Next::Update(p) if p == sent => continue,
             Next::Update(p) => {
-                if send_update(r, id, p).await {
+                if send_update(r, id, &p).await {
                     log::info!(
-                        "ref={r}: QoS monitoring SRR {id} now Periodic every {p} s \
-                         (subscription {sub_id} replaced)"
+                        "ref={r}: QoS monitoring SRR {id} now {} ({sub_id} replaced)",
+                        describe(&p)
                     );
                     sent = p;
                 }
@@ -853,7 +957,7 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
                     m.get_mut(r)
                         .and_then(|s| {
                             let i = s.position(sub_id, id)?;
-                            s.srrs[i].period = sent;
+                            s.srrs[i].sent = sent.clone();
                             s.srrs[i].state = SrrState::Installed;
                             Some(())
                         })
@@ -880,6 +984,8 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
                 if known {
                     want_ran(r, false);
                 }
+                // #2208: the last GTPUPM SRR gone, IE 271 goes too.
+                sync_transport_delay(r).await;
                 return false;
             }
         }
@@ -887,14 +993,13 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
     unreachable!("the last pass always settles")
 }
 
-/// Update SRR `id` on `r` to `period` (TS 29.244 Table 7.5.4.20-1).
-async fn send_update(r: &str, id: u8, period: u32) -> bool {
-    let (Some(b), Some(upf_seid)) = (crate::lookup_policy_binding(r), crate::lookup_upf_seid(r))
-    else {
+/// Update SRR `id` on `r` to `controls` (TS 29.244 Table 7.5.4.20-1).
+async fn send_update(r: &str, id: u8, controls: &Controls) -> bool {
+    let Some(upf_seid) = crate::lookup_upf_seid(r) else {
         return false;
     };
     let params = crate::n4_build::SessionModificationParams {
-        update_srrs: vec![(id, vec![control_for(b.qfi, period)])],
+        update_srrs: vec![(id, controls.clone())],
         ..Default::default()
     };
     match crate::pfcp_modify_with(crate::smf_n4_seid_for(r), upf_seid, &params).await {
@@ -920,6 +1025,174 @@ async fn send_remove(r: &str, id: u8, sub_id: &str) {
         Err(e) => {
             log::warn!("ref={r}: Remove SRR {id} (QOS_MON subscription {sub_id}) failed: {e}")
         }
+    }
+}
+
+/// The PSA's preceding UL GTP-U peer for session SEID `smf_seid`: the GTP-U peer
+/// its access-side FAR (FAR 2) forwards to, the NG-RAN or, behind an I-UPF, the
+/// I-UPF's N9 address (TS 29.244 §5.24.5.3). `None` while the FAR forwards
+/// nowhere (no user plane).
+fn preceding_peer(smf_seid: u64) -> Option<std::net::IpAddr> {
+    let handle = crate::context::smf_self();
+    let ctx = handle.read().ok()?;
+    let peers = ctx.far_peers.read().ok()?;
+    peers
+        .get(&smf_seid)?
+        .get(&crate::DL_FAR_ID)
+        .filter(|p| p.access && p.forwarding)
+        .map(|p| p.ip)
+}
+
+/// The Transport Delay Reporting (IE 271) the PSA's UL PDR should hold now
+/// (#2208): its preceding UL GTP-U peer while a GTPUPM SRR is installed or
+/// being installed, else none.
+fn transport_delay_wanted(
+    s: &SessionMon,
+    peer: Option<std::net::IpAddr>,
+) -> Option<std::net::IpAddr> {
+    (s.gtpupm && s.live()).then_some(peer).flatten()
+}
+
+/// Bring the Transport Delay Reporting (IE 271, TS 29.244 Table 7.5.2.2-6) of
+/// the PSA's UL PDR in line with the session (#2208, §5.24.5.3): "the SMF shall
+/// include Transport Delay Reporting IE in the UL Create PDR" of the PSA, naming
+/// its preceding UL GTP-U peer, while the flow is measured by GTP-U path
+/// monitoring; a new peer (a handover, an I-UPF) is sent as an Update PDR, and
+/// the IE is deactivated (an empty IE 271, Table 7.5.4.2-1) when the last GTPUPM
+/// SRR goes. One task per session sends, looking again after each request, so the
+/// last Update PDR the PSA gets names the current peer.
+pub async fn sync_transport_delay(r: &str) {
+    let claimed = with(|m| {
+        let Some(s) = m.get_mut(r) else {
+            return false;
+        };
+        if s.tdr_busy {
+            s.tdr_dirty = true;
+            return false;
+        }
+        s.tdr_busy = true;
+        true
+    });
+    if !claimed {
+        return;
+    }
+    loop {
+        let psa_seid = crate::lookup_upf_seid(r).map(|_| crate::smf_n4_seid_for(r));
+        let peer = psa_seid.and_then(preceding_peer);
+        // #2208: an I-UPF on N9 measures the N3 delay toward the NG-RAN with its own
+        // IE 271 (TS 29.244 §5.24.5.3: "the SMF shall include ... in the UL Create
+        // PDR ... of the PSA and of each I-UPF"); the PSA's preceding peer is then
+        // the I-UPF, the peer its FAR 2 forwards to.
+        let leg = psa_seid.and_then(crate::iupf::leg_of);
+        let iupf_peer = leg.and_then(|l| preceding_peer(l.smf_seid));
+        let step = with(|m| {
+            let s = m.get_mut(r)?;
+            s.tdr_dirty = false;
+            let want = transport_delay_wanted(s, peer);
+            let want_iupf = if leg.is_some() {
+                transport_delay_wanted(s, iupf_peer)
+            } else {
+                None
+            };
+            let psa = (want != s.tdr_peer).then_some(want);
+            let iupf = (want_iupf != s.tdr_iupf_peer).then_some(want_iupf);
+            if psa.is_none() && iupf.is_none() {
+                s.tdr_busy = false;
+                tidy(m, r);
+                return None;
+            }
+            Some((psa, iupf))
+        });
+        let Some((psa, iupf)) = step else {
+            return;
+        };
+        let mut sent_psa = None;
+        let mut sent_iupf = None;
+        if let (Some(want), Some(upf_seid)) = (psa, crate::lookup_upf_seid(r)) {
+            if send_transport_delay(r, crate::smf_n4_seid_for(r), upf_seid, want, "PSA").await {
+                sent_psa = Some(want);
+            }
+        }
+        if let (Some(want), Some(l)) = (iupf, leg) {
+            if send_transport_delay(r, l.smf_seid, l.upf_seid, want, "I-UPF").await {
+                sent_iupf = Some(want);
+            }
+        }
+        let ok = sent_psa.is_some() || sent_iupf.is_some();
+        let again = with(|m| {
+            let Some(s) = m.get_mut(r) else {
+                return false;
+            };
+            if let Some(w) = sent_psa {
+                s.tdr_peer = w;
+            }
+            if let Some(w) = sent_iupf {
+                s.tdr_iupf_peer = w;
+            }
+            // A failed request is retried only when something changes again.
+            if ok || std::mem::take(&mut s.tdr_dirty) {
+                return true;
+            }
+            s.tdr_busy = false;
+            tidy(m, r);
+            false
+        });
+        if !again {
+            return;
+        }
+    }
+}
+
+/// Send the UL PDR's Transport Delay Reporting `want` (or its deactivation) to
+/// the UPF of N4 session (`smf_seid`, `upf_seid`), the `role` of session `r`.
+async fn send_transport_delay(
+    r: &str,
+    smf_seid: u64,
+    upf_seid: u64,
+    want: Option<std::net::IpAddr>,
+    role: &str,
+) -> bool {
+    let ie = want.map(
+        |ip| nextgcore_pfcp::qos_monitoring::TransportDelayReporting {
+            preceding_ul_gtpu_peer: crate::n4_build::remote_gtpu_peer(ip),
+            ..Default::default()
+        },
+    );
+    let params = crate::n4_build::SessionModificationParams {
+        update_pdr_transport_delay: vec![(crate::UL_PDR_ID, ie)],
+        ..Default::default()
+    };
+    match crate::pfcp_modify_with(smf_seid, upf_seid, &params).await {
+        Ok(_) => {
+            log::info!(
+                "ref={r}: {role} UL PDR Transport Delay Reporting {} (TS 29.244 §5.24.5.3)",
+                match want {
+                    Some(ip) => format!("with preceding UL GTP-U peer {ip}"),
+                    None => "deactivated".into(),
+                }
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("ref={r}: {role} Update PDR with Transport Delay Reporting failed: {e}");
+            false
+        }
+    }
+}
+
+/// A Session Establishment or Modification of SEID `smf_seid` was accepted
+/// (#2208): if it moved the access-side FAR of a session whose PSA measures by
+/// GTP-U path, its IE 271 follows the new peer.
+pub fn on_session_request(smf_seid: u64) {
+    // #2208: an I-UPF leg's request moves the I-UPF's NG-RAN peer.
+    let smf_seid = crate::iupf::psa_seid_of(smf_seid);
+    let r = with(|m| {
+        m.iter()
+            .find(|(_, s)| s.gtpupm && s.smf_seid == Some(smf_seid))
+            .map(|(r, _)| r.clone())
+    });
+    if let Some(r) = r {
+        tokio::spawn(async move { sync_transport_delay(&r).await });
     }
 }
 
@@ -1015,6 +1288,15 @@ pub async fn on_session_report(smf_seid: u64, payload: &[u8]) {
             result.rt_delay,
             if result.failure { " (measurement failure)" } else { "" }
         );
+        // #2208: an SRR of a PCF QoS monitoring decision reports to the decision's
+        // target, not to a subscription.
+        if let Some(qm_id) = subscription_of(&r, srr_id)
+            .as_deref()
+            .and_then(|k| k.strip_prefix(crate::pcc_qos_mon::REQUESTER_PREFIX))
+        {
+            crate::pcc_qos_mon::deliver(&r, qm_id, &result).await;
+            continue;
+        }
         // #1390 review M2: the subscription as it is now must still cover the
         // session (a PUT may have narrowed it while the SRR was being removed).
         let Some(sub) = subscription_of(&r, srr_id)

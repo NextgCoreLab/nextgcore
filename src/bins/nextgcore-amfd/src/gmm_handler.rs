@@ -543,6 +543,8 @@ pub mod payload_container_type {
     pub const SOR_TRANSPARENT_CONTAINER: u8 = 0x04;
     pub const UE_POLICY_CONTAINER: u8 = 0x05;
     pub const UE_PARAMETERS_UPDATE: u8 = 0x06;
+    /// "SLPP message container" (TS 24.501 k00 §9.11.3.40, #557).
+    pub const SLPP: u8 = 0x0c;
     pub const MULTIPLE_PAYLOADS: u8 = 0x0f;
 }
 
@@ -577,6 +579,10 @@ pub enum UlTransportAction {
     /// the serving LMF over Nlmf. Until an LMF association exists (lmfd-07) the
     /// caller falls back to the #90 abnormal action, so the wire is unchanged.
     ForwardLppToLmf { lpp: Vec<u8> },
+    /// SLPP message container (TS 24.501 k00 §5.4.5.2.5 c1, #557): send the
+    /// container type and content to the LMF. On the SBI that is an
+    /// N1MessageNotify with `n1MessageClass` "SLPP".
+    ForwardSlppToLmf { slpp: Vec<u8> },
     /// UE policy container (TS 24.501 Annex D, e.g. MANAGE UE POLICY COMPLETE /
     /// COMMAND REJECT): forward the uplink UE-policy message to the PCF over
     /// Namf `N1MessageNotify` (Wave-6 E6, TS 29.525 §4.2.2.2 delivery-result
@@ -647,6 +653,16 @@ pub fn handle_ul_nas_transport(
             );
             Ok(UlTransportAction::ForwardLppToLmf {
                 lpp: transport.payload_container.clone(),
+            })
+        }
+        payload_container_type::SLPP => {
+            log::info!(
+                "[{}] UL NAS Transport - SLPP container ({} bytes) for the LMF",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                transport.payload_container.len()
+            );
+            Ok(UlTransportAction::ForwardSlppToLmf {
+                slpp: transport.payload_container.clone(),
             })
         }
         payload_container_type::UE_POLICY_CONTAINER => {
@@ -1053,6 +1069,23 @@ mod tests {
 
         let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
         assert_eq!(result, Ok(UlTransportAction::ForwardLppToLmf { lpp }));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_slpp_forwards_to_lmf() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+        // TS 24.501 k00 §9.11.3.40: 1100 is "SLPP message container".
+        assert_eq!(payload_container_type::SLPP, 12);
+        let slpp = vec![0xC4u8, 0x07, 0x4B, 0x4B, 0x4A];
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::SLPP,
+            payload_container: slpp.clone(),
+            pdu_session_id: None,
+            ..Default::default()
+        };
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(result, Ok(UlTransportAction::ForwardSlppToLmf { slpp }));
     }
 
     #[test]

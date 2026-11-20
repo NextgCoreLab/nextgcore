@@ -82,6 +82,12 @@ pub struct NfInstance {
     /// that bound a context to a set reads it to tell whether another instance may
     /// stand in for the one it bound to (#1518).
     pub nf_set_ids: Vec<String>,
+    /// The profile's `defaultNotificationSubscriptions` (TS 29.510 §6.1.6.2.2,
+    /// `DefaultNotificationSubscription` §6.1.6.2.4) as the NRF returned them:
+    /// where this NF takes a notification it never subscribed to, e.g. an LMF's
+    /// uplink LPP or NRPPa (TS 29.518 §5.2.2.3.5.3, §5.2.2.3.6.3). Empty when
+    /// the profile names none.
+    pub default_notification_subscriptions: Vec<serde_json::Value>,
 }
 
 impl NfInstance {
@@ -102,6 +108,7 @@ impl NfInstance {
             capacity: 100,
             lmf_info: None,
             nf_set_ids: Vec::new(),
+            default_notification_subscriptions: Vec::new(),
         }
     }
 

@@ -1887,7 +1887,7 @@ fn parse_event_area(v: &Value, presence_info_key: Option<&str>) -> Option<EventA
         }
         // `ecgiList` / `globalRanNodeIdList` / `globaleNbIdList` are deliberately NOT
         // parsed. E-UTRAN cell ids and eNodeB ids describe an EPS access this AMF's N2
-        // never carries (`UserLocationInformation` in `nextgcore-ngap` has exactly one
+        // never carries (`ngap_types::UserLocationInformation` has exactly one
         // variant, `Nr`), and the AMF stores no NG-RAN node identity per UE:
         // `AmfContext::gnb_list` has ZERO production writers, since `gnb_add`'s only
         // callers are inside `mod tests`. An area of those kinds therefore has no
@@ -4059,7 +4059,7 @@ pub fn fire_loss_of_connectivity(ue: &AmfUe, reason: &str) {
 /// `ranReleaseCode` as an `NgApCause` holding *"the decimal value of the NG AP cause
 /// code values as specified in TS 38.413"* — group and value, both `required`
 /// (`TS29571_CommonData.yaml:2562-2564`). The NGAP Cause is already decoded into
-/// `UeContextReleaseRequest.cause` by `nextgcore_ngap::parser` and was simply
+/// `UeContextReleaseRequest.cause` by the NGAP decoder (`decode_ue_context_release_request_asn1`) and was simply
 /// discarded; it is the real release code, not a placeholder.
 ///
 /// `nasReleaseCode` is NOT set: its pattern is `^(MM|SM)-[0-9]{1,3}$`
@@ -5764,18 +5764,26 @@ pub fn send_n1_message_notify(
 /// (`process_positioning_downlinks`) resolves the serving association and
 /// delivers. The opaque NRPPa/LPP payloads are carried verbatim — the AMF is a
 /// transparent relay. The `Nlmf` uplink callback (UE/gNB→LMF) is `lmfd-07`.
+/// `n1MessageClass` for SLPP (#557). TS 29.518 defines no SLPP value
+/// (TS29518_Namf_Communication.yaml:4511-4523), and the enum is
+/// `anyOf [enum, string]`. TS 24.501 k00 §5.4.5.2.5 c1 has the AMF tell the LMF
+/// the payload container type, and this class is how it does so. lmfd spells
+/// it the same way.
+pub const N1_MESSAGE_CLASS_SLPP: &str = "SLPP";
+
 fn try_positioning_relay(
     ue_context_id: &str,
     ue: &AmfUe,
     request: &SbiRequest,
     body: &Value,
 ) -> Option<SbiResponse> {
-    let is_lpp = body
+    let class = body
         .pointer("/n1MessageContainer/n1MessageClass")
-        .and_then(Value::as_str)
-        == Some("LPP");
+        .and_then(Value::as_str);
+    let is_lpp = class == Some("LPP");
+    let is_slpp = class == Some(N1_MESSAGE_CLASS_SLPP);
     let nrppa_info = body.pointer("/n2InfoContainer/nrppaInfo");
-    if !is_lpp && nrppa_info.is_none() {
+    if !is_lpp && !is_slpp && nrppa_info.is_none() {
         return None; // not a positioning transfer — fall through to SM handling
     }
 
@@ -5819,16 +5827,26 @@ fn try_positioning_relay(
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
         .map(String::from);
-    if let (true, Some(corr)) = (is_lpp, lcs_correlation_id.as_deref()) {
-        let lmf_id = nextgcore_sbi::owner_binding::verified_consumer_id(request)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                body.pointer("/n1MessageContainer/nfId")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                    .map(String::from)
-            });
+    // The same holds for an NRPPa transfer: the gNB's answer echoes the NGAP
+    // Routing ID, which names this LMF, and its notification carries the
+    // correlation this LMF last used for the UE.
+    let verified_lmf = nextgcore_sbi::owner_binding::verified_consumer_id(request)
+        .ok()
+        .flatten();
+    let declared_nf_id = |pointer: &str| {
+        body.pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from)
+    };
+    if let Some(corr) = lcs_correlation_id.as_deref() {
+        let lmf_id = verified_lmf.clone().or_else(|| {
+            if is_lpp || is_slpp {
+                declared_nf_id("/n1MessageContainer/nfId")
+            } else {
+                declared_nf_id("/n2InfoContainer/nrppaInfo/nfId")
+            }
+        });
         let route = crate::context::LcsUplinkRoute {
             lcs_correlation_id: corr.to_string(),
             lmf_id: lmf_id.clone(),
@@ -5839,7 +5857,7 @@ fn try_positioning_relay(
             .unwrap_or(false);
         if !recorded {
             log::warn!(
-                "[{ue_context_id}] LPP transfer from LMF {lmf_id:?} reuses LCS correlation \
+                "[{ue_context_id}] positioning transfer from LMF {lmf_id:?} reuses LCS correlation \
                  {corr:?}, which belongs to another LMF: the UE's answers to it still go to \
                  that LMF"
             );
@@ -5869,6 +5887,30 @@ fn try_positioning_relay(
         });
     }
 
+    // SLPP → UE (N1, DL NAS Transport, payload container type 12, #557).
+    if is_slpp {
+        let Some(slpp_pdu) = body
+            .pointer("/n1MessageContainer/n1MessageContent/contentId")
+            .and_then(Value::as_str)
+            .and_then(|cid| find_binary_part(request, cid))
+        else {
+            return Some(mandatory_ie_incorrect(
+                "n1MessageContainer.n1MessageContent.contentId",
+                "no binary part for the SLPP payload",
+            ));
+        };
+        downlinks.push(PendingPositioningDl {
+            amf_ue_ngap_id: ue.id,
+            kind: PositioningDlKind::SlppToUe {
+                slpp_pdu,
+                lcs_correlation_id: body
+                    .get("lcsCorrelationId")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            },
+        });
+    }
+
     // NRPPa → serving gNB (N2, UE-associated NRPPa transport, NGAP procedure 8).
     if let Some(nrppa) = nrppa_info {
         let ie_ok = nrppa
@@ -5894,10 +5936,23 @@ fn try_positioning_relay(
         };
         // The originating LMF id seeds the NGAP RoutingID so the gNB's uplink
         // reply routes back to the right LMF (opaque echo for our relay).
-        let routing_id = nrppa
-            .get("nfId")
-            .and_then(Value::as_str)
-            .map(|s| s.as_bytes().to_vec())
+        // #2256: the Routing ID "identifies an LMF" (TS 38.413 §9.3.3.13), and
+        // the uplink relay routes the gNB's answer by it, so it names the
+        // caller's verified identity when there is one, not an nfId it could
+        // set to another LMF's.
+        let declared = declared_nf_id("/n2InfoContainer/nrppaInfo/nfId");
+        if let (Some(v), Some(d)) = (verified_lmf.as_deref(), declared.as_deref()) {
+            if !nextgcore_sbi::owner_binding::same_nf_instance_id(v, d) {
+                log::warn!(
+                    "[{ue_context_id}] NRPPa transfer from LMF {v} declares nrppaInfo.nfId \
+                     {d}: the Routing ID names {v}"
+                );
+            }
+        }
+        let routing_id = verified_lmf
+            .clone()
+            .or(declared)
+            .map(String::into_bytes)
             .unwrap_or_default();
         downlinks.push(PendingPositioningDl {
             amf_ue_ngap_id: ue.id,
@@ -5984,6 +6039,8 @@ fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> 
                 nrppa_pdu,
             } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
             PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+            PositioningDlKind::SlppToUe { slpp_pdu, .. } => (3u8, slpp_pdu).hash(&mut h),
+            PositioningDlKind::PayloadNotForwarded { payload, .. } => (4u8, payload).hash(&mut h),
         }
     }
     format!("lcs-{:016x}", h.finish())
@@ -10423,6 +10480,46 @@ mod tests {
             over.map(|r| r.status)
         );
         server.stop().await.expect("stop");
+    }
+
+    /// #557: an LMF's SLPP transfer becomes a type 12 DL NAS Transport, and the
+    /// downlink carries the LMF's LCS correlation id for the Additional
+    /// information IE (TS 24.501 k00 §5.4.5.3.2 c1). It is never queued as LPP.
+    #[tokio::test]
+    async fn test_n1n2_slpp_to_connected_ue_relays_as_slpp() {
+        let _q = updp_queue_test_lock().lock().await;
+        let supi = "imsi-001010000060557";
+        let ue = setup_ue(supi, true, true);
+        let slpp = [0x44u8, 0x02, 0x00, 0x40, 0x04, 0x00];
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "SLPP",
+                "n1MessageContent": { "contentId": "slpp-req" }
+            },
+            "lcsCorrelationId": "slpp-1-imsi"
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "slpp-req",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::copy_from_slice(&slpp),
+            ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        let drained = drain_downlinks_for(ue.id);
+        assert_eq!(drained.len(), 1, "this transfer's one downlink");
+        match &drained[0].kind {
+            PositioningDlKind::SlppToUe {
+                slpp_pdu,
+                lcs_correlation_id,
+            } => {
+                assert_eq!(slpp_pdu.as_slice(), slpp);
+                assert_eq!(lcs_correlation_id.as_deref(), Some("slpp-1-imsi"));
+            }
+            other => panic!("SLPP queued as {other:?}"),
+        }
     }
 
     /// LCS: an LMF push of LPP (n1MessageClass "LPP", no PDU session) to a

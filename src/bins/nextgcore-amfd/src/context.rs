@@ -765,6 +765,13 @@ pub enum PositioningDlKind {
         lpp_pdu: Vec<u8>,
         lcs_correlation_id: Option<String>,
     },
+    /// SLPP message -> UE (N1, DL NAS Transport with payload container type
+    /// "SLPP message container" 12 and the LMF's LCS correlation id in
+    /// Additional information, TS 24.501 k00 §5.4.5.3.2 c1, #557).
+    SlppToUe {
+        slpp_pdu: Vec<u8>,
+        lcs_correlation_id: Option<String>,
+    },
     /// UPDP message (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) → UE
     /// (N1, DL NAS Transport with payload container type "UE policy
     /// container" 0x05, TS 24.501 §9.11.3.40). Wave-6 E5: the PCF pushes it
@@ -772,6 +779,14 @@ pub enum PositioningDlKind {
     /// (TS 29.518, TS29518_Namf_Communication.yaml:4453); the payload is
     /// opaque to the AMF and relayed verbatim.
     UePolicyToUe { updp_pdu: Vec<u8> },
+    /// #2256: an uplink payload the AMF could not forward, echoed back to the UE
+    /// in a DL NAS Transport with 5GMM cause #90 "payload was not forwarded"
+    /// (TS 24.501 §5.4.5.2.5). Queued once the LMF's NRF default notification
+    /// subscription turned out not to exist, after the uplink was handled.
+    PayloadNotForwarded {
+        payload_container_type: u8,
+        payload: Vec<u8>,
+    },
 }
 
 /// The NGAP procedure an N1N2MessageTransfer's N2 SM information asks for
@@ -3795,6 +3810,44 @@ impl AmfContext {
         })
     }
 
+    /// The subscription an uplink positioning N1 message of `class` goes to
+    /// (#557).
+    ///
+    /// An exact-class subscription wins. SLPP without one goes to the UE's
+    /// "LPP" subscriber, which is the serving LMF: TS 24.501 k00 §5.4.5.2.5 c1
+    /// sends SLPP to "the LMF", and TS 29.518 defines no SLPP class an LMF could
+    /// subscribe to. LPP itself never falls back to anything.
+    pub fn n1n2_subscription_find_positioning(
+        &self,
+        ue_context_id: &str,
+        class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscription_find_n1(ue_context_id, class)
+            .or_else(|| {
+                (class == crate::namf_server::N1_MESSAGE_CLASS_SLPP)
+                    .then(|| self.n1n2_subscription_find_n1(ue_context_id, "LPP"))
+                    .flatten()
+            })
+    }
+
+    /// #2256 + #557: [`Self::n1n2_subscription_find_positioning`] routed by the
+    /// LMF the uplink's routing information names
+    /// ([`Self::n1n2_subscription_find_n1_routed`]): that LMF's subscription of
+    /// `class`, else (for SLPP) its LPP one; never one another LMF owns.
+    pub fn n1n2_subscription_find_positioning_routed(
+        &self,
+        ue_context_id: &str,
+        class: &str,
+        lmf_id: Option<&str>,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscription_find_n1_routed(ue_context_id, class, lmf_id)
+            .or_else(|| {
+                (class == crate::namf_server::N1_MESSAGE_CLASS_SLPP)
+                    .then(|| self.n1n2_subscription_find_n1_routed(ue_context_id, "LPP", lmf_id))
+                    .flatten()
+            })
+    }
+
     /// Find the subscription registered for an N2 information class on a UE
     /// (exact-class match, fail-closed). When several match, the most recent
     /// wins.
@@ -4099,19 +4152,22 @@ impl AmfContext {
     /// for the UE's uplink. A correlation already bound to another LMF keeps
     /// that binding and `false` is returned: the LMF that first used it owns the
     /// UE's answers to it, and another cannot redirect them by reusing the id.
-    /// A re-record by the same LMF (or one naming none) is a no-op that keeps the
-    /// first identity it learnt. Past [`MAX_LCS_UPLINK_ROUTES_PER_UE`] the oldest
-    /// correlation is dropped.
+    /// A re-record by the same LMF (or one naming none) keeps the first identity
+    /// it learnt and makes the correlation the newest, the one
+    /// [`Self::lcs_uplink_route_latest_for_lmf`] returns. Past
+    /// [`MAX_LCS_UPLINK_ROUTES_PER_UE`] the least recently used correlation is
+    /// dropped.
     pub fn lcs_uplink_route_record(&self, ue_context_id: &str, route: LcsUplinkRoute) -> bool {
         let Ok(mut routes) = self.lcs_uplink_routes.write() else {
             return false;
         };
         let list = routes.entry(ue_context_id.to_string()).or_default();
-        if let Some(known) = list
-            .iter_mut()
-            .find(|r| r.lcs_correlation_id == route.lcs_correlation_id)
+        if let Some(i) = list
+            .iter()
+            .position(|r| r.lcs_correlation_id == route.lcs_correlation_id)
         {
-            return match (known.lmf_id.as_deref(), route.lmf_id.as_deref()) {
+            let mut known = list.remove(i);
+            let accepted = match (known.lmf_id.as_deref(), route.lmf_id.as_deref()) {
                 (Some(a), Some(b)) => nextgcore_sbi::owner_binding::same_nf_instance_id(a, b),
                 (None, Some(_)) => {
                     known.lmf_id = route.lmf_id;
@@ -4119,6 +4175,12 @@ impl AmfContext {
                 }
                 (_, None) => true,
             };
+            if accepted {
+                list.push(known);
+            } else {
+                list.insert(i, known);
+            }
+            return accepted;
         }
         if list.len() >= MAX_LCS_UPLINK_ROUTES_PER_UE {
             list.remove(0);
@@ -4140,6 +4202,15 @@ impl AmfContext {
                 .find(|r| r.lcs_correlation_id == lcs_correlation_id)
                 .cloned()
         })
+    }
+
+    /// #2256: the route most recently recorded for a UE: the LMF of its latest
+    /// positioning transfer, for an uplink that names none.
+    pub fn lcs_uplink_route_latest(&self, ue_context_id: &str) -> Option<LcsUplinkRoute> {
+        self.lcs_uplink_routes
+            .read()
+            .ok()
+            .and_then(|routes| routes.get(ue_context_id)?.last().cloned())
     }
 
     /// #2256: drop every uplink route of a UE (UE-context release path).
@@ -4170,15 +4241,47 @@ impl AmfContext {
         let Some(lmf_id) = lmf_id else {
             return self.n1n2_subscription_find_n1(ue_context_id, n1_message_class);
         };
+        self.n1n2_subscription_find_routed(ue_context_id, lmf_id, |s| {
+            s.n1_message_class.as_deref() == Some(n1_message_class)
+                && s.n1_notify_callback_uri.is_some()
+        })
+    }
+
+    /// #2256, TS 38.413 §9.3.3.13 / TS 29.518 §6.1.6.2.18: the subscription an
+    /// uplink UE-associated NRPPa transport goes to when its Routing ID names the
+    /// LMF `lmf_id`. The same rule as
+    /// [`Self::n1n2_subscription_find_n1_routed`]: that LMF's own subscription,
+    /// else one with no owner, never one another LMF owns; with no LMF named,
+    /// the most recent subscription of the class.
+    pub fn n1n2_subscription_find_n2_routed(
+        &self,
+        ue_context_id: &str,
+        n2_information_class: &str,
+        lmf_id: Option<&str>,
+    ) -> Option<UeN1N2InfoSubscription> {
+        let Some(lmf_id) = lmf_id else {
+            return self.n1n2_subscription_find_n2(ue_context_id, n2_information_class);
+        };
+        self.n1n2_subscription_find_routed(ue_context_id, lmf_id, |s| {
+            s.n2_information_class.as_deref() == Some(n2_information_class)
+                && s.n2_notify_callback_uri.is_some()
+        })
+    }
+
+    /// The most recent subscription matching `class` that `lmf_id` owns, else
+    /// the most recent matching one with no owner.
+    fn n1n2_subscription_find_routed(
+        &self,
+        ue_context_id: &str,
+        lmf_id: &str,
+        class: impl Fn(&UeN1N2InfoSubscription) -> bool,
+    ) -> Option<UeN1N2InfoSubscription> {
         self.n1n2_subscriptions.read().ok().and_then(|subs| {
             let candidates: Vec<&UeN1N2InfoSubscription> = subs
                 .get(ue_context_id)?
                 .iter()
                 .rev()
-                .filter(|s| {
-                    s.n1_message_class.as_deref() == Some(n1_message_class)
-                        && s.n1_notify_callback_uri.is_some()
-                })
+                .filter(|s| class(s))
                 .collect();
             candidates
                 .iter()
@@ -4189,6 +4292,27 @@ impl AmfContext {
                 })
                 .or_else(|| candidates.iter().find(|s| s.owner.is_none()))
                 .map(|s| (*s).clone())
+        })
+    }
+
+    /// #2256: the LCS correlation `lmf_id` most recently recorded for a UE, for
+    /// an uplink that names its LMF but not its correlation (NRPPa).
+    pub fn lcs_uplink_route_latest_for_lmf(
+        &self,
+        ue_context_id: &str,
+        lmf_id: &str,
+    ) -> Option<String> {
+        self.lcs_uplink_routes.read().ok().and_then(|routes| {
+            routes
+                .get(ue_context_id)?
+                .iter()
+                .rev()
+                .find(|r| {
+                    r.lmf_id.as_deref().is_some_and(|l| {
+                        nextgcore_sbi::owner_binding::same_nf_instance_id(l, lmf_id)
+                    })
+                })
+                .map(|r| r.lcs_correlation_id.clone())
         })
     }
 
@@ -8042,6 +8166,51 @@ mod tests {
         assert!(ctx.positioning_dl_drain().is_empty());
     }
 
+    /// #557: SLPP goes to the UE's serving LMF. That is an "SLPP" subscriber
+    /// when one exists, else the "LPP" one. No other class falls back, and with
+    /// no positioning subscriber at all nothing is found.
+    #[test]
+    fn test_slpp_uplink_goes_to_the_serving_lmf() {
+        let ctx = AmfContext::new();
+        let supi = "imsi-001010000070557";
+        let sub = |id: &str, class: &str, uri: &str| UeN1N2InfoSubscription {
+            owner: None,
+            subscription_id: id.to_string(),
+            n1_message_class: Some(class.to_string()),
+            n1_notify_callback_uri: Some(uri.to_string()),
+            n2_information_class: None,
+            n2_notify_callback_uri: None,
+            lcs_correlation_id: None,
+        };
+        assert!(ctx
+            .n1n2_subscription_find_positioning(supi, "SLPP")
+            .is_none());
+        assert!(ctx.n1n2_subscription_add(supi, sub("lpp", "LPP", "http://lmf/lpp")));
+        let found = ctx
+            .n1n2_subscription_find_positioning(supi, "SLPP")
+            .expect("the LPP subscriber is the serving LMF");
+        assert_eq!(found.subscription_id, "lpp");
+        assert!(
+            ctx.n1n2_subscription_find_positioning(supi, "UPDP")
+                .is_none(),
+            "only SLPP falls back"
+        );
+        assert!(ctx.n1n2_subscription_add(supi, sub("slpp", "SLPP", "http://lmf/slpp")));
+        assert_eq!(
+            ctx.n1n2_subscription_find_positioning(supi, "SLPP")
+                .expect("exact")
+                .subscription_id,
+            "slpp",
+            "an exact SLPP subscriber wins"
+        );
+        assert_eq!(
+            ctx.n1n2_subscription_find_positioning(supi, "LPP")
+                .expect("exact")
+                .subscription_id,
+            "lpp"
+        );
+    }
+
     /// Two N1N2 subscriptions on one UE coexist; lookup by (ueContextId,
     /// class) returns the right callback URI; unknown classes are never
     /// returned (fail-closed).
@@ -8171,7 +8340,7 @@ mod tests {
 
     /// #2256: each LCS correlation keeps the LMF that first used it, a second
     /// LMF cannot take it over, and a UE holds at most
-    /// MAX_LCS_UPLINK_ROUTES_PER_UE of them, oldest dropped first.
+    /// MAX_LCS_UPLINK_ROUTES_PER_UE of them, least recently used dropped first.
     #[test]
     fn lcs_uplink_routes_keep_their_first_lmf_and_are_bounded() {
         let ctx = AmfContext::new();
@@ -8199,6 +8368,26 @@ mod tests {
         assert!(ctx.lcs_uplink_route_find(supi, "c-x").is_none());
         assert!(ctx.lcs_uplink_route_find("imsi-other", "c-a").is_none());
 
+        // The newest correlation of an LMF is the last it (re)used.
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-a2", Some("lmf-a"))));
+        assert_eq!(
+            ctx.lcs_uplink_route_latest_for_lmf(supi, "LMF-A")
+                .as_deref(),
+            Some("c-a2")
+        );
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-a", Some("lmf-a"))));
+        assert_eq!(
+            ctx.lcs_uplink_route_latest_for_lmf(supi, "lmf-a")
+                .as_deref(),
+            Some("c-a")
+        );
+        assert_eq!(
+            ctx.lcs_uplink_route_latest_for_lmf(supi, "lmf-b")
+                .as_deref(),
+            Some("c-b")
+        );
+        assert!(ctx.lcs_uplink_route_latest_for_lmf(supi, "lmf-z").is_none());
+
         // An identity learnt later fills one that was unknown.
         assert!(ctx.lcs_uplink_route_record(supi, route("c-n", None)));
         assert!(ctx.lcs_uplink_route_record(supi, route("c-n", Some("lmf-n"))));
@@ -8212,7 +8401,7 @@ mod tests {
         }
         assert!(
             ctx.lcs_uplink_route_find(supi, "c-a").is_none(),
-            "the oldest is dropped past the bound"
+            "the least recently used is dropped past the bound"
         );
         assert!(ctx.lcs_uplink_route_find(supi, "c-0").is_some());
         assert!(ctx
@@ -8256,6 +8445,25 @@ mod tests {
         assert!(ctx
             .n1n2_subscription_find_n1_routed(supi, "SMS", Some("lmf-a"))
             .is_none());
+
+        // The NRPPa (N2) lookup by Routing ID follows the same rule.
+        let n2 = |id: &str, owner: Option<&str>| UeN1N2InfoSubscription {
+            n1_message_class: None,
+            n1_notify_callback_uri: None,
+            n2_information_class: Some("NRPPa".to_string()),
+            n2_notify_callback_uri: Some(format!("http://{id}/n2")),
+            ..sub(id, owner)
+        };
+        let found_n2 = |lmf: Option<&str>| {
+            ctx.n1n2_subscription_find_n2_routed(supi, "NRPPa", lmf)
+                .map(|s| s.subscription_id)
+        };
+        assert!(ctx.n1n2_subscription_add(supi, n2("na", Some("lmf-a"))));
+        assert!(ctx.n1n2_subscription_add(supi, n2("nb", Some("lmf-b"))));
+        assert_eq!(found_n2(Some("lmf-a")).as_deref(), Some("na"));
+        assert_eq!(found_n2(Some("lmf-b")).as_deref(), Some("nb"));
+        assert_eq!(found_n2(None).as_deref(), Some("nb"), "the fallback");
+        assert_eq!(found_n2(Some("lmf-c")), None);
     }
 
     #[test]

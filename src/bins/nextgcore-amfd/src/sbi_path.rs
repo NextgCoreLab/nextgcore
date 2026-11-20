@@ -773,6 +773,13 @@ async fn amf_nrf_discover_qualified_at(
                 instance.capacity = c;
             }
             instance.lmf_info = nf_json.get("lmfInfo").cloned();
+            // #2256: where an LMF takes uplink positioning messages it has no
+            // subscription for (TS 29.518 §5.2.2.3.5.3, §5.2.2.3.6.3).
+            instance.default_notification_subscriptions = nf_json
+                .get("defaultNotificationSubscriptions")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
 
             if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
                 for svc_json in services {
@@ -3416,6 +3423,79 @@ pub async fn resolve_lmf_by_identification(lmf_identification: &str) -> Option<(
         .get_nf_instance(lmf_identification)
         .await
         .and_then(|i| i.endpoint_for(service))
+}
+
+/// What an uplink positioning message is, for the LMF default notification
+/// subscription it may go to (TS 29.510 §6.1.6.2.4 `DefaultNotificationSubscription`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LmfDefaultNotification {
+    /// `N1_MESSAGES`, `n1MessageClass` "LPP" (TS 29.518 §5.2.2.3.5.3 step 1).
+    N1Lpp,
+    /// `N2_INFORMATION`, `n2InformationClass` "NRPPa" (TS 29.518 §5.2.2.3.6.3
+    /// step 1).
+    N2Nrppa,
+}
+
+impl LmfDefaultNotification {
+    /// Whether `subscription`, one entry of a profile's
+    /// `defaultNotificationSubscriptions`, is for this kind of message.
+    fn matches(self, subscription: &serde_json::Value) -> bool {
+        let (kind, field, class) = match self {
+            Self::N1Lpp => ("N1_MESSAGES", "n1MessageClass", "LPP"),
+            Self::N2Nrppa => ("N2_INFORMATION", "n2InformationClass", "NRPPa"),
+        };
+        subscription
+            .get("notificationType")
+            .and_then(|v| v.as_str())
+            == Some(kind)
+            && subscription.get(field).and_then(|v| v.as_str()) == Some(class)
+    }
+}
+
+/// #2256, TS 29.518 §5.2.2.3.5.3 / §5.2.2.3.6.3 step 1: "If the corresponding
+/// N1 [N2] notification URI is not available, the AMF shall retrieve the NF
+/// profile of the NF Service Consumer (e.g. the LMF) from the NRF using the NF
+/// Instance Identifier received during corresponding N1N2MessageTransfer ...
+/// and fetch [the] Notification URI from the default notification subscription"
+/// of that kind.
+///
+/// The profile is this AMF's cached one for `lmf_id`, else the one an NRF
+/// discovery for that instance (`target-nf-instance-id`) returns, as
+/// [`resolve_lmf_by_identification`] finds it. A cached profile with no such
+/// default subscription is the answer: the NRF is not asked again on every
+/// uplink. `None` when the LMF is unknown or names none.
+pub async fn lmf_default_notification_uri(
+    lmf_id: &str,
+    kind: LmfDefaultNotification,
+) -> Option<String> {
+    let sbi_ctx = global_context();
+    let pick = |instance: NfInstance| {
+        if instance.nf_type != nextgcore_sbi::types::NfType::Lmf {
+            return None;
+        }
+        instance
+            .default_notification_subscriptions
+            .iter()
+            .filter(|d| kind.matches(d))
+            .find_map(|d| d.get("callbackUri").and_then(|v| v.as_str()))
+            .filter(|uri| !uri.trim().is_empty())
+            .map(str::to_string)
+    };
+    if let Some(instance) = sbi_ctx.get_nf_instance(lmf_id).await {
+        return pick(instance);
+    }
+    let extra = [(
+        "target-nf-instance-id",
+        nextgcore_sbi::uri_encode::encode_query_value(lmf_id),
+    )];
+    let nrf_override = LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    amf_nrf_discover_qualified_at(nrf_override, "LMF", "nlmf-loc", &extra)
+        .await
+        .ok()?;
+    pick(sbi_ctx.get_nf_instance(lmf_id).await?)
 }
 
 /// `Nlmf_Location_CancelLocation`: POST /nlmf-loc/v1/cancel-location
