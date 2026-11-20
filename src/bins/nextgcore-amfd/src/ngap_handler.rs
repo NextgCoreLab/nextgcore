@@ -6,7 +6,7 @@ use crate::context::{
     AmfContext, AmfGnb, NgapCause, NrCgi, PlmnId, SNssai, SupportedTa, Tai5gs,
     UavAuthorizationContext,
 };
-use nextgcore_ngap::types::{NgReset, ResetType, UeAssociatedLogicalNgConnectionItem};
+use crate::ngap_types::{NgReset, ResetType, UeAssociatedLogicalNgConnectionItem};
 
 // ============================================================================
 // Constants
@@ -121,7 +121,7 @@ pub struct NgSetupRequest {
     pub plmn_id: PlmnId,
     /// The ngENB-ID, with its length, when the node is an ng-eNB (#876); `None` for
     /// a gNB.
-    pub ng_enb_id: Option<nextgcore_ngap::types::NgEnbId>,
+    pub ng_enb_id: Option<crate::ngap_types::NgEnbId>,
     /// RAN Node Name
     pub ran_node_name: Option<String>,
     /// Supported TA List
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_handle_ng_reset_full_interface_releases_all_gnb_ues() {
-        use nextgcore_ngap::types::{Cause, CauseMisc};
+        use crate::ngap_types::{Cause, CauseMisc};
 
         let gnb_pool_id = 987_001u64;
         // Initialise the process-global context rather than relying on a sibling
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_handle_ng_reset_partial_releases_listed_ues_only() {
-        use nextgcore_ngap::types::{Cause, CauseRadioNetwork};
+        use crate::ngap_types::{Cause, CauseRadioNetwork};
 
         let gnb_pool_id = 987_002u64;
         // Initialise the process-global context rather than relying on a sibling
@@ -810,7 +810,7 @@ mod tests {
     /// near certain; the reset must still finish every round.
     #[test]
     fn an_ng_reset_completes_while_a_writer_contends_for_the_context() {
-        use nextgcore_ngap::types::{Cause, CauseMisc};
+        use crate::ngap_types::{Cause, CauseMisc};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 

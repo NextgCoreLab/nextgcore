@@ -18,7 +18,7 @@
 //!   PacketLossRate `0..1000`).
 
 use crate::aper_golden::{amf_ue_ngap_id, ran_ue_ngap_id, Bits};
-use nextgcore_ngap::types as t;
+use crate::ngap_types as t;
 
 /// Run `f` on a fresh sink and return its complete encoding (§11.1: padded to
 /// an octet).

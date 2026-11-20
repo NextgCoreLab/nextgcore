@@ -1,12 +1,13 @@
 //! NGAP ASN.1 Encoding for AMF
 //!
-//! This module provides ASN.1 APER encoding for NGAP messages
-//! using the nextgcore-ngap crate. This ensures wire compatibility with
-//! the gNB (nextgsim-gnb) which also uses proper ASN.1 encoding.
+//! This module provides ASN.1 APER encoding and decoding for NGAP messages
+//! through the codec generated from the TS 38.413 ASN.1
+//! (`nextgcore-ngap-gen`), mapping its PDUs to and from amfd's domain values
+//! ([`crate::ngap_types`]).
 //!
-//! #417 is migrating these builders, one procedure family at a time, onto the
-//! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated so
-//! far: the whole NG Setup family -- the Response and Failure encoders (stage 2)
+//! #417 moved these builders, one procedure family at a time, onto the
+//! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated, in
+//! order: the whole NG Setup family -- the Response and Failure encoders (stage 2)
 //! and the Request decoder (stage 3), which applies TS 38.413 §10.3.4/§10.3.5 to
 //! not-comprehended and missing IEs ([`decode_ng_setup_request_asn1`]) -- and
 //! the UE Context Release family (stage 4): the Command encoder and the Request
@@ -22,8 +23,8 @@
 //! ([`build_n2_sm_setup_request_transfer`],
 //! [`parse_n2_sm_setup_response_transfer`]).
 
-use nextgcore_ngap::types::*;
-use nextgcore_ngap::types::{
+use crate::ngap_types::*;
+use crate::ngap_types::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
 
@@ -284,7 +285,7 @@ fn generated_s_nssai(s_nssai: &crate::context::SNssai) -> ngap_gen::S_NSSAI {
     }
 }
 
-/// The hand-written [`Cause`] as the generated one, carrying each value over as
+/// The domain [`Cause`] as the generated one, carrying each value over as
 /// its wire number. Extension values (radioNetwork 45/46) encode past the root
 /// like any other (nextgsim #213), so the mapping is total.
 fn generated_cause(cause: Cause) -> ngap_gen::Cause {
@@ -2523,10 +2524,10 @@ pub struct UplinkNasTransportData {
     pub user_location_info: Option<UserLocationInformation>,
 }
 
-/// A generated NR [`ngap_gen::UserLocationInformation`] as the hand-written
+/// A generated NR [`ngap_gen::UserLocationInformation`] as the domain
 /// one. `None` for an E-UTRA, N3IWF or choice-extension location, which this
 /// AMF has no representation for, or for a field of the wrong size.
-fn hand_written_user_location(
+fn domain_user_location(
     uli: &ngap_gen::UserLocationInformation,
 ) -> Option<UserLocationInformation> {
     let ngap_gen::UserLocationInformation::UserLocationInformationNR(nr) = uli else {
@@ -2667,7 +2668,7 @@ pub fn decode_initial_ue_message_asn1(data: &[u8]) -> NasTransportDecode<Initial
         nr_cell_identity,
         tai_tac,
         ..
-    }) = hand_written_user_location(&uli)
+    }) = domain_user_location(&uli)
     else {
         log::error!("Initial UE Message: only an NR User Location Information is supported");
         return Undecodable;
@@ -2742,7 +2743,7 @@ pub fn decode_uplink_nas_transport_asn1(data: &[u8]) -> NasTransportDecode<Uplin
             Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
             Ie::Id_NAS_PDU(v) => nas_pdu = Some(v.0),
             Ie::Id_UserLocationInformation(v) => {
-                user_location_info = hand_written_user_location(&v);
+                user_location_info = domain_user_location(&v);
                 if user_location_info.is_none() {
                     log::warn!(
                         "Uplink NAS Transport: not an NR User Location Information; \
@@ -3908,7 +3909,7 @@ pub(crate) fn recommended_paging_targets(
         .iter()
         .filter_map(|item| match &item.amf_paging_target {
             ngap_gen::AMFPagingTarget::GlobalRANNodeID(id) => {
-                hand_written_global_ran_node_id(id).map(RecommendedPagingTarget::RanNode)
+                domain_global_ran_node_id(id).map(RecommendedPagingTarget::RanNode)
             }
             ngap_gen::AMFPagingTarget::TAI(tai) => Some(RecommendedPagingTarget::Tai(
                 decode_plmn_id(&tai.plmn_identity.0),
@@ -4258,7 +4259,7 @@ pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
 
 /// The hand-written Cause a generated one maps to; misc/unspecified for a
 /// choice extension, which has no group.
-fn hand_written_cause(cause: &ngap_gen::Cause) -> Cause {
+fn domain_cause(cause: &ngap_gen::Cause) -> Cause {
     match cause_pair(cause) {
         Some((group, value)) => build_cause(group, value),
         None => Cause::Misc(CauseMisc::Unspecified),
@@ -4310,7 +4311,7 @@ pub fn decode_handover_cancel_asn1(data: &[u8]) -> NasTransportDecode<HandoverCa
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
-            Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
+            Ie::Id_Cause(v) => cause = Some(domain_cause(&v)),
         }
     }
     if amf.is_none() {
@@ -4373,7 +4374,7 @@ pub fn decode_handover_notify_asn1(
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
-            Ie::Id_UserLocationInformation(v) => uli = hand_written_user_location(&v),
+            Ie::Id_UserLocationInformation(v) => uli = domain_user_location(&v),
             // Comprehended; the AMF does not act on it.
             Ie::Id_NotifySourceNGRANNode(_) => {}
         }
@@ -4418,8 +4419,8 @@ fn bits_value(bits: &bitvec::prelude::BitSlice<u8, bitvec::prelude::Msb0>) -> u3
 
 /// A generated NgENB-ID as the hand-written CHOICE, keeping which length the
 /// gNB named (TS 38.413 §9.3.1.8); `None` for a choice extension.
-fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<nextgcore_ngap::types::NgEnbId> {
-    use nextgcore_ngap::types::NgEnbId;
+fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<crate::ngap_types::NgEnbId> {
+    use crate::ngap_types::NgEnbId;
     Some(match id {
         ngap_gen::NgENB_ID::MacroNgENB_ID(b) => NgEnbId::Macro(bits_value(&b.0)),
         ngap_gen::NgENB_ID::ShortMacroNgENB_ID(b) => NgEnbId::ShortMacro(bits_value(&b.0)),
@@ -4432,7 +4433,7 @@ fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<nextgcore_ngap::types::N
 /// The hand-written GlobalRanNodeId a generated GlobalRANNodeID maps to: a gNB or
 /// an ng-eNB; `None` for an N3IWF or a choice extension, which a handover target
 /// cannot be.
-fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<GlobalRanNodeId> {
+fn domain_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<GlobalRanNodeId> {
     match id {
         ngap_gen::GlobalRANNodeID::GlobalGNB_ID(gnb) => {
             let bits = match &gnb.gnb_id {
@@ -4466,10 +4467,10 @@ fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<Glo
 /// ngENB-ID keeps which of the three lengths the gNB named (#741), because TS
 /// 29.274 §8.51 encodes a macro id under Target Type 1 and a short or long macro
 /// id under Target Type 4.
-fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
+fn domain_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
     match target {
         ngap_gen::TargetID::TargetRANNodeID(t) => Some(TargetId::TargetRanNodeId {
-            global_ran_node_id: hand_written_global_ran_node_id(&t.global_ran_node_id)?,
+            global_ran_node_id: domain_global_ran_node_id(&t.global_ran_node_id)?,
             selected_tai: TaiListItem {
                 tai_plmn: t.selected_tai.plmn_identity.0.as_slice().try_into().ok()?,
                 tai_tac: t.selected_tai.tac.0.as_slice().try_into().ok()?,
@@ -4478,7 +4479,7 @@ fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
         ngap_gen::TargetID::TargeteNB_ID(t) => Some(TargetId::TargetGlobalNgEnbId {
             plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
             ng_enb_id: ng_enb_id_variant(&t.global_enb_id.ng_enb_id)?,
-            selected_eps_tai: nextgcore_ngap::types::EpsTai {
+            selected_eps_tai: crate::ngap_types::EpsTai {
                 plmn_identity: t
                     .selected_eps_tai
                     .plmn_identity
@@ -4494,9 +4495,9 @@ fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
     }
 }
 
-/// A [`CriticalityErrorIndication`]'s report as the hand-written Criticality
+/// A [`CriticalityErrorIndication`]'s report as the domain Criticality
 /// Diagnostics a HANDOVER PREPARATION FAILURE carries.
-pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> CriticalityDiagnostics {
+pub fn domain_diagnostics(report: &CriticalityErrorIndication) -> CriticalityDiagnostics {
     CriticalityDiagnostics {
         procedure_code: Some(report.procedure.procedure_code),
         triggering_message: Some(report.procedure.triggering_message),
@@ -4506,9 +4507,9 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
             .iter()
             .map(|ie| IeCriticalityDiagnostics {
                 ie_criticality: match ie.criticality {
-                    ngap_gen::Criticality::REJECT => nextgcore_ngap::types::Criticality::Reject,
-                    ngap_gen::Criticality::IGNORE => nextgcore_ngap::types::Criticality::Ignore,
-                    _ => nextgcore_ngap::types::Criticality::Notify,
+                    ngap_gen::Criticality::REJECT => crate::ngap_types::Criticality::Reject,
+                    ngap_gen::Criticality::IGNORE => crate::ngap_types::Criticality::Ignore,
+                    _ => crate::ngap_types::Criticality::Notify,
                 },
                 ie_id: ie.ie_id,
                 type_of_error: if ie.type_of_error == ngap_gen::TypeOfError::MISSING {
@@ -4553,7 +4554,7 @@ pub fn handover_required_unsupported_target(data: &[u8]) -> Option<(u64, u32)> {
                         | ngap_gen::HandoverType::EPS_TO_5GS
                 )
             }
-            Ie::Id_TargetID(v) => unsupported |= hand_written_target_id(&v).is_none(),
+            Ie::Id_TargetID(v) => unsupported |= domain_target_id(&v).is_none(),
             _ => {}
         }
     }
@@ -4604,10 +4605,10 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
                     }
                 }
             }
-            Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
+            Ie::Id_Cause(v) => cause = Some(domain_cause(&v)),
             Ie::Id_TargetID(v) => {
                 target_present = true;
-                match hand_written_target_id(&v) {
+                match domain_target_id(&v) {
                     Some(t) => target = Some(t),
                     None => {
                         log::warn!("Handover Required names a target this AMF cannot represent");
@@ -4616,9 +4617,8 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
                 }
             }
             Ie::Id_DirectForwardingPathAvailability(_) => {
-                direct = Some(
-                    nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
-                )
+                direct =
+                    Some(crate::ngap_types::DirectForwardingPathAvailability::DirectPathAvailable)
             }
             Ie::Id_PDUSessionResourceListHORqd(v) => {
                 sessions = Some(
@@ -4739,7 +4739,7 @@ pub fn decode_handover_failure_asn1(data: &[u8]) -> NasTransportDecode<HandoverF
     for entry in failure.protocol_i_es.0 {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
-            Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
+            Ie::Id_Cause(v) => cause = Some(domain_cause(&v)),
             Ie::Id_CriticalityDiagnostics(_)
             | Ie::Id_TargettoSource_Failure_TransparentContainer(_) => {}
         }
@@ -4788,7 +4788,7 @@ fn generated_s_nssai_from(s_nssai: &SNssai) -> ngap_gen::S_NSSAI {
     }
 }
 
-/// A hand-written [`HandoverType`] as the generated ENUMERATED (§9.3.1.22).
+/// A domain [`HandoverType`] as the generated ENUMERATED (§9.3.1.22).
 fn generated_handover_type(handover_type: HandoverType) -> ngap_gen::HandoverType {
     ngap_gen::HandoverType(match handover_type {
         HandoverType::Intra5gs => ngap_gen::HandoverType::INTRA5GS,
@@ -5336,9 +5336,9 @@ fn generated_ue_security_capabilities(
     }
 }
 
-/// The generated UE Security Capabilities as the hand-written type. A bitmap
+/// The generated UE Security Capabilities as the domain type. A bitmap
 /// wider than 16 bits (the SIZE is extensible) keeps its first 16 bits.
-fn hand_written_ue_security_capabilities(
+fn domain_ue_security_capabilities(
     caps: &ngap_gen::UESecurityCapabilities,
 ) -> UeSecurityCapabilities {
     let first16 = |bits: &bitvec::vec::BitVec<u8, bitvec::order::Msb0>| {
@@ -5418,10 +5418,8 @@ pub fn decode_path_switch_request_asn1(data: &[u8]) -> PathSwitchRequestDecode {
         match entry.value {
             Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
             Ie::Id_SourceAMF_UE_NGAP_ID(v) => amf = Some(v.0),
-            Ie::Id_UserLocationInformation(v) => uli = hand_written_user_location(&v),
-            Ie::Id_UESecurityCapabilities(v) => {
-                caps = Some(hand_written_ue_security_capabilities(&v))
-            }
+            Ie::Id_UserLocationInformation(v) => uli = domain_user_location(&v),
+            Ie::Id_UESecurityCapabilities(v) => caps = Some(domain_ue_security_capabilities(&v)),
             Ie::Id_PDUSessionResourceToBeSwitchedDLList(v) => {
                 sessions = Some(
                     v.0.into_iter()
@@ -6171,7 +6169,7 @@ pub fn decode_pws_indication_asn1(data: &[u8]) -> NasTransportDecode<PwsIndicati
                 procedure_code = ngap_gen::ID_PWS_RESTART_INDICATION;
                 for e in entries {
                     match e.value {
-                        Ie::Id_GlobalRANNodeID(v) => node = hand_written_global_ran_node_id(&v),
+                        Ie::Id_GlobalRANNodeID(v) => node = domain_global_ran_node_id(&v),
                         Ie::Id_TAIListForRestart(v) => {
                             tais = v.0.len();
                             tai_list = true;
@@ -6186,7 +6184,7 @@ pub fn decode_pws_indication_asn1(data: &[u8]) -> NasTransportDecode<PwsIndicati
                 procedure_code = ngap_gen::ID_PWS_FAILURE_INDICATION;
                 for e in entries {
                     match e.value {
-                        Ie::Id_GlobalRANNodeID(v) => node = hand_written_global_ran_node_id(&v),
+                        Ie::Id_GlobalRANNodeID(v) => node = domain_global_ran_node_id(&v),
                         Ie::Id_PWSFailedCellIDList(_) => failed_cells = true,
                     }
                 }
@@ -7651,10 +7649,7 @@ pub(crate) mod tests {
                 tac: [0, 0, 1],
                 broadcast_plmn_list: vec![BroadcastPlmnItem {
                     plmn_identity: [0x99, 0xf9, 0x07],
-                    tai_slice_support_list: vec![nextgcore_ngap::types::SNssai {
-                        sst: 1,
-                        sd: None,
-                    }],
+                    tai_slice_support_list: vec![crate::ngap_types::SNssai { sst: 1, sd: None }],
                 }],
             }],
             default_paging_drx: PagingDrx::V128,
@@ -7734,9 +7729,9 @@ pub(crate) mod tests {
         }
         // #876: all three ngENB-ID lengths.
         for id in [
-            nextgcore_ngap::types::NgEnbId::Macro(0xabcde),
-            nextgcore_ngap::types::NgEnbId::ShortMacro(0x34b89),
-            nextgcore_ngap::types::NgEnbId::LongMacro(0x1abcde),
+            crate::ngap_types::NgEnbId::Macro(0xabcde),
+            crate::ngap_types::NgEnbId::ShortMacro(0x34b89),
+            crate::ngap_types::NgEnbId::LongMacro(0x1abcde),
         ] {
             let mut ng_enb = baseline_request_ies();
             ng_enb.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
@@ -7765,8 +7760,8 @@ pub(crate) mod tests {
                     BroadcastPlmnItem {
                         plmn_identity: [0x99, 0xf9, 0x07],
                         tai_slice_support_list: vec![
-                            nextgcore_ngap::types::SNssai { sst: 1, sd: None },
-                            nextgcore_ngap::types::SNssai {
+                            crate::ngap_types::SNssai { sst: 1, sd: None },
+                            crate::ngap_types::SNssai {
                                 sst: 255,
                                 sd: Some([0x00, 0x00, 0x01]),
                             },
@@ -7775,7 +7770,7 @@ pub(crate) mod tests {
                     BroadcastPlmnItem {
                         plmn_identity: [0x13, 0x00, 0x62],
                         // 0xFFFFFF is "no SD": read back as absent.
-                        tai_slice_support_list: vec![nextgcore_ngap::types::SNssai {
+                        tai_slice_support_list: vec![crate::ngap_types::SNssai {
                             sst: 2,
                             sd: Some([0xff, 0xff, 0xff]),
                         }],
@@ -7813,7 +7808,7 @@ pub(crate) mod tests {
     /// and different lengths apart; a gNB's has none.
     #[test]
     fn an_ng_enb_setup_keeps_its_ng_enb_id_length() {
-        use nextgcore_ngap::types::NgEnbId;
+        use crate::ngap_types::NgEnbId;
         for id in [
             NgEnbId::Macro(0x1234),
             NgEnbId::ShortMacro(0x1234),
@@ -9077,7 +9072,7 @@ pub(crate) mod tests {
         // decoders must recover the UE NGAP IDs (used to gate the registration
         // on the ICS Response).
         let resp = crate::gnb_pdus::initial_context_setup_response(
-            &nextgcore_ngap::types::InitialContextSetupResponse {
+            &crate::ngap_types::InitialContextSetupResponse {
                 amf_ue_ngap_id: 7,
                 ran_ue_ngap_id: 9,
             },
@@ -9094,7 +9089,7 @@ pub(crate) mod tests {
         ));
 
         let fail = crate::gnb_pdus::initial_context_setup_failure(
-            &nextgcore_ngap::types::InitialContextSetupFailure {
+            &crate::ngap_types::InitialContextSetupFailure {
                 amf_ue_ngap_id: 11,
                 ran_ue_ngap_id: 13,
                 cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
@@ -12540,7 +12535,7 @@ pub(crate) mod tests {
     /// INITIAL CONTEXT SETUP RESPONSE, derived: [`crate::gnb_pdus`].
     pub(crate) fn ics_response_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
         crate::gnb_pdus::initial_context_setup_response(
-            &nextgcore_ngap::types::InitialContextSetupResponse {
+            &crate::ngap_types::InitialContextSetupResponse {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
             },
@@ -12936,7 +12931,7 @@ pub(crate) mod tests {
     // #417: the NAS transport family on the generated codec.
     // ------------------------------------------------------------------
 
-    use nextgcore_ngap::types::{
+    use crate::ngap_types::{
         InitialUeMessage as HwInitialUe, RrcEstablishmentCause as HwCause, SNssai as HwSNssai,
         UplinkNasTransport as HwUplinkNas, UserLocationInformation as HwUli,
     };
@@ -14009,7 +14004,7 @@ mod handover_required_tests {
                 .collect(),
             source_to_target_container: vec![0xAB; 5],
             direct_forwarding_path_availability: direct.then_some(
-                nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
+                crate::ngap_types::DirectForwardingPathAvailability::DirectPathAvailable,
             ),
         }
     }
@@ -14145,10 +14140,10 @@ mod handover_required_tests {
             panic!("an eNB target");
         };
         assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
-        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(ng_enb_id, crate::ngap_types::NgEnbId::Macro(0x12345));
         assert_eq!(
             selected_eps_tai,
-            nextgcore_ngap::types::EpsTai {
+            crate::ngap_types::EpsTai {
                 plmn_identity: [0x99, 0xF9, 0x07],
                 tac: [0x00, 0x07],
             }
@@ -14157,8 +14152,8 @@ mod handover_required_tests {
         let msg = required(
             TargetId::TargetGlobalNgEnbId {
                 plmn_identity: [0x99, 0xF9, 0x07],
-                ng_enb_id: nextgcore_ngap::types::NgEnbId::Macro(0x12345),
-                selected_eps_tai: nextgcore_ngap::types::EpsTai {
+                ng_enb_id: crate::ngap_types::NgEnbId::Macro(0x12345),
+                selected_eps_tai: crate::ngap_types::EpsTai {
                     plmn_identity: [0x99, 0xF9, 0x07],
                     tac: [0x00, 0x07],
                 },
@@ -14174,7 +14169,7 @@ mod handover_required_tests {
     /// case.
     #[test]
     fn every_ng_enb_id_length_round_trips_through_the_generated_decode() {
-        use nextgcore_ngap::types::{EpsTai, NgEnbId};
+        use crate::ngap_types::{EpsTai, NgEnbId};
         let golden_target = |id: NgEnbId| TargetId::TargetGlobalNgEnbId {
             plmn_identity: [0x99, 0xF9, 0x07],
             ng_enb_id: id,
@@ -14253,8 +14248,8 @@ mod handover_required_tests {
             ngap_gen::ID_HANDOVER_PREPARATION
         );
         assert_eq!(
-            hand_written_diagnostics(&report).ies[0].ie_criticality,
-            nextgcore_ngap::types::Criticality::Notify
+            domain_diagnostics(&report).ies[0].ie_criticality,
+            crate::ngap_types::Criticality::Notify
         );
         // reject: rejected, naming the IE and both UE ids.
         let NasTransportDecode::Reject(report) =
@@ -14264,11 +14259,11 @@ mod handover_required_tests {
         };
         assert_eq!(report.amf_ue_ngap_id, Some(0x1_0000_0001));
         assert_eq!(report.ran_ue_ngap_id, Some(7));
-        let diag = hand_written_diagnostics(&report);
+        let diag = domain_diagnostics(&report);
         assert_eq!(diag.ies[0].ie_id, 9999);
         assert_eq!(
             diag.ies[0].ie_criticality,
-            nextgcore_ngap::types::Criticality::Reject
+            crate::ngap_types::Criticality::Reject
         );
         assert_eq!(diag.ies[0].type_of_error, TypeOfError::NotUnderstood);
         assert_eq!(diag.procedure_code, Some(ngap_gen::ID_HANDOVER_PREPARATION));

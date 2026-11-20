@@ -552,10 +552,10 @@ pub fn build_forward_relocation_complete_acknowledge(
 /// truncated id names a different eNB.
 pub fn encode_enb_target_identification(
     plmn_identity: &[u8; 3],
-    ng_enb_id: nextgcore_ngap::types::NgEnbId,
+    ng_enb_id: crate::ngap_types::NgEnbId,
     eps_tac: [u8; 2],
 ) -> Result<Bytes, String> {
-    use nextgcore_ngap::types::NgEnbId;
+    use crate::ngap_types::NgEnbId;
     if !ng_enb_id.fits() {
         return Err(format!(
             "ng-eNB id {:#x} does not fit its {}-bit alternative",
@@ -684,7 +684,7 @@ mod tests {
             &[0xAA, 0xBB],
             &encode_enb_target_identification(
                 &[0x00, 0xF1, 0x10],
-                nextgcore_ngap::types::NgEnbId::Macro(1),
+                crate::ngap_types::NgEnbId::Macro(1),
                 [0x00, 0x01],
             )
             .expect("fits"),
@@ -1168,7 +1168,7 @@ mod tests {
     /// encoder. PLMN 001/01 is `00 F1 10`; the EPS TAC is `12 34`.
     #[test]
     fn target_identification_follows_figures_8_51_2_and_8_51_4() {
-        use nextgcore_ngap::types::NgEnbId;
+        use crate::ngap_types::NgEnbId;
         let plmn = [0x00, 0xF1, 0x10];
         let cases: [(NgEnbId, [u8; 9], &str); 6] = [
             // Fig 8.51-2: type 1; octet 9 = spare 0000 | id bits 20-17 (0x1); then 0x2345.

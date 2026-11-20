@@ -1,0 +1,1800 @@
+-- TAG-SLPP-PDU-DEFINITIONS-START
+
+SLPP-PDU-Definitions DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+    CommonIEsRequestCapabilities,
+    CommonIEsProvideCapabilities,
+    CommonIEsRequestAssistanceData,
+    CommonIEsProvideAssistanceData,
+    CommonIEsRequestLocationInformation,
+    CommonIEsProvideLocationInformation
+
+FROM
+    SLPP-PDU-CommonContents
+
+    CommonSL-PRS-MethodsIEsRequestCapabilities,
+    CommonSL-PRS-MethodsIEsProvideCapabilities,
+    CommonSL-PRS-MethodsIEsRequestAssistanceData,
+    CommonSL-PRS-MethodsIEsProvideAssistanceData,
+    CommonSL-PRS-MethodsIEsRequestLocationInformation,
+    CommonSL-PRS-MethodsIEsProvideLocationInformation
+
+FROM
+    SLPP-PDU-CommonSL-PRS-MethodsContents
+
+    SL-AoA-RequestCapabilities,
+    SL-AoA-ProvideCapabilities,
+    SL-AoA-RequestAssistanceData,
+    SL-AoA-ProvideAssistanceData,
+    SL-AoA-RequestLocationInformation,
+    SL-AoA-ProvideLocationInformation
+
+FROM
+    SLPP-PDU-SL-AoA-Contents
+
+    SL-RTT-RequestCapabilities,
+    SL-RTT-ProvideCapabilities,
+    SL-RTT-RequestAssistanceData,
+    SL-RTT-ProvideAssistanceData,
+    SL-RTT-RequestLocationInformation,
+    SL-RTT-ProvideLocationInformation
+
+FROM
+    SLPP-PDU-SL-RTT-Contents
+
+    SL-TDOA-RequestCapabilities,
+    SL-TDOA-ProvideCapabilities,
+    SL-TDOA-RequestAssistanceData,
+    SL-TDOA-ProvideAssistanceData,
+    SL-TDOA-RequestLocationInformation,
+    SL-TDOA-ProvideLocationInformation
+
+FROM
+    SLPP-PDU-SL-TDOA-Contents
+
+    SL-TOA-RequestCapabilities,
+    SL-TOA-ProvideCapabilities,
+    SL-TOA-RequestAssistanceData,
+    SL-TOA-ProvideAssistanceData,
+    SL-TOA-RequestLocationInformation,
+    SL-TOA-ProvideLocationInformation
+
+FROM
+    SLPP-PDU-SL-TOA-Contents;
+
+-- TAG-SLPP-PDU-DEFINITIONS-STOP
+
+-- TAG-SLPP-MESSAGE-START
+
+SLPP-Message ::=            SEQUENCE {
+    applicationLayerID          OCTET STRING        OPTIONAL,
+    transactionID               INTEGER (0..255)    OPTIONAL,
+    endTransaction              BOOLEAN,
+    sequenceNumber              SequenceNumber      OPTIONAL,
+    sessionID                   SessionID           OPTIONAL,
+    acknowledgement             Acknowledgement     OPTIONAL,
+    slpp-MessageBody            SLPP-MessageBody    OPTIONAL,
+    nonCriticalExtension        SEQUENCE {}         OPTIONAL
+}
+
+SequenceNumber ::= INTEGER (0..255)
+SessionID ::= OCTET STRING (SIZE (6))
+
+Acknowledgement ::= SEQUENCE {
+    ackRequested        BOOLEAN,
+    ackIndicator        SequenceNumber        OPTIONAL
+}
+
+-- TAG-SLPP-MESSAGE-STOP
+
+-- TAG-SLPP-MESSAGEBODY-START
+
+SLPP-MessageBody ::= CHOICE {
+    c1                          CHOICE {
+        requestCapabilities         RequestCapabilities,
+        provideCapabilities         ProvideCapabilities,
+        requestAssistanceData       RequestAssistanceData,
+        provideAssistanceData       ProvideAssistanceData,
+        requestLocationInformation  RequestLocationInformation,
+        provideLocationInformation  ProvideLocationInformation,
+        abort                       Abort,
+        error                       Error,
+        spare8 NULL, spare7 NULL, spare6 NULL, spare5 NULL, spare4 NULL, spare3 NULL, spare2 NULL, spare1 NULL
+    },
+    messageClassExtension    SEQUENCE {}
+}
+
+-- TAG-SLPP-MESSAGEBODY-STOP
+
+-- TAG-REQUESTCAPABILITIES-START
+
+RequestCapabilities ::= SEQUENCE {
+    criticalExtensions      CHOICE {
+        requestCapabilities         RequestCapabilities-IEs,
+        criticalExtensionsFuture    SEQUENCE {}
+    }
+}
+
+RequestCapabilities-IEs ::= SEQUENCE {
+    commonIEsRequestCapabilities                  OCTET STRING    OPTIONAL, -- Containing CommonIEsRequestCapabilities
+    commonSL-PRS-MethodsIEsRequestCapabilities    OCTET STRING    OPTIONAL, -- Containing CommonSL-PRS-MethodsIEsRequestCapabilities
+    sl-AoA-RequestCapabilities                    OCTET STRING    OPTIONAL, -- Containing SL-AoA-RequestCapabilities
+    sl-RTT-RequestCapabilities                    OCTET STRING    OPTIONAL, -- Containing SL-RTT-RequestCapabilities
+    sl-TDOA-RequestCapabilities                   OCTET STRING    OPTIONAL, -- Containing SL-TDOA-RequestCapabilities
+    sl-TOA-RequestCapabilities                    OCTET STRING    OPTIONAL, -- Containing SL-TOA-RequestCapabilities
+    lateNonCriticalExtension                      OCTET STRING    OPTIONAL,
+    nonCriticalExtension                          SEQUENCE {}     OPTIONAL
+
+}
+
+-- TAG-REQUESTCAPABILITIES-STOP
+
+-- TAG-PROVIDECAPABILITIES-START
+
+ProvideCapabilities ::= SEQUENCE {
+    criticalExtensions      CHOICE {
+        provideCapabilities         ProvideCapabilities-IEs,
+        criticalExtensionsFuture    SEQUENCE {}
+    }
+}
+
+ProvideCapabilities-IEs ::= SEQUENCE {
+    commonIEsProvideCapabilities                  OCTET STRING    OPTIONAL, -- Containing CommonIEsProvideCapabilities
+    commonSL-PRS-MethodsIEsProvideCapabilities    OCTET STRING    OPTIONAL, -- Containing CommonSL-PRS-MethodsIEsProvideCapabilities
+    sl-AoA-ProvideCapabilities                    OCTET STRING    OPTIONAL, -- Containing SL-AoA-ProvideCapabilities
+    sl-RTT-ProvideCapabilities                    OCTET STRING    OPTIONAL, -- Containing SL-RTT-ProvideCapabilities
+    sl-TDOA-ProvideCapabilities                   OCTET STRING    OPTIONAL, -- Containing SL-TDOA-ProvideCapabilities
+    sl-TOA-ProvideCapabilities                    OCTET STRING    OPTIONAL, -- Containing SL-TOA-ProvideCapabilities
+    lateNonCriticalExtension                      OCTET STRING    OPTIONAL,
+    nonCriticalExtension                          SEQUENCE {}     OPTIONAL
+
+}
+
+-- TAG-PROVIDECAPABILITIES-STOP
+
+-- TAG-REQUESTASSISTANCEDATA-START
+
+RequestAssistanceData ::= SEQUENCE {
+    criticalExtensions        CHOICE {
+        requestAssistanceData     RequestAssistanceData-IEs,
+        criticalExtensionsFuture  SEQUENCE {}
+    }
+}
+
+RequestAssistanceData-IEs ::= SEQUENCE {
+    commonIEsRequestAssistanceData                  OCTET STRING    OPTIONAL, -- Containing CommonIEsRequestAssistanceData
+    commonSL-PRS-MethodsIEsRequestAssistanceData    OCTET STRING    OPTIONAL, -- Containing CommonSL-PRS-MethodsIEsRequestAssistanceData
+    sl-AoA-RequestAssistanceData                    OCTET STRING    OPTIONAL, -- Containing SL-AoA-RequestAssistanceData
+    sl-RTT-RequestAssistanceData                    OCTET STRING    OPTIONAL, -- Containing SL-RTT-RequestAssistanceData
+    sl-TDOA-RequestAssistanceData                   OCTET STRING    OPTIONAL, -- Containing SL-TDOA-RequestAssistanceData
+    sl-TOA-RequestAssistanceData                    OCTET STRING    OPTIONAL, -- Containing SL-TOA-RequestAssistanceData
+    lateNonCriticalExtension                        OCTET STRING    OPTIONAL,
+    nonCriticalExtension                            SEQUENCE {}     OPTIONAL
+}
+
+-- TAG-REQUESTASSISTANCEDATA-STOP
+
+-- TAG-PROVIDEASSISTANCEDATA-START
+
+ProvideAssistanceData ::= SEQUENCE {
+    criticalExtensions        CHOICE {
+        provideAssistanceData     ProvideAssistanceData-IEs,
+        criticalExtensionsFuture  SEQUENCE {}
+    }
+}
+
+ProvideAssistanceData-IEs ::= SEQUENCE {
+    commonIEsProvideAssistanceData                  OCTET STRING    OPTIONAL, -- Containing CommonIEsProvideAssistanceData
+    commonSL-PRS-MethodsIEsProvideAssistanceData    OCTET STRING    OPTIONAL, -- Containing CommonSL-PRS-MethodsIEsProvideAssistanceData
+    sl-AoA-ProvideAssistanceData                    OCTET STRING    OPTIONAL, -- Containing SL-AoA-ProvideAssistanceData
+    sl-RTT-ProvideAssistanceData                    OCTET STRING    OPTIONAL, -- Containing SL-RTT-ProvideAssistanceData
+    sl-TDOA-ProvideAssistanceData                   OCTET STRING    OPTIONAL, -- Containing SL-TDOA-ProvideAssistanceData
+    sl-TOA-ProvideAssistanceData                    OCTET STRING    OPTIONAL, -- Containing SL-TOA-ProvideAssistanceData
+    lateNonCriticalExtension                        OCTET STRING    OPTIONAL,
+    nonCriticalExtension                            SEQUENCE {}     OPTIONAL
+}
+
+-- TAG-PROVIDEASSISTANCEDATA-STOP
+
+-- TAG-REQUESTLOCATIONINFORMATION-START
+
+RequestLocationInformation ::= SEQUENCE {
+    criticalExtensions             CHOICE {
+        requestLocationInformation     RequestLocationInformation-IEs,
+        criticalExtensionsFuture       SEQUENCE {}
+    }
+}
+
+RequestLocationInformation-IEs ::= SEQUENCE {
+    commonIEsRequestLocationInformation                  OCTET STRING    OPTIONAL, -- Containing CommonIEsRequestLocationInformation
+    commonSL-PRS-MethodsIEsRequestLocationInformation    OCTET STRING    OPTIONAL, -- Containing CommonSL-PRS-MethodsIEsRequestLocationInformation
+    sl-AoA-RequestLocationInformation                    OCTET STRING    OPTIONAL, -- Containing SL-AoA-RequestLocationInformation
+    sl-RTT-RequestLocationInformation                    OCTET STRING    OPTIONAL, -- Containing SL-RTT-RequestLocationInformation
+    sl-TDOA-RequestLocationInformation                   OCTET STRING    OPTIONAL, -- Containing SL-TDOA-RequestLocationInformation
+    sl-TOA-RequestLocationInformation                    OCTET STRING    OPTIONAL, -- Containing SL-TOA-RequestLocationInformation
+    lateNonCriticalExtension                             OCTET STRING    OPTIONAL,
+    nonCriticalExtension                                 SEQUENCE {}     OPTIONAL
+}
+
+-- TAG-REQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-PROVIDELOCATIONINFORMATION-START
+
+ProvideLocationInformation ::= SEQUENCE {
+    criticalExtensions             CHOICE {
+        provideLocationInformation    ProvideLocationInformation-IEs,
+        criticalExtensionsFuture      SEQUENCE {}
+    }
+}
+
+ProvideLocationInformation-IEs ::= SEQUENCE {
+    commonIEsProvideLocationInformation                  OCTET STRING    OPTIONAL, -- Containing CommonIEsProvideLocationInformation
+    commonSL-PRS-MethodsIEsProvideLocationInformation    OCTET STRING    OPTIONAL, -- Containing CommonSL-PRS-MethodsIEsProvideLocationInformation
+    sl-AoA-ProvideLocationInformation                    OCTET STRING    OPTIONAL, -- Containing SL-AoA-ProvideLocationInformation
+    sl-RTT-ProvideLocationInformation                    OCTET STRING    OPTIONAL, -- Containing SL-RTT-ProvideLocationInformation
+    sl-TDOA-ProvideLocationInformation                   OCTET STRING    OPTIONAL, -- Containing SL-TDOA-ProvideLocationInformation
+    sl-TOA-ProvideLocationInformation                    OCTET STRING    OPTIONAL, -- Containing SL-TOA-ProvideLocationInformation
+    lateNonCriticalExtension                             OCTET STRING    OPTIONAL,
+    nonCriticalExtension                                 SEQUENCE {}     OPTIONAL
+}
+
+-- TAG-PROVIDELOCATIONINFORMATION-STOP
+
+-- TAG-ABORT-START
+
+Abort ::= SEQUENCE {
+    criticalExtensions    CHOICE {
+        abort                       Abort-IEs,
+        criticalExtensionsFuture    SEQUENCE {}
+    }
+}
+
+Abort-IEs ::= SEQUENCE {
+    commonIEsAbort             CommonIEsAbort  OPTIONAL,
+    lateNonCriticalExtension   OCTET STRING    OPTIONAL,
+    nonCriticalExtension       SEQUENCE {}     OPTIONAL
+}
+
+-- TAG-ABORT-STOP
+
+-- TAG-ERROR-START
+
+Error ::= CHOICE {
+    criticalExtensions    CHOICE {
+        error                       Error-IEs,
+        criticalExtensionsFuture    SEQUENCE {}
+    }
+}
+
+Error-IEs ::= SEQUENCE {
+    commonIEsError              CommonIEsError  OPTIONAL,
+    lateNonCriticalExtension    OCTET STRING    OPTIONAL,
+    nonCriticalExtension        SEQUENCE {}     OPTIONAL
+}
+-- TAG-ERROR-STOP
+
+-- TAG-ARFCN-VALUENR-START
+
+ARFCN-ValueNR ::= INTEGER (0..3279165)
+
+-- TAG-ARFCN-VALUENR-STOP
+
+-- TAG-COMMONIESABORT-START
+
+CommonIEsAbort ::= SEQUENCE {
+    abortCause        ENUMERATED { undefined, stopPeriodicReporting }
+}
+
+-- TAG-COMMONIESABORT-STOP
+
+-- TAG-COMMONIESERROR-START
+
+CommonIEsError ::= SEQUENCE {
+    errorCause         ENUMERATED { undefined, slppMessageHeaderError, slppMessageBodyError, incorrectDataValue }
+}
+
+-- TAG-COMMONIESERROR-STOP
+
+-- TAG-GNSS-ID-BITMAP-START
+
+GNSS-ID-Bitmap ::= BIT STRING { gps (0), sbas (1), qzss (2), galileo (3), glonass (4), bds (5), navic (6) } (SIZE (1..16))
+
+-- TAG-GNSS-ID-BITMAP-STOP
+
+-- TAG-LCS-GCS-TRANSLATION-START
+
+LCS-GCS-Translation ::= SEQUENCE {
+    alpha                    INTEGER (0..3599),
+    beta                     INTEGER (0..3599),
+    gamma                    INTEGER (0..3599)
+}
+-- TAG-LCS-GCS-TRANSLATION-STOP
+
+-- TAG-LOS-NLOS-INDICATOR-START
+
+LOS-NLOS-Indicator ::= SEQUENCE {
+    indicator              CHOICE {
+        soft                   INTEGER (0..10),
+        hard                   BOOLEAN
+    }
+}
+
+-- TAG-LOS-NLOS-INDICATOR-STOP
+
+-- TAG-NCGI-START
+
+NCGI ::= SEQUENCE {
+    mcc                SEQUENCE (SIZE (3))     OF INTEGER (0..9),
+    mnc                SEQUENCE (SIZE (2..3))  OF INTEGER (0..9),
+    nr-CellIdentity    BIT STRING (SIZE (36))
+}
+
+-- TAG-NCGI-STOP
+
+-- TAG-NR-PHYSCELLID-START
+
+NR-PhysCellID ::= INTEGER (0..1007)
+
+-- TAG-NR-PHYSCELLID-STOP
+
+-- TAG-POSITIONINGMODES-START
+
+PositioningModes ::= BIT STRING { sl-TargetUE-Based (0), sl-TargetUE-Assisted (1) } (SIZE (1..8))
+
+-- TAG-POSITIONINGMODES-STOP
+
+-- TAG-SL-RTD-INFO-START
+
+SL-RTD-Info ::= SEQUENCE ( SIZE (1.. maxNrOfUEs)) OF RTD-InfoListPerAnchorUE
+
+RTD-InfoListPerAnchorUE ::= SEQUENCE {
+    applicationLayerID          OCTET STRING,
+    referenceRTD-Info           ReferenceRTD-Info                  OPTIONAL,
+    rtd-BetweenAnchorUEs        CHOICE {
+        subframeOffset              INTEGER (0..1966079),
+        sl-OffsetDFN                INTEGER (0..1000)
+    }                                                              OPTIONAL,
+    rtd-Quality                 SL-TimingQuality                   OPTIONAL,
+    syncSourceType              ENUMERATED { gnss, gNB-eNB, ue}    OPTIONAL
+}
+
+ReferenceRTD-Info ::= SEQUENCE {
+    syncSourceType        ENUMERATED { gnss, gNB-eNB, ue},
+    applicationLayerID    OCTET STRING                       OPTIONAL,
+    nrCell-Identify       SEQUENCE {
+        nr-PhysCellID             NR-PhysCellID              OPTIONAL,
+        nr-ARFCN                  ARFCN-ValueNR              OPTIONAL,
+        nr-CellGlobalID           NCGI                       OPTIONAL
+    }                                                        OPTIONAL
+}
+
+-- TAG-SL-RTD-INFO-STOP
+
+-- TAG-SL-TIMESTAMP-START
+
+SL-TimeStamp ::= CHOICE {
+    dfn-Time                    SEQUENCE {
+        syncSourceType              ENUMERATED { gnss, ue}    OPTIONAL,
+        applicationLayerID          OCTET STRING              OPTIONAL,
+        dfn                         INTEGER (0.. 1023),
+        nr-Slot                     CHOICE {
+            scs15                       INTEGER (0..9),
+            scs30                       INTEGER (0..19),
+            scs60                       INTEGER (0..39),
+            scs120                      INTEGER (0..79)
+        }
+    },
+    sfn-Time                    SEQUENCE {
+        nr-PhysCellID               NR-PhysCellID             OPTIONAL,
+        nr-ARFCN                    ARFCN-ValueNR             OPTIONAL,
+        nr-CellGlobalID             NCGI                      OPTIONAL,
+        nr-SFN                      INTEGER (0..1023),
+        nr-Slot                     CHOICE {
+            scs15                       INTEGER (0..9),
+            scs30                       INTEGER (0..19),
+            scs60                       INTEGER (0..39),
+            scs120                      INTEGER (0..79)
+        }
+    }
+}
+-- TAG-SL-TIMESTAMP-STOP
+
+-- TAG-SL-TIMINGQUALITY-START
+
+SL-TimingQuality ::= SEQUENCE {
+    timingQualityValue        INTEGER (0..31),
+    timingQualityResolution   ENUMERATED {mdot1, m1, m10, m30}
+}
+-- TAG-SL-TIMINGQUALITY-STOP
+
+-- TAG-SCHEDULEDLOCATIONTIMESUPPORTPERMODE-START
+
+ScheduledLocationTimeSupportPerMode ::= SEQUENCE {
+    utcTime                                 PositioningModes                              OPTIONAL,
+    gnssTime                                SEQUENCE {
+        posModes                                PositioningModes,
+        gnss-TimeIDs                            GNSS-ID-Bitmap
+    }                                                                                     OPTIONAL,
+    nrTime                                  PositioningModes                              OPTIONAL,
+    relativeTime                            PositioningModes                              OPTIONAL
+}
+-- TAG-SCHEDULEDLOCATIONTIMESUPPORTPERMODE-STOP
+
+-- TAG-MULTIPLICITY-AND-TYPE-CONSTRAINT-DEFINITIONS-START
+
+maxNrOfUEs                                  INTEGER ::= 256        -- Max number of Tx UEs or Rx UEs
+nrMaxBands                                  INTEGER ::= 1024       -- Maximum number of supported bands in UE capability
+
+-- TAG-MULTIPLICITY-AND-TYPE-CONSTRAINT-DEFINITIONS-STOP
+
+
+END
+
+-- TAG-SLPP-PDU-COMMONCONTENTS-START
+
+SLPP-PDU-CommonContents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+IMPORTS
+    ARFCN-ValueNR,
+    NCGI,
+    NR-PhysCellID,
+    SL-TimeStamp
+FROM
+    SLPP-PDU-Definitions;
+
+-- TAG-SLPP-PDU-COMMON-CONTENTS-STOP
+
+-- TAG-COMMONIESREQUESTCAPABILITIES-START
+
+CommonIEsRequestCapabilities ::= SEQUENCE {
+    ...
+}
+
+-- TAG-COMMONIESREQUESTCAPABILITIES-STOP
+
+-- TAG-COMMONIESPROVIDECAPABILITIES-START
+
+CommonIEsProvideCapabilities ::= SEQUENCE {
+    ...
+}
+-- TAG-COMMONIESPROVIDECAPABILITIES-STOP
+
+-- TAG-COMMONIESREQUESTASSISTANCEDATA-START
+
+CommonIEsRequestAssistanceData ::= SEQUENCE {
+    ...
+}
+-- TAG-COMMONIESREQUESTASSISTANCEDATA-STOP
+
+-- TAG-COMMONIESPROVIDEASSISTANCEDATA-START
+
+CommonIEsProvideAssistanceData ::= SEQUENCE {
+    ...
+}
+
+-- TAG-COMMONIESPROVIDEASSISTANCEDATA-STOP
+
+-- TAG-COMMONIESREQUESTLOCATIONINFORMATION-START
+
+CommonIEsRequestLocationInformation ::= SEQUENCE {
+    locationInformationType                 LocationInformationType,
+    periodicalReporting                     PeriodicalReportingCriteria OPTIONAL,
+    additionalInformation                   AdditionalInformation       OPTIONAL,
+    qos                                     QoS                         OPTIONAL,
+    environment                             Environment                 OPTIONAL,
+    scheduledLocationTime                   ScheduledLocationTime       OPTIONAL,
+    locationCoordinateTypes                 LocationCoordinateTypes     OPTIONAL,
+    velocityTypes                           VelocityTypes               OPTIONAL,
+    ...
+}
+
+LocationInformationType ::= ENUMERATED { locationEstimateRequired, locationMeasurementsRequired, locationEstimatePreferred,
+                                         locationMeasurementsPreferred, rangeEstimateRequired, rangeMeasurementsRequired,
+                                         rangeEstimatePreferred, rangeMeasurementsPreferred, directionEstimateRequired,
+                                         directionMeasurementsRequired, directionEstimatePreferred, directionMeasurementsPreferred,
+                                         rangeDirectionEstimateRequired, rangeDirectionMeasurementsRequired,
+                                         rangeDirectionEstimatePreferred, rangeDirectionMeasurementsPreferred,
+                                         relativeLocationEstimateRequired, relativeLocationMeasurementsRequired,
+                                         relativeLocationEstimatePreferred, relativeLocationMeasurementsPreferred, spare12, spare11,
+                                         spare10, spare9, spare8, spare7, spare6, spare5, spare4, spare3, spare2, spare1 }
+
+PeriodicalReportingCriteria ::= SEQUENCE {
+    reportingAmount                 ENUMERATED { ra2, ra4, ra8, ra16, ra32, ra64, ra-Infinity },
+    reportingInterval               ENUMERATED { ri1, ri2, ri4, ri8, ri10, ri16, ri20, ri32, ri64}
+}
+
+AdditionalInformation ::= ENUMERATED { onlyReturnInformationRequested, mayReturnAdditionalInformation}
+
+QoS ::= SEQUENCE {
+    horizontalAccuracy              HorizontalAccuracy    OPTIONAL,
+    verticalCoordinateRequest       BOOLEAN,
+    verticalAccuracy                VerticalAccuracy      OPTIONAL,
+    rangeAccuracy                   RangeAccuracy         OPTIONAL,
+    azimuthAccuracy                 AzimuthAccuracy       OPTIONAL,
+    elevationAccuracy               ElevationAccuracy     OPTIONAL,
+    responseTime                    ResponseTime          OPTIONAL,
+    velocityRequest                 BOOLEAN
+}
+
+HorizontalAccuracy ::= SEQUENCE {
+    accuracy               INTEGER(0..255),
+    confidence             INTEGER(0..100)
+}
+
+VerticalAccuracy ::= SEQUENCE {
+    accuracy             INTEGER(0..255),
+    confidence           INTEGER(0..100)
+}
+
+RangeAccuracy ::= SEQUENCE {
+    accuracy          INTEGER(0..127),
+    confidence        INTEGER(0..100)
+}
+AzimuthAccuracy ::= SEQUENCE {
+    accuracy            INTEGER(0..127),
+    confidence          INTEGER(0..100)
+}
+
+ElevationAccuracy ::= SEQUENCE {
+    accuracy              INTEGER(0..127),
+    confidence            INTEGER(0..100)
+}
+
+ResponseTime ::= SEQUENCE {
+    time             INTEGER (1..128),
+    tenMilliSeconds  ENUMERATED { true}    OPTIONAL
+}
+
+Environment ::= ENUMERATED { badArea, notBadArea, mixedArea}
+
+ScheduledLocationTime ::= SEQUENCE {
+    utc-Time                  UTCTime                                       OPTIONAL,
+    gnss-Time                 SEQUENCE {
+        gnss-TOD-Msec              INTEGER (0..3599999),
+        gnss-TimeID                GNSS-ID
+    }                                                                       OPTIONAL,
+    nr-Time                   SEQUENCE {
+        nr-PhysCellID             NR-PhysCellID,
+        nr-ARFCN                  ARFCN-ValueNR,
+        nr-CellGlobalID           NCGI                                      OPTIONAL,
+        nr-SFN                    INTEGER (0..1023),
+        nr-Slot                   CHOICE {
+            scs15                     INTEGER (0..9),
+            scs30                     INTEGER (0..19),
+            scs60                     INTEGER (0..39),
+            scs120                    INTEGER (0..79)
+        }                                                                   OPTIONAL
+    }                                                                       OPTIONAL,
+    relativeTime              INTEGER (1..1024)                             OPTIONAL
+}
+
+GNSS-ID ::= ENUMERATED{ gps, sbas, qzss, galileo, glonass, bds, navic, spare1}
+
+LocationCoordinateTypes ::= SEQUENCE {
+    ellipsoidPoint                                          BOOLEAN,
+    ellipsoidPointWithUncertaintyCircle                     BOOLEAN,
+    ellipsoidPointWithUncertaintyEllipse                    BOOLEAN,
+    polygon                                                 BOOLEAN,
+    ellipsoidPointWithAltitude                              BOOLEAN,
+    ellipsoidPointWithAltitudeAndUncertaintyEllipsoid       BOOLEAN,
+    ellipsoidArc                                            BOOLEAN,
+    relative2D-LocationWithUncertaintyEllipse               BOOLEAN,
+    relative3D-LocationWithUncertaintyEllipsoid             BOOLEAN,
+    rangeAndDirection-range                                 BOOLEAN,
+    rangeAndDirection-azimuth                               BOOLEAN,
+    rangeAndDirection-elevation                             BOOLEAN,
+    ...
+}
+
+VelocityTypes ::= SEQUENCE {
+    horizontalVelocity                                      BOOLEAN,
+    horizontalWithVerticalVelocity                          BOOLEAN,
+    horizontalVelocityWithUncertainty                       BOOLEAN,
+    horizontalWithVerticalVelocityAndUncertainty            BOOLEAN,
+    relativeVelocityWithUncertainty                         BOOLEAN,
+    ...
+}
+
+-- TAG-COMMONIESREQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-COMMONIESPROVIDELOCATIONINFORMATION-START
+
+CommonIEsProvideLocationInformation ::= SEQUENCE {
+    locationEstimate                        LocationCoordinates            OPTIONAL, -- locationTargetUe-sl-pos
+    rangeAndOrDirection                     RangeAndOrDirection            OPTIONAL,
+    velocityEstimate                        Velocity                       OPTIONAL,
+    relativeLocationEstimate                RelativeLocationCoordinates    OPTIONAL,
+    locationError                           LocationError                  OPTIONAL,
+    ...,
+    [[
+    locationTimeStamp                       SL-TimeStamp                   OPTIONAL
+    ]]
+}
+
+LocationCoordinates ::= CHOICE {
+    ellipsoidPoint                                      EllipsoidPoint,
+    ellipsoidPointWithUncertaintyCircle                 EllipsoidPointWithUncertaintyCircle,
+    ellipsoidPointWithUncertaintyEllipse                EllipsoidPointWithUncertaintyEllipse,
+    polygon                                             Polygon,
+    ellipsoidPointWithAltitude                          EllipsoidPointWithAltitude,
+    ellipsoidPointWithAltitudeAndUncertaintyEllipsoid   EllipsoidPointWithAltitudeAndUncertaintyEllipsoid,
+    ellipsoidArc                                        EllipsoidArc
+}
+
+RelativeLocationCoordinates ::= CHOICE {
+    relative2D-LocationWithUncertaintyEllipse                                      Relative2D-LocationWithUncertaintyEllipse,
+    relative3D-LocationWithUncertaintyEllipsoid                                    Relative3D-LocationWithUncertaintyEllipsoid,
+    ...
+}
+
+Relative2D-LocationWithUncertaintyEllipse ::=   SEQUENCE {
+    x                                               INTEGER (-134217728..134217727),   -- 28 bit field
+    y                                               INTEGER (-134217728..134217727),   -- 28 bit field
+    uncertaintySemiMajor                            INTEGER (0..255),
+    uncertaintySemiMinor                            INTEGER (0..255),
+    orientationMajorAxis                            INTEGER (0..179),
+    confidence                                      INTEGER (0..100)
+}
+
+Relative3D-LocationWithUncertaintyEllipsoid ::= SEQUENCE {
+    x                                               INTEGER (-134217728..134217727),     -- 28 bit field
+    y                                               INTEGER (-134217728..134217727),     -- 28 bit field
+    z                                               INTEGER (-16777216..16777215),       -- 25 bit field
+    uncertaintySemiMajor                            INTEGER (0..255),
+    uncertaintySemiMinor                            INTEGER (0..255),
+    orientationMajorAxis                            INTEGER (0..179),
+    uncertaintyAltitude                             INTEGER (0..255),
+    confidence                                      INTEGER (0..100)
+}
+
+Velocity ::= CHOICE {
+    horizontalVelocity                              HorizontalVelocity,
+    horizontalWithVerticalVelocity                  HorizontalWithVerticalVelocity,
+    horizontalVelocityWithUncertainty               HorizontalVelocityWithUncertainty,
+    horizontalWithVerticalVelocityAndUncertainty    HorizontalWithVerticalVelocityAndUncertainty,
+    relativeVelocityWithUncertainty                 RelativeVelocityWithUncertainty
+}
+
+LocationError ::= SEQUENCE {
+    locationfailurecause        LocationFailureCause
+}
+
+LocationFailureCause ::= ENUMERATED { undefined, requestedMethodNotSupported, positionMethodFailure, periodicLocationMeasurementsNotAvailable}
+
+EllipsoidPoint ::= SEQUENCE {
+    latitudeSign        ENUMERATED {north, south},
+    degreesLatitude     INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude    INTEGER (-8388608..8388607)  -- 24 bit field
+}
+
+EllipsoidPointWithUncertaintyCircle ::= SEQUENCE {
+    latitudeSign                             ENUMERATED {north, south},
+    degreesLatitude                          INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude                         INTEGER (-8388608..8388607), -- 24 bit field
+    uncertainty                              INTEGER (0..127)
+}
+
+EllipsoidPointWithUncertaintyEllipse ::= SEQUENCE {
+    latitudeSign                             ENUMERATED {north, south},
+    degreesLatitude                          INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude                         INTEGER (-8388608..8388607), -- 24 bit field
+    uncertaintySemiMajor                     INTEGER (0..127),
+    uncertaintySemiMinor                     INTEGER (0..127),
+    orientationMajorAxis                     INTEGER (0..179),
+    confidence                               INTEGER (0..100)
+}
+
+EllipsoidPointWithAltitude ::= SEQUENCE {
+    latitudeSign                   ENUMERATED {north, south},
+    degreesLatitude                INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude               INTEGER (-8388608..8388607), -- 24 bit field
+    altitudeDirection              ENUMERATED {height, depth},
+    altitude                       INTEGER (0..32767)           -- 15 bit field
+}
+
+EllipsoidPointWithAltitudeAndUncertaintyEllipsoid ::= SEQUENCE {
+    latitudeSign                                          ENUMERATED {north, south},
+    degreesLatitude                                       INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude                                      INTEGER (-8388608..8388607), -- 24 bit field
+    altitudeDirection                                     ENUMERATED {height, depth},
+    altitude                                              INTEGER (0..32767),          -- 15 bit field
+    uncertaintySemiMajor                                  INTEGER (0..127),
+    uncertaintySemiMinor                                  INTEGER (0..127),
+    orientationMajorAxis                                  INTEGER (0..179),
+    uncertaintyAltitude                                   INTEGER (0..127),
+    confidence                                            INTEGER (0..100)
+}
+
+EllipsoidArc ::= SEQUENCE {
+    latitudeSign                ENUMERATED {north, south},
+    degreesLatitude             INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude            INTEGER (-8388608..8388607), -- 24 bit field
+    innerRadius                 INTEGER (0..65535),          -- 16 bit field,
+    uncertaintyRadius           INTEGER (0..127),
+    offsetAngle                 INTEGER (0..179),
+    includedAngle               INTEGER (0..179),
+    confidence                  INTEGER (0..100)
+}
+
+RangeAndOrDirection ::= SEQUENCE {
+    range                   Range       OPTIONAL,
+    azimuth                 Azimuth     OPTIONAL,
+    elevation               Elevation   OPTIONAL
+}
+
+Range ::= SEQUENCE {
+    rangeResult                  INTEGER (0..134217727),
+    uncertainty                  INTEGER (0..255),
+    confidence                   INTEGER (0..100)             OPTIONAL
+}
+
+Azimuth ::= SEQUENCE {
+    azimuthResult                INTEGER (0..3599),
+    uncertainty                  INTEGER (0..127),
+    confidence                   INTEGER (0..100)             OPTIONAL
+}
+
+Elevation ::= SEQUENCE {
+    elevationResult              INTEGER (0..1800),
+    uncertainty                  INTEGER (0..63),
+    confidence                   INTEGER (0..100)             OPTIONAL
+}
+
+HorizontalVelocity ::= SEQUENCE {
+    bearing               INTEGER(0..359),
+    horizontalSpeed       INTEGER(0..2047)
+}
+
+HorizontalWithVerticalVelocity ::= SEQUENCE {
+    bearing                            INTEGER(0..359),
+    horizontalSpeed                    INTEGER(0..2047),
+    verticalDirection                  ENUMERATED{upward, downward},
+    verticalSpeed                      INTEGER(0..255)
+}
+
+HorizontalVelocityWithUncertainty ::= SEQUENCE {
+    bearing                               INTEGER(0..359),
+    horizontalSpeed                       INTEGER(0..2047),
+    uncertaintySpeed                      INTEGER(0..255)
+}
+
+HorizontalWithVerticalVelocityAndUncertainty ::= SEQUENCE {
+    bearing                                          INTEGER(0..359),
+    horizontalSpeed                                  INTEGER(0..2047),
+    verticalDirection                                ENUMERATED{upward, downward},
+    verticalSpeed                                    INTEGER(0..255),
+    horizontalUncertaintySpeed                       INTEGER(0..255),
+    verticalUncertaintySpeed                         INTEGER(0..255)
+}
+
+Polygon ::= SEQUENCE (SIZE (3..15)) OF PolygonPoints
+
+PolygonPoints ::= SEQUENCE {
+    latitudeSign      ENUMERATED {north, south},
+    degreesLatitude   INTEGER (0..8388607),        -- 23 bit field
+    degreesLongitude  INTEGER (-8388608..8388607)  -- 24 bit field
+}
+
+RelativeVelocityWithUncertainty ::=        SEQUENCE {
+    radialVelocityComponent                    SEQUENCE {
+        unitsRadialVelocity                        ENUMERATED { mPerS, cmPerS, ... },
+        radialVelocity                             INTEGER (-2048..2047),
+        uncertaintyRadialVelocity                  INTEGER (0..255),
+        confidenceUncertaintyRadialVelocity        INTEGER (0..100)
+    }                                                                                             OPTIONAL,
+    transverseVelocityComponent                SEQUENCE {
+        unitsTransverseVelocity                    ENUMERATED { degPerSec1, degPerSec0-1, ... },
+        azimuth                                    SEQUENCE {
+            azimuthRateOfChange                        INTEGER (0..1023),
+            uncertaintyAzimuthRateOfChange             INTEGER (0..255),
+            confidenceUncertaintyAzimuthRateOfChange   INTEGER (0..100)
+        }                                                                                         OPTIONAL,
+        elevation                       SEQUENCE {
+            elevationRateOfChange                      INTEGER (0..1023),
+            uncertaintyElevationRateOfChange           INTEGER (0..255),
+            confidenceUncertaintyElevationRateOfChange INTEGER (0..100)
+        }                                                                                         OPTIONAL
+    }                                                                                             OPTIONAL,
+    ...,
+    [[
+    azimuthRateOfChangeDirection               ENUMERATED {anticlockwise}                         OPTIONAL,
+    elevationRateOfChangeDirection             ENUMERATED {downward}                              OPTIONAL
+    ]]
+}
+
+-- TAG-COMMONIESPROVIDELOCATIONINFORMATION-STOP
+
+
+END
+
+-- TAG-SLPP-PDU-COMMONSL-PRS-METHODSCONTENTS-START
+
+SLPP-PDU-CommonSL-PRS-MethodsContents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+    EllipsoidPoint,
+    EllipsoidPointWithUncertaintyEllipse,
+    EllipsoidPointWithAltitude,
+    EllipsoidPointWithAltitudeAndUncertaintyEllipsoid
+
+FROM
+    SLPP-PDU-CommonContents
+
+    SL-TimeStamp,
+    maxNrOfUEs,
+    nrMaxBands
+
+FROM
+    SLPP-PDU-Definitions;
+
+-- TAG-SLPP-PDU-COMMONSL-PRS-METHODSCONTENTS-STOP
+
+-- TAG-COMMONSL-PRS-METHODSIESREQUESTCAPABILITIES-START
+
+CommonSL-PRS-MethodsIEsRequestCapabilities ::= SEQUENCE {
+    ...
+}
+
+-- TAG-COMMONSL-PRS-METHODSIESREQUESTCAPABILITIES-STOP
+
+-- TAG-COMMONSL-PRS-METHODSIESPROVIDECAPABILITIES-START
+
+CommonSL-PRS-MethodsIEsProvideCapabilities ::= SEQUENCE {
+    --R1 41-1-1a Common SL-PRS processing capability per UE
+    sl-PRS-CommonProcCapabilityPerUE               SL-PRS-CommonProcCapabilityPerUE            OPTIONAL,
+    sl-PRS-CapabilityBandList                      SEQUENCE (SIZE (1..nrMaxBands)) OF SL-PRS-CapabilityPerBand,
+    ...
+}
+
+SL-PRS-CapabilityPerBand ::=                SEQUENCE {
+    freqBandIndicatorNR                         INTEGER (1..1024),
+    --R1 41-1-1 Common SL-PRS processing capability in an SL BWP
+    sl-PRS-CommonProcCapabilityPerBand          SL-PRS-CommonProcCapabilityPerBand             OPTIONAL,
+    --R1 41-1-19 ARP location provision for sidelink as assistance data
+    sl-PositioningARP-LocationProvision         ENUMERATED {supported}                         OPTIONAL,
+    dummy1                                      ENUMERATED {supported}                         OPTIONAL,
+    dummy2                                      ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-2 Receiving SL-PRS in a shared resource pool
+    sl-PRS-RxInSharedResourcePool               ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-3 Receiving SL-PRS in a dedicated resource pool
+    sl-PRS-RxInDedicatedResourcePool            SL-PRS-RxInDedicatedResourcePool               OPTIONAL,
+    --R1 41-1-4a Transmitting SL-PRS in a shared resource pool
+    sl-PRS-TxInSharedResourcePool               ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-4b Transmitting SL-PRS mode 1 in a dedicated resource pool
+    sl-PRS-TxScheme1InDedicatedResourcePool     ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-4c Transmitting SL-PRS mode 2 in a dedicated resource pool
+    sl-PRS-TxScheme2InDedicatedResourcePool     ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-7e SL PRS measurement for SL PRS-RSRP
+    sl-PRS-RSRP-Meas                            ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-7f SL PRS measurement for SL PRS-RSRPP
+    sl-PRS-RSRPP-Meas                           ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-11 TDM-based multiplexing of SL-PRS reception from different UEs in the same slot in dedicated resource pool
+    sl-PRS-TDM-Multiplexing                     ENUMERATED {supported}                         OPTIONAL,
+    --R1 41-1-12 Comb-based multiplexing for SL-PRS reception from different UEs in the same slot in dedicated resource pool
+    sl-PRS-RxCombMultiplexing                  ENUMERATED {supported}                          OPTIONAL,
+    --R1 41-1-13 Reporting the additional paths for SL positioning
+    sl-PRS-AdditionalPathsReport                ENUMERATED {n1,n2,n4,n6,n8}                    OPTIONAL,
+    --R1 41-1-14 LoS/NLoS indicator for SL positioning per measurement
+    sl-PRS-LOS-NLOS-Indication                  ENUMERATED {hard, hard-soft}                   OPTIONAL,
+    -- R1 41-1-20: Supports SL PRS Rx for a band configured with SL CA
+    sl-PRS-RxForBandWithSL-CA                   ENUMERATED {supported}                         OPTIONAL,
+    -- R1 41-1-21: Supports SL PRS Tx for a band configured with SL CA
+    sl-PRS-TxForBandWithSL-CA                   ENUMERATED {supported}                         OPTIONAL,
+    ...,
+    [[
+    --R1 41-1-19b Report of Tx ARP-ID to LMF or another UE for the transmitted SL PRS
+    sl-PRS-ReportTxARP-ID                       ENUMERATED {n2, n3, n4}                         OPTIONAL
+    ]]
+}
+
+SL-PRS-CommonProcCapabilityPerUE ::=     SEQUENCE {
+    --R1 41-1-1a    Common SL-PRS processing capability
+    maxNumOfActiveSL-PRS-Resources           SEQUENCE {
+        fr1                                      ENUMERATED {n1, n2, n4, n6, n8, n12, n16, n24}                        OPTIONAL,
+        fr2                                      ENUMERATED {n1, n2, n4, n6, n8, n12, n16, n24, n32, n48, n64, n128}   OPTIONAL
+    },
+    maxNumOfSlotswithActiveSL-PRS-Resources  SEQUENCE {
+        fr1                                      ENUMERATED {n1, n2, n3, n4, n6, n8}                                   OPTIONAL,
+        fr2                                      ENUMERATED {n1, n2, n4, n8, n12, n16, n24, n32, n48, n64}             OPTIONAL
+    }
+}
+
+SL-PRS-CommonProcCapabilityPerBand ::=   SEQUENCE {
+    maxSL-PRS-Bandwidth                      CHOICE {
+        fr1                                      ENUMERATED {mhz5, mhz10, mhz20, mhz40, mhz50, mhz80, mhz100},
+        fr2                                      ENUMERATED {mhz50, mhz100, mhz200, mhz400}
+    },
+    maxNumOfActiveSL-PRS-ResourcesInOneSlot  CHOICE {
+        fr1                                      ENUMERATED {n1, n2, n4, n6, n8, n12, n16, n24},
+        fr2                                      ENUMERATED {n1, n2, n4, n6, n8, n12, n16, n24, n32, n48, n64, n128}
+    },
+    maxNumOfSlotsWithActiveSL-PRS-Resources  CHOICE {
+        fr1                                      ENUMERATED {n1, n2, n3, n4, n6, n8},
+        fr2                                      ENUMERATED {n1, n2, n4, n8, n12, n16, n24, n32, n48, n64}
+    },
+    minTimeAfterEndofSlotCarryActiveSL-PRS-Resources    ENUMERATED {ms20, ms30, ms40, ms50, ms80, ms100, ms160}
+}
+
+SL-PRS-RxInDedicatedResourcePool ::=  SEQUENCE {
+    numOfSupportedRxPSCCH-PerSlot         ENUMERATED {value1, value2},
+    supportedCP-TypeFor60kHzSCS           ENUMERATED {ncp, ncpAndECP}
+}
+
+-- TAG-COMMONSL-PRS-METHODSIESPROVIDECAPABILITIES-STOP
+
+-- TAG-COMMONSL-PRS-METHODSIESREQUESTASSISTANCEDATA-START
+
+CommonSL-PRS-MethodsIEsRequestAssistanceData ::= SEQUENCE {
+    sl-PRS-AssistanceDataInfoReq                     BIT STRING { sl-PRS-SequenceID-Req    (0),
+                                                                  anchorUE-LocationInfoReq (1),
+                                                                  arp-LocationInfoReq      (2),
+                                                                  sl-POS-ARP-ID-Tx-Req     (3)
+    }    (SIZE (1..8))                                                                            OPTIONAL,
+    ...
+}
+-- TAG-COMMONSL-PRS-METHODSIESREQUESTASSISTANCEDATA-STOP
+
+-- TAG-COMMONSL-PRS-METHODSIESPROVIDEASSISTANCEDDATA-START
+
+CommonSL-PRS-MethodsIEsProvideAssistanceData ::= SEQUENCE {
+    sl-PRS-AssistanceDataInfo                        SEQUENCE (SIZE (1..maxNrOfUEs)) OF SL-PRS-AssistanceData                OPTIONAL,
+    sl-PRS-Error                                     SL-PRS-AssistanceDataError                                              OPTIONAL,
+    ...
+}
+
+SL-PRS-AssistanceData ::= SEQUENCE {
+    applicationLayerID            OCTET STRING,
+    sl-PRS-SequenceID             INTEGER(0..4095)              OPTIONAL,  -- SL PRS sequence ID for transmitting SL-PRS
+    anchorUE-LocationInformation  AnchorLocationCoordinates     OPTIONAL,
+    arp-LocationInfo              ARP-LocationInfo              OPTIONAL,
+    sl-PRS-TxInfo                 SL-PRS-TxInfo                 OPTIONAL,
+    sl-POS-ARP-ID-Tx              SL-POS-ARP-ID-Tx-InfoList     OPTIONAL,
+    ...
+}
+
+AnchorLocationCoordinates ::= CHOICE {
+    ellipsoidPoint                                      EllipsoidPoint,
+    ellipsoidPointWithUncertaintyEllipse                EllipsoidPointWithUncertaintyEllipse,
+    ellipsoidPointWithAltitude                          EllipsoidPointWithAltitude,
+    ellipsoidPointWithAltitudeAndUncertaintyEllipsoid   EllipsoidPointWithAltitudeAndUncertaintyEllipsoid
+}
+
+ARP-LocationInfo ::= SEQUENCE {
+    referencePoint         ReferencePoint            OPTIONAL,
+    arp-LocationInfoList   SEQUENCE (SIZE (1..4)) OF ARP-LocationInfoElement
+}
+
+ReferencePoint ::= CHOICE {
+    location2D                          EllipsoidPointWithUncertaintyEllipse,
+    location3D                          EllipsoidPointWithAltitudeAndUncertaintyEllipsoid
+}
+
+ARP-LocationInfoElement ::= SEQUENCE {
+    sl-PRS-ARP-ID               INTEGER (1..4),
+    arp-LocationInfo            RelativeLocation
+}
+
+RelativeLocation ::= SEQUENCE {
+    milliArcSecondUnits  ENUMERATED { mas0-03, mas0-3, mas3, mas30},
+    heightUnits          ENUMERATED { mm, cm, m, spare1},
+    deltaLatitude        DeltaLatitude,
+    deltaLongitude       DeltaLongitude,
+    deltaHeight          DeltaHeight,
+    locationUNC          LocationUncertainty                             OPTIONAL
+}
+
+DeltaLatitude ::= SEQUENCE {
+    deltaLatitude        INTEGER (-1024..1023),
+    coarseDeltaLatitude  INTEGER (0..4095)        OPTIONAL
+}
+
+DeltaLongitude ::= SEQUENCE {
+    deltaLongitude        INTEGER (-1024..1023),
+    coarseDeltaLongitude  INTEGER (0..4095)        OPTIONAL
+}
+
+DeltaHeight ::= SEQUENCE {
+    deltaHeight        INTEGER (-1024..1023),
+    coarseDeltaHeight  INTEGER (0..4095)        OPTIONAL
+}
+
+LocationUncertainty ::= SEQUENCE {
+    horizontalUncertainty    INTEGER (0..255),
+    horizontalConfidence     INTEGER (0..100),
+    verticalUncertainty      INTEGER (0..255),
+    verticalConfidence       INTEGER (0..100)
+}
+
+SL-PRS-AssistanceDataError ::= ENUMERATED { undefined, assistanceDataNotAvailable, ... }
+
+SL-PRS-TxInfo ::=                 SEQUENCE {
+    sl-PRS-Priority                   INTEGER (1..8)                                                             OPTIONAL,
+    sl-PRS-DelayBudget                INTEGER (0..1023)                                                          OPTIONAL,
+    sl-PRS-Bandwidth                  ENUMERATED {mhz5, mhz10, mhz15, mhz20, mhz25, mhz30, mhz35, mhz40,
+                                                mhz45, mhz50, mhz60, mhz70, mhz80, mhz90, mhz100, mhz200, mhz400,
+                                                spare15, spare14, spare13, spare12, spare11, spare10, spare9, spare8,
+                                                spare7, spare6, spare5, spare4, spare3, spare2, spare1}          OPTIONAL,
+    sl-PRS-Periodicity                ENUMERATED {ms100, ms200, ms300, ms400, ms500, ms600, ms700, ms800,
+                                               ms900, ms1000, spare6, spare5, spare4, spare3, spare2, spare1}    OPTIONAL,
+    sl-PRS-Transmission               ENUMERATED {true}                                                          OPTIONAL
+}
+
+-- TAG-COMMONSL-PRS-METHODSIESPROVIDEASSISTANCEDDATA-STOP
+
+-- TAG-COMMONSL-PRS-METHODSIESREQUESTLOCATIONINFORMATION-START
+
+CommonSL-PRS-MethodsIEsRequestLocationInformation ::= SEQUENCE {
+    sl-POS-ARP-ID-Tx-Req                                  ENUMERATED { true }                 OPTIONAL,
+   ...
+}
+
+-- TAG-COMMONSL-PRS-METHODSIESREQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-COMMONSL-PRS-METHODSIESPROVIDELOCATIONINFORMATION-START
+
+CommonSL-PRS-MethodsIEsProvideLocationInformation ::= SEQUENCE {
+    sl-POS-ARP-ID-Tx                                      SL-POS-ARP-ID-Tx-InfoList            OPTIONAL,
+    sl-PRS-Error                                          SL-PRS-LocationInformationError      OPTIONAL,
+    ...
+}
+
+SL-POS-ARP-ID-Tx-InfoList ::= SEQUENCE (SIZE (1..4)) OF SL-POS-ARP-ID-Tx-Info
+
+SL-POS-ARP-ID-Tx-Info ::= SEQUENCE {
+    sl-POS-ARP-ID                          INTEGER (1..4),
+    sl-PRS-ResourceIdList-Tx               SEQUENCE (SIZE(1..16)) OF SL-PRS-ResourceId-Tx
+}
+
+SL-PRS-LocationInformationError ::= ENUMERATED { undefined, ... }
+
+SL-PRS-ResourceId-Tx ::= SEQUENCE {
+    sl-PRS-ResourceId        INTEGER (0..16)                      OPTIONAL,
+    tx-TimeStamp             SL-TimeStamp
+}
+
+-- TAG-COMMONSL-PRS-METHODSIESPROVIDELOCATIONINFORMATION-STOP
+
+
+END
+
+-- TAG-SLPP-PDU-SL-AOA-CONTENTS-START
+
+SLPP-PDU-SL-AoA-Contents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+    LCS-GCS-Translation,
+    LOS-NLOS-Indicator,
+    PositioningModes,
+    SL-TimeStamp,
+    SL-TimingQuality,
+    maxNrOfUEs,
+    ScheduledLocationTimeSupportPerMode,
+    nrMaxBands
+FROM
+    SLPP-PDU-Definitions
+
+    LocationCoordinateTypes,
+    VelocityTypes
+FROM
+    SLPP-PDU-CommonContents;
+
+-- TAG-SLPP-PDU-SL-AOA-CONTENTS-STOP
+
+-- TAG-SL-AOA-REQUESTCAPABILITIES-START
+
+SL-AoA-RequestCapabilities ::= SEQUENCE {
+    ...
+}
+
+-- TAG-SL-AOA-REQUESTCAPABILITIES-STOP
+
+-- TAG-SL-AOA-PROVIDECAPABILITIES-START
+
+SL-AoA-ProvideCapabilities ::= SEQUENCE {
+    positioningModes                     PositioningModes,
+    tenMsUnitResponseTime                PositioningModes                             OPTIONAL,
+    periodicalReporting                  PositioningModes                             OPTIONAL,
+    scheduledLocationRequestSupported    ScheduledLocationTimeSupportPerMode          OPTIONAL,
+    locationCoordinateTypes              LocationCoordinateTypes                      OPTIONAL,
+    velocityTypes                        VelocityTypes                                OPTIONAL,
+    sl-AoA-CapabilityBandList            SEQUENCE (SIZE (1..nrMaxBands)) OF SL-AoA-CapabilityPerBand,
+    ...
+}
+
+SL-AoA-CapabilityPerBand ::= SEQUENCE {
+    --R1 41-1-7g SL PRS measurement for SL AoA
+    sl-AoA-Meas                        BIT STRING { gcs (0), lcsWithTranslation (1), lcsWithoutTranslation (2) } (SIZE (1..8))
+                                                                                      OPTIONAL,
+    dummy                              ENUMERATED { supported }                       OPTIONAL,
+    ...,
+    [[
+    --R1 41-1-19a Report of Rx ARP-ID with SL positioning measurements
+    measurementsForMultipleARP-IDs-Rx  ENUMERATED {n2, n3, n4}                        OPTIONAL
+    ]],
+    [[
+    freqBandIndicatorNR                INTEGER (1..1024)                              OPTIONAL
+    ]]
+}
+
+-- TAG-SL-AOA-PROVIDECAPABILITIES-STOP
+
+-- TAG-SL-AOA-REQUESTASSISTANCEDATA-START
+
+SL-AoA-RequestAssistanceData ::= SEQUENCE {
+    expectedSL-ElevationAoA-AndUncertainty          ENUMERATED { true}                           OPTIONAL,
+    ...
+}
+-- TAG-SL-AOA-REQUESTASSISTANCEDATA-STOP
+
+-- TAG-SL-AOA-PROVIDEASSISTANCEDATA-START
+
+SL-AoA-ProvideAssistanceData ::= SEQUENCE {
+    sl-AoA-AssistanceDataInfo        SEQUENCE (SIZE (1..maxNrOfUEs)) OF SL-AoA-AssistanceData     OPTIONAL,
+    sl-AoA-Error                     SL-AoA-AssistanceDataError                                   OPTIONAL,
+    ...
+}
+
+SL-AoA-AssistanceData ::= SEQUENCE {
+    applicationLayerID                           OCTET STRING,
+    expectedSL-AoA                               SEQUENCE {
+        expectedSL-AzimuthAoA                        INTEGER(0..3599),                  -- expected-SL-AoA-and-Uncertainty
+        expectedSL-AzimuthAoA-Uncertainty            INTEGER (0..60)         OPTIONAL,
+        expectedSL-ElevationAoA                      INTEGER(0..1800)        OPTIONAL,  -- expected-SL-AoA-and-Uncertainty
+        expectedSL-ElevationAoA-Uncertainty          INTEGER(0..30)          OPTIONAL
+    },
+    lcs-GCS-TranslationParameter                 LCS-GCS-Translation         OPTIONAL,
+    ...
+}
+
+SL-AoA-AssistanceDataError ::= ENUMERATED { undefined, assistanceDataNotAvailable, ... }
+
+-- TAG-SL-AoA-PROVIDEASSISTANCEDATA-STOP
+
+-- TAG-SL-AOA-REQUESTLOCATIONINFORMATION-START
+
+SL-AoA-RequestLocationInformation ::= SEQUENCE {
+    sl-AoA-Request                        ENUMERATED { aoa, zoa, both},
+    measurementReportingType              ENUMERATED { gcs, lcsWithTranslation, lcsWithoutTranslation }    OPTIONAL,
+    measurementsForMultipleARP-IDs-Rx     SEQUENCE {
+        requestedARP-IDs-Rx                   BIT STRING (SIZE (4))                                        OPTIONAL
+    }                                                                                                      OPTIONAL,
+    sl-ARP-InfoRequest                    ENUMERATED { true }                                              OPTIONAL,
+    sl-LOS-NLOS-IndicatorRequest          ENUMERATED { true }                                              OPTIONAL,
+    sl-PRS-RSRP-Request                   ENUMERATED { true }                                              OPTIONAL,
+    sl-RSRPP-Request                      ENUMERATED { true }                                              OPTIONAL,
+    sl-AdditionalPathsRequest             ENUMERATED { true }                                              OPTIONAL,
+    ...
+}
+
+-- TAG-SL-AOA-REQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-SL-AOA-PROVIDELOCATIONINFORMATION-START
+
+SL-AoA-ProvideLocationInformation ::= SEQUENCE {
+    sl-AoA-SignalMeasurementInformation   SL-AoA-SignalMeasurementInformation    OPTIONAL,
+    sl-AoA-Error                          SL-AoA-LocationInformationError        OPTIONAL,
+    ...
+}
+
+SL-AoA-SignalMeasurementInformation ::= SEQUENCE {
+    sl-AoA-MeasList                         SEQUENCE (SIZE(1.. maxNrOfUEs)) OF SL-AoA-MeasElementPerARP-ID-Rx,
+    ...
+}
+
+SL-AoA-MeasElementPerARP-ID-Rx ::= SEQUENCE (SIZE(1..4)) OF SL-AoA-MeasElement
+
+SL-AoA-MeasElement ::= SEQUENCE {
+    applicationLayerID                    OCTET STRING              OPTIONAL,  -- Cond FirstElement
+    sl-LCS-GCS-Translation                LCS-GCS-Translation       OPTIONAL,  -- Cond FirstElement
+    los-NLOS-Indicator                    LOS-NLOS-Indicator        OPTIONAL,  -- sl-losNlosIndicator
+    sl-AngleQuality                       MeasurementAngleQuality   OPTIONAL,  -- sl-AngleQuality
+    sl-AoA-AdditionalPathList             SL-AoA-AdditionalPathList OPTIONAL,
+    sl-AzimuthAoA-Result                  INTEGER (0..3599)         OPTIONAL,  -- sl-PRS-AoA
+    sl-POS-ARP-ID-Rx                      INTEGER (1..4)            OPTIONAL,  -- sl-pos-arpID-Rx
+    sl-PRS-ResourceId                     INTEGER (0..16)           OPTIONAL,  -- sl-PRS-ResourceId
+    sl-PRS-RSRP-Result                    INTEGER (0..126)          OPTIONAL,  -- sl-PRS-RSRP
+    sl-PRS-RSRPP-Result                   INTEGER (0..126)          OPTIONAL,  -- sl-PRS-RSRPP
+    sl-TimeStamp                          SL-TimeStamp              OPTIONAL,  -- sl-Timestamp
+    sl-ElevationAoA-Result                INTEGER (0..1800)         OPTIONAL,  -- sl-PRS-AoA
+    ...
+}
+
+SL-AoA-AdditionalPathList ::= SEQUENCE (SIZE(1..2)) OF SL-AoA-AdditionalPath
+
+SL-AoA-AdditionalPath  ::= SEQUENCE {
+    sl-AngleQuality                            MeasurementAngleQuality   OPTIONAL,  -- sl-AngleQuality
+    sl-AzimuthAoA-AdditionalPathResult         INTEGER (0..3599)         OPTIONAL,  -- additionalPath-SL-PRS-AoA
+    sl-ElevationAoA-AdditionalPathResult       INTEGER (0..1800)         OPTIONAL,  -- additionalPath-SL-PRS-AoA
+    sl-PRS-AdditionalPathRSRPP-Result          INTEGER (0..126)          OPTIONAL,  -- additionalPath-SL-PRS-RSRPP
+    ...
+}
+
+MeasurementAngleQuality ::= SEQUENCE {
+    azimuthQuality              INTEGER (0..255),
+    elevationQuality            INTEGER (0..255)        OPTIONAL
+}
+
+SL-AoA-LocationInformationError ::= ENUMERATED { undefined, assistanceDataMissing, notAllRequestedMeasurementsPossible, ... }
+
+-- TAG-SL-AOA-PROVIDELOCATIONINFORMATION-STOP
+
+
+END
+
+-- TAG-SLPP-PDU-SL-RTT-CONTENTS-START
+
+SLPP-PDU-SL-RTT-Contents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+    LOS-NLOS-Indicator,
+    PositioningModes,
+    SL-TimeStamp,
+    SL-TimingQuality,
+    maxNrOfUEs,
+    ScheduledLocationTimeSupportPerMode,
+    nrMaxBands
+
+FROM
+    SLPP-PDU-Definitions
+
+    LocationCoordinateTypes,
+    VelocityTypes
+
+FROM
+    SLPP-PDU-CommonContents;
+
+-- TAG-SLPP-PDU-SL-RTT-CONTENTS-STOP
+
+-- TAG-SL-RTT-REQUESTCAPABILITIES-START
+
+SL-RTT-RequestCapabilities ::= SEQUENCE {
+    ...
+}
+
+-- TAG-SL-RTT-REQUESTCAPABILITIES-STOP
+
+-- TAG-SL-RTT-PROVIDECAPABILITIES-START
+
+SL-RTT-ProvideCapabilities ::= SEQUENCE {
+    positioningModes                     PositioningModes,
+    tenMsUnitResponseTime                PositioningModes                            OPTIONAL,
+    periodicalReporting                  PositioningModes                            OPTIONAL,
+    scheduledLocationRequestSupported    ScheduledLocationTimeSupportPerMode         OPTIONAL,
+    locationCoordinateTypes              LocationCoordinateTypes                     OPTIONAL,
+    velocityTypes                        VelocityTypes                               OPTIONAL,
+    sl-RTT-CapabilityBandList            SEQUENCE (SIZE (1..nrMaxBands)) OF SL-RTT-CapabilityPerBand,
+    ...
+}
+
+SL-RTT-CapabilityPerBand ::= SEQUENCE {
+    --R1 41-1-7c SL PRS measurement for UE Rx–Tx time difference without Tx time stamp
+    sl-PRS-RxTxTimeDiffWithoutTxTimeStamp ENUMERATED {n1,n2,n3,n4}                        OPTIONAL,
+    --R1 41-1-7d SL PRS measurement for UE Rx–Tx time difference with Tx time stamp
+    sl-PRS-RxTxTimeDiffWithTxTimeStamp    SEQUENCE {
+        numOfMeasForSameSL-PRS                ENUMERATED {n1,n2,n3,n4},
+        maxMeasReportingForDiffSL-PRS         ENUMERATED {n1,n2,n3,n4}
+    }                                                                                     OPTIONAL,
+    dummy                                 ENUMERATED { supported }                        OPTIONAL,
+    ...,
+    [[
+    --R1 41-1-19a Report of Rx ARP-ID with SL positioning measurements
+    measurementsForMultipleARP-IDs-Rx     ENUMERATED {n2, n3, n4}                         OPTIONAL
+    ]],
+    [[
+    freqBandIndicatorNR                   INTEGER (1..1024)                               OPTIONAL
+    ]]
+}
+
+-- TAG-SL-RTT-PROVIDECAPABILITIES-STOP
+
+-- TAG-SL-RTT-REQUESTASSISTANCEDATA-START
+
+SL-RTT-RequestAssistanceData ::= SEQUENCE {
+    ...
+}
+-- TAG-SL-RTT-REQUESTASSISTANCEDATA-STOP
+
+-- TAG-SL-RTT-PROVIDEASSISTANCEDATA-START
+
+SL-RTT-ProvideAssistanceData ::= SEQUENCE {
+    ...
+}
+
+-- TAG-SL-RTT-PROVIDEASSISTANCEDATA-STOP
+
+-- TAG-SL-RTT-REQUESTLOCATIONINFORMATION-START
+
+SL-RTT-RequestLocationInformation ::= SEQUENCE {
+    sl-ARP-InfoRequest                    ENUMERATED { true }              OPTIONAL,
+    sl-LOS-NLOS-IndicatorRequest          ENUMERATED { true }              OPTIONAL,
+    sl-PRS-RSRP-Request                   ENUMERATED { true }              OPTIONAL,
+    sl-RSRPP-Request                      ENUMERATED { true }              OPTIONAL,
+    sl-AdditionalPathsRequest             ENUMERATED { true }              OPTIONAL,
+    dummy                                 ENUMERATED { true }              OPTIONAL,
+    multipleSL-PRS-RxTxTimeDiffRequest    SEQUENCE {
+        diffSL-PRS-Receptions                 ENUMERATED { n2, n3, n4 }    OPTIONAL,
+        diffSL-PRS-Transmissions              ENUMERATED { n2, n3, n4 }    OPTIONAL
+    }                                                                      OPTIONAL,
+    measurementsForMultipleARP-IDs-Rx     SEQUENCE {
+        requestedARP-IDs-Rx                   BIT STRING (SIZE (4))        OPTIONAL
+    }                                                                      OPTIONAL,
+    associatedSL-PRS-TxTimeStampRequest   ENUMERATED { true }              OPTIONAL,
+    ...
+}
+
+-- TAG-SL-RTT-REQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-SL-RTT-PROVIDELOCATIONINFORMATION-START
+
+SL-RTT-ProvideLocationInformation ::= SEQUENCE {
+    sl-RTT-SignalMeasurementInformation   SL-RTT-SignalMeasurementInformation    OPTIONAL,
+    sl-RTT-Error                          SL-RTT-LocationInformationError        OPTIONAL,
+    ...
+}
+
+SL-RTT-MeasElementPerARP-ID-Rx ::= SEQUENCE (SIZE(1..4)) OF SL-RTT-MeasElement
+
+SL-RTT-SignalMeasurementInformation ::= SEQUENCE {
+    sl-RTT-MeasList                         SEQUENCE (SIZE(1..maxNrOfUEs)) OF SL-RTT-MeasElementPerARP-ID-Rx,
+    ...
+}
+
+SL-RTT-MeasElement ::= SEQUENCE {
+    applicationLayerID                    OCTET STRING              OPTIONAL,  -- Cond FirstElement
+    los-NLOS-Indicator                    LOS-NLOS-Indicator        OPTIONAL,  -- sl-losNlosIndicator
+    sl-POS-ARP-ID-Rx                      INTEGER (1..4)            OPTIONAL,  -- sl-pos-arpID-Rx
+    sl-PRS-RxTxTimeDiffMeasResult         SL-PRS-RxTxTimeDiffMeasResult,
+    ...
+}
+
+SL-PRS-RxTxTimeDiffMeasResult ::= CHOICE {
+    single-SL-PRS-RxTxTimeDiff        SL-PRS-RxTxTimeDiffResult,
+    multiple-SL-PRS-RxTxTimeDiff          SEQUENCE {
+        sameSL-PRS-TxAndDiffSL-PRS-Rx         SEQUENCE (SIZE (2..4)) OF SL-PRS-RxTxTimeDiffResult    OPTIONAL,
+        sameSL-PRS-RxAndDiffSL-PRS-Tx         SEQUENCE (SIZE (2..4)) OF SL-PRS-RxTxTimeDiffResult    OPTIONAL
+    },
+    ...
+}
+
+SL-PRS-RxTxTimeDiffResult ::= SEQUENCE {
+    sl-PRS-ResourceId             INTEGER (0..16)               OPTIONAL,  -- sl-PRS-ResourceId
+    sl-PRS-RxTxTimeDiffResult         CHOICE {
+        k0                                INTEGER (0..1970049),
+        k1                                INTEGER (0..985025),
+        k2                                INTEGER (0..492513),
+        k3                                INTEGER (0..246257),
+        k4                                INTEGER (0..123129),
+        k5                                INTEGER (0..61565)
+    }                                                           OPTIONAL,  -- sl-PRS-RxTxTimeDiff
+    sl-PRS-RSRP-Result            INTEGER (0..126)              OPTIONAL,  -- sl-PRS-RSRP
+    sl-PRS-RSRPP-Result           INTEGER (0..126)              OPTIONAL,  -- sl-PRS-RSRPP
+    sl-RTT-AdditionalPathList     SL-RTT-AdditionalPathList     OPTIONAL,
+    sl-TimeStamp                  SL-TimeStamp                  OPTIONAL,  -- sl-Timestamp
+    sl-TimingQuality              SL-TimingQuality              OPTIONAL,  -- sl-TimingQuality
+    tx-TimeInfo                   SL-TimeStamp                  OPTIONAL,  -- tx-Time-Info
+    ...
+
+}
+
+SL-RTT-AdditionalPathList ::= SEQUENCE (SIZE(1..8)) OF SL-RTT-AdditionalPath
+
+SL-RTT-AdditionalPath  ::= SEQUENCE {
+    sl-PRS-RxTxTimeDiffAdditionalPathResult    CHOICE {
+        k0                                         INTEGER (0..8191),
+        k1                                         INTEGER (0..4095),
+        k2                                         INTEGER (0..2047),
+        k3                                         INTEGER (0..1023),
+        k4                                         INTEGER (0..511),
+        k5                                         INTEGER (0..255)
+    }                                                                   OPTIONAL,  -- additionalPath-SL-PRS-Rx-Tx-TimeDiff
+    sl-PRS-AdditionalPathRSRPP-Result          INTEGER (0..126)         OPTIONAL,  -- additionalPath-SL-PRS-RSRPP
+    sl-TimingQuality                           SL-TimingQuality         OPTIONAL,  -- sl-TimingQuality
+    ...
+}
+
+SL-RTT-LocationInformationError ::= ENUMERATED { undefined, assistanceDataMissing, notAllRequestedMeasurementsPossible, ... }
+
+-- TAG-SL-RTT-PROVIDELOCATIONINFORMATION-STOP
+
+
+END
+
+-- TAG-SLPP-PDU-SL-TDOA-CONTENTS-START
+
+SLPP-PDU-SL-TDOA-Contents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+    LOS-NLOS-Indicator,
+    PositioningModes,
+    SL-RTD-Info,
+    SL-TimeStamp,
+    SL-TimingQuality,
+    maxNrOfUEs,
+    ScheduledLocationTimeSupportPerMode,
+    nrMaxBands
+
+FROM
+    SLPP-PDU-Definitions
+
+    LocationCoordinateTypes,
+    VelocityTypes
+
+FROM
+    SLPP-PDU-CommonContents;
+
+-- TAG-SLPP-PDU-SL-TDOA-CONTENTS-STOP
+
+-- TAG-SL-TDOA-REQUESTCAPABILITIES-START
+
+SL-TDOA-RequestCapabilities ::= SEQUENCE {
+    ...
+}
+
+-- TAG-SL-TDOA-REQUESTCAPABILITIES-STOP
+
+-- TAG-SL-TDOA-PROVIDECAPABILITIES-START
+
+SL-TDOA-ProvideCapabilities ::= SEQUENCE {
+    positioningModes                     PositioningModes,
+    tenMsUnitResponseTime                PositioningModes                            OPTIONAL,
+    periodicalReporting                  PositioningModes                            OPTIONAL,
+    scheduledLocationRequestSupported    ScheduledLocationTimeSupportPerMode         OPTIONAL,
+    locationCoordinateTypes              LocationCoordinateTypes                     OPTIONAL,
+    velocityTypes                        VelocityTypes                               OPTIONAL,
+    sl-TDOA-CapabilityBandList           SEQUENCE (SIZE (1..nrMaxBands)) OF SL-TDOA-CapabilityPerBand,
+    ...
+}
+
+SL-TDOA-CapabilityPerBand ::=      SEQUENCE {
+    --R1 41-1-7a    SL PRS measurement for SL-RSTD
+    sl-PRS-RSTD-Meas                   ENUMERATED {n1,n2,n3,n4}                      OPTIONAL,
+    dummy                              ENUMERATED { supported }                      OPTIONAL,
+    ...,
+    [[
+    --R1 41-1-19a Report of Rx ARP-ID with SL positioning measurements
+    measurementsForMultipleARP-IDs-Rx  ENUMERATED {n2, n3, n4}                        OPTIONAL
+    ]],
+    [[
+    freqBandIndicatorNR                INTEGER (1..1024)                              OPTIONAL
+    ]]
+}
+
+-- TAG-SL-TDOA-PROVIDECAPABILITIES-STOP
+
+-- TAG-SL-TDOA-REQUESTASSISTANCEDATA-START
+
+SL-TDOA-RequestAssistanceData ::= SEQUENCE {
+    sl-RTD-InfoRequest                 ENUMERATED { true}                    OPTIONAL,
+    ...
+}
+-- TAG-SL-TDOA-REQUESTASSISTANCEDATA-STOP
+
+-- TAG-SL-TDOA-PROVIDEASSISTANCEDATA-START
+
+SL-TDOA-ProvideAssistanceData ::= SEQUENCE {
+    sl-RTD-Info                              SL-RTD-Info                                                   OPTIONAL,
+    sl-TDOA-Error                            SL-TDOA-AssistanceDataError                                   OPTIONAL,
+    ...
+}
+
+SL-TDOA-AssistanceDataError ::= ENUMERATED { undefined, assistanceDataNotAvailable, ... }
+
+-- TAG-SL-TDOA-PROVIDEASSISTANCEDATA-STOP
+
+-- TAG-SL-TDOA-REQUESTLOCATIONINFORMATION-START
+
+SL-TDOA-RequestLocationInformation ::= SEQUENCE {
+    sl-ARP-InfoRequest                     ENUMERATED { true }        OPTIONAL,
+    sl-LOS-NLOS-IndicatorRequest           ENUMERATED { true }        OPTIONAL,
+    sl-PRS-RSRP-Request                    ENUMERATED { true }        OPTIONAL,
+    sl-RSRPP-Request                       ENUMERATED { true }        OPTIONAL,
+    sl-AdditionalPathsRequest              ENUMERATED { true }        OPTIONAL,
+    measurementsForMultipleARP-IDs-Rx      SEQUENCE {
+        requestedARP-IDs-Rx                    BIT STRING (SIZE (4))  OPTIONAL
+    }                                                                 OPTIONAL,
+    ...,
+    [[
+    maxNumberOfMeasurementsPerARP          INTEGER (2..4)             OPTIONAL
+    ]]
+}
+
+-- TAG-SL-TDOA-REQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-SL-TDOA-PROVIDELOCATIONINFORMATION-START
+
+SL-TDOA-ProvideLocationInformation ::= SEQUENCE {
+    sl-RSTD-ReferenceUE-Info               SEQUENCE {
+        applicationLayerID                     OCTET STRING
+    }                                                                              OPTIONAL,
+    sl-TDOA-SignalMeasurementInformation   SL-TDOA-SignalMeasurementInformation    OPTIONAL,
+    sl-TDOA-Error                          SL-TDOA-LocationInformationError        OPTIONAL,
+    ...
+}
+
+SL-TDOA-SignalMeasurementInformation ::= SEQUENCE {
+    sl-TDOA-MeasList                         SEQUENCE (SIZE(1..maxNrOfUEs)) OF SL-TDOA-MeasElementPerARP-ID-Rx,
+    ...
+}
+
+SL-TDOA-MeasElementPerARP-ID-Rx ::= SEQUENCE (SIZE(1..4)) OF SL-TDOA-MeasElement
+
+SL-TDOA-MeasElement ::= SEQUENCE {
+    applicationLayerID                    OCTET STRING              OPTIONAL,  -- Cond FirstElement
+    los-NLOS-Indicator                    LOS-NLOS-Indicator        OPTIONAL,  -- sl-losNlosIndicator
+    sl-POS-ARP-ID-Rx                      INTEGER (1..4)            OPTIONAL,  -- sl-pos-arpID-Rx
+    sl-PRS-ResourceId                     INTEGER (0..16)           OPTIONAL,  -- sl-PRS-ResourceId
+    sl-PRS-RSRP-Result                    INTEGER (0..126)          OPTIONAL,  -- sl-PRS-RSRP
+    sl-PRS-RSRPP-Result                   INTEGER (0..126)          OPTIONAL,  -- sl-PRS-RSRPP
+    sl-RSTD-Result                        CHOICE {
+        k0                                    INTEGER (0..1970049),
+        k1                                    INTEGER (0..985025),
+        k2                                    INTEGER (0..492513),
+        k3                                    INTEGER (0..246257),
+        k4                                    INTEGER (0..123129),
+        k5                                    INTEGER (0..61565)
+    }                                                                OPTIONAL,  -- sl-PRS-RSTD
+    sl-TDOA-AdditionalPathList            SL-TDOA-AdditionalPathList OPTIONAL,
+    sl-TimeStamp                          SL-TimeStamp               OPTIONAL,  -- sl-Timestamp
+    sl-TimingQuality                      SL-TimingQuality           OPTIONAL,  -- sl-TimingQuality
+    ...,
+    [[
+    sl-TDOA-AdditionalMeasurements        SL-TDOA-AdditionalMeasurements          OPTIONAL
+    ]]
+}
+
+SL-TDOA-AdditionalMeasurements ::= SEQUENCE (SIZE (1..3)) OF SL-TDOA-AdditionalMeasurementElement
+
+SL-TDOA-AdditionalMeasurementElement ::= SEQUENCE {
+    sl-PRS-ResourceId                        INTEGER (0..16)                      OPTIONAL,
+    sl-PRS-RSRP-Result                       INTEGER (0..126)                     OPTIONAL,
+    sl-PRS-RSRPP-Result                      INTEGER (0..126)                     OPTIONAL,
+    sl-RSTD-Result                           CHOICE {
+        k0                                       INTEGER (0..1970049),
+        k1                                       INTEGER (0..985025),
+        k2                                       INTEGER (0..492513),
+        k3                                       INTEGER (0..246257),
+        k4                                       INTEGER (0..123129),
+        k5                                       INTEGER (0..61565)
+    }                                                                             OPTIONAL,
+    los-NLOS-Indicator                       LOS-NLOS-Indicator                   OPTIONAL,
+    sl-TDOA-AdditionalPathList               SL-TDOA-AdditionalPathList           OPTIONAL,
+    sl-TimeStamp                             SL-TimeStamp                         OPTIONAL,
+    sl-TimingQuality                         SL-TimingQuality                     OPTIONAL,
+    ...
+}
+
+SL-TDOA-AdditionalPathList ::= SEQUENCE (SIZE(1..8)) OF SL-TDOA-AdditionalPath
+
+SL-TDOA-AdditionalPath  ::= SEQUENCE {
+    sl-RSTD-AdditionalPathResult          CHOICE {
+        k0                                    INTEGER (0..1970049),
+        k1                                    INTEGER (0..985025),
+        k2                                    INTEGER (0..492513),
+        k3                                    INTEGER (0..246257),
+        k4                                    INTEGER (0..123129),
+        k5                                    INTEGER (0..61565)
+    }                                                               OPTIONAL,  -- additionalPath-SL-PRS-RSTD
+    sl-PRS-AdditionalPathRSRPP-Result      INTEGER (0..126)         OPTIONAL,  -- additionalPath-SL-PRS-RSRPP
+    sl-TimingQuality                       SL-TimingQuality         OPTIONAL,  -- sl-TimingQuality
+    ...
+}
+
+SL-TDOA-LocationInformationError ::= ENUMERATED { undefined, assistanceDataMissing, notAllRequestedMeasurementsPossible, ... }
+
+-- TAG-SL-TDOA-PROVIDELOCATIONINFORMATION-STOP
+
+
+END
+
+-- TAG-SLPP-PDU-SL-TOA-CONTENTS-START
+
+SLPP-PDU-SL-TOA-Contents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+    LOS-NLOS-Indicator,
+    PositioningModes,
+    SL-RTD-Info,
+    SL-TimeStamp,
+    SL-TimingQuality,
+    maxNrOfUEs,
+    ScheduledLocationTimeSupportPerMode,
+    nrMaxBands
+
+FROM
+    SLPP-PDU-Definitions
+
+    LocationCoordinateTypes,
+    VelocityTypes
+
+FROM
+    SLPP-PDU-CommonContents;
+
+-- TAG-SLPP-PDU-SL-TOA-CONTENTS-STOP
+
+-- TAG-SL-TOA-REQUESTCAPABILITIES-START
+
+SL-TOA-RequestCapabilities ::= SEQUENCE {
+    ...
+}
+
+-- TAG-SL-TOA-REQUESTCAPABILITIES-STOP
+
+-- TAG-SL-TOA-PROVIDECAPABILITIES-START
+
+SL-TOA-ProvideCapabilities ::= SEQUENCE {
+    positioningModes                     PositioningModes,
+    tenMsUnitResponseTime                PositioningModes                                  OPTIONAL,
+    periodicalReporting                  PositioningModes                                  OPTIONAL,
+    scheduledLocationRequestSupported    ScheduledLocationTimeSupportPerMode               OPTIONAL,
+    locationCoordinateTypes              LocationCoordinateTypes                           OPTIONAL,
+    velocityTypes                        VelocityTypes                                     OPTIONAL,
+    sl-TOA-CapabilityBandList            SEQUENCE (SIZE (1..nrMaxBands)) OF SL-TOA-CapabilityPerBand,
+    ...
+}
+
+SL-TOA-CapabilityPerBand ::= SEQUENCE {
+    --R1 41-1-7b SL PRS measurement for SL RTOA
+    sl-RTOA-Meas                       ENUMERATED {n1,n2,n3,n4}                      OPTIONAL,
+    dummy                              ENUMERATED { supported }                      OPTIONAL,
+    ...,
+    [[
+    --R1 41-1-19a Report of Rx ARP-ID with SL positioning measurements
+    measurementsForMultipleARP-IDs-Rx  ENUMERATED {n2, n3, n4}                        OPTIONAL
+    ]],
+    [[
+    freqBandIndicatorNR                INTEGER (1..1024)                              OPTIONAL
+    ]]
+}
+
+-- TAG-SL-TOA-PROVIDECAPABILITIES-STOP
+
+-- TAG-SL-TOA-REQUESTASSISTANCEDATA-START
+
+SL-TOA-RequestAssistanceData ::= SEQUENCE {
+    sl-RTD-InfoRequest               ENUMERATED { true}                    OPTIONAL,
+    ...
+}
+-- TAG-SL-TOA-REQUESTASSISTANCEDATA-STOP
+
+-- TAG-SL-TOA-PROVIDEASSISTANCEDATA-START
+
+SL-TOA-ProvideAssistanceData ::= SEQUENCE {
+    sl-RTD-Info                             SL-RTD-Info                                                   OPTIONAL,
+    sl-TOA-Error                            SL-TOA-AssistanceDataError                                    OPTIONAL,
+    ...
+}
+
+SL-TOA-AssistanceDataError ::= ENUMERATED { undefined, assistanceDataNotAvailable, ... }
+
+-- TAG-SL-TOA-PROVIDEASSISTANCEDATA-STOP
+
+-- TAG-SL-TOA-REQUESTLOCATIONINFORMATION-START
+
+SL-TOA-RequestLocationInformation ::= SEQUENCE {
+    sl-ARP-InfoRequest                    ENUMERATED { true }        OPTIONAL,
+    sl-LOS-NLOS-IndicatorRequest          ENUMERATED { true }        OPTIONAL,
+    sl-PRS-RSRP-Request                   ENUMERATED { true }        OPTIONAL,
+    sl-RSRPP-Request                      ENUMERATED { true }        OPTIONAL,
+    sl-AdditionalPathsRequest             ENUMERATED { true }        OPTIONAL,
+    measurementsForMultipleARP-IDs-Rx     SEQUENCE {
+        requestedARP-IDs-Rx                   BIT STRING (SIZE (4))  OPTIONAL
+    }                                                                OPTIONAL,
+    ...,
+    [[
+    maxNumberOfMeasurementsPerARP         INTEGER (2..4)             OPTIONAL
+    ]]
+}
+
+-- TAG-SL-TOA-REQUESTLOCATIONINFORMATION-STOP
+
+-- TAG-SL-TOA-PROVIDELOCATIONINFORMATION-START
+
+SL-TOA-ProvideLocationInformation ::= SEQUENCE {
+    sl-TOA-SignalMeasurementInformation   SL-TOA-MeasElementPerARP-ID-Rx         OPTIONAL,
+    sl-TOA-Error                          SL-TOA-LocationInformationError        OPTIONAL,
+    ...
+}
+
+SL-TOA-MeasElementPerARP-ID-Rx ::= SEQUENCE (SIZE(1..4)) OF SL-TOA-MeasElement
+
+SL-TOA-MeasElement ::= SEQUENCE {
+    los-NLOS-Indicator                    LOS-NLOS-Indicator        OPTIONAL,  -- sl-losNlosIndicator
+    sl-RTOA-Result                        CHOICE {
+        k0                                    INTEGER (0..1970049),
+        k1                                    INTEGER (0..985025),
+        k2                                    INTEGER (0..492513),
+        k3                                    INTEGER (0..246257),
+        k4                                    INTEGER (0..123129),
+        k5                                    INTEGER (0..61565)
+    }                                                               OPTIONAL,  -- sl-PRS-RTOA
+    sl-POS-ARP-ID-Rx                      INTEGER (1..4)            OPTIONAL,  -- sl-pos-arpID-Rx
+    sl-PRS-ResourceId                     INTEGER (0..16)           OPTIONAL,  -- sl-PRS-ResourceId
+    sl-PRS-RSRP-Result                    INTEGER (0..126)          OPTIONAL,  -- sl-PRS-RSRP
+    sl-PRS-RSRPP-Result                   INTEGER (0..126)          OPTIONAL,  -- sl-PRS-RSRPP
+    sl-TOA-AdditionalPathList             SL-TOA-AdditionalPathList OPTIONAL,
+    sl-TimeStamp                          SL-TimeStamp              OPTIONAL,  -- sl-Timestamp
+    sl-TimingQuality                      SL-TimingQuality          OPTIONAL,  -- sl-TimingQuality
+    ...,
+    [[
+    sl-TOA-AdditionalMeasurements         SL-TOA-AdditionalMeasurements      OPTIONAL
+    ]]
+}
+
+SL-TOA-AdditionalMeasurements ::= SEQUENCE (SIZE (1..3)) OF SL-TOA-AdditionalMeasurementElement
+
+SL-TOA-AdditionalMeasurementElement ::= SEQUENCE {
+    sl-PRS-ResourceId                       INTEGER (0..16)               OPTIONAL,
+    sl-PRS-RSRP-Result                      INTEGER (0..126)              OPTIONAL,
+    sl-PRS-RSRPP-Result                     INTEGER (0..126)              OPTIONAL,
+    sl-RTOA-Result                          CHOICE {
+        k0                                      INTEGER (0..1970049),
+        k1                                      INTEGER (0..985025),
+        k2                                      INTEGER (0..492513),
+        k3                                      INTEGER (0..246257),
+        k4                                      INTEGER (0..123129),
+        k5                                      INTEGER (0..61565)
+    }                                                                     OPTIONAL,
+    los-NLOS-Indicator                      LOS-NLOS-Indicator            OPTIONAL,
+    sl-TOA-AdditionalPathList               SL-TOA-AdditionalPathList     OPTIONAL,
+    sl-TimeStamp                            SL-TimeStamp                  OPTIONAL,
+    sl-TimingQuality                        SL-TimingQuality              OPTIONAL,
+    ...
+}
+
+SL-TOA-AdditionalPathList ::= SEQUENCE (SIZE(1..8)) OF SL-TOA-AdditionalPath
+
+SL-TOA-AdditionalPath  ::= SEQUENCE {
+    sl-RTOA-AdditionalPathResult               CHOICE {
+        k0                                         INTEGER (0..16351),
+        k1                                         INTEGER (0..8176),
+        k2                                         INTEGER (0..4088),
+        k3                                         INTEGER (0..2044),
+        k4                                         INTEGER (0..1022),
+        k5                                         INTEGER (0..511)
+    }                                                                OPTIONAL,  -- additionalPath-SL-PRS-RTOA
+    sl-PRS-AdditionalPathRSRPP-Result          INTEGER (0..126)      OPTIONAL,  -- additionalPath-SL-PRS-RSRPP
+    sl-TimingQuality                           SL-TimingQuality      OPTIONAL,  -- sl-TimingQuality
+    ...
+}
+
+SL-TOA-LocationInformationError ::= ENUMERATED { undefined, assistanceDataMissing, notAllRequestedMeasurementsPossible, ... }
+
+-- TAG-SL-TOA-PROVIDELOCATIONINFORMATION-STOP
+
+
+END
+
+-- TAG-NR-DISCOVERYMESSAGEMETADATACONTENTS-START
+
+NR-DiscoveryMessageMetaDataContents DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+-- TAG-NR-DISCOVERYMESSAGEMETADATACONTENTS-STOP
+
+-- TAG-RSPP-METADATA-START
+
+RSPP-Metadata ::= SEQUENCE {
+    ue-RoleList               BIT STRING { sl-anchorUE(0), sl-ServerUE(1), sl-TargetUE(2) } (SIZE (1..8)),
+    knownLocationAvailable    ENUMERATED {true}                                                      OPTIONAL,
+    ...
+}
+
+-- TAG-RSPP-METADATA-STOP
+
+
+END

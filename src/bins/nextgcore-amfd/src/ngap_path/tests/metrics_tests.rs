@@ -65,7 +65,7 @@ async fn a_rejected_registration_moves_the_ngap_and_registration_counters_1334()
             assoc,
             &service_request_initial_ue_with(
                 nas,
-                nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
+                crate::ngap_types::RrcEstablishmentCause::MoSignalling,
             ),
         )
         .await

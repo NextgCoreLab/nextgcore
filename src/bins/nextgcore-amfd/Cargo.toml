@@ -66,7 +66,6 @@ nextgcore-proto = { workspace = true, optional = true }
 # F-TEID interface-type constants sitting in smfd were the tree's entire N26 support and
 # had no reader anywhere.
 nextgcore-gtp = { workspace = true }
-nextgcore-ngap = { workspace = true }
 # #417: the NGAP codec generated from TS 38.413, migrating one family at a time.
 nextgcore-ngap-gen = { workspace = true }
 # The generated fixed-size BIT STRINGs are bitvec types (AMF Region/Set/Pointer).
@@ -100,7 +99,6 @@ mongodb = { workspace = true }
 # #2005: the stand-in OAuth2 client for the DECREASE token-bound test.
 nextgcore-sbi = { workspace = true, features = ["test-support"] }
 nextgcore-core = { workspace = true, features = ["test-log"] }
-nextgcore-asn1c = { workspace = true }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true

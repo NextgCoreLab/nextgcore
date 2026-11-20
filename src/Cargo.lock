@@ -2418,14 +2418,12 @@ dependencies = [
  "log",
  "mongodb",
  "nextgcore-app",
- "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-crypt",
  "nextgcore-demo",
  "nextgcore-gtp",
  "nextgcore-metrics",
  "nextgcore-nas",
- "nextgcore-ngap",
  "nextgcore-ngap-gen",
  "nextgcore-proto",
  "nextgcore-sbi",
@@ -2861,7 +2859,6 @@ dependencies = [
  "nextgcore-gtp",
  "nextgcore-metrics",
  "nextgcore-nas",
- "nextgcore-ngap",
  "nextgcore-s1ap",
  "nextgcore-s1ap-gen",
  "nextgcore-sbcap-gen",
@@ -3338,6 +3335,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-slpp-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "nextgcore-smfd"
 version = "0.1.0"
 dependencies = [
@@ -3358,7 +3366,6 @@ dependencies = [
  "nextgcore-ipfw",
  "nextgcore-metrics",
  "nextgcore-nas",
- "nextgcore-ngap",
  "nextgcore-ngap-gen",
  "nextgcore-pfcp",
  "nextgcore-sbi",

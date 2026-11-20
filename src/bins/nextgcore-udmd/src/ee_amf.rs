@@ -513,16 +513,51 @@ const UNSUBSCRIBE_MAX_LANES: usize = 64;
 /// [`UNSUBSCRIBE_BACKOFF_MAX`], and cleared by a delivery. An AMF that is backing
 /// off takes no lane slot, so dead AMFs past the first pass do not keep a healthy
 /// one waiting for a slot.
-#[cfg(not(test))]
 pub const UNSUBSCRIBE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(test)]
-pub const UNSUBSCRIBE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(300);
 /// The longest a failing AMF is left alone between attempts.
 pub const UNSUBSCRIBE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Per AMF (URI authority): its backoff. Guarded like [`parked_unsubscribes`].
 static UNSUBSCRIBE_BACKOFF: nextgcore_core::backoff::PeerBackoff =
-    nextgcore_core::backoff::PeerBackoff::new(UNSUBSCRIBE_BACKOFF_BASE, UNSUBSCRIBE_BACKOFF_MAX);
+    nextgcore_core::backoff::PeerBackoff::with_clock(
+        UNSUBSCRIBE_BACKOFF_BASE,
+        UNSUBSCRIBE_BACKOFF_MAX,
+        unsubscribe_backoff_now,
+    );
+
+/// The time [`UNSUBSCRIBE_BACKOFF`] reads: the runtime's clock.
+#[cfg(not(test))]
+fn unsubscribe_backoff_now() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+}
+
+/// #2196: in tests, [`UNSUBSCRIBE_BACKOFF`] reads a clock that moves only when a
+/// test calls [`advance_unsubscribe_backoff_clock_for_test`]. The reconciler
+/// tests drive real sockets on a multi-thread runtime, which tokio cannot pause,
+/// and a wall-clock window lost the race on a loaded host: "the second pass ran
+/// inside the backoff window" failed at seed 11 when the time from pass 1's
+/// failure to pass 2 outran the 300 ms test base. A backoff now ends only when a
+/// test says time has passed.
+///
+/// Part of the backoff's state, so guarded like it: by
+/// `crate::test_support::CONTEXT_GUARD`.
+#[cfg(test)]
+static UNSUBSCRIBE_BACKOFF_CLOCK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn unsubscribe_backoff_now() -> tokio::time::Instant {
+    static EPOCH: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(tokio::time::Instant::now)
+        + std::time::Duration::from_millis(UNSUBSCRIBE_BACKOFF_CLOCK_MS.load(Ordering::SeqCst))
+}
+
+/// Move [`UNSUBSCRIBE_BACKOFF`]'s clock on by `by` (tests; hold `CONTEXT_GUARD`).
+#[cfg(test)]
+fn advance_unsubscribe_backoff_clock_for_test(by: std::time::Duration) {
+    let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+    UNSUBSCRIBE_BACKOFF_CLOCK_MS.fetch_add(by, Ordering::SeqCst);
+}
 
 /// The AMF a parked unsubscribe goes to (its URI authority): its lane and its
 /// backoff key.
@@ -1876,8 +1911,18 @@ mod tests {
     /// healthy AMF do not starve it. Once the blackholed AMF fails in a pass, its
     /// other unsubscribes wait for the next pass, and a tried one goes to the back.
     ///
-    /// REVERT-VERIFIED: with every URI tried in order and re-parked at the front, as
-    /// before, this fails: the healthy AMF's unsubscribe is never sent in two passes.
+    /// #2196: the blackholed AMF holds every DELETE until the healthy AMF has
+    /// answered its own, and only then drops the connection, so its DELETE fails.
+    /// Nothing here races a timer: the healthy DELETE has the full 5 s call cap
+    /// (a 200 ms cap timed out on a loaded host at seed 11), and the second pass
+    /// skips the blackholed AMF because its backoff clock has not moved.
+    ///
+    /// REVERT-VERIFIED: with every URI tried in turn (`UNSUBSCRIBE_MAX_LANES` at 1)
+    /// and a backing-off AMF tried anyway, this fails 3/3: the healthy AMF's
+    /// unsubscribe is never sent in two passes (the blackholed DELETE ahead of it
+    /// is held to the call cap, past the pass deadline, every pass). With the
+    /// healthy AMF's answer stalled 300 ms, the old 200 ms-cap version failed 3/3
+    /// and this one passes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
     async fn a_blackholed_amf_does_not_starve_a_healthy_one_1877() {
@@ -1886,17 +1931,35 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         clear_parked_unsubscribes_for_test();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        AMF_CALL_TIMEOUT_MS.store(200, Ordering::Relaxed);
-        // An AMF that accepts connections and never answers.
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        let answered = Arc::new(tokio::sync::Notify::new());
+        // An AMF that accepts connections and answers nothing. Once the healthy
+        // AMF has answered, it drops them, and every later one at once.
         let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hole = blackhole.local_addr().unwrap();
+        let release = answered.clone();
         let held = tokio::spawn(async move {
             let mut conns = Vec::new();
-            while let Ok((c, _)) = blackhole.accept().await {
-                conns.push(c);
+            loop {
+                tokio::select! {
+                    accepted = blackhole.accept() => match accepted {
+                        Ok((c, _)) => conns.push(c),
+                        Err(_) => return,
+                    },
+                    () = release.notified() => break,
+                }
             }
+            drop(conns);
+            while blackhole.accept().await.is_ok() {}
         });
-        let (_amf, healthy, seen) = recorder(|_| SbiResponse::with_status(204)).await;
+        let signal = answered.clone();
+        let (_amf, healthy, seen) = recorder(move |_| {
+            // A stored permit: the blackhole is released even if it is not
+            // waiting yet.
+            signal.notify_one();
+            SbiResponse::with_status(204)
+        })
+        .await;
         for n in 0..3 {
             park_unsubscribe(&format!(
                 "http://{hole}/namf-evts/v1/subscriptions/dead-{n}"
@@ -1914,7 +1977,6 @@ mod tests {
             .filter(|u| u.contains(&hole.to_string()) || *u == live)
             .collect();
         clear_parked_unsubscribes_for_test();
-        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
         held.abort();
 
         assert_eq!(delivered, 1, "the healthy AMF's unsubscribe is delivered");
@@ -2186,23 +2248,55 @@ mod tests {
 
     /// An AMF that accepts connections and never answers, counting them: its
     /// address, how many it accepted, and its task (abort it at the end).
-    async fn blackhole_2029() -> (
-        String,
-        Arc<std::sync::atomic::AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    async fn blackhole_2029() -> (String, Arc<Accepted2029>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = accepted.clone();
+        let accepted = Arc::new(Accepted2029::default());
+        let seen = accepted.clone();
         let task = tokio::spawn(async move {
             let mut conns = Vec::new();
-            while let Ok((c, _)) = listener.accept().await {
-                count.fetch_add(1, Ordering::SeqCst);
+            while let Ok((c, peer)) = listener.accept().await {
+                seen.peers.lock().unwrap().push(peer);
+                seen.arrived.notify_waiters();
                 conns.push(c);
             }
         });
         (addr, accepted, task)
+    }
+
+    /// The connections a [`blackhole_2029`] accepted, in accept order.
+    #[derive(Default)]
+    struct Accepted2029 {
+        peers: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+        arrived: tokio::sync::Notify,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Accepted2029 {
+        /// #2196: how many connections the code under test has made to `hole` so
+        /// far. A count read right after a pass raced the accept task: on a loaded
+        /// host the pass's connection sat in the listen backlog, not yet accepted,
+        /// and the count read 0 ("tried in the first pass", 1 run in 3 on seed 11).
+        /// So connect a probe of our own and wait until it is accepted: the
+        /// backlog is accepted in order, so every connection made before the probe
+        /// is counted by then. The probes are not counted.
+        async fn attempts(&self, hole: &str) -> usize {
+            let probe = tokio::net::TcpStream::connect(hole).await.expect("probe");
+            let me = probe.local_addr().expect("probe address");
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let arrived = self.arrived.notified();
+                    if self.peers.lock().unwrap().contains(&me) {
+                        return;
+                    }
+                    arrived.await;
+                }
+            })
+            .await
+            .expect("the probe is accepted");
+            self.peers.lock().unwrap().len() - self.probes.load(Ordering::SeqCst)
+        }
     }
 
     fn ours_2029(uris: &[&String]) -> Vec<String> {
@@ -2249,7 +2343,9 @@ mod tests {
     /// (nor hold a lane slot for it), and the one after its wait does.
     ///
     /// REVERT-VERIFIED: with the `backing_off` check removed, this fails: the
-    /// blackholed AMF is connected to again in the second pass.
+    /// blackholed AMF is connected to again in the second pass. With the backoff
+    /// reading the wall clock again (#2196), it fails the other way: the third
+    /// pass, past the wait on the test clock, still skips it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
     async fn a_failed_amf_backs_off_2029() {
@@ -2264,13 +2360,19 @@ mod tests {
         park_unsubscribe(&dead);
 
         reconcile_unsubscribes_once().await;
-        let first = accepted.load(Ordering::SeqCst);
+        let first = accepted.attempts(&hole).await;
         let backoff = UNSUBSCRIBE_BACKOFF.current(&amf_of(&dead));
+        // #2196: the backoff's clock moves only when this test moves it, so the
+        // second pass is inside the window however loaded the host is, and the
+        // third is past it.
+        advance_unsubscribe_backoff_clock_for_test(
+            UNSUBSCRIBE_BACKOFF_BASE - std::time::Duration::from_millis(1),
+        );
         reconcile_unsubscribes_once().await;
-        let second = accepted.load(Ordering::SeqCst);
-        tokio::time::sleep(UNSUBSCRIBE_BACKOFF_BASE + std::time::Duration::from_millis(50)).await;
+        let second = accepted.attempts(&hole).await;
+        advance_unsubscribe_backoff_clock_for_test(std::time::Duration::from_millis(1));
         reconcile_unsubscribes_once().await;
-        let third = accepted.load(Ordering::SeqCst);
+        let third = accepted.attempts(&hole).await;
         let still = ours_2029(&[&dead]);
         clear_parked_unsubscribes_for_test();
         AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
@@ -2881,10 +2983,11 @@ mod tests {
         );
     }
 
-    /// An AMF that answers every request after `delay`, counting how many of
-    /// its (and its siblings') requests are in flight at once in `peak`.
-    async fn slow_amf(
-        delay: Duration,
+    /// An AMF that holds every request until `gate` opens, counting how many
+    /// of its (and its siblings') requests are in flight at once in `in_flight`
+    /// and the most there ever were in `peak`.
+    async fn gated_amf(
+        gate: Arc<tokio::sync::Semaphore>,
         in_flight: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
         expiry: u64,
@@ -2893,11 +2996,11 @@ mod tests {
         let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(move |_req: SbiRequest| {
-                let (in_flight, peak) = (in_flight.clone(), peak.clone());
+                let (gate, in_flight, peak) = (gate.clone(), in_flight.clone(), peak.clone());
                 async move {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(delay).await;
+                    drop(gate.acquire().await.expect("gate"));
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     SbiResponse::with_status(200)
                         .with_json_body(&json!({ "subscription": { "options": {
@@ -2914,14 +3017,21 @@ mod tests {
     }
 
     /// **#2182** (R42 minor on #2182): legs at different AMFs are renewed in
-    /// parallel, [`LEG_RENEW_MAX_AMFS`] (8) AMFs at once and no more. Nine slow
-    /// AMFs, each holding one due leg and answering after 300 ms: the
-    /// renewals overlap up to the cap, and the pass takes two waves, not one
-    /// per AMF.
+    /// parallel, [`LEG_RENEW_MAX_AMFS`] (8) AMFs at once and no more. Nine AMFs,
+    /// each holding one due leg and holding its renewal until the test opens
+    /// the gate: eight renewals are in flight at once, the ninth is not sent
+    /// while they are held, and once the gate opens all nine are renewed.
     ///
-    /// REVERT-VERIFIED: with `LEG_RENEW_MAX_AMFS` = 1, "renewals overlap" and
-    /// "two waves" fail; with no cap (a semaphore of 64), "renewals overlap"
-    /// fails at 9.
+    /// #2235: no wall clock. The AMFs used to answer after 300 ms, and the test
+    /// timed the pass ("two waves": under 900 ms). On a loaded host the eight
+    /// renewals did not all reach their AMFs within 300 ms of the first, so
+    /// "renewals overlap, up to the cap" read 6 or 7 (3 of 6 runs at seed 2121,
+    /// `--test-threads=1`), and "two waves" failed once in parallel. Overlap and
+    /// the cap are now read from the AMFs' in-flight count while they hold.
+    ///
+    /// REVERT-VERIFIED: with `LEG_RENEW_MAX_AMFS` = 1, "eight renewals in
+    /// flight at once" times out (one at a time); with no cap (a semaphore of
+    /// 64), "the ninth waits for a slot" fails at 9.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
     async fn legs_at_different_amfs_are_renewed_in_parallel_2182() {
@@ -2931,16 +3041,17 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         crate::context::udm_context_init(1024, 4096);
         AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
-        const DELAY: Duration = Duration::from_millis(300);
         // Pinned as numbers, not from the constant, so lowering it fails here.
         const AMFS: usize = 9;
         const CAP: usize = 8;
         let now = crate::context::now_unix_secs();
         let (in_flight, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut amfs = Vec::new();
         let mut ids = Vec::new();
         for n in 0..AMFS {
-            let (server, addr) = slow_amf(DELAY, in_flight.clone(), peak.clone(), now + 600).await;
+            let (server, addr) =
+                gated_amf(gate.clone(), in_flight.clone(), peak.clone(), now + 600).await;
             amfs.push(server);
             let mut sub = UdmEeSubscription::for_ue(
                 format!("imsi-00101000002183{n}"),
@@ -2967,20 +3078,28 @@ mod tests {
             udm_self().read().unwrap().ee_subscription_insert(sub);
         }
 
-        let started = std::time::Instant::now();
-        let renewed = renew_amf_legs(now).await;
-        let took = started.elapsed();
+        let pass = tokio::spawn(renew_amf_legs(now));
+        // Every slot is taken: eight renewals are held at their AMFs at once.
+        let all_in = tokio::time::timeout(Duration::from_secs(4), async {
+            while in_flight.load(Ordering::SeqCst) < CAP {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        // While they are held, the ninth is not sent. (A pass with no cap sends
+        // it at once; this window only lets a broken cap show.)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = in_flight.load(Ordering::SeqCst);
+        gate.add_permits(AMFS);
+        let renewed = pass.await.expect("the pass");
         for id in &ids {
             udm_self().read().unwrap().ee_subscription_remove(id);
         }
 
+        assert!(all_in.is_ok(), "eight renewals in flight at once");
+        assert_eq!(held, CAP, "the ninth waits for a slot");
         assert_eq!(renewed, AMFS, "every leg is renewed");
-        assert_eq!(
-            peak.load(Ordering::SeqCst),
-            CAP,
-            "renewals overlap, up to the cap"
-        );
-        assert!(took < DELAY * 3, "two waves: {took:?}");
+        assert_eq!(peak.load(Ordering::SeqCst), CAP, "never more than the cap");
     }
 
     /// **#2149** (R42 on #2144): the AMF leg carries the Nudm_EE subscription's

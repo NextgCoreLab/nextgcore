@@ -5619,9 +5619,9 @@ pub(crate) fn global_ran_node_id_json(
 /// `SMacroNGeNB-` (18 bits, 5 nibbles) and `LMacroNGeNB-` (21 bits, 6 nibbles).
 pub(crate) fn ng_enb_id_json(
     plmn: &crate::context::PlmnId,
-    ng_enb_id: &nextgcore_ngap::types::NgEnbId,
+    ng_enb_id: &crate::ngap_types::NgEnbId,
 ) -> Value {
-    use nextgcore_ngap::types::NgEnbId;
+    use crate::ngap_types::NgEnbId;
     let value = match *ng_enb_id {
         NgEnbId::Macro(v) => format!("MacroNGeNB-{v:05X}"),
         NgEnbId::ShortMacro(v) => format!("SMacroNGeNB-{v:05X}"),
@@ -18232,7 +18232,7 @@ mod tests {
     /// every ng-eNB rendered as `MacroNGeNB-`.
     #[test]
     fn an_ng_enb_id_renders_with_its_alternatives_prefix() {
-        use nextgcore_ngap::types::NgEnbId;
+        use crate::ngap_types::NgEnbId;
         let plmn = crate::context::PlmnId::new("001", "01");
         for (id, expected) in [
             (NgEnbId::Macro(0xABC), "MacroNGeNB-00ABC"),

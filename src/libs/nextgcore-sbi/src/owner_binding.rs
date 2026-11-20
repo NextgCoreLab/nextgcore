@@ -468,6 +468,24 @@ fn seeded_nf_type(_id: &str, _nf_type: crate::types::NfType) -> bool {
     false
 }
 
+/// #2237: whether `id` is seeded as some NF type other than `nf_type`. An NF
+/// instance has one `nfType` (TS 29.510 NFProfile), so the NRF would list it,
+/// but not as `nf_type`: the lookup answers "not listed", and a test that
+/// seeds a GMLC pins the type rule instead of the no-NRF refusal.
+#[cfg(any(test, feature = "test-support"))]
+fn seeded_as_another_nf_type(id: &str, nf_type: crate::types::NfType) -> bool {
+    let own = nf_type_key("", nf_type.to_str(), id);
+    let suffix = format!(" {}", id.trim().to_ascii_lowercase());
+    seeded_nf_types()
+        .iter()
+        .any(|key| *key != own && key.ends_with(&suffix))
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn seeded_as_another_nf_type(_id: &str, _nf_type: crate::types::NfType) -> bool {
+    false
+}
+
 /// The one NRF client the lookups share, rebuilt only when the NRF URI changes.
 fn nrf_client(nrf_uri: &str) -> Option<std::sync::Arc<crate::client::SbiClient>> {
     static CLIENT: std::sync::Mutex<Option<(String, std::sync::Arc<crate::client::SbiClient>)>> =
@@ -532,6 +550,9 @@ pub async fn nrf_lists_nf_type_at(
 async fn nrf_lists_nf_type(id: &str, nf_type: crate::types::NfType) -> Result<bool, String> {
     if seeded_nf_type(id, nf_type) {
         return Ok(true);
+    }
+    if seeded_as_another_nf_type(id, nf_type) {
+        return Ok(false);
     }
     let ctx = crate::context::global_context();
     let nrf_uri = ctx
@@ -735,6 +756,20 @@ mod tests {
     // ---- #2099: verified_nf_type ----
 
     use crate::types::NfType;
+
+    /// #2237: an instance seeded as one NF type is listed as that type and as
+    /// no other (an NF instance has one `nfType`, TS 29.510), with no NRF
+    /// asked, so a test that seeds a GMLC pins the type rule.
+    ///
+    /// REVERT-VERIFIED: with `seeded_as_another_nf_type` answering false, the
+    /// AMF lookup goes to the (absent) NRF and is an error, not `Ok(false)`.
+    #[tokio::test]
+    async fn a_seeded_instance_is_not_listed_as_another_type_2237() {
+        const ID: &str = "dddddddd-2237-4000-8000-0000000000d1";
+        seed_nf_type_for_test(ID, NfType::Gmlc);
+        assert_eq!(nrf_lists_nf_type(ID, NfType::Gmlc).await, Ok(true));
+        assert_eq!(nrf_lists_nf_type(ID, NfType::Amf).await, Ok(false));
+    }
 
     /// A stand-in NRF: `listed` are AMFs, `smf` an SMF, `err` answers 500.
     /// Counts the lookups.
