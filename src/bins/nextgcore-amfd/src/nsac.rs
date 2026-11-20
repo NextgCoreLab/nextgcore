@@ -708,19 +708,24 @@ pub fn parked() -> Vec<Admission> {
     lock(pending()).iter().map(|p| p.a.clone()).collect()
 }
 
+/// #2223: how many NSACFs one pass sends to at once (one DECREASE in flight
+/// per NSACF), so dead NSACFs cost a timeout each in parallel, not in turn.
+pub const MAX_PEERS_AT_ONCE: usize = 16;
+
 /// One reconcile pass over the parked DECREASEs, oldest first, for at most
 /// [`MAX_PASS`]. One older than [`MAX_AGE`] ends as `expired`.
 ///
-/// #1961: once a DECREASE to an NSACF fails, that NSACF backs off and its other
-/// DECREASEs are not tried this pass (nor until the backoff ends); one tried and
-/// failed goes to the BACK of the queue, one not reached keeps its place at the
-/// FRONT. Returns how many ended.
+/// #2223: on the shared bounded per-peer sweep (`nextgcore_sbi::sweep::retry_parked`):
+/// one DECREASE in flight per NSACF, up to [`MAX_PEERS_AT_ONCE`] NSACFs at
+/// once, nothing new started after [`MAX_PASS`]. An NSACF backing off is not
+/// tried and takes no slot; once a DECREASE to an NSACF fails, that NSACF
+/// backs off and its other DECREASEs are not tried this pass (#1961). One tried
+/// and failed goes to the BACK of the queue, one not reached keeps its place at
+/// the FRONT. Returns how many ended.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<Parked> = lock(pending()).drain(..).collect();
-    let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut untried = Vec::new();
-    let mut failed = Vec::new();
+    let mut live = Vec::new();
     for p in batch {
         let a = &p.a;
         if p.since.elapsed().unwrap_or_default() > MAX_AGE {
@@ -734,22 +739,42 @@ pub async fn reconcile_once() -> usize {
             ended += 1;
             continue;
         }
-        let peer = peer_of(a);
-        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
-            untried.push(p);
-            continue;
-        }
-        let result = match decrease_once(a.clone()).await {
-            Outcome::Superseded => "superseded",
-            Outcome::Accepted => "delivered",
-            Outcome::Refused => "refused",
-            Outcome::Failed => {
-                BACKOFF.note_failure(&peer);
+        live.push((peer_of(a), p));
+    }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: MAX_PEERS_AT_ONCE,
+        budget: MAX_PASS,
+    };
+    let tried =
+        nextgcore_sbi::sweep::retry_parked(&BACKOFF, limits, live, |_peer, p: Parked| async move {
+            use nextgcore_sbi::sweep::Verdict;
+            let outcome = decrease_once(p.a.clone()).await;
+            let verdict = match outcome {
+                Outcome::Failed => Some(Verdict::PeerDown),
+                Outcome::Superseded => None,
+                Outcome::Accepted | Outcome::Refused => Some(Verdict::Answered),
+            };
+            (verdict, p, outcome)
+        })
+        .await;
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for (p, outcome) in tried {
+        let result = match outcome {
+            None => {
+                untried.push(p);
+                continue;
+            }
+            Some(Outcome::Failed) => {
                 failed.push(p);
                 continue;
             }
+            Some(Outcome::Superseded) => "superseded",
+            Some(Outcome::Accepted) => "delivered",
+            Some(Outcome::Refused) => "refused",
         };
-        BACKOFF.note_success(&peer);
+        let a = &p.a;
         log::info!(
             "[{}] parked NSACF DECREASE for SST={} SD={:?}: {result}",
             a.supi,
@@ -1302,6 +1327,60 @@ pub(crate) mod tests {
         assert_eq!(delivered, 1, "the healthy NSACF gets its DECREASE");
         assert_eq!(hits, 1);
         assert_eq!(left, 3, "the blackholed ones stay parked");
+    }
+
+    /// **#2223** (the blackholed-peer test): a DECREASE toward a blackholed
+    /// NSACF parked AHEAD of one toward a healthy NSACF does not hold it back:
+    /// the healthy one is delivered in the FIRST pass, before the blackholed
+    /// one's request timeout ([`DECREASE_REQUEST_TIMEOUT`]), and the blackholed
+    /// ones stay parked with their NSACF backing off.
+    ///
+    /// REVERT-VERIFIED: with the serial loop restored (one DECREASE at a time,
+    /// in queue order), the first pass spends its 2 s test [`MAX_PASS`] on the
+    /// blackholed DECREASE and never reaches the healthy one: "delivered in the
+    /// first pass" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_peer_ahead_does_not_hold_back_a_healthy_one_2223() {
+        let _g = NSAC_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        clear_for_test();
+        let arrived: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+        let at = arrived.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let at = at.clone();
+                async move {
+                    at.lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let dead = blackhole_1961();
+        for n in 0..3 {
+            park(admission_toward_1961(
+                dead,
+                &format!("imsi-00101000002223{n}"),
+            ));
+        }
+        park(admission_toward_1961(addr.port(), "imsi-001010000022239"));
+        let before = RECONCILED.get(&["delivered"]);
+        let started = std::time::Instant::now();
+        let ended = reconcile_once().await;
+        let delivered = RECONCILED.get(&["delivered"]) - before;
+        let waited = arrived.lock().unwrap().map(|t| t - started);
+        let left = pending_count();
+        let backing_off = BACKOFF.backing_off(&format!("127.0.0.1:{dead}"));
+        clear_for_test();
+        srv.stop().await.ok();
+        assert_eq!((ended, delivered), (1, 1), "delivered in the first pass");
+        assert!(
+            waited.is_some_and(|w| w < DECREASE_REQUEST_TIMEOUT),
+            "not held back by the blackholed NSACF: arrived after {waited:?}"
+        );
+        assert_eq!(left, 3, "the blackholed ones stay parked");
+        assert!(backing_off, "the blackholed NSACF backs off");
     }
 
     /// #1961: a DECREASE parked longer than [`MAX_AGE`] ends as `expired`.

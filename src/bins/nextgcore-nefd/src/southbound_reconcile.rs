@@ -241,23 +241,29 @@ pub fn clear_for_test() {
     BACKOFF.clear();
 }
 
+/// #2223: how many producers one pass sends to at once (one DELETE in flight
+/// per producer), so dead producers cost a timeout each in parallel.
+pub const MAX_PEERS_AT_ONCE: usize = 16;
+
 /// One pass: retry the parked unsubscribes in turn order, for at most
 /// [`MAX_PASS`], at the producer each subscription was made at (else the producer
 /// URI configured now, for one recorded before that was kept). Returns how many
 /// ended.
 ///
-/// No producer can starve the others (R30 #1954, R27 #1972): once a DELETE to a
-/// producer fails it backs off ([`BACKOFF_BASE`], doubling to [`BACKOFF_MAX`]), so
-/// its other unsubscribes wait, in this pass and the next ones, instead of each
-/// costing a timeout; and a tried one goes to the BACK of the queue while one this
-/// pass did not reach keeps its place at the front. One parked longer than
-/// [`MAX_AGE`] is given up as `expired`.
+/// No producer can starve the others (R30 #1954, R27 #1972; #2223: on the shared
+/// bounded per-peer sweep, `nextgcore_sbi::sweep::retry_parked`): one DELETE in
+/// flight per producer, up to [`MAX_PEERS_AT_ONCE`] producers at once, nothing
+/// new started after [`MAX_PASS`]. A producer backing off is not tried and
+/// takes no slot; once a DELETE to a producer fails it backs off
+/// ([`BACKOFF_BASE`], doubling to [`BACKOFF_MAX`]), so its other unsubscribes
+/// wait, in this pass and the next ones, instead of each costing a timeout. A
+/// tried one goes to the BACK of the queue while one this pass did not reach
+/// keeps its place at the front. One parked longer than [`MAX_AGE`] is given up
+/// as `expired`.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<Parked> = lock().drain(..).collect();
-    let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut untried = Vec::new();
-    let mut failed = Vec::new();
+    let mut live = Vec::new();
     for parked in batch {
         let southbound = &parked.southbound;
         if parked.since.elapsed() > MAX_AGE {
@@ -270,26 +276,46 @@ pub async fn reconcile_once() -> usize {
             ended += 1;
             continue;
         }
-        let uri = target_of(southbound);
-        let target = uri.clone().unwrap_or_default();
-        // A producer that failed (in this pass or an earlier one) is backing off:
-        // its unsubscribes wait, so it costs one attempt per backoff period.
-        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&target) {
-            untried.push(parked);
-            continue;
-        }
-        if crate::try_southbound_unsubscribe(uri, southbound).await {
-            BACKOFF.note_success(&target);
-            log::info!(
-                "{} unsubscribe of {}: reconciled",
-                southbound.producer.as_str(),
-                southbound.subscription_id
-            );
-            RECONCILED.inc(&["delivered"]);
-            ended += 1;
-        } else {
-            BACKOFF.note_failure(&target);
-            failed.push(parked);
+        live.push((target_of(southbound).unwrap_or_default(), parked));
+    }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: MAX_PEERS_AT_ONCE,
+        budget: MAX_PASS,
+    };
+    let tried = nextgcore_sbi::sweep::retry_parked(
+        &BACKOFF,
+        limits,
+        live,
+        |_target, parked: Parked| async move {
+            use nextgcore_sbi::sweep::Verdict;
+            let southbound = &parked.southbound;
+            let delivered =
+                crate::try_southbound_unsubscribe(target_of(southbound), southbound).await;
+            let verdict = if delivered {
+                Verdict::Answered
+            } else {
+                Verdict::PeerDown
+            };
+            (Some(verdict), parked, delivered)
+        },
+    )
+    .await;
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for (parked, delivered) in tried {
+        match delivered {
+            None => untried.push(parked),
+            Some(false) => failed.push(parked),
+            Some(true) => {
+                log::info!(
+                    "{} unsubscribe of {}: reconciled",
+                    parked.southbound.producer.as_str(),
+                    parked.southbound.subscription_id
+                );
+                RECONCILED.inc(&["delivered"]);
+                ended += 1;
+            }
         }
     }
     let mut set = lock();

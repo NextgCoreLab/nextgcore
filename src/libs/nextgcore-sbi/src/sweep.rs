@@ -24,9 +24,15 @@
 //! per peer and one for the peers), so dropping the sweep's future aborts
 //! every item still in flight: nothing outlives a cancelled pass.
 //!
-//! New passes use this helper; `tests::no_hand_rolled_sweeps_remain` is the
+//! A reconciler of parked work that keeps a [`PeerBackoff`] per peer runs on
+//! [`retry_parked`] (#2223), which adds the backoff around [`sweep`]: a peer
+//! backing off is not started and takes no slot, and the pass's verdicts feed
+//! the backoff.
+//!
+//! New passes use these helpers; `tests::no_hand_rolled_sweeps_remain` is the
 //! source guard that fails on a new hand-rolled one in the migrated crates.
 
+use nextgcore_core::backoff::PeerBackoff;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -132,11 +138,12 @@ where
     let offset = if n_peers == 0 {
         0
     } else {
-        use std::hash::{BuildHasher, Hasher};
-        (std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish() as usize)
-            % n_peers
+        pinned_offset().unwrap_or_else(|| {
+            use std::hash::{BuildHasher, Hasher};
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish() as usize
+        }) % n_peers
     };
     let mut peers_in_order: Vec<(usize, (K, Vec<I>))> = by_peer.into_iter().enumerate().collect();
     peers_in_order.rotate_left(offset);
@@ -168,6 +175,116 @@ where
             .extend(part.skipped.into_iter().map(|(_, k, i, s)| (k, i, s)));
     }
     report
+}
+
+#[cfg(any(test, feature = "test-support"))]
+tokio::task_local! {
+    static START_OFFSET: usize;
+}
+
+/// The start offset [`with_start_offset`] pinned for this task, if any.
+fn pinned_offset() -> Option<usize> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Ok(offset) = START_OFFSET.try_with(|o| *o) {
+        return Some(offset);
+    }
+    None
+}
+
+/// Test support (#2223, R41 on #2240): every [`sweep`] that `f` runs on this
+/// task starts its peers at index `offset` of the key order (modulo the number
+/// of peers), then on in key order, instead of at a random offset. A test of
+/// "a dead peer does not starve a healthy one" pins the dead peers first, so
+/// its revert (the peers run in turn) fails on every run, not only when the
+/// random order happens to put a dead peer first.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn with_start_offset<F: std::future::Future>(offset: usize, f: F) -> F::Output {
+    START_OFFSET.scope(offset, f).await
+}
+
+/// One pass of a reconciler of parked work (#2223) on [`sweep`], with
+/// `backoff` per peer around it:
+///
+/// - an item whose peer is backing off when the pass begins is not started and
+///   takes no slot (as udmd's and lmfd's reconcilers did since #2186);
+/// - `work` answers `(verdict, item, result)`: `Some(Verdict::PeerDown)` parks
+///   the peer for the rest of the pass, `Some(Verdict::Answered)` keeps going,
+///   and `None` says the item was not sent (a deferred or superseded one), so
+///   it tells the backoff nothing;
+/// - after the pass, a peer with any `PeerDown` item is noted as failed (once),
+///   and one with an `Answered` item as succeeded (first: with one item in
+///   flight per peer, its answers came before the failure that parked it).
+///
+/// `limits.per_peer` must be 1 (#2223 R48): with more in flight, an answer may
+/// land after the failure, and the success-then-failure order would be wrong.
+///
+/// Returns every item in `batch` order, with `Some(result)` if its work ran or
+/// `None` if it was not started (its peer backing off or parked in this pass,
+/// or the budget ran out). The caller requeues: by convention the not-started
+/// at the FRONT, the failed at the BACK.
+pub async fn retry_parked<P, R, F, Fut>(
+    backoff: &PeerBackoff,
+    limits: SweepLimits,
+    batch: Vec<(String, P)>,
+    work: F,
+) -> Vec<(P, Option<R>)>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    F: Fn(String, P) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = (Option<Verdict>, P, R)> + Send + 'static,
+{
+    debug_assert_eq!(
+        limits.per_peer, 1,
+        "retry_parked notes the backoff in order"
+    );
+    let mut out: Vec<(usize, P, Option<R>)> = Vec::with_capacity(batch.len());
+    let mut items = Vec::new();
+    for (place, (peer, item)) in batch.into_iter().enumerate() {
+        if backoff.backing_off(&peer) {
+            out.push((place, item, None));
+        } else {
+            items.push((peer, (place, item)));
+        }
+    }
+    let work = Arc::new(work);
+    let report = sweep(
+        limits,
+        items,
+        || (),
+        move |peer, (place, item), ()| {
+            let work = work.clone();
+            async move {
+                let (verdict, item, r) = work(peer, item).await;
+                let said = verdict.unwrap_or(Verdict::Answered);
+                (said, (place, item, verdict, r))
+            }
+        },
+    )
+    .await;
+    let mut down: Vec<String> = Vec::new();
+    let mut answered: Vec<String> = Vec::new();
+    for (peer, (place, item, verdict, r)) in report.done {
+        match verdict {
+            Some(Verdict::PeerDown) if !down.contains(&peer) => down.push(peer),
+            Some(Verdict::Answered) if !answered.contains(&peer) => answered.push(peer),
+            _ => {}
+        }
+        out.push((place, item, Some(r)));
+    }
+    for (_, (place, item), _) in report.skipped {
+        out.push((place, item, None));
+    }
+    // In the order they happened: a peer's items run one at a time and a
+    // failure parks it, so its answers came before its failure.
+    for peer in &answered {
+        backoff.note_success(peer);
+    }
+    for peer in &down {
+        backoff.note_failure(peer);
+    }
+    out.sort_by_key(|(place, ..)| *place);
+    out.into_iter().map(|(_, item, r)| (item, r)).collect()
 }
 
 struct PeerPart<K, I, R> {

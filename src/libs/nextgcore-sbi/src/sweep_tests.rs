@@ -239,6 +239,95 @@ async fn the_start_order_rotates_between_passes() {
     assert!(first.len() > 1, "always the same peer first: {first:?}");
 }
 
+/// #2223 (R41 on #2240): [`with_start_offset`] pins the start order: with
+/// only the first-started peer running per pass, the pinned one runs in every
+/// pass, and the pin is this task's only.
+///
+/// REVERT-VERIFIED: with `pinned_offset` always `None`, "c" is not first in
+/// every pass.
+#[tokio::test(start_paused = true)]
+async fn a_pinned_start_offset_fixes_the_first_peer() {
+    for _ in 0..30 {
+        let report = with_start_offset(
+            2,
+            sweep(
+                limits(1, 1, Duration::from_millis(500)),
+                vec![("a", 0u8), ("b", 0), ("c", 0)],
+                Instant::now,
+                |_, _, _| async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    (Verdict::Answered, ())
+                },
+            ),
+        )
+        .await;
+        assert_eq!(report.done.len(), 1);
+        assert_eq!(report.done[0].0, "c", "index 2 of the key order starts");
+    }
+}
+
+/// #2223: [`retry_parked`] around the backoff. A peer backing off when the
+/// pass begins is not started (its work never runs) and takes no slot; a dead
+/// peer costs one item and is noted failed once; a live one is noted
+/// succeeded; an item not sent (`None`) tells the backoff nothing; every item
+/// comes back in batch order, `None` for the ones not started.
+///
+/// REVERT-VERIFIED: with the backoff filter dropped, the backing-off peer's
+/// work runs ("not tried while backing off"); with the notes dropped, "dead
+/// backs off" fails.
+#[tokio::test(start_paused = true)]
+async fn retry_parked_filters_and_feeds_the_backoff() {
+    let backoff = PeerBackoff::new(Duration::from_secs(30), Duration::from_secs(600));
+    backoff.note_failure("off");
+    let ran: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let seen = ran.clone();
+    let batch: Vec<(String, u32)> = vec![
+        ("off".into(), 1),
+        (DEAD.into(), 2),
+        (DEAD.into(), 3),
+        (LIVE.into(), 4),
+        ("quiet".into(), 5),
+    ];
+    let out = retry_parked(
+        &backoff,
+        limits(1, 1, Duration::from_secs(60)),
+        batch,
+        move |peer, n| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(n);
+                match peer.as_str() {
+                    DEAD => {
+                        tokio::time::sleep(REQUEST_TIMEOUT).await;
+                        (Some(Verdict::PeerDown), n, "down")
+                    }
+                    LIVE => (Some(Verdict::Answered), n, "ok"),
+                    _ => (None, n, "not sent"),
+                }
+            }
+        },
+    )
+    .await;
+    assert_eq!(
+        out,
+        vec![
+            (1, None),
+            (2, Some("down")),
+            (3, None),
+            (4, Some("ok")),
+            (5, Some("not sent")),
+        ]
+    );
+    let mut ran = ran.lock().unwrap().clone();
+    ran.sort();
+    assert_eq!(ran, vec![2, 4, 5], "not tried while backing off");
+    assert!(backoff.backing_off(DEAD), "dead backs off");
+    assert_eq!(backoff.current(DEAD), Some(Duration::from_secs(30)), "once");
+    assert_eq!(backoff.current(LIVE), None);
+    assert_eq!(backoff.current("quiet"), None, "not sent: no entry");
+    assert_eq!(backoff.current("off"), Some(Duration::from_secs(30)));
+}
+
 /// Why a flagged fn is not a hand-rolled peer sweep (or is one still to move).
 const TIMER: &str = "a timer loop that drives a pass; the pass is checked on its own";
 const PROCEDURE: &str = "one request's or one UE's procedure, not a periodic pass over peers";
@@ -248,9 +337,29 @@ const ONE_PEER: &str = "every call goes to one peer, so no peer can hold another
 const CONCURRENT: &str =
     "all calls already run at once on a JoinSet, each bounded by its own timeout";
 const LOCAL: &str = "no remote call per peer in the loop";
-/// Serial reconcilers, each a pass over parked work at many peers, bounded by
-/// `PeerBackoff` but still one at a time: to move onto `sweep` (#2186 follow-up).
-const PENDING: &str = "a serial multi-peer reconciler still to move onto sweep: tracked in #2223";
+/// #2223: a reconciler of parked work whose every item goes to the one peer it
+/// resolves (tsctsf's PCF, pcfd's BSF): its first failure ends or backs off the
+/// pass, and there is no other peer to hold back.
+const ONE_RESOLVED_PEER: &str =
+    "every parked item goes to the one peer resolved for the pass; a failure stops the pass";
+
+// Known limits of the guard, a name-and-syntax heuristic (#2216 R41, #2223):
+//
+// - G1, a pass fn plus a helper: `refresh_all_legs` calling a `send_each`
+//   (no pass word) that loops and awaits is not flagged. Following a pass
+//   fn's same-crate callees was tried (#2223) and flagged 35 more fns on main,
+//   every one checked a per-UE or per-request procedure (or a callee already
+//   allowed, such as lmfd's concurrent `unsubscribe_all`), so it would mostly
+//   grow this list.
+// - G2, the pass word only in the type: `impl LegRefresher { async fn run() }`
+//   is not flagged.
+// - A fn that calls `sweep::sweep(` or `sweep::retry_parked(` is exempt as a
+//   whole, so a serial loop beside the call is not flagged (#2223 R48; the
+//   self-test's `reconcile_on_retry_parked` plants one).
+// - A fn is cut at the next `fn `, so a closure-heavy body or a nested fn can
+//   move a loop to the fn after it.
+//
+// Review a new periodic pass against `sweep` by hand as well.
 
 /// Every production fn the guard flags today: (file, fn name, how many fns of
 /// that name in the file the guard flags, the reason it is not (yet) a shared
@@ -271,7 +380,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         1,
         PROCEDURE,
     ),
-    ("nextgcore-amfd/src/nsac.rs", "reconcile_once", 1, PENDING),
     ("nextgcore-amfd/src/nsac.rs", "spawn_reconciler", 1, TIMER),
     (
         "nextgcore-amfd/src/ngap_path.rs",
@@ -358,12 +466,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         TIMER,
     ),
     (
-        "nextgcore-hssd/src/s6a_path.rs",
-        "sweep_pending_requests",
-        1,
-        PENDING,
-    ),
-    (
         "nextgcore-lmfd/src/amf_unsubscribe.rs",
         "spawn_reconciler",
         1,
@@ -395,27 +497,9 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "nextgcore-mbsmfd/src/reconcile.rs",
-        "reconcile_once",
-        1,
-        PENDING,
-    ),
-    (
-        "nextgcore-mbsmfd/src/reconcile.rs",
         "spawn_reconciler",
         1,
         TIMER,
-    ),
-    (
-        "nextgcore-nefd/src/main.rs",
-        "reconcile_pending_subscriptions",
-        1,
-        PENDING,
-    ),
-    (
-        "nextgcore-nefd/src/southbound_reconcile.rs",
-        "reconcile_once",
-        1,
-        PENDING,
     ),
     (
         "nextgcore-nefd/src/southbound_reconcile.rs",
@@ -433,7 +517,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "nextgcore-pcfd/src/bsf_reconcile.rs",
         "reconcile_once",
         1,
-        PENDING,
+        ONE_RESOLVED_PEER,
     ),
     (
         "nextgcore-pcfd/src/bsf_reconcile.rs",
@@ -528,12 +612,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("nextgcore-smfd/src/qos_mon.rs", "reconcile", 1, LOCAL),
     (
         "nextgcore-smfd/src/reconcile.rs",
-        "reconcile_once",
-        1,
-        PENDING,
-    ),
-    (
-        "nextgcore-smfd/src/reconcile.rs",
         "spawn_reconciler",
         1,
         TIMER,
@@ -560,7 +638,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "nextgcore-tsctsf/src/reconcile.rs",
         "reconcile_once",
         1,
-        PENDING,
+        ONE_RESOLVED_PEER,
     ),
     (
         "nextgcore-tsctsf/src/reconcile.rs",
@@ -664,6 +742,18 @@ fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether `s` has an `.await` (#2223: as a token, so a field such as
+/// hssd's `req.awaiting_peer` is not one).
+fn awaits(s: &str) -> bool {
+    s.match_indices(".await")
+        .any(|(at, m)| !s[at + m.len()..].chars().next().is_some_and(is_ident))
+}
+
+/// Whether `body` runs its pass on the shared sweep.
+fn on_sweep(body: &str) -> bool {
+    body.contains("sweep::sweep(") || body.contains("sweep::retry_parked(")
+}
+
 /// Whether `body` has a `for`, `while` or `loop` whose block awaits.
 fn loop_awaits(body: &str) -> bool {
     // #2216 R41 F3: a stream or iterator combinator whose closure awaits is a
@@ -671,7 +761,7 @@ fn loop_awaits(body: &str) -> bool {
     // `for_each_concurrent(limit, ...)`, a hand-rolled bound).
     for call in [".for_each(", "for_each_concurrent(", ".then(", ".fold("] {
         for (at, _) in body.match_indices(call) {
-            if paren_span(body, at + call.len() - 1).contains(".await") {
+            if awaits(paren_span(body, at + call.len() - 1)) {
                 return true;
             }
         }
@@ -683,7 +773,7 @@ fn loop_awaits(body: &str) -> bool {
             if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
                 continue;
             }
-            if block_at(body, at + kw.len()).contains(".await") {
+            if awaits(block_at(body, at + kw.len())) {
                 return true;
             }
         }
@@ -691,11 +781,9 @@ fn loop_awaits(body: &str) -> bool {
     false
 }
 
-/// The fns of `src` (production code: cut at `#[cfg(test)] mod tests`) that look
-/// like a hand-rolled pass over peers: named for one ([`PASS_WORDS`]) and
-/// either building a semaphore (`Semaphore::new` / `const_new`) or awaiting
-/// inside a loop, and not running on [`sweep`].
-fn hand_rolled(src: &str) -> Vec<String> {
+/// The fns of `src` (production code: cut at `#[cfg(test)] mod tests`), each
+/// with its body: from its `fn` to the next fn's.
+fn fns_of(src: &str) -> Vec<(String, &str)> {
     let src = match src.find("\n#[cfg(test)]\nmod tests") {
         Some(cut) => &src[..cut],
         None => src,
@@ -709,26 +797,49 @@ fn hand_rolled(src: &str) -> Vec<String> {
             (at, rest[..end].to_string())
         })
         .collect();
-    let mut out = Vec::new();
-    for (i, (at, name)) in heads.iter().enumerate() {
-        if !PASS_WORDS.iter().any(|w| name.contains(w)) {
-            continue;
-        }
-        let end = heads.get(i + 1).map_or(src.len(), |(n, _)| *n);
-        let body = &src[*at..end];
-        let semaphore = body.contains("Semaphore::new(") || body.contains("Semaphore::const_new(");
-        if (semaphore || loop_awaits(body)) && !body.contains("sweep::sweep(") {
-            out.push(name.clone());
-        }
-    }
-    out
+    heads
+        .iter()
+        .enumerate()
+        .map(|(i, (at, name))| {
+            let end = heads.get(i + 1).map_or(src.len(), |(n, _)| *n);
+            (name.clone(), &src[*at..end])
+        })
+        .collect()
+}
+
+/// Whether `body` itself looks like a hand-rolled pass: it builds a semaphore
+/// (`Semaphore::new` / `const_new`) or awaits inside a loop, and does not run
+/// on [`sweep`].
+fn rolls_by_hand(body: &str) -> bool {
+    let semaphore = body.contains("Semaphore::new(") || body.contains("Semaphore::const_new(");
+    (semaphore || loop_awaits(body)) && !on_sweep(body)
+}
+
+fn is_pass_name(name: &str) -> bool {
+    PASS_WORDS.iter().any(|w| name.contains(w))
+}
+
+/// The fns of `src` that look like a hand-rolled pass over peers: named for
+/// one ([`PASS_WORDS`]) and [`rolls_by_hand`].
+fn hand_rolled(src: &str) -> Vec<String> {
+    fns_of(src)
+        .into_iter()
+        .filter(|(name, body)| is_pass_name(name) && rolls_by_hand(body))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// R44's three planted shapes are flagged: the #2155 serial `for ... .await`,
 /// a `drain_*` fn with a semaphore, and `Semaphore::const_new`; and R41's
 /// (#2216): a serial `purge_*` loop (F2), and a stream `for_each` /
 /// `for_each_concurrent(1, ...)` whose closure awaits (F3). A pass on the
-/// shared sweep, and a fn not named for a pass, are not.
+/// shared sweep (or on `retry_parked`), a fn not named for a pass, and (#2223)
+/// a loop that only reads a field named `awaiting_*` (hssd's
+/// `sweep_pending_requests`, which awaits nothing), are not.
+///
+/// #2223 REVERT-VERIFIED: with `.await` matched as a substring,
+/// `sweep_pending_requests` is flagged; without `retry_parked` in `on_sweep`,
+/// `reconcile_on_retry_parked` is.
 ///
 /// REVERT-VERIFIED: with the loop check dropped, the serial shape passes; with
 /// only `Semaphore::new(` matched, `const_new` passes; with the old six words,
@@ -765,6 +876,20 @@ async fn refresh_all_peers(xs: Vec<Peer>) {
 }
 async fn cleanup_legs(xs: Vec<Peer>) {
     futures::stream::iter(xs).for_each_concurrent(1, |x| async move { release(x).await; }).await;
+}
+fn sweep_pending_requests(reqs: Vec<Req>) {
+    for r in reqs {
+        if r.awaiting_peer || r.awaited {
+            send(r);
+        }
+    }
+}
+async fn reconcile_on_retry_parked(batch: Vec<(String, u32)>) {
+    for b in &batch {
+        log(b).await;
+    }
+    nextgcore_sbi::sweep::retry_parked(&B, limits(), batch, |_, i| async move { (None, i, ()) })
+        .await;
 }
 async fn serve_requests(reqs: Vec<Req>) {
     for r in reqs {
@@ -884,10 +1009,10 @@ mod r41_extra {
         .map(|n| ("nextgcore-amfd/src/nsac.rs".to_string(), n))
         .collect();
     assert_eq!(found.len(), 2);
-    let allowed = [("nextgcore-amfd/src/nsac.rs", "reconcile_once", 1, PENDING)];
+    let allowed = [("nextgcore-amfd/src/nsac.rs", "reconcile_once", 1, PROCEDURE)];
     let v = allowlist_violations(&found, &allowed);
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains("2 flagged, ALLOWED says 1"), "{v:?}");
-    let allowed = [("nextgcore-amfd/src/nsac.rs", "reconcile_once", 2, PENDING)];
+    let allowed = [("nextgcore-amfd/src/nsac.rs", "reconcile_once", 2, PROCEDURE)];
     assert!(allowlist_violations(&found, &allowed).is_empty());
 }

@@ -21,7 +21,9 @@
 //!   whenever it changes, and restored from it at boot, so a restart does not forget
 //!   a cleanup it still owes. Like the sessions, only when the durable state is
 //!   configured (`--state-file` / `NEXTGCORE_SMF_STATE_FILE`).
-//! - No peer starves the others (#1961, the #1954 / #1972 pattern): once a cleanup
+//! - No peer starves the others (#1961, the #1954 / #1972 pattern; #2223: on the
+//!   shared bounded per-peer sweep, one cleanup in flight per peer and the peers
+//!   at once): once a cleanup
 //!   to a peer (an NSACF, the PCF, the UDM) fails, that peer backs off
 //!   ([`BACKOFF_BASE`], doubling to [`BACKOFF_MAX`]) and its other cleanups wait, in
 //!   this pass and later ones; one tried and failed goes to the BACK of the queue,
@@ -341,8 +343,14 @@ fn holder(supi: &str, psi: u8) -> Holder {
 #[derive(Debug, PartialEq, Eq)]
 enum Attempt {
     Delivered,
+    /// Not sent: a live session holds the record (#2223 R48: says nothing of
+    /// the peer).
     Superseded,
+    /// Sent, and the peer answered a 4xx a retry cannot change.
     Refused,
+    /// Not sent, and never will be: the UDM client is disabled. Counted
+    /// `refused`, but says nothing of the peer (#2223 R48).
+    Unsendable,
     /// Not sent this pass (a create for the same pair is in flight).
     Deferred,
     Failed,
@@ -428,7 +436,7 @@ async fn attempt(c: &Cleanup) -> Attempt {
                 Holder::None => {}
             }
             if !crate::udm::enabled() {
-                return Attempt::Refused;
+                return Attempt::Unsendable;
             }
             if !in_flight.entry.begin_deregistration() {
                 return Attempt::Superseded;
@@ -448,7 +456,7 @@ async fn attempt(c: &Cleanup) -> Attempt {
             subscription_id,
         } => {
             if !crate::udm::enabled() {
-                return Attempt::Refused;
+                return Attempt::Unsendable;
             }
             match tokio::time::timeout(
                 crate::UDM_RELEASE_TIMEOUT,
@@ -463,23 +471,28 @@ async fn attempt(c: &Cleanup) -> Attempt {
     }
 }
 
+/// #2223: how many peers one pass sends to at once (one cleanup in flight per
+/// peer), so dead peers cost a timeout each in parallel rather than in turn.
+pub const MAX_PEERS_AT_ONCE: usize = 16;
+
 /// One reconcile pass: retry the parked cleanups, oldest first, for at most
 /// [`MAX_PASS`]. One older than [`MAX_AGE`] ends as `expired`.
 ///
-/// #1961: once a cleanup to a peer fails, that peer backs off and its other
-/// cleanups are not tried this pass (nor until the backoff ends); one tried and
-/// failed goes to the BACK of the queue, one deferred or not reached keeps its
-/// place at the FRONT. Returns how many ended.
+/// #2223: on the shared bounded per-peer sweep (`nextgcore_sbi::sweep::retry_parked`):
+/// one cleanup in flight per peer, up to [`MAX_PEERS_AT_ONCE`] peers at once,
+/// nothing new started after [`MAX_PASS`]. A peer backing off is not tried and
+/// takes no slot; once a cleanup to a peer fails, that peer backs off and its
+/// other cleanups are not tried this pass (#1961). One tried and failed goes to
+/// the BACK of the queue; one deferred or not reached keeps its place at the
+/// FRONT. Returns how many ended.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<Parked> = lock().drain(..).collect();
     if batch.is_empty() {
         prune_backoff();
         return 0;
     }
-    let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
-    let mut untried = Vec::new();
-    let mut failed = Vec::new();
+    let mut live = Vec::new();
     for p in batch {
         let c = &p.cleanup;
         if p.since.elapsed().unwrap_or_default() > MAX_AGE {
@@ -488,28 +501,46 @@ pub async fn reconcile_once() -> usize {
             ended += 1;
             continue;
         }
-        let peer = peer_of(c);
-        if tokio::time::Instant::now() >= deadline || BACKOFF.backing_off(&peer) {
-            untried.push(p);
-            continue;
-        }
-        let result = match attempt(c).await {
-            Attempt::Delivered => "delivered",
-            Attempt::Superseded => "superseded",
-            Attempt::Refused => "refused",
-            Attempt::Deferred => {
+        live.push((peer_of(c), p));
+    }
+    let limits = nextgcore_sbi::sweep::SweepLimits {
+        per_peer: 1,
+        global: MAX_PEERS_AT_ONCE,
+        budget: MAX_PASS,
+    };
+    let tried =
+        nextgcore_sbi::sweep::retry_parked(&BACKOFF, limits, live, |_peer, p: Parked| async move {
+            use nextgcore_sbi::sweep::Verdict;
+            let attempt = attempt(&p.cleanup).await;
+            let verdict = match attempt {
+                // #2223 (R48): only an answer the peer gave counts for its
+                // backoff. A cleanup not sent says nothing of the peer:
+                // crediting it would reset a dead peer's backoff to the base.
+                Attempt::Deferred | Attempt::Superseded | Attempt::Unsendable => None,
+                Attempt::Failed => Some(Verdict::PeerDown),
+                Attempt::Delivered | Attempt::Refused => Some(Verdict::Answered),
+            };
+            (verdict, p, attempt)
+        })
+        .await;
+    let mut untried = Vec::new();
+    let mut failed = Vec::new();
+    for (p, attempt) in tried {
+        let result = match attempt {
+            Some(Attempt::Delivered) => "delivered",
+            Some(Attempt::Superseded) => "superseded",
+            Some(Attempt::Refused | Attempt::Unsendable) => "refused",
+            None | Some(Attempt::Deferred) => {
                 untried.push(p);
                 continue;
             }
-            Attempt::Failed => {
-                BACKOFF.note_failure(&peer);
+            Some(Attempt::Failed) => {
                 failed.push(p);
                 continue;
             }
         };
-        BACKOFF.note_success(&peer);
-        log::info!("{}: reconciled ({result})", c.describe());
-        RECONCILED.inc(&[c.kind(), result]);
+        log::info!("{}: reconciled ({result})", p.cleanup.describe());
+        RECONCILED.inc(&[p.cleanup.kind(), result]);
         ended += 1;
     }
     {
@@ -736,6 +767,114 @@ mod tests {
         assert_eq!(got, 1, "the healthy NSACF gets its DECREASE");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(left.len(), 3, "the blackholed ones stay parked: {left:?}");
+    }
+
+    /// **#2223** (the blackholed-peer test): a DECREASE toward a blackholed
+    /// NSACF parked AHEAD of one toward a healthy NSACF does not hold it back:
+    /// the healthy one is delivered in the FIRST pass, while the blackholed
+    /// one is still waiting out its 3 s `UDM_RELEASE_TIMEOUT`, and the
+    /// blackholed ones stay parked with their NSACF backing off.
+    ///
+    /// REVERT-VERIFIED: with the serial loop restored (one cleanup at a time,
+    /// in queue order), the first pass spends its 2 s test `MAX_PASS` on the
+    /// blackholed DECREASE and never reaches the healthy one: "delivered in
+    /// the first pass" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_peer_ahead_does_not_hold_back_a_healthy_one_2223() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        clear_for_test();
+        let arrived: std::sync::Arc<Mutex<Option<std::time::Instant>>> = Default::default();
+        let at = arrived.clone();
+        let (srv, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let at = at.clone();
+                async move {
+                    at.lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            },
+        )
+        .await;
+        let dead = blackhole_1961();
+        for n in 0..3 {
+            park(decrease_at(dead, 20 + n));
+        }
+        park(decrease_at(addr.port(), 29));
+        let delivered = || RECONCILED.get(&["nsac_decrease", "delivered"]);
+        let before = delivered();
+        let started = std::time::Instant::now();
+        let ended = reconcile_once().await;
+        let got = delivered() - before;
+        let waited = arrived.lock().unwrap().map(|t| t - started);
+        let left = snapshot();
+        let dead_peer = format!("nsacf 127.0.0.1:{dead}");
+        let backing_off = BACKOFF.backing_off(&dead_peer);
+        clear_for_test();
+        let _ = tokio::time::timeout(Duration::from_secs(1), srv.stop()).await;
+        assert_eq!((ended, got), (1, 1), "delivered in the first pass");
+        assert!(
+            waited.is_some_and(|w| w < crate::UDM_RELEASE_TIMEOUT),
+            "not held back by the blackholed NSACF: arrived after {waited:?}"
+        );
+        assert_eq!(left.len(), 3, "the blackholed ones stay parked: {left:?}");
+        assert!(backing_off, "the blackholed NSACF backs off");
+    }
+
+    /// **#2223** (R48 on #2255): a cleanup the pass did not send says nothing of
+    /// its peer, so it does not clear the peer's backoff. The UDM has failed
+    /// before (its backoff is at the base, its wait over); a UECM deregistration
+    /// that cannot be sent (the UDM client is off) leaves that backoff as it
+    /// was, so the UDM's next failure doubles it instead of restarting at the
+    /// base.
+    ///
+    /// REVERT-VERIFIED: with `Unsendable` (and `Superseded`) mapped to
+    /// `Verdict::Answered` again, as on #2255's first head, the pass calls
+    /// `note_success` and "an unsent cleanup leaves the backoff" fails.
+    #[tokio::test]
+    async fn a_cleanup_not_sent_does_not_credit_its_peer_2223() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        clear_for_test();
+        crate::udm::set_for_test(false);
+        // A second UDM cleanup whose session is being created: deferred, so it
+        // stays parked and the pass's prune keeps the UDM's backoff.
+        crate::context::smf_context_init(64, 256, 512);
+        {
+            let ctx = crate::smf_self();
+            let guard = ctx.read().expect("context");
+            let ue = guard.ue_add_by_supi("imsi-001010000022232").expect("ue");
+            guard.sess_add_by_psi(ue.id, 5).expect("sess");
+        }
+        park(Cleanup::UecmDeregister {
+            supi: "imsi-001010000022232".into(),
+            psi: 5,
+        });
+        BACKOFF.note_failure("udm");
+        while BACKOFF.backing_off("udm") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        park(Cleanup::UecmDeregister {
+            supi: "imsi-001010000022231".into(),
+            psi: 5,
+        });
+        let refused = || RECONCILED.get(&["uecm_deregister", "refused"]);
+        let before = refused();
+        let ended = reconcile_once().await;
+        let counted = refused() - before;
+        let after = BACKOFF.current("udm");
+        let left = snapshot().len();
+        clear_for_test();
+
+        assert_eq!((ended, counted), (1, 1), "ended as refused");
+        assert_eq!(left, 1, "the deferred one stays parked");
+        assert_eq!(
+            after,
+            Some(BACKOFF_BASE),
+            "an unsent cleanup leaves the backoff"
+        );
     }
 
     /// #1961: a cleanup parked longer than [`MAX_AGE`] ends as `expired`.
