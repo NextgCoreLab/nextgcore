@@ -6,6 +6,9 @@ src = "src"
 
 [build]
 build-dir = "../docs/book"
+# #2185: a SUMMARY.md entry whose file is missing fails the build rather than
+# shipping an empty page (mdBook's default creates the file).
+create-missing = false
 
 [output.html]
 default-theme = "navy"
