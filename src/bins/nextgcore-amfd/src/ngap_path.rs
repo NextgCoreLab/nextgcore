@@ -47394,7 +47394,7 @@ mod tests {
     /// RAN sent — not a placeholder.
     ///
     /// The issue says *"Neither release code is plumbed anywhere the event could read
-    /// it"*. The RAN one was: `nextgcore_ngap::parser::parse_ue_context_release_request`
+    /// it"*. The RAN one was: the hand-written `nextgcore-ngap` parser's `parse_ue_context_release_request`
     /// decodes Cause as a mandatory IE and refuses the message without it, then the
     /// value was discarded. So this test builds a REAL UEContextReleaseRequest PDU and
     /// lets the production decoder recover the cause — asserting on a value that only
