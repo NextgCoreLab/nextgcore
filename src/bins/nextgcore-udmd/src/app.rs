@@ -2887,6 +2887,8 @@ fn spawn_ee_expiry_sweep() {
         loop {
             tick.tick().await;
             sweep_expired_ee_subscriptions(crate::context::now_unix_secs()).await;
+            // #2156: and keep the live subscriptions' AMF legs from lapsing.
+            crate::ee_amf::renew_amf_legs(crate::context::now_unix_secs()).await;
         }
     });
 }
@@ -6230,6 +6232,7 @@ mod tests {
             notify_uri: "http://nef.example.org/ee-notify".to_string(),
             events: vec!["LOSS_OF_CONNECTIVITY_REPORT".to_string()],
             expiry: None,
+            amf_expiry: None,
         });
         let lapsed_id = lapsed.id.clone();
         udm_self().read().unwrap().ee_subscription_insert(lapsed);
