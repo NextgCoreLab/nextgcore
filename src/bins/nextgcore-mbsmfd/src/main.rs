@@ -4337,6 +4337,13 @@ mod tests {
         );
 
         // ---- an untrackable consumer keeps the pre-#295 behaviour ----
+        //
+        // #2157: dev only. An empty nfcInstanceId names no NF, so no verified
+        // caller can match it and production refuses it 403 (#2060,
+        // `refuse_foreign_nfc_instance`); only a dev deployment's anonymous
+        // caller reaches this fallback. Declared here: this half used to pass
+        // only after a sibling had set the override, and failed 403 alone.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let anon_id = [0xC2, 0x95, 0x03];
         let anon = seed_global_session(anon_id);
         let rsp = post_ctx_update(
