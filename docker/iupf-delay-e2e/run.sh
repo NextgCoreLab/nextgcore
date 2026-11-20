@@ -33,13 +33,17 @@
 #
 # Environment: ECHO_HOLD_MS (40), N9_MS (15, expected), NETEM_N9_MS (N9_MS,
 # injected), TOLERANCE_MS (8; below min(ECHO_HOLD_MS/2, N9_MS)), RUN_ID (this
-# shell's PID), NET_OCTET (derived from RUN_ID).
+# shell's PID; digits only), NET_OCTET (derived from RUN_ID; 1-254),
+# STALE_AFTER_S (3600: another run's resources older than this are swept).
 #
 # Usage: run.sh <dir with nextgcore-smfd, nextgcore-upfd, iupf-delay-harness> <out-dir>
 # Needs docker and the sch_netem module; plain `docker run`, no compose. Each run
 # has its own container names, network, subnet and image tags (RUN_ID), so two
 # runs on one host do not clobber each other; a subnet already taken refuses the
-# run rather than reusing it.
+# run rather than reusing it. Every container, network and image carries the
+# label nextg.iupf-delay.run=<RUN_ID>: cleanup removes by that label, so it is
+# idempotent, and it runs at the start too, also sweeping what a killed
+# (SIGKILL) run of another RUN_ID left behind once it is older than any job.
 set -euo pipefail
 
 BIN="$(cd "${1:?binaries dir}" && pwd)"
@@ -48,7 +52,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUST="$HERE/../rust"
 
 RUN_ID="${RUN_ID:-$$}"
-OCTET="${NET_OCTET:-$((RUN_ID % 200 + 30))}"
+if ! [[ $RUN_ID =~ ^[0-9]+$ ]]; then
+  echo "RUN_ID must be digits only (it names resources and picks the subnet): '$RUN_ID'" >&2
+  exit 2
+fi
+# 10# so a leading zero is not read as octal.
+OCTET="${NET_OCTET:-$((10#$RUN_ID % 200 + 30))}"
+if ! [[ $OCTET =~ ^[0-9]+$ ]] || [ "$((10#$OCTET))" -lt 1 ] || [ "$((10#$OCTET))" -gt 254 ]; then
+  echo "NET_OCTET must be 1-254: '$OCTET'" >&2
+  exit 2
+fi
+OCTET=$((10#$OCTET))
+STALE_AFTER_S="${STALE_AFTER_S:-3600}"
+LABEL=nextg.iupf-delay.run
 CORE_IMAGE="${IUPF_DELAY_CORE_IMAGE:-nextgcore-core:latest}"
 SMF_IMAGE="nextgcore-rust/smf:iupf-delay-$RUN_ID"
 UPF_IMAGE="nextgcore-rust/upf:iupf-delay-$RUN_ID"
@@ -75,9 +91,46 @@ docker image inspect "$CORE_IMAGE" >/dev/null 2>&1 ||
 ctx="$OUT/image-context"
 mkdir -p "$ctx/binaries"
 cp "$BIN/nextgcore-smfd" "$BIN/nextgcore-upfd" "$ctx/binaries/"
+# Remove this run's labelled resources: containers, then networks, then images.
+# Safe to run any number of times.
+remove_run() { # <run id>
+  local ids=()
+  mapfile -t ids < <(docker ps -aq --filter "label=$LABEL=$1")
+  [ "${#ids[@]}" -eq 0 ] || docker rm -f "${ids[@]}" >/dev/null 2>&1 || true
+  mapfile -t ids < <(docker network ls -q --filter "label=$LABEL=$1")
+  [ "${#ids[@]}" -eq 0 ] || docker network rm "${ids[@]}" >/dev/null 2>&1 || true
+  mapfile -t ids < <(docker images -q --filter "label=$LABEL=$1" | sort -u)
+  [ "${#ids[@]}" -eq 0 ] || docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true
+}
+# Every other run whose resources are older than STALE_AFTER_S: a killed run's.
+sweep_stale() {
+  local now kind fmt id run created ids
+  now="$(date +%s)"
+  for kind in container network image; do
+    case $kind in
+      container) mapfile -t ids < <(docker ps -aq --filter "label=$LABEL"); fmt=.Config.Labels ;;
+      network) mapfile -t ids < <(docker network ls -q --filter "label=$LABEL"); fmt=.Labels ;;
+      image) mapfile -t ids < <(docker images -q --filter "label=$LABEL" | sort -u); fmt=.Config.Labels ;;
+    esac
+    # ${a[@]+...}: an empty array under set -u in bash < 4.4.
+    for id in ${ids[@]+"${ids[@]}"}; do
+      run="$(docker "$kind" inspect -f "{{index $fmt \"$LABEL\"}}" "$id" 2>/dev/null)" || continue
+      created="$(date -d "$(docker "$kind" inspect -f '{{.Created}}' "$id")" +%s 2>/dev/null)" || continue
+      if [ -n "$run" ] && [ "$run" != "$RUN_ID" ] && [ $((now - created)) -gt "$STALE_AFTER_S" ]; then
+        echo "sweeping stale iupf-delay run $run ($kind $id)" >&2
+        remove_run "$run"
+      fi
+    done
+  done
+}
+remove_run "$RUN_ID"
+sweep_stale
+
 docker build -q -f "$RUST/Dockerfile.nf" --build-arg CORE_IMAGE="$CORE_IMAGE" \
+  --label "$LABEL=$RUN_ID" \
   --build-arg NF_NAME=nextgcore-smfd -t "$SMF_IMAGE" "$ctx" >/dev/null
 docker build -q -f "$RUST/Dockerfile.nf" --build-arg CORE_IMAGE="$CORE_IMAGE" \
+  --label "$LABEL=$RUN_ID" \
   --build-arg NF_NAME=nextgcore-upfd -t "$UPF_IMAGE" "$ctx" >/dev/null
 
 NET="nextg-iupf-delay-$RUN_ID"
@@ -89,13 +142,11 @@ names=(harness smf iupf psa)
 cleanup() {
   for c in "${names[@]}"; do
     docker logs "iupf-delay-$RUN_ID-$c" > "$OUT/$c.log" 2>&1 || true
-    docker rm -f "iupf-delay-$RUN_ID-$c" >/dev/null 2>&1 || true
   done
-  docker network rm "$NET" >/dev/null 2>&1 || true
-  docker image rm "$SMF_IMAGE" "$UPF_IMAGE" >/dev/null 2>&1 || true
+  remove_run "$RUN_ID"
 }
 trap cleanup EXIT
-docker network create --subnet "$P.0/24" "$NET" >/dev/null || {
+docker network create --label "$LABEL=$RUN_ID" --subnet "$P.0/24" "$NET" >/dev/null || {
   echo "cannot create $NET on $P.0/24 (taken?); set NET_OCTET or RUN_ID" >&2
   exit 2
 }
@@ -104,7 +155,7 @@ docker network create --subnet "$P.0/24" "$NET" >/dev/null || {
 # the REAL upfd starts with GTP-U path (GPQM) and QoS flow (QFQM) monitoring.
 # NET_ADMIN for tc and the TUN, the TUN device itself; not privileged.
 upf() { # <name> <own ip> <the other UPF's ip> <tun ip>
-  docker run -d --name "iupf-delay-$RUN_ID-$1" --network "$NET" --ip "$2" \
+  docker run -d --name "iupf-delay-$RUN_ID-$1" --label "$LABEL=$RUN_ID" --network "$NET" --ip "$2" \
     --user root --cap-add NET_ADMIN --device /dev/net/tun \
     --sysctl net.ipv4.ip_forward=1 -e RUST_LOG=info \
     --entrypoint /bin/sh "$UPF_IMAGE" -c "
@@ -121,7 +172,7 @@ upf iupf "$IUPF" "$PSA" 10.46.0.1
 
 # The REAL smfd: the PSA is UPF_PFCP_ADDR, the I-UPF is smf.yaml's
 # `intermediate_upf`; a private network of stand-ins, so cleartext h2c.
-docker run -d --name "iupf-delay-$RUN_ID-smf" --network "$NET" --ip "$SMF" \
+docker run -d --name "iupf-delay-$RUN_ID-smf" --label "$LABEL=$RUN_ID" --network "$NET" --ip "$SMF" \
   -e RUST_LOG=info -e NEXTGCORE_SBI_PROFILE=dev \
   -e SMF_PFCP_ADDR="$SMF" -e UPF_PFCP_ADDR="$PSA" -e UPF_PFCP_PORT=8805 \
   -e PCF_URI="http://$HARNESS:7777" \
@@ -129,7 +180,7 @@ docker run -d --name "iupf-delay-$RUN_ID-smf" --network "$NET" --ip "$SMF" \
   "$SMF_IMAGE" -c /etc/nextgcore/smf.yaml >/dev/null
 
 set +e
-docker run --name "iupf-delay-$RUN_ID-harness" --network "$NET" --ip "$HARNESS" \
+docker run --name "iupf-delay-$RUN_ID-harness" --label "$LABEL=$RUN_ID" --network "$NET" --ip "$HARNESS" \
   -e RUST_LOG=info -e NEXTGCORE_SBI_PROFILE=dev \
   -v "$OUT/harness:/harness:ro" --entrypoint /harness/iupf-delay-harness \
   "$CORE_IMAGE" \
