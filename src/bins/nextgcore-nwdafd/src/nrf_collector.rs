@@ -647,7 +647,8 @@ pub async fn handle_nf_status_notify_with_ctx(
 ///   grace window). The token-less route of subscriptions made before #1421
 ///   carries none, so it is refused;
 /// - the TLS peer must be the NRF, or an SCP relaying it: the verified client
-///   certificate names NF type NRF, or is a relay's naming SCP
+///   certificate names NF type NRF and no other (#2153: `[NRF, AMF]` is not the
+///   NRF's certificate alone, so it cannot act as the NRF), or is a relay's naming SCP
 ///   ([`nextgcore_sbi::owner_binding::is_relay_certificate`]: relay types only;
 ///   RFC 9310). The NRF's notification carries no bearer (TS 33.501 §13.4.1),
 ///   so the certificate plus the per-subscription token is the only proof. A
@@ -689,7 +690,14 @@ pub fn refuse_notifier(
     // #2131: the shared relay rule, so `[SCP, X]` is X, not a relay.
     let relay_scp = nextgcore_sbi::owner_binding::is_relay_certificate(&request.peer_cert_nf_types)
         && names("SCP");
-    if names("NRF") || relay_scp {
+    // #2153 (R41 on #2147): the NRF's own certificate names NRF and nothing
+    // else; one that also names another type is refused like any other NF.
+    let nrf_only = !request.peer_cert_nf_types.is_empty()
+        && request
+            .peer_cert_nf_types
+            .iter()
+            .all(|t| t.trim().eq_ignore_ascii_case("NRF"));
+    if nrf_only || relay_scp {
         return None;
     }
     refuse(
@@ -970,6 +978,19 @@ mod tests {
             deliver(&["SCP", "AMF"], current.clone()).await,
             (403, 0),
             "a mixed [SCP, AMF] certificate is an AMF's"
+        );
+        // #2153 (R41 on #2147): and a certificate naming NRF alongside another
+        // type is not the NRF's. REVERT-VERIFIED: with the NRF arm back on
+        // `names("NRF")`, this `[NRF, AMF]` notification is ingested (204, 1).
+        assert_eq!(
+            deliver(&["NRF", "AMF"], current.clone()).await,
+            (403, 0),
+            "a mixed [NRF, AMF] certificate cannot act as the NRF"
+        );
+        assert_eq!(
+            deliver(&["nrf"], current.clone()).await,
+            (204, 1),
+            "an NRF-only certificate, in any case"
         );
     }
 
