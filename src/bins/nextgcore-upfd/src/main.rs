@@ -1373,14 +1373,27 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 );
                 // #1450: an I-UPF's downlink PDR detects on its N9 F-TEID (the PFCP
                 // layer wrote the chosen TEID into its PDI).
+                //
+                // #2234 (R47 M1): an uplink PDR on an F-TEID of its own, other than
+                // the session's `ul_teid` (the last uplink PDR's), detects on it the
+                // same way, and the TEID routes to this session. Before, only
+                // `ul_teid` was indexed, and the UE-address fallback found the
+                // session for the other uplink PDRs' G-PDUs (TS 29.281 §7.3.1 has
+                // no such fallback). The modification path binds every Create PDR's
+                // F-TEID already (#583); removal and deletion unbind them.
                 {
                     let mut tunnels = session.pdr_teids.write().unwrap();
-                    for p in pdrs
-                        .iter()
-                        .filter(|p| p.pdi.source_interface == data_plane::SRC_INTF_CORE)
-                    {
-                        if let Some(f) =
-                            p.pdi.local_f_teid.as_ref().filter(|f| !f.ch && f.teid != 0)
+                    for p in pdrs.iter() {
+                        if let Some(f) = p
+                            .pdi
+                            .local_f_teid
+                            .as_ref()
+                            .filter(|f| !f.ch && f.teid != 0)
+                            .filter(|f| {
+                                p.pdi.source_interface == data_plane::SRC_INTF_CORE
+                                    || (p.pdi.source_interface == data_plane::SRC_INTF_ACCESS
+                                        && f.teid != ul_teid)
+                            })
                         {
                             tunnels.insert(p.pdr_id, f.teid);
                             data_plane.sessions.bind_ul_teid(f.teid, upf_seid);

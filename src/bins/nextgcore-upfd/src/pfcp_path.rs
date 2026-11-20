@@ -2579,6 +2579,10 @@ impl PfcpServer {
         // #1815: the TEIDs this request holds in the pool, chosen or (#1834) named
         // by the CP function and reserved; given back if it is refused.
         let mut chosen_teids: Vec<u32> = Vec::new();
+        // #2234 (R47 M1): PDRs of the establishment with the same CHOOSE ID share
+        // the F-TEID the UP function chooses (TS 29.244 §5.5.3), as in a
+        // modification (#1682).
+        let mut by_choose_id: HashMap<u8, u32> = HashMap::new();
 
         for mut pdr in create_pdrs {
             // #1450: Transport Delay Reporting is acted on only with GPQM (§5.24.5).
@@ -2610,11 +2614,12 @@ impl PfcpServer {
             let core = pdr.pdi.source_interface == crate::data_plane::SRC_INTF_CORE;
             let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
                 if fteid.ch || fteid.teid == 0 {
-                    // #1815: one TEID per PDR here, as before; no CHOOSE ID sharing
-                    // at establishment.
+                    // #1815: one TEID per PDR, unless PDRs share a CHOOSE ID
+                    // (#2234: then they share the TEID, §5.5.3).
+                    let choose_id = fteid.choose_id.filter(|_| fteid.chid);
                     let chosen = self.local_f_teid_addrs(fteid).and_then(|addrs| {
                         let teid =
-                            self.choose_teid(None, &mut HashMap::new(), &mut chosen_teids)?;
+                            self.choose_teid(choose_id, &mut by_choose_id, &mut chosen_teids)?;
                         Some((addrs, teid))
                     });
                     let Some(((ipv4, ipv6), teid)) = chosen else {
@@ -2701,7 +2706,11 @@ impl PfcpServer {
             // F-TEID of its N9 tunnel from the PSA. It is not the session's uplink
             // TEID; the data plane routes it to the PDR, so the TEID is written into
             // the parsed PDI, as a modification does (#583).
-            if core {
+            //
+            // #2234 (R47 M1): so is every Access PDR's. Only the last one becomes the
+            // session's `ul_teid`; the others are routed to the session by the
+            // TEID the PDI now names, not by the UE-address fallback that is gone.
+            {
                 if let (Some(&teid), Some(f)) =
                     (pdr_teids.get(&pdr.pdr_id), pdr.pdi.local_f_teid.as_mut())
                 {
@@ -9063,6 +9072,192 @@ mod tests {
             .write(true)
             .open("/dev/null")
             .expect("/dev/null stands in for the TUN")
+    }
+
+    /// Establish, through the real N4 handler, a session with the uplink PDRs
+    /// `uls` (PDR ID, F-TEID IE value), all Access with UE IP `ue` and FAR 1, and
+    /// a downlink PDR 2 (Core, FAR 2). Applied to `dp`; returns the response.
+    async fn establish_uls_2234(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        rx: &mut mpsc::Receiver<PfcpSessionEvent>,
+        dp: &crate::data_plane::DataPlane,
+        (cp_seid, seq): (u64, u32),
+        uls: &[(u16, Vec<u8>)],
+        ue: Ipv4Addr,
+    ) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: cp_seid,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        for (i, (id, f_teid)) in uls.iter().enumerate() {
+            let mut ul = crate::n4_build::PfcpMessageBuilder::new();
+            ul.add_pdr_id(*id);
+            ul.add_u32(pfcp_ie::PRECEDENCE, 100 + i as u32);
+            ul.add_tlv(pfcp_ie::PDI, &pdi_1682(0, Some(f_teid.clone()), Some(ue)));
+            ul.add_u32(pfcp_ie::FAR_ID, 1);
+            b.add_tlv(pfcp_ie::CREATE_PDR, &ul.build());
+        }
+        let mut dl = crate::n4_build::PfcpMessageBuilder::new();
+        dl.add_pdr_id(2);
+        dl.add_u32(pfcp_ie::PRECEDENCE, 200);
+        dl.add_tlv(pfcp_ie::PDI, &pdi_1682(1, None, Some(ue)));
+        dl.add_u32(pfcp_ie::FAR_ID, 2);
+        b.add_tlv(pfcp_ie::CREATE_PDR, &dl.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(2, 0x02));
+        let resp = exchange(smf, addr, &encode_pfcp(50, Some(0), seq, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(rx, dp).await;
+        resp
+    }
+
+    /// **#2234 (R47 M1 on #2257), TS 29.244 §5.2.1 and TS 29.281 §7.3.1.** A
+    /// Session Establishment with two uplink PDRs, each on an F-TEID of its own,
+    /// routes G-PDUs on both TEIDs to the session, whether the UP function chose
+    /// the TEID (CHOOSE) or the SMF named it. Before, only the last uplink PDR's
+    /// TEID was indexed and the UE-address fallback found the session for the
+    /// other one; with the fallback gone, that TEID drew an Error Indication. A
+    /// Remove PDR of the first stops its TEID routing (an unknown TEID again),
+    /// the second keeps forwarding, and a Session Deletion unbinds both.
+    ///
+    /// REVERT-VERIFIED: with the establishment binding only Core PDRs' F-TEIDs,
+    /// the first uplink PDR's TEID is an unknown TEID in both sessions.
+    #[tokio::test]
+    async fn every_uplink_pdr_of_an_establishment_routes_its_own_teid_2234() {
+        use crate::data_plane::DropReason;
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let tun = dev_null_tun();
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        // Session A: PDR 1 CHOOSE (chosen by the UPF), PDR 3 named 0x4703 (last).
+        let ue_a = Ipv4Addr::new(10, 45, 22, 31);
+        let resp = establish_uls_2234(
+            &smf,
+            addr,
+            &mut rx,
+            &dp,
+            (0x0002_234a, 2),
+            &[(1, vec![0x05]), (3, f_teid_1682(0x4703))],
+            ue_a,
+        )
+        .await;
+        let chosen = created_f_teid(&resp, 1).teid;
+        assert_ne!(chosen, 0x4703);
+        let seid_a = dp.sessions.find_by_ul_teid(0x4703).expect("A").upf_seid;
+        // Session B: PDR 1 named 0x4711, PDR 3 CHOOSE (last).
+        let ue_b = Ipv4Addr::new(10, 45, 22, 32);
+        let resp = establish_uls_2234(
+            &smf,
+            addr,
+            &mut rx,
+            &dp,
+            (0x0002_234b, 3),
+            &[(1, f_teid_1682(0x4711)), (3, vec![0x05])],
+            ue_b,
+        )
+        .await;
+        let chosen_b = created_f_teid(&resp, 3).teid;
+        let seid_b = dp.sessions.find_by_ul_teid(chosen_b).expect("B").upf_seid;
+
+        for (seid, teid, ue) in [
+            (seid_a, chosen, ue_a),
+            (seid_a, 0x4703, ue_a),
+            (seid_b, 0x4711, ue_b),
+            (seid_b, chosen_b, ue_b),
+        ] {
+            assert_eq!(
+                dp.sessions.find_by_ul_teid(teid).map(|s| s.upf_seid),
+                Some(seid),
+                "TEID {teid:#x} routes to its session"
+            );
+            assert!(
+                forwarded_1682(&dp, &tun, seid, teid, ue).await,
+                "a G-PDU on TEID {teid:#x} reaches N6"
+            );
+        }
+        assert_eq!(
+            dp.stats.drops(DropReason::UnknownTeid),
+            0,
+            "no Error Indication: {}",
+            dp.stats.summary()
+        );
+
+        // Remove PDR 1 of session A: its TEID no longer routes; PDR 3's does.
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::REMOVE_PDR, &remove_body_u16(1));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(seid_a), 4, &m.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert!(dp.sessions.find_by_ul_teid(chosen).is_none(), "unbound");
+        assert!(!forwarded_1682(&dp, &tun, seid_a, chosen, ue_a).await);
+        assert_eq!(dp.stats.drops(DropReason::UnknownTeid), 1);
+        assert!(forwarded_1682(&dp, &tun, seid_a, 0x4703, ue_a).await);
+
+        // Deleting session B unbinds both its TEIDs.
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(seid_b), 5, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert!(
+            dp.sessions.find_by_ul_teid(0x4711).is_none(),
+            "B's PDR 1 TEID"
+        );
+        assert!(
+            dp.sessions.find_by_ul_teid(chosen_b).is_none(),
+            "B's PDR 3 TEID"
+        );
+    }
+
+    /// **#2234 (R47 M1 on #2257), TS 29.244 §5.5.3.** At establishment, uplink
+    /// PDRs that share a CHOOSE ID share the F-TEID the UP function chooses, and a
+    /// CHOOSE without one gets a TEID of its own. Each forwards.
+    ///
+    /// REVERT-VERIFIED: with the establishment ignoring the CHOOSE ID, PDRs 1 and
+    /// 3 are given different TEIDs ("one F-TEID for one CHOOSE ID").
+    #[tokio::test]
+    async fn uplink_pdrs_sharing_a_choose_id_share_its_teid_at_establishment_2234() {
+        use crate::data_plane::DropReason;
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let tun = dev_null_tun();
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let ue = Ipv4Addr::new(10, 45, 22, 33);
+        // F-TEID flags (§8.2.3): V4 | CH | CHID = 0x0d, then the CHOOSE ID.
+        let resp = establish_uls_2234(
+            &smf,
+            addr,
+            &mut rx,
+            &dp,
+            (0x0002_234c, 2),
+            &[(1, vec![0x0d, 7]), (3, vec![0x0d, 7]), (4, vec![0x05])],
+            ue,
+        )
+        .await;
+        let (t1, t3, t4) = (
+            created_f_teid(&resp, 1).teid,
+            created_f_teid(&resp, 3).teid,
+            created_f_teid(&resp, 4).teid,
+        );
+        assert_eq!(t1, t3, "one F-TEID for one CHOOSE ID");
+        assert_ne!(t1, t4, "a CHOOSE without an ID gets its own");
+        let seid = dp.sessions.find_by_ul_teid(t4).expect("session").upf_seid;
+        for teid in [t1, t4] {
+            assert!(
+                forwarded_1682(&dp, &tun, seid, teid, ue).await,
+                "a G-PDU on TEID {teid:#x} reaches N6"
+            );
+        }
+        assert_eq!(dp.stats.drops(DropReason::UnknownTeid), 0);
     }
 
     /// **#1682, TS 29.244 Table 7.5.4.2-1.** An Update PDR whose PDI names a new
