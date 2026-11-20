@@ -1316,6 +1316,19 @@ fn parse_bsf_subscription(
         .as_deref()
         .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
     {
+        // #2106 (R31 on #2105): a suggested expiry that has already passed is
+        // refused. The confirmed expiry may not be later than the suggested one
+        // (Table 5.6.2.4-1), so it cannot be clamped forward; a subscription
+        // confirmed as already expired would only be swept unused.
+        if suggested <= nextgcore_sbi::datetime::now_epoch_secs() as i64 {
+            return Err(Box::new(nextgcore_sbi::server::send_bad_request(
+                &format!(
+                    "the suggested expiry {} has already passed",
+                    expiry.as_deref().unwrap_or_default()
+                ),
+                Some("MANDATORY_IE_INCORRECT"),
+            )));
+        }
         let cap = nextgcore_sbi::datetime::now_epoch_secs() as i64
             + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs() as i64;
         if suggested > cap {
@@ -1927,9 +1940,14 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
 
         // expiry
         match patch_str(&update_data, "expiry") {
+            // #2106 (R31 on #2105): clearing the expiry falls back to the default
+            // TTL from now, as a binding created without one gets. It used to clear
+            // the deadline too, and `sweep_expired` reads only `expiry_epoch`, so
+            // the binding was never swept.
             Patch::Clear => {
                 sess.expiry = None;
-                sess.expiry_epoch = None;
+                sess.expiry_epoch =
+                    Some(context::now_epoch() + timer::defaults::BINDING_EXPIRY.as_secs() as i64);
             }
             Patch::Set(s) => {
                 if !sess.set_expiry(s) {
@@ -5569,6 +5587,85 @@ mod tests {
                 .is_empty(),
             "nothing stored"
         );
+    }
+
+    /// #2106 (R31 on #2105): a PATCH with `expiry: null` clears the binding's
+    /// expiry but not its deadline: the default TTL from now applies, as at
+    /// create, so the binding is still swept. It used to clear the deadline and
+    /// leave the binding in memory for good.
+    ///
+    /// REVERT-VERIFIED: with the clear setting no deadline, the deadline
+    /// assertion fails.
+    #[tokio::test]
+    async fn a_patch_clearing_the_expiry_keeps_a_deadline_2106() {
+        let (server, client) = start_bsf().await;
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet", "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.210.6", "supi": "imsi-001010000021061",
+                    "pcfFqdn": "pcf.example.com", "expiry": "2099-01-01T00:00:00Z"
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let id = resp
+            .http
+            .get_header("Location")
+            .expect("Location")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
+        req.http.set_content(json!({ "expiry": null }).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let before = context::now_epoch();
+        let patched = client.send_request(req).await.expect("PATCH");
+        assert_eq!(patched.status, 200, "{:?}", patched.http.content);
+        let deadline = bsf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.sess_find_by_binding_id(&id))
+            .and_then(|s| s.expiry_epoch);
+        let ttl = timer::defaults::BINDING_EXPIRY.as_secs() as i64;
+        assert!(
+            deadline.is_some_and(|d| d >= before + ttl && d <= context::now_epoch() + ttl),
+            "the default TTL from now: {deadline:?}"
+        );
+        // `sweep_expired` reads this deadline (shown by #2084's tests); it is not
+        // run here, where it would sweep every concurrent test's bindings too.
+        let _ = client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await;
+        server.stop().await.ok();
+    }
+
+    /// #2106 (R31 on #2105), TS 29.521 Table 5.6.2.4-1: a subscription whose
+    /// suggested `expiry` has already passed is refused 400 and not stored. The
+    /// confirmed expiry may not be later than the suggested one, so it is not
+    /// clamped forward.
+    ///
+    /// REVERT-VERIFIED: without the refusal, the subscription is 201.
+    #[tokio::test]
+    async fn a_suggested_subscription_expiry_in_the_past_is_refused_2106() {
+        let (server, client) = start_bsf().await;
+        let mut doc = bsf_sub_doc(
+            "http://127.0.0.1:9/bsf-notify-2106",
+            "imsi-001010000021062",
+            &["PCF_PDU_SESSION_BINDING_REGISTRATION"],
+        );
+        doc["expiry"] = json!("2000-01-01T00:00:00Z");
+        let resp = client
+            .post_json("/nbsf-management/v1/subscriptions", &doc)
+            .await
+            .expect("POST");
+        server.stop().await.ok();
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        assert!(resp.http.get_header("Location").is_none());
     }
 
     /// #2084: a binding created without an `expiry` has its deadline in the record,
