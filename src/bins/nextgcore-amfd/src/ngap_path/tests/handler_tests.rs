@@ -62,20 +62,17 @@ pub(super) fn uplink_nas_transport(
     ran_ue_ngap_id: u32,
     nas: &[u8],
 ) -> Vec<u8> {
-    nextgcore_ngap::builder::build_uplink_nas_transport(
-        &nextgcore_ngap::types::UplinkNasTransport {
-            amf_ue_ngap_id,
-            ran_ue_ngap_id,
-            nas_pdu: nas.to_vec(),
-            user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
-                nr_cgi_plmn: [0x00, 0xF1, 0x10],
-                nr_cell_identity: 1,
-                tai_plmn: [0x00, 0xF1, 0x10],
-                tai_tac: [0x00, 0x00, 0x01],
-            },
+    crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        nas_pdu: nas.to_vec(),
+        user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+            nr_cgi_plmn: [0x00, 0xF1, 0x10],
+            nr_cell_identity: 1,
+            tai_plmn: [0x00, 0xF1, 0x10],
+            tai_tac: [0x00, 0x00, 0x01],
         },
-    )
-    .expect("encode an Uplink NAS Transport")
+    })
 }
 
 /// A plain SERVICE REQUEST (TS 24.501 §8.2.16), service type "data", with an
@@ -2804,7 +2801,9 @@ async fn a_setup_requests_n1_rides_the_items_pdu_session_nas_pdu() {
 pub(super) struct ServeOneGuami(Vec<crate::context::Guami>);
 
 impl ServeOneGuami {
+    #[track_caller]
     pub(super) fn install() -> Self {
+        crate::test_support::assert_context_guard_held("ServeOneGuami::install");
         let ctx = crate::context::amf_self();
         let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
         let previous = std::mem::replace(
@@ -3437,13 +3436,12 @@ async fn a_released_connection_loses_its_contextless_allocation() {
         .expect("rejected #9");
     take_sent_ngap(&mut server);
 
-    let complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+    let complete = crate::gnb_pdus::ue_context_release_complete(
         &nextgcore_ngap::types::UeContextReleaseComplete {
             amf_ue_ngap_id: id,
             ran_ue_ngap_id: 512,
         },
-    )
-    .expect("encode a UE Context Release Complete");
+    );
     server
         .handle_ue_context_release_complete(ASSOC, &complete)
         .await
@@ -3482,11 +3480,10 @@ async fn an_ng_reset_drops_the_contextless_allocations_it_resets() {
     server.remember_contextless_ue_id(assoc, 7_758_033, 33);
     server.remember_contextless_ue_id(other, 7_758_034, 31);
     let reset = |reset_type| {
-        nextgcore_ngap::builder::build_ng_reset(&NgReset {
+        crate::gnb_pdus::ng_reset(&NgReset {
             cause: Cause::Transport(CauseTransport::TransportResourceUnavailable),
             reset_type,
         })
-        .expect("encode an NG Reset")
     };
 
     let partial = reset(ResetType::PartOfNgInterface(vec![
@@ -5397,13 +5394,12 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
     assert_eq!(released.len(), 1, "one UE Context Release Command");
     assert_eq!(released[0].0, new_id);
 
-    let complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+    let complete = crate::gnb_pdus::ue_context_release_complete(
         &nextgcore_ngap::types::UeContextReleaseComplete {
             amf_ue_ngap_id: new_id,
             ran_ue_ngap_id: 512,
         },
-    )
-    .expect("encode a UE Context Release Complete");
+    );
     server
         .handle_ue_context_release_complete(ASSOC, &complete)
         .await
@@ -6106,23 +6102,20 @@ async fn the_establishment_cause_marks_a_high_priority_access_ue() {
     .enumerate()
     {
         let ran_ue_ngap_id = 1_222_100 + n as u32;
-        let pdu = nextgcore_ngap::builder::build_initial_ue_message(
-            &nextgcore_ngap::types::InitialUeMessage {
-                ran_ue_ngap_id,
-                nas_pdu: vec![
-                    0x7E,
-                    security_header::PLAIN_NAS_MESSAGE,
-                    message_type::REGISTRATION_REQUEST,
-                    0x09,
-                    0x00,
-                ],
-                user_location_info: super::test_user_location(1, 0x10),
-                rrc_establishment_cause: cause,
-                ue_context_request: Some(true),
-                allowed_nssai: Vec::new(),
-            },
-        )
-        .expect("encode an InitialUEMessage");
+        let pdu = crate::gnb_pdus::initial_ue_message(&nextgcore_ngap::types::InitialUeMessage {
+            ran_ue_ngap_id,
+            nas_pdu: vec![
+                0x7E,
+                security_header::PLAIN_NAS_MESSAGE,
+                message_type::REGISTRATION_REQUEST,
+                0x09,
+                0x00,
+            ],
+            user_location_info: super::test_user_location(1, 0x10),
+            rrc_establishment_cause: cause,
+            ue_context_request: Some(true),
+            allowed_nssai: Vec::new(),
+        });
         let _ = server.handle_initial_ue_message(ASSOC_1222, &pdu).await;
         let (key, state) = server
             .ue_auth_state
@@ -6355,8 +6348,12 @@ async fn an_idle_ues_deregistration_request_deregisters_it_1691() {
 /// again, no Initial Context Setup Request is sent and the first assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unauthenticated_emergency_registration_gets_its_accept_2033() {
-    crate::context::amf_context_init(64, 1024, 4096);
     let _policy = crate::emergency::emergency_policy_test_guard().await;
+    // #2039: it replaces the process-wide served GUAMIs, which every GUTI test
+    // reads under CONTEXT_GUARD; without it, its restore emptied them mid-test.
+    // After the emergency-policy guard, the order lib.rs's config tests use.
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     struct EmergencySlice(Option<crate::context::SNssai>);
     impl Drop for EmergencySlice {

@@ -1927,6 +1927,24 @@ fn refuse_foreign_nfc_instance(
     nfc_instance_id: &str,
     terminate: bool,
 ) -> Option<SbiResponse> {
+    refuse_foreign_nfc_instance_with(
+        request,
+        nfc_instance_id,
+        terminate,
+        owner_binding::identity_required(),
+    )
+}
+
+/// [`refuse_foreign_nfc_instance`] under an explicit profile (#2214): the
+/// profile is read once, so the identity rule and the "no identity" decision
+/// cannot disagree, and the production refusals are testable without touching
+/// the process-wide override.
+fn refuse_foreign_nfc_instance_with(
+    request: &SbiRequest,
+    nfc_instance_id: &str,
+    terminate: bool,
+    production: bool,
+) -> Option<SbiResponse> {
     let operation = if terminate {
         "ContextUpdate Terminate"
     } else {
@@ -1940,16 +1958,17 @@ fn refuse_foreign_nfc_instance(
             None,
         ))
     };
-    let caller = match owner_binding::verified_consumer_id(request) {
+    let caller = match owner_binding::verified_consumer_id_with(request, production) {
         Ok(Some(caller)) => caller,
-        Ok(None) if !owner_binding::identity_required() => return None,
+        Ok(None) if !production => return None,
         Ok(None) => return forbidden(format!("{operation}: the caller proved no NF identity")),
         Err(why) => return forbidden(format!("{operation}: {why}")),
     };
     if owner_binding::same_nf_instance_id(&caller, nfc_instance_id) {
         return None;
     }
-    log::warn!(
+    // debug, not warn: a peer can send these at will (#1620 review m7).
+    log::debug!(
         "{operation} refused: nfcInstanceId {nfc_instance_id:?} is not the caller ({caller})"
     );
     forbidden(format!(
@@ -3772,6 +3791,64 @@ mod tests {
             .expect("session exists")
     }
 
+    /// **#2214**: the production refusals of the #2060 consumer check, through
+    /// `refuse_foreign_nfc_instance_with(.., production = true)` so no test
+    /// changes the process-wide profile. Under production, a ContextUpdate is
+    /// refused 403 when the caller proves no NF identity (anonymous, or a
+    /// certificate without NF types, #2065), and when `nfcInstanceId` is empty:
+    /// an empty ID names no NF, so even a verified caller does not match it.
+    /// Admitted: a verified caller naming itself. Under dev only the anonymous
+    /// caller is admitted; an identified one still has to name itself.
+    ///
+    /// REVERT-VERIFIED: with the `Ok(None)` arm admitting under production too,
+    /// "production: anonymous" fails; with `same_nf_instance_id` treating ""
+    /// as anyone's, "production: empty nfcInstanceId" fails.
+    #[test]
+    fn the_production_consumer_check_refuses_anonymous_and_empty_ids_2214() {
+        const SMF: &str = "aaaaaaaa-2214-4000-8000-0000000000a1";
+        let anonymous = SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update");
+        let mut typeless = anonymous.clone();
+        typeless.peer_cert_nf_instance_id = Some(SMF.to_string());
+        let mut smf = anonymous.clone();
+        smf.peer_cert_nf_instance_id = Some(SMF.to_string());
+        smf.peer_cert_nf_types = vec!["SMF".into()];
+        let detail = |r: Option<SbiResponse>| -> Option<(u16, String)> {
+            r.map(|r| (r.status, r.http.content.unwrap_or_default()))
+        };
+        for terminate in [false, true] {
+            let check = |r: &SbiRequest, nfc: &str, production: bool| {
+                detail(super::refuse_foreign_nfc_instance_with(
+                    r, nfc, terminate, production,
+                ))
+            };
+            for (what, req, why) in [
+                ("anonymous", &anonymous, "proved no NF identity"),
+                // #2065: an untyped certificate is no identity under production.
+                ("typeless", &typeless, "names no NF type"),
+            ] {
+                let (status, body) = check(req, SMF, true).expect("refused");
+                assert_eq!(status, 403, "production: {what}");
+                assert!(body.contains(why), "{what}: {body}");
+            }
+            let (status, body) = check(&smf, "", true).expect("refused");
+            assert_eq!(status, 403, "production: empty nfcInstanceId");
+            assert!(body.contains("is not the calling NF"), "{body}");
+            assert!(
+                check(&anonymous, "", true).is_some(),
+                "production: anonymous and empty"
+            );
+            assert_eq!(
+                check(&smf, SMF, true),
+                None,
+                "production: the SMF naming itself"
+            );
+            // Dev: the anonymous caller is admitted, an identified one is not
+            // excused from naming itself.
+            assert_eq!(check(&anonymous, "", false), None, "dev: anonymous");
+            assert!(check(&smf, "", false).is_some(), "dev: an SMF naming no NF");
+        }
+    }
+
     /// #2060: a ContextUpdate joins or terminates only the caller's own
     /// `nfcInstanceId`. Another SMF naming smf-a is refused 403, and smf-a stays
     /// a consumer, whether it calls directly with an SMF certificate, with a
@@ -4337,6 +4414,13 @@ mod tests {
         );
 
         // ---- an untrackable consumer keeps the pre-#295 behaviour ----
+        //
+        // #2157: dev only. An empty nfcInstanceId names no NF, so no verified
+        // caller can match it and production refuses it 403 (#2060,
+        // `refuse_foreign_nfc_instance`); only a dev deployment's anonymous
+        // caller reaches this fallback. Declared here: this half used to pass
+        // only after a sibling had set the override, and failed 403 alone.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let anon_id = [0xC2, 0x95, 0x03];
         let anon = seed_global_session(anon_id);
         let rsp = post_ctx_update(

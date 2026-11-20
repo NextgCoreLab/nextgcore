@@ -4156,16 +4156,18 @@ mod tests {
         ];
         for (path, body, scope) in &calls {
             for types in [&["SCP"][..], &["SEPP"][..], &[][..]] {
+                // #2089: a typeless certificate alone is refused under both
+                // profiles: under production by #2065's shared rule (no
+                // identity, 403), under dev by the ECS's own typeless check
+                // (401). A relay's alone is 401 under both. #2162: the profile
+                // is read once, before the handler runs, so the expectation is
+                // the one for the profile the handler sees.
+                let production = nextgcore_sbi::owner_binding::identity_required();
                 let r = block_on(ees_sbi_request_handler(with_cert(
                     SbiRequest::post(*path).with_json_body(body).unwrap(),
                     types,
                 )));
-                // #2089: a typeless certificate alone is refused under both
-                // profiles: under production by #2065's shared rule (no
-                // identity, 403), under dev by the ECS's own typeless check
-                // (401). A relay's alone is 401 under both.
-                let want = if types.is_empty() && nextgcore_sbi::owner_binding::identity_required()
-                {
+                let want = if types.is_empty() && production {
                     403
                 } else {
                     401
@@ -4199,6 +4201,84 @@ mod tests {
             "an AMF certificate is not an EES: {:?}",
             r.http.content
         );
+        ecs_role::set_for_test(false);
+        ecs_role::clear_registry_for_test();
+    }
+
+    /// **#2210**: EES registration goes through the shared certificate rule. A
+    /// mixed `[EES, AMF]` certificate is refused 403 and stores nothing, alone and
+    /// with a registration-scope token (the typed certificate decides). So is an
+    /// AMF's with that token. A relay's certificate alone is 401. A relay's
+    /// carrying an EES's token is served, and so is `[EES, SCP]` (#2113: the
+    /// EES's own). Control: `[EES]` alone registers.
+    ///
+    /// REVERT-VERIFIED: with `require_ees_type` back to "any token, or any
+    /// certificate containing EES", the `[EES, AMF]` registration is 201 and
+    /// "mixed certificate alone" fails.
+    #[test]
+    fn a_mixed_or_relay_certificate_is_not_an_ees_2210() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ecs_role::clear_registry_for_test();
+        ecs_role::set_for_test(true);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let register = |ees: &str, types: &[&str], token: bool| {
+            let body = serde_json::json!({
+                "eesProf": {"eesId": ees, "endPt": {"uri": "http://10.0.0.9:7814"}},
+            });
+            let mut r = SbiRequest::post("/eecs-eesregistration/v1/registrations")
+                .with_json_body(&body)
+                .expect("serialize");
+            if !types.is_empty() {
+                r.peer_cert_nf_instance_id = Some("22100000-0000-4000-8000-0000000000e1".into());
+                r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            }
+            if token {
+                r = r.with_header(
+                    "Authorization",
+                    bearer_sub(&sk, "k1", ecs_role::SCOPE_EES_REGISTRATION, "ees-2210"),
+                );
+            }
+            block_on(ees_sbi_request_handler(r))
+        };
+        let stored = |ees: &str| {
+            ecs_role::registered_eess()
+                .iter()
+                .any(|s| s.registration.ees_prof.ees_id == ees)
+        };
+        for (what, types, token, want) in [
+            ("mixed certificate alone", &["EES", "AMF"][..], false, 403),
+            ("mixed certificate + token", &["AMF", "EES"][..], true, 403),
+            ("AMF certificate + token", &["AMF"][..], true, 403),
+            ("relay certificate alone", &["SCP"][..], false, 401),
+        ] {
+            let ees = format!("ees-2210-{}", what.replace(' ', "-"));
+            let r = register(&ees, types, token);
+            assert_eq!(r.status, want, "{what}: {:?}", r.http.content);
+            assert!(!stored(&ees), "{what}: nothing stored");
+        }
+        let r = register("ees-2210-mixed", &["EES", "AMF"], false);
+        assert!(
+            r.http
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("several NF types"),
+            "the refusal says why: {:?}",
+            r.http.content
+        );
+        for (what, types, token) in [
+            ("relay certificate + EES token", &["SCP"][..], true),
+            ("[EES, SCP] certificate", &["EES", "SCP"][..], false),
+            ("[EES] certificate", &["EES"][..], false),
+        ] {
+            let ees = format!("ees-2210-ok-{}", what.len());
+            let r = register(&ees, types, token);
+            assert_eq!(r.status, 201, "{what}: {:?}", r.http.content);
+            assert!(stored(&ees), "{what}: registered");
+        }
         ecs_role::set_for_test(false);
         ecs_role::clear_registry_for_test();
     }

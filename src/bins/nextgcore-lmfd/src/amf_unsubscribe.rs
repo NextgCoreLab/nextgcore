@@ -37,10 +37,14 @@ pub const RECONCILE_PERIOD: Duration = Duration::from_secs(30);
 pub const RECONCILE_PERIOD: Duration = Duration::from_millis(20);
 
 /// The longest one pass sends for.
-#[cfg(not(test))]
+///
+/// #2230: the same in tests. A 500 ms test value made every test that checks
+/// what a pass delivers depend on a loopback DELETE finishing inside it. Under
+/// a loaded parallel suite the first DELETE of a test took 260-590 ms (2-3 ms
+/// alone), with the test's own runtime stalled for up to 387 ms, so "a 404
+/// ends it" flaked as "not ended". The one test of the bound passes its own
+/// short budget to [`reconcile_within`].
 pub const MAX_PASS: Duration = Duration::from_secs(30);
-#[cfg(test)]
-pub const MAX_PASS: Duration = Duration::from_millis(500);
 
 /// An entry parked this long is given up (`expired`): an AMF that has not
 /// answered for a day is decommissioned, not restarting.
@@ -208,15 +212,20 @@ const MAX_LANES: usize = 64;
 
 /// One pass over the parked unsubscribes, in turn order, for at most
 /// [`MAX_PASS`]. Returns how many ended (delivered or expired).
+pub async fn reconcile_once() -> usize {
+    reconcile_within(MAX_PASS).await
+}
+
+/// [`reconcile_once`], sending for at most `max_pass`.
 ///
 /// Each AMF is a lane, its entries sent in turn, up to [`MAX_LANES`] lanes at
 /// once. An AMF that is backing off is not tried and takes no slot. Once a
 /// DELETE to an AMF fails, that AMF backs off and the rest of its lane waits. An
 /// entry that was tried and failed goes to the back of the queue; one this pass
 /// did not try keeps its place at the front, ahead of anything parked meanwhile.
-pub async fn reconcile_once() -> usize {
+pub(crate) async fn reconcile_within(max_pass: Duration) -> usize {
     let batch: Vec<Parked> = parked().drain(..).collect();
-    let deadline = tokio::time::Instant::now() + MAX_PASS;
+    let deadline = tokio::time::Instant::now() + max_pass;
     let mut ended = 0;
     let mut lanes: Vec<(String, Vec<(usize, Parked)>)> = Vec::new();
     for (place, p) in batch.into_iter().enumerate() {
@@ -468,21 +477,12 @@ mod tests {
         clear_for_test();
     }
 
-    /// **#2085** (CONVENTIONS: one blackholed-peer test per reconciler): an AMF
-    /// that accepts and never answers costs one bounded attempt per pass. Its
-    /// entries are re-parked, it backs off and is not tried again in the next
-    /// pass, and a healthy AMF parked behind it is delivered in the first pass.
-    ///
-    /// REVERT-VERIFIED: with the lanes run in turn (no `JoinSet`), the healthy
-    /// AMF's unsubscribe waits behind the blackhole and "the healthy AMF is not
-    /// starved" fails.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_blackholed_amf_neither_stalls_nor_starves_the_pass_2085() {
-        let _g = TEST_LOCK.lock().await;
-        clear_for_test();
+    /// A loopback AMF that never answers: it accepts and holds every
+    /// connection, counting them.
+    async fn blackholed_amf() -> (DiscoveredAmf, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let hole_port = listener.local_addr().unwrap().port();
+        let port = listener.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let a = accepted.clone();
         let hole = tokio::spawn(async move {
@@ -492,27 +492,33 @@ mod tests {
                 held.push(sock);
             }
         });
-        let dead = amf_at(hole_port);
+        (amf_at(port), accepted, hole)
+    }
+
+    /// **#2085** (CONVENTIONS: one blackholed-peer test per reconciler): an AMF
+    /// that accepts and never answers costs one bounded attempt per pass. The
+    /// pass ends at its budget, the AMF's entries are re-parked, it backs off,
+    /// and it is not tried again in the next pass.
+    ///
+    /// #2230: the budget is this test's own (`reconcile_within`), so no other
+    /// test's delivery races a short one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_amf_does_not_stall_the_pass_2085() {
+        let _g = TEST_LOCK.lock().await;
+        clear_for_test();
+        const PASS: Duration = Duration::from_millis(500);
+        let (dead, accepted, hole) = blackholed_amf().await;
         for n in 0..3 {
             park(&dead, &subscription_path(None, &format!("hole-{n}")));
         }
-        let (_server, healthy, seen) = scripted_amf(&[]).await;
-        let ok = subscription_path(None, "healthy-2085");
-        park(&healthy, &ok);
 
         let started = std::time::Instant::now();
-        assert_eq!(
-            reconcile_once().await,
-            1,
-            "the healthy AMF is not starved: delivered in the first pass"
-        );
+        assert_eq!(reconcile_within(PASS).await, 0);
         assert!(
-            started.elapsed() < MAX_PASS + Duration::from_secs(1),
+            started.elapsed() < PASS + Duration::from_secs(1),
             "the pass is bounded: {:?}",
             started.elapsed()
         );
-        assert!(!is_parked(&ok), "the healthy AMF is not starved");
-        assert_eq!(*seen.lock().unwrap(), vec![ok]);
         assert_eq!(
             parked_count(),
             3,
@@ -521,7 +527,7 @@ mod tests {
         assert!(backing_off(&dead), "the blackholed AMF backs off");
 
         let tried = accepted.load(Ordering::SeqCst);
-        assert_eq!(reconcile_once().await, 0);
+        assert_eq!(reconcile_within(PASS).await, 0);
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             tried,
@@ -529,6 +535,64 @@ mod tests {
         );
         clear_for_test();
         hole.abort();
+    }
+
+    /// **#2085**: a healthy AMF parked behind a blackholed one is not starved:
+    /// its DELETE is answered while the blackholed AMF's lane is still waiting
+    /// out the client's 3 s request timeout (`namf_client::client_for`), in the
+    /// same pass.
+    ///
+    /// #2230: asserted on when the healthy DELETE arrives, against the dead
+    /// lane's 3 s, not on a short pass budget, so a stalled runtime under a
+    /// loaded suite does not fail it.
+    ///
+    /// REVERT-VERIFIED: with the lanes run in turn (no `JoinSet`), the healthy
+    /// DELETE arrives only after the blackholed one times out, and "the healthy
+    /// AMF is not starved" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_amf_does_not_starve_a_healthy_one_2085() {
+        let _g = TEST_LOCK.lock().await;
+        clear_for_test();
+        const DEAD_LANE: Duration = Duration::from_secs(3);
+        let (dead, _accepted, hole) = blackholed_amf().await;
+        for n in 0..3 {
+            park(&dead, &subscription_path(None, &format!("hole-{n}")));
+        }
+        let arrived: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+        let at = arrived.clone();
+        let (_server, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let at = at.clone();
+                async move {
+                    at.lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            },
+        )
+        .await;
+        let healthy = amf_at(addr.port());
+        let ok = subscription_path(None, "healthy-2085");
+        park(&healthy, &ok);
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            reconcile_once().await,
+            1,
+            "the healthy AMF is delivered in the first pass"
+        );
+        let waited = arrived.lock().unwrap().map(|t| t - started);
+        let still_parked = is_parked(&ok);
+        clear_for_test();
+        hole.abort();
+
+        assert!(!still_parked, "delivered, not re-parked");
+        assert!(
+            waited.is_some_and(|w| w < DEAD_LANE),
+            "the healthy AMF is not starved: its DELETE arrived after {waited:?}, \
+             not after the blackholed AMF's {DEAD_LANE:?}"
+        );
     }
 
     /// **#2085**: shutdown unsubscribes every subscription at once.

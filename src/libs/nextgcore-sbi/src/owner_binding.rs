@@ -102,6 +102,44 @@ pub fn is_relay_certificate<S: AsRef<str>>(nf_types: &[S]) -> bool {
         })
 }
 
+/// #2210: whether the consumer's own typed client certificate (RFC 9310
+/// NFTypes, not a relay's: [`is_relay_certificate`] is false) shows it to be an
+/// `expected`. `Ok` when it does, else `Err` with why.
+///
+/// TS 33.310 §6.1.3c.3: an NF certificate's "nfTypes shall contain NF type for
+/// the Network Function instance", and an NF instance has one type (TS 29.510
+/// `NFProfile.nfType`). So, once the relay types are set aside (#2113: `[SCP,
+/// PCF]` is the PCF's), the certificate must name exactly one NF type, and it
+/// must be `expected`. A certificate naming two consumer types, `[EES, AMF]`
+/// say, describes no single NF instance and is refused for both rather than
+/// read as either. This is the certificate half of [`verified_nf_type`],
+/// shared with gates whose token half is not an NRF lookup (eesd: the EES is
+/// not an NRF `NFType`).
+pub fn certificate_nf_type_refusal<S: AsRef<str>>(
+    nf_types: &[S],
+    expected: &str,
+) -> Result<(), String> {
+    let mut own: Vec<&str> = Vec::new();
+    for t in nf_types.iter().map(|t| t.as_ref().trim()) {
+        let relay = RELAY_NF_TYPES.iter().any(|r| r.eq_ignore_ascii_case(t));
+        if !relay && !own.iter().any(|o| o.eq_ignore_ascii_case(t)) {
+            own.push(t);
+        }
+    }
+    let names: Vec<&str> = nf_types.iter().map(|t| t.as_ref()).collect();
+    match own.as_slice() {
+        [only] if only.eq_ignore_ascii_case(expected) => Ok(()),
+        [_] | [] => Err(format!(
+            "the requester's certificate names {names:?}, not {expected}"
+        )),
+        _ => Err(format!(
+            "the requester's certificate names several NF types {names:?}; an NF instance's \
+             certificate names its one NF type (TS 33.310 §6.1.3c.3), so it is not shown to \
+             be an {expected}"
+        )),
+    }
+}
+
 /// NF Instance IDs are UUIDs (TS 29.571 `NfInstanceId`), compared without case.
 pub fn same_nf_instance_id(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
@@ -122,6 +160,94 @@ pub fn verified_consumer_id(request: &SbiRequest) -> Result<Option<String>, Stri
     verified_consumer_id_with(request, identity_required())
 }
 
+/// How often [`warn_untyped_certificate`] may log (R32 on #2089, #2082).
+pub const UNTYPED_CERTIFICATE_WARN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// The most distinct certificate IDs [`UntypedCertificateWarnings`] remembers
+/// per interval; past it the WARN says "at least" this many (#2210). Bounds the
+/// memory a peer presenting fresh IDs can make it hold.
+pub const UNTYPED_CERTIFICATE_DISTINCT_MAX: usize = 1024;
+
+/// The rate limiter behind [`warn_untyped_certificate`] (R32 on #2089, #2210).
+/// It counts distinct certificates, by NF instance ID, rather than lookups: one
+/// request can look its caller up several times (owner check, type check), and
+/// one certificate presented on every request is still one certificate.
+#[derive(Debug, Default)]
+struct UntypedCertificateWarnings {
+    last: Option<std::time::Instant>,
+    /// Distinct IDs seen since `last` was logged, other than the logged one.
+    seen: std::collections::BTreeSet<String>,
+    logged: String,
+    overflowed: bool,
+}
+
+impl UntypedCertificateWarnings {
+    const fn new() -> Self {
+        Self {
+            last: None,
+            seen: std::collections::BTreeSet::new(),
+            logged: String::new(),
+            overflowed: false,
+        }
+    }
+
+    /// Note `nf_instance_id` at `now`. `Some((n, at_least))` means log now, and
+    /// that `n` other distinct certificates (`at_least`: the cap was reached)
+    /// were seen since the previous WARN; `None` means it was only counted.
+    fn note(&mut self, nf_instance_id: &str, now: std::time::Instant) -> Option<(usize, bool)> {
+        let id = nf_instance_id.trim().to_ascii_lowercase();
+        if self
+            .last
+            .is_some_and(|at| now.duration_since(at) < UNTYPED_CERTIFICATE_WARN_INTERVAL)
+        {
+            if id != self.logged && !self.seen.contains(&id) {
+                if self.seen.len() < UNTYPED_CERTIFICATE_DISTINCT_MAX {
+                    self.seen.insert(id);
+                } else {
+                    self.overflowed = true;
+                }
+            }
+            return None;
+        }
+        self.seen.remove(&id);
+        let others = (std::mem::take(&mut self.seen).len(), self.overflowed);
+        self.overflowed = false;
+        self.last = Some(now);
+        self.logged = id;
+        Some(others)
+    }
+}
+
+/// R32 on #2089 (#2082): under production a client certificate without RFC 9310
+/// NFTypes is no identity, so a consumer issued one is refused or treated as
+/// its token alone with nothing in the logs. Say so at WARN, at most once per
+/// [`UNTYPED_CERTIFICATE_WARN_INTERVAL`] process-wide, with how many other
+/// distinct certificates were seen meanwhile (#2210: certificates, not
+/// lookups), so an operator can find relays and consumers whose certificates
+/// were issued without NFTypes. Rate-limited because a peer can present one on
+/// every request. Returns whether it logged.
+fn warn_untyped_certificate(nf_instance_id: &str) -> bool {
+    static WARNINGS: std::sync::Mutex<UntypedCertificateWarnings> =
+        std::sync::Mutex::new(UntypedCertificateWarnings::new());
+    let noted = WARNINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note(nf_instance_id, std::time::Instant::now());
+    let Some((others, at_least)) = noted else {
+        return false;
+    };
+    log::warn!(
+        "a client certificate without RFC 9310 NFTypes (NF instance {nf_instance_id}) is no \
+         identity under the production SBI profile: it cannot be told from a relay's. Reissue \
+         it with the NF's type ({}{others} other distinct such certificates seen since the \
+         previous warning, at most one warning per {}s)",
+        if at_least { "at least " } else { "" },
+        UNTYPED_CERTIFICATE_WARN_INTERVAL.as_secs()
+    );
+    true
+}
+
 /// [`verified_consumer_id`] with an explicit `required` (the production rule of
 /// #2065 for an untyped certificate).
 pub fn verified_consumer_id_with(
@@ -135,6 +261,7 @@ pub fn verified_consumer_id_with(
             .is_some_and(|s| !s.trim().is_empty());
     if required && untyped {
         // #2065: an untyped certificate is not an identity under production.
+        warn_untyped_certificate(request.peer_cert_nf_instance_id.as_deref().unwrap_or(""));
         return match request
             .oauth2_subject
             .as_deref()
@@ -476,9 +603,11 @@ async fn cached_nrf_lists_nf_type_at(
 /// - the caller's identity is [`verified_consumer_id`]'s; none, or a
 ///   certificate/token mismatch, refuses;
 /// - the consumer's own client certificate naming NF types (RFC 9310, TS
-///   33.310 §6.1.3c) must name `expected`. A relay's certificate (one naming
-///   relay types only, [`is_relay_certificate`]) is not the consumer's; one
-///   naming a relay type and a consumer type is (#2113);
+///   33.310 §6.1.3c) must name `expected` as its one NF type
+///   ([`certificate_nf_type_refusal`], #2210: `[EES, AMF]` is neither). A
+///   relay's certificate (one naming relay types only,
+///   [`is_relay_certificate`]) is not the consumer's; one naming a relay type
+///   and a consumer type is (#2113);
 /// - otherwise -- a token alone, a token through an SCP or SEPP, or a
 ///   certificate without NF types plus a token -- the NRF must list the
 ///   token's verified subject as an `expected` ([`nrf_lists_nf_type_at`],
@@ -516,13 +645,7 @@ pub async fn verified_nf_type_with(
         .as_deref()
         .is_some_and(|c| !c.trim().is_empty());
     if cert && !relay && !types.is_empty() {
-        return if types.iter().any(|t| t.eq_ignore_ascii_case(want)) {
-            Ok(())
-        } else {
-            Err(format!(
-                "the requester's certificate names {types:?}, not {want}"
-            ))
-        };
+        return certificate_nf_type_refusal(types, want);
     }
     let Some(sub) = request
         .oauth2_subject
@@ -543,6 +666,52 @@ pub async fn verified_nf_type_with(
             Err(format!("the NRF does not list {sub} as an {want} ({e})"))
         }
     }
+}
+
+/// The `403` for a caller that may not use `operation` because it is not a
+/// verified `expected` NF, or `None` to go on (#2082): the gate an NF-type-only
+/// route (Nudm_UEAU's AUSF, the NSACF's local-configs update) runs before it
+/// reads or changes anything.
+///
+/// The rule is [`verified_nf_type_with`]'s: a typed non-relay certificate
+/// decides by its own NF types; a token alone, a token through a relay, or an
+/// untyped certificate with a token is the NRF's to vouch for; an untyped
+/// certificate alone, a relay's certificate alone and an anonymous caller are
+/// refused. Under `production` nothing else is admitted. Under dev a caller
+/// that presents no typed certificate and no token (plaintext, nothing to
+/// verify) is admitted as before; a typed certificate or a token is still
+/// checked.
+pub async fn nf_type_refusal_with(
+    request: &SbiRequest,
+    expected: crate::types::NfType,
+    operation: &str,
+    production: bool,
+) -> Option<SbiResponse> {
+    if let Err(why) = verified_consumer_id_with(request, production) {
+        return Some(forbidden(operation, &why));
+    }
+    let types = &request.peer_cert_nf_types;
+    let typed_certificate = !types.is_empty() && !is_relay_certificate(types);
+    let token = request
+        .oauth2_subject
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !production && !token && !typed_certificate {
+        return None;
+    }
+    match verified_nf_type_with(request, expected, production).await {
+        Ok(()) => None,
+        Err(why) => Some(forbidden(operation, &why)),
+    }
+}
+
+/// [`nf_type_refusal_with`] under the process's SBI profile.
+pub async fn nf_type_refusal(
+    request: &SbiRequest,
+    expected: crate::types::NfType,
+    operation: &str,
+) -> Option<SbiResponse> {
+    nf_type_refusal_with(request, expected, operation, identity_required()).await
 }
 
 fn forbidden(operation: &str, why: &str) -> SbiResponse {
@@ -825,6 +994,41 @@ mod tests {
         assert_eq!(new_seen.lock().unwrap().len(), 1, "the new NRF was asked");
     }
 
+    /// **#2162** (R42 on #2173): the two rules that refuse a certificate naming
+    /// no NF types with no token, each pinned by its exact sentence with the
+    /// profile passed explicitly, so both run on every run whatever the
+    /// process-wide profile: under production #2065's (no identity at all),
+    /// under dev #2099's typeless check. The lmfd/smfd tests assert dev's
+    /// through their handlers.
+    ///
+    /// REVERT-VERIFIED: with `verified_consumer_id_with`'s untyped rule applied
+    /// under dev too (`if untyped` without `required`), the dev case yields
+    /// production's sentence and the `dev` assertion fails.
+    #[tokio::test]
+    async fn a_typeless_certificate_is_refused_by_the_profiles_rule_2162() {
+        let typeless = caller(Some(A), None, &[]);
+        let production = verified_nf_type_with(&typeless, NfType::Lmf, true).await;
+        let dev = verified_nf_type_with(&typeless, NfType::Lmf, false).await;
+        assert_eq!(
+            production,
+            Err::<(), String>(
+                "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it \
+                 cannot be told from a relay's, and it presented no access token"
+                    .to_string()
+            ),
+            "production"
+        );
+        assert_eq!(
+            dev,
+            Err::<(), String>(
+                "the requester's certificate names no NF types and it sent no access token, so it \
+                 cannot be shown to be an LMF"
+                    .to_string()
+            ),
+            "dev"
+        );
+    }
+
     /// **#2099**: the caller-side rule. A certificate of the consumer naming NF
     /// types decides alone (no NRF); a certificate without NF types and no
     /// token, an anonymous caller and a certificate/token mismatch refuse; a
@@ -948,6 +1152,172 @@ mod tests {
             Ok(()),
             "a mixed certificate naming AMF is an AMF"
         );
+    }
+
+    /// **#2210**: a certificate naming two consumer NF types describes no single
+    /// NF instance (TS 33.310 §6.1.3c.3: "the NF type for the Network Function
+    /// instance"), so it is refused as either, even with a token the NRF lists
+    /// as the expected type: the typed certificate decides. Relay types are set
+    /// aside first (#2113), a repeated type is one type, and case is ignored.
+    ///
+    /// REVERT-VERIFIED: with `certificate_nf_type_refusal` back to "names
+    /// `expected` among others", `[AMF, SMF]` is admitted and "two consumer
+    /// types" fails.
+    #[tokio::test]
+    async fn a_certificate_naming_two_consumer_types_is_neither_2210() {
+        const AMF: &str = "aaaaaaaa-2210-4000-8000-0000000000a1";
+        seed_nf_type_for_test(AMF, NfType::Amf);
+        let ok = |r: SbiRequest| async move { verified_nf_type(&r, NfType::Amf).await };
+        for types in [
+            &["AMF", "SMF"][..],
+            &["SMF", "amf"][..],
+            &["AMF", "SCP", "PCF"][..],
+        ] {
+            let why = ok(caller(Some(AMF), None, types)).await.unwrap_err();
+            assert!(
+                why.contains("several NF types") && why.contains("6.1.3c.3"),
+                "two consumer types {types:?}: {why}"
+            );
+            assert!(
+                ok(caller(Some(AMF), Some(AMF), types)).await.is_err(),
+                "two consumer types {types:?} + the AMF's own token"
+            );
+        }
+        assert_eq!(certificate_nf_type_refusal(&["AMF", "amf"], "AMF"), Ok(()));
+        assert_eq!(certificate_nf_type_refusal(&["SEPP", "AMF"], "AMF"), Ok(()));
+        assert!(certificate_nf_type_refusal(&["SMF"], "AMF")
+            .unwrap_err()
+            .contains("not AMF"));
+        assert_eq!(
+            ok(caller(Some(AMF), None, &["AMF"])).await,
+            Ok(()),
+            "control: the AMF's own certificate"
+        );
+    }
+
+    /// R32 on #2089 (#2082): an untyped certificate under production is logged
+    /// at WARN at most once per interval; the ones in between are counted, not
+    /// logged.
+    ///
+    /// REVERT-VERIFIED: with the interval check dropped, the second call logs
+    /// and the `!` assertion fails.
+    #[test]
+    fn an_untyped_certificate_warns_at_most_once_per_interval_2082() {
+        // The limiter is process-wide; another test may have just logged, so
+        // the first call here is not asserted, only the one right after it.
+        let _ = warn_untyped_certificate("aaaaaaaa-2082-4000-8000-0000000000f1");
+        assert!(
+            !warn_untyped_certificate("aaaaaaaa-2082-4000-8000-0000000000f2"),
+            "a second untyped certificate within the interval is not logged again"
+        );
+    }
+
+    /// **#2210**: the untyped-certificate WARN counts distinct certificates, not
+    /// lookups. Within one interval, the same certificate looked up again and
+    /// again is not counted, and neither is the one that was logged. Two other
+    /// distinct ones are counted once each, case-insensitively, and the next
+    /// interval's WARN reports exactly 2. Past the cap it says "at least". Own
+    /// limiter instance and synthetic instants, so no process-global or clock
+    /// is involved.
+    ///
+    /// REVERT-VERIFIED: with `note` counting every in-interval call (the
+    /// pre-#2210 counter), the report is `(6, false)` and "distinct
+    /// certificates, not lookups" fails.
+    #[test]
+    fn the_untyped_certificate_warn_counts_distinct_certificates_2210() {
+        let t0 = std::time::Instant::now();
+        let mut w = UntypedCertificateWarnings::new();
+        assert_eq!(w.note("aaaa-1", t0), Some((0, false)), "the first one logs");
+        let inside = t0 + std::time::Duration::from_secs(1);
+        for id in ["aaaa-1", "aaaa-1", "bbbb-2", "BBBB-2", "bbbb-2", "cccc-3"] {
+            assert_eq!(w.note(id, inside), None, "{id}: counted, not logged");
+        }
+        let next = t0 + UNTYPED_CERTIFICATE_WARN_INTERVAL;
+        assert_eq!(
+            w.note("dddd-4", next),
+            Some((2, false)),
+            "distinct certificates, not lookups"
+        );
+        let inside = next + std::time::Duration::from_secs(1);
+        for i in 0..=UNTYPED_CERTIFICATE_DISTINCT_MAX {
+            assert_eq!(w.note(&format!("id-{i}"), inside), None);
+        }
+        assert_eq!(
+            w.note("eeee-5", next + UNTYPED_CERTIFICATE_WARN_INTERVAL),
+            Some((UNTYPED_CERTIFICATE_DISTINCT_MAX, true)),
+            "capped: at least the cap"
+        );
+    }
+
+    /// **#2082**: the NF-type gate. Under production only a verified `expected`
+    /// passes (its own typed certificate, or a token the NRF lists as one); an
+    /// untyped certificate alone, a relay's alone, a wrong type, a token the NRF
+    /// does not list and an anonymous caller are refused 403. Under dev an
+    /// unidentified plaintext caller passes, but a typed certificate or a token
+    /// is still checked.
+    ///
+    /// REVERT-VERIFIED: with the gate reduced to the pre-#2082 rule (an empty
+    /// type list passes), the production untyped-certificate case passes and
+    /// its `is_some` fails.
+    #[tokio::test]
+    async fn the_nf_type_gate_admits_only_a_verified_type_2082() {
+        const AUSF: &str = "aaaaaaaa-2082-4000-8000-0000000000a1";
+        const OTHER: &str = "bbbbbbbb-2082-4000-8000-0000000000b1";
+        const SCP: &str = "55555555-2082-4000-8000-000000000005";
+        seed_nf_type_for_test(AUSF, NfType::Ausf);
+        let gate = |r: SbiRequest, production: bool| async move {
+            nf_type_refusal_with(&r, NfType::Ausf, "Op", production)
+                .await
+                .map(|resp| resp.status)
+        };
+        for production in [true, false] {
+            assert_eq!(
+                gate(caller(Some(AUSF), None, &["AUSF"]), production).await,
+                None
+            );
+            assert_eq!(
+                gate(caller(None, Some(AUSF), &[]), production).await,
+                None,
+                "a token the NRF lists as an AUSF"
+            );
+            assert_eq!(
+                gate(caller(Some(SCP), Some(AUSF), &["SCP"]), production).await,
+                None,
+                "an AUSF's token through an SCP"
+            );
+            assert_eq!(
+                gate(caller(Some(OTHER), None, &["SMF"]), production).await,
+                Some(403),
+                "another type's certificate (production={production})"
+            );
+            assert_eq!(
+                gate(caller(Some(SCP), Some(OTHER), &["SCP"]), production).await,
+                Some(403),
+                "a token the NRF does not list as an AUSF"
+            );
+            assert_eq!(
+                gate(caller(Some(AUSF), Some(OTHER), &["AUSF"]), production).await,
+                Some(403),
+                "a certificate and token that disagree"
+            );
+        }
+        // Production refuses what proves no AUSF at all.
+        for (what, r) in [
+            (
+                "an untyped certificate alone",
+                caller(Some(AUSF), None, &[]),
+            ),
+            (
+                "a relay's certificate alone",
+                caller(Some(SCP), None, &["SCP"]),
+            ),
+            ("an anonymous caller", caller(None, None, &[])),
+        ] {
+            assert_eq!(gate(r, true).await, Some(403), "production: {what}");
+        }
+        // Dev: an unidentified plaintext caller is admitted as before.
+        assert_eq!(gate(caller(None, None, &[]), false).await, None);
+        assert_eq!(gate(caller(Some(SCP), None, &["SCP"]), false).await, None);
     }
 
     const A: &str = "aaaaaaaa-1865-4000-8000-000000000001";

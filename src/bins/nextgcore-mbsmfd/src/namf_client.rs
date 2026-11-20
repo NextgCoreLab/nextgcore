@@ -2300,20 +2300,25 @@ mod tests {
             tmgi: None,
         };
         let (record, token) = released_record_1985(context, [0x0d, 0x19, 0x85]);
-        crate::reconcile::park(vec![record]);
+        crate::reconcile::park(vec![record.clone()]);
         let pass = tokio::spawn(crate::reconcile::reconcile_once());
         accepted.notified().await;
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            0,
-            "drained into the pass"
+        // #2175: about this record, not the whole pending set: a sibling
+        // session's detached release-retry task parks its own failures into the
+        // same set on its own schedule (it outlives the test that started it,
+        // and so the lock), which made a count of 0 / 1 fail about 1 run in 4
+        // under load.
+        assert!(
+            !crate::reconcile::is_parked(&record),
+            "drained into the pass (pending: {})",
+            crate::reconcile::pending_count()
         );
         pass.abort();
         let _ = pass.await;
-        assert_eq!(
-            crate::reconcile::pending_count(),
-            1,
-            "a cancelled pass re-parks its in-flight delete"
+        assert!(
+            crate::reconcile::is_parked(&record),
+            "a cancelled pass re-parks its in-flight delete (pending: {})",
+            crate::reconcile::pending_count()
         );
         assert!(admitted(&token), "and its token");
         crate::reconcile::clear_for_test();

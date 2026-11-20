@@ -190,7 +190,7 @@ nextgcore/
 ├── deploy/helm/        # Helm chart (5GC control plane)
 ├── deploy/eks/         # EKS deployment (PROFILE=<name>)
 ├── docs/               # GitHub Pages site, OpenAPI specs, design notes
-├── docs-book/          # mdBook sources (built into docs/book/)
+├── docs-book/          # mdBook sources (built into docs/book/ by pages.yml; not committed)
 └── webui/              # Node.js subscriber-management WebUI
 ```
 
