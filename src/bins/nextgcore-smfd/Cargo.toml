@@ -61,6 +61,10 @@ base64.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# #2221: the end to end runs this SMF's PCF client and QoS monitoring path against
+# the REAL pcfd router, so the producer and the consumer of `qosMonDecs` cannot
+# drift. Dev-only, not linked into the binary.
+nextgcore-pcfd = { path = "../nextgcore-pcfd" }
 # #2208: the in-process end to end runs two REAL UPFs (PSA and I-UPF) through
 # upfd's library. Dev-only, not linked into the binary.
 nextgcore-upfd = { path = "../nextgcore-upfd", features = ["test-support"] }

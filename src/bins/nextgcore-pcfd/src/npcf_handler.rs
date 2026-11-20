@@ -505,9 +505,51 @@ pub fn af_pcc_rules_to_decision(rules: &[AfPccRule]) -> (serde_json::Value, serd
 /// `tsnPortManContDstt` and `tsnPortManContNwtts` under exactly the names
 /// TS 29.514 uses on the inbound PolicyAuthorization leg, so this is a copy and
 /// not a translation — there is no mapping step in which they could be corrupted.
+///
+/// #2221: and the session's QoS monitoring policy (TS 29.512 §4.2.3.25.1):
+/// `qosMonDecs`, each AF rule's `refQosMon`, and QOS_MONITORING among the
+/// `policyCtrlReqTriggers` so the SMF reports to this PCF (§4.2.4.24). Once a
+/// policy has been sent ([`PcfSess::qos_mon_provisioned`]) the rules' references
+/// and the trigger list are always stated, a rule with none as `refQosMon: null`
+/// (QoS monitoring disabled), so a withdrawn policy is withdrawn at the SMF; a
+/// session that never had one is notified exactly as before.
 pub fn build_af_sm_policy_notification(sess: &PcfSess) -> serde_json::Value {
-    let (pcc_rules, qos_decs) = af_pcc_rules_to_decision(&sess.af_pcc_rules);
+    let (mut pcc_rules, qos_decs) = af_pcc_rules_to_decision(&sess.af_pcc_rules);
     let mut decision = serde_json::Map::new();
+    if sess.qos_mon_provisioned {
+        if let Some(rules) = pcc_rules.as_object_mut() {
+            for (id, rule) in rules.iter_mut() {
+                let refs: Vec<&str> = sess
+                    .af_qos_mon
+                    .iter()
+                    .filter(|q| q.pcc_rule_ids.iter().any(|r| r == id))
+                    .map(|q| q.qm_id.as_str())
+                    .collect();
+                rule["refQosMon"] = if refs.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(refs)
+                };
+            }
+        }
+        let decs: serde_json::Map<String, serde_json::Value> = sess
+            .af_qos_mon
+            .iter()
+            .map(|q| (q.qm_id.clone(), q.data.clone()))
+            .collect();
+        if !decs.is_empty() {
+            decision.insert("qosMonDecs".to_string(), serde_json::Value::Object(decs));
+        }
+        let mut triggers = sess.policy_triggers.clone();
+        triggers.retain(|t| t != "QOS_MONITORING");
+        if !sess.af_qos_mon.is_empty() {
+            triggers.push("QOS_MONITORING".to_string());
+        }
+        decision.insert(
+            "policyCtrlReqTriggers".to_string(),
+            serde_json::json!(triggers),
+        );
+    }
     decision.insert("pccRules".to_string(), pcc_rules);
     decision.insert("qosDecs".to_string(), qos_decs);
     decision.extend(sess.tsc_containers.to_decision_fragment());

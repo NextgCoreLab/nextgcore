@@ -597,6 +597,26 @@ pub struct PcfSess {
     /// session (TS 29.514 PolicyAuthorization → TS 29.512 SmPolicyDecision).
     /// Pushed to the SMF in the SM policy update notification.
     pub af_pcc_rules: Vec<crate::npcf_handler::AfPccRule>,
+    /// #2221: the authorised QoS monitoring policy (TS 29.512 §4.2.3.25.1), one
+    /// `QosMonitoringData` per AF app session that subscribed to QOS_MONITORING,
+    /// referenced from that app session's PCC rules (`refQosMon`).
+    #[serde(default)]
+    pub af_qos_mon: Vec<crate::qos_mon::AfQosMon>,
+    /// #2221: set once a QoS monitoring policy has been sent to the SMF. From then
+    /// on the AF-derived decisions state `refQosMon` and `policyCtrlReqTriggers`
+    /// explicitly, so a policy that is withdrawn is withdrawn at the SMF too; a
+    /// session that never had one is notified as before.
+    #[serde(default)]
+    pub qos_mon_provisioned: bool,
+    /// #2221: the `policyCtrlReqTriggers` of the create answer. A decision that
+    /// carries the list replaces the SMF's (TS 29.512 §4.2.6.2.1), so adding
+    /// QOS_MONITORING has to restate these.
+    #[serde(default)]
+    pub policy_triggers: Vec<String>,
+    /// #2221: PacketDelayFailureReport (TS 29.512 feature 73) negotiated with the
+    /// SMF; past the 64 bits of `smpolicycontrol_features`.
+    #[serde(default)]
+    pub sm_packet_delay_failure_report: bool,
     /// Last `accessType` seen for this PDU session (TS 29.512
     /// `SmPolicyContextData`/`SmPolicyUpdateContextData`).
     ///
@@ -748,6 +768,10 @@ impl PcfSess {
             pcf_ue_sm_id,
             stream_id: None,
             af_pcc_rules: Vec::new(),
+            af_qos_mon: Vec::new(),
+            qos_mon_provisioned: false,
+            policy_triggers: Vec::new(),
+            sm_packet_delay_failure_report: false,
             access_type: None,
             policy_dnn_data: None,
             tsc_containers: Default::default(),
@@ -1294,6 +1318,15 @@ pub struct PcfApp {
     /// an ownerless record is frozen and could otherwise never be removed.
     #[serde(default)]
     pub ownerless_until: Option<i64>,
+    /// #2221: the PolicyAuthorization features negotiated with the AF (TS 29.514
+    /// §5.8): whether it may be sent `qosMonReports` (QoSMonitoring) and `pdmf`
+    /// (PacketDelayFailureReport).
+    #[serde(default)]
+    pub pa_features: u64,
+    /// #2221: the PCC rules this app session's media components installed, which
+    /// its QoS monitoring policy is referenced from.
+    #[serde(default)]
+    pub pcc_rule_ids: Vec<String>,
 }
 
 impl PcfApp {
@@ -1306,6 +1339,8 @@ impl PcfApp {
             notif_uri: None,
             sess_id,
             events_subsc: None,
+            pa_features: 0,
+            pcc_rule_ids: Vec::new(),
         }
     }
 

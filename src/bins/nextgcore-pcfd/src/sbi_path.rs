@@ -1354,6 +1354,13 @@ fn record_terminate_for_test(app: &crate::context::PcfApp) {
 /// session's — the AF may point events at a different endpoint from the session.
 /// Returns false when the AF subscribed to none of `events`, which is not a
 /// failure: an unsubscribed event must not be pushed.
+/// #2221: send an AF `EventsNotification` already built (`body`, TS 29.514
+/// §4.2.5) to `uri` + `/notify`, as [`pcf_sbi_send_policyauthorization_events_notify`]
+/// sends the ones that carry only events.
+pub fn pcf_sbi_send_af_events_notification(uri: String, body: serde_json::Value) -> bool {
+    spawn_notification(uri, "/notify", body, "AF QoS monitoring")
+}
+
 pub fn pcf_sbi_send_policyauthorization_events_notify(app_id: u64, events: &[&str]) -> bool {
     let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
         ctx.app_find_by_id(app_id).and_then(|app| {
