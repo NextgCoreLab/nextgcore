@@ -658,8 +658,8 @@ async fn a_psa_on_n3_ignores_an_n3_n9_value_from_the_ran() {
 }
 
 /// The DSCP the IE names marks the probe's outer IPv4 header (Table 7.5.2.2-6),
-/// read here from the received datagram's TOS (IP_RECVTOS); and the socket's
-/// marking is put back after it.
+/// read here from the received datagram's TOS (IP_RECVTOS); the socket itself
+/// carries no marking (#2197: per-datagram `sendmsg` control message).
 ///
 /// REVERT-VERIFIED: with the probe not marked, the TOS reads 0.
 #[tokio::test]
@@ -709,9 +709,12 @@ async fn a_probe_carries_the_dscp_the_ie_names() {
         .unwrap();
     assert_eq!(tos, Some(46 << 2), "DSCP EF in the outer TOS");
     assert_eq!(
-        r.dp.gtpu_tos.load(Ordering::Relaxed),
+        crate::data_plane::tos_test_support::socket_marking(
+            r.dp.gtpu_socket.as_ref().unwrap(),
+            false
+        ),
         0,
-        "the socket's marking is put back"
+        "marked on the datagram, not the socket (#2197)"
     );
 }
 
@@ -746,4 +749,26 @@ fn recv_tos(s: &std::net::UdpSocket) -> Option<u8> {
         }
     }
     None
+}
+
+/// #2197 review (R43 minor 2): a PSA downlink on an N9 TEID this I-UPF does not
+/// hold, whose inner source is a UE of this I-UPF (UE-to-UE traffic), does not
+/// find that UE's session by address: it is an unknown TEID, answered with an
+/// Error Indication (TS 29.281 §7.3.1), and nothing goes back up to the PSA.
+///
+/// REVERT-VERIFIED: with the UE-address lookup applied to I-UPF sessions, the
+/// packet passes anti-spoofing and the PSA receives it as this UE's uplink.
+#[tokio::test]
+async fn a_psa_downlink_on_an_unknown_n9_teid_is_not_found_by_ue_address() {
+    let ue = Ipv4Addr::new(10, 45, 14, 51);
+    let r = i_upf_with_ue(Some(ue)).await;
+    let mut inner = inner_ul();
+    inner[12..16].copy_from_slice(&ue.octets()); // UE A to UE B
+    inner[16..20].copy_from_slice(&[10, 45, 14, 52]);
+    r.send_as_psa(&gpdu(0x0dea_d197, &PduSessionContainer::dl(QFI), &inner))
+        .await;
+    let back = recv(&r.psa).await.expect("an answer to the PSA");
+    assert_eq!(back[1], 26, "an Error Indication, not a relayed G-PDU");
+    assert!(recv(&r.psa).await.is_none(), "nothing else goes up");
+    assert_eq!(r.dp.stats.drops(DropReason::UnknownTeid), 1);
 }

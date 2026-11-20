@@ -33,3 +33,6 @@ __pycache__/
 # Proptest regression seeds from local runs. A seed worth keeping becomes a
 # named test; the few committed regression files elsewhere stay tracked.
 proptest-regressions/
+
+# The mdBook output: pages.yml builds it from docs-book/ at publish time (#2168).
+/docs/book/

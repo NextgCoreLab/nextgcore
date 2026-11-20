@@ -559,6 +559,7 @@ pub fn begin_unrestorable_at_boot() -> tokio::task::JoinHandle<(usize, usize)> {
     // maps after telling its AMF it is RELEASED would have the two ends disagree the
     // other way round.
     let mut nsac = Vec::new();
+    let mut released_legs = Vec::new();
     if let Ok(ctx) = global.read() {
         for entry in &pending {
             let r = &entry.sm_context_ref;
@@ -588,6 +589,8 @@ pub fn begin_unrestorable_at_boot() -> tokio::task::JoinHandle<(usize, usize)> {
             if let Ok(mut m) = ctx.session_upfs.write() {
                 m.remove(&seid);
             }
+            // #2208 (R43 M2 on #2243): its I-UPF leg, released below.
+            released_legs.push(seid);
             // #912 review M3: the restored allocation goes back too; nothing else
             // holds it, since the binding that named it could not be read.
             if let Some(ip) = entry.ue_ip {
@@ -600,6 +603,9 @@ pub fn begin_unrestorable_at_boot() -> tokio::task::JoinHandle<(usize, usize)> {
         }
         // Once, after every write guard has dropped: `persist` re-reads these maps.
         ctx.persist();
+    }
+    for seid in released_legs {
+        crate::iupf::release_leg(seid);
     }
     for (supi, psi, sst, sd) in nsac {
         tokio::spawn(async move {

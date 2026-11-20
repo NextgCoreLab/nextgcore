@@ -3500,13 +3500,19 @@ impl NgapServer {
         let affected: Vec<u64> = match &reset.reset_type {
             // `snapshot` and not `iter`: the loop below re-enters the store, so a live
             // guard here would DEADLOCK. See `ue_store`'s module docs.
-            ResetType::NgInterface => self
-                .ue_auth_state
-                .snapshot()
-                .into_iter()
-                .filter(|(_, state)| state.association_id == association_id)
-                .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
-                .collect(),
+            ResetType::NgInterface => {
+                #[cfg(test)]
+                crate::test_support::refuse_releasing_the_shared_test_association(
+                    association_id,
+                    "a whole-interface NG Reset",
+                );
+                self.ue_auth_state
+                    .snapshot()
+                    .into_iter()
+                    .filter(|(_, state)| state.association_id == association_id)
+                    .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
+                    .collect()
+            }
             ResetType::PartOfNgInterface(connections) => {
                 let on_this_gnb: Vec<(u64, u32)> = self
                     .ue_auth_state
@@ -3666,6 +3672,8 @@ impl NgapServer {
     /// UE-associated connection it carried is gone. Each UE of `association_id` is
     /// released as by a whole-interface NG Reset, and its SMF calls start at once.
     async fn reset_ue_associations_of(&mut self, association_id: u64, why: &str) {
+        #[cfg(test)]
+        crate::test_support::refuse_releasing_the_shared_test_association(association_id, why);
         self.drop_contextless_ue_ids_for_reset(
             association_id,
             &nextgcore_ngap::types::ResetType::NgInterface,
@@ -3987,7 +3995,7 @@ impl NgapServer {
                     };
                     // #406, the THIRD instance of the class: store the cell identity too.
                     //
-                    // `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+                    // `decode_initial_ue_message_asn1` decodes `nr_cell_identity` off the
                     // InitialUEMessage's own `UserLocationInformation`
                     // (`ngap_asn1.rs:357-368`); before this it was LOGGED at `:1602-1607` and
                     // then dropped, so `amf_ue.nr_cgi` had exactly one production writer
@@ -4186,7 +4194,7 @@ impl NgapServer {
         //    already-validated location, and a UE whose PDU session signalling arrives
         //    from a new cell has still moved.
         // 3. The IE's validity does not depend on the NAS payload: it was decoded and
-        //    accepted before `parse_uplink_nas_transport_asn1` returned. Nothing below can
+        //    accepted before `decode_uplink_nas_transport_asn1` returned. Nothing below can
         //    make it untrue.
         //
         // Safe despite the security-decode block's `remove`/`insert` round-trip further
@@ -23538,7 +23546,7 @@ fn plmn_id_from_ngap_bytes(bytes: &[u8; 3]) -> PlmnId {
 /// Callers: `handle_uplink_nas_transport` (the SERVICE REQUEST and every other UL
 /// NAS message), `handle_path_switch_request` (Xn handover) and
 /// `handle_handover_notify` (N2 handover). `handle_initial_ue_message` does not use
-/// it because `parse_initial_ue_message_asn1` has already flattened the IE into
+/// it because `decode_initial_ue_message_asn1` has already flattened the IE into
 /// `InitialUeMessageData`'s own fields, so no `UserLocationInformation` survives to
 /// that site.
 ///
@@ -24130,17 +24138,15 @@ mod tests {
             direct_forwarding_path_availability: None,
         };
         for (id, golden) in cases {
-            let bytes = nextgcore_ngap::builder::build_handover_required(&required(
-                TargetId::TargetGlobalNgEnbId {
+            let bytes =
+                crate::gnb_pdus::handover_required(&required(TargetId::TargetGlobalNgEnbId {
                     plmn_identity: plmn,
                     ng_enb_id: id,
                     selected_eps_tai: EpsTai {
                         plmn_identity: plmn,
                         tac: [0x00, 0x07],
                     },
-                },
-            ))
-            .expect("build");
+                }));
             let crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } =
                 crate::ngap_asn1::decode_handover_required_asn1(&bytes)
             else {
@@ -25517,14 +25523,30 @@ mod tests {
             None,
         )
         .expect("build ICS");
-        let decoded = nextgcore_ngap::parser::decode_ngap_pdu(&bytes).expect("decode");
-        match decoded {
-            nextgcore_ngap::NgapMessage::InitialContextSetupRequest(req) => {
-                assert_eq!(req.security_key, kgnb);
-                assert_ne!(req.security_key, [0u8; 32]);
-            }
-            other => panic!("expected InitialContextSetupRequest, got {other:?}"),
-        }
+        // #417: read the Security Key (id 94, `BIT STRING (SIZE(256))`) back
+        // through the generated decoder, bit for bit.
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_InitialContextSetup(req),
+            ..
+        }) = nextgcore_ngap_gen::decode(&bytes).expect("decode")
+        else {
+            panic!("expected InitialContextSetupRequest");
+        };
+        let key: Vec<u8> = req
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|ie| match ie.value {
+                g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(k) => Some(k.0),
+                _ => None,
+            })
+            .expect("a Security Key IE")
+            .chunks(8)
+            .map(|c| c.iter().fold(0u8, |o, b| o << 1 | u8::from(*b)))
+            .collect();
+        assert_eq!(key, kgnb);
+        assert_ne!(key, [0u8; 32]);
     }
 
     #[test]
@@ -25548,13 +25570,12 @@ mod tests {
         assert!(!state.initial_context_setup_response_received);
 
         // The gNB confirms: parse a real ICS Response and apply the gate.
-        let resp = nextgcore_ngap::builder::build_initial_context_setup_response(
+        let resp = crate::gnb_pdus::initial_context_setup_response(
             &nextgcore_ngap::types::InitialContextSetupResponse {
                 amf_ue_ngap_id: 1,
                 ran_ue_ngap_id: 2,
             },
-        )
-        .expect("build resp");
+        );
         let parsed = crate::ngap_asn1::decode_initial_context_setup_response_asn1(&resp);
         assert!(matches!(
             parsed,
@@ -25612,36 +25633,29 @@ mod tests {
         // ErrorIndication carrying a protocol cause (TS 38.413 Section 10.3).
         // This mirrors the `_` dispatch arm's behaviour.
         let unknown_pdu = [0x00u8, 99, 0x00]; // InitiatingMessage, procedure 99
-        let parsed = nextgcore_ngap::parser::decode_ngap_pdu(&unknown_pdu);
-        // Either decodes to Unknown or fails to decode; both drive ErrorIndication.
-        let is_unknown_or_err = matches!(
-            parsed,
-            Ok(nextgcore_ngap::NgapMessage::Unknown { .. }) | Err(_)
-        );
-        assert!(is_unknown_or_err, "got {parsed:?}");
+                                              // Procedure 99 is not in the V17.9 object set: the generated decoder
+                                              // refuses it, which is what drives the Error Indication.
+        assert!(nextgcore_ngap_gen::decode(&unknown_pdu).is_err());
 
-        // Build the ErrorIndication the dispatch would emit and confirm it is a
-        // valid, decodable PDU with the protocol cause.
-        let ei = nextgcore_ngap::types::ErrorIndication {
-            amf_ue_ngap_id: None,
-            ran_ue_ngap_id: None,
-            cause: Some(nextgcore_ngap::types::Cause::Protocol(
-                nextgcore_ngap::types::CauseProtocol::AbstractSyntaxErrorReject,
+        // The ErrorIndication the dispatch emits (#417: the production builder,
+        // against octets derived by hand): initiatingMessage, id-ErrorIndication
+        // 9, ignore, length 8; one IE; id 15 Cause (ignore), protocol `011`,
+        // extension `0`, abstract-syntax-error-reject index 1 of seven `001`,
+        // padded -> `62`.
+        use nextgcore_ngap_gen::generated as g;
+        let bytes = crate::ngap_asn1::build_error_indication_generated(
+            None,
+            None,
+            g::Cause::Protocol(g::CauseProtocol(
+                g::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
             )),
-            criticality_diagnostics: None,
-        };
-        let bytes = nextgcore_ngap::builder::build_error_indication(&ei).unwrap();
-        assert_eq!(bytes[0], 0x00); // InitiatingMessage
+        )
+        .expect("encode");
+        assert_eq!(
+            bytes,
+            [0x00, 0x09, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x0f, 0x40, 0x01, 0x62]
+        );
         assert_eq!(bytes[1], proc_code::ERROR_INDICATION as u8);
-        match nextgcore_ngap::parser::decode_ngap_pdu(&bytes).unwrap() {
-            nextgcore_ngap::NgapMessage::ErrorIndication(e) => {
-                assert!(matches!(
-                    e.cause,
-                    Some(nextgcore_ngap::types::Cause::Protocol(_))
-                ));
-            }
-            other => panic!("expected ErrorIndication, got {other:?}"),
-        }
     }
 
     #[test]
@@ -25649,19 +25663,18 @@ mod tests {
         let start = crate::ngap_asn1::build_overload_start_asn1(40).expect("overload start");
         assert_eq!(start[0], 0x00);
         assert_eq!(start[1], proc_code::OVERLOAD_START as u8);
-        match nextgcore_ngap::parser::decode_ngap_pdu(&start).unwrap() {
-            nextgcore_ngap::NgapMessage::OverloadStart(o) => {
-                assert_eq!(o.traffic_load_reduction, Some(40));
-            }
-            other => panic!("expected OverloadStart, got {other:?}"),
-        }
+        // #417, by hand: initiatingMessage, id-OverloadStart 22, ignore, length 8;
+        // one IE; id 9 AMFTrafficLoadReductionIndication (ignore),
+        // `INTEGER (1..99)` as 40-1 = 39 in seven bits `0100111`, padded -> `4e`.
+        assert_eq!(
+            start,
+            [0x00, 0x16, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x09, 0x40, 0x01, 0x4e]
+        );
 
         let stop = crate::ngap_asn1::build_overload_stop_asn1().expect("overload stop");
         assert_eq!(stop[1], proc_code::OVERLOAD_STOP as u8);
-        match nextgcore_ngap::parser::decode_ngap_pdu(&stop).unwrap() {
-            nextgcore_ngap::NgapMessage::OverloadStop(_) => {}
-            other => panic!("expected OverloadStop, got {other:?}"),
-        }
+        // id-OverloadStop 23, reject; an empty IE container `00 00 00`.
+        assert_eq!(stop, [0x00, 0x17, 0x00, 0x03, 0x00, 0x00, 0x00]);
     }
 
     // ------------------------------------------------------------------
@@ -25918,15 +25931,6 @@ mod tests {
     // TS 38.413 §8.15.3/§8.15.5) → Namf N2InfoNotify producer (TS 29.518
     // §5.2.2.3.3) toward the LMF callback registered via N1N2MessageSubscribe.
     // ======================================================================
-
-    /// APER-encode an NGAP PDU exactly like the wire path does.
-    fn encode_ngap_pdu(pdu: &nextgcore_asn1c::ngap::pdu::NgapPdu) -> Vec<u8> {
-        use nextgcore_asn1c::per::{AperEncode, AperEncoder};
-        let mut encoder = AperEncoder::new();
-        pdu.encode_aper(&mut encoder).expect("APER encode");
-        encoder.align();
-        encoder.into_bytes().to_vec()
-    }
 
     /// Capture SbiServer standing in for the LMF's notify-callback endpoint:
     /// records (uri, json root, binary parts) for each POST and returns 204.
@@ -28410,7 +28414,7 @@ mod tests {
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_480u64, 1_442_007u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 67).await;
-        let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
+        let failure = crate::gnb_pdus::initial_context_setup_failure(
             &nextgcore_ngap::types::InitialContextSetupFailure {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 67,
@@ -28418,8 +28422,7 @@ mod tests {
                     nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
                 ),
             },
-        )
-        .expect("encode an Initial Context Setup Failure");
+        );
         ngap.handle_initial_context_setup_failure(base + 1, &failure)
             .await
             .expect("handled");
@@ -28702,17 +28705,14 @@ mod tests {
         nas: Vec<u8>,
         cause: nextgcore_ngap::types::RrcEstablishmentCause,
     ) -> Vec<u8> {
-        nextgcore_ngap::builder::build_initial_ue_message(
-            &nextgcore_ngap::types::InitialUeMessage {
-                ran_ue_ngap_id: 512,
-                nas_pdu: nas,
-                user_location_info: test_user_location(0x74, 0x0005_1200),
-                rrc_establishment_cause: cause,
-                ue_context_request: None,
-                allowed_nssai: Vec::new(),
-            },
-        )
-        .expect("encode an InitialUEMessage")
+        crate::gnb_pdus::initial_ue_message(&nextgcore_ngap::types::InitialUeMessage {
+            ran_ue_ngap_id: 512,
+            nas_pdu: nas,
+            user_location_info: test_user_location(0x74, 0x0005_1200),
+            rrc_establishment_cause: cause,
+            ue_context_request: None,
+            allowed_nssai: Vec::new(),
+        })
     }
 
     /// TS 23.502 §4.2.3.2 / §4.2.3.3: the page is answered by a Service Request in a
@@ -29144,13 +29144,12 @@ mod tests {
         ue.registered = true;
         ngap.ue_auth_state.insert(id, ue);
         assert!(!ngap.ue_auth_state.get(id).unwrap().is_cm_idle());
-        let pdu = nextgcore_ngap::builder::build_ue_context_release_complete(
+        let pdu = crate::gnb_pdus::ue_context_release_complete(
             &nextgcore_ngap::types::UeContextReleaseComplete {
                 amf_ue_ngap_id: id,
                 ran_ue_ngap_id: 53,
             },
-        )
-        .expect("encode");
+        );
         let _ = ngap.handle_ue_context_release_complete(1, &pdu).await;
         assert!(ngap.ue_auth_state.get(id).unwrap().is_cm_idle());
     }
@@ -29311,22 +29310,19 @@ mod tests {
 
     /// A conformant WRITE-REPLACE WARNING REQUEST, as the CBCF's container.
     fn pws_warning_pdu(message_identifier: u16, serial_number: u16) -> Vec<u8> {
-        nextgcore_ngap::builder::build_write_replace_warning_request(
-            &nextgcore_ngap::types::WriteReplaceWarningRequest {
-                message_identifier,
-                serial_number,
-                warning_area_list: None,
-                repetition_period: 32,
-                number_of_broadcasts_requested: 2,
-                warning_type: None,
-                warning_security_info: None,
-                data_coding_scheme: Some(0x01),
-                warning_message_contents: Some(b"FLOOD".to_vec()),
-                concurrent_warning_message_indicator: false,
-                warning_area_coordinates: None,
-            },
-        )
-        .expect("build WRITE-REPLACE WARNING REQUEST")
+        crate::gnb_pdus::write_replace_warning(&nextgcore_ngap::types::WriteReplaceWarningRequest {
+            message_identifier,
+            serial_number,
+            warning_area_list: None,
+            repetition_period: 32,
+            number_of_broadcasts_requested: 2,
+            warning_type: None,
+            warning_security_info: None,
+            data_coding_scheme: Some(0x01),
+            warning_message_contents: Some(b"FLOOD".to_vec()),
+            concurrent_warning_message_indicator: false,
+            warning_area_coordinates: None,
+        })
     }
 
     /// The whole point of criterion 3: **assert the encoded NGAP PDU the gNB
@@ -29779,15 +29775,12 @@ mod tests {
             );
         }
 
-        let pdu = nextgcore_ngap::builder::build_pws_cancel_response(
-            &nextgcore_ngap::types::PwsCancelResponse {
-                message_identifier: mid,
-                serial_number: sn,
-                broadcast_cancelled_area_list: None,
-                criticality_diagnostics: None,
-            },
-        )
-        .expect("build PWS CANCEL RESPONSE");
+        let pdu = crate::gnb_pdus::pws_cancel_response(&nextgcore_ngap::types::PwsCancelResponse {
+            message_identifier: mid,
+            serial_number: sn,
+            broadcast_cancelled_area_list: None,
+            criticality_diagnostics: None,
+        });
         assert_eq!(pdu[0], 0x20);
         assert_eq!(pdu[1], 32, "id-PWSCancel = 32 (`38413-j30.txt:59077`)");
 
@@ -29854,15 +29847,14 @@ mod tests {
         // --- (1) subscription present, no sendRanResponse record ---
         let (mid1, sn1) = (0x5399u16, 0x6399u16);
         let sub_id = add_pws_subscription("PWS-BCAL", &callback_uri, None, "sub-399-neg");
-        let pdu1 = nextgcore_ngap::builder::build_write_replace_warning_response(
+        let pdu1 = crate::gnb_pdus::write_replace_warning_answer(
             &nextgcore_ngap::types::WriteReplaceWarningResponse {
                 message_identifier: mid1,
                 serial_number: sn1,
                 broadcast_completed_area_list: None,
                 criticality_diagnostics: None,
             },
-        )
-        .expect("build response");
+        );
         ngap.process_ngap_message(association_id, &pdu1)
             .await
             .expect("dispatch");
@@ -29895,15 +29887,14 @@ mod tests {
                 "this half needs the subscription genuinely absent"
             );
         }
-        let pdu2 = nextgcore_ngap::builder::build_write_replace_warning_response(
+        let pdu2 = crate::gnb_pdus::write_replace_warning_answer(
             &nextgcore_ngap::types::WriteReplaceWarningResponse {
                 message_identifier: mid2,
                 serial_number: sn2,
                 broadcast_completed_area_list: None,
                 criticality_diagnostics: None,
             },
-        )
-        .expect("build response");
+        );
         ngap.process_ngap_message(association_id, &pdu2)
             .await
             .expect("dispatch");
@@ -29942,8 +29933,8 @@ mod tests {
             &[("001", "01", 0x74)],
         )
         .await;
-        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
-            &nextgcore_ngap::types::PwsRestartIndication {
+        let restart =
+            crate::gnb_pdus::pws_restart_indication(&nextgcore_ngap::types::PwsRestartIndication {
                 cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
                     nextgcore_ngap::types::NrCgi {
                         plmn_identity: [0x00, 0xF1, 0x10],
@@ -29960,9 +29951,7 @@ mod tests {
                     tai_tac: [0x00, 0x00, 0x74],
                 }],
                 emergency_area_id_list_for_restart: Vec::new(),
-            },
-        )
-        .expect("build PWS RESTART INDICATION");
+            });
         ngap.process_ngap_message(association_id, &restart)
             .await
             .expect("dispatch");
@@ -30027,8 +30016,8 @@ mod tests {
         };
 
         // --- PWS RESTART INDICATION, procedure 34 ---
-        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
-            &nextgcore_ngap::types::PwsRestartIndication {
+        let restart =
+            crate::gnb_pdus::pws_restart_indication(&nextgcore_ngap::types::PwsRestartIndication {
                 cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
                     nextgcore_ngap::types::NrCgi {
                         plmn_identity: [0x00, 0xF1, 0x10],
@@ -30041,9 +30030,7 @@ mod tests {
                     tai_tac: [0x00, 0x00, 0x74],
                 }],
                 emergency_area_id_list_for_restart: Vec::new(),
-            },
-        )
-        .expect("build PWS RESTART INDICATION");
+            });
         // An indication is an InitiatingMessage (0x00) of procedure **34** -- NOT 33.
         // The ASN.1 table is alphabetical (Failure 33, Restart 34), the reverse of
         // the clause order (Restart §9.2.8.5, Failure §9.2.8.6).
@@ -30091,18 +30078,15 @@ mod tests {
         assert!(json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"].is_null());
 
         // --- PWS FAILURE INDICATION, procedure 33 ---
-        let failure = nextgcore_ngap::builder::build_pws_failure_indication(
-            &nextgcore_ngap::types::PwsFailureIndication {
-                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
-                    nextgcore_ngap::types::NrCgi {
-                        plmn_identity: [0x00, 0xF1, 0x10],
-                        nr_cell_identity: 0x39A,
-                    },
-                ]),
-                global_ran_node_id: pdu_node,
-            },
-        )
-        .expect("build PWS FAILURE INDICATION");
+        let failure = crate::gnb_pdus::pws_failure(&nextgcore_ngap::types::PwsFailureIndication {
+            failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                nextgcore_ngap::types::NrCgi {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    nr_cell_identity: 0x39A,
+                },
+            ]),
+            global_ran_node_id: pdu_node,
+        });
         assert_eq!(failure[0], 0x00);
         assert_eq!(
             failure[1], 33,
@@ -30164,22 +30148,19 @@ mod tests {
             );
         }
 
-        let failure = nextgcore_ngap::builder::build_pws_failure_indication(
-            &nextgcore_ngap::types::PwsFailureIndication {
-                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
-                    nextgcore_ngap::types::NrCgi {
-                        plmn_identity: [0x00, 0xF1, 0x10],
-                        nr_cell_identity: 0x39B,
-                    },
-                ]),
-                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+        let failure = crate::gnb_pdus::pws_failure(&nextgcore_ngap::types::PwsFailureIndication {
+            failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                nextgcore_ngap::types::NrCgi {
                     plmn_identity: [0x00, 0xF1, 0x10],
-                    gnb_id: 0x888,
-                    gnb_id_len: 32,
+                    nr_cell_identity: 0x39B,
                 },
+            ]),
+            global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x00, 0xF1, 0x10],
+                gnb_id: 0x888,
+                gnb_id_len: 32,
             },
-        )
-        .expect("build PWS FAILURE INDICATION");
+        });
 
         // Reaching the PWS arm at all is the claim: the `_` fallthrough would have
         // tried to SEND an ErrorIndication on this (synthetic) association.
@@ -30225,33 +30206,29 @@ mod tests {
         // (pdu, expected byte 0, expected procedure code)
         let fixtures: Vec<(Vec<u8>, u8, u8)> = vec![
             (
-                nextgcore_ngap::builder::build_write_replace_warning_response(
+                crate::gnb_pdus::write_replace_warning_answer(
                     &nextgcore_ngap::types::WriteReplaceWarningResponse {
                         message_identifier: 0x9399,
                         serial_number: 0xA399,
                         broadcast_completed_area_list: None,
                         criticality_diagnostics: None,
                     },
-                )
-                .expect("build"),
+                ),
                 0x20,
                 51,
             ),
             (
-                nextgcore_ngap::builder::build_pws_cancel_response(
-                    &nextgcore_ngap::types::PwsCancelResponse {
-                        message_identifier: 0xB399,
-                        serial_number: 0xC399,
-                        broadcast_cancelled_area_list: None,
-                        criticality_diagnostics: None,
-                    },
-                )
-                .expect("build"),
+                crate::gnb_pdus::pws_cancel_response(&nextgcore_ngap::types::PwsCancelResponse {
+                    message_identifier: 0xB399,
+                    serial_number: 0xC399,
+                    broadcast_cancelled_area_list: None,
+                    criticality_diagnostics: None,
+                }),
                 0x20,
                 32,
             ),
             (
-                nextgcore_ngap::builder::build_pws_restart_indication(
+                crate::gnb_pdus::pws_restart_indication(
                     &nextgcore_ngap::types::PwsRestartIndication {
                         cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell.clone()),
                         global_ran_node_id: node.clone(),
@@ -30261,19 +30238,15 @@ mod tests {
                         }],
                         emergency_area_id_list_for_restart: Vec::new(),
                     },
-                )
-                .expect("build"),
+                ),
                 0x00,
                 34,
             ),
             (
-                nextgcore_ngap::builder::build_pws_failure_indication(
-                    &nextgcore_ngap::types::PwsFailureIndication {
-                        failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell),
-                        global_ran_node_id: node,
-                    },
-                )
-                .expect("build"),
+                crate::gnb_pdus::pws_failure(&nextgcore_ngap::types::PwsFailureIndication {
+                    failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell),
+                    global_ran_node_id: node,
+                }),
                 0x00,
                 33,
             ),
@@ -31028,13 +31001,12 @@ mod tests {
         seed_gnb_session(&ngap, assoc).await;
         seed_gnb_session(&ngap, other_assoc).await;
         let reset = |reset_type| {
-            nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
                 cause: nextgcore_ngap::types::Cause::Transport(
                     nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
                 ),
                 reset_type,
             })
-            .expect("build NG Reset")
         };
         let item =
             |amf: u64, ran: u32| nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
@@ -31183,13 +31155,12 @@ mod tests {
     }
 
     fn ng_reset_pdu(reset_type: nextgcore_ngap::types::ResetType) -> Vec<u8> {
-        nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+        crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
                 nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
             ),
             reset_type,
         })
-        .expect("build NG Reset")
     }
 
     /// **#754, review of #848 (M1).** A whole-interface NG Reset with many connected UEs
@@ -31979,8 +31950,6 @@ mod tests {
         // it describes a dev-profile deployment (issue #63). Declared explicitly
         // rather than inherited from the environment.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
 
         let (_sink, port, mut rx) = start_lmf_callback_sink().await;
@@ -32018,14 +31987,12 @@ mod tests {
         // leg seeds the RoutingID from the LMF's nfId — TS 38.413 §9.3.3.23).
         let nrppa = vec![0x20u8, 0x0B, 0x00, 0x07, 0xAA, 0xBB, 0xCC];
         let routing = b"lmf-nf-instance-1".to_vec();
-        let pdu = build_uplink_ue_associated_nrppa_transport(
-            AmfUeNgapId(amf_ue_ngap_id),
-            RanUeNgapId(7),
-            RoutingId::new(routing),
-            NrppaPdu::new(nrppa.clone()),
-        )
-        .expect("build UplinkUEAssociatedNRPPaTransport");
-        let bytes = encode_ngap_pdu(&pdu);
+        let bytes = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+            amf_ue_ngap_id,
+            7,
+            &routing,
+            &nrppa.clone(),
+        );
         // Hand-derived header check: InitiatingMessage (0x00), procedure 50.
         assert_eq!(bytes[0], 0x00);
         assert_eq!(bytes[1], 50);
@@ -32085,8 +32052,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_uplink_nrppa_no_subscription_drops_without_error_indication() {
-        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
 
         let mut ngap = test_ngap_server().await;
@@ -32108,14 +32073,12 @@ mod tests {
              this association-less server)"
         );
 
-        let pdu = build_uplink_ue_associated_nrppa_transport(
-            AmfUeNgapId(amf_ue_ngap_id),
-            RanUeNgapId(8),
-            RoutingId::new(b"lmf-nf-instance-9".to_vec()),
-            NrppaPdu::new(vec![0x01, 0x02, 0x03]),
-        )
-        .expect("build UplinkUEAssociatedNRPPaTransport");
-        let bytes = encode_ngap_pdu(&pdu);
+        let bytes = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+            amf_ue_ngap_id,
+            8,
+            b"lmf-nf-instance-9",
+            &[0x01, 0x02, 0x03],
+        );
         assert_eq!(bytes[1], 50);
 
         let dropped_before =
@@ -32197,8 +32160,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_uplink_non_ue_nrppa_answer_goes_to_the_lmf_its_routing_id_names() {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
         let (_sink, port, mut rx) = start_lmf_callback_sink().await;
         let sub_id = "nonuen2sub-807-routing";
@@ -32231,12 +32192,9 @@ mod tests {
         )
         .await;
         let nrppa = vec![0x20u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
-        let bytes = encode_ngap_pdu(
-            &build_uplink_non_ue_associated_nrppa_transport(
-                RoutingId::new(b"lmf-routing-807".to_vec()),
-                NrppaPdu::new(nrppa.clone()),
-            )
-            .unwrap(),
+        let bytes = crate::gnb_pdus::uplink_non_ue_associated_nrppa_transport(
+            b"lmf-routing-807",
+            &nrppa.clone(),
         );
         ngap.process_ngap_message(1, &bytes).await.unwrap();
         let (_, json_root, parts) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -32268,8 +32226,6 @@ mod tests {
         // it describes a dev-profile deployment (issue #63). Declared explicitly
         // rather than inherited from the environment.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
 
         let (_sink, port, mut rx) = start_lmf_callback_sink().await;
@@ -32301,12 +32257,10 @@ mod tests {
 
         let mut ngap = test_ngap_server().await;
         let nrppa = vec![0x00u8, 0x11, 0x22, 0x33, 0x44];
-        let pdu = build_uplink_non_ue_associated_nrppa_transport(
-            RoutingId::new(b"lmf-nf-instance-2".to_vec()),
-            NrppaPdu::new(nrppa.clone()),
-        )
-        .expect("build UplinkNonUEAssociatedNRPPaTransport");
-        let bytes = encode_ngap_pdu(&pdu);
+        let bytes = crate::gnb_pdus::uplink_non_ue_associated_nrppa_transport(
+            b"lmf-nf-instance-2",
+            &nrppa.clone(),
+        );
         assert_eq!(bytes[0], 0x00);
         assert_eq!(bytes[1], 47);
 
@@ -32586,10 +32540,10 @@ mod tests {
         ] {
             server.sm_context_refs.insert((ue, psi), r.to_string());
         }
-        use nextgcore_ngap::{builder as b, types as t};
+        use nextgcore_ngap::types as t;
 
-        let setup =
-            b::build_pdu_session_resource_setup_response(&t::PduSessionResourceSetupResponse {
+        let setup = crate::gnb_pdus::pdu_session_resource_setup_response(
+            &t::PduSessionResourceSetupResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
                 setup_list: vec![],
@@ -32597,15 +32551,15 @@ mod tests {
                     pdu_session_id: 1,
                     transfer: vec![0x11],
                 }],
-            })
-            .expect("setup response");
+            },
+        );
         server
             .handle_pdu_session_resource_setup_response(9525, &setup)
             .await
             .expect("handled");
 
-        let modify =
-            b::build_pdu_session_resource_modify_response(&t::PduSessionResourceModifyResponse {
+        let modify = crate::gnb_pdus::pdu_session_resource_modify_response(
+            &t::PduSessionResourceModifyResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
                 modify_list: vec![t::PduSessionResourceModifyResponseItem {
@@ -32616,29 +32570,29 @@ mod tests {
                     pdu_session_id: 3,
                     transfer: vec![0x31],
                 }],
-            })
-            .expect("modify response");
+            },
+        );
         server
             .handle_pdu_session_resource_modify_response(9525, &modify)
             .await
             .expect("handled");
 
-        let release =
-            b::build_pdu_session_resource_release_response(&t::PduSessionResourceReleaseResponse {
+        let release = crate::gnb_pdus::pdu_session_resource_release_response(
+            &t::PduSessionResourceReleaseResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
                 released_list: vec![t::PduSessionResourceReleasedItem {
                     pdu_session_id: 4,
                     transfer: vec![0x41],
                 }],
-            })
-            .expect("release response");
+            },
+        );
         server
             .handle_pdu_session_resource_release_response(9525, &release)
             .await
             .expect("handled");
 
-        let notify = b::build_pdu_session_resource_notify(&t::PduSessionResourceNotify {
+        let notify = crate::gnb_pdus::pdu_session_resource_notify(&t::PduSessionResourceNotify {
             amf_ue_ngap_id: ue,
             ran_ue_ngap_id: 1,
             notify_list: vec![t::PduSessionResourceNotifyItem {
@@ -32649,8 +32603,7 @@ mod tests {
                 pdu_session_id: 6,
                 transfer: vec![0x61],
             }],
-        })
-        .expect("notify");
+        });
         server
             .handle_pdu_session_resource_notify(9525, &notify)
             .await
@@ -33007,8 +32960,7 @@ mod tests {
             default_paging_drx: None,
             global_ran_node_id: None,
         };
-        let pdu = nextgcore_ngap::builder::build_ran_configuration_update(&update)
-            .expect("build RAN Configuration Update");
+        let pdu = crate::gnb_pdus::ran_configuration_update(&update);
 
         // The acknowledgement send fails (no live SCTP association in this test);
         // the assertion is on what was STORED, which happens before the send.
@@ -33044,8 +32996,7 @@ mod tests {
             default_paging_drx: None,
             global_ran_node_id: None,
         };
-        let pdu = nextgcore_ngap::builder::build_ran_configuration_update(&update)
-            .expect("build RAN Configuration Update");
+        let pdu = crate::gnb_pdus::ran_configuration_update(&update);
         let _ = server.handle_ran_configuration_update(assoc, &pdu).await;
 
         let sessions = server.sessions.read().await;
@@ -33061,19 +33012,16 @@ mod tests {
     // ---- criterion 2: UPLINK RAN STATUS TRANSFER is relayed to the target ----
 
     fn uplink_status_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
-        nextgcore_ngap::builder::build_uplink_ran_status_transfer(
-            &nextgcore_ngap::types::RanStatusTransfer {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id,
-                // A valid RANStatusTransfer-TransparentContainer (one DRB, 12-bit
-                // COUNTs): since #417 the AMF decodes it (§9.3.1.31 is a
-                // SEQUENCE) instead of relaying opaque octets.
-                container: vec![
-                    0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
-                ],
-            },
-        )
-        .expect("build UplinkRANStatusTransfer")
+        crate::gnb_pdus::uplink_ran_status_transfer(&nextgcore_ngap::types::RanStatusTransfer {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            // A valid RANStatusTransfer-TransparentContainer (one DRB, 12-bit
+            // COUNTs): since #417 the AMF decodes it (§9.3.1.31 is a
+            // SEQUENCE) instead of relaying opaque octets.
+            container: vec![
+                0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+            ],
+        })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33202,8 +33150,8 @@ mod tests {
         }
 
         let plmn = plmn_id_to_ngap_bytes(&PlmnId::new("001", "01"));
-        let required = nextgcore_ngap::builder::build_handover_required(
-            &nextgcore_ngap::types::HandoverRequired {
+        let required =
+            crate::gnb_pdus::handover_required(&nextgcore_ngap::types::HandoverRequired {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 9,
                 handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
@@ -33230,9 +33178,7 @@ mod tests {
                     .collect(),
                 source_to_target_container: vec![0xAB; 4],
                 direct_forwarding_path_availability: None,
-            },
-        )
-        .expect("build HandoverRequired");
+            });
         server
             .handle_handover_required(source, &required)
             .await
@@ -33327,7 +33273,7 @@ mod tests {
         target_gnb_id_len: u8,
         psis: &[u8],
     ) -> Vec<u8> {
-        nextgcore_ngap::builder::build_handover_required(&nextgcore_ngap::types::HandoverRequired {
+        crate::gnb_pdus::handover_required(&nextgcore_ngap::types::HandoverRequired {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
             handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
@@ -33355,7 +33301,6 @@ mod tests {
             source_to_target_container: vec![0xAB; 4],
             direct_forwarding_path_availability: None,
         })
-        .expect("build HandoverRequired")
     }
 
     /// **#876, TS 38.413 §9.3.1.8.** A HANDOVER REQUIRED naming an ng-eNB target
@@ -33391,8 +33336,8 @@ mod tests {
             gnb.plmn_id = (*node_plmn).clone();
         }
         let target_of = |global_ran_node_id: GlobalRanNodeId| {
-            let bytes = nextgcore_ngap::builder::build_handover_required(
-                &nextgcore_ngap::types::HandoverRequired {
+            let bytes =
+                crate::gnb_pdus::handover_required(&nextgcore_ngap::types::HandoverRequired {
                     amf_ue_ngap_id: 1,
                     ran_ue_ngap_id: 1,
                     handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
@@ -33412,9 +33357,7 @@ mod tests {
                     }],
                     source_to_target_container: vec![0xAB; 4],
                     direct_forwarding_path_availability: None,
-                },
-            )
-            .expect("build HandoverRequired");
+                });
             match crate::ngap_asn1::decode_handover_required_asn1(&bytes) {
                 crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message.target_id,
                 _ => panic!("HANDOVER REQUIRED decodes"),
@@ -33760,7 +33703,7 @@ mod tests {
         ran_ue_ngap_id: u32,
         admitted: &[(u8, Vec<u8>)],
     ) -> Vec<u8> {
-        nextgcore_ngap::builder::build_handover_request_acknowledge(
+        crate::gnb_pdus::handover_request_acknowledge(
             &nextgcore_ngap::types::HandoverRequestAcknowledge {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
@@ -33777,7 +33720,6 @@ mod tests {
                 target_to_source_container: vec![0xC0, 0xFE],
             },
         )
-        .expect("build HandoverRequestAcknowledge")
     }
 
     /// Seed a gNB session whose Global gNB ID is `gnb_id`, so a HandoverRequired
@@ -33836,16 +33778,13 @@ mod tests {
             .starts_with("HandoverRequired (amf_ue_ngap_id=7, ran_ue_ngap_id=3, type=Intra5gs)"));
         assert!(handover_required_log_line(&required, None).contains(" source_gnb_id=unknown "));
 
-        let bytes = nextgcore_ngap::builder::build_handover_failure(
-            &nextgcore_ngap::types::HandoverFailure {
-                amf_ue_ngap_id: 7,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::CellNotAvailable,
-                ),
-                criticality_diagnostics: None,
-            },
-        )
-        .expect("build HandoverFailure");
+        let bytes = crate::gnb_pdus::handover_failure(&nextgcore_ngap::types::HandoverFailure {
+            amf_ue_ngap_id: 7,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::CellNotAvailable,
+            ),
+            criticality_diagnostics: None,
+        });
         let failure = match crate::ngap_asn1::decode_handover_failure_asn1(&bytes) {
             crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message,
             _ => panic!("HandoverFailure decodes"),
@@ -33933,23 +33872,21 @@ mod tests {
 
             match abandon {
                 Abandon::Cancel => {
-                    let cancel = nextgcore_ngap::builder::build_handover_cancel(
-                        &nextgcore_ngap::types::HandoverCancel {
+                    let cancel =
+                        crate::gnb_pdus::handover_cancel(&nextgcore_ngap::types::HandoverCancel {
                             amf_ue_ngap_id: ue,
                             ran_ue_ngap_id: source_ran,
                             cause: nextgcore_ngap::types::Cause::RadioNetwork(
                                 nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
                             ),
-                        },
-                    )
-                    .expect("build HandoverCancel");
+                        });
                     server
                         .handle_handover_cancel(source, &cancel)
                         .await
                         .expect("handled");
                 }
                 Abandon::Failure => {
-                    let failure = nextgcore_ngap::builder::build_handover_failure(
+                    let failure = crate::gnb_pdus::handover_failure(
                         &nextgcore_ngap::types::HandoverFailure {
                             amf_ue_ngap_id: ue,
                             cause: nextgcore_ngap::types::Cause::RadioNetwork(
@@ -33957,8 +33894,7 @@ mod tests {
                             ),
                             criticality_diagnostics: None,
                         },
-                    )
-                    .expect("build HandoverFailure");
+                    );
                     server
                         .handle_handover_failure(target_a, &failure)
                         .await
@@ -34123,16 +34059,13 @@ mod tests {
                 .sm_context_smfs
                 .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
         }
-        let cancel = nextgcore_ngap::builder::build_handover_cancel(
-            &nextgcore_ngap::types::HandoverCancel {
-                amf_ue_ngap_id: ue,
-                ran_ue_ngap_id: source_ran,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::TngrelocprepExpiry,
-                ),
-            },
-        )
-        .expect("build HandoverCancel");
+        let cancel = crate::gnb_pdus::handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+            amf_ue_ngap_id: ue,
+            ran_ue_ngap_id: source_ran,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::TngrelocprepExpiry,
+            ),
+        });
 
         server
             .handle_handover_required(
@@ -34169,16 +34102,13 @@ mod tests {
             "no HandoverCommand for the cancelled handover"
         );
         // A late Failure from A must not abort B's preparation either.
-        let failure = nextgcore_ngap::builder::build_handover_failure(
-            &nextgcore_ngap::types::HandoverFailure {
-                amf_ue_ngap_id: ue,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
-                ),
-                criticality_diagnostics: None,
-            },
-        )
-        .expect("build HandoverFailure");
+        let failure = crate::gnb_pdus::handover_failure(&nextgcore_ngap::types::HandoverFailure {
+            amf_ue_ngap_id: ue,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+            ),
+            criticality_diagnostics: None,
+        });
         server
             .handle_handover_failure(target_a, &failure)
             .await
@@ -34370,7 +34300,7 @@ mod tests {
             .iter()
             .all(|s| s.2 == "HANDOVER_REQUIRED" && s.3 == vec![0x00]));
 
-        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+        let ack = crate::gnb_pdus::handover_request_acknowledge(
             &nextgcore_ngap::types::HandoverRequestAcknowledge {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: target_ran,
@@ -34384,8 +34314,7 @@ mod tests {
                 }]),
                 target_to_source_container: vec![0xC0, 0xFE],
             },
-        )
-        .expect("build HandoverRequestAcknowledge");
+        );
         server
             .handle_handover_request_acknowledge(target, &ack)
             .await
@@ -34493,7 +34422,7 @@ mod tests {
             "the session refused at PREPARING is not offered to the target"
         );
 
-        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+        let ack = crate::gnb_pdus::handover_request_acknowledge(
             &nextgcore_ngap::types::HandoverRequestAcknowledge {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: target_ran,
@@ -34510,8 +34439,7 @@ mod tests {
                 failed_list: None,
                 target_to_source_container: vec![0xC0, 0xFE],
             },
-        )
-        .expect("build HandoverRequestAcknowledge");
+        );
         server
             .handle_handover_request_acknowledge(target, &ack)
             .await
@@ -34748,14 +34676,13 @@ mod tests {
         seed_gnb_session(&server, source).await;
         seed_gnb_session(&server, target).await;
         let cancel = |ue: u64, ran: u32| {
-            nextgcore_ngap::builder::build_handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+            crate::gnb_pdus::handover_cancel(&nextgcore_ngap::types::HandoverCancel {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: ran,
                 cause: nextgcore_ngap::types::Cause::RadioNetwork(
                     nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
                 ),
             })
-            .expect("build HandoverCancel")
         };
         let cancelled = Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::HANDOVER_CANCELLED);
 
@@ -35607,7 +35534,7 @@ mod tests {
         );
 
         // The gNB reports PSI 3 released.
-        let notify = nextgcore_ngap::builder::build_pdu_session_resource_notify(
+        let notify = crate::gnb_pdus::pdu_session_resource_notify(
             &nextgcore_ngap::types::PduSessionResourceNotify {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 11,
@@ -35617,8 +35544,7 @@ mod tests {
                     transfer: vec![0x03],
                 }],
             },
-        )
-        .expect("build Notify");
+        );
         server
             .handle_pdu_session_resource_notify(assoc, &notify)
             .await
@@ -35689,7 +35615,7 @@ mod tests {
         drive_sbi(&mut server).await;
         assert!(server.handover_target_transfers.contains_key(&(ue, 1)));
 
-        let reset = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+        let reset = crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
                 nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
             ),
@@ -35699,8 +35625,7 @@ mod tests {
                     ran_ue_ngap_id: Some(source_ran),
                 },
             ]),
-        })
-        .expect("build NG Reset");
+        });
         server
             .handle_ng_reset(source, &reset)
             .await
@@ -35738,34 +35663,31 @@ mod tests {
         let source = 97_441u64;
         seed_gnb_session(&server, source).await;
         let plmn = plmn_id_to_ngap_bytes(&PlmnId::new("001", "01"));
-        let base = nextgcore_ngap::builder::build_handover_required(
-            &nextgcore_ngap::types::HandoverRequired {
-                amf_ue_ngap_id: 7_744_001,
-                ran_ue_ngap_id: 44,
-                handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
-                ),
-                target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
-                    global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
-                        plmn_identity: plmn,
-                        gnb_id: 0x7_4402,
-                        gnb_id_len: 22,
-                    },
-                    selected_tai: nextgcore_ngap::types::TaiListItem {
-                        tai_plmn: plmn,
-                        tai_tac: [0x00, 0x00, 0x01],
-                    },
+        let base = crate::gnb_pdus::handover_required(&nextgcore_ngap::types::HandoverRequired {
+            amf_ue_ngap_id: 7_744_001,
+            ran_ue_ngap_id: 44,
+            handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+            ),
+            target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: plmn,
+                    gnb_id: 0x7_4402,
+                    gnb_id_len: 22,
                 },
-                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceItemHoRqd {
-                    pdu_session_id: 1,
-                    transfer: vec![0x00],
-                }],
-                source_to_target_container: vec![0xAB; 4],
-                direct_forwarding_path_availability: None,
+                selected_tai: nextgcore_ngap::types::TaiListItem {
+                    tai_plmn: plmn,
+                    tai_tac: [0x00, 0x00, 0x01],
+                },
             },
-        )
-        .expect("build HandoverRequired");
+            pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                pdu_session_id: 1,
+                transfer: vec![0x00],
+            }],
+            source_to_target_container: vec![0xAB; 4],
+            direct_forwarding_path_availability: None,
+        });
         // Re-encode the base PDU with one IE value replaced.
         let mutate = |f: &dyn Fn(&mut g::HandoverRequiredProtocolIEs_EntryValue)| {
             let mut pdu = nextgcore_ngap_gen::decode(&base).expect("decodes");
@@ -36007,7 +35929,7 @@ mod tests {
             .sm_context_smfs
             .insert((amf_ue_ngap_id, 5), ("127.0.0.1".to_string(), smf_port));
 
-        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+        let ack = crate::gnb_pdus::handover_request_acknowledge(
             &nextgcore_ngap::types::HandoverRequestAcknowledge {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: target_ran,
@@ -36018,8 +35940,7 @@ mod tests {
                 failed_list: None,
                 target_to_source_container: vec![0xC0, 0xFE],
             },
-        )
-        .expect("build HandoverRequestAcknowledge");
+        );
         // The HandoverRequest of this preparation went to `target`: only it may answer
         // (#742 review).
         server
@@ -36082,19 +36003,16 @@ mod tests {
         // #803: the target the Acknowledge recorded, with the RAN UE NGAP ID the Notify
         // carries.
         server.handover_target_assoc.insert(ue_notify, (target, 9));
-        let notify = nextgcore_ngap::builder::build_handover_notify(
-            &nextgcore_ngap::types::HandoverNotify {
-                amf_ue_ngap_id: ue_notify,
-                ran_ue_ngap_id: 9,
-                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
-                    nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
-                    nr_cell_identity: 1,
-                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
-                    tai_tac: [0x00, 0x00, 0x01],
-                },
+        let notify = crate::gnb_pdus::handover_notify(&nextgcore_ngap::types::HandoverNotify {
+            amf_ue_ngap_id: ue_notify,
+            ran_ue_ngap_id: 9,
+            user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                nr_cell_identity: 1,
+                tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                tai_tac: [0x00, 0x00, 0x01],
             },
-        )
-        .expect("build HandoverNotify");
+        });
         server
             .handle_handover_notify(target, &notify)
             .await
@@ -36107,16 +36025,13 @@ mod tests {
         // HandoverCancel: the source abandoned it.
         let ue_cancel = 78_022u64; // #2008: not 78_002, a sibling's UE id in the global store
         server.handover_target_assoc.insert(ue_cancel, (target, 1));
-        let cancel = nextgcore_ngap::builder::build_handover_cancel(
-            &nextgcore_ngap::types::HandoverCancel {
-                amf_ue_ngap_id: ue_cancel,
-                ran_ue_ngap_id: 10,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
-                ),
-            },
-        )
-        .expect("build HandoverCancel");
+        let cancel = crate::gnb_pdus::handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+            amf_ue_ngap_id: ue_cancel,
+            ran_ue_ngap_id: 10,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
+            ),
+        });
         let _ = server.handle_handover_cancel(source, &cancel).await;
         assert!(!server.handover_target_assoc.contains_key(&ue_cancel));
 
@@ -36128,16 +36043,13 @@ mod tests {
         // The HandoverRequest of the current preparation went to `target` (#742 review:
         // only that association may answer it).
         server.handover_pending_target.insert(ue_failure, target);
-        let failure = nextgcore_ngap::builder::build_handover_failure(
-            &nextgcore_ngap::types::HandoverFailure {
-                amf_ue_ngap_id: ue_failure,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_ngap::types::CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell,
-                ),
-                criticality_diagnostics: None,
-            },
-        )
-        .expect("build HandoverFailure");
+        let failure = crate::gnb_pdus::handover_failure(&nextgcore_ngap::types::HandoverFailure {
+            amf_ue_ngap_id: ue_failure,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell,
+            ),
+            criticality_diagnostics: None,
+        });
         let _ = server.handle_handover_failure(target, &failure).await;
         assert!(!server.handover_target_assoc.contains_key(&ue_failure));
     }
@@ -36222,7 +36134,7 @@ mod tests {
             .sm_context_refs
             .insert((amf_ue_ngap_id, 9), "smf-ref-gamma".to_string());
 
-        let pdu = nextgcore_ngap::builder::build_pdu_session_resource_setup_response(
+        let pdu = crate::gnb_pdus::pdu_session_resource_setup_response(
             &nextgcore_ngap::types::PduSessionResourceSetupResponse {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 12,
@@ -36241,8 +36153,7 @@ mod tests {
                     transfer: vec![0xc1, 0xc2],
                 }],
             },
-        )
-        .expect("build PDUSessionResourceSetupResponse");
+        );
 
         server
             .handle_pdu_session_resource_setup_response(9301, &pdu)
@@ -36284,7 +36195,7 @@ mod tests {
         }
 
         // Modify Response (TS 38.413 Section 8.2.2) — used to be logged and dropped.
-        let modify = nextgcore_ngap::builder::build_pdu_session_resource_modify_response(
+        let modify = crate::gnb_pdus::pdu_session_resource_modify_response(
             &nextgcore_ngap::types::PduSessionResourceModifyResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36296,15 +36207,14 @@ mod tests {
                 ],
                 failed_list: vec![],
             },
-        )
-        .expect("build modify response");
+        );
         server
             .handle_pdu_session_resource_modify_response(9401, &modify)
             .await
             .expect("handled");
 
         // Release Response (Section 8.2.3) — likewise.
-        let release = nextgcore_ngap::builder::build_pdu_session_resource_release_response(
+        let release = crate::gnb_pdus::pdu_session_resource_release_response(
             &nextgcore_ngap::types::PduSessionResourceReleaseResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36321,15 +36231,14 @@ mod tests {
                     },
                 ],
             },
-        )
-        .expect("build release response");
+        );
         server
             .handle_pdu_session_resource_release_response(9401, &release)
             .await
             .expect("handled");
 
         // Notify (Section 8.2.5).
-        let notify = nextgcore_ngap::builder::build_pdu_session_resource_notify(
+        let notify = crate::gnb_pdus::pdu_session_resource_notify(
             &nextgcore_ngap::types::PduSessionResourceNotify {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36339,15 +36248,14 @@ mod tests {
                 }],
                 released_list: vec![],
             },
-        )
-        .expect("build notify");
+        );
         server
             .handle_pdu_session_resource_notify(9401, &notify)
             .await
             .expect("handled");
 
         // Modify Indication (Section 8.2.4).
-        let indication = nextgcore_ngap::builder::build_pdu_session_resource_modify_indication(
+        let indication = crate::gnb_pdus::pdu_session_resource_modify_indication(
             &nextgcore_ngap::types::PduSessionResourceModifyIndication {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36358,8 +36266,7 @@ mod tests {
                     },
                 ],
             },
-        )
-        .expect("build modify indication");
+        );
         // Class 1 since #525: the handler now answers with a Modify Confirm, and
         // this test's association does not exist, so drive the answer directly.
         let _ = server.modify_indication_answer(9401, &indication).await;
@@ -36536,32 +36443,29 @@ mod tests {
             .collect();
 
         // First: this codec must agree with nextgsim's on the abstract values.
-        match nextgcore_ngap::parser::decode_ngap_pdu(&bytes) {
-            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceNotify(n)) => {
-                assert_eq!(n.amf_ue_ngap_id, 42, "AMF-UE-NGAP-ID");
-                assert_eq!(n.ran_ue_ngap_id, 7, "RAN-UE-NGAP-ID");
-                assert_eq!(n.notify_list.len(), 1, "one notified session");
-                assert_eq!(n.notify_list[0].pdu_session_id, 5);
-                assert_eq!(
-                    n.notify_list[0].transfer,
-                    vec![0x40, 0x01, 0x28],
-                    "the notify transfer must arrive byte for byte -- it is an \
-                     opaque OCTET STRING the SMF parses, so a shifted length here \
-                     lands garbage on N11"
-                );
-                assert_eq!(n.released_list.len(), 1, "one released session");
-                assert_eq!(n.released_list[0].pdu_session_id, 6);
-                assert_eq!(n.released_list[0].transfer, vec![0x08]);
-            }
-            Ok(other) => panic!(
-                "nextgsim's Notify decoded as the wrong message here, so the two \
-                 products disagree on the wire: {other:?}"
+        // First (#417): nextgsim's encoder and this tree's hand derivation
+        // (`gnb_pdus`) agree octet for octet -- two independent productions of the
+        // same abstract values. The notify transfer must arrive byte for byte: it
+        // is an opaque OCTET STRING the SMF parses, so a shifted length here lands
+        // garbage on N11.
+        assert_eq!(
+            bytes,
+            crate::gnb_pdus::pdu_session_resource_notify(
+                &nextgcore_ngap::types::PduSessionResourceNotify {
+                    amf_ue_ngap_id: 42,
+                    ran_ue_ngap_id: 7,
+                    notify_list: vec![nextgcore_ngap::types::PduSessionResourceNotifyItem {
+                        pdu_session_id: 5,
+                        transfer: vec![0x40, 0x01, 0x28],
+                    }],
+                    released_list: vec![nextgcore_ngap::types::PduSessionResourceReleasedItem {
+                        pdu_session_id: 6,
+                        transfer: vec![0x08],
+                    }],
+                },
             ),
-            Err(e) => panic!(
-                "nextgsim's Notify does not decode with this parser, so the gNB is \
-                 emitting a PDU this AMF cannot read: {e:?}"
-            ),
-        }
+            "nextgsim's Notify and the hand-derived one disagree on the wire"
+        );
 
         // Then: the handler must drive the SMF-facing relay for BOTH lists, each
         // against its own SM context ref.
@@ -36604,7 +36508,7 @@ mod tests {
         let mut server = test_ngap_server().await;
         let ue = 79_003u64;
         // Deliberately store NO ref for PSI 1.
-        let pdu = nextgcore_ngap::builder::build_pdu_session_resource_setup_response(
+        let pdu = crate::gnb_pdus::pdu_session_resource_setup_response(
             &nextgcore_ngap::types::PduSessionResourceSetupResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36614,8 +36518,7 @@ mod tests {
                 }],
                 failed_list: vec![],
             },
-        )
-        .expect("build setup response");
+        );
         server
             .handle_pdu_session_resource_setup_response(9501, &pdu)
             .await
@@ -37031,7 +36934,7 @@ mod tests {
                 plmn_identity: [0x99, 0xf9, 0x07],
                 ng_enb_id: id,
             };
-            nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build")
+            crate::gnb_pdus::ng_setup_request(&ies)
         };
         let nodes = [
             (87_611u64, NgEnbId::Macro(0x1234)),
@@ -37118,13 +37021,12 @@ mod tests {
             "the slow step must start"
         );
         server.cancel_sessions_at_smfs(ue, &[1], "HO_CANCEL");
-        let reset = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+        let reset = crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Misc(
                 nextgcore_ngap::types::CauseMisc::Unspecified,
             ),
             reset_type: nextgcore_ngap::types::ResetType::NgInterface,
-        })
-        .expect("build NG Reset");
+        });
         server
             .handle_ng_reset(assoc, &reset)
             .await
@@ -37219,7 +37121,7 @@ mod tests {
     // ---- #70: HandoverNotify completes the relocation ----
 
     fn handover_notify_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
-        nextgcore_ngap::builder::build_handover_notify(&nextgcore_ngap::types::HandoverNotify {
+        crate::gnb_pdus::handover_notify(&nextgcore_ngap::types::HandoverNotify {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
             user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
@@ -37229,7 +37131,6 @@ mod tests {
                 tai_tac: [0x00, 0x00, 0x01],
             },
         })
-        .expect("build HandoverNotify")
     }
 
     /// TS 38.413 §8.4.3: after HandoverNotify the AMF releases the SOURCE NG-RAN UE
@@ -38054,13 +37955,12 @@ mod tests {
 
         // Positive control: the release of the SERVING leg (the target's) is the one
         // that ends the N1 connection.
-        let target_complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+        let target_complete = crate::gnb_pdus::ue_context_release_complete(
             &nextgcore_ngap::types::UeContextReleaseComplete {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: target_ran,
             },
-        )
-        .expect("encode");
+        );
         server
             .handle_ue_context_release_complete(target, &target_complete)
             .await
@@ -38178,13 +38078,12 @@ mod tests {
         state.registered = true;
         server.ue_auth_state.insert(amf_ue_ngap_id, state);
         let complete = |ran_ue_ngap_id| {
-            nextgcore_ngap::builder::build_ue_context_release_complete(
+            crate::gnb_pdus::ue_context_release_complete(
                 &nextgcore_ngap::types::UeContextReleaseComplete {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,
                 },
             )
-            .expect("encode")
         };
         server
             .handle_ue_context_release_complete(assoc, &complete(40))
@@ -38245,33 +38144,30 @@ mod tests {
     }
 
     fn path_switch_request_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32, psis: &[u8]) -> Vec<u8> {
-        nextgcore_ngap::builder::build_path_switch_request(
-            &nextgcore_ngap::types::PathSwitchRequest {
-                ran_ue_ngap_id,
-                source_amf_ue_ngap_id: amf_ue_ngap_id,
-                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
-                    nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
-                    nr_cell_identity: 7,
-                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
-                    tai_tac: [0, 0, 1],
-                },
-                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
-                    nr_encryption_algorithms: 0xF000,
-                    nr_integrity_algorithms: 0xF000,
-                    eutra_encryption_algorithms: 0,
-                    eutra_integrity_algorithms: 0,
-                },
-                pdu_session_list: psis
-                    .iter()
-                    .map(|&psi| nextgcore_ngap::types::PduSessionResourceSwitchItem {
-                        pdu_session_id: psi,
-                        transfer: vec![0x11, 0x22, 0x33, 0x44],
-                    })
-                    .collect(),
-                failed_list: None,
+        crate::gnb_pdus::path_switch_request(&nextgcore_ngap::types::PathSwitchRequest {
+            ran_ue_ngap_id,
+            source_amf_ue_ngap_id: amf_ue_ngap_id,
+            user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                nr_cell_identity: 7,
+                tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                tai_tac: [0, 0, 1],
             },
-        )
-        .expect("build PathSwitchRequest")
+            ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                nr_encryption_algorithms: 0xF000,
+                nr_integrity_algorithms: 0xF000,
+                eutra_encryption_algorithms: 0,
+                eutra_integrity_algorithms: 0,
+            },
+            pdu_session_list: psis
+                .iter()
+                .map(|&psi| nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                    pdu_session_id: psi,
+                    transfer: vec![0x11, 0x22, 0x33, 0x44],
+                })
+                .collect(),
+            failed_list: None,
+        })
     }
 
     /// **#745, TS 38.413 §8.4.4.4.** A PATH SWITCH REQUEST naming the same PDU Session
@@ -38370,8 +38266,8 @@ mod tests {
     /// This is the test #400's criterion 2 asks for: *"a test drives the production path
     /// and observes the notification at a real subscriber, not the emitter"*. It calls
     /// `handle_handover_notify` — the live NGAP dispatch target for procedure
-    /// `HandoverNotify` (`ngap_path.rs:1078`) — with a real APER-encoded PDU built by
-    /// `nextgcore_ngap::builder`, and reads the notification off an in-process
+    /// `HandoverNotify` (`ngap_path.rs:1078`) — with a real APER-encoded PDU derived by
+    /// hand in `crate::gnb_pdus` (#417), and reads the notification off an in-process
     /// `SbiServer` the AMF POSTs to over real HTTP/2.
     ///
     /// Reachable without a stand-in gNB, unlike the registration site: the emitter sits
@@ -38869,25 +38765,22 @@ mod tests {
         }
         let (sink, mut rx) = location_report_sink(supi, "466-ps").await;
 
-        let pdu = nextgcore_ngap::builder::build_path_switch_request(
-            &nextgcore_ngap::types::PathSwitchRequest {
-                ran_ue_ngap_id: 88,
-                source_amf_ue_ngap_id: amf_ue_ngap_id,
-                user_location_info: test_user_location(0x0E0F10, 0x0007_7777),
-                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
-                    nr_encryption_algorithms: 0x8000,
-                    nr_integrity_algorithms: 0x8000,
-                    eutra_encryption_algorithms: 0,
-                    eutra_integrity_algorithms: 0,
-                },
-                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
-                    pdu_session_id: 1,
-                    transfer: vec![0x00],
-                }],
-                failed_list: None,
+        let pdu = crate::gnb_pdus::path_switch_request(&nextgcore_ngap::types::PathSwitchRequest {
+            ran_ue_ngap_id: 88,
+            source_amf_ue_ngap_id: amf_ue_ngap_id,
+            user_location_info: test_user_location(0x0E0F10, 0x0007_7777),
+            ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                nr_encryption_algorithms: 0x8000,
+                nr_integrity_algorithms: 0x8000,
+                eutra_encryption_algorithms: 0,
+                eutra_integrity_algorithms: 0,
             },
-        )
-        .expect("encode a PathSwitchRequest");
+            pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                pdu_session_id: 1,
+                transfer: vec![0x00],
+            }],
+            failed_list: None,
+        });
         let (_smf, smf_port, _calls) = handler_tests::path_switch_smf().await;
         ngap.sm_context_refs
             .insert((amf_ue_ngap_id, 1), "ps466-1".to_string());
@@ -39034,25 +38927,22 @@ mod tests {
         );
 
         // The Xn handover: target TAC 0x14200A, outside the presence area.
-        let pdu = nextgcore_ngap::builder::build_path_switch_request(
-            &nextgcore_ngap::types::PathSwitchRequest {
-                ran_ue_ngap_id: 88,
-                source_amf_ue_ngap_id: amf_ue_ngap_id,
-                user_location_info: test_user_location(0x14200A, 0x0014_200A),
-                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
-                    nr_encryption_algorithms: 0x8000,
-                    nr_integrity_algorithms: 0x8000,
-                    eutra_encryption_algorithms: 0,
-                    eutra_integrity_algorithms: 0,
-                },
-                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
-                    pdu_session_id: 1,
-                    transfer: vec![0x00],
-                }],
-                failed_list: None,
+        let pdu = crate::gnb_pdus::path_switch_request(&nextgcore_ngap::types::PathSwitchRequest {
+            ran_ue_ngap_id: 88,
+            source_amf_ue_ngap_id: amf_ue_ngap_id,
+            user_location_info: test_user_location(0x14200A, 0x0014_200A),
+            ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                nr_encryption_algorithms: 0x8000,
+                nr_integrity_algorithms: 0x8000,
+                eutra_encryption_algorithms: 0,
+                eutra_integrity_algorithms: 0,
             },
-        )
-        .expect("encode a PathSwitchRequest");
+            pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                pdu_session_id: 1,
+                transfer: vec![0x00],
+            }],
+            failed_list: None,
+        });
         let (_smf, smf_port, _calls) = handler_tests::path_switch_smf().await;
         ngap.sm_context_refs
             .insert((amf_ue_ngap_id, 1), "ps1420-1".to_string());
@@ -41029,8 +40919,8 @@ mod tests {
         let (plain, mut plain_rx) = location_report_sink(supi, "1716-plain").await;
 
         // An Uplink NAS Transport of the registration, from the same cell.
-        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
-            &nextgcore_ngap::types::UplinkNasTransport {
+        let ul_pdu =
+            crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
                 amf_ue_ngap_id: id,
                 ran_ue_ngap_id: ran,
                 nas_pdu: vec![
@@ -41039,9 +40929,7 @@ mod tests {
                     message_type::CONFIGURATION_UPDATE_COMPLETE,
                 ],
                 user_location_info: test_user_location(tac, cell),
-            },
-        )
-        .expect("encode an Uplink NAS Transport");
+            });
         ngap.handle_uplink_nas_transport(1, &ul_pdu)
             .await
             .expect("handled");
@@ -41254,17 +41142,15 @@ mod tests {
 
         let fires_before = crate::namf_server::ues_in_area_fires_on_this_thread();
         ngap.forced_amf_ue_ngap_id = Some(new_id);
-        let initial_ue = nextgcore_ngap::builder::build_initial_ue_message(
-            &nextgcore_ngap::types::InitialUeMessage {
+        let initial_ue =
+            crate::gnb_pdus::initial_ue_message(&nextgcore_ngap::types::InitialUeMessage {
                 ran_ue_ngap_id: 512,
                 nas_pdu: nas,
                 user_location_info: test_user_location(0x15_4902, 0x0015_4902),
                 rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
                 ue_context_request: None,
                 allowed_nssai: Vec::new(),
-            },
-        )
-        .expect("encode an InitialUEMessage");
+            });
         let _ = ngap.handle_initial_ue_message(1, &initial_ue).await;
         assert!(
             ngap.ue_auth_state
@@ -42607,25 +42493,10 @@ mod tests {
         // address the SMF — the same code path a failed or empty answer takes.
         assert!(server.sm_context_refs.is_empty());
 
-        let request_transfer = nextgcore_ngap::transfer::PathSwitchRequestTransfer {
-            dl_ngu_up_tnl_information:
-                nextgcore_ngap::transfer::UpTransportLayerInformation::GtpTunnel(
-                    nextgcore_ngap::transfer::GtpTunnel {
-                        transport_layer_address:
-                            nextgcore_ngap::transfer::TransportLayerAddress::from_ipv4([
-                                10, 45, 0, 9,
-                            ]),
-                        gtp_teid: [0x00, 0x00, 0xBE, 0xEF],
-                    },
-                ),
-            qos_flow_accepted_list: vec![1],
-        };
         // The gNB's own transfer, which must NOT come back in the acknowledge.
         let inbound_bytes = {
-            // No encoder exists for the request transfer (it is decode-only in this tree),
-            // so an opaque non-empty byte string stands in: the assertion is that WHATEVER
-            // came in is not what goes out.
-            let _ = &request_transfer;
+            // An opaque non-empty byte string stands in for the request transfer: the
+            // assertion is that WHATEVER came in is not what goes out.
             vec![0x11, 0x22, 0x33, 0x44]
         };
 
@@ -42650,8 +42521,7 @@ mod tests {
             }],
             failed_list: None,
         };
-        let pdu = nextgcore_ngap::builder::build_path_switch_request(&psr)
-            .expect("build PathSwitchRequest");
+        let pdu = crate::gnb_pdus::path_switch_request(&psr);
 
         // The acknowledge SEND fails here — this harness has no live SCTP association — so
         // the error is tolerated. What is asserted is everything the handler did BEFORE the
@@ -42946,8 +42816,8 @@ mod tests {
         // Transport and fed through the LIVE dispatch — not by calling an inner handler.
         // That is the point: before #72 the type had no arm, so the message reached the
         // `other =>` catch-all, and only the full path can show that it no longer does.
-        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
-            &nextgcore_ngap::types::UplinkNasTransport {
+        let ul_pdu =
+            crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 72,
                 nas_pdu: vec![
@@ -42961,9 +42831,7 @@ mod tests {
                     tai_plmn: [0x00, 0xF1, 0x10],
                     tai_tac: [0x00, 0x00, 0x01],
                 },
-            },
-        )
-        .expect("encode an Uplink NAS Transport");
+            });
         ngap.handle_uplink_nas_transport(1, &ul_pdu)
             .await
             .expect("the COMPLETE must be handled");
@@ -43093,15 +42961,13 @@ mod tests {
         .await
         .expect("rejected #9");
         assert!(!ngap.ue_auth_state.contains(amf_ue_ngap_id));
-        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
-            &nextgcore_ngap::types::UplinkNasTransport {
+        let ul_pdu =
+            crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 512,
                 nas_pdu: sample_registration_request(),
                 user_location_info: test_user_location(0x000676, 0x0006_7600),
-            },
-        )
-        .expect("encode an Uplink NAS Transport");
+            });
         let _ = ngap.handle_uplink_nas_transport(1, &ul_pdu).await;
         // Before #675 the handler found no context, answered REGISTRATION REJECT #9
         // and left none behind; the procedure now runs on a context of its own.
@@ -43161,8 +43027,8 @@ mod tests {
         // WHERE THE UE NOW IS: a different tracking area and a different cell.
         let moved_tac = 0x0A0B0Cu32;
         let moved_cell = 0x0009_9999u64;
-        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
-            &nextgcore_ngap::types::UplinkNasTransport {
+        let ul_pdu =
+            crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 74,
                 nas_pdu: vec![
@@ -43171,9 +43037,7 @@ mod tests {
                     message_type::CONFIGURATION_UPDATE_COMPLETE,
                 ],
                 user_location_info: test_user_location(moved_tac, moved_cell),
-            },
-        )
-        .expect("encode an Uplink NAS Transport");
+            });
         ngap.handle_uplink_nas_transport(1, &ul_pdu)
             .await
             .expect("the message must be handled");
@@ -43243,8 +43107,8 @@ mod tests {
         // while it was in CM-IDLE, which is the scenario the mandatory IE exists for.
         let moved_tac = 0x0C0D0Eu32;
         let moved_cell = 0x0008_8888u64;
-        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
-            &nextgcore_ngap::types::UplinkNasTransport {
+        let ul_pdu =
+            crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 75,
                 // ngKSI + 5G-S-TMSI-shaped tail; the service-type nibble is read from
@@ -43257,9 +43121,7 @@ mod tests {
                     0x00,
                 ],
                 user_location_info: test_user_location(moved_tac, moved_cell),
-            },
-        )
-        .expect("encode an Uplink NAS Transport");
+            });
         // The Service Accept cannot egress (no live association), and that does not
         // matter here: the location write happens before dispatch, so it is committed
         // either way. `handle_uplink_nas_transport` swallows the send failure.
@@ -43319,25 +43181,22 @@ mod tests {
         // THE TARGET CELL, in a different tracking area.
         let target_tac = 0x0E0F10u32;
         let target_cell = 0x0007_7777u64;
-        let pdu = nextgcore_ngap::builder::build_path_switch_request(
-            &nextgcore_ngap::types::PathSwitchRequest {
-                ran_ue_ngap_id: 88,
-                source_amf_ue_ngap_id: amf_ue_ngap_id,
-                user_location_info: test_user_location(target_tac, target_cell),
-                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
-                    nr_encryption_algorithms: 0x8000,
-                    nr_integrity_algorithms: 0x8000,
-                    eutra_encryption_algorithms: 0,
-                    eutra_integrity_algorithms: 0,
-                },
-                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
-                    pdu_session_id: 1,
-                    transfer: vec![0x00],
-                }],
-                failed_list: None,
+        let pdu = crate::gnb_pdus::path_switch_request(&nextgcore_ngap::types::PathSwitchRequest {
+            ran_ue_ngap_id: 88,
+            source_amf_ue_ngap_id: amf_ue_ngap_id,
+            user_location_info: test_user_location(target_tac, target_cell),
+            ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                nr_encryption_algorithms: 0x8000,
+                nr_integrity_algorithms: 0x8000,
+                eutra_encryption_algorithms: 0,
+                eutra_integrity_algorithms: 0,
             },
-        )
-        .expect("encode a PathSwitchRequest");
+            pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                pdu_session_id: 1,
+                transfer: vec![0x00],
+            }],
+            failed_list: None,
+        });
         // Association 2 is the target's; the session is held at a stand-in SMF that
         // switches it, so the Acknowledge goes out and the relocation is committed.
         let (_smf, smf_port, _calls) = handler_tests::path_switch_smf().await;
@@ -43381,7 +43240,7 @@ mod tests {
     /// #406 criterion 7, the THIRD instance of the class: registration stores the cell
     /// identity it already parsed.
     ///
-    /// `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+    /// `decode_initial_ue_message_asn1` decodes `nr_cell_identity` off the
     /// InitialUEMessage's own `UserLocationInformation`; `handle_initial_ue_message`
     /// LOGGED it and dropped it, storing only the TAI. So `amf_ue.nr_cgi` had one
     /// production writer (`handle_handover_notify`) and an `ncgiList` Area of Interest
@@ -43499,23 +43358,20 @@ mod tests {
         let mut ngap = test_ngap_server().await;
 
         let ran_ue_ngap_id = 600_901u32;
-        let pdu = nextgcore_ngap::builder::build_initial_ue_message(
-            &nextgcore_ngap::types::InitialUeMessage {
-                ran_ue_ngap_id,
-                nas_pdu: vec![
-                    0x7E,
-                    security_header::PLAIN_NAS_MESSAGE,
-                    message_type::REGISTRATION_REQUEST,
-                    0x09,
-                    0x00,
-                ],
-                user_location_info: test_user_location(1, 0x10),
-                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
-                ue_context_request: Some(true),
-                allowed_nssai: Vec::new(),
-            },
-        )
-        .expect("encode an InitialUEMessage");
+        let pdu = crate::gnb_pdus::initial_ue_message(&nextgcore_ngap::types::InitialUeMessage {
+            ran_ue_ngap_id,
+            nas_pdu: vec![
+                0x7E,
+                security_header::PLAIN_NAS_MESSAGE,
+                message_type::REGISTRATION_REQUEST,
+                0x09,
+                0x00,
+            ],
+            user_location_info: test_user_location(1, 0x10),
+            rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
+            ue_context_request: Some(true),
+            allowed_nssai: Vec::new(),
+        });
         let _ = ngap.handle_initial_ue_message(ASSOC, &pdu).await;
 
         // This test's own connection, so the record found can only be the one the
@@ -43566,25 +43422,22 @@ mod tests {
         // The cell and tracking area the gNB reports at registration.
         let reg_tac = 0x00040Fu32;
         let reg_cell = 0x0006_6666u64;
-        let pdu = nextgcore_ngap::builder::build_initial_ue_message(
-            &nextgcore_ngap::types::InitialUeMessage {
-                ran_ue_ngap_id: 77,
-                // A minimal REGISTRATION REQUEST: enough for the EPD/type gate at the top
-                // of the handler, which is all this test needs to reach past.
-                nas_pdu: vec![
-                    0x7E,
-                    security_header::PLAIN_NAS_MESSAGE,
-                    message_type::REGISTRATION_REQUEST,
-                    0x09,
-                    0x00,
-                ],
-                user_location_info: test_user_location(reg_tac, reg_cell),
-                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
-                ue_context_request: Some(true),
-                allowed_nssai: Vec::new(),
-            },
-        )
-        .expect("encode an InitialUEMessage");
+        let pdu = crate::gnb_pdus::initial_ue_message(&nextgcore_ngap::types::InitialUeMessage {
+            ran_ue_ngap_id: 77,
+            // A minimal REGISTRATION REQUEST: enough for the EPD/type gate at the top
+            // of the handler, which is all this test needs to reach past.
+            nas_pdu: vec![
+                0x7E,
+                security_header::PLAIN_NAS_MESSAGE,
+                message_type::REGISTRATION_REQUEST,
+                0x09,
+                0x00,
+            ],
+            user_location_info: test_user_location(reg_tac, reg_cell),
+            rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
+            ue_context_request: Some(true),
+            allowed_nssai: Vec::new(),
+        });
         let _ = ngap.handle_initial_ue_message(1, &pdu).await;
 
         let state = ngap
@@ -44187,8 +44040,12 @@ mod tests {
     /// in this Accept and the assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_registration_without_nsac_sends_no_stale_rejected_nssai_2022() {
-        crate::context::amf_context_init(64, 1024, 4096);
         let _policy = crate::emergency::emergency_policy_test_guard().await;
+        // #2039: it replaces the process-wide served GUAMIs, which every GUTI test
+        // reads under CONTEXT_GUARD; without it, its restore emptied them mid-test.
+        // After the emergency-policy guard, the order lib.rs's config tests use.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
         let _guami = handler_tests::ServeOneGuami::install();
         let mut ngap = capturing_ngap_server().await;
         seed_gnb_session(&ngap, 1).await;
@@ -44670,7 +44527,7 @@ mod tests {
         assert_eq!(ngap.emergency.active_count(), 2);
 
         // PartOfNgInterface: the reset names the UE.
-        let partial = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+        let partial = crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
                 nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
             ),
@@ -44680,8 +44537,7 @@ mod tests {
                     ran_ue_ngap_id: Some(72),
                 },
             ]),
-        })
-        .expect("build NG Reset");
+        });
         // Result discarded: the NG Reset Acknowledge cannot be sent over this fixture's
         // transport, and the state drop under test happens before that send.
         let _ = ngap.handle_ng_reset(reset_assoc, &partial).await;
@@ -44696,13 +44552,12 @@ mod tests {
         );
 
         // NgInterface: the reset names no UE, so the whole association goes.
-        let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+        let whole = crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
                 nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
             ),
             reset_type: nextgcore_ngap::types::ResetType::NgInterface,
-        })
-        .expect("build NG Reset");
+        });
         let _ = ngap.handle_ng_reset(other_assoc, &whole).await;
 
         assert_eq!(
@@ -44726,13 +44581,12 @@ mod tests {
         let ue = 7_417_001u64;
         register_emergency_ue(&mut ngap, assoc, ue);
 
-        let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+        let whole = crate::gnb_pdus::ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Misc(
                 nextgcore_ngap::types::CauseMisc::Unspecified,
             ),
             reset_type: nextgcore_ngap::types::ResetType::NgInterface,
-        })
-        .expect("build NG Reset");
+        });
         let rejected = crate::ngap_asn1::tests::with_unknown_ie(&whole, 9999, 0x00);
         let _ = ngap.process_ngap_message(assoc, &rejected).await;
         assert!(
@@ -45211,7 +45065,9 @@ mod tests {
     /// Serve only [`local_guami`] until the returned guard drops, which puts back
     /// the GUAMIs served before, even on a panic (#1636, R5's #1624 review).
     #[must_use = "the served GUAMIs are put back when this is dropped"]
+    #[track_caller]
     fn serve_only_local_guami() -> ServedGuamiGuard {
+        crate::test_support::assert_context_guard_held("serve_only_local_guami");
         let ctx_arc = crate::context::amf_self();
         let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
         let saved = std::mem::take(&mut ctx.served_guami);
@@ -47597,7 +47453,7 @@ mod tests {
         // A real APER-encoded UEContextReleaseRequest. The Cause is recovered by the
         // production decoder from these bytes, so the assertion below cannot be
         // satisfied by a hardcoded report.
-        let pdu = nextgcore_ngap::builder::build_ue_context_release_request(
+        let pdu = crate::gnb_pdus::ue_context_release_request(
             &nextgcore_ngap::types::UeContextReleaseRequest {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
@@ -47605,8 +47461,7 @@ mod tests {
                     nextgcore_ngap::types::CauseRadioNetwork::RadioConnectionWithUeLost,
                 ),
             },
-        )
-        .expect("encode UEContextReleaseRequest");
+        );
 
         // The PRODUCTION handler procedure code 42 dispatches to.
         let _ = ngap.handle_ue_context_release(1, &pdu).await;
@@ -47731,10 +47586,8 @@ mod tests {
                 ),
             }))
             .expect("encode UEContextReleaseRequest");
-        assert!(
-            nextgcore_ngap::parser::decode_ngap_pdu(&pdu).is_err(),
-            "the hand-written parser refuses this request, which is the defect"
-        );
+        // (The hand-written parser refused this request, which was the defect;
+        // that parser is gone with #417.)
 
         let _ = ngap.handle_ue_context_release(1, &pdu).await;
 
@@ -47780,13 +47633,12 @@ mod tests {
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let assoc = 98_021u64;
-        let valid = nextgcore_ngap::builder::build_ue_context_release_complete(
+        let valid = crate::gnb_pdus::ue_context_release_complete(
             &nextgcore_ngap::types::UeContextReleaseComplete {
                 amf_ue_ngap_id: 7_802_999,
                 ran_ue_ngap_id: 9,
             },
-        )
-        .expect("encode");
+        );
         let reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&valid, 9_999, 0x00);
         for (n, pdu) in [vec![0x20, 0x29, 0x00], reject_ie].into_iter().enumerate() {
             let (connected, idle) = (7_802_001u64 + 10 * n as u64, 7_802_002u64 + 10 * n as u64);
@@ -48078,13 +47930,12 @@ mod tests {
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 99_231u64;
-        let valid = nextgcore_ngap::builder::build_ue_context_release_complete(
+        let valid = crate::gnb_pdus::ue_context_release_complete(
             &nextgcore_ngap::types::UeContextReleaseComplete {
                 amf_ue_ngap_id: 7_923_999,
                 ran_ue_ngap_id: 9,
             },
-        )
-        .expect("encode");
+        );
         let reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&valid, 9_999, 0x00);
         for (n, unusable) in [vec![0x20, 0x29, 0x00], reject_ie].into_iter().enumerate() {
             let (ue, ran) = (7_923_001u64 + n as u64, 31 + n as u32);
@@ -48324,7 +48175,7 @@ mod tests {
         ue_ctx.amf_ue.supi = Some(supi.to_string());
         ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
 
-        let pdu = nextgcore_ngap::builder::build_ue_context_release_request(
+        let pdu = crate::gnb_pdus::ue_context_release_request(
             &nextgcore_ngap::types::UeContextReleaseRequest {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
@@ -48332,8 +48183,7 @@ mod tests {
                     nextgcore_ngap::types::CauseRadioNetwork::UserInactivity,
                 ),
             },
-        )
-        .expect("encode UEContextReleaseRequest");
+        );
         let _ = ngap.handle_ue_context_release(1, &pdu).await;
 
         // A bounded wait, not an instantaneous check: delivery is spawned, so asserting
@@ -48507,7 +48357,7 @@ mod tests {
 
     /// A Release Request carrying an UNEXPECTED cause, as a conformant gNB encodes it.
     fn release_request_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
-        nextgcore_ngap::builder::build_ue_context_release_request(
+        crate::gnb_pdus::ue_context_release_request(
             &nextgcore_ngap::types::UeContextReleaseRequest {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
@@ -48516,7 +48366,6 @@ mod tests {
                 ),
             },
         )
-        .expect("encode UEContextReleaseRequest")
     }
 
     /// **#451.** A gNB's UE Context Release Request reaches the release path THROUGH
@@ -49935,7 +49784,7 @@ mod eps_to_5gs_tests {
         assert_eq!(stored_sessions[0].s_nssai.sd, Some(1));
 
         // Steps 10-14: the gNB admits the UE.
-        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+        let ack = crate::gnb_pdus::handover_request_acknowledge(
             &nextgcore_ngap::types::HandoverRequestAcknowledge {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 77,
@@ -49946,8 +49795,7 @@ mod eps_to_5gs_tests {
                 failed_list: None,
                 target_to_source_container: vec![0xC0, 0xFE],
             },
-        )
-        .unwrap();
+        );
         ngap.handle_handover_request_acknowledge(ASSOC, &ack)
             .await
             .unwrap();
@@ -50013,19 +49861,16 @@ mod eps_to_5gs_tests {
         );
 
         // Execution: the UE arrives.
-        let notify = nextgcore_ngap::builder::build_handover_notify(
-            &nextgcore_ngap::types::HandoverNotify {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id: 77,
-                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
-                    nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("999", "70")),
-                    nr_cell_identity: 0x1A2001,
-                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("999", "70")),
-                    tai_tac: [0, 0, 1],
-                },
+        let notify = crate::gnb_pdus::handover_notify(&nextgcore_ngap::types::HandoverNotify {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id: 77,
+            user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("999", "70")),
+                nr_cell_identity: 0x1A2001,
+                tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("999", "70")),
+                tai_tac: [0, 0, 1],
             },
-        )
-        .unwrap();
+        });
         // #1645: the UE arrived at this AMF from the EPS: one CONNECTED report and one
         // REACHABLE to a "UE Reachable for DL Traffic" subscriber, from this handler
         // (counted on this thread).
@@ -50522,7 +50367,7 @@ mod eps_to_5gs_tests {
         let (n26, mme, mut ngap, amf_ue_ngap_id, mut smf_rx, _smf, _nrf) =
             prepared_handover().await;
 
-        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+        let ack = crate::gnb_pdus::handover_request_acknowledge(
             &nextgcore_ngap::types::HandoverRequestAcknowledge {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 77,
@@ -50533,8 +50378,7 @@ mod eps_to_5gs_tests {
                 failed_list: None,
                 target_to_source_container: vec![0xC0, 0xFE],
             },
-        )
-        .unwrap();
+        );
         ngap.handle_handover_request_acknowledge(CANCEL_ASSOC, &ack)
             .await
             .unwrap();
@@ -51262,14 +51106,13 @@ mod fivegs_to_eps_tests {
 
     /// A HANDOVER CANCEL (TS 38.413 §9.2.3.11) from the source gNB for [`UE`].
     fn handover_cancel() -> Vec<u8> {
-        nextgcore_ngap::builder::build_handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+        crate::gnb_pdus::handover_cancel(&nextgcore_ngap::types::HandoverCancel {
             amf_ue_ngap_id: UE,
             ran_ue_ngap_id: RAN_UE,
             cause: nextgcore_ngap::types::Cause::RadioNetwork(
                 nextgcore_ngap::types::CauseRadioNetwork::TngrelocprepExpiry,
             ),
         })
-        .expect("build HandoverCancel")
     }
 
     /// A source-gNB NGAP server holding [`UE`], with its NGAP egress captured.
@@ -51475,18 +51318,19 @@ mod fivegs_to_eps_tests {
         ] {
             let (assoc, pdu) = answer_for(container, cause, seq).await;
             assert_eq!(assoc, SOURCE_ASSOC);
-            match nextgcore_ngap::parser::decode_ngap_pdu(&pdu).unwrap() {
-                nextgcore_ngap::NgapMessage::HandoverPreparationFailure(f) => {
-                    assert_eq!((f.amf_ue_ngap_id, f.ran_ue_ngap_id), (UE, RAN_UE));
-                    assert_eq!(
-                        f.cause,
-                        nextgcore_ngap::types::Cause::RadioNetwork(
-                            nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
-                        )
-                    );
-                }
-                other => panic!("cause {cause}, container {container:?}: {other:?}"),
-            }
+            // #417, by hand: unsuccessfulOutcome `40`, id-HandoverPreparation 12,
+            // reject; ids 10 and 85 (ignore); id 15 Cause (ignore), radioNetwork
+            // ho-failure-in-target-5GC-ngran-node-or-target-system, root index 7
+            // `000 0 000111` -> `01 c0`.
+            let mut expected = vec![0x40, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x03];
+            let mut ies = crate::aper_golden::Bits::default();
+            ies.ie(10, 1, &crate::aper_golden::amf_ue_ngap_id(UE))
+                .ie(85, 1, &crate::aper_golden::ran_ue_ngap_id(RAN_UE))
+                .ie(15, 1, &[0x01, 0xc0]);
+            let ies = ies.finish();
+            expected[3] = (ies.len() + 3) as u8;
+            expected.extend_from_slice(&ies);
+            assert_eq!(pdu, expected, "cause {cause}, container {container:?}");
         }
     }
 }

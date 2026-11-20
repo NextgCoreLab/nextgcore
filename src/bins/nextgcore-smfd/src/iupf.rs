@@ -91,6 +91,10 @@ pub struct IupfLeg {
     pub n9: (u32, [u8; 4]),
     /// The PSA's UL F-TEID, the I-UPF's FAR 1 Outer Header Creation.
     pub psa_ul: (u32, [u8; 4]),
+    /// The NG-RAN tunnel the I-UPF's FAR 2 forwards to, `None` while it buffers
+    /// (R43 M1 on #2243): what a failed split restores.
+    #[serde(default)]
+    pub dl_tunnel: Option<(u32, [u8; 4])>,
 }
 
 struct Config {
@@ -130,6 +134,54 @@ pub fn leg_of(psa_seid: u64) -> Option<IupfLeg> {
     legs.get(&psa_seid).copied()
 }
 
+/// A test seam (R43 M1 on #2243): the next split modification stops between its
+/// halves, signals `reached`, and waits for `proceed`, so a test can cancel it
+/// there.
+#[cfg(test)]
+pub(crate) struct BetweenLegs {
+    pub(crate) reached: Arc<tokio::sync::Notify>,
+    pub(crate) proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static BETWEEN_LEGS: std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+impl BetweenLegs {
+    pub(crate) fn arm() -> Self {
+        let h = Self {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            proceed: Arc::new(tokio::sync::Notify::new()),
+        };
+        *BETWEEN_LEGS.lock().unwrap() = Some((h.reached.clone(), h.proceed.clone()));
+        h
+    }
+}
+
+#[cfg(test)]
+impl Drop for BetweenLegs {
+    fn drop(&mut self) {
+        BETWEEN_LEGS.lock().unwrap().take();
+        self.proceed.notify_one();
+    }
+}
+
+/// Stop at an armed [`BetweenLegs`], if any.
+#[cfg(test)]
+pub(crate) async fn test_hold_between_legs() {
+    let hold = BETWEEN_LEGS.lock().unwrap().take();
+    if let Some((reached, proceed)) = hold {
+        reached.notify_one();
+        proceed.notified().await;
+    }
+}
+
+/// No hold outside tests.
+#[cfg(not(test))]
+pub(crate) async fn test_hold_between_legs() {}
+
 fn store_leg(psa_seid: u64, leg: Option<IupfLeg>) {
     if let Ok(ctx) = crate::context::smf_self().read() {
         if let Ok(mut legs) = ctx.iupf_legs.write() {
@@ -147,12 +199,7 @@ fn store_leg(psa_seid: u64, leg: Option<IupfLeg>) {
 
 /// The I-UPF's Session Establishment Request body for the leg of `psa_seid`
 /// (see the module docs), flow `qfi`, toward the PSA's UL F-TEID `psa_ul`.
-pub fn establishment_body(
-    client: &PfcpClient,
-    psa_seid: u64,
-    qfi: u8,
-    psa_ul: (u32, [u8; 4]),
-) -> Vec<u8> {
+pub fn establishment_body(client: &PfcpClient, psa_seid: u64, psa_ul: (u32, [u8; 4])) -> Vec<u8> {
     let mut b = PfcpMessageBuilder::new();
     let mut node_id = bytes::BytesMut::new();
     client.node_id().encode(&mut node_id);
@@ -165,7 +212,8 @@ pub fn establishment_body(
         f_teid: Some((0, None, None)),
         outer_header_removal: Some(0),
         far_id: Some(far_id),
-        qfi: Some(qfi),
+        // No QFI (R43 minor 1 on #2243): the I-UPF relays the tunnel, whatever
+        // QoS flows it carries now or later.
         ..Default::default()
     };
     b.add_tlv(
@@ -251,8 +299,17 @@ fn tlvs(d: &[u8]) -> Vec<(u16, &[u8])> {
 /// Returns the leg, whose N3 F-TEID the NG-RAN is then given; `None` when no
 /// I-UPF applies, or when it could not be inserted, in which case the session is
 /// served by the PSA alone (logged).
-pub async fn insert(psa_seid: u64, dnn: &str, qfi: u8, psa_ul: (u32, [u8; 4])) -> Option<IupfLeg> {
+pub async fn insert(psa_seid: u64, dnn: &str, psa_ul: (u32, [u8; 4])) -> Option<IupfLeg> {
     let client = applies_to(dnn)?;
+    // R43 minor 4 on #2243: the leg SEID is the PSA's with bit 47 set, so a PSA
+    // SEID that already has it (an EPC epoch past 2^15) gets no I-UPF.
+    if is_leg_seid(psa_seid) {
+        log::error!(
+            "PSA SEID 0x{psa_seid:016x} has bit 47 set: no I-UPF leg SEID can be derived; \
+             served by the PSA alone"
+        );
+        return None;
+    }
     if !client.is_associated().await {
         log::warn!(
             "I-UPF {} has no PFCP association: the session on DNN {dnn} is served by its PSA \
@@ -261,7 +318,7 @@ pub async fn insert(psa_seid: u64, dnn: &str, qfi: u8, psa_ul: (u32, [u8; 4])) -
         );
         return None;
     }
-    let body = establishment_body(&client, psa_seid, qfi, psa_ul);
+    let body = establishment_body(&client, psa_seid, psa_ul);
     let resp = client
         .session_request(
             pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST,
@@ -304,6 +361,7 @@ pub async fn insert(psa_seid: u64, dnn: &str, qfi: u8, psa_ul: (u32, [u8; 4])) -
         n3: *n3,
         n9: *n9,
         psa_ul,
+        dl_tunnel: None,
     };
     store_leg(psa_seid, Some(leg));
     log::info!(
@@ -325,13 +383,63 @@ pub fn forget(psa_seid: u64) {
     store_leg(psa_seid, None);
 }
 
+/// Which way a split Session Modification moves the session's downlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Nothing for the I-UPF: the PSA's alone.
+    PsaOnly,
+    /// FAR 2 gets an NG-RAN tunnel (activation, handover, path switch): the
+    /// I-UPF first, so the PSA forwards only to an I-UPF that can deliver.
+    TowardActive((u32, [u8; 4])),
+    /// FAR 2's Apply Action alone changes (AN release, BUFF|NOCP): the PSA
+    /// first, so it buffers before the I-UPF stops, and nothing is lost between.
+    ApplyAction(u16),
+}
+
+/// A Session Modification of a PSA session with an I-UPF, split (see the module
+/// docs), with what undoes each half when the other fails (R43 M1 on #2243:
+/// "a rejected or failed request applies nothing").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Split {
+    pub psa: Vec<u8>,
+    pub iupf: Option<Vec<u8>>,
+    pub direction: Direction,
+    /// Puts the I-UPF's FAR 2 back as it was: its previous NG-RAN tunnel, or BUFF.
+    pub iupf_restore: Vec<u8>,
+    /// Puts the PSA's FAR 2 back as it was: FORW to the I-UPF over N9 while the
+    /// I-UPF had a tunnel, else BUFF.
+    pub psa_restore: Vec<u8>,
+}
+
+fn far2_to(tunnel: Option<(u32, [u8; 4])>) -> Vec<u8> {
+    let far = match tunnel {
+        Some((teid, ip)) => n4_build::build_update_far_activate(
+            crate::DL_FAR_ID,
+            0,
+            Some((0x0100, teid, Some(ip), None)),
+            false,
+        ),
+        None => {
+            n4_build::build_update_far_apply_action(crate::DL_FAR_ID, n4_build::apply_action::BUFF)
+        }
+    };
+    let mut b = PfcpMessageBuilder::new();
+    b.add_tlv(pfcp_ie::UPDATE_FAR, &far);
+    b.build()
+}
+
+/// PFCPSMReq-Flags (TS 29.244 §8.2.31) bits: SNDEM (End Markers on the old
+/// tunnel) is the I-UPF's, which holds the NG-RAN tunnel; DROBU and QAURR are the
+/// PSA's, which holds the buffer and the URRs (R43 minor 2 on #2243).
+const SNDEM: u8 = 0x02;
+
 /// Split a Session Modification Request `body` for the PSA session with I-UPF
-/// `leg` (see the module docs): the PSA's body, and the I-UPF's when it gets
-/// anything.
-pub fn split_modification(body: &[u8], leg: &IupfLeg) -> (Vec<u8>, Option<Vec<u8>>) {
+/// `leg` (see the module docs).
+pub fn split_modification(body: &[u8], leg: &IupfLeg) -> Split {
     let mut psa = Vec::new();
     let mut iupf = Vec::new();
-    let mut flags = None;
+    let mut flags: u8 = 0;
+    let mut direction = Direction::PsaOnly;
     let push = |out: &mut Vec<u8>, t: u16, v: &[u8]| {
         out.extend_from_slice(&t.to_be_bytes());
         out.extend_from_slice(&(v.len() as u16).to_be_bytes());
@@ -339,7 +447,7 @@ pub fn split_modification(body: &[u8], leg: &IupfLeg) -> (Vec<u8>, Option<Vec<u8
     };
     for (t, v) in tlvs(body) {
         if t == pfcp_ie::PFCPSMREQ_FLAGS {
-            flags = Some(v.to_vec());
+            flags |= v.first().copied().unwrap_or(0);
             continue;
         }
         if t != pfcp_ie::UPDATE_FAR {
@@ -355,15 +463,25 @@ pub fn split_modification(body: &[u8], leg: &IupfLeg) -> (Vec<u8>, Option<Vec<u8
             push(&mut psa, t, v);
             continue;
         }
-        let tunnel = inner.iter().any(|(t, v)| {
-            *t == pfcp_ie::UPDATE_FORWARDING_PARAMETERS
-                && tlvs(v)
-                    .iter()
-                    .any(|(t, _)| *t == pfcp_ie::OUTER_HEADER_CREATION)
-        });
+        let ohc = inner
+            .iter()
+            .find(|(t, _)| *t == pfcp_ie::UPDATE_FORWARDING_PARAMETERS)
+            .and_then(|(_, v)| {
+                tlvs(v)
+                    .into_iter()
+                    .find(|(t, _)| *t == pfcp_ie::OUTER_HEADER_CREATION)
+                    .map(|(_, o)| o.to_vec())
+            });
         push(&mut iupf, t, v);
-        if tunnel {
+        if let Some(o) = ohc {
             // The NG-RAN tunnel is the I-UPF's; the PSA forwards to the I-UPF.
+            let tunnel = (o.len() >= 10).then(|| {
+                (
+                    u32::from_be_bytes(o[2..6].try_into().unwrap()),
+                    [o[6], o[7], o[8], o[9]],
+                )
+            });
+            direction = Direction::TowardActive(tunnel.unwrap_or((0, [0; 4])));
             let far = n4_build::build_update_far_activate(
                 crate::DL_FAR_ID,
                 0,
@@ -372,22 +490,137 @@ pub fn split_modification(body: &[u8], leg: &IupfLeg) -> (Vec<u8>, Option<Vec<u8
             );
             push(&mut psa, pfcp_ie::UPDATE_FAR, &far);
         } else {
+            let action = inner
+                .iter()
+                .find(|(t, v)| *t == pfcp_ie::APPLY_ACTION && !v.is_empty())
+                .map(|(_, v)| {
+                    let hi = v.get(1).copied().unwrap_or(0);
+                    u16::from(v[0]) | (u16::from(hi) << 8)
+                })
+                .unwrap_or(0);
+            if !matches!(direction, Direction::TowardActive(_)) {
+                direction = Direction::ApplyAction(action);
+            }
             push(&mut psa, t, v);
         }
     }
-    if iupf.is_empty() {
-        if let Some(f) = flags {
-            push(&mut psa, pfcp_ie::PFCPSMREQ_FLAGS, &f);
+    let psa_flags = flags & !SNDEM;
+    let iupf_flags = flags & SNDEM;
+    let with_flags = |f: u8, rest: Vec<u8>| {
+        if f == 0 {
+            return rest;
         }
-        return (psa, None);
+        let mut out = Vec::new();
+        push(&mut out, pfcp_ie::PFCPSMREQ_FLAGS, &[f]);
+        out.extend_from_slice(&rest);
+        out
+    };
+    let iupf = if iupf.is_empty() {
+        None
+    } else {
+        Some(with_flags(iupf_flags, iupf))
+    };
+    // SNDEM with nothing for the I-UPF has no tunnel to send End Markers on.
+    let psa = with_flags(if iupf.is_none() { flags } else { psa_flags }, psa);
+    if iupf.is_none() {
+        direction = Direction::PsaOnly;
     }
-    if let Some(f) = flags {
-        let mut with = Vec::new();
-        push(&mut with, pfcp_ie::PFCPSMREQ_FLAGS, &f);
-        with.extend_from_slice(&iupf);
-        iupf = with;
+    Split {
+        psa,
+        iupf,
+        direction,
+        iupf_restore: far2_to(leg.dl_tunnel),
+        psa_restore: far2_to(leg.dl_tunnel.map(|_| leg.n9)),
     }
-    (psa, Some(iupf))
+}
+
+/// Record the I-UPF's NG-RAN tunnel after a split that both UPFs accepted.
+pub fn note_applied(psa_seid: u64, direction: Direction) {
+    let Some(mut leg) = leg_of(psa_seid) else {
+        return;
+    };
+    match direction {
+        Direction::TowardActive(t) => leg.dl_tunnel = Some(t),
+        Direction::ApplyAction(a) if a & n4_build::apply_action::FORW == 0 => leg.dl_tunnel = None,
+        _ => return,
+    }
+    store_leg(psa_seid, Some(leg));
+}
+
+/// The PSA session `psa_seid` went without an N4 Deletion reaching its I-UPF
+/// (association loss, a restart, an unrestorable session; R43 M2 on #2243): its
+/// leg is forgotten and the I-UPF's session deleted, best effort, so the I-UPF
+/// relays nothing toward a PSA tunnel that is gone.
+pub fn release_leg(psa_seid: u64) {
+    let Some(leg) = leg_of(psa_seid) else {
+        return;
+    };
+    forget(psa_seid);
+    let Some(client) = client() else {
+        return;
+    };
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        log::warn!(
+            "I-UPF leg of SEID 0x{psa_seid:016x} forgotten; no runtime to delete its session"
+        );
+        return;
+    };
+    rt.spawn(async move {
+        let body = n4_build::build_session_deletion_request();
+        match client
+            .session_request(
+                pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+                leg.smf_seid,
+                Some(leg.upf_seid),
+                &body,
+            )
+            .await
+        {
+            Ok(_) => log::info!(
+                "I-UPF session of SEID 0x{psa_seid:016x} deleted: its PSA session is gone"
+            ),
+            Err(e) => log::warn!(
+                "I-UPF session of SEID 0x{psa_seid:016x} not deleted ({e}); its PSA session \
+                 is gone"
+            ),
+        }
+    });
+}
+
+/// Every PSA session went at once (`clear_pfcp_sessions`): every leg is released.
+pub fn release_all_legs() {
+    let seids: Vec<u64> = {
+        let ctx = crate::context::smf_self();
+        let Ok(ctx) = ctx.read() else {
+            return;
+        };
+        let Ok(legs) = ctx.iupf_legs.read() else {
+            return;
+        };
+        legs.keys().copied().collect()
+    };
+    for s in seids {
+        release_leg(s);
+    }
+}
+
+/// Restored legs with no I-UPF configured (R43 minor 3 on #2243): said once at
+/// startup, since their sessions' modifications then fail until released.
+pub fn warn_orphaned_legs() {
+    if client().is_some() {
+        return;
+    }
+    let n = crate::context::smf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.iupf_legs.read().ok().map(|l| l.len()))
+        .unwrap_or(0);
+    if n > 0 {
+        log::warn!(
+            "{n} restored session(s) have an I-UPF leg but smf.intermediate_upf is not \
+             configured: their Session Modifications fail until they are released"
+        );
+    }
 }
 
 #[cfg(test)]

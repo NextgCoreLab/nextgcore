@@ -6329,6 +6329,11 @@ mod tests {
         let assoc =
             ue_policy::ue_policy_add("imsi-001010000091004", "http://127.0.0.1:9/old-notify", "");
         let id = assoc.pol_asso_id.clone();
+        // #2157: owned by the consumer `make_request` speaks as, as the create
+        // handler records it (#1937). Seeded ownerless, the PATCH was refused 403
+        // under the default production profile and passed only after a sibling had
+        // set the Dev override.
+        ue_policy::ue_policy_set_owner(&id, Some(TEST_CONSUMER_1865.to_string()));
         ue_policy::ue_policy_set_delivery(
             &id,
             0x90,
@@ -8244,9 +8249,9 @@ mod tests {
         );
         assert_eq!(
             body["resourceUri"],
-            serde_json::json!(format!(
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
                 "/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}"
-            )),
+            ))),
             "and names the association it re-authorises"
         );
         let chg = body["smPolicyDecision"]["chgDecs"]
@@ -10715,7 +10720,9 @@ mod tests {
         // triggers: []} with no resourceUri at all.
         assert_eq!(
             update["resourceUri"],
-            format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-am-policy-control/v1/policies/{pol_id}"
+            )),
             "PolicyUpdate.resourceUri: {update}"
         );
         assert_eq!(
@@ -12421,7 +12428,9 @@ mod tests {
         );
         assert_eq!(
             got[0].1["resourceUri"],
-            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{ims}"))
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{ims}"
+            )))
         );
 
         assert_eq!(
@@ -12519,7 +12528,9 @@ mod tests {
         );
         assert_eq!(
             got[0].1["resourceUri"],
-            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{v6_only}"))
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{v6_only}"
+            )))
         );
 
         assert_eq!(
@@ -15012,7 +15023,9 @@ mod tests {
         assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/13/update");
         assert_eq!(
             got[0].1["resourceUri"],
-            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"))
+            serde_json::json!(crate::sbi_path::expected_resource_uri_for_test(&format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{pol}"
+            )))
         );
         assert_eq!(
             sess_rule_1383(&got[0].1["smPolicyDecision"]),
@@ -15114,7 +15127,9 @@ mod tests {
         assert_eq!(
             got[0].1,
             serde_json::json!({
-                "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+                "resourceUri": crate::sbi_path::expected_resource_uri_for_test(&format!(
+                    "/npcf-smpolicycontrol/v1/sm-policies/{pol}"
+                )),
                 "smPolicyDecision": { "pcscfRestIndication": true },
             }),
             "the restoration request, and no re-sent policy"

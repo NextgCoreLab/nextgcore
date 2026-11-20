@@ -411,7 +411,16 @@ mod tests {
     /// instance-id, none cached, no env) → the response carries NO `sorInfo`
     /// and NO `steeringContainer` anywhere, yet the rest of am-data survives.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the AUSF env and NF cache
     async fn ausf_unreachable_withholds_sor_info() {
+        // #2210: these read the AUSF env vars and the NF-instance cache ("any
+        // cached AUSF") that other tests write under CONTEXT_GUARD, so they take
+        // it too, as upu.rs's twins already do (#1659 review m4). Unlocked, this
+        // one reached `test_http_ueau_ausf_pinning_..`'s stand-in `ausf-a`
+        // mid-test: the stray hit #2082 then filtered out instead of isolating.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"{"gpsis":["msisdn-9"]}"#;
         let out = inject_sor_info(
             "imsi-001010000000009",
@@ -437,7 +446,12 @@ mod tests {
     /// unprotected `sorInfo.steeringContainer` must NOT leak it when the AUSF
     /// cannot protect it — the pre-existing sorInfo is stripped.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the AUSF env and NF cache
     async fn udr_provisioned_unprotected_sor_is_stripped_when_ausf_down() {
+        // #2210: reads the NF-instance cache, so it takes CONTEXT_GUARD (see above).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"{"gpsis":["msisdn-3"],"sorInfo":{"steeringContainer":[{"plmnId":{"mcc":"262","mnc":"02"}}],"ackInd":true}}"#;
         let out = inject_sor_info("imsi-001010000000003", raw.to_string(), None, None).await;
         assert!(

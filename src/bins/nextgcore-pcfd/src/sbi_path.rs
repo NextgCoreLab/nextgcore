@@ -3147,6 +3147,44 @@ pub fn pcf_self_info_for(
     })
 }
 
+/// #2157: the `resourceUri` a test should expect the PCF to emit for `path`:
+/// the complete URI (`{apiRoot}{path}`, TS 29.501 §4.4.1) once an identity is
+/// published, else the bare path.
+///
+/// [`PCF_SELF_INFO`] is set-once, and
+/// `a_binding_that_lands_after_its_policy_went_is_deregistered_1877` publishes
+/// it (the BSF binding needs it), so it cannot be cleared again. Tests that
+/// pinned the bare path failed whenever they ran after that one: 2 under
+/// shuffle seed 7, 7 under 42. The expectation follows the global instead. It
+/// is checked against an independent spelling: with no identity it is exactly
+/// `path`; with one it is `http://` + host + `:` + port + `path`.
+///
+/// #2214: the scheme is pinned, not "http or https". It is the one this PCF
+/// advertises (`advertised_sbi_scheme`, #92), and in the unit-test binary
+/// that is `http`: only `run` turns TLS on (`set_sbi_tls_active`). The helper
+/// asserts that premise too, so a test that ever turns TLS on fails here,
+/// naming the reason, instead of being matched by the wrong scheme.
+#[cfg(test)]
+pub(crate) fn expected_resource_uri_for_test(path: &str) -> String {
+    let uri = pcf_resource_uri(path);
+    match pcf_self_info() {
+        None => assert_eq!(uri, path),
+        Some(info) => {
+            assert!(
+                !SBI_TLS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                "the unit tests advertise plaintext SBI; a test turned TLS on"
+            );
+            let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
+            assert_eq!(
+                uri,
+                format!("http://{host}:{}{path}", info.sbi_port),
+                "the apiRoot of {info:?} followed by {path}"
+            );
+        }
+    }
+    uri
+}
+
 /// The published PCF identity, if `main` (or a test) has set it.
 pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
     PCF_SELF_INFO.get()
@@ -3529,7 +3567,8 @@ mod tests {
             "the SMF must receive a terminate for an association the PCF cannot serve"
         );
         assert_eq!(
-            seen_bodies[0]["resourceUri"], "/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire",
+            seen_bodies[0]["resourceUri"],
+            expected_resource_uri_for_test("/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire"),
             "TS 29.512 TerminationNotification names the resource the SMF holds, body was {:?}",
             seen_bodies[0]
         );
@@ -3763,6 +3802,11 @@ mod tests {
     /// SmPolicyNotification body (bounded timeouts both directions).
     #[tokio::test]
     async fn notification_post_round_trip() {
+        // #2157: the stub SMF is a loopback PLAINTEXT peer and the notification
+        // client follows the SBI profile, so this is a dev deployment. Declared
+        // rather than inherited: alone, under the default production profile, the
+        // POST failed on the missing client certificate before reaching the stub.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;

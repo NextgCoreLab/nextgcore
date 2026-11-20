@@ -3821,7 +3821,13 @@ mod tests {
     const AMF_A_1872: &str = "18720000-0000-4000-8000-00000000000a";
     const AMF_B_1872: &str = "18720000-0000-4000-8000-00000000000b";
 
-    fn as_nf_1872(mut req: SbiRequest, token_sub: Option<&str>, cert: Option<&str>) -> SbiRequest {
+    /// The request as an **AMF** sends it (#2082, R32 on #2089: the name says
+    /// so, rather than quietly typing whatever certificate it is given): the
+    /// token `sub` and certificate id are listed as AMFs, and a certificate the
+    /// request does not already type names `AMF` (RFC 9310). A test that means
+    /// an untyped or another type's certificate sets `peer_cert_nf_instance_id`
+    /// and `peer_cert_nf_types` itself, as the #2065 and #2132 tests do.
+    fn as_amf_1872(mut req: SbiRequest, token_sub: Option<&str>, cert: Option<&str>) -> SbiRequest {
         // #1964: these callers are AMFs, as their NRF profiles would say.
         for id in token_sub.iter().chain(cert.iter()) {
             nextgcore_sbi::owner_binding::seed_nf_type_for_test(
@@ -3931,8 +3937,8 @@ mod tests {
             std::env::set_var("UDM_SBI_PORT", udm_addr.port().to_string());
 
             let supi = "imsi-001010000001872";
-            let amf_a = || as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), None);
-            let amf_b = || as_nf_1872(SbiRequest::default(), Some(AMF_B_1872), None);
+            let amf_a = || as_amf_1872(SbiRequest::default(), Some(AMF_A_1872), None);
+            let amf_b = || as_amf_1872(SbiRequest::default(), Some(AMF_B_1872), None);
 
             let (first, _) = authenticate_1872(supi, amf_a()).await;
             let (ctx_id, rand) = authenticate_1872(supi, amf_a()).await;
@@ -3954,7 +3960,7 @@ mod tests {
             for (req, what) in [
                 (amf_b(), "another AMF's token"),
                 (
-                    as_nf_1872(SbiRequest::default(), None, Some(AMF_B_1872)),
+                    as_amf_1872(SbiRequest::default(), None, Some(AMF_B_1872)),
                     "another AMF's cert",
                 ),
                 (SbiRequest::default(), "an unverified caller"),
@@ -3993,7 +3999,7 @@ mod tests {
 
             // The creator, through an SCP: the certificate is the SCP's, the
             // token sub is AMF A's.
-            let mut via_scp = as_nf_1872(
+            let mut via_scp = as_amf_1872(
                 SbiRequest::default(),
                 Some(AMF_A_1872),
                 Some("18720000-0000-4000-8000-0000000005c9"),
@@ -4005,7 +4011,7 @@ mod tests {
             let conf: serde_json::Value =
                 serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(conf["authResult"], "AUTHENTICATION_SUCCESS");
-            let upper = as_nf_1872(
+            let upper = as_amf_1872(
                 SbiRequest::default(),
                 Some(&AMF_A_1872.to_uppercase()),
                 None,
@@ -4073,7 +4079,7 @@ mod tests {
     /// and the first assertion fails.
     #[test]
     fn a_token_naming_another_nf_than_the_certificate_is_refused_1907() {
-        let mixed = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872));
+        let mixed = as_amf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872));
         let err = caller_identity(&mixed).expect_err("mismatched identities");
         assert!(err.contains("name different NF instances"), "{err}");
         let mut scp = mixed.clone();
@@ -4083,7 +4089,7 @@ mod tests {
             Some(AMF_A_1872),
             "through an SCP the token names the consumer"
         );
-        let same = as_nf_1872(
+        let same = as_amf_1872(
             SbiRequest::default(),
             Some(AMF_A_1872),
             Some(&AMF_A_1872.to_uppercase()),
@@ -4126,7 +4132,7 @@ mod tests {
                     "through a {relay} the token names the consumer"
                 );
             }
-            let amf = as_nf_1872(SbiRequest::default(), None, Some(AMF_A_1872));
+            let amf = as_amf_1872(SbiRequest::default(), None, Some(AMF_A_1872));
             assert_eq!(
                 caller_identity_with(&amf, production).unwrap().as_deref(),
                 Some(AMF_A_1872)
@@ -4161,7 +4167,7 @@ mod tests {
         ctx.init(8);
         let unbound = ctx.ue_add("suci-0-001-01-0000-0-0-2065000001").unwrap();
         assert!(unbound.owner.is_none());
-        let caller = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), None);
+        let caller = as_amf_1872(SbiRequest::default(), Some(AMF_A_1872), None);
         let refused = refuse_foreign_caller_with(&unbound, &caller, true).expect("frozen");
         assert_eq!(refused.status, 403);
         assert!(
@@ -4179,7 +4185,7 @@ mod tests {
         let _lock = TEST_MUTEX.lock().await;
         ausf_context_init(128);
         let suci = "suci-0-001-01-0000-0-0-1907000002";
-        let req = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872)).with_body(
+        let req = as_amf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872)).with_body(
             serde_json::json!({"supiOrSuci": suci, "servingNetworkName": TEST_SNN}).to_string(),
             "application/json",
         );
@@ -4224,12 +4230,12 @@ mod tests {
         seed();
         for (req, what) in [
             (
-                as_nf_1872(SbiRequest::default(), Some(AMF_B_1872), None),
+                as_amf_1872(SbiRequest::default(), Some(AMF_B_1872), None),
                 "another AMF",
             ),
             (SbiRequest::default(), "an unverified caller"),
             (
-                as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872)),
+                as_amf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872)),
                 "mixed identities",
             ),
         ] {
@@ -4239,7 +4245,7 @@ mod tests {
         }
 
         // The owning AMF may.
-        let r = handle_ue_authentication_deregister(&deregister(as_nf_1872(
+        let r = handle_ue_authentication_deregister(&deregister(as_amf_1872(
             SbiRequest::default(),
             Some(AMF_A_1872),
             None,
@@ -4250,7 +4256,7 @@ mod tests {
 
         // So may the UDM, by its certificate's NFTypes (TS 29.509 §5.2.2.3).
         seed();
-        let mut udm = as_nf_1872(
+        let mut udm = as_amf_1872(
             SbiRequest::default(),
             None,
             Some("19070000-0000-4000-8000-0000000000d1"),
@@ -4394,7 +4400,7 @@ mod tests {
             )
         };
         let via_scp = |sub: &str| {
-            let mut req = as_nf_1872(SbiRequest::default(), Some(sub), Some(scp_cert));
+            let mut req = as_amf_1872(SbiRequest::default(), Some(sub), Some(scp_cert));
             req.peer_cert_nf_types = vec!["SCP".into()];
             req
         };
@@ -4405,7 +4411,7 @@ mod tests {
         assert!(held(), "A's context is intact");
 
         // AMF B, directly (its certificate names AMF), with the scope: refused.
-        let mut direct = as_nf_1872(SbiRequest::default(), Some(AMF_B_1872), Some(AMF_B_1872));
+        let mut direct = as_amf_1872(SbiRequest::default(), Some(AMF_B_1872), Some(AMF_B_1872));
         direct.peer_cert_nf_types = vec!["AMF".into()];
         let r = handle_ue_authentication_deregister(&deregister(direct)).await;
         assert_eq!(r.status, 403, "AMF B directly: {:?}", r.http.content);
@@ -4611,7 +4617,8 @@ mod tests {
     /// certificate is exempt and the first assertion fails.
     #[test]
     fn only_a_pure_scp_certificate_is_exempt_1928() {
-        let mut mixed_types = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872));
+        let mut mixed_types =
+            as_amf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872));
         mixed_types.peer_cert_nf_types = vec!["AMF".into(), "SCP".into()];
         assert!(
             caller_identity(&mixed_types).is_err(),
@@ -5701,6 +5708,43 @@ mod tests_advertised_scheme_1791 {
 // first `#[cfg(test)]`.
 #[cfg(test)]
 mod self_instance_tests_2141 {
+    /// #2178: `src`'s function starting at `signature`, through its closing
+    /// brace at column 0, with `//` comments removed, so a commented-out call
+    /// does not count.
+    fn startup_code_2178(src: &str, signature: &str) -> String {
+        let body = &src[src.find(signature).expect("the startup function")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        body.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #2178 (R41 on #2174): the startup path itself brings the listener up
+    /// through `start_serving`, whose ordering the test above pins: the one
+    /// place the SBI server is started is the closure passed to it. Comments
+    /// are stripped, so commenting the call out fails this.
+    ///
+    /// REVERT-VERIFIED: with the startup function starting the server
+    /// directly (`sbi_server.start(..)` outside `start_serving`), this fails.
+    #[test]
+    fn the_startup_path_starts_the_listener_through_start_serving_2178() {
+        let code = startup_code_2178(include_str!("app.rs"), "pub async fn run(");
+        let call = code
+            .find("start_serving(")
+            .expect("startup calls start_serving");
+        let starts: Vec<usize> = code
+            .match_indices(".start(ausf_sbi_request_handler)")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts.len(), 1, "the listener is started in one place");
+        let between = &code[call..starts[0]];
+        assert!(
+            starts[0] > call && !between.contains(';'),
+            "and that place is start_serving's closure"
+        );
+    }
+
     /// #2160 (R41 on #2141): behavioural, on the startup step `run` uses. The
     /// listener is started only once the self instance is set: `start` (the
     /// listener) observes it, in an isolated context that starts empty. A
