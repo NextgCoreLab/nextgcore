@@ -2855,6 +2855,43 @@ mod tests {
         assert!(manager.get("nf-suspend-test").is_none());
     }
 
+    /// #2160: the UCMF still discovers the NEF (the profile-level list admits
+    /// it), although none of the NEF's services is for it. The service-level
+    /// list (#2160) narrows the token grant only.
+    ///
+    /// REVERT-VERIFIED: with UCMF dropped from the profile-level list, the NEF is
+    /// hidden from the UCMF and the `discovered` assertion fails.
+    #[test]
+    fn the_ucmf_still_discovers_the_nef_2160() {
+        let nef = serde_json::json!({
+            "nfInstanceId": "aaaaaaaa-2160-4000-8000-0000000000ef",
+            "nfType": "NEF",
+            "nfStatus": "REGISTERED",
+            "nfServices": [{
+                "serviceInstanceId": "nef-2160-nnef-eventexposure",
+                "serviceName": "nnef-eventexposure",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"]
+            }],
+            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP", "UCMF"]
+        });
+        let query = |requester: &str| DiscoveryQuery {
+            target_nf_type: "NEF".to_string(),
+            requester_nf_type: requester.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            profile_matches(&nef, "REGISTERED", &query("UCMF")),
+            "discovered"
+        );
+        assert!(
+            !profile_matches(&nef, "REGISTERED", &query("PCF")),
+            "a PCF does not"
+        );
+    }
+
     /// #1719: discovery's `target-nf-set-id` returns only the profiles in that
     /// NF Set, compared case-insensitively (TS 23.003 §28.12).
     ///

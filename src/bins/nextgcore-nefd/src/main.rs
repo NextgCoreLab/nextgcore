@@ -3165,6 +3165,10 @@ fn nef_notify_base(
         nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
     ))
 }
+/// #2160: the NF types that consume nnef-eventexposure (TS 23.502 §4.15.3.2:
+/// the AF; the AMF and UDM as monitoring-event producers' peers; the SCP that
+/// relays). The UCMF is on the profile only, for discovery.
+const NEF_EVENT_EXPOSURE_CONSUMERS: &[&str] = &["AF", "AMF", "UDM", "SCP"];
 
 fn build_nf_profile(
     nf_instance_id: &str,
@@ -3185,7 +3189,13 @@ fn build_nf_profile(
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
                     "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
-                    "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+                    "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                    // #2160: the service's consumers, without the UCMF: it only
+                    // discovers the NEF (the profile-level list below) and
+                    // consumes no NEF service, and the NRF grants a service
+                    // token only to a type both levels allow (TS 29.510
+                    // §6.1.6.2.3), so the UCMF gets no nnef-eventexposure token.
+                    "allowedNfTypes": NEF_EVENT_EXPOSURE_CONSUMERS
                 }
             ],
             // #2141 (R41): and the UCMF, which types a NEF caller by
@@ -3451,6 +3461,11 @@ mod tests {
         assert_eq!(
             profile["nfServices"][0]["serviceName"],
             "nnef-eventexposure"
+        );
+        // #2160: the service itself is not for the UCMF.
+        assert_eq!(
+            profile["nfServices"][0]["allowedNfTypes"],
+            serde_json::json!(["AF", "AMF", "UDM", "SCP"])
         );
         assert_eq!(
             profile["nfServices"][0]["serviceInstanceId"],
