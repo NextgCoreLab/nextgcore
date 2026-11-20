@@ -371,3 +371,46 @@ fn an_idle_restore_keeps_nocp_2208() {
     assert_eq!(action(&sp.iupf_restore), BUFF | NOCP);
     assert_eq!(action(&sp.psa_restore), BUFF | NOCP);
 }
+
+/// R43 on #2249: an AN release both UPFs accept is recorded (`note_applied`), and
+/// the next failed split then restores BUFF|NOCP, so the idle UE is still paged.
+#[tokio::test]
+async fn an_applied_an_release_is_recorded_and_restored_with_nocp_2208() {
+    use crate::n4_build::apply_action::{BUFF, NOCP};
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _seeded = crate::context::SeededState::track();
+    crate::smf_context_init(64, 256, 512);
+    let psa = crate::smf_n4_seid_for("22089");
+    store_leg(
+        psa,
+        Some(IupfLeg {
+            smf_seid: leg_seid(psa),
+            ..LEG
+        }),
+    );
+    note_applied(psa, Direction::ApplyAction(BUFF | NOCP));
+    let leg = leg_of(psa).expect("the leg");
+    forget(psa);
+    assert_eq!(leg.idle_action, Some(BUFF | NOCP), "recorded");
+    assert_eq!(leg.dl_tunnel, None, "no NG-RAN tunnel while idle");
+    let body = build_session_modification_request(&SessionModificationParams {
+        update_fars_activate: vec![(2, 0, Some((0x0100, 0x78, Some([10, 0, 0, 6]), None)), false)],
+        ..Default::default()
+    });
+    let sp = split_modification(&body, &leg);
+    let action = |b: &[u8]| {
+        let far = top(b)
+            .into_iter()
+            .find(|(t, _)| *t == pfcp_ie::UPDATE_FAR)
+            .unwrap()
+            .1;
+        let a = top(&far)
+            .into_iter()
+            .find(|(t, _)| *t == pfcp_ie::APPLY_ACTION)
+            .unwrap()
+            .1;
+        u16::from(a[0]) | (u16::from(a.get(1).copied().unwrap_or(0)) << 8)
+    };
+    assert_eq!(action(&sp.iupf_restore), BUFF | NOCP);
+    assert_eq!(action(&sp.psa_restore), BUFF | NOCP);
+}
