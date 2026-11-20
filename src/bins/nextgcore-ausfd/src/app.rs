@@ -5701,6 +5701,43 @@ mod tests_advertised_scheme_1791 {
 // first `#[cfg(test)]`.
 #[cfg(test)]
 mod self_instance_tests_2141 {
+    /// #2178: `src`'s function starting at `signature`, through its closing
+    /// brace at column 0, with `//` comments removed, so a commented-out call
+    /// does not count.
+    fn startup_code_2178(src: &str, signature: &str) -> String {
+        let body = &src[src.find(signature).expect("the startup function")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        body.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #2178 (R41 on #2174): the startup path itself brings the listener up
+    /// through `start_serving`, whose ordering the test above pins: the one
+    /// place the SBI server is started is the closure passed to it. Comments
+    /// are stripped, so commenting the call out fails this.
+    ///
+    /// REVERT-VERIFIED: with the startup function starting the server
+    /// directly (`sbi_server.start(..)` outside `start_serving`), this fails.
+    #[test]
+    fn the_startup_path_starts_the_listener_through_start_serving_2178() {
+        let code = startup_code_2178(include_str!("app.rs"), "pub async fn run(");
+        let call = code
+            .find("start_serving(")
+            .expect("startup calls start_serving");
+        let starts: Vec<usize> = code
+            .match_indices(".start(ausf_sbi_request_handler)")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts.len(), 1, "the listener is started in one place");
+        let between = &code[call..starts[0]];
+        assert!(
+            starts[0] > call && !between.contains(';'),
+            "and that place is start_serving's closure"
+        );
+    }
+
     /// #2160 (R41 on #2141): behavioural, on the startup step `run` uses. The
     /// listener is started only once the self instance is set: `start` (the
     /// listener) observes it, in an isolated context that starts empty. A
