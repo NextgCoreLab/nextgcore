@@ -229,7 +229,7 @@ fn an_error_message_round_trips_as_ended() {
 
 #[test]
 fn provide_assistance_data_ends_the_ues_transaction() {
-    let bytes = build_provide_assistance_data(4, Some(1)).expect("builds");
+    let bytes = build_provide_assistance_data(Some(4), None, Some(1)).expect("builds");
     let msg = nextgcore_slpp_gen::decode(&bytes).expect("decodes");
     assert_eq!(msg.transaction_id.map(|t| t.0), Some(4));
     assert!(
@@ -313,24 +313,185 @@ fn the_lmf_stamps_a_sequence_number() {
 #[test]
 fn sequence_numbers_are_distinct_per_ue_and_repeats_are_discarded() {
     let s = SlppSequences::default();
-    assert_eq!(s.next_sequence("ue-1"), Some(0));
-    assert_eq!(s.next_sequence("ue-1"), Some(1));
-    assert_eq!(s.next_sequence("ue-2"), Some(0), "per UE");
-    assert!(!s.is_duplicate("ue-1", Some(5)));
+    let c = Some("corr-1");
+    assert_eq!(s.next_sequence("ue-1", c), Some(0));
+    assert_eq!(s.next_sequence("ue-1", c), Some(1));
+    assert_eq!(s.next_sequence("ue-2", c), Some(0), "per UE");
+    assert!(!s.is_duplicate("ue-1", c, Some(5)));
     assert!(
-        s.is_duplicate("ue-1", Some(5)),
+        s.is_duplicate("ue-1", c, Some(5)),
         "the same number again is discarded"
     );
     assert!(
-        !s.is_duplicate("ue-2", Some(5)),
+        !s.is_duplicate("ue-2", c, Some(5)),
         "another UE's number is its own"
     );
-    assert!(!s.is_duplicate("ue-1", Some(6)));
+    assert!(!s.is_duplicate("ue-1", c, Some(6)));
     assert!(
-        !s.is_duplicate("ue-1", None),
+        !s.is_duplicate("ue-1", c, None),
         "no number, nothing to compare"
     );
-    assert!(!s.is_duplicate("ue-1", None));
+    assert!(!s.is_duplicate("ue-1", c, None));
+}
+
+/// TS 38.355 §4.3.2: sequence numbers belong to a location session. A new
+/// session starts its own, and the server deletes a session's numbers when it
+/// ends.
+#[test]
+fn sequence_numbers_are_per_location_session_and_end_with_it() {
+    let s = SlppSequences::default();
+    assert_eq!(s.next_sequence("ue-1", Some("a")), Some(0));
+    assert_eq!(s.next_sequence("ue-1", Some("a")), Some(1));
+    assert_eq!(s.next_sequence("ue-1", Some("b")), Some(0), "per session");
+    assert!(!s.is_duplicate("ue-1", Some("a"), Some(0)));
+    assert!(
+        !s.is_duplicate("ue-1", Some("b"), Some(0)),
+        "seq 0 of another session is not a duplicate"
+    );
+    assert!(s.is_duplicate("ue-1", Some("a"), Some(0)));
+    s.end_session("ue-1", Some("a"));
+    assert!(!s.tracks("ue-1", Some("a")), "deleted at the session's end");
+    assert!(s.tracks("ue-1", Some("b")), "the other session is kept");
+    assert_eq!(s.next_sequence("ue-1", Some("a")), Some(0));
+    assert!(!s.is_duplicate("ue-1", Some("a"), Some(0)));
+}
+
+/// The session guard of a SL-RTT run deletes its numbers on any exit.
+#[tokio::test]
+async fn a_finished_sl_rtt_session_deletes_its_sequence_numbers() {
+    let _g = SLPP_GLOBALS_TEST_LOCK.lock().await;
+    let ue = "imsi-001010000557901";
+    let a = SessionGuard::begin(ue);
+    let b = SessionGuard::begin(ue);
+    assert_ne!(a.correlation_id(), b.correlation_id(), "one id per session");
+    let corr = a.correlation_id().to_string();
+    assert_eq!(sequences().next_sequence(ue, Some(&corr)), Some(0));
+    assert!(!sequences().is_duplicate(ue, Some(&corr), Some(3)));
+    drop(a);
+    assert!(!sequences().tracks(ue, Some(&corr)));
+}
+
+/// A bare acknowledgement of sequence number 1 (TS 38.355 §4.3.3), hand-derived:
+/// opts `0000100` (acknowledgement only) | end `0` | Acknowledgement opts `1` |
+/// ackRequested `0` | ackIndicator `00000001`. That is 18 bits, plus 6 pad
+/// bits. No transactionID and no sequenceNumber without a body (§6.2).
+#[test]
+fn a_bare_acknowledgement_is_the_hand_derived_octets() {
+    assert_eq!(build_ack(1).expect("builds"), [0x08, 0x80, 0x40]);
+    let msg = nextgcore_slpp_gen::decode(&[0x08, 0x80, 0x40]).expect("decodes");
+    assert_eq!(msg.sequence_number, None);
+    assert_eq!(msg.transaction_id, None);
+    assert!(msg.slpp_message_body.is_none());
+}
+
+/// §5.2.5: the answer carries the received sessionID and transactionID, and no
+/// transactionID when the request had none.
+#[test]
+fn provide_assistance_data_echoes_the_session_and_the_transaction() {
+    let session = vec![1, 2, 3, 4, 5, 6];
+    let msg = nextgcore_slpp_gen::decode(
+        &build_provide_assistance_data(Some(4), Some(session.clone()), Some(1)).expect("builds"),
+    )
+    .expect("decodes");
+    assert_eq!(msg.session_id.map(|s| s.0), Some(session));
+    assert_eq!(msg.transaction_id.map(|t| t.0), Some(4));
+    let msg = nextgcore_slpp_gen::decode(
+        &build_provide_assistance_data(None, None, Some(1)).expect("builds"),
+    )
+    .expect("decodes");
+    assert_eq!(msg.transaction_id, None, "no invented transaction 0");
+    assert_eq!(msg.session_id, None);
+}
+
+/// A UE RequestAssistanceData with `seq`, a sessionID, and an acknowledgement
+/// request when `ack`.
+fn ue_assistance_request(tid: Option<u8>, seq: u8, ack: bool) -> Vec<u8> {
+    nextgcore_slpp_gen::encode(&g::SLPP_Message {
+        application_layer_id: Some(g::SLPP_MessageApplicationLayerID(UE_A.to_vec())),
+        transaction_id: tid.map(g::SLPP_MessageTransactionID),
+        end_transaction: g::SLPP_MessageEndTransaction(false),
+        sequence_number: Some(g::SequenceNumber(seq)),
+        session_id: Some(g::SessionID(vec![9; 6])),
+        acknowledgement: ack.then_some(g::Acknowledgement {
+            ack_requested: g::AcknowledgementAckRequested(true),
+            ack_indicator: None,
+        }),
+        slpp_message_body: Some(g::SLPP_MessageBody::C1(
+            g::SLPP_MessageBody_c1::RequestAssistanceData(g::RequestAssistanceData {
+                critical_extensions:
+                    g::RequestAssistanceDataCriticalExtensions::CriticalExtensionsFuture(
+                        g::RequestAssistanceDataCriticalExtensions_criticalExtensionsFuture {},
+                    ),
+            }),
+        )),
+        non_critical_extension: None,
+    })
+    .expect("encodes")
+}
+
+/// §4.3.3 and §4.3.4.2 step 4 at the handler: a message asking for an
+/// acknowledgement gets a bare one first, and a duplicate still gets one but
+/// nothing else.
+#[tokio::test]
+async fn the_handler_acknowledges_every_copy_that_asks() {
+    let _g = SLPP_GLOBALS_TEST_LOCK.lock().await;
+    let ue = "imsi-001010000557902";
+    let corr = Some("corr-ack");
+    let req = ue_assistance_request(Some(7), 4, true);
+    let first = crate::slpp_uplink_answers(ue, corr, &req);
+    assert_eq!(
+        first.len(),
+        2,
+        "acknowledgement, then ProvideAssistanceData"
+    );
+    let ack = nextgcore_slpp_gen::decode(&first[0]).expect("decodes");
+    assert_eq!(
+        ack.acknowledgement
+            .and_then(|a| a.ack_indicator)
+            .map(|s| s.0),
+        Some(4)
+    );
+    assert_eq!(ack.sequence_number, None, "§6.2: none without a body");
+    let pad = nextgcore_slpp_gen::decode(&first[1]).expect("decodes");
+    assert_eq!(pad.transaction_id.map(|t| t.0), Some(7));
+    assert_eq!(pad.session_id.map(|s| s.0), Some(vec![9; 6]), "§5.2.5");
+
+    let repeat = crate::slpp_uplink_answers(ue, corr, &req);
+    assert_eq!(
+        repeat.len(),
+        1,
+        "the duplicate gets only its acknowledgement"
+    );
+    assert_eq!(repeat[0], first[0]);
+
+    // Without the request, nothing acknowledges.
+    let plain = crate::slpp_uplink_answers(ue, corr, &ue_assistance_request(None, 5, false));
+    assert_eq!(plain.len(), 1);
+    let pad = nextgcore_slpp_gen::decode(&plain[0]).expect("decodes");
+    assert!(pad.acknowledgement.is_none());
+    assert_eq!(pad.transaction_id, None, "none received, none sent");
+    sequences().end_session(ue, corr);
+}
+
+/// §4.3.2 at the handler: the duplicate check is per location session, so the
+/// same sequence number under another LCS correlation id is processed.
+#[tokio::test]
+async fn the_handler_checks_duplicates_per_location_session() {
+    let _g = SLPP_GLOBALS_TEST_LOCK.lock().await;
+    let ue = "imsi-001010000557903";
+    let req = ue_assistance_request(Some(1), 0, false);
+    assert_eq!(crate::slpp_uplink_answers(ue, Some("s-1"), &req).len(), 1);
+    assert_eq!(
+        crate::slpp_uplink_answers(ue, Some("s-2"), &req).len(),
+        1,
+        "seq 0 of another session is answered"
+    );
+    assert!(
+        crate::slpp_uplink_answers(ue, Some("s-1"), &req).is_empty(),
+        "a repeat within s-1 is discarded"
+    );
+    sequences().end_session(ue, Some("s-1"));
+    sequences().end_session(ue, Some("s-2"));
 }
 
 /// The cross-repo pin: nextgsim's UE answers lmfd's REQUEST_CAPABILITIES with

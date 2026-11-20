@@ -1502,13 +1502,14 @@ fn sl_ranging_peer(input: &nlmf::InputData) -> Option<&str> {
         .map(|u| u.applicationlayer_id.as_str())
 }
 
-/// One SLPP transaction to `target`: send what `build` makes on a fresh
-/// transaction and wait until `deadline` for the UE's answer on it. Nothing is
-/// left waiting on any exit: the exchange guard removes the waiter when this
-/// future ends or is dropped.
+/// One SLPP transaction to `target` in location `session`: send what `build`
+/// makes on a fresh transaction and wait until `deadline` for the UE's answer
+/// on it. Nothing is left waiting on any exit: the exchange guard removes the
+/// waiter when this future ends or is dropped.
 async fn slpp_exchange(
     amf: &namf_client::DiscoveredAmf,
     target: &str,
+    session: &slpp::SessionGuard,
     lmf_id: &str,
     build: fn(u8, Option<u8>) -> Result<Vec<u8>, String>,
     deadline: tokio::time::Instant,
@@ -1518,16 +1519,16 @@ async fn slpp_exchange(
         log::warn!("SLPP: no exchange slot for {target} transaction {tid}");
         return None;
     };
-    let pdu = match build(tid, slpp::sequences().next_sequence(target)) {
+    let corr = session.correlation_id();
+    let pdu = match build(tid, slpp::sequences().next_sequence(target, Some(corr))) {
         Ok(pdu) => pdu,
         Err(e) => {
             log::warn!("SLPP: {e}");
             return None;
         }
     };
-    let corr = format!("slpp-{tid}-{target}");
     let outcome =
-        namf_client::send_n1_transfer(amf, target, &corr, lmf_id, namf_client::N1Class::Slpp, pdu)
+        namf_client::send_n1_transfer(amf, target, corr, lmf_id, namf_client::N1Class::Slpp, pdu)
             .await;
     if outcome != namf_client::TransferOutcome::Initiated {
         log::warn!("SLPP to {target} (transaction {tid}) not delivered: {outcome:?}");
@@ -1568,10 +1569,15 @@ async fn sl_rtt_range(input: &nlmf::InputData, peer: &str, budget: Duration) -> 
         .and_then(|c| c.nf_instance_id())
         .unwrap_or_else(|| "nextgcore-lmf".to_string());
     namf_client::ensure_n1n2_subscription(&amf, target).await;
+    // One location session for the whole run: both transactions travel under
+    // its LCS correlation identifier, and its sequence numbers are deleted when
+    // the run ends (TS 38.355 §4.3.2).
+    let session = slpp::SessionGuard::begin(target);
 
     match slpp_exchange(
         &amf,
         target,
+        &session,
         &lmf_id,
         slpp::build_request_capabilities,
         deadline,
@@ -1590,6 +1596,7 @@ async fn sl_rtt_range(input: &nlmf::InputData, peer: &str, budget: Duration) -> 
     let reporter = match slpp_exchange(
         &amf,
         target,
+        &session,
         &lmf_id,
         slpp::build_request_location_information,
         deadline,
@@ -1670,29 +1677,56 @@ async fn handle_slpp_uplink(
         );
     };
     let corr = lcs_correlation_id.map(str::to_string);
-    let decoded = slpp::decode_uplink_with_sequence(&bytes);
-    // TS 38.355 §4.3.2: a repeat of the last sequence number is discarded.
-    if let Ok((_, seq)) = &decoded {
-        if slpp::sequences().is_duplicate(&ue, *seq) {
-            log::info!("SLPP from {ue}: duplicate sequence number {seq:?} discarded");
-            return SbiResponse::no_content();
+    let answers = slpp_uplink_answers(&ue, lcs_correlation_id, &bytes);
+    if !answers.is_empty() {
+        spawn_slpp_downlink(ue, corr, answers);
+    }
+    SbiResponse::no_content()
+}
+
+/// Act on one uplink SLPP message from `ue` in location session `session`
+/// (the notification's LCS correlation identifier) and return the SLPP
+/// messages that answer it, in sending order.
+///
+/// - A requested acknowledgement comes first, and it is sent even for a
+///   duplicate or an undecodable body (TS 38.355 §4.3.3, §4.3.4.2 step 4).
+/// - A repeat of the session's last sequence number is then discarded (§4.3.2).
+/// - An undecodable message gets Error (§5.4.3), and RequestAssistanceData gets
+///   ProvideAssistanceData (§5.2.5). Anything else completes the exchange
+///   waiting on its transaction.
+fn slpp_uplink_answers(ue: &str, session: Option<&str>, bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut answers = Vec::new();
+    let header = slpp::uplink_header(bytes).unwrap_or_default();
+    if let Some(acked) = header.ack_for {
+        match slpp::build_ack(acked) {
+            Ok(pdu) => answers.push(pdu),
+            Err(e) => log::warn!("SLPP acknowledgement for {ue}: {e}"),
         }
     }
-    let seq = slpp::sequences().next_sequence(&ue);
-    match decoded.map(|(u, _)| u) {
+    if slpp::sequences().is_duplicate(ue, session, header.seq) {
+        log::info!(
+            "SLPP from {ue}: duplicate sequence number {:?} discarded",
+            header.seq
+        );
+        return answers;
+    }
+    match slpp::decode_uplink(bytes) {
         Err(e) => {
             log::warn!(
                 "SLPP from {ue}: {} -- answering Error {:?}",
                 e.detail,
                 e.cause
             );
-            if let Ok(pdu) = slpp::build_error(e.tid, seq, e.cause) {
-                spawn_slpp_downlink(ue, corr, pdu);
+            let seq = slpp::sequences().next_sequence(ue, session);
+            match slpp::build_error(e.tid, seq, e.cause) {
+                Ok(pdu) => answers.push(pdu),
+                Err(e) => log::warn!("SLPP Error for {ue}: {e}"),
             }
         }
         Ok(slpp::Uplink::AssistanceRequest { tid }) => {
-            match slpp::build_provide_assistance_data(tid.unwrap_or(0), seq) {
-                Ok(pdu) => spawn_slpp_downlink(ue, corr, pdu),
+            let seq = slpp::sequences().next_sequence(ue, session);
+            match slpp::build_provide_assistance_data(tid, header.session_id, seq) {
+                Ok(pdu) => answers.push(pdu),
                 Err(e) => log::warn!("SLPP ProvideAssistanceData for {ue}: {e}"),
             }
         }
@@ -1711,17 +1745,17 @@ async fn handle_slpp_uplink(
                     slpp::sl_rtt_store().note(app_id, halves);
                 }
             }
-            if !slpp::exchanges().complete(&ue, uplink.clone()) {
+            if !slpp::exchanges().complete(ue, uplink.clone()) {
                 log::info!("SLPP from {ue} answers no waiting transaction: {uplink:?}");
             }
         }
     }
-    SbiResponse::no_content()
+    answers
 }
 
-/// Send an SLPP answer to `ue` on its own task, so the notification is
-/// acknowledged without waiting for the AMF.
-fn spawn_slpp_downlink(ue: String, corr: Option<String>, pdu: Vec<u8>) {
+/// Send SLPP answers to `ue`, in order, on their own task, so the notification
+/// is acknowledged without waiting for the AMF.
+fn spawn_slpp_downlink(ue: String, corr: Option<String>, pdus: Vec<Vec<u8>>) {
     tokio::spawn(async move {
         let Some(amf) = namf_client::discover_amf(None).await else {
             log::warn!("SLPP answer to {ue}: no AMF discoverable");
@@ -1733,17 +1767,19 @@ fn spawn_slpp_downlink(ue: String, corr: Option<String>, pdu: Vec<u8>) {
             .and_then(|c| c.nf_instance_id())
             .unwrap_or_else(|| "nextgcore-lmf".to_string());
         let corr = corr.unwrap_or_else(|| format!("slpp-answer-{ue}"));
-        let outcome = namf_client::send_n1_transfer(
-            &amf,
-            &ue,
-            &corr,
-            &lmf_id,
-            namf_client::N1Class::Slpp,
-            pdu,
-        )
-        .await;
-        if outcome != namf_client::TransferOutcome::Initiated {
-            log::warn!("SLPP answer to {ue} not delivered: {outcome:?}");
+        for pdu in pdus {
+            let outcome = namf_client::send_n1_transfer(
+                &amf,
+                &ue,
+                &corr,
+                &lmf_id,
+                namf_client::N1Class::Slpp,
+                pdu,
+            )
+            .await;
+            if outcome != namf_client::TransferOutcome::Initiated {
+                log::warn!("SLPP answer to {ue} not delivered: {outcome:?}");
+            }
         }
     });
 }

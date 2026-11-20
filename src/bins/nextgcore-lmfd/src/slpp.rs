@@ -1,9 +1,32 @@
 //! SLPP sidelink positioning at the LMF (#557).
 //!
-//! The LMF is Endpoint A of TS 38.355 §5 and the target UE is Endpoint B. SLPP
-//! travels in UL and DL NAS TRANSPORT as payload container type 12, "SLPP
-//! message container" (TS 24.501 k00 §9.11.3.40). On the SBI it is carried with
-//! `n1MessageClass` "SLPP" (see [`N1_MESSAGE_CLASS_SLPP`]).
+//! The LMF is Endpoint B of TS 38.355 §5: it requests capabilities and
+//! location information (§5.1.2, §5.3.2) and serves assistance data (§5.2.5).
+//! The target UE is Endpoint A. SLPP travels in UL and DL NAS TRANSPORT as
+//! payload container type 12, "SLPP message container" (TS 24.501 k00
+//! §9.11.3.40). On the SBI it is carried with `n1MessageClass` "SLPP" (see
+//! [`N1_MESSAGE_CLASS_SLPP`]).
+//!
+//! # Transport (TS 38.355 §4.3)
+//!
+//! - Every message with a body that the LMF sends carries a sequence number,
+//!   counted per UE and location session (§4.3.2). A bare acknowledgement
+//!   carries none: sequenceNumber "shall be omitted" without a body (§6.2).
+//! - The last sequence number received is held per UE and location session.
+//!   A repeat is discarded. The LMF deletes both numbers when its location
+//!   session ends, as §4.3.2 asks of a server.
+//! - A location session is named by its LCS correlation identifier. The LMF
+//!   mints one per SL-RTT run and sends every DL message of that run under it.
+//!   The AMF reports it back on the UE's uplink.
+//! - A UE message that asks for an acknowledgement gets a bare one (§4.3.3),
+//!   duplicates and undecodable bodies included (§4.3.4.2 step 4).
+//! - **Deviation: the LMF never asks for an acknowledgement and never
+//!   retransmits (§4.3.4).** §4.3.1 puts reliable transport on the UE. Over NAS,
+//!   delivery to the UE is reliable already, and each LMF exchange is bounded
+//!   by the DetermineLocation response time instead.
+//! - The answer to a UE's RequestAssistanceData carries the received sessionID
+//!   and transactionID (§5.2.5). An Error carries a sessionID only "if PC5-U
+//!   is used as transport layer" (§5.4.3), so over NAS it carries none.
 //!
 //! # Method: SL-RTT (TS 38.305 §4.3.16.1, §8.15.2)
 //!
@@ -70,10 +93,15 @@ pub const MAX_PENDING_EXCHANGES: usize = 1024;
 // Downlink messages (LMF -> UE)
 // ---------------------------------------------------------------------------
 
-fn message(tid: u8, seq: Option<u8>, end: bool, body: g::SLPP_MessageBody_c1) -> g::SLPP_Message {
+fn message(
+    tid: Option<u8>,
+    seq: Option<u8>,
+    end: bool,
+    body: g::SLPP_MessageBody_c1,
+) -> g::SLPP_Message {
     g::SLPP_Message {
         application_layer_id: None,
-        transaction_id: Some(g::SLPP_MessageTransactionID(tid)),
+        transaction_id: tid.map(g::SLPP_MessageTransactionID),
         end_transaction: g::SLPP_MessageEndTransaction(end),
         sequence_number: seq.map(g::SequenceNumber),
         session_id: None,
@@ -102,7 +130,7 @@ pub fn build_request_capabilities(tid: u8, seq: Option<u8>) -> Result<Vec<u8>, S
         non_critical_extension: None,
     };
     encode(&message(
-        tid,
+        Some(tid),
         seq,
         false,
         g::SLPP_MessageBody_c1::RequestCapabilities(g::RequestCapabilities {
@@ -152,7 +180,7 @@ pub fn build_request_location_information(tid: u8, seq: Option<u8>) -> Result<Ve
         non_critical_extension: None,
     };
     encode(&message(
-        tid,
+        Some(tid),
         seq,
         false,
         g::SLPP_MessageBody_c1::RequestLocationInformation(g::RequestLocationInformation {
@@ -164,12 +192,18 @@ pub fn build_request_location_information(tid: u8, seq: Option<u8>) -> Result<Ve
 }
 
 /// ProvideAssistanceData answering a UE's RequestAssistanceData for SL-RTT
-/// (TS 38.355 §5.2.1), on the UE's transaction and ending it. `SL-RTT-
+/// (TS 38.355 §5.2.5), on the UE's transaction and ending it. It carries the
+/// received transactionID and sessionID, and none when none was received
+/// (an invented transaction 0 could match a real one at the UE). `SL-RTT-
 /// ProvideAssistanceData` is `SEQUENCE { ... }` in V19.2.0, with no root
 /// member, so the SL-RTT part carries no data. The SL-PRS configuration a UE
 /// would want sits in the common SL-PRS methods IEs, and this LMF holds none
 /// (it schedules no SL-PRS), so it sends none rather than inventing one.
-pub fn build_provide_assistance_data(tid: u8, seq: Option<u8>) -> Result<Vec<u8>, String> {
+pub fn build_provide_assistance_data(
+    tid: Option<u8>,
+    session_id: Option<Vec<u8>>,
+    seq: Option<u8>,
+) -> Result<Vec<u8>, String> {
     let ies = g::ProvideAssistanceData_IEs {
         common_i_es_provide_assistance_data: None,
         common_sl_prs_methods_i_es_provide_assistance_data: None,
@@ -184,7 +218,7 @@ pub fn build_provide_assistance_data(tid: u8, seq: Option<u8>) -> Result<Vec<u8>
         late_non_critical_extension: None,
         non_critical_extension: None,
     };
-    encode(&message(
+    let mut msg = message(
         tid,
         seq,
         true,
@@ -193,8 +227,9 @@ pub fn build_provide_assistance_data(tid: u8, seq: Option<u8>) -> Result<Vec<u8>
                 ies,
             ),
         }),
-    ))
-    .map_err(|e| format!("SLPP encode: {e:?}"))
+    );
+    msg.session_id = session_id.map(g::SessionID);
+    encode(&msg).map_err(|e| format!("SLPP encode: {e:?}"))
 }
 
 /// Error (TS 38.355 §5.4.2) with `errorCause` slppMessageHeaderError (1) or
@@ -220,6 +255,56 @@ pub fn build_error(tid: Option<u8>, seq: Option<u8>, cause: ErrorCause) -> Resul
         non_critical_extension: None,
     };
     encode(&msg).map_err(|e| format!("SLPP encode: {e:?}"))
+}
+
+/// A bare acknowledgement of the UE's message `acked` (TS 38.355 §4.3.3).
+/// With no body it carries no transactionID and no sequenceNumber (§6.2
+/// field descriptions), and endTransaction is FALSE.
+pub fn build_ack(acked: u8) -> Result<Vec<u8>, String> {
+    encode(&g::SLPP_Message {
+        application_layer_id: None,
+        transaction_id: None,
+        end_transaction: g::SLPP_MessageEndTransaction(false),
+        sequence_number: None,
+        session_id: None,
+        acknowledgement: Some(g::Acknowledgement {
+            ack_requested: g::AcknowledgementAckRequested(false),
+            ack_indicator: Some(g::SequenceNumber(acked)),
+        }),
+        slpp_message_body: None,
+        non_critical_extension: None,
+    })
+    .map_err(|e| format!("SLPP encode: {e:?}"))
+}
+
+/// The header fields of an uplink SLPP message that the transport (§4.3) and
+/// the answer (§5.2.5) act on, whatever its body holds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UplinkHeader {
+    /// sequenceNumber (§4.3.2).
+    pub seq: Option<u8>,
+    /// The sequence number to acknowledge, when the UE asked (§4.3.3).
+    pub ack_for: Option<u8>,
+    /// sessionID, echoed in the answer (§5.2.5).
+    pub session_id: Option<Vec<u8>>,
+}
+
+/// The header of an uplink SLPP message, when the message decodes. A body
+/// container that does not decode leaves the header readable (§4.3.4.2
+/// step 4: acknowledged "regardless of whether the message body can be
+/// correctly decoded").
+pub fn uplink_header(bytes: &[u8]) -> Option<UplinkHeader> {
+    let msg = decode(bytes).ok()?;
+    let seq = msg.sequence_number.as_ref().map(|s| s.0);
+    Some(UplinkHeader {
+        seq,
+        ack_for: msg
+            .acknowledgement
+            .as_ref()
+            .filter(|a| a.ack_requested.0)
+            .and(seq),
+        session_id: msg.session_id.map(|s| s.0),
+    })
 }
 
 /// `CommonIEsError.errorCause` (TS 38.355).
@@ -271,7 +356,7 @@ pub enum Uplink {
     AssistanceRequest { tid: Option<u8> },
     /// Error (§5.4) or Abort (§5.5) from the UE. Either one ends the transaction.
     Ended { tid: Option<u8>, what: &'static str },
-    /// A body this LMF does not act on as Endpoint A.
+    /// A body this LMF does not act on as Endpoint B.
     Other { tid: Option<u8> },
 }
 
@@ -613,53 +698,118 @@ pub fn exchanges() -> &'static SlppExchanges {
     EXCHANGES.get_or_init(SlppExchanges::default)
 }
 
-/// TS 38.355 §4.3.2 on both sides of the LMF's SLPP sessions with each UE.
+/// A location session with one UE (§4.3.2): the UE and the LCS correlation
+/// identifier its SLPP messages travel under.
+type SessionKey = (String, Option<String>);
+
+fn session_key(ue: &str, session: Option<&str>) -> SessionKey {
+    (ue.to_string(), session.map(str::to_string))
+}
+
+/// TS 38.355 §4.3.2 on both sides of the LMF's SLPP location sessions.
 ///
-/// - Sending: the LMF "shall include a sequence number in all SLPP messages",
-///   distinct per message, and [`next_sequence`] increases it per UE.
+/// - Sending: the LMF "shall include a sequence number in all SLPP messages
+///   sent for a particular location session", distinct per message, and
+///   [`next_sequence`] increases it per UE and session.
 /// - Receiving: a message whose sequence number equals the last one received
-///   from that UE "shall be discarded" ([`is_duplicate`]).
+///   "for the same pair of endpoints and the associated location session ...
+///   shall be discarded" ([`is_duplicate`]).
+/// - Both "shall be deleted in a server when the associated location session
+///   is terminated" ([`end_session`]).
 ///
-/// The LMF keys a location session by the UE, since it holds one SLPP session
-/// per UE at a time. Both maps are capped at [`MAX_PENDING_EXCHANGES`] UEs and
-/// are cleared once full, which is the server-side "deleted when the session is
-/// terminated" for UEs that left.
+/// A session is named by (UE, LCS correlation identifier). Both maps are also
+/// capped at [`MAX_PENDING_EXCHANGES`] sessions and cleared once full. That
+/// bounds sessions the LMF never ended itself, such as a UE's unsolicited
+/// messages.
 #[derive(Debug, Default)]
 pub struct SlppSequences {
-    sent: Mutex<HashMap<String, u8>>,
-    received: Mutex<HashMap<String, u8>>,
+    sent: Mutex<HashMap<SessionKey, u8>>,
+    received: Mutex<HashMap<SessionKey, u8>>,
 }
 
 impl SlppSequences {
-    /// The next sequence number to send to `ue`.
-    pub fn next_sequence(&self, ue: &str) -> Option<u8> {
+    /// The next sequence number to send to `ue` in location session `session`.
+    pub fn next_sequence(&self, ue: &str, session: Option<&str>) -> Option<u8> {
+        let key = session_key(ue, session);
         let mut m = self.sent.lock().ok()?;
-        if m.len() >= MAX_PENDING_EXCHANGES && !m.contains_key(ue) {
+        if m.len() >= MAX_PENDING_EXCHANGES && !m.contains_key(&key) {
             m.clear();
         }
-        let n = m.entry(ue.to_string()).or_insert(u8::MAX);
+        let n = m.entry(key).or_insert(u8::MAX);
         *n = n.wrapping_add(1);
         Some(*n)
     }
 
-    /// Whether a message from `ue` with sequence number `seq` repeats the last
-    /// one received from it, which marks it for discarding. A message without
-    /// a sequence number cannot be checked and is not a duplicate.
-    pub fn is_duplicate(&self, ue: &str, seq: Option<u8>) -> bool {
+    /// Whether a message from `ue` in `session` with sequence number `seq`
+    /// repeats the last one received there, which marks it for discarding. A
+    /// message without a sequence number cannot be checked and is not a
+    /// duplicate.
+    pub fn is_duplicate(&self, ue: &str, session: Option<&str>, seq: Option<u8>) -> bool {
         let Some(seq) = seq else {
             return false;
         };
         let Ok(mut m) = self.received.lock() else {
             return false;
         };
-        if m.get(ue) == Some(&seq) {
+        let key = session_key(ue, session);
+        if m.get(&key) == Some(&seq) {
             return true;
         }
-        if m.len() >= MAX_PENDING_EXCHANGES && !m.contains_key(ue) {
+        if m.len() >= MAX_PENDING_EXCHANGES && !m.contains_key(&key) {
             m.clear();
         }
-        m.insert(ue.to_string(), seq);
+        m.insert(key, seq);
         false
+    }
+
+    /// The LMF ended location session `session` with `ue`: both its sequence
+    /// numbers are deleted (§4.3.2).
+    pub fn end_session(&self, ue: &str, session: Option<&str>) {
+        let key = session_key(ue, session);
+        if let Ok(mut m) = self.sent.lock() {
+            m.remove(&key);
+        }
+        if let Ok(mut m) = self.received.lock() {
+            m.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    fn tracks(&self, ue: &str, session: Option<&str>) -> bool {
+        let key = session_key(ue, session);
+        self.sent.lock().is_ok_and(|m| m.contains_key(&key))
+            || self.received.lock().is_ok_and(|m| m.contains_key(&key))
+    }
+}
+
+/// Ends a location session's sequence numbers when dropped, so a SL-RTT run
+/// that fails, times out or is cancelled still deletes them (§4.3.2).
+pub struct SessionGuard {
+    ue: String,
+    session: String,
+}
+
+impl SessionGuard {
+    /// A new location session with `ue`, under a fresh LCS correlation
+    /// identifier.
+    pub fn begin(ue: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            ue: ue.to_string(),
+            session: format!("slpp-{n}-{ue}"),
+        }
+    }
+
+    /// The session's LCS correlation identifier.
+    pub fn correlation_id(&self) -> &str {
+        &self.session
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        sequences().end_session(&self.ue, Some(&self.session));
     }
 }
 
