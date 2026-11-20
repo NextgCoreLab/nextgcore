@@ -315,14 +315,46 @@ mod tests {
                 "{alias:?}: every NF's NEXTGCORE_SBI_PROFILE is production"
             );
         }
-        // The key left out is the chart's default, dev.
-        if let Some(r) = super::try_render_chart_with(&root, &[]) {
-            let rendered = r.expect("the default values render");
-            assert_eq!(
-                profiles_of(&rendered),
-                vec![Some("dev".to_string()); 9],
-                "an absent global.sbiProfile is dev"
-            );
+        // The key left out is the chart's default, dev. #2136: so is a null one
+        // (helm drops it before the chart sees it), as values.yaml documents.
+        for args in [vec![], vec!["--set", "global.sbiProfile=null"]] {
+            if let Some(r) = super::try_render_chart_with(&root, &args) {
+                let rendered = r.expect("the default values render");
+                assert_eq!(
+                    profiles_of(&rendered),
+                    vec![Some("dev".to_string()); 9],
+                    "{args:?}: an absent (or null) global.sbiProfile is dev"
+                );
+            }
+        }
+        // #2136 (R41 on #2130): every dev alias the NFs accept
+        // (`SbiProfile::from_env_value` reads `DEV_PROFILE_VALUES`), in any case
+        // and padded, renders dev and keeps the NSSF's OAuth2 opt-out, so the
+        // chart's alias set cannot drift from the NFs'.
+        for dev in crate::sbi_profile::DEV_PROFILE_VALUES {
+            for alias in [
+                dev.to_string(),
+                dev.to_ascii_uppercase(),
+                format!(" {dev} "),
+            ] {
+                let set = format!("global.sbiProfile={alias}");
+                let Some(r) = super::try_render_chart_with(&root, &["--set-string", &set]) else {
+                    return;
+                };
+                let rendered = r.unwrap_or_else(|e| panic!("{alias:?} renders: {e}"));
+                assert_eq!(
+                    profiles_of(&rendered),
+                    vec![Some("dev".to_string()); 9],
+                    "{alias:?}: every NF's NEXTGCORE_SBI_PROFILE is dev"
+                );
+                let nssf = super::config_in(&rendered, "nssf.yaml").expect("nssf.yaml");
+                let nssf: serde_yaml::Value = serde_yaml::from_str(&nssf).unwrap();
+                assert_eq!(
+                    nssf["nssf"]["sbi"]["oauth2"]["require"],
+                    serde_yaml::Value::Bool(false),
+                    "{alias:?}: dev keeps the NSSF opt-out"
+                );
+            }
         }
         for (args, want) in [
             (
