@@ -905,8 +905,16 @@ mod tests {
     /// REVERT-VERIFIED: with `#[serde(skip)]` on `northbound_api`, the snapshot
     /// carries no tag and "the tag is written" fails (and the Nnef subscription
     /// restores as T8).
+    ///
+    /// #2267: the snapshot carries the process-wide owed-unsubscribe set (#2086),
+    /// and a restore counts and re-owes it. Unguarded, a sibling's parked DELETE
+    /// was written into this file and restored with these records, so a restart
+    /// counted 3, not 2. Like the #192 tests, hold the NEF state lock and start
+    /// (and end) with an empty set.
     #[test]
     fn the_subscription_api_tag_survives_a_restart_2163() {
+        let _guard = super::lock_nef_context_for_test();
+        crate::southbound_reconcile::clear_for_test();
         let path = temp_state_path("api-tag-2163");
         let _ = std::fs::remove_file(&path);
         let (nnef_id, t8_id);
@@ -966,6 +974,7 @@ mod tests {
             ),
             "a record without the tag restores as T8"
         );
+        crate::southbound_reconcile::clear_for_test();
         let _ = std::fs::remove_file(&path);
     }
 
