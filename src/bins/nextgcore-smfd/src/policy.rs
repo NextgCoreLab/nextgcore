@@ -110,6 +110,115 @@ pub struct PolicyDecision {
     /// TS 29.512 `SmPolicyDecision.tsnBridgeManCont` / `tsnPortManContDstt` /
     /// `tsnPortManContNwtts`), decoded from base64 ready for N4.
     pub tsc: TscContainers,
+    /// #2208: the QoS monitoring part of the decision (TS 29.512 §4.2.3.25), as
+    /// the delta it is: `qosMonDecs`, the PCC rules' `refQosMon`, and whether
+    /// `policyCtrlReqTriggers` carries QOS_MONITORING. Applied per session by
+    /// `pcc_qos_mon::apply`.
+    pub qos_mon: QosMonDelta,
+}
+
+/// The QoS monitoring members of one `SmPolicyDecision` (#2208, TS 29.512
+/// §4.2.3.25), kept as the delta TS 29.512 §4.2.6.1 makes them: a map entry
+/// carries only what was added, modified or removed, and `null` removes it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QosMonDelta {
+    /// `qosMonDecs` entries in the decision: `Some(object)` added or modified
+    /// (merged as an RFC 7396 patch onto the stored instance), `None` removed.
+    pub decs: Vec<(String, Option<serde_json::Value>)>,
+    /// `qosMonDecs: null`: every QoS monitoring decision of the session is removed.
+    pub decs_cleared: bool,
+    /// The PCC rules in the decision and what each says about `refQosMon`.
+    pub rules: Vec<(String, RuleQosMon)>,
+    /// `Some(true)` when the decision carries `policyCtrlReqTriggers` with
+    /// QOS_MONITORING, `Some(false)` when it carries the list without it, `None`
+    /// when it carries no list (the trigger set is unchanged).
+    pub qos_monitoring_trigger: Option<bool>,
+    /// From the PCF's `suppFeat` (the create answer): whether it negotiated
+    /// PacketDelayFailureReport (TS 29.512 Table 5.8-1 feature 73), so a
+    /// measurement failure may be reported as `pdmf`.
+    pub packet_delay_failure_report: Option<bool>,
+}
+
+impl QosMonDelta {
+    /// Whether the decision says anything about QoS monitoring.
+    pub fn is_empty(&self) -> bool {
+        self.decs.is_empty()
+            && !self.decs_cleared
+            && self.rules.is_empty()
+            && self.qos_monitoring_trigger.is_none()
+            && self.packet_delay_failure_report.is_none()
+    }
+}
+
+/// What one PCC rule entry of a decision says about its QoS monitoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleQosMon {
+    /// The PCC rule is removed (`null` entry).
+    Removed,
+    /// `refQosMon` names these QoS Monitoring Data IDs.
+    Refs(Vec<String>),
+    /// `refQosMon: null`: QoS monitoring of the rule is disabled (§4.2.3.25.1).
+    RefsRemoved,
+    /// The rule is in the decision without `refQosMon`: a new rule with no QoS
+    /// monitoring, or a modified one whose references are unchanged.
+    Unchanged,
+}
+
+/// The QoS monitoring members of `json` (#2208).
+pub fn parse_qos_mon_delta(json: &serde_json::Value) -> QosMonDelta {
+    let mut d = QosMonDelta::default();
+    match json.get("qosMonDecs") {
+        Some(serde_json::Value::Null) => d.decs_cleared = true,
+        Some(serde_json::Value::Object(m)) => {
+            for (id, v) in m {
+                d.decs.push((id.clone(), (!v.is_null()).then(|| v.clone())));
+            }
+        }
+        _ => {}
+    }
+    if let Some(pcc) = json.get("pccRules").and_then(|v| v.as_object()) {
+        for (id, rule) in pcc {
+            let what = if rule.is_null() {
+                RuleQosMon::Removed
+            } else {
+                match rule.get("refQosMon") {
+                    None => RuleQosMon::Unchanged,
+                    Some(serde_json::Value::Null) => RuleQosMon::RefsRemoved,
+                    Some(v) => RuleQosMon::Refs(
+                        v.as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|r| r.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                }
+            };
+            d.rules.push((id.clone(), what));
+        }
+    }
+    if let Some(t) = json.get("policyCtrlReqTriggers").and_then(|v| v.as_array()) {
+        d.qos_monitoring_trigger = Some(t.iter().any(|v| v.as_str() == Some("QOS_MONITORING")));
+    }
+    if let Some(f) = json.get("suppFeat").and_then(|v| v.as_str()) {
+        d.packet_delay_failure_report =
+            Some(supports_feature(f, FEATURE_PACKET_DELAY_FAILURE_REPORT));
+    }
+    d
+}
+
+/// Whether the TS 29.571 §5.2.2 `SupportedFeatures` hex string `s` sets feature
+/// `n` (1-based: feature 1 is the least significant bit of the last character).
+pub fn supports_feature(s: &str, n: u32) -> bool {
+    let Some(bit) = n.checked_sub(1) else {
+        return false;
+    };
+    let pos = (bit / 4) as usize;
+    s.len() > pos
+        && (s.as_bytes()[s.len() - 1 - pos] as char)
+            .to_digit(16)
+            .is_some_and(|nibble| nibble & (1 << (bit % 4)) != 0)
 }
 
 /// The TSC management containers a PCF decision carries, decoded (#321).
@@ -254,6 +363,7 @@ impl PolicyDecision {
             // default here: TSC configuration comes from a TSN AF via the PCF, and
             // inventing one would have the SMF configure a bridge nobody asked for.
             tsc: TscContainers::default(),
+            qos_mon: QosMonDelta::default(),
         }
     }
 
@@ -1217,8 +1327,16 @@ fn pdu_session_type_name(t: u8) -> &'static str {
 }
 
 /// The Npcf_SMPolicyControl features this SMF supports (TS 29.512 §5.8, TS 29.571
-/// §5.2.2 SupportedFeatures): feature 9, PCSCF-Restoration-Enhancement (#1398).
-pub const SMF_SM_POLICY_SUPPORTED_FEATURES: &str = "100";
+/// §5.2.2 SupportedFeatures): feature 9, PCSCF-Restoration-Enhancement (#1398);
+/// feature 24, QosMonitoring (#2208: `qosMonDecs`, `refQosMon` and the
+/// QOS_MONITORING report, §4.2.3.25 and §4.2.4.24); feature 73,
+/// PacketDelayFailureReport (#2208: `pdmf`, which requires QosMonitoring).
+pub const SMF_SM_POLICY_SUPPORTED_FEATURES: &str = "1000000000000800100";
+
+/// TS 29.512 Table 5.8-1 feature 24, QosMonitoring.
+pub const FEATURE_QOS_MONITORING: u32 = 24;
+/// TS 29.512 Table 5.8-1 feature 73, PacketDelayFailureReport.
+pub const FEATURE_PACKET_DELAY_FAILURE_REPORT: u32 = 73;
 
 /// Npcf_SMPolicyControl_Create (POST /npcf-smpolicycontrol/v1/sm-policies)
 pub async fn sm_policy_create(
@@ -1328,10 +1446,35 @@ pub async fn sm_policy_update(
     if let Some(ambr) = subs_sess_ambr.and_then(subs_sess_ambr_json) {
         body["subsSessAmbr"] = ambr;
     }
+    post_sm_policy_update(pcf, sm_policy_id, &body).await
+}
+
+/// Npcf_SMPolicyControl_Update reporting QoS monitoring results (#2208, TS 29.512
+/// §4.2.4.24): QOS_MONITORING in `repPolicyCtrlReqTriggers` and the reports in
+/// `qosMonReports`, each naming its PCC rules in `refPccRuleIds`. Returns the
+/// answer's `SmPolicyDecision`, a delta like [`sm_policy_update`]'s.
+pub async fn sm_policy_update_qos_mon_reports(
+    pcf: &PcfEndpoint,
+    sm_policy_id: &str,
+    reports: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, PolicyError> {
+    let body = serde_json::json!({
+        "repPolicyCtrlReqTriggers": ["QOS_MONITORING"],
+        "qosMonReports": reports,
+    });
+    post_sm_policy_update(pcf, sm_policy_id, &body).await
+}
+
+/// POST an `SmPolicyUpdateContextData` and return the answer's decision.
+async fn post_sm_policy_update(
+    pcf: &PcfEndpoint,
+    sm_policy_id: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, PolicyError> {
     let path = format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update");
     let resp = pcf
         .client()
-        .post_json(&path, &body)
+        .post_json(&path, body)
         .await
         .map_err(|e| PolicyError::Transport(e.to_string()))?;
     if resp.status != 200 {
@@ -1445,6 +1588,9 @@ fn apply_sm_policy_decision(dec: &mut PolicyDecision, json: &serde_json::Value) 
     // not held between decisions, and the notify path sends them to N4 only when this
     // decision carries some, so an absent member here is "no TSC change" as it should be.
     dec.tsc = parse_tsc_containers(json);
+    // #2208: replaced, like the TSC containers: the delta is applied per session by
+    // `pcc_qos_mon::apply`, which holds what the earlier decisions installed.
+    dec.qos_mon = parse_qos_mon_delta(json);
 
     // Session rules: authorized session AMBR + default QoS. The first rule that is NOT
     // a removal (`null`, TS 29.512 §4.2.6.3.1): a removal carries no values, and
@@ -3220,7 +3366,8 @@ mod tests {
             assert_eq!(body["subsSessAmbr"]["downlink"], "80 Mbps");
             // #1398: the SMF offers PCSCF-Restoration-Enhancement (feature 9), so a
             // PCF can ask it to restore a P-CSCF (TS 29.512 §4.2.3.18).
-            assert_eq!(body["suppFeat"], "100", "body was {body}");
+            // #2208: and QosMonitoring (24) with PacketDelayFailureReport (73).
+            assert_eq!(body["suppFeat"], "1000000000000800100", "body was {body}");
 
             // Only one direction stated: nothing is reported, because `Ambr` cannot
             // express half a pair and a defaulted zero would bound the subscriber to
@@ -3571,6 +3718,74 @@ mod tests {
         assert!(
             ies.iter().all(|ie| ie.conditional_holds()),
             "every emitted IE must satisfy the NW-TT-port conditional"
+        );
+    }
+
+    /// #2208: the QoS monitoring members of a decision, as the delta they are (TS
+    /// 29.512 §4.2.6.1): an entry added, modified or `null`; `qosMonDecs: null`;
+    /// each PCC rule's `refQosMon` (present, `null`, absent) and a removed rule;
+    /// the QOS_MONITORING trigger; and PacketDelayFailureReport from `suppFeat`.
+    #[test]
+    fn the_qos_monitoring_members_are_read_as_a_delta_2208() {
+        let d = parse_qos_mon_delta(&serde_json::json!({
+            "qosMonDecs": { "qm1": { "repPeriod": 3 }, "qm2": null },
+            "pccRules": {
+                "a": { "refQosMon": ["qm1"] },
+                "b": { "refQosMon": null },
+                "c": { "precedence": 2 },
+                "d": null,
+            },
+            "policyCtrlReqTriggers": ["PLMN_CH", "QOS_MONITORING"],
+            "suppFeat": "1000000000000800100",
+        }));
+        assert_eq!(
+            d.decs,
+            vec![
+                (
+                    "qm1".to_string(),
+                    Some(serde_json::json!({ "repPeriod": 3 }))
+                ),
+                ("qm2".to_string(), None),
+            ]
+        );
+        assert!(!d.decs_cleared);
+        assert_eq!(
+            d.rules,
+            vec![
+                ("a".to_string(), RuleQosMon::Refs(vec!["qm1".into()])),
+                ("b".to_string(), RuleQosMon::RefsRemoved),
+                ("c".to_string(), RuleQosMon::Unchanged),
+                ("d".to_string(), RuleQosMon::Removed),
+            ]
+        );
+        assert_eq!(d.qos_monitoring_trigger, Some(true));
+        assert_eq!(d.packet_delay_failure_report, Some(true));
+        let d = parse_qos_mon_delta(&serde_json::json!({
+            "qosMonDecs": null, "policyCtrlReqTriggers": [], "suppFeat": "800100",
+        }));
+        assert!(d.decs_cleared);
+        assert_eq!(d.qos_monitoring_trigger, Some(false));
+        assert_eq!(d.packet_delay_failure_report, Some(false));
+        assert!(parse_qos_mon_delta(&serde_json::json!({ "sessRules": {} })).is_empty());
+        // The merge path carries it too.
+        let dec = parse_sm_policy_decision("p", &serde_json::json!({ "qosMonDecs": { "q": {} } }));
+        assert_eq!(dec.qos_mon.decs.len(), 1);
+    }
+
+    /// TS 29.571 §5.2.2: feature n is bit (n-1) of the hex string, the last
+    /// character holding features 1-4. Pinned against TS 29.512 Table 5.8-1: 9
+    /// PCSCF-Restoration-Enhancement, 24 QosMonitoring, 73 PacketDelayFailureReport.
+    #[test]
+    fn supported_features_are_read_by_bit_2208() {
+        let ours = SMF_SM_POLICY_SUPPORTED_FEATURES;
+        let set: Vec<u32> = (1..=80).filter(|n| supports_feature(ours, *n)).collect();
+        assert_eq!(set, vec![9, 24, FEATURE_PACKET_DELAY_FAILURE_REPORT]);
+        assert_eq!(FEATURE_QOS_MONITORING, 24);
+        assert_eq!(FEATURE_PACKET_DELAY_FAILURE_REPORT, 73);
+        assert!(supports_feature("1", 1) && !supports_feature("1", 2));
+        assert!(supports_feature("8", 4) && supports_feature("10", 5));
+        assert!(
+            !supports_feature("", 1) && !supports_feature("zz", 1) && !supports_feature("1", 0)
         );
     }
 
