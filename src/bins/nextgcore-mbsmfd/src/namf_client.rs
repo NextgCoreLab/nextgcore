@@ -1089,10 +1089,15 @@ mod tests {
         use std::sync::atomic::Ordering;
         let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         crate::reconcile::clear_for_test();
-        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &[500]).await;
+        // #2274: the AMF holds the first ContextDelete while session B reuses the
+        // context, so B holds it before the 500 comes back and the first retry
+        // is due. Before, B recorded it only after `release_amf_contexts`
+        // returned, and a loaded host let the 20 ms retry fire first.
+        let (_server, context, deletes, arrived, release) = scripted_amf(true, &[500]).await;
         crate::mbsmf_context_init(256);
         let ctx = crate::mbsmf_self();
-        assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        let first = tokio::spawn(crate::release_amf_contexts(vec![context.clone()]));
+        arrived.notified().await;
         let b = ctx
             .read()
             .unwrap()
@@ -1105,6 +1110,8 @@ mod tests {
             .read()
             .unwrap()
             .record_amf_context(b.id, context.clone()));
+        release.notify_one();
+        assert!(!first.await.expect("the first delete"), "refused");
         // #2236: the retry task ends at its first retry (the context is in
         // use); wait for that rather than a fixed sleep.
         crate::reconcile::retries_settled().await;
@@ -1627,6 +1634,11 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the callback exemption not installed, the notify is
     /// refused 401 and the record stays.
+    ///
+    /// #2274: "nor is the token admitted any more" is checked once the record is
+    /// gone, so it needs `drop_amf_context_by_token` to drop the record and its
+    /// tokens in one critical section. REVERT-VERIFIED: with the two steps apart
+    /// again and 200 ms between them, that assertion fails every run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_amfs_status_notify_passes_the_mbsmf_gate_on_its_token_1796() {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
@@ -2174,6 +2186,11 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with `forget_abandoned` forgetting without the held check,
     /// "A's token is B's" fails (amfd's notify on it would then be answered 404).
+    ///
+    /// #2274: "releasedInd ends the context's tokens" is checked once B's record
+    /// is gone, so it needs `drop_amf_context_by_token` to drop the record and
+    /// its tokens in one critical section. REVERT-VERIFIED: with the two steps
+    /// apart again and 200 ms between them, that assertion fails every run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_expiry_racing_a_reuse_leaves_b_notified_by_amfd_2015() {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
