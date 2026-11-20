@@ -55,6 +55,17 @@ pub const ANY_NF_INSTANCE_ID_ENV: &str = "NEXTGCORE_NF_INSTANCE_ID";
 /// divergence is the defect this module closes.
 static NF_INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
+/// #2123 (#2120 item 3): the NF type this process first resolved its ID as,
+/// in [`nf_instance_id`]. Every daemon calls that with its own type, so this is
+/// the type it is, known before (and without) a self NF instance.
+static OWN_NF_TYPE: OnceLock<NfType> = OnceLock::new();
+
+/// #2123: this process's own NF type, as its first [`nf_instance_id`] call named
+/// it; `None` before that call.
+pub fn own_nf_type() -> Option<NfType> {
+    OWN_NF_TYPE.get().copied()
+}
+
 /// Per-NF-type environment variable name, e.g. `NEXTGCORE_AMF_INSTANCE_ID`.
 ///
 /// Derived from the TS 29.510 NF type string so a new `NfType` needs no edit
@@ -112,6 +123,7 @@ pub fn seed(id: &str) -> bool {
 /// the `no_daemon_mints_its_own_nf_instance_id` guard in `security.rs` fails the
 /// build for a `bins/` crate that does otherwise.
 pub fn nf_instance_id(nf_type: NfType) -> &'static str {
+    let _ = OWN_NF_TYPE.set(nf_type);
     NF_INSTANCE_ID.get_or_init(|| {
         if let Some(id) = non_empty_env(ANY_NF_INSTANCE_ID_ENV) {
             log::info!(

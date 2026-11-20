@@ -249,8 +249,8 @@ fn refuse_unbound_peer(
     claimed: &str,
     operation: &str,
 ) -> Option<HttpResponse> {
-    let claimed = claimed.trim().trim_end_matches('.').to_ascii_lowercase();
-    match peer_binding(request, &claimed) {
+    let claimed = normalized_sepp_fqdn(claimed);
+    match peer_binding_of(request, &claimed) {
         PeerBinding::Bound => return None,
         PeerBinding::NoCertificate => {
             log::warn!("{operation} from [{claimed}] refused: no verified peer SEPP certificate");
@@ -292,7 +292,18 @@ enum PeerBinding {
 /// nothing, so a caller that must answer a refusal exactly as another outcome
 /// (#2112: a foreign `n32f-terminate` as an unknown context) can.
 fn peer_binding(request: &HttpRequest, claimed: &str) -> PeerBinding {
-    let claimed = claimed.trim().trim_end_matches('.').to_ascii_lowercase();
+    peer_binding_of(request, &normalized_sepp_fqdn(claimed))
+}
+
+/// A SEPP FQDN as a certificate's DNS SAN is compared: trimmed, without a
+/// trailing dot, lowercase.
+fn normalized_sepp_fqdn(fqdn: &str) -> String {
+    fqdn.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// [`peer_binding`] for a `claimed` already [`normalized_sepp_fqdn`] (#2137:
+/// normalised once, by whichever caller holds it).
+fn peer_binding_of(request: &HttpRequest, claimed: &str) -> PeerBinding {
     if !request.peer_cert_present {
         return if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
             PeerBinding::NoCertificate
@@ -300,7 +311,7 @@ fn peer_binding(request: &HttpRequest, claimed: &str) -> PeerBinding {
             PeerBinding::Bound
         };
     }
-    if request.peer_cert_dns_sans.contains(&claimed) {
+    if request.peer_cert_dns_sans.iter().any(|san| san == claimed) {
         PeerBinding::Bound
     } else {
         PeerBinding::OtherPeer
@@ -2531,71 +2542,93 @@ mod tests {
         assert!(n32c_handler::take_n32c_tls_exporter_secret(peer).is_none());
     }
 
-    /// **#2112** (R31 on #2110): a foreign `n32f-terminate` takes the unknown
-    /// context's path, not just its answer: the same status and body, and the
-    /// same log line, at DEBUG. Before, the foreign case built and discarded a
-    /// 403 and logged a WARN naming both SEPPs, a timing and log-volume
-    /// difference a peer could also use to fill the log.
+    /// **#2112** (R31 on #2110), **#2137** (R42 on #2135): a foreign
+    /// `n32f-terminate` takes the unknown context's path, not just its answer:
+    /// the same status, body and headers, and the same log lines at the same
+    /// level -- every line naming the call's context id, its caller or SEPP A,
+    /// compared positively -- whether the caller holds another SEPP's
+    /// certificate or (production) none. Before, the foreign case built and
+    /// discarded a 403 and logged a WARN naming both SEPPs.
     ///
     /// REVERT-VERIFIED: with the filter back on `refuse_unbound_peer`, the
-    /// WARN naming SEPP A is logged and "no WARN" fails.
+    /// foreign call logs a WARN naming SEPP A and the `the same log lines`
+    /// assertion fails, for the other-certificate case and the no-certificate
+    /// case alike.
     #[test]
     fn a_foreign_n32f_terminate_is_answered_and_logged_as_an_unknown_context_2112() {
         nextgcore_core::test_log::init();
+        assert!(
+            nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+            "the no-certificate case needs the production profile (the default)"
+        );
         let a = "sepp-a-2112.example.com";
         let node_id = tls_peer_with_context(a, "ctx-2112-a");
-        let from_b = from_sepp(HttpRequest::default(), &["sepp-b-2112.example.com"]);
-        let terminate = |id: &str| {
+        let terminate = |id: &str, from: &HttpRequest| {
             handle_n32f_terminate(
                 &serde_json::json!({ "n32fContextId": id }).to_string(),
-                &from_b,
+                from,
             )
         };
-        let about_a = nextgcore_core::test_log::watch(a);
-        let foreign_log = nextgcore_core::test_log::watch("ctx-2112-a");
-        let unknown_log = nextgcore_core::test_log::watch("ctx-2112-none");
-
-        let foreign = terminate("ctx-2112-a");
-        let unknown = terminate("ctx-2112-none");
-
-        let answer = |r: &HttpResponse, id: &str| {
+        // One call, and every log line naming its context id, its caller or A,
+        // with those replaced so two calls compare.
+        let call = |id: &str, caller: Option<&str>| {
+            let from = match caller {
+                Some(c) => from_sepp(HttpRequest::default(), &[c]),
+                None => HttpRequest::default(),
+            };
+            let watches: Vec<_> = [Some(id), caller, Some(a)]
+                .into_iter()
+                .flatten()
+                .map(nextgcore_core::test_log::watch)
+                .collect();
+            let r = terminate(id, &from);
+            let scrub = |t: &str| {
+                let t = t.replace(id, "ID").replace(a, "A");
+                caller.map_or(t.clone(), |c| t.replace(c, "CALLER"))
+            };
+            let mut lines: Vec<String> = watches
+                .iter()
+                .flat_map(|w| w.records())
+                .map(|l| scrub(&l))
+                .collect();
+            lines.sort();
+            lines.dedup();
+            let mut headers: Vec<(String, String)> = r
+                .http
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), scrub(v)))
+                .collect();
+            headers.sort();
             (
                 r.status,
-                r.http.content.as_deref().map(|c| c.replace(id, "ID")),
+                r.http.content.as_deref().map(scrub),
+                headers,
+                lines,
             )
         };
-        assert_eq!(answer(&foreign, "ctx-2112-a").0, 404);
-        assert_eq!(
-            answer(&foreign, "ctx-2112-a"),
-            answer(&unknown, "ctx-2112-none"),
-            "the same answer"
-        );
-        let lines = |w: &nextgcore_core::test_log::Watch, id: &str| {
-            w.records()
-                .iter()
-                .map(|r| r.replace(id, "ID"))
-                .collect::<Vec<_>>()
-        };
-        let unknown_lines = lines(&unknown_log, "ctx-2112-none");
-        assert_eq!(
-            unknown_lines,
-            [
-                "DEBUG nextgcore_seppd::n32_server: n32f-terminate of ID answered 404: the \
-                 calling SEPP has no N32-f context with that id"
-            ],
-            "an unknown context leaves one DEBUG line"
-        );
-        assert_eq!(
-            lines(&foreign_log, "ctx-2112-a"),
-            unknown_lines,
-            "and a foreign one the same line"
-        );
-        let warns: Vec<String> = about_a
-            .records()
-            .into_iter()
-            .filter(|r| r.starts_with("WARN"))
-            .collect();
-        assert_eq!(warns, Vec::<String>::new(), "no WARN names SEPP A");
+        let debug_line = "DEBUG nextgcore_seppd::n32_server: n32f-terminate of ID answered 404: \
+                          the calling SEPP has no N32-f context with that id";
+
+        for (case, foreign_from, unknown_from) in [
+            (
+                "another SEPP's certificate",
+                Some("sepp-b-2112.example.com"),
+                Some("sepp-c-2112.example.com"),
+            ),
+            ("no certificate", None, None),
+        ] {
+            let foreign = call("ctx-2112-a", foreign_from);
+            let unknown = call(&format!("ctx-2112-none-{}", case.len()), unknown_from);
+            assert_eq!(foreign.0, 404, "{case}");
+            assert_eq!(
+                (&foreign.0, &foreign.1, &foreign.2),
+                (&unknown.0, &unknown.1, &unknown.2),
+                "{case}: the same status, body and headers"
+            );
+            assert_eq!(unknown.3, [debug_line], "{case}: one DEBUG line");
+            assert_eq!(foreign.3, unknown.3, "{case}: the same log lines");
+        }
 
         let ctx = sepp_self();
         let c = ctx.read().unwrap();
