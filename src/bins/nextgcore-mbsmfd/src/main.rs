@@ -5824,6 +5824,10 @@ mod subscription_owner_tests_1865 {
 
     fn with_identity(mut r: SbiRequest, cert: Option<&str>, token: Option<&str>) -> SbiRequest {
         r.peer_cert_nf_instance_id = cert.map(str::to_string);
+        if cert.is_some() {
+            // #2065: typed, as a consumer's certificate is (RFC 9310).
+            r.peer_cert_nf_types = vec!["AF".into()];
+        }
         r.oauth2_subject = token.map(str::to_string);
         r
     }

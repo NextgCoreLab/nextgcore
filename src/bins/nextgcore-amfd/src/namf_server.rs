@@ -2990,6 +2990,21 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
         };
         guard.event_subscription_find(subscription_id)
     };
+    // #2133 (R42 on #2128): an expired subscription no longer exists (TS 29.518
+    // §5.3.2.2.3), so a modify answers 404 and cannot revive it; it is swept now
+    // rather than at the next opportunistic cleanup.
+    let existing = existing.filter(|sub| {
+        let expired = sub
+            .expiry
+            .is_some_and(|e| e <= std::time::SystemTime::now());
+        if expired {
+            if let Ok(guard) = ctx.read() {
+                guard.event_subscription_remove(subscription_id);
+            }
+            cancel_periodic_location_reports(subscription_id);
+        }
+        !expired
+    });
     let Some(mut sub) = existing else {
         return send_error(
             404,
@@ -9969,6 +9984,74 @@ mod tests {
         .await;
     }
 
+    /// **#2133** (R42 on #2128): a modify of a subscription whose expiry has
+    /// passed answers 404 SUBSCRIPTION_NOT_FOUND and does not revive it, even
+    /// when the patch moves the expiry into the future: it no longer exists
+    /// (TS 29.518 §5.3.2.2.3). It is gone from the store afterwards. A live
+    /// subscription's same patch is 200.
+    ///
+    /// REVERT-VERIFIED: with the expiry filter removed, the expired PATCH is
+    /// 200 (revived) and "an expired subscription is not modified" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modify_does_not_revive_an_expired_subscription_2133() {
+        amf_context_init(64, 1024, 4096);
+        let body = subscription_body(
+            "imsi-001010000021330",
+            "http://127.0.0.1:9/notify-2133",
+            "LOCATION_REPORT",
+        );
+        let req = SbiRequest::post("/namf-evts/v1/subscriptions")
+            .with_json_body(&body)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 201);
+        let live = EventSubscriptionGuard::of(&resp);
+        let expired_id = "sub-2133-expired";
+        let expired = EventSubscription {
+            subscription_id: expired_id.to_string(),
+            expiry: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1)),
+            ..amf_self()
+                .read()
+                .unwrap()
+                .event_subscription_find(live.subscription_id())
+                .expect("stored")
+        };
+        assert!(amf_self().read().unwrap().event_subscription_add(expired));
+        let _expired = EventSubscriptionGuard::id(expired_id);
+        let refresh = |id: &str| {
+            SbiRequest::patch(format!("/namf-evts/v1/subscriptions/{id}"))
+                .with_json_body(&json!([{
+                    "op": "replace",
+                    "path": "/options/expiry",
+                    "value": "2099-01-01T00:00:00Z",
+                }]))
+                .expect("json")
+        };
+
+        let resp = namf_request_handler(refresh(expired_id)).await;
+        assert_eq!(
+            resp.status, 404,
+            "an expired subscription is not modified: {:?}",
+            resp.http.content
+        );
+        assert_eq!(
+            body_json(&resp)["cause"],
+            "SUBSCRIPTION_NOT_FOUND",
+            "{:?}",
+            resp.http.content
+        );
+        assert!(
+            amf_self()
+                .read()
+                .unwrap()
+                .event_subscription_find(expired_id)
+                .is_none(),
+            "and it is gone"
+        );
+        let resp = namf_request_handler(refresh(live.subscription_id())).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+    }
+
     #[test]
     fn test_expired_subscription_is_skipped_and_swept() {
         amf_context_init(64, 1024, 4096);
@@ -10844,6 +10927,8 @@ mod tests {
         setup_ue(supi, true, true);
         let mut create = n1n2_subscription_request(supi, &n1n2_subscription_body("o1865"));
         create.peer_cert_nf_instance_id = Some(owner.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        create.peer_cert_nf_types = vec!["SMF".into()];
         let resp = namf_request_handler(create).await;
         assert_eq!(resp.status, 201);
         let sub_id = body_json(&resp)["n1n2NotifySubscriptionId"]
@@ -10861,10 +10946,14 @@ mod tests {
         assert_eq!(held(), Some(Some(owner.to_string())));
         let mut foreign_cert = SbiRequest::delete(uri.clone());
         foreign_cert.peer_cert_nf_instance_id = Some(other.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        foreign_cert.peer_cert_nf_types = vec!["SMF".into()];
         let mut foreign_token = SbiRequest::delete(uri.clone());
         foreign_token.oauth2_subject = Some(other.into());
         let mut mixed = SbiRequest::delete(uri.clone());
         mixed.peer_cert_nf_instance_id = Some(owner.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["SMF".into()];
         mixed.oauth2_subject = Some(other.into());
         for req in [foreign_cert, foreign_token, mixed] {
             assert_eq!(namf_request_handler(req).await.status, 403);
@@ -18639,6 +18728,8 @@ mod subscription_owner_tests_1865 {
 
     fn as_cert(mut r: SbiRequest, id: &str) -> SbiRequest {
         r.peer_cert_nf_instance_id = Some(id.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        r.peer_cert_nf_types = vec!["SMF".into()];
         r
     }
     fn as_token(mut r: SbiRequest, id: &str) -> SbiRequest {

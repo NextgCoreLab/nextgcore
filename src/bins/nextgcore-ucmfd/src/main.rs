@@ -1519,13 +1519,25 @@ async fn provisioner_refusal(
     policy: &context::ProvisioningPolicy,
     request: &SbiRequest,
 ) -> Option<SbiResponse> {
+    provisioner_refusal_with(policy, request, production_profile()).await
+}
+
+/// [`provisioner_refusal`] under the profile `production` says (#2089): under
+/// it a certificate naming no NF type is no identity on its own (#2065), so it
+/// is refused before the NRF is asked; under dev the shared rule refuses it as
+/// well, as it cannot be told from a relay's (#2099).
+async fn provisioner_refusal_with(
+    policy: &context::ProvisioningPolicy,
+    request: &SbiRequest,
+    production: bool,
+) -> Option<SbiResponse> {
     policy.trusted_afs.as_ref()?;
     let refuse = |why: String| {
         let why = format!("only the NEF or a trusted AF provisions (TS 29.675 §4.1.3.2): {why}");
         log::debug!("{why}");
         Some(nextgcore_sbi::server::send_forbidden(&why, None))
     };
-    let caller = match owner_binding::verified_consumer_id(request) {
+    let caller = match owner_binding::verified_consumer_id_with(request, production) {
         Ok(Some(caller)) => caller,
         Ok(None) => return refuse("the requester has no verified identity".into()),
         Err(why) => return refuse(why),
@@ -1533,7 +1545,13 @@ async fn provisioner_refusal(
     if policy.trusts_af(Some(&caller)) {
         return None;
     }
-    match owner_binding::verified_nf_type(request, nextgcore_sbi::types::NfType::Nef).await {
+    match owner_binding::verified_nf_type_with(
+        request,
+        nextgcore_sbi::types::NfType::Nef,
+        production,
+    )
+    .await
+    {
         Ok(()) => None,
         Err(why) => refuse(format!(
             "{caller} is not in ucmf.provisioning.trusted_afs, and {why}"
@@ -1639,7 +1657,9 @@ fn provisioning_owner_in(
     production: bool,
 ) -> Result<Option<String>, Box<SbiResponse>> {
     const OP: &str = "Nucmf_Provisioning_Create";
-    match owner_binding::owner_for_new_resource(request, OP)? {
+    // The profile is the caller's `production`, not the process's: a test that
+    // passes it explicitly must not depend on another test's profile override.
+    match owner_binding::owner_for_new_resource_with(request, OP, production)? {
         None if production => {
             let why = "the requester has no verified identity; under the production SBI \
                        profile every provisioning is bound to its creator (TS 33.501 §13.4.1)";
@@ -2286,6 +2306,21 @@ mod tests {
         );
 
         let u = ucmf();
+        // #2089 R40: `ucmf()` has just set the process-wide Dev override, so
+        // this checks `provisioning_owner_in` judges by its explicit
+        // `production` and not the process profile, whatever order the suite
+        // runs in. Under production an untyped certificate alone is no
+        // identity (#2065); read through the process profile (Dev) it would
+        // become the owner.
+        let mut untyped = anon.clone();
+        untyped.peer_cert_nf_instance_id = Some(NEF_A_1916.to_string());
+        let refused = provisioning_owner_in(&untyped, true)
+            .expect_err("production: an untyped certificate alone is no identity");
+        assert_eq!(refused.status, 403);
+        assert!(body(&refused)["detail"]
+            .as_str()
+            .unwrap()
+            .contains("names no NF type"));
         assert_eq!(handle(&u, &anon, now()).0.status, 201, "dev: ownerless");
         let state = read_state(&u);
         for who in [Some(NEF_A_1916), Some(NEF_B_1916), None] {
@@ -3063,6 +3098,28 @@ mod tests {
         ] {
             assert!(provisioner_refusal(&policy, &r).await.is_none(), "{r:?}");
         }
+        // #2065/#2089: a typeless certificate alone. Under production it is no
+        // identity and is refused before the NRF is asked; under dev the shared
+        // rule (#2099) refuses it too, as it cannot be told from a relay's.
+        // Both profiles are passed explicitly, so the test reads no process-wide
+        // override (#2089).
+        let typeless = caller(&[], Some(NEF_A_1916), None);
+        let dev = provisioner_refusal_with(&policy, &typeless, false)
+            .await
+            .expect("dev: a typeless certificate alone is refused (#2099)");
+        assert_eq!(dev.status, 403);
+        let r = provisioner_refusal_with(&policy, &typeless, true)
+            .await
+            .expect("production: a typeless certificate alone is no identity");
+        assert_eq!(r.status, 403);
+        assert!(
+            body(&r)["detail"]
+                .as_str()
+                .unwrap()
+                .contains("names no NF type"),
+            "{:?}",
+            body(&r)
+        );
     }
 
     /// #2141 (R41), end to end with no seeded cache: a NEF provisioning with a

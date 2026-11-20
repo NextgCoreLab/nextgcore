@@ -1953,10 +1953,14 @@ mod tests {
     fn strangers_1865(request: impl Fn() -> SbiRequest) -> Vec<(&'static str, SbiRequest)> {
         let mut foreign_cert = request();
         foreign_cert.peer_cert_nf_instance_id = Some(OTHER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        foreign_cert.peer_cert_nf_types = vec!["AF".into()];
         let mut foreign_token = request();
         foreign_token.oauth2_subject = Some(OTHER_1865.to_string());
         let mut mismatch = request();
         mismatch.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mismatch.peer_cert_nf_types = vec!["AF".into()];
         mismatch.oauth2_subject = Some(OTHER_1865.to_string());
         vec![
             ("foreign certificate", foreign_cert),
@@ -2059,6 +2063,8 @@ mod tests {
                 // A mismatched create stores nothing.
                 let mut mismatched = post(collection, body.clone());
                 mismatched.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                mismatched.peer_cert_nf_types = vec!["AF".into()];
                 mismatched.oauth2_subject = Some(OTHER_1865.to_string());
                 let r = super::tsctsf_sbi_request_handler(mismatched).await;
                 assert_eq!(
@@ -2180,6 +2186,8 @@ mod tests {
                 );
                 let mut by_cert = SbiRequest::delete(uri.clone());
                 by_cert.peer_cert_nf_instance_id = Some(OWNER_1865.to_uppercase());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                by_cert.peer_cert_nf_types = vec!["AF".into()];
                 assert_eq!(super::tsctsf_sbi_request_handler(by_cert).await.status, 204);
                 let gone =
                     super::tsctsf_sbi_request_handler(owned_1865(SbiRequest::delete(uri.clone())))
@@ -2188,6 +2196,8 @@ mod tests {
 
                 let mut mixed = post(collection, body);
                 mixed.peer_cert_nf_instance_id = Some(OWNER_1865.to_string());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                mixed.peer_cert_nf_types = vec!["AF".into()];
                 mixed.oauth2_subject = Some(OTHER_1865.to_string());
                 assert_eq!(
                     super::tsctsf_sbi_request_handler(mixed).await.status,

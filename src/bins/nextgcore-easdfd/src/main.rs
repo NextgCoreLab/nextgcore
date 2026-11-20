@@ -1798,10 +1798,14 @@ easdf:
             };
             let foreign_cert = |mut r: SbiRequest| {
                 r.peer_cert_nf_instance_id = Some(OTHER.into());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                r.peer_cert_nf_types = vec!["SMF".into()];
                 r
             };
             let mismatch = |mut r: SbiRequest| {
                 r.peer_cert_nf_instance_id = Some(OTHER.into());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                r.peer_cert_nf_types = vec!["SMF".into()];
                 r.oauth2_subject = Some(TEST_SMF.into());
                 r
             };
@@ -1822,6 +1826,8 @@ easdf:
         let before = ctx_count();
         let mut mixed = create_request(valid_body());
         mixed.peer_cert_nf_instance_id = Some(OTHER.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["SMF".into()];
         assert_eq!(block_on(easdf_sbi_request_handler(mixed)).status, 403);
         assert_eq!(ctx_count(), before, "a refused create stores nothing");
 
@@ -1870,6 +1876,8 @@ easdf:
         let before = patterns();
         let mut mixed = as_smf(create());
         mixed.peer_cert_nf_instance_id = Some(OTHER.into());
+        // #2065: typed, as a consumer's certificate is (RFC 9310).
+        mixed.peer_cert_nf_types = vec!["SMF".into()];
         assert_eq!(block_on(easdf_sbi_request_handler(mixed)).status, 403);
         assert_eq!(patterns(), before, "a refused create stores nothing");
         let resp = block_on(easdf_sbi_request_handler(as_smf(create())));

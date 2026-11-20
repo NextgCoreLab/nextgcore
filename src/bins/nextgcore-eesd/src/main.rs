@@ -3824,6 +3824,8 @@ mod tests {
             let mut mixed = request("POST", collection, body)
                 .with_header("Authorization", bearer_sub(&sk, "k1", scope, OWNER));
             mixed.peer_cert_nf_instance_id = Some(OTHER.into());
+            // #2065: typed, as a consumer's certificate is (RFC 9310).
+            mixed.peer_cert_nf_types = vec!["AF".into()];
             let resp = block_on(ees_sbi_request_handler(mixed));
             assert_eq!(resp.status, 403, "{kind:?}: a mismatched create is refused");
             assert_eq!(
@@ -3854,9 +3856,13 @@ mod tests {
                 let mut foreign_cert = request(method, &item, body)
                     .with_header("Authorization", bearer_sub(&sk, "k1", scope, OTHER));
                 foreign_cert.peer_cert_nf_instance_id = Some(OTHER.into());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                foreign_cert.peer_cert_nf_types = vec!["AF".into()];
                 let mut mismatch = request(method, &item, body)
                     .with_header("Authorization", bearer_sub(&sk, "k1", scope, OWNER));
                 mismatch.peer_cert_nf_instance_id = Some(OTHER.into());
+                // #2065: typed, as a consumer's certificate is (RFC 9310).
+                mismatch.peer_cert_nf_types = vec!["AF".into()];
                 for (who, req, want) in [
                     ("foreign token", foreign_token, 403),
                     ("foreign certificate", foreign_cert, 403),
@@ -4154,7 +4160,17 @@ mod tests {
                     SbiRequest::post(*path).with_json_body(body).unwrap(),
                     types,
                 )));
-                assert_eq!(r.status, 401, "{path} with only a {types:?} certificate");
+                // #2089: a typeless certificate alone is refused under both
+                // profiles: under production by #2065's shared rule (no
+                // identity, 403), under dev by the ECS's own typeless check
+                // (401). A relay's alone is 401 under both.
+                let want = if types.is_empty() && nextgcore_sbi::owner_binding::identity_required()
+                {
+                    403
+                } else {
+                    401
+                };
+                assert_eq!(r.status, want, "{path} with only a {types:?} certificate");
             }
             // Through the relay with the consumer's token: served.
             let relayed = with_cert(
