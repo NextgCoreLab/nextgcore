@@ -2,8 +2,9 @@
 //! NGAP goldens in amfd's tests.
 //!
 //! The goldens that replace the hand-written `nextgcore-ngap` codec are derived
-//! by hand from the TS 38.413 V17.9 ASN.1 (`libs/nextgcore-ngap-gen/asn`) and
-//! X.691. Where a PDU's width depends on its values (lists, long integers), the
+//! by hand from the TS 38.413 V17.9.0 ASN.1 (`libs/nextgcore-ngap-gen/asn`,
+//! the module the generated codec is compiled from) and X.691; § numbers in
+//! the derivations cite the V19.3.0 prose (`38413-j30`). Where a PDU's width depends on its values (lists, long integers), the
 //! derivation drives this sink. The sink knows bits, bit-fields, alignment and
 //! the open-type length determinant, and nothing about the schema. Each test
 //! that uses it says, beside the calls, which schema member each call encodes
@@ -62,19 +63,28 @@ impl Bits {
     }
 
     /// An open type (or an unconstrained OCTET STRING) holding `inner`: the
-    /// aligned length determinant, short form below 128, two-octet `10` form
-    /// below 16384 (§11.9.3.6-§11.9.3.7), then the octets.
+    /// aligned length determinant (§11.9.3.6-§11.9.3.8), then the octets.
+    /// - below 128 octets: one octet `0` + the length in seven bits;
+    /// - below 16384: two octets `10` + the length in fourteen bits;
+    /// - otherwise, while 16384 or more remain: one octet `11` + m in six bits,
+    ///   m the number of 16K blocks in this fragment, as many as fit and at
+    ///   most 4, then those m x 16384 octets; then the remainder with its own
+    ///   determinant as above, a remainder of zero included, written `00`: a
+    ///   length that is a multiple of 16K still ends in a final, empty part.
     pub(crate) fn open(&mut self, inner: &[u8]) -> &mut Self {
-        assert!(
-            inner.len() < 16384,
-            "fragmented lengths are not derived here"
-        );
-        if inner.len() < 128 {
-            self.octets(&[inner.len() as u8]);
-        } else {
-            self.octets(&(0x8000 | inner.len() as u16).to_be_bytes());
+        const K16: usize = 16384;
+        let mut rest = inner;
+        while rest.len() >= K16 {
+            let m = (rest.len() / K16).min(4);
+            self.octets(&[0xC0 | m as u8]).octets(&rest[..m * K16]);
+            rest = &rest[m * K16..];
         }
-        self.octets(inner)
+        if rest.len() < 128 {
+            self.octets(&[rest.len() as u8]);
+        } else {
+            self.octets(&(0x8000 | rest.len() as u16).to_be_bytes());
+        }
+        self.octets(rest)
     }
 
     /// One ProtocolIE-Field: id, criticality (0 reject, 1 ignore, 2 notify),
@@ -93,6 +103,14 @@ impl Bits {
             .map(|c| c.iter().fold(0u8, |o, b| o << 1 | u8::from(*b)))
             .collect()
     }
+}
+
+/// `inner` as an open type / unconstrained OCTET STRING, on its own: the
+/// whole IE value of a NAS-PDU, a transfer or a container.
+pub(crate) fn open_value(inner: &[u8]) -> Vec<u8> {
+    let mut b = Bits::default();
+    b.open(inner);
+    b.finish()
 }
 
 /// An NGAP-PDU: `choice` 0 initiatingMessage, 1 successfulOutcome, 2
@@ -129,6 +147,23 @@ pub(crate) fn long_integer(value: u64, width: u32) -> Vec<u8> {
     let mut b = Bits::default();
     b.field((8 - skip) as u64 - 1, width).octets(&be[skip..]);
     b.finish()
+}
+
+/// BitRate `INTEGER (0..4000000000000, ...)` (TS 38.413 §9.3.1.4), a root
+/// value: extension `0`, then a range past 64K, so the octet count n (1..=6,
+/// as 4e12 needs 42 bits) as n-1 in three bits, then the value in its minimal
+/// n octets, aligned (§12.1, §11.5.7.4). A value past the root is not
+/// derived.
+pub(crate) fn bit_rate(b: &mut Bits, v: u64) {
+    assert!(
+        v <= 4_000_000_000_000,
+        "a BitRate extension value is not derived"
+    );
+    let be = v.to_be_bytes();
+    let skip = be.iter().take_while(|o| **o == 0).count().min(7);
+    b.bit(false)
+        .field((8 - skip) as u64 - 1, 3)
+        .octets(&be[skip..]);
 }
 
 /// The AMF-UE-NGAP-ID IE value.

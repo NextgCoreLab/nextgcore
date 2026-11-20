@@ -4283,6 +4283,75 @@ mod tests {
         ecs_role::clear_registry_for_test();
     }
 
+    /// **#2226** (R42 on #2218): the caller's own typed certificate decides even
+    /// when a token is present. The token here names the certificate's own
+    /// instance, so the token/certificate agreement check passes and only the
+    /// certificate rule is left to refuse. An `[AMF]` or `[EES, AMF]`
+    /// certificate with such a token is 403 and stores nothing. Control: `[EES]`
+    /// with the same agreeing token registers, so the token is not refused for
+    /// some other reason.
+    ///
+    /// REVERT-VERIFIED: with `require_ees_type` admitting a token before it looks
+    /// at the certificate, "an AMF certificate with an agreeing token" is 201.
+    #[test]
+    fn the_certificate_decides_when_the_token_agrees_with_it_2226() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ecs_role::clear_registry_for_test();
+        ecs_role::set_for_test(true);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        const INSTANCE: &str = "22260000-0000-4000-8000-0000000000e1";
+        let register = |ees: &str, types: &[&str]| {
+            let body = serde_json::json!({
+                "eesProf": {"eesId": ees, "endPt": {"uri": "http://10.0.0.9:7814"}},
+            });
+            let mut r = SbiRequest::post("/eecs-eesregistration/v1/registrations")
+                .with_json_body(&body)
+                .expect("serialize")
+                .with_header(
+                    "Authorization",
+                    bearer_sub(&sk, "k1", ecs_role::SCOPE_EES_REGISTRATION, INSTANCE),
+                );
+            r.peer_cert_nf_instance_id = Some(INSTANCE.into());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            block_on(ees_sbi_request_handler(r))
+        };
+        let stored = |ees: &str| {
+            ecs_role::registered_eess()
+                .iter()
+                .any(|s| s.registration.ees_prof.ees_id == ees)
+        };
+        let control = register("ees-2226-ees", &["EES"]);
+        let amf = register("ees-2226-amf", &["AMF"]);
+        let mixed = register("ees-2226-mixed", &["EES", "AMF"]);
+        let (amf_stored, mixed_stored) = (stored("ees-2226-amf"), stored("ees-2226-mixed"));
+        ecs_role::set_for_test(false);
+        ecs_role::clear_registry_for_test();
+
+        assert_eq!(
+            control.status, 201,
+            "control: an [EES] certificate with an agreeing token registers: {:?}",
+            control.http.content
+        );
+        assert_eq!(
+            amf.status, 403,
+            "an AMF certificate with an agreeing token: {:?}",
+            amf.http.content
+        );
+        assert!(
+            !amf_stored,
+            "an AMF certificate with an agreeing token: nothing stored"
+        );
+        assert_eq!(
+            mixed.status, 403,
+            "an [EES, AMF] certificate with an agreeing token: {:?}",
+            mixed.http.content
+        );
+        assert!(!mixed_stored, "an [EES, AMF] certificate: nothing stored");
+    }
+
     /// An `eecs-*` route must not require an EES OAuth2 scope. The ECS APIs are a
     /// different reference point (EDGE-4/EDGE-6) with different consumers, and gating
     /// them on an `eees-*` scope would make an EEC's bootstrap need an EAS's token.
