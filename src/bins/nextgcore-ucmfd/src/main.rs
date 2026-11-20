@@ -3073,6 +3073,28 @@ mod tests {
     /// instance as at startup, so the NEF is admitted, an AF's token is refused,
     /// and every lookup names UCMF.
     ///
+    /// #2141 (R40): ucmfd's startup registers its self instance (and the NRF
+    /// URI the lookup asks) before the listener serves.
+    ///
+    /// REVERT-VERIFIED: with the `register_self_instance` call removed from
+    /// `main`, this fails at "startup".
+    #[test]
+    fn startup_registers_the_self_instance_before_the_listener_serves_2141() {
+        let src = include_str!("main.rs");
+        let main = &src[src.find("async fn main(").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("end of main")];
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("startup: {needle}"))
+        };
+        let serve = at(".start(ucmf_sbi_request_handler)");
+        assert!(
+            at("register_self_instance(") < serve,
+            "startup: self instance first"
+        );
+        assert!(at("set_nrf_uri(") < serve, "startup: NRF URI first");
+    }
+
     /// REVERT-VERIFIED: with UCMF dropped from the stand-in NEF profile (nefd's
     /// list before #2141), the NEF is refused and the `NEF via the SCP`
     /// assertion fails.

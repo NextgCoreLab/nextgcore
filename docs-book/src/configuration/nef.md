@@ -6,7 +6,7 @@ The NEF (Network Exposure Function, `nextgcore-nefd`, TS 23.501 §6.2.5) exposes
 - **Device Triggering** (TS 29.122 §5.10): `POST /3gpp-device-triggering/v1/{scsAsId}/transactions`.
 - **`Nnef_EventExposure`** (TS 29.591): `POST /nnef-eventexposure/v1/subscriptions`, `DELETE .../subscriptions/{subId}`, and the producer notification sink `POST /nnef-eventexposure/v1/notify/{subId}`, which forwards AMF/UDM notifications to the AF's `notificationDestination` as a TS 29.122 MonitoringNotification.
 
-It registers with the NRF as `nfType: NEF` advertising `nnef-eventexposure`, with `allowedNfTypes` `[AF, AMF, UDM, SCP, UCMF]`. UCMF was added in #2141: the UCMF discovers the NEF to verify a NEF provisioner's NF type, and the NRF hides a profile from a requester that list leaves out. PFD management, traffic influence and parameter provision are out of scope (`src/bins/nextgcore-nefd/src/main.rs` module docs).
+It registers with the NRF as `nfType: NEF` advertising `nnef-eventexposure`, with `allowedNfTypes` `[AF, AMF, UDM, SCP, UCMF]`. UCMF was added in #2141: the UCMF discovers the NEF to verify a NEF provisioner's NF type, and the NRF hides a profile from a requester that list leaves out. Because the NRF also grants NEF service access tokens by this list, the UCMF can now obtain NEF access tokens too. PFD management, traffic influence and parameter provision are out of scope (`src/bins/nextgcore-nefd/src/main.rs` module docs).
 
 No compose file, k8s manifest or Helm chart in this repo runs `nefd`, and no `nef.yaml` is shipped.
 

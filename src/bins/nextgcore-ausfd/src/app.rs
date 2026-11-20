@@ -2317,7 +2317,26 @@ mod self_instance_tests_2141 {
     /// `requester-nf-type` is registered before serving, with or without an
     /// advertised host.
     ///
-    /// REVERT-VERIFIED: with `register_self_instance` empty, this fails.
+    /// REVERT-VERIFIED: with the startup call removed from `main`, the
+    /// `startup` test below fails; with `register_self_instance` empty, this
+    /// one does.
+    #[test]
+    fn startup_registers_the_self_instance_before_the_listener_serves_2141() {
+        let src = include_str!("app.rs");
+        let main = &src[src.find("pub async fn run(").expect("startup fn")..];
+        let main = &main[..main.find("\n}\n").expect("end of main")];
+        let register = main
+            .find("register_self_instance(")
+            .expect("startup: main registers the self instance");
+        let serve = main
+            .find(".start(ausf_sbi_request_handler)")
+            .expect("main starts the listener");
+        assert!(
+            register < serve,
+            "startup: registered before the listener serves"
+        );
+    }
+
     #[tokio::test]
     async fn ausfd_registers_its_self_instance_before_serving_2141() {
         for host in [None, Some("10.0.0.21")] {
