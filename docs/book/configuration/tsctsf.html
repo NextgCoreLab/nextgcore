@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -244,7 +244,12 @@ subscription (no <code>transactionRefId</code>) is notified for every transactio
 subscriber that named none asked for everything.</p>
 <h3 id="administrative-route-not-a-3gpp-service-operation"><a class="header" href="#administrative-route-not-a-3gpp-service-operation">Administrative route (not a 3GPP service operation)</a></h3>
 <p><code>POST /ntsctsf-time-synchronization/v1/admin/capability-change</code> fans a capability
-change out to every <code>CapsSubscribe</code> subscriber and answers <code>200 {"notified": N}</code>.</p>
+change out to every <code>CapsSubscribe</code> subscriber and answers <code>200 {"notified": N}</code>.
+Since #1971 it is served <strong>only on the loopback admin listener</strong> (<code>--admin-port</code>,
+<code>--admin-addr</code>, which must be a loopback address or startup fails), never on the SBI,
+where it answers 404. Any NF that passed the SBI gate could otherwise push a
+CapsNotify with arbitrary content to every subscriber. With no <code>--admin-port</code> there
+is no admin listener at all.</p>
 <p>It exists because the 5GS capability change that would trigger <code>CapsNotify</code> has <strong>no
 in-tree source</strong> — reporting one needs the capability leg tracked in #284 — and
 without a trigger the notify path would be unreachable in principle. It answers a
@@ -290,6 +295,8 @@ NF’s own invention rather than a name a conformant consumer knows.</p>
 <tr><td><code>--sbi-port</code></td><td><code>7819</code></td><td>SBI port.</td></tr>
 <tr><td><code>--tls</code>, <code>--tls-cert</code>, <code>--tls-key</code></td><td>off / unset</td><td>TLS for the SBI server.</td></tr>
 <tr><td><code>--nrf-uri</code></td><td><code>http://127.0.0.1:7777</code></td><td>NRF location for registration and the OAuth2 JWKS.</td></tr>
+<tr><td><code>--admin-port</code></td><td>unset</td><td>Port of the admin listener serving <code>admin/capability-change</code> (#1971). Unset: no admin listener.</td></tr>
+<tr><td><code>--admin-addr</code></td><td><code>127.0.0.1</code></td><td>Address of the admin listener; anything but loopback refuses to start (#1971).</td></tr>
 <tr><td><code>--nf-instance-id</code></td><td>generated UUID</td><td>NF Instance ID.</td></tr>
 <tr><td><code>--max-configs</code></td><td><code>4096</code></td><td>Capacity cap, applied <strong>per collection</strong> (configurations, capability subscriptions, ASTI configurations, QoS/TSC sessions and their subscriptions). Exhaustion answers <code>507</code>.</td></tr>
 </tbody>
@@ -297,30 +304,49 @@ NF’s own invention rather than a name a conformant consumer knows.</p>
 </div>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>All three services are advertised to the NRF.</strong> The NFProfile lists
+<li>
+<p><strong>Resources are bound to their creator (#1865, #1937).</strong> Time-sync configurations, ASTI configurations, QoS/TSC sessions and both kinds of subscription record the verified identity of the AF/NEF that created them (<code>nextgcore_sbi::owner_binding</code>: client certificate unless it names a relay, else token <code>sub</code>; the two must agree). GET, PATCH, PUT and DELETE by anyone else are refused 403 before anything is read or changed. Under the <code>production</code> SBI profile an anonymous create is refused.</p>
+</li>
+<li>
+<p><strong>All three services are advertised to the NRF.</strong> The NFProfile lists
 <code>ntsctsf-time-synchronization</code>, <code>ntsctsf-asti</code> and <code>ntsctsf-qos-tsctsf</code>, so the
 profile and the router change together — advertising one while serving three makes
 the other two undiscoverable, and advertising services that are not served would be
-worse.</li>
-<li><strong>All state is in-memory</strong> (<code>RwLock&lt;HashMap&lt;..&gt;&gt;</code>), matching the other small NFs.
-There is no state file, so every configuration and subscription is lost on restart.</li>
-<li><strong>Resource ids are minted by the server, never taken from the request.</strong> A
+worse.</p>
+</li>
+<li>
+<p><strong>All state is in-memory</strong> (<code>RwLock&lt;HashMap&lt;..&gt;&gt;</code>), matching the other small NFs.
+There is no state file, so every configuration and subscription is lost on restart.</p>
+</li>
+<li>
+<p><strong>Resource ids are minted by the server, never taken from the request.</strong> A
 consumer-supplied <code>subscriptionId</code> would let one AF address another’s subscription
-resource.</li>
-<li><strong>Unmodelled optional members survive a round trip.</strong> A configuration is stored
+resource.</p>
+</li>
+<li>
+<p><strong>Unmodelled optional members survive a round trip.</strong> A configuration is stored
 both as typed IEs and as the body it arrived in, and a GET or an update response
 overlays the typed members on the original — so a parameter this build does not
-model is returned rather than silently dropped.</li>
-<li><strong>Notifications are best-effort.</strong> A failed notification is logged and never
+model is returned rather than silently dropped.</p>
+</li>
+<li>
+<p><strong>Notifications are best-effort.</strong> A failed notification is logged and never
 propagated to the consumer whose request triggered it: letting an unreachable AF
 fail the operation that changed the configuration would be a worse outcome than a
 missed notification. A notification target with no usable host is refused rather
-than guessed at, because notifying the wrong node is worse than not notifying.</li>
-<li><strong>OAuth2</strong> producer enforcement mirrors dccfd: enable with
+than guessed at, because notifying the wrong node is worse than not notifying.</p>
+</li>
+<li>
+<p><strong>OAuth2</strong> producer enforcement mirrors dccfd: enable with
 <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1</code> or <code>tsctsf.sbi.oauth2.require: true</code>; tokens are
-verified against the NRF JWKS with audience <code>TSCTSF</code>.</li>
-<li><strong>Environment variables:</strong> <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code>, <code>TSCTSF_ACTUATION</code>,
-<code>PCF_URI</code> and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (default <code>http://jaeger:4317</code>).</li>
+verified against the NRF JWKS with audience <code>TSCTSF</code>.
+The outbound token client is installed under the knob or the <code>production</code> SBI
+profile (#1665).</p>
+</li>
+<li>
+<p><strong>Environment variables:</strong> <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code>, <code>TSCTSF_ACTUATION</code>,
+<code>PCF_URI</code> and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (default <code>http://jaeger:4317</code>).</p>
+</li>
 </ul>
 <h2 id="actuation-284--off-by-default"><a class="header" href="#actuation-284--off-by-default">Actuation (#284) — off by default</a></h2>
 <p>Before #284 a stored configuration did <strong>nothing</strong>: no PCF was contacted, no
@@ -369,6 +395,14 @@ nothing must not wake every subscriber.
 <code>POST /ntsctsf-time-synchronization/v1/admin/capability-change</code> is retained as a
 <strong>test-only shim</strong> and is documented as such in the code: it is not a capability
 source and anything relying on it in a deployment is relying on a shim.</p>
+<p><strong>A Delete the PCF never accepts is not forgotten (#1754, #1817).</strong> A refused or
+undelivered Delete keeps the <code>appSessionId</code> and is retried 5 times (1, 2, 4, 8,
+16 s). After that it is parked and retried every 30 s (one pass sends for at most
+30 s) until the PCF answers 2xx or 404. At most 4096 are parked, and one more evicts (and forgets) the oldest, logged
+at error. The <code>nextgcore_tsctsf_pcf_app_session_deletes_pending</code> gauge and
+<code>..._delete_reconciled_total{result}</code> counter are on <code>/metrics</code>
+(<code>NEXTGCORE_METRICS_BIND</code>, loopback by default, : <code>TSCTSF_METRICS_PORT</code>, 9090). The
+set is in memory and does not survive a restart.</p>
 <p><strong>Limits worth knowing:</strong></p>
 <ul>
 <li><strong>The UPF’s <code>tsn_bridge</code> is still <code>None</code>.</strong> Driving it needs the N4 leg — a PFCP

@@ -296,8 +296,11 @@ fn nf_type_cache() -> std::sync::MutexGuard<'static, NfTypeCache> {
 }
 
 fn nf_type_key(nrf_uri: &str, nf_type: &str, id: &str) -> String {
-    // A space cannot occur in a URI, an NF type or a UUID, so the parts cannot
-    // run into each other.
+    // #2139: a space cannot occur in a URI or an NF type, so the first two
+    // parts cannot run into anything. The id comes last: it can be a token
+    // `sub`, which is not validated as a UUID and may itself hold a space, but
+    // as the final field it cannot shift where the URI or the type ends, so two
+    // different (URI, type, id) triples still cannot share a key.
     format!(
         "{} {} {}",
         nrf_uri.trim().trim_end_matches('/'),

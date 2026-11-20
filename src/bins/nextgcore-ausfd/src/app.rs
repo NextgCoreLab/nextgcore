@@ -1045,47 +1045,24 @@ fn caller_identity(request: &SbiRequest) -> Result<Option<String>, String> {
 
 /// [`caller_identity`] under the profile `production` says (#2065).
 ///
-/// Under production a certificate that names NO NF type (RFC 9310 NFTypes) is not
-/// an identity: it cannot be told from an untyped relay's, which would otherwise
-/// own every context started through it. With a token, the token's `sub` is the
-/// caller; without one the caller is refused. Under dev it still counts as the
-/// caller's (the rule of `nextgcore_sbi::owner_binding`, #2065).
+/// #2132: the shared rule, `nextgcore_sbi::owner_binding::verified_consumer_id_with`
+/// (CONVENTIONS: caller identity always comes from it), so ausfd and every
+/// other owner_binding NF agree on who the caller is (TS 33.501 §13.3.1,
+/// §13.4.1):
+/// - a typed, non-relay certificate is the caller, and a token naming another
+///   instance refuses;
+/// - a relay's certificate (SCP, or SEPP for #1948's roaming signalling) is
+///   never the caller: the relayed token's `sub` is, and alone it is no
+///   identity (`Ok(None)`). Before #2132 a pure SCP certificate alone was
+///   taken as the caller here;
+/// - under production a certificate naming no NF type is no identity on its
+///   own (#2065); with a token the token's `sub` is the caller. Under dev it
+///   still counts as the caller's;
+/// - a certificate naming a relay type AND another NF type is that NF's
+///   (#1928, and the shared rule since #2123), so a token naming another
+///   instance refuses.
 fn caller_identity_with(request: &SbiRequest, production: bool) -> Result<Option<String>, String> {
-    let verified = |v: &Option<String>| {
-        v.as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let token = verified(&request.oauth2_subject);
-    let cert = verified(&request.peer_cert_nf_instance_id);
-    if production && cert.is_some() && request.peer_cert_nf_types.is_empty() {
-        return token.map(Some).ok_or_else(|| {
-            "the client certificate names no NF type, so it cannot be told from a relay's, \
-             and no access token was presented"
-                .to_string()
-        });
-    }
-    match (token, cert) {
-        (Some(t), Some(c)) if !t.eq_ignore_ascii_case(&c) => {
-            // #1928: a certificate naming the SCP AND another NF type could
-            // otherwise present any token `sub`; only a pure SCP certificate
-            // is exempt.
-            // #1948: and a pure SEPP certificate: roaming signalling relayed
-            // over N32-f by the home SEPP carries the visited AMF's token
-            // (TS 33.501 §13.2, §13.4.1.2). What a SEPP-relayed caller may do
-            // is narrowed by `refuse_sepp_relayed`.
-            if relayed_by(request, "SCP") || relayed_by(request, "SEPP") {
-                Ok(Some(t))
-            } else {
-                Err(format!(
-                    "the access token names NF {t} but the client certificate names NF {c}"
-                ))
-            }
-        }
-        (Some(t), _) => Ok(Some(t)),
-        (None, c) => Ok(c),
-    }
+    nextgcore_sbi::owner_binding::verified_consumer_id_with(request, production)
 }
 
 /// #1928/#1948: whether the verified client certificate names `relay` (SCP or
@@ -4078,7 +4055,7 @@ mod tests {
     fn a_token_naming_another_nf_than_the_certificate_is_refused_1907() {
         let mixed = as_nf_1872(SbiRequest::default(), Some(AMF_A_1872), Some(AMF_B_1872));
         let err = caller_identity(&mixed).expect_err("mismatched identities");
-        assert!(err.contains("client certificate names"), "{err}");
+        assert!(err.contains("name different NF instances"), "{err}");
         let mut scp = mixed.clone();
         scp.peer_cert_nf_types = vec!["SCP".into()];
         assert_eq!(
@@ -4091,7 +4068,50 @@ mod tests {
             Some(AMF_A_1872),
             Some(&AMF_A_1872.to_uppercase()),
         );
-        assert_eq!(caller_identity(&same).unwrap().as_deref(), Some(AMF_A_1872));
+        // #2132: the shared rule names the caller by its certificate's spelling
+        // when certificate and token agree; NF Instance IDs compare without case
+        // (TS 29.571), as every ausfd owner check does.
+        assert!(caller_identity(&same)
+            .unwrap()
+            .is_some_and(|c| c.eq_ignore_ascii_case(AMF_A_1872)));
+    }
+
+    /// #2132: the caller is the shared `owner_binding` identity. A relay's
+    /// certificate alone (a pure SCP's, or a pure SEPP's) is no caller in
+    /// either profile; with the relayed token the token's `sub` is; a typed AMF
+    /// certificate is its own caller.
+    ///
+    /// REVERT-VERIFIED: with `caller_identity_with` back to its own
+    /// `(None, c) => Ok(c)` match, the pure SCP certificate alone is the
+    /// caller and the first assertion fails.
+    #[test]
+    fn a_relay_certificate_alone_is_no_caller_2132() {
+        for production in [true, false] {
+            for relay in ["SCP", "SEPP"] {
+                let mut alone = SbiRequest::default();
+                alone.peer_cert_nf_instance_id = Some(AMF_A_1872.into());
+                alone.peer_cert_nf_types = vec![relay.into()];
+                assert_eq!(
+                    caller_identity_with(&alone, production),
+                    Ok(None),
+                    "a {relay} certificate alone is no caller (production={production})"
+                );
+                let mut relayed = alone.clone();
+                relayed.oauth2_subject = Some(AMF_B_1872.into());
+                assert_eq!(
+                    caller_identity_with(&relayed, production)
+                        .unwrap()
+                        .as_deref(),
+                    Some(AMF_B_1872),
+                    "through a {relay} the token names the consumer"
+                );
+            }
+            let amf = as_nf_1872(SbiRequest::default(), None, Some(AMF_A_1872));
+            assert_eq!(
+                caller_identity_with(&amf, production).unwrap().as_deref(),
+                Some(AMF_A_1872)
+            );
+        }
     }
 
     /// #2065: under production a certificate naming no NF type is no identity

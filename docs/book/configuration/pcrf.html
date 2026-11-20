@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -179,12 +179,12 @@
                     <main>
                         <h1 id="pcrf-configuration"><a class="header" href="#pcrf-configuration">PCRF Configuration</a></h1>
 <p>The PCRF (Policy and Charging Rules Function, <code>nextgcore-pcrfd</code>) is the 4G/EPC policy node in NextGCore’s dual 5G+4G core. It is a pure Diameter server (RFC 6733 responder, per the <code>fd_path.rs</code> module comment): PCEFs (P-GW) connect on <strong>Gx</strong> (TS 29.212 §5.6 messages / §5.3 AVPs, as cited in the daemon source) and AFs (P-CSCF) connect on <strong>Rx</strong> (TS 29.214 §4.4.1 AAR, §4.4.4 STR, §4.4.6 ASR, per code comments). Both applications share one Diameter listener; incoming requests are dispatched by Application-Id (<code>dispatch_request</code> in <code>fd_path.rs</code>). The PCRF answers Gx CCR with CCA and Rx AAR/STR with AAA/STA, and originates Gx RAR (Charging-Rule-Install/Remove) and Rx ASR over the peer connections the remote nodes established. There is no SBI/HTTP surface and no NRF interaction — this NF is Diameter-only.</p>
-<p>Configuration is almost entirely command-line flags. The daemon accepts a YAML file path (default <code>/etc/nextgcore/pcrf.yaml</code>, overridable with <code>-c/--config</code>), but the parser behind it — <code>pcrf_context_parse_config</code> in <code>src/bins/nextgcore-pcrfd/src/context.rs</code> — is a stub that returns <code>Ok(())</code> without reading the file. <code>main.rs</code> only checks that the file exists and logs a message. Every operative knob (Diameter identity/realm, listen address, session limit, log level) is a clap flag on the <code>Args</code> struct in <code>src/bins/nextgcore-pcrfd/src/main.rs</code>.</p>
+<p>Configuration comes from a YAML file (default <code>/etc/nextgcore/pcrf.yaml</code>, <code>-c/--config</code>) and from the clap flags of the <code>Args</code> struct in <code>src/bins/nextgcore-pcrfd/src/main.rs</code>. The file’s <code>pcrf:</code> section is parsed by <code>pcrf_context_parse_config</code> in <code>src/bins/nextgcore-pcrfd/src/context.rs</code>. It supplies the Diameter identity, realm and listen address, directly (<code>pcrf.diameter</code>) or through the freeDiameter file named by <code>pcrf.freeDiameter</code>. A flag passed on the command line beats both (see “Diameter identity precedence” below). The top-level <code>db_uri</code> and <code>logger.level</code> are read too. The session limit and the state file are flags only.</p>
 <blockquote>
-<p><strong>Honesty note:</strong> PCRF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E deployments, not by third-party conformance certification. Three things an operator should know up front: (1) <strong>the YAML config file is not parsed at all</strong> — it is decorative (see below); (2) the freeDiameter-style config shipped in <code>docker/rust/configs/epc/freeDiameter/pcrf.conf</code> is <strong>never read</strong> by this Rust binary (the <code>--diameter-config</code> flag is accepted but unused; identity/realm/address come from other flags); (3) although a subscriber-policy DB lookup exists in the code (<code>lookup_subscriber_policy</code> via <code>nextgcore-dbi</code>), this binary never initializes the MongoDB connection, so <strong>every session gets the built-in default policy profile</strong> (QCI 9, APN-AMBR 100 Mbps DL / 50 Mbps UL).</p>
+<p><strong>Honesty note:</strong> PCRF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E deployments, not by third-party conformance certification. Three things an operator should know up front: (1) <strong>part of the YAML config file is inert</strong> (<code>logger.file.path</code>, <code>global.max.*</code>; see below), and unknown keys anywhere in it are ignored without a warning, so a misspelt <code>pcrf.diameter</code> key silently keeps the lower-precedence value; (2) the freeDiameter file is read <strong>only</strong> through the YAML’s <code>pcrf.freeDiameter</code> key, and only for its Identity, Realm, first ListenOn and Port. The <code>--diameter-config</code> flag is accepted but never read; (3) the subscriber store named by the top-level <code>db_uri</code> (or <code>--db-uri</code>) is opened at startup (#1459) and each Gx session’s QCI, ARP and APN-AMBR come from the subscriber’s provisioned session for the APN; a configured store that cannot be reached <strong>fails startup</strong>.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
-<p>From <code>nextgcore/docker/rust/configs/epc/pcrf.yaml</code> (mounted read-only at <code>/etc/nextgcore/pcrf.yaml</code> by <code>docker-compose-epc.yml</code>, which starts the daemon with <code>-c /etc/nextgcore/pcrf.yaml</code> and no other flags):</p>
+<p>From <code>nextgcore/docker/rust/configs/epc/pcrf.yaml</code>. <code>docker-compose-epc.yml</code> mounts it read-only at <code>/etc/nextgcore/pcrf.yaml</code>, mounts <code>configs/epc/freeDiameter/</code> at <code>/etc/freeDiameter</code>, and starts the daemon with <code>-c /etc/nextgcore/pcrf.yaml --diameter-addr 0.0.0.0:3868</code>:</p>
 <pre><code class="language-yaml"># NextGCore PCRF Configuration for Docker EPC Deployment
 # Rust implementation
 
@@ -202,20 +202,54 @@ global:
 
 pcrf:
   freeDiameter: /etc/freeDiameter/pcrf.conf
-  metrics:
-    server:
-      - address: 172.24.0.9
-        port: 9090
+  # Diameter identity for this node. Commented out so this file keeps the
+  # built-in defaults; uncomment and set your PLMN to advertise a real
+  # Origin-Host/Origin-Realm. RFC 6733 6.1 routes and authorizes on
+  # Destination-Realm, so a wrong realm breaks interop with real peers.
+  # TS 23.003 19.2 formats the EPC realm as epc.mncNNN.mccMMM.3gppnetwork.org.
+  # An explicit --diameter-id/--diameter-realm flag overrides these.
+  # diameter:
+  #   identity: pcrf.epc.mnc001.mcc001.3gppnetwork.org
+  #   realm: epc.mnc001.mcc001.3gppnetwork.org
+  #   addr: 172.24.0.9
+  #   port: 3868
 </code></pre>
 <h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
-<p><strong>None.</strong> The daemon deserializes zero fields from the YAML file. There is no <code>#[derive(Deserialize)]</code> config struct anywhere in <code>src/bins/nextgcore-pcrfd/</code>; the config entry point <code>pcrf_context_parse_config(_config_path)</code> in <code>src/bins/nextgcore-pcrfd/src/context.rs</code> is a stub that immediately returns <code>Ok(())</code> (its own comment reads “Note: Implement YAML configuration parsing”). <code>main.rs</code> logs <code>Loading configuration from &lt;path&gt;</code> when the file exists, which can mislead — nothing is loaded. All runtime behavior is driven by the CLI flags below and two environment variables (see Behavior notes).</p>
-<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
-<p>Because parsing is a stub, <strong>every</strong> field in the shipped example file is inert:</p>
+<p><code>main.rs</code> checks whether the <code>-c</code> file exists. A <strong>missing</strong> file is not an error: the daemon starts on the flags and built-in defaults (logged at debug). A file that <strong>exists</strong> is parsed by <code>pcrf_context_parse_config</code>. If it cannot be read or is not valid YAML, <strong>startup fails</strong> (“Failed to parse config …”). A file with no <code>pcrf:</code> section is valid and keeps the defaults. So is a <code>pcrf:</code> section with neither a <code>diameter</code> block nor a <code>freeDiameter</code> key; with only <code>freeDiameter</code>, that file supplies what it states. The top-level <code>db_uri</code> is read separately by <code>resolve_db_uri</code> in <code>main.rs</code> (#1459), and <code>logger.level</code> by the shared <code>nf_log_level</code>.</p>
+<h3 id="pcrfdiameter"><a class="header" href="#pcrfdiameter"><code>pcrf.diameter</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Sets</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>identity</code></td><td>Origin-Host (RFC 6733 §6.3)</td><td>Beaten by <code>--diameter-id</code>.</td></tr>
+<tr><td><code>realm</code></td><td>Origin-Realm (RFC 6733 §6.4)</td><td>Beaten by <code>--diameter-realm</code>.</td></tr>
+<tr><td><code>addr</code></td><td>Host of the shared Gx + Rx listener</td><td>Beaten by <code>--diameter-addr</code>. Without it the host is <code>127.0.0.1</code> (#1308).</td></tr>
+<tr><td><code>port</code></td><td>Port of that listener</td><td>Beaten by <code>--diameter-addr</code>. Without it the port is <code>3868</code>.</td></tr>
+<tr><td><code>port_tls</code></td><td>Stored</td><td><strong>Inert</strong>: pcrfd opens no TLS listener.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Each key is optional, and an absent key leaves the lower-precedence value in place. <code>addr</code> and <code>port</code> fall back independently, so setting only one of them keeps the default for the other. Any other key under <code>pcrf.diameter</code> is ignored.</p>
+<h3 id="pcrffreediameter"><a class="header" href="#pcrffreediameter"><code>pcrf.freeDiameter</code></a></h3>
+<p>A path to a freeDiameter-style <code>.conf</code>. It is loaded with <code>nextgcore_diameter::fd_conf::FreeDiameterConf::load</code> <strong>before</strong> <code>pcrf.diameter</code> is applied, so it is the lower-precedence source:</p>
 <ul>
-<li><strong><code>db_uri</code> is inert.</strong> The binary has a <code>--db-uri</code> flag too, but neither is ever passed to <code>nextgcore_dbi_init</code>/<code>nextgcore_mongoc_init</code> — no MongoDB connection is made by this daemon.</li>
+<li><code>Identity</code>, <code>Realm</code>, the <strong>first</strong> <code>ListenOn</code> and <code>Port</code> set the identity, realm, listen host and listen port. <code>SecPort</code> is stored like <code>port_tls</code> and is just as inert.</li>
+<li><code>ConnectPeer</code> is parsed and dropped, because the PCRF never dials out: it only accepts inbound connections. The flags (<code>No_IPv6</code>, <code>No_TCP</code>, <code>NoRelay</code>, …) are also parsed and not applied.</li>
+<li>Any other directive is logged at info as “directives not interpreted”.</li>
+<li>A directive from the list above whose value does not parse (<code>Port = "abc"</code>, <code>Port = 70000</code>, <code>Port = 0</code>, <code>ListenOn = ""</code>, or a ConnectPeer whose identity or <code>ConnectTo</code> is empty) sets nothing. Each one is logged at WARN as <code>'&lt;Directive&gt; = &lt;value&gt;' does not parse</code>, and the next source applies: the YAML, a flag, or the default. An earlier valid occurrence of the same directive stands.</li>
+<li>A file that cannot be read is a <strong>warning</strong>, not a startup failure, and the daemon continues without it.</li>
+</ul>
+<p>The path is recorded in the context for diagnosis. The <code>--diameter-config</code> flag does not feed this loader and is never read.</p>
+<p>In the shipped Docker EPC deployment this file is <code>docker/rust/configs/epc/freeDiameter/pcrf.conf</code>, which sets Identity <code>pcrf.localdomain</code>, Realm <code>localdomain</code> and <code>ListenOn 172.24.0.9</code>. Identity and realm match the built-in defaults. Its listen host is overridden by the compose file’s <code>--diameter-addr 0.0.0.0:3868</code>.</p>
+<h3 id="diameter-identity-precedence"><a class="header" href="#diameter-identity-precedence">Diameter identity precedence</a></h3>
+<p><code>resolve_diameter_identity</code> in <code>main.rs</code> resolves each value as <strong>CLI flag &gt; <code>pcrf.diameter</code> &gt; <code>pcrf.freeDiameter</code> file &gt; built-in default</strong>. The built-in defaults are <code>pcrf.localdomain</code> / <code>localdomain</code> / <code>127.0.0.1:3868</code>. The flags have no clap default, so only an explicitly passed flag outranks the file. <code>--diameter-addr</code> takes a whole <code>host:port</code> and so replaces both halves. The resolved identity, realm and listen address are logged at startup (“PCRF Diameter identity: …”).</p>
+<h3 id="other-keys"><a class="header" href="#other-keys">Other keys</a></h3>
+<ul>
+<li><strong><code>db_uri</code> opens the subscriber store (#1459).</strong> The top-level <code>db_uri</code> (or <code>--db-uri</code>, which wins) names the MongoDB that each CCR’s policy is read from. It is opened before the Diameter listener; an unreachable server is retried 5 times, 2 s apart, and then <strong>fails startup</strong>, as does a malformed URI. A SIGTERM during that wait exits cleanly. Each attempt waits one server selection, which nextgcore-dbi bounds unless the URI sets <code>serverSelectionTimeoutMS</code> itself. Store reads run with <code>block_in_place</code>, so a slow read does not hold a Diameter runtime worker. With no <code>db_uri</code> configured the PCRF still starts, logs a warning, and answers the built-in default (see Behavior notes). Before #1459 the key was never read.</li>
 <li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> Logging goes to stderr via <code>env_logger</code>. The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). The <code>-l/--log-file</code> flag is also accepted but never used.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The only session limit is the <code>--max-sess</code> flag (and even that is stored, not enforced — see Behavior notes).</li>
-<li><strong><code>pcrf.freeDiameter</code> is inert.</strong> Neither the YAML pointer (<code>/etc/freeDiameter/pcrf.conf</code>) nor the CLI default (<code>--diameter-config /etc/nextgcore/freeDiameter/pcrf.conf</code>) is ever opened. The shipped <code>docker/rust/configs/epc/freeDiameter/pcrf.conf</code> (Identity <code>pcrf.localdomain</code>, Realm <code>localdomain</code>, <code>ListenOn 172.24.0.9</code>, <code>ConnectPeer smf.localdomain</code>) is mounted into the container but ignored; the daemon’s actual identity/realm/listen address come from <code>--diameter-id</code>/<code>--diameter-realm</code>/<code>--diameter-addr</code>, whose defaults happen to match the conf’s Identity/Realm. The PCRF never dials out to peers (<code>ConnectPeer</code> has no equivalent): it only accepts inbound connections.</li>
 <li><strong>No <code>pcrf.metrics.server[]</code></strong> (removed from the shipped config, #1312): no Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).</li>
 </ul>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
@@ -226,17 +260,17 @@ pcrf:
 <tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/pcrf.yaml</code></td><td>Configuration file path. Only its existence is checked; contents are ignored (stub parser).</td></tr>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/pcrf.yaml</code></td><td>Configuration file path. A missing file is skipped; a present one that cannot be read or parsed fails startup (see YAML parameters).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but <strong>never used</strong> — logs always go to stderr.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
-<tr><td><code>--diameter-config</code></td><td>path</td><td><code>/etc/nextgcore/freeDiameter/pcrf.conf</code></td><td>FreeDiameter configuration file — accepted but <strong>never read</strong>.</td></tr>
-<tr><td><code>--diameter-id</code></td><td>string</td><td><code>pcrf.localdomain</code></td><td>Diameter Origin-Host identity of this PCRF.</td></tr>
-<tr><td><code>--diameter-realm</code></td><td>string</td><td><code>localdomain</code></td><td>Diameter Origin-Realm.</td></tr>
-<tr><td><code>--diameter-addr</code></td><td>socket addr</td><td><code>127.0.0.1:3868</code> (loopback, #1308)</td><td>Diameter listen address; Gx and Rx share this one listener. Must parse as <code>host:port</code> or startup fails with “Invalid –diameter-addr”.</td></tr>
+<tr><td><code>--diameter-config</code></td><td>path</td><td><code>/etc/nextgcore/freeDiameter/pcrf.conf</code></td><td>Accepted but <strong>never read</strong>. The freeDiameter file that is read is the one the YAML’s <code>pcrf.freeDiameter</code> names.</td></tr>
+<tr><td><code>--diameter-id</code></td><td>string</td><td><code>pcrf.diameter.identity</code>, else the freeDiameter Identity, else <code>pcrf.localdomain</code></td><td>Diameter Origin-Host identity of this PCRF. Beats the config file.</td></tr>
+<tr><td><code>--diameter-realm</code></td><td>string</td><td><code>pcrf.diameter.realm</code>, else the freeDiameter Realm, else <code>localdomain</code></td><td>Diameter Origin-Realm. Beats the config file.</td></tr>
+<tr><td><code>--diameter-addr</code></td><td>socket addr</td><td>from <code>pcrf.diameter.addr</code>/<code>port</code>, else the freeDiameter ListenOn/Port, else <code>127.0.0.1:3868</code> (loopback, #1308)</td><td>Diameter listen address; Gx and Rx share this one listener. Beats the config file. The resolved address must parse as <code>host:port</code>, or startup fails with “Invalid Diameter listen address”.</td></tr>
 <tr><td><code>--max-sess</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of sessions. Stored in the context and logged at startup, but <strong>no code path enforces it</strong> — <code>gx_session_add</code> never checks it.</td></tr>
-<tr><td><code>--db-uri</code></td><td>string</td><td>unset</td><td>MongoDB URI — parsed but never wired to the DB layer.</td></tr>
+<tr><td><code>--db-uri</code></td><td>string</td><td>the YAML <code>db_uri</code>, else unset</td><td>Subscriber store (MongoDB) URI; beats the YAML (#1459). A configured store that cannot be reached fails startup.</td></tr>
 <tr><td><code>--db-name</code></td><td>string</td><td><code>nextgcore</code></td><td>Database name — parsed but never used.</td></tr>
 <tr><td><code>--state-file</code></td><td>path</td><td>unset</td><td>JSON snapshot file for the Gx/Rx session tables (#57). Falls back to <code>NEXTGCORE_PCRF_STATE_FILE</code>; an empty value is treated as unset. With neither set the PCRF is memory-only.</td></tr>
 </tbody>
@@ -289,7 +323,7 @@ every call, so it is not a stable per-instance restart indicator (RFC 6733 §8.1
 and the signalling option has no working foundation today. That is filed as its own
 diameter-layer issue; persistence needs nothing from it.</p>
 <ul>
-<li><strong>Policy is always the default profile in practice:</strong> <code>build_subscriber_session_data</code> (<code>gx_path.rs</code>) tries <code>nextgcore_dbi_subscription_data</code>, but since this binary never initializes the Mongo client, the lookup always fails and it falls back to the built-in <code>default_profile</code> — QCI 9, ARP derived from the QCI table, APN-AMBR 100,000,000 bps down / 50,000,000 bps up, and one catch-all non-GBR PCC rule named <code>pcrf-&lt;apn&gt;-default</code> (precedence 100, bidirectional <code>permit ... ip from any to assigned</code> IPFilterRules).</li>
+<li><strong>Policy source:</strong> <code>build_subscriber_session_data</code> (<code>gx_path.rs</code>) reads <code>nextgcore_dbi_subscription_data</code> for the CCR’s IMSI and takes the QCI, ARP and APN-AMBR of the provisioned session whose name is the Called-Station-Id (APN), else the UE-level AMBR. When the store is reachable but holds nothing for the subscriber or APN, or no store is configured, it falls back to the built-in <code>default_profile</code> (below). When the store <strong>cannot be read</strong> at runtime (an outage; each read gives up after one server selection, 1 s by default, #1462), the PCRF does not invent a policy (#1539 review): a CCR-I is answered with Experimental-Result <code>DIAMETER_ERROR_INITIAL_PARAMETERS</code> (5140, vendor 10415), so the PCEF rejects the IP-CAN session establishment (TS 29.212 §4.5.1); a CCR-U is answered 2001 with no QoS or trigger provisioning, so the session keeps the policy the PCEF already enforces; a CCR-T does not read the store. The outage is logged at WARN, at most once per 10 s with a count. The default profile is QCI 9, ARP derived from the QCI table, APN-AMBR 100,000,000 bps down / 50,000,000 bps up, and one catch-all non-GBR PCC rule named <code>pcrf-&lt;apn&gt;-default</code> (precedence 100, bidirectional <code>permit ... ip from any to assigned</code> IPFilterRules).</li>
 <li><strong>Rx session binding (TS 29.214 per code comments):</strong> an AAR is bound to the Gx (IP-CAN) session via the UE IP address; if no Gx session matches, the AAA carries Experimental-Result 5065 <code>IP_CAN_SESSION_NOT_AVAILABLE</code> (vendor 10415). If pushing the derived PCC rules to the PCEF via Gx RAR fails, the AAA carries 5063 <code>REQUESTED_SERVICE_NOT_AUTHORIZED</code>. An STR triggers a Gx RAR with Charging-Rule-Remove and unbinds the Rx session.</li>
 <li><strong>PCRF-initiated requests:</strong> RAR/ASR are sent over the connection the target peer established (looked up by Origin-Host); the answer wait is capped at 5 s (<code>ANSWER_TIMEOUT</code> in <code>fd_path.rs</code>) with no application-level retransmission. If the peer is not connected the send fails immediately.</li>
 <li><strong>Environment variables:</strong> <code>PCRF_RELEASE_RESTARTED_PCEF_SESSIONS</code> (<code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code>; off by default) releases the Gx sessions of a PCEF whose restart was detected from Origin-State-Id (#365); off by default because it drops traffic, while the detection itself is always on. <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry OTLP trace endpoint (default <code>http://jaeger:4317</code>; export failure is silently ignored). <code>RUST_LOG</code> overrides <code>-e/--log-level</code> when set. <code>NEXTGCORE_PCRF_STATE_FILE</code> supplies the durable-state path when <code>--state-file</code> is absent (the flag wins), and <code>PCRF_ASR_ON_RULE_FAILURE</code> (<code>0</code>/<code>false</code>/<code>no</code>/<code>off</code>) suppresses the §4.5.12 ASR. Gx/Rx message counters are held in memory and logged as a summary line at shutdown.</li>

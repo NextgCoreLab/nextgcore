@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -277,11 +277,12 @@ bash e2e-test.sh                   # run the E2E suite against the cluster
 kubectl port-forward -n nextg-system svc/grafana 3000:3000     # dashboards
 kubectl port-forward -n nextg-system svc/prometheus 9090:9090  # metrics
 kubectl port-forward -n nextg-system svc/jaeger 16686:16686    # traces
-kubectl port-forward -n nextg-system svc/nrf 7777:7777         # NRF SBI
+kubectl port-forward -n nextg-system svc/nrf 7777:7777         # NRF SBI, TLS (#1617): https://nrf:7777 with --resolve nrf:7777:127.0.0.1 and ca.crt of Secret nf-tls-nrf
 </code></pre>
 <p>Every Service is ClusterIP: nothing is published on a node port, a load
 balancer or the kind host, and <code>kubectl port-forward</code> listens on 127.0.0.1
 only (#1365).</p>
+<p>The NRF’s <code>nrf.nf_set_allowlist</code> names the stack’s AMF for its AMF Set (#2052; see <a href="configuration/nrf.html">NRF</a>). The Helm chart derives that entry from the AMF’s GUAMI and <code>nfInstanceId</code> (<code>nrf.nfSetAllowlist</code> overrides it). <code>k8s/manifests/configmap.yaml</code> carries it statically: when you change the AMF’s PLMN, <code>amf_id</code> or <code>NEXTGCORE_AMF_INSTANCE_ID</code>, change the entry with it, or the NRF refuses the AMF’s GUAMIs.</p>
 <p>Every NF exposes Prometheus metrics on port 9090 (<code>/metrics</code>); monitoring assets are under <code>k8s/monitoring/</code> and <code>docker/rust/monitoring/</code>. <code>teardown.sh</code> removes the deployment.</p>
 <h2 id="where-configs-live"><a class="header" href="#where-configs-live">Where Configs Live</a></h2>
 <p>Per-NF YAML configs for the Docker stack are under <code>docker/rust/configs/</code>:</p>

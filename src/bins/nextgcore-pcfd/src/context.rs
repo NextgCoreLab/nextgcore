@@ -2280,8 +2280,9 @@ impl PcfContext {
         if !self.state.is_enabled() {
             return;
         }
-        let doc = self.snapshot();
-        if let Err(e) = self.state.persist(&doc) {
+        // #2151: snapshot under the store's write lock, so concurrent persists
+        // publish in snapshot order.
+        if let Err(e) = self.state.persist_with(|| self.snapshot()) {
             // The association exists in memory but not on disk: the request was
             // answered and will not survive a restart.
             log::error!("PCF state was NOT persisted: {e}");

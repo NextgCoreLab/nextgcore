@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -252,6 +252,8 @@ upf:
 <tr><td><code>--max-sessions</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of PFCP sessions (sizes the UPF context).</td></tr>
 <tr><td><code>--no-dataplane</code></td><td>bool</td><td><code>false</code></td><td>Disable the TUN data plane; control-plane-only mode (no user traffic forwarding).</td></tr>
 <tr><td><code>--nrf-uri</code></td><td>string</td><td><code>""</code> (empty = disabled)</td><td>Opt-in NRF base URI (e.g. <code>http://127.0.0.10:7777</code>). When set, the UPF registers a UPF NFProfile and PATCHes a real PFCP-session <code>/load</code> gauge on each heartbeat (code comment cites TS 29.510 §5.2.2.3.2). Empty disables the SBI/NRF plane entirely; NRF failures are log-only and never affect packet forwarding.</td></tr>
+<tr><td><code>--nat-exclude</code></td><td>list</td><td>empty</td><td>DN prefixes the UE subnet is <strong>not</strong> source-NATed toward (#1455): comma-separated IPv4 prefixes or addresses, e.g. <code>10.60.0.0/24</code>; <code>UPF_NAT_EXCLUDE</code> when the flag is not given. Traffic to them leaves with the UE’s own address, so a DN server, EAS or AF can identify the UE by it (TS 23.502 §4.15.10). The exclusions go in a nat chain of their own, <code>UPF-NAT-EXCLUDE</code>, flushed and refilled at every start and jumped to from the head of <code>POSTROUTING</code>, so they also win over a MASQUERADE a container wrapper installed first (the k8s, Helm and EKS manifests do). Any exclusion that cannot be installed refuses startup. Empty: the single MASQUERADE as before (the UPF only flushes a <code>UPF-NAT-EXCLUDE</code> an earlier run left). Duplicates are merged; <code>0.0.0.0/0</code> turns NAT off everywhere and is logged as a warning. See the notes below.</td></tr>
+<tr><td><code>--session-metrics</code></td><td><code>off</code>|<code>seid</code>|<code>seid-ue-ip</code></td><td><code>off</code></td><td>Per-session byte counters on <code>/metrics</code> (#1455): <code>upf_session_ul_bytes_total</code> / <code>upf_session_dl_bytes_total</code>, one series per live PFCP session, labelled <code>seid="0x.."</code> (the UPF SEID as upfd logs it); <code>seid-ue-ip</code> also adds <code>ue_ipv4</code>. Never a SUPI. <code>UPF_SESSION_METRICS</code> when the flag is not given; an unknown value refuses startup. <strong>Unbounded cardinality</strong> (one series per session; <code>--max-sessions</code> does not cap it): opt-in, for deployments with few sessions. Off: <code>/metrics</code> is unchanged.</td></tr>
 </tbody>
 </table>
 </div>
@@ -264,6 +266,8 @@ upf:
 <tbody>
 <tr><td><code>UPF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus <code>/metrics</code> port, including the TUN-path data-plane counters (#581).</td></tr>
 <tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network.</td></tr>
+<tr><td><code>UPF_NAT_EXCLUDE</code></td><td>empty</td><td><code>--nat-exclude</code> when the flag is not given.</td></tr>
+<tr><td><code>UPF_SESSION_METRICS</code></td><td><code>off</code></td><td><code>--session-metrics</code> when the flag is not given.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
 </tbody>
 </table>
@@ -273,9 +277,14 @@ upf:
 </blockquote>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
+<li><strong>PFCP retransmissions:</strong> a retransmitted request from the associated CP function (same Sequence Number, same content, same address and port, TS 29.244 §6.4) is answered with the response the original got and is not executed again, for 12 seconds (T1 3 s for the original and each of N1 = 3 retransmissions; at most 32768 responses are kept). A new Association Setup, or a peer restart detected from the Recovery Time Stamp, forgets them (#1851).</li>
 <li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>
-<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4. URRs provisioned by the SMF are measured and enforced (Volume/Time Quota, #80), Usage Reports are sent, and an explicit Query URR IE is honoured (#428).</li>
+<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4. URRs provisioned by the SMF are measured and enforced (Volume/Time Quota, #80), Usage Reports are sent, and an explicit Query URR IE is honoured (#428). A Query URR Reference (IE 125) beside a Query URR or QAURR is echoed in every usage report that answers the query (#1835). This includes the final report of a URR the same message removes when the query covers it, which then sets IMMER beside TERMR (#1852). A Session Modification carrying both the QAURR flag and a Query URR IE, which TS 29.244 Table 7.5.4.1-1 NOTE 3 makes exclusive, is rejected with cause Mandatory IE incorrect (offending IE PFCPSMReq-Flags), and nothing in it is applied (#1816).</li>
+<li><strong>Local F-TEIDs:</strong> the UPF chooses a TEID when a PDR asks for one (CH, or a zero TEID). A TEID the SMF names itself is reserved in the same pool, so the UPF never chooses it for another session. A PDR naming a TEID another session holds is refused with Rule creation/modification failure, naming the PDR. PDRs of one session may share a TEID (#1834).</li>
 <li><strong>EPC role:</strong> the EPC compose runs a dedicated upfd as PGW-U (<code>docker/rust/configs/epc/pgwu.yaml</code>, which it does not parse either; the flags in <code>docker-compose-epc.yml</code> drive it).</li>
+<li><strong><code>--nat-exclude</code> needs a return route.</strong> The DN sees the UE’s own address, so it must route the UE subnet (e.g. <code>10.45.0.0/16</code>) back via the UPF’s N6 address; without that route the replies go nowhere, and a strict reverse-path filter on the DN may drop even the requests. This is the ordinary “UPF without NAT” DN.</li>
+<li><strong><code>--nat-exclude</code> applies to new flows.</strong> NAT is decided on a connection’s first packet, so a flow that was already masqueraded (for instance across a UPF restart that added the exclusion) stays NATed while its conntrack entry lives. Flush conntrack, or wait for the flow to end.</li>
+<li><strong><code>--session-metrics seid-ue-ip</code> puts UE addresses on <code>/metrics</code>.</strong> The listener is unauthenticated. It binds loopback by default (<code>NEXTGCORE_METRICS_BIND</code>), but the shipped compose files and manifests set <code>0.0.0.0</code> inside the container or pod network, so anything that can reach the pod can read them. Use <code>seid</code> unless the deployment needs to join a session to the address a DN saw.</li>
 <li><strong>Validation status:</strong> UPF behavior has been exercised in the project’s matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.</li>
 </ul>
 <h2 id="parsed-but-inert-summary"><a class="header" href="#parsed-but-inert-summary">Parsed-but-inert summary</a></h2>

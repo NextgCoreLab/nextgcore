@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3615b3a3.js";
+            window.path_to_searchindex_js = "../searchindex-1697da2e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -217,14 +217,14 @@ mme:
         port: 9090
   gummei:
     - plmn_id:
-        mcc: 999
-        mnc: 70
+        mcc: "999"
+        mnc: "70"
       mme_gid: 2
       mme_code: 1
   tai:
     - plmn_id:
-        mcc: 999
-        mnc: 70
+        mcc: "999"
+        mnc: "70"
       tac: 1
   security:
     integrity_order: [EIA2, EIA1, EIA0]
@@ -248,7 +248,7 @@ mme:
 <tr><td><code>gtpc.client.sgwc[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>SGW-C S11 peer. The first is used for every session (TS 23.401 SGW selection by DNS is not implemented; a second entry is named in a warning). <code>gtpc.client.smf</code> is accepted and unused (the PGW-C is the SGW-C’s peer, not the MME’s).</td></tr>
 <tr><td><code>n26.server[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>N26 GTP-C bind address toward an AMF (#347). Read always, bound only when <code>MME_N26_INTERWORKING</code> is on.</td></tr>
 <tr><td><code>n26.client.amf[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>AMF N26 peer for Context Request / Forward Relocation.</td></tr>
-<tr><td><code>gummei[]</code></td><td>list</td><td>empty</td><td>Served GUMMEIs: <code>plmn_id.{mcc,mnc}</code> (string or int), <code>mme_gid</code> (u16), <code>mme_code</code> (u8). With none configured every S1 Setup is answered with S1 Setup Failure (TS 36.413 §8.7.3.4).</td></tr>
+<tr><td><code>gummei[]</code></td><td>list</td><td>empty</td><td>Served GUMMEIs: <code>plmn_id.{mcc,mnc}</code> (quoted digit strings: an MCC is 3 digits, an MNC 2 or 3, TS 23.003 §2.2; a YAML number or a malformed string drops the entry with an error, #2115; if that leaves no GUMMEI, start-up fails), <code>mme_gid</code> (u16), <code>mme_code</code> (u8). With none configured every S1 Setup is answered with S1 Setup Failure (TS 36.413 §8.7.3.4).</td></tr>
 <tr><td><code>tai[]</code></td><td>list</td><td>empty</td><td>Served TAIs: <code>plmn_id</code>, <code>tac</code> (u16).</td></tr>
 <tr><td><code>security.integrity_order</code> / <code>.ciphering_order</code></td><td>list of strings</td><td>built-in order</td><td><code>EIA0</code>–<code>EIA3</code> / <code>EEA0</code>–<code>EEA3</code>. A configured list replaces the built-in one.</td></tr>
 <tr><td><code>network_name.full</code> / <code>.short</code></td><td>string</td><td>none</td><td>Network names sent to the UE.</td></tr>
