@@ -30,10 +30,12 @@ udm:
     # profile builder before nextgcore #85: the heartbeat is a deployment-timing
     # decision and allowed_nf_types is access control, so an operator adding an
     # NF type that must reach the UDM had to edit Rust. The values below are the
-    # historical defaults; omit the block entirely to keep them.
+    # defaults; omit the block entirely to keep them. UDR (#2123): the UDR
+    # discovers the UDM to verify a UDM caller's NF type, and the NRF hides a
+    # profile from a requester this list leaves out.
     nrf_profile:
       heartbeat_timer: 10
-      allowed_nf_types: [AMF, SMF, AUSF, PCF, SCP]
+      allowed_nf_types: [AMF, SMF, AUSF, PCF, SCP, UDR]
     # TLS configuration (G36: SBI TLS)
     # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
     tls:

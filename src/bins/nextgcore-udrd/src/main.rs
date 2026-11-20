@@ -535,6 +535,10 @@ async fn main() -> Result<()> {
             .set_nrf_uri(uri)
             .await;
     }
+    // #2123 (R41 M1): the self instance, as the other NFs register it, so the
+    // shared verified-NF-type lookup names this UDR as its requester
+    // (`requester-nf-type`, mandatory in TS 29.510: nrfd answers 400 without it).
+    register_self_instance().await;
 
     // Build SBI server configuration (legacy, for context)
     // #1312: bind CLI, then YAML, then loopback; advertise --sbi-advertise, then
@@ -714,6 +718,19 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore UDR stopped");
     Ok(())
+}
+
+/// #2123 (R41 M1): record this UDR as the global context's self NF instance
+/// (its NF Instance ID, type UDR). The shared NRF lookup of a caller's type
+/// (`owner_binding::verified_nf_type`) sends it as `requester-nf-type`.
+async fn register_self_instance() {
+    let id = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udr);
+    nextgcore_sbi::context::global_context()
+        .set_self_instance(nextgcore_sbi::context::NfInstance::new(
+            id,
+            nextgcore_sbi::types::NfType::Udr,
+        ))
+        .await;
 }
 
 /// #2079: the NF types that write the UDM's context data in the UDR: the
@@ -8749,6 +8766,132 @@ udr:
                 .get(supi)
                 .map(|d| d["amfInstanceId"].clone()),
             Some(json!("amf-relayed"))
+        );
+    }
+
+    /// #2123 (R41 M1, M2), end to end with no seeded cache: a UDM reaching
+    /// udrd through an SCP with its token is typed by a stand-in NRF that
+    /// behaves as nrfd does -- 400 for a discovery without `requester-nf-type`
+    /// (TS 29.510 mandatory, nrfd main.rs), and a profile hidden from a
+    /// requester its `allowedNfTypes` leaves out (nrfd nnrf_handler.rs). The UDM
+    /// profile carries UDR, as udmd's default now does. udrd registers its self
+    /// instance as it does at startup (`register_self_instance`), so the lookup
+    /// names UDR, the UDM's write is stored, and an AMF's token with the same
+    /// scope is refused.
+    ///
+    /// REVERT-VERIFIED: with neither `register_self_instance` here nor the sbi
+    /// `own_nf_type` fallback, the lookup carries no `requester-nf-type`, the
+    /// NRF answers 400 and the `UDM via the SCP` assertion fails (403); with
+    /// UDR dropped from the stand-in profile's allowedNfTypes, it fails the
+    /// same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_udm_via_the_scp_is_typed_by_the_nrf_2123() {
+        use nextgcore_sbi::resource_scope::NUDR_DR_REGISTRATIONS_WRITE as WRITE;
+        const UDM: &str = "dddddddd-2123-4000-8000-0000000000d7";
+        const AMF: &str = "aaaaaaaa-2123-4000-8000-0000000000a7";
+        const SCP: &str = "eeeeeeee-2123-4000-8000-0000000000e7";
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let requesters: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+        let seen = requesters.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    let param = |k: &str| req.http.params.get(k).cloned();
+                    let requester = param("requester-nf-type");
+                    seen.lock().unwrap().push(requester.clone());
+                    let Some(requester) = requester else {
+                        return nextgcore_sbi::server::send_error(
+                            400,
+                            "Bad Request",
+                            "requester-nf-type is mandatory",
+                            Some("MANDATORY_QUERY_PARAM_MISSING"),
+                        );
+                    };
+                    let profiles = [
+                        (UDM, "UDM", vec!["AMF", "SMF", "AUSF", "PCF", "SCP", "UDR"]),
+                        (AMF, "AMF", vec!["SMF", "UDM", "UDR", "SCP"]),
+                    ];
+                    let list: Vec<_> = profiles
+                        .iter()
+                        .filter(|(id, ty, allowed)| {
+                            param("target-nf-instance-id").as_deref() == Some(*id)
+                                && param("target-nf-type").as_deref() == Some(*ty)
+                                && allowed.contains(&requester.as_str())
+                        })
+                        .map(|(id, ty, allowed)| {
+                            json!({"nfInstanceId": id, "nfType": ty, "allowedNfTypes": allowed})
+                        })
+                        .collect();
+                    SbiResponse::with_status(200)
+                        .with_json_body(&json!({ "nfInstances": list }))
+                        .expect("json")
+                }
+            })
+            .await;
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        register_self_instance().await;
+
+        let supi = "imsi-001010000021237";
+        let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
+        let put = |sub: &str, amf: &str| {
+            let mut r = ctx_write_2079(
+                "PUT",
+                &path,
+                Some(json!({
+                    "amfInstanceId": amf,
+                    "deregCallbackUri": "http://amf.example.org/dereg",
+                    "guami": {"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "cafe00"},
+                    "ratType": "NR"
+                })),
+            );
+            r.peer_cert_nf_instance_id = Some(SCP.to_string());
+            r.peer_cert_nf_types = vec!["SCP".to_string()];
+            r.oauth2_subject = Some(sub.to_string());
+            r.oauth2_scope = Some(format!("nudr-dr {WRITE}"));
+            r
+        };
+        let by_amf = udr_sbi_request_handler(put(AMF, "amf-by-amf")).await;
+        let stored_after_amf = AmfAccessSlot::ThreeGpp.get(supi);
+        let by_udm = udr_sbi_request_handler(put(UDM, "amf-by-udm")).await;
+        nrf.stop().await.ok();
+        let requesters = requesters.lock().unwrap().clone();
+
+        assert_eq!(
+            by_udm.status, 201,
+            "UDM via the SCP: {:?} (NRF saw requesters {requesters:?})",
+            by_udm.http.content
+        );
+        assert_eq!(by_amf.status, 403, "{:?}", by_amf.http.content);
+        assert_eq!(stored_after_amf, None, "the AMF's write stored nothing");
+        assert_eq!(
+            AmfAccessSlot::ThreeGpp
+                .get(supi)
+                .map(|d| d["amfInstanceId"].clone()),
+            Some(json!("amf-by-udm"))
+        );
+        assert!(
+            !requesters.is_empty() && requesters.iter().all(|r| r.as_deref() == Some("UDR")),
+            "every lookup names the UDR: {requesters:?}"
+        );
+    }
+
+    /// #2123 (R41 M1): udrd's startup registers its self instance as a UDR.
+    ///
+    /// REVERT-VERIFIED: with `register_self_instance` empty, this fails.
+    #[tokio::test]
+    async fn udrd_registers_its_self_instance_as_a_udr_2123() {
+        register_self_instance().await;
+        let me = nextgcore_sbi::context::global_context()
+            .get_self_instance()
+            .await
+            .expect("a self instance");
+        assert_eq!(me.nf_type, nextgcore_sbi::types::NfType::Udr);
+        assert_eq!(
+            me.id,
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udr)
         );
     }
 

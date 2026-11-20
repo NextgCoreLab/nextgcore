@@ -7362,11 +7362,15 @@ mod tests {
         }
         assert_eq!(advertised_version(&profile, "nudm-sdm"), "v2");
         assert_eq!(advertised_version(&profile, "nudm-ee"), "v1");
-        // Defaults reproduce the pre-#85 literals exactly.
+        // Defaults reproduce the pre-#85 literals, plus (#2123, R41 M2) the UDR:
+        // nrfd hides a profile from a requester its allowedNfTypes leaves out,
+        // and the UDR types a UDM caller by discovering it
+        // (`owner_binding::verified_nf_type`), so without UDR here every
+        // UDM-only write the UDR gates through the NRF is refused.
         assert_eq!(profile["heartBeatTimer"], 10);
         assert_eq!(
             profile["allowedNfTypes"],
-            serde_json::json!(["AMF", "SMF", "AUSF", "PCF", "SCP"])
+            serde_json::json!(["AMF", "SMF", "AUSF", "PCF", "SCP", "UDR"])
         );
 
         // Configured knobs reach the wire.
