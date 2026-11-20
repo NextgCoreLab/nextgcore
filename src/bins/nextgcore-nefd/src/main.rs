@@ -1799,8 +1799,14 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
             nextgcore_sbi::sweep::Skip::PeerParked => {
                 still_failing.push((sub, leg, "its producer did not answer".to_string()))
             }
-            // Not reached: the next pass's, whatever its age.
-            nextgcore_sbi::sweep::Skip::Budget => report.still_pending += 1,
+            // #2223 (R48): not reached in this pass's budget. Its deadline is
+            // still checked: expiry is local and needs no request, and the pass
+            // order is stable, so a leg at the tail of a slow producer could
+            // otherwise be skipped pass after pass past its deadline, the AF
+            // never told.
+            nextgcore_sbi::sweep::Skip::Budget => {
+                still_failing.push((sub, leg, "not reached within the pass budget".to_string()))
+            }
         }
     }
     for (sub, leg, outcome) in still_failing {
@@ -6566,6 +6572,62 @@ mod tests {
         });
         std::env::remove_var("NEF_PENDING_LEG_DEADLINE_SECS");
         reset_context();
+    }
+
+    /// **#2223** (R48 on #2255): a deferred leg the pass does not reach within
+    /// its budget still gets its deadline check. Two legs at an AMF that answers
+    /// each subscribe only after 1.5 s (a refusal, so it is not parked), a
+    /// one-second pass budget, and a deadline already passed: the first leg is
+    /// tried, the second is not started, and both are expired (the AF told).
+    ///
+    /// REVERT-VERIFIED: with the budget-skipped leg counted still pending
+    /// without the check, as on #2255's first head, "both legs expire" fails
+    /// (1 expired, 1 still pending).
+    #[test]
+    fn a_leg_skipped_for_the_budget_still_expires_2223() {
+        let _guard = lock_globals();
+        reset_context();
+        set_producers(None, None);
+        std::env::set_var("NEF_PENDING_LEG_DEADLINE_SECS", "0");
+        std::env::set_var("NEF_RECONCILE_INTERVAL_SECS", "1");
+        let report = block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            for _ in 0..2 {
+                let created = handle_monitoring_subscription_create(
+                    "af1",
+                    &monitoring_request(valid_monitoring_body()),
+                    NorthboundApi::T8MonitoringEvent,
+                )
+                .await;
+                created_subscription_id(&created).expect("id");
+            }
+            let (amf, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    SbiResponse::with_status(403)
+                })
+                .await;
+            set_producers(Some(&format!("http://{addr}")), None);
+            let report = reconcile_pending_subscriptions().await;
+            amf.stop().await.ok();
+            report
+        });
+        std::env::remove_var("NEF_RECONCILE_INTERVAL_SECS");
+        std::env::remove_var("NEF_PENDING_LEG_DEADLINE_SECS");
+        let left = nef_self().read().unwrap().subscription_count();
+        reset_context();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                promoted: 0,
+                expired: 2,
+                still_pending: 0
+            },
+            "both legs expire"
+        );
+        assert_eq!(left, 0, "and are removed");
     }
 
     #[test]

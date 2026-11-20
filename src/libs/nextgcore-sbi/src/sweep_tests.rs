@@ -353,6 +353,9 @@ const ONE_RESOLVED_PEER: &str =
 //   grow this list.
 // - G2, the pass word only in the type: `impl LegRefresher { async fn run() }`
 //   is not flagged.
+// - A fn that calls `sweep::sweep(` or `sweep::retry_parked(` is exempt as a
+//   whole, so a serial loop beside the call is not flagged (#2223 R48; the
+//   self-test's `reconcile_on_retry_parked` plants one).
 // - A fn is cut at the next `fn `, so a closure-heavy body or a nested fn can
 //   move a loop to the fn after it.
 //

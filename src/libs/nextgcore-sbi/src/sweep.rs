@@ -215,6 +215,9 @@ pub async fn with_start_offset<F: std::future::Future>(offset: usize, f: F) -> F
 ///   and one with an `Answered` item as succeeded (first: with one item in
 ///   flight per peer, its answers came before the failure that parked it).
 ///
+/// `limits.per_peer` must be 1 (#2223 R48): with more in flight, an answer may
+/// land after the failure, and the success-then-failure order would be wrong.
+///
 /// Returns every item in `batch` order, with `Some(result)` if its work ran or
 /// `None` if it was not started (its peer backing off or parked in this pass,
 /// or the budget ran out). The caller requeues: by convention the not-started
@@ -231,6 +234,10 @@ where
     F: Fn(String, P) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = (Option<Verdict>, P, R)> + Send + 'static,
 {
+    debug_assert_eq!(
+        limits.per_peer, 1,
+        "retry_parked notes the backoff in order"
+    );
     let mut out: Vec<(usize, P, Option<R>)> = Vec::with_capacity(batch.len());
     let mut items = Vec::new();
     for (place, (peer, item)) in batch.into_iter().enumerate() {

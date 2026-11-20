@@ -343,8 +343,14 @@ fn holder(supi: &str, psi: u8) -> Holder {
 #[derive(Debug, PartialEq, Eq)]
 enum Attempt {
     Delivered,
+    /// Not sent: a live session holds the record (#2223 R48: says nothing of
+    /// the peer).
     Superseded,
+    /// Sent, and the peer answered a 4xx a retry cannot change.
     Refused,
+    /// Not sent, and never will be: the UDM client is disabled. Counted
+    /// `refused`, but says nothing of the peer (#2223 R48).
+    Unsendable,
     /// Not sent this pass (a create for the same pair is in flight).
     Deferred,
     Failed,
@@ -430,7 +436,7 @@ async fn attempt(c: &Cleanup) -> Attempt {
                 Holder::None => {}
             }
             if !crate::udm::enabled() {
-                return Attempt::Refused;
+                return Attempt::Unsendable;
             }
             if !in_flight.entry.begin_deregistration() {
                 return Attempt::Superseded;
@@ -450,7 +456,7 @@ async fn attempt(c: &Cleanup) -> Attempt {
             subscription_id,
         } => {
             if !crate::udm::enabled() {
-                return Attempt::Refused;
+                return Attempt::Unsendable;
             }
             match tokio::time::timeout(
                 crate::UDM_RELEASE_TIMEOUT,
@@ -507,11 +513,12 @@ pub async fn reconcile_once() -> usize {
             use nextgcore_sbi::sweep::Verdict;
             let attempt = attempt(&p.cleanup).await;
             let verdict = match attempt {
-                Attempt::Deferred => None,
+                // #2223 (R48): only an answer the peer gave counts for its
+                // backoff. A cleanup not sent says nothing of the peer:
+                // crediting it would reset a dead peer's backoff to the base.
+                Attempt::Deferred | Attempt::Superseded | Attempt::Unsendable => None,
                 Attempt::Failed => Some(Verdict::PeerDown),
-                Attempt::Delivered | Attempt::Superseded | Attempt::Refused => {
-                    Some(Verdict::Answered)
-                }
+                Attempt::Delivered | Attempt::Refused => Some(Verdict::Answered),
             };
             (verdict, p, attempt)
         })
@@ -522,7 +529,7 @@ pub async fn reconcile_once() -> usize {
         let result = match attempt {
             Some(Attempt::Delivered) => "delivered",
             Some(Attempt::Superseded) => "superseded",
-            Some(Attempt::Refused) => "refused",
+            Some(Attempt::Refused | Attempt::Unsendable) => "refused",
             None | Some(Attempt::Deferred) => {
                 untried.push(p);
                 continue;
@@ -814,6 +821,60 @@ mod tests {
         );
         assert_eq!(left.len(), 3, "the blackholed ones stay parked: {left:?}");
         assert!(backing_off, "the blackholed NSACF backs off");
+    }
+
+    /// **#2223** (R48 on #2255): a cleanup the pass did not send says nothing of
+    /// its peer, so it does not clear the peer's backoff. The UDM has failed
+    /// before (its backoff is at the base, its wait over); a UECM deregistration
+    /// that cannot be sent (the UDM client is off) leaves that backoff as it
+    /// was, so the UDM's next failure doubles it instead of restarting at the
+    /// base.
+    ///
+    /// REVERT-VERIFIED: with `Unsendable` (and `Superseded`) mapped to
+    /// `Verdict::Answered` again, as on #2255's first head, the pass calls
+    /// `note_success` and "an unsent cleanup leaves the backoff" fails.
+    #[tokio::test]
+    async fn a_cleanup_not_sent_does_not_credit_its_peer_2223() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        clear_for_test();
+        crate::udm::set_for_test(false);
+        // A second UDM cleanup whose session is being created: deferred, so it
+        // stays parked and the pass's prune keeps the UDM's backoff.
+        crate::context::smf_context_init(64, 256, 512);
+        {
+            let ctx = crate::smf_self();
+            let guard = ctx.read().expect("context");
+            let ue = guard.ue_add_by_supi("imsi-001010000022232").expect("ue");
+            guard.sess_add_by_psi(ue.id, 5).expect("sess");
+        }
+        park(Cleanup::UecmDeregister {
+            supi: "imsi-001010000022232".into(),
+            psi: 5,
+        });
+        BACKOFF.note_failure("udm");
+        while BACKOFF.backing_off("udm") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        park(Cleanup::UecmDeregister {
+            supi: "imsi-001010000022231".into(),
+            psi: 5,
+        });
+        let refused = || RECONCILED.get(&["uecm_deregister", "refused"]);
+        let before = refused();
+        let ended = reconcile_once().await;
+        let counted = refused() - before;
+        let after = BACKOFF.current("udm");
+        let left = snapshot().len();
+        clear_for_test();
+
+        assert_eq!((ended, counted), (1, 1), "ended as refused");
+        assert_eq!(left, 1, "the deferred one stays parked");
+        assert_eq!(
+            after,
+            Some(BACKOFF_BASE),
+            "an unsent cleanup leaves the backoff"
+        );
     }
 
     /// #1961: a cleanup parked longer than [`MAX_AGE`] ends as `expired`.
