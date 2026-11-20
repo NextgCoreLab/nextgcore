@@ -7007,28 +7007,20 @@ mod tests {
     /// discover it, but its nnef-eventexposure service does not: the token grant
     /// honours the service-level `allowedNfTypes` (TS 29.510 §6.1.6.2.3, ANDed
     /// with the profile's), so the UCMF is refused a token for that service
-    /// while the AF is granted one. The profile is nefd's (`build_nf_profile`,
-    /// whose test pins the same two lists).
+    /// while the AF is granted one. #2178: the profile is nefd's own, built by
+    /// the shared `nextgcore_sbi::nf_profiles::nef` that nefd registers.
     ///
     /// REVERT-VERIFIED: with `authorizes_service` ignoring the service-level
     /// list, the UCMF is granted the nnef-eventexposure scope and the `refused`
     /// assertion fails.
     #[test]
     fn the_ucmf_gets_no_nef_service_token_2160() {
-        let nef = NfProfile::from_json(&serde_json::json!({
-            "nfInstanceId": "aaaaaaaa-2160-4000-8000-0000000000ef",
-            "nfType": "NEF",
-            "nfStatus": "REGISTERED",
-            "nfServices": [{
-                "serviceInstanceId": "nef-2160-nnef-eventexposure",
-                "serviceName": "nnef-eventexposure",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"]
-            }],
-            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP", "UCMF"]
-        }))
+        let nef = NfProfile::from_json(&nextgcore_sbi::nf_profiles::nef(
+            "aaaaaaaa-2160-4000-8000-0000000000ef",
+            "10.0.0.9",
+            7817,
+            nextgcore_sbi::types::UriScheme::Http,
+        ))
         .expect("NEF profile");
         let requested: Vec<String> = vec!["nnef-eventexposure".into()];
         let ask = |nf_type: &str| {
@@ -7045,6 +7037,11 @@ mod tests {
         assert_eq!(ask("AF").ok(), Some(requested.clone()), "the AF is granted");
         let refused = ask("UCMF").expect_err("refused: the UCMF consumes no NEF service");
         assert_eq!(refused.0, "unauthorized_client");
+        // #2178: nor does nextgcore's NWDAF (no Nnef consumer path).
+        assert_eq!(
+            ask("NWDAF").expect_err("refused: NWDAF").0,
+            "unauthorized_client"
+        );
     }
 
     /// #1811: only the UDM is granted the AuthenticationSubscription scope.
