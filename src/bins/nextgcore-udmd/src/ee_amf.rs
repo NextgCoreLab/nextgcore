@@ -1765,23 +1765,55 @@ mod tests {
 
     /// An AMF that accepts connections and never answers, counting them: its
     /// address, how many it accepted, and its task (abort it at the end).
-    async fn blackhole_2029() -> (
-        String,
-        Arc<std::sync::atomic::AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    async fn blackhole_2029() -> (String, Arc<Accepted2029>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = accepted.clone();
+        let accepted = Arc::new(Accepted2029::default());
+        let seen = accepted.clone();
         let task = tokio::spawn(async move {
             let mut conns = Vec::new();
-            while let Ok((c, _)) = listener.accept().await {
-                count.fetch_add(1, Ordering::SeqCst);
+            while let Ok((c, peer)) = listener.accept().await {
+                seen.peers.lock().unwrap().push(peer);
+                seen.arrived.notify_waiters();
                 conns.push(c);
             }
         });
         (addr, accepted, task)
+    }
+
+    /// The connections a [`blackhole_2029`] accepted, in accept order.
+    #[derive(Default)]
+    struct Accepted2029 {
+        peers: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+        arrived: tokio::sync::Notify,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Accepted2029 {
+        /// #2196: how many connections the code under test has made to `hole` so
+        /// far. A count read right after a pass raced the accept task: on a loaded
+        /// host the pass's connection sat in the listen backlog, not yet accepted,
+        /// and the count read 0 ("tried in the first pass", 1 run in 3 on seed 11).
+        /// So connect a probe of our own and wait until it is accepted: the
+        /// backlog is accepted in order, so every connection made before the probe
+        /// is counted by then. The probes are not counted.
+        async fn attempts(&self, hole: &str) -> usize {
+            let probe = tokio::net::TcpStream::connect(hole).await.expect("probe");
+            let me = probe.local_addr().expect("probe address");
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let arrived = self.arrived.notified();
+                    if self.peers.lock().unwrap().contains(&me) {
+                        return;
+                    }
+                    arrived.await;
+                }
+            })
+            .await
+            .expect("the probe is accepted");
+            self.peers.lock().unwrap().len() - self.probes.load(Ordering::SeqCst)
+        }
     }
 
     fn ours_2029(uris: &[&String]) -> Vec<String> {
@@ -1843,13 +1875,16 @@ mod tests {
         park_unsubscribe(&dead);
 
         reconcile_unsubscribes_once().await;
-        let first = accepted.load(Ordering::SeqCst);
+        let first = accepted.attempts(&hole).await;
         let backoff = UNSUBSCRIBE_BACKOFF.current(&amf_of(&dead));
+        // The probe above takes milliseconds; the window is 300 ms. Said, so a
+        // stall long enough to matter fails here by name, not as a spurious try.
+        let in_window = UNSUBSCRIBE_BACKOFF.backing_off(&amf_of(&dead));
         reconcile_unsubscribes_once().await;
-        let second = accepted.load(Ordering::SeqCst);
+        let second = accepted.attempts(&hole).await;
         tokio::time::sleep(UNSUBSCRIBE_BACKOFF_BASE + std::time::Duration::from_millis(50)).await;
         reconcile_unsubscribes_once().await;
-        let third = accepted.load(Ordering::SeqCst);
+        let third = accepted.attempts(&hole).await;
         let still = ours_2029(&[&dead]);
         clear_parked_unsubscribes_for_test();
         AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
@@ -1857,6 +1892,7 @@ mod tests {
 
         assert!(first >= 1, "tried in the first pass");
         assert_eq!(backoff, Some(UNSUBSCRIBE_BACKOFF_BASE));
+        assert!(in_window, "the second pass ran inside the backoff window");
         assert_eq!(second, first, "not tried while backing off");
         assert!(third > second, "tried again once its wait ran out");
         assert_eq!(still, vec![dead], "and still parked");
