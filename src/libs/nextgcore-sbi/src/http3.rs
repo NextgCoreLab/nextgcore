@@ -263,6 +263,7 @@ where
         peer_cert_present: false,
         peer_cert_uri_sans: Vec::new(),
         peer_cert_dns_sans: Vec::new(),
+        peer_cert_der: None,
         oauth2_subject: None,
         oauth2_scope: None,
     };
