@@ -886,6 +886,169 @@ pub(crate) fn initial_context_setup_failure(m: &t::InitialContextSetupFailure) -
     pdu(2, 14, 0, &ies)
 }
 
+/// RANNodeName, the ASN.1 `PrintableString (SIZE(1..150, ...))`: the size
+/// extension bit `0`, length-1 in an 8-bit field (range 150, a constrained
+/// whole number, not aligned), then the characters. PrintableString has 74
+/// characters, so b = 7 and the ALIGNED variant rounds it to 8 bits per
+/// character (§30.5.2); ub x 8 = 1200 bits is past 16, so the characters are
+/// octet-aligned (§30.5.7), each its ASCII octet.
+fn ran_node_name(name: &str) -> Vec<u8> {
+    assert!((1..=150).contains(&name.len()) && name.is_ascii());
+    let mut b = Bits::default();
+    b.bit(false)
+        .field(name.len() as u64 - 1, 8)
+        .octets(name.as_bytes());
+    b.finish()
+}
+
+/// SupportedTAList (the ASN.1 `SupportedTAList`, carried by NG Setup and RAN
+/// Configuration Update):
+/// - `SIZE(1..256)`: count-1 in one aligned octet (range 256);
+/// - SupportedTAItem: extension `0`, iE-Extensions `0`; TAC `OCTET STRING
+///   (SIZE(3))` aligned; BroadcastPLMNList `SIZE(1..12)`: count-1 in four bits;
+/// - BroadcastPLMNItem: extension `0`, iE-Extensions `0`; the PLMN aligned;
+///   SliceSupportList `SIZE(1..1024)`: ub 1024 is below 64K, so count-1 in two
+///   aligned octets (range 1024);
+/// - SliceSupportItem: extension `0`, iE-Extensions `0`; S-NSSAI extension
+///   `0`, presence sD, iE-Extensions `0`; SST `OCTET STRING (SIZE(1))`, fixed
+///   and at most two octets, so eight bits NOT aligned (§17.6); SD
+///   `OCTET STRING (SIZE(3))` aligned.
+fn supported_ta_list(items: &[t::SupportedTaItem]) -> Vec<u8> {
+    assert!((1..=256).contains(&items.len()));
+    let mut b = Bits::default();
+    b.octets(&[(items.len() - 1) as u8]);
+    for item in items {
+        assert!((1..=12).contains(&item.broadcast_plmn_list.len()));
+        b.field(0, 2)
+            .octets(&item.tac)
+            .field(item.broadcast_plmn_list.len() as u64 - 1, 4);
+        for plmn in &item.broadcast_plmn_list {
+            let slices = &plmn.tai_slice_support_list;
+            assert!((1..=1024).contains(&slices.len()));
+            b.field(0, 2)
+                .octets(&plmn.plmn_identity)
+                .octets(&(slices.len() as u16 - 1).to_be_bytes());
+            for slice in slices {
+                b.field(0, 2)
+                    .bit(false)
+                    .bit(slice.sd.is_some())
+                    .bit(false)
+                    .field(u64::from(slice.sst), 8);
+                if let Some(sd) = slice.sd {
+                    b.octets(&sd);
+                }
+            }
+        }
+    }
+    b.finish()
+}
+
+/// PagingDRX `ENUMERATED {v32, v64, v128, v256, ...}`: extension `0` + two
+/// bits, padded.
+fn paging_drx(drx: t::PagingDrx) -> Vec<u8> {
+    let index = match drx {
+        t::PagingDrx::V32 => 0,
+        t::PagingDrx::V64 => 1,
+        t::PagingDrx::V128 => 2,
+        t::PagingDrx::V256 => 3,
+    };
+    let mut b = Bits::default();
+    b.bit(false).field(index, 2);
+    b.finish()
+}
+
+/// NG SETUP REQUEST (§9.2.6.1): initiatingMessage, id-NGSetup 21, reject; id
+/// 27 GlobalRANNodeID (reject); id 82 RANNodeName (ignore) when named; id 102
+/// SupportedTAList (reject); id 21 DefaultPagingDRX (ignore).
+pub(crate) fn ng_setup_request(m: &t::NgSetupRequest) -> Vec<u8> {
+    let mut ies = vec![(27, 0, global_ran_node_id_value(&m.global_ran_node_id))];
+    if let Some(name) = &m.ran_node_name {
+        ies.push((82, 1, ran_node_name(name)));
+    }
+    ies.push((102, 0, supported_ta_list(&m.supported_ta_list)));
+    ies.push((21, 1, paging_drx(m.default_paging_drx)));
+    pdu(0, 21, 0, &ies)
+}
+
+/// RAN CONFIGURATION UPDATE (§9.2.6.4): initiatingMessage,
+/// id-RANConfigurationUpdate 35, reject; each present member as its IE: id 82
+/// RANNodeName (ignore), id 102 SupportedTAList (reject), id 21
+/// DefaultPagingDRX (ignore), id 27 GlobalRANNodeID (ignore).
+pub(crate) fn ran_configuration_update(m: &t::RanConfigurationUpdate) -> Vec<u8> {
+    let mut ies = Vec::new();
+    if let Some(name) = &m.ran_node_name {
+        ies.push((82, 1, ran_node_name(name)));
+    }
+    if let Some(list) = &m.supported_ta_list {
+        ies.push((102, 0, supported_ta_list(list)));
+    }
+    if let Some(drx) = m.default_paging_drx {
+        ies.push((21, 1, paging_drx(drx)));
+    }
+    if let Some(id) = &m.global_ran_node_id {
+        ies.push((27, 1, global_ran_node_id_value(id)));
+    }
+    pdu(0, 35, 0, &ies)
+}
+
+/// UPLINK RAN STATUS TRANSFER (§9.2.3.13): initiatingMessage,
+/// id-UplinkRANStatusTransfer 49, ignore; ids 10, 85 (reject); id 84
+/// RANStatusTransfer-TransparentContainer (reject). The container is a
+/// SEQUENCE, not an OCTET STRING, so the IE's open type holds the caller's
+/// octets, which must already be its complete encoding, directly.
+pub(crate) fn uplink_ran_status_transfer(m: &t::RanStatusTransfer) -> Vec<u8> {
+    pdu(
+        0,
+        49,
+        1,
+        &[
+            (10, 0, crate::aper_golden::amf_ue_ngap_id(m.amf_ue_ngap_id)),
+            (85, 0, crate::aper_golden::ran_ue_ngap_id(m.ran_ue_ngap_id)),
+            (84, 0, m.container.clone()),
+        ],
+    )
+}
+
+/// UPLINK UE ASSOCIATED NRPPA TRANSPORT (§9.2.9.2): initiatingMessage,
+/// id-UplinkUEAssociatedNRPPaTransport 50, ignore; ids 10, 85 (reject); id 89
+/// RoutingID and id 46 NRPPa-PDU (reject), both unconstrained OCTET STRINGs.
+pub(crate) fn uplink_ue_associated_nrppa_transport(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    routing_id: &[u8],
+    nrppa_pdu: &[u8],
+) -> Vec<u8> {
+    pdu(
+        0,
+        50,
+        1,
+        &[
+            (10, 0, crate::aper_golden::amf_ue_ngap_id(amf_ue_ngap_id)),
+            (85, 0, crate::aper_golden::ran_ue_ngap_id(ran_ue_ngap_id)),
+            (89, 0, octet_string(routing_id)),
+            (46, 0, octet_string(nrppa_pdu)),
+        ],
+    )
+}
+
+/// UPLINK NON UE ASSOCIATED NRPPA TRANSPORT (§9.2.9.4): initiatingMessage,
+/// id-UplinkNonUEAssociatedNRPPaTransport 47, ignore; id 89 RoutingID and id
+/// 46 NRPPa-PDU (reject).
+pub(crate) fn uplink_non_ue_associated_nrppa_transport(
+    routing_id: &[u8],
+    nrppa_pdu: &[u8],
+) -> Vec<u8> {
+    pdu(
+        0,
+        47,
+        1,
+        &[
+            (89, 0, octet_string(routing_id)),
+            (46, 0, octet_string(nrppa_pdu)),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +1075,13 @@ mod tests {
                 g::InitiatingMessageValue::Id_HandoverNotification(v) => (11, ies!(v)),
                 g::InitiatingMessageValue::Id_PathSwitchRequest(v) => (25, ies!(v)),
                 g::InitiatingMessageValue::Id_PWSRestartIndication(v) => (34, ies!(v)),
+                g::InitiatingMessageValue::Id_NGSetup(v) => (21, ies!(v)),
+                g::InitiatingMessageValue::Id_RANConfigurationUpdate(v) => (35, ies!(v)),
+                g::InitiatingMessageValue::Id_UplinkRANStatusTransfer(v) => (49, ies!(v)),
+                g::InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(v) => (50, ies!(v)),
+                g::InitiatingMessageValue::Id_UplinkNonUEAssociatedNRPPaTransport(v) => {
+                    (47, ies!(v))
+                }
                 g::InitiatingMessageValue::Id_PDUSessionResourceNotify(v) => (30, ies!(v)),
                 g::InitiatingMessageValue::Id_PDUSessionResourceModifyIndication(v) => {
                     (27, ies!(v))
@@ -1621,5 +1791,154 @@ mod tests {
             target(t::NgEnbId::LongMacro(0x1A_BCDE)),
             [0x40, 0x00, 0xf1, 0x10, 0x80, 0xd5, 0xe6, 0xf0, 0x00, 0xf1, 0x10, 0x00, 0x07]
         );
+    }
+
+    /// NG Setup Request and RAN Configuration Update, by hand and read back
+    /// through the generated decoder value by value (the SIZE(1..65536) lesson:
+    /// an id-level decode check passes a wrong count).
+    #[test]
+    fn ng_setup_and_ran_configuration_update_are_the_worked_octets() {
+        let ta = |tac: [u8; 3], sst: u8, sd: Option<[u8; 3]>| t::SupportedTaItem {
+            tac,
+            broadcast_plmn_list: vec![t::BroadcastPlmnItem {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                tai_slice_support_list: vec![t::SNssai { sst, sd }],
+            }],
+        };
+        let setup = ng_setup_request(&t::NgSetupRequest {
+            global_ran_node_id: t::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                gnb_id: 1,
+                gnb_id_len: 32,
+            },
+            ran_node_name: Some("g1".to_string()),
+            supported_ta_list: vec![ta([0, 0, 1], 1, None)],
+            default_paging_drx: t::PagingDrx::V128,
+        });
+        assert_eq!(
+            setup,
+            [
+                0x00, 0x15, 0x00, 0x2e, 0x00, 0x00, 0x04, // initiatingMessage, 21, reject, 46
+                // GlobalRANNodeID (reject, 9).
+                0x00, 0x1b, 0x00, 0x09, 0x00, 0x99, 0xf9, 0x07, 0x50, 0x00, 0x00, 0x00, 0x01,
+                // RANNodeName (ignore, 4): `0` + length-1 `00000001`, pad; "g1".
+                0x00, 0x52, 0x40, 0x04, 0x00, 0x80, b'g', b'1', //
+                // SupportedTAList (reject, 10): count-1 `00`; item `00` pad; TAC;
+                // BPLMN count-1 `0000` + item `00` + pad; PLMN; slices count-1
+                // `00 00`; `00` + `0 0 0` + SST `00000001` -> `00 08`.
+                0x00, 0x66, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x99, 0xf9, 0x07, 0x00,
+                0x00, 0x00, 0x08, //
+                // DefaultPagingDRX (ignore, 1): v128 `0 10` -> `40`.
+                0x00, 0x15, 0x40, 0x01, 0x40,
+            ]
+        );
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_NGSetup(req),
+            ..
+        }) = nextgcore_ngap_gen::decode(&setup).expect("strict decode")
+        else {
+            panic!("NG Setup Request");
+        };
+        use g::NGSetupRequestProtocolIEs_EntryValue as Ie;
+        for ie in req.protocol_i_es.0 {
+            match ie.value {
+                Ie::Id_RANNodeName(n) => assert_eq!(n.0, "g1"),
+                Ie::Id_SupportedTAList(l) => {
+                    let item = &l.0[0];
+                    assert_eq!(item.tac.0, [0, 0, 1]);
+                    let bplmn = &item.broadcast_plmn_list.0[0];
+                    assert_eq!(bplmn.plmn_identity.0, [0x99, 0xf9, 0x07]);
+                    let s = &bplmn.tai_slice_support_list.0[0].s_nssai;
+                    assert_eq!((s.sst.0.clone(), s.sd.is_none()), (vec![1], true));
+                }
+                Ie::Id_DefaultPagingDRX(d) => assert_eq!(d.0, g::PagingDRX::V128),
+                Ie::Id_GlobalRANNodeID(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // RAN Configuration Update with two TAs, the second with an SD.
+        let rcu = ran_configuration_update(&t::RanConfigurationUpdate {
+            ran_node_name: None,
+            supported_ta_list: Some(vec![
+                ta([0, 0, 7], 1, None),
+                ta([0, 0, 8], 2, Some([1, 2, 3])),
+            ]),
+            default_paging_drx: None,
+            global_ran_node_id: None,
+        });
+        assert_eq!(ids(&rcu), (35, vec![102]));
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_RANConfigurationUpdate(update),
+            ..
+        }) = nextgcore_ngap_gen::decode(&rcu).expect("strict decode")
+        else {
+            panic!("RAN Configuration Update");
+        };
+        let g::RANConfigurationUpdateProtocolIEs_EntryValue::Id_SupportedTAList(list) =
+            &update.protocol_i_es.0[0].value
+        else {
+            panic!("SupportedTAList");
+        };
+        let read: Vec<_> = list
+            .0
+            .iter()
+            .map(|item| {
+                let s = &item.broadcast_plmn_list.0[0].tai_slice_support_list.0[0].s_nssai;
+                (
+                    item.tac.0.clone(),
+                    s.sst.0.clone(),
+                    s.sd.as_ref().map(|d| d.0.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (vec![0, 0, 7], vec![1], None),
+                (vec![0, 0, 8], vec![2], Some(vec![1, 2, 3])),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_transfer_and_nrppa_transports_are_the_worked_octets() {
+        let status = uplink_ran_status_transfer(&t::RanStatusTransfer {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            container: vec![
+                0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+            ],
+        });
+        assert_eq!(&status[..4], [0x00, 0x31, 0x40, 0x1f]);
+        assert_eq!(
+            &status[status.len() - 16..],
+            [
+                0x00, 0x54, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56,
+                0x00, 0x78
+            ]
+        );
+        assert_eq!(ids(&status), (49, vec![10, 85, 84]));
+        let ue = uplink_ue_associated_nrppa_transport(1, 2, b"r1", &[0x20, 0x0b]);
+        assert_eq!(
+            ue,
+            [
+                0x00, 0x32, 0x40, 0x1d, 0x00, 0x00, 0x04, // initiatingMessage, 50, ignore, 29
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x02, //
+                0x00, 0x59, 0x00, 0x03, 0x02, b'r', b'1', // RoutingID
+                0x00, 0x2e, 0x00, 0x03, 0x02, 0x20, 0x0b, // NRPPa-PDU
+            ]
+        );
+        assert_eq!(ids(&ue), (50, vec![10, 85, 89, 46]));
+        let non_ue = uplink_non_ue_associated_nrppa_transport(b"r1", &[0x20, 0x0b]);
+        assert_eq!(
+            non_ue,
+            [
+                0x00, 0x2f, 0x40, 0x11, 0x00, 0x00, 0x02, // initiatingMessage, 47, ignore, 17
+                0x00, 0x59, 0x00, 0x03, 0x02, b'r', b'1', //
+                0x00, 0x2e, 0x00, 0x03, 0x02, 0x20, 0x0b,
+            ]
+        );
+        assert_eq!(ids(&non_ue), (47, vec![89, 46]));
     }
 }

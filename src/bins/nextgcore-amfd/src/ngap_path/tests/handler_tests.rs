@@ -3586,16 +3586,11 @@ fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
     ))
     .expect("encode UERadioCapabilityInfoIndication");
     let nrppa = {
-        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
-        super::encode_ngap_pdu(
-            &build_uplink_ue_associated_nrppa_transport(
-                AmfUeNgapId(amf),
-                RanUeNgapId(ran),
-                RoutingId::new(b"lmf-739".to_vec()),
-                NrppaPdu::new(vec![0x20, 0x0B, 0x00]),
-            )
-            .expect("build NRPPa"),
+        crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+            amf,
+            ran,
+            &b"lmf-739".to_vec(),
+            &vec![0x20, 0x0B, 0x00],
         )
     };
     vec![

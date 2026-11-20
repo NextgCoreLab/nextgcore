@@ -25515,14 +25515,30 @@ mod tests {
             None,
         )
         .expect("build ICS");
-        let decoded = nextgcore_ngap::parser::decode_ngap_pdu(&bytes).expect("decode");
-        match decoded {
-            nextgcore_ngap::NgapMessage::InitialContextSetupRequest(req) => {
-                assert_eq!(req.security_key, kgnb);
-                assert_ne!(req.security_key, [0u8; 32]);
-            }
-            other => panic!("expected InitialContextSetupRequest, got {other:?}"),
-        }
+        // #417: read the Security Key (id 94, `BIT STRING (SIZE(256))`) back
+        // through the generated decoder, bit for bit.
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_InitialContextSetup(req),
+            ..
+        }) = nextgcore_ngap_gen::decode(&bytes).expect("decode")
+        else {
+            panic!("expected InitialContextSetupRequest");
+        };
+        let key: Vec<u8> = req
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|ie| match ie.value {
+                g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(k) => Some(k.0),
+                _ => None,
+            })
+            .expect("a Security Key IE")
+            .chunks(8)
+            .map(|c| c.iter().fold(0u8, |o, b| o << 1 | u8::from(*b)))
+            .collect();
+        assert_eq!(key, kgnb);
+        assert_ne!(key, [0u8; 32]);
     }
 
     #[test]
@@ -25609,36 +25625,29 @@ mod tests {
         // ErrorIndication carrying a protocol cause (TS 38.413 Section 10.3).
         // This mirrors the `_` dispatch arm's behaviour.
         let unknown_pdu = [0x00u8, 99, 0x00]; // InitiatingMessage, procedure 99
-        let parsed = nextgcore_ngap::parser::decode_ngap_pdu(&unknown_pdu);
-        // Either decodes to Unknown or fails to decode; both drive ErrorIndication.
-        let is_unknown_or_err = matches!(
-            parsed,
-            Ok(nextgcore_ngap::NgapMessage::Unknown { .. }) | Err(_)
-        );
-        assert!(is_unknown_or_err, "got {parsed:?}");
+                                              // Procedure 99 is not in the V17.9 object set: the generated decoder
+                                              // refuses it, which is what drives the Error Indication.
+        assert!(nextgcore_ngap_gen::decode(&unknown_pdu).is_err());
 
-        // Build the ErrorIndication the dispatch would emit and confirm it is a
-        // valid, decodable PDU with the protocol cause.
-        let ei = nextgcore_ngap::types::ErrorIndication {
-            amf_ue_ngap_id: None,
-            ran_ue_ngap_id: None,
-            cause: Some(nextgcore_ngap::types::Cause::Protocol(
-                nextgcore_ngap::types::CauseProtocol::AbstractSyntaxErrorReject,
+        // The ErrorIndication the dispatch emits (#417: the production builder,
+        // against octets derived by hand): initiatingMessage, id-ErrorIndication
+        // 9, ignore, length 8; one IE; id 15 Cause (ignore), protocol `011`,
+        // extension `0`, abstract-syntax-error-reject index 1 of seven `001`,
+        // padded -> `62`.
+        use nextgcore_ngap_gen::generated as g;
+        let bytes = crate::ngap_asn1::build_error_indication_generated(
+            None,
+            None,
+            g::Cause::Protocol(g::CauseProtocol(
+                g::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
             )),
-            criticality_diagnostics: None,
-        };
-        let bytes = nextgcore_ngap::builder::build_error_indication(&ei).unwrap();
-        assert_eq!(bytes[0], 0x00); // InitiatingMessage
+        )
+        .expect("encode");
+        assert_eq!(
+            bytes,
+            [0x00, 0x09, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x0f, 0x40, 0x01, 0x62]
+        );
         assert_eq!(bytes[1], proc_code::ERROR_INDICATION as u8);
-        match nextgcore_ngap::parser::decode_ngap_pdu(&bytes).unwrap() {
-            nextgcore_ngap::NgapMessage::ErrorIndication(e) => {
-                assert!(matches!(
-                    e.cause,
-                    Some(nextgcore_ngap::types::Cause::Protocol(_))
-                ));
-            }
-            other => panic!("expected ErrorIndication, got {other:?}"),
-        }
     }
 
     #[test]
@@ -25646,19 +25655,18 @@ mod tests {
         let start = crate::ngap_asn1::build_overload_start_asn1(40).expect("overload start");
         assert_eq!(start[0], 0x00);
         assert_eq!(start[1], proc_code::OVERLOAD_START as u8);
-        match nextgcore_ngap::parser::decode_ngap_pdu(&start).unwrap() {
-            nextgcore_ngap::NgapMessage::OverloadStart(o) => {
-                assert_eq!(o.traffic_load_reduction, Some(40));
-            }
-            other => panic!("expected OverloadStart, got {other:?}"),
-        }
+        // #417, by hand: initiatingMessage, id-OverloadStart 22, ignore, length 8;
+        // one IE; id 9 AMFTrafficLoadReductionIndication (ignore),
+        // `INTEGER (1..99)` as 40-1 = 39 in seven bits `0100111`, padded -> `4e`.
+        assert_eq!(
+            start,
+            [0x00, 0x16, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x09, 0x40, 0x01, 0x4e]
+        );
 
         let stop = crate::ngap_asn1::build_overload_stop_asn1().expect("overload stop");
         assert_eq!(stop[1], proc_code::OVERLOAD_STOP as u8);
-        match nextgcore_ngap::parser::decode_ngap_pdu(&stop).unwrap() {
-            nextgcore_ngap::NgapMessage::OverloadStop(_) => {}
-            other => panic!("expected OverloadStop, got {other:?}"),
-        }
+        // id-OverloadStop 23, reject; an empty IE container `00 00 00`.
+        assert_eq!(stop, [0x00, 0x17, 0x00, 0x03, 0x00, 0x00, 0x00]);
     }
 
     // ------------------------------------------------------------------
@@ -25915,15 +25923,6 @@ mod tests {
     // TS 38.413 §8.15.3/§8.15.5) → Namf N2InfoNotify producer (TS 29.518
     // §5.2.2.3.3) toward the LMF callback registered via N1N2MessageSubscribe.
     // ======================================================================
-
-    /// APER-encode an NGAP PDU exactly like the wire path does.
-    fn encode_ngap_pdu(pdu: &nextgcore_asn1c::ngap::pdu::NgapPdu) -> Vec<u8> {
-        use nextgcore_asn1c::per::{AperEncode, AperEncoder};
-        let mut encoder = AperEncoder::new();
-        pdu.encode_aper(&mut encoder).expect("APER encode");
-        encoder.align();
-        encoder.into_bytes().to_vec()
-    }
 
     /// Capture SbiServer standing in for the LMF's notify-callback endpoint:
     /// records (uri, json root, binary parts) for each POST and returns 204.
@@ -31943,8 +31942,6 @@ mod tests {
         // it describes a dev-profile deployment (issue #63). Declared explicitly
         // rather than inherited from the environment.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
 
         let (_sink, port, mut rx) = start_lmf_callback_sink().await;
@@ -31982,14 +31979,12 @@ mod tests {
         // leg seeds the RoutingID from the LMF's nfId — TS 38.413 §9.3.3.23).
         let nrppa = vec![0x20u8, 0x0B, 0x00, 0x07, 0xAA, 0xBB, 0xCC];
         let routing = b"lmf-nf-instance-1".to_vec();
-        let pdu = build_uplink_ue_associated_nrppa_transport(
-            AmfUeNgapId(amf_ue_ngap_id),
-            RanUeNgapId(7),
-            RoutingId::new(routing),
-            NrppaPdu::new(nrppa.clone()),
-        )
-        .expect("build UplinkUEAssociatedNRPPaTransport");
-        let bytes = encode_ngap_pdu(&pdu);
+        let bytes = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+            amf_ue_ngap_id,
+            7,
+            &routing,
+            &nrppa.clone(),
+        );
         // Hand-derived header check: InitiatingMessage (0x00), procedure 50.
         assert_eq!(bytes[0], 0x00);
         assert_eq!(bytes[1], 50);
@@ -32049,8 +32044,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_uplink_nrppa_no_subscription_drops_without_error_indication() {
-        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
 
         let mut ngap = test_ngap_server().await;
@@ -32072,14 +32065,12 @@ mod tests {
              this association-less server)"
         );
 
-        let pdu = build_uplink_ue_associated_nrppa_transport(
-            AmfUeNgapId(amf_ue_ngap_id),
-            RanUeNgapId(8),
-            RoutingId::new(b"lmf-nf-instance-9".to_vec()),
-            NrppaPdu::new(vec![0x01, 0x02, 0x03]),
-        )
-        .expect("build UplinkUEAssociatedNRPPaTransport");
-        let bytes = encode_ngap_pdu(&pdu);
+        let bytes = crate::gnb_pdus::uplink_ue_associated_nrppa_transport(
+            amf_ue_ngap_id,
+            8,
+            &b"lmf-nf-instance-9".to_vec(),
+            &vec![0x01, 0x02, 0x03],
+        );
         assert_eq!(bytes[1], 50);
 
         let dropped_before =
@@ -32161,8 +32152,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_uplink_non_ue_nrppa_answer_goes_to_the_lmf_its_routing_id_names() {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
         let (_sink, port, mut rx) = start_lmf_callback_sink().await;
         let sub_id = "nonuen2sub-807-routing";
@@ -32195,12 +32184,9 @@ mod tests {
         )
         .await;
         let nrppa = vec![0x20u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
-        let bytes = encode_ngap_pdu(
-            &build_uplink_non_ue_associated_nrppa_transport(
-                RoutingId::new(b"lmf-routing-807".to_vec()),
-                NrppaPdu::new(nrppa.clone()),
-            )
-            .unwrap(),
+        let bytes = crate::gnb_pdus::uplink_non_ue_associated_nrppa_transport(
+            &b"lmf-routing-807".to_vec(),
+            &nrppa.clone(),
         );
         ngap.process_ngap_message(1, &bytes).await.unwrap();
         let (_, json_root, parts) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -32232,8 +32218,6 @@ mod tests {
         // it describes a dev-profile deployment (issue #63). Declared explicitly
         // rather than inherited from the environment.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
-        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
 
         let (_sink, port, mut rx) = start_lmf_callback_sink().await;
@@ -32265,12 +32249,10 @@ mod tests {
 
         let mut ngap = test_ngap_server().await;
         let nrppa = vec![0x00u8, 0x11, 0x22, 0x33, 0x44];
-        let pdu = build_uplink_non_ue_associated_nrppa_transport(
-            RoutingId::new(b"lmf-nf-instance-2".to_vec()),
-            NrppaPdu::new(nrppa.clone()),
-        )
-        .expect("build UplinkNonUEAssociatedNRPPaTransport");
-        let bytes = encode_ngap_pdu(&pdu);
+        let bytes = crate::gnb_pdus::uplink_non_ue_associated_nrppa_transport(
+            &b"lmf-nf-instance-2".to_vec(),
+            &nrppa.clone(),
+        );
         assert_eq!(bytes[0], 0x00);
         assert_eq!(bytes[1], 47);
 
@@ -32970,8 +32952,7 @@ mod tests {
             default_paging_drx: None,
             global_ran_node_id: None,
         };
-        let pdu = nextgcore_ngap::builder::build_ran_configuration_update(&update)
-            .expect("build RAN Configuration Update");
+        let pdu = crate::gnb_pdus::ran_configuration_update(&update);
 
         // The acknowledgement send fails (no live SCTP association in this test);
         // the assertion is on what was STORED, which happens before the send.
@@ -33007,8 +32988,7 @@ mod tests {
             default_paging_drx: None,
             global_ran_node_id: None,
         };
-        let pdu = nextgcore_ngap::builder::build_ran_configuration_update(&update)
-            .expect("build RAN Configuration Update");
+        let pdu = crate::gnb_pdus::ran_configuration_update(&update);
         let _ = server.handle_ran_configuration_update(assoc, &pdu).await;
 
         let sessions = server.sessions.read().await;
@@ -33024,19 +33004,16 @@ mod tests {
     // ---- criterion 2: UPLINK RAN STATUS TRANSFER is relayed to the target ----
 
     fn uplink_status_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
-        nextgcore_ngap::builder::build_uplink_ran_status_transfer(
-            &nextgcore_ngap::types::RanStatusTransfer {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id,
-                // A valid RANStatusTransfer-TransparentContainer (one DRB, 12-bit
-                // COUNTs): since #417 the AMF decodes it (§9.3.1.31 is a
-                // SEQUENCE) instead of relaying opaque octets.
-                container: vec![
-                    0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
-                ],
-            },
-        )
-        .expect("build UplinkRANStatusTransfer")
+        crate::gnb_pdus::uplink_ran_status_transfer(&nextgcore_ngap::types::RanStatusTransfer {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            // A valid RANStatusTransfer-TransparentContainer (one DRB, 12-bit
+            // COUNTs): since #417 the AMF decodes it (§9.3.1.31 is a
+            // SEQUENCE) instead of relaying opaque octets.
+            container: vec![
+                0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+            ],
+        })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36458,32 +36435,29 @@ mod tests {
             .collect();
 
         // First: this codec must agree with nextgsim's on the abstract values.
-        match nextgcore_ngap::parser::decode_ngap_pdu(&bytes) {
-            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceNotify(n)) => {
-                assert_eq!(n.amf_ue_ngap_id, 42, "AMF-UE-NGAP-ID");
-                assert_eq!(n.ran_ue_ngap_id, 7, "RAN-UE-NGAP-ID");
-                assert_eq!(n.notify_list.len(), 1, "one notified session");
-                assert_eq!(n.notify_list[0].pdu_session_id, 5);
-                assert_eq!(
-                    n.notify_list[0].transfer,
-                    vec![0x40, 0x01, 0x28],
-                    "the notify transfer must arrive byte for byte -- it is an \
-                     opaque OCTET STRING the SMF parses, so a shifted length here \
-                     lands garbage on N11"
-                );
-                assert_eq!(n.released_list.len(), 1, "one released session");
-                assert_eq!(n.released_list[0].pdu_session_id, 6);
-                assert_eq!(n.released_list[0].transfer, vec![0x08]);
-            }
-            Ok(other) => panic!(
-                "nextgsim's Notify decoded as the wrong message here, so the two \
-                 products disagree on the wire: {other:?}"
+        // First (#417): nextgsim's encoder and this tree's hand derivation
+        // (`gnb_pdus`) agree octet for octet -- two independent productions of the
+        // same abstract values. The notify transfer must arrive byte for byte: it
+        // is an opaque OCTET STRING the SMF parses, so a shifted length here lands
+        // garbage on N11.
+        assert_eq!(
+            bytes,
+            crate::gnb_pdus::pdu_session_resource_notify(
+                &nextgcore_ngap::types::PduSessionResourceNotify {
+                    amf_ue_ngap_id: 42,
+                    ran_ue_ngap_id: 7,
+                    notify_list: vec![nextgcore_ngap::types::PduSessionResourceNotifyItem {
+                        pdu_session_id: 5,
+                        transfer: vec![0x40, 0x01, 0x28],
+                    }],
+                    released_list: vec![nextgcore_ngap::types::PduSessionResourceReleasedItem {
+                        pdu_session_id: 6,
+                        transfer: vec![0x08],
+                    }],
+                },
             ),
-            Err(e) => panic!(
-                "nextgsim's Notify does not decode with this parser, so the gNB is \
-                 emitting a PDU this AMF cannot read: {e:?}"
-            ),
-        }
+            "nextgsim's Notify and the hand-derived one disagree on the wire"
+        );
 
         // Then: the handler must drive the SMF-facing relay for BOTH lists, each
         // against its own SM context ref.
@@ -36952,7 +36926,7 @@ mod tests {
                 plmn_identity: [0x99, 0xf9, 0x07],
                 ng_enb_id: id,
             };
-            nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build")
+            crate::gnb_pdus::ng_setup_request(&ies)
         };
         let nodes = [
             (87_611u64, NgEnbId::Macro(0x1234)),
@@ -38284,8 +38258,8 @@ mod tests {
     /// This is the test #400's criterion 2 asks for: *"a test drives the production path
     /// and observes the notification at a real subscriber, not the emitter"*. It calls
     /// `handle_handover_notify` — the live NGAP dispatch target for procedure
-    /// `HandoverNotify` (`ngap_path.rs:1078`) — with a real APER-encoded PDU built by
-    /// `nextgcore_ngap::builder`, and reads the notification off an in-process
+    /// `HandoverNotify` (`ngap_path.rs:1078`) — with a real APER-encoded PDU derived by
+    /// hand in `crate::gnb_pdus` (#417), and reads the notification off an in-process
     /// `SbiServer` the AMF POSTs to over real HTTP/2.
     ///
     /// Reachable without a stand-in gNB, unlike the registration site: the emitter sits
@@ -42511,25 +42485,10 @@ mod tests {
         // address the SMF — the same code path a failed or empty answer takes.
         assert!(server.sm_context_refs.is_empty());
 
-        let request_transfer = nextgcore_ngap::transfer::PathSwitchRequestTransfer {
-            dl_ngu_up_tnl_information:
-                nextgcore_ngap::transfer::UpTransportLayerInformation::GtpTunnel(
-                    nextgcore_ngap::transfer::GtpTunnel {
-                        transport_layer_address:
-                            nextgcore_ngap::transfer::TransportLayerAddress::from_ipv4([
-                                10, 45, 0, 9,
-                            ]),
-                        gtp_teid: [0x00, 0x00, 0xBE, 0xEF],
-                    },
-                ),
-            qos_flow_accepted_list: vec![1],
-        };
         // The gNB's own transfer, which must NOT come back in the acknowledge.
         let inbound_bytes = {
-            // No encoder exists for the request transfer (it is decode-only in this tree),
-            // so an opaque non-empty byte string stands in: the assertion is that WHATEVER
-            // came in is not what goes out.
-            let _ = &request_transfer;
+            // An opaque non-empty byte string stands in for the request transfer: the
+            // assertion is that WHATEVER came in is not what goes out.
             vec![0x11, 0x22, 0x33, 0x44]
         };
 
@@ -47613,10 +47572,8 @@ mod tests {
                 ),
             }))
             .expect("encode UEContextReleaseRequest");
-        assert!(
-            nextgcore_ngap::parser::decode_ngap_pdu(&pdu).is_err(),
-            "the hand-written parser refuses this request, which is the defect"
-        );
+        // (The hand-written parser refused this request, which was the defect;
+        // that parser is gone with #417.)
 
         let _ = ngap.handle_ue_context_release(1, &pdu).await;
 
@@ -51347,18 +51304,19 @@ mod fivegs_to_eps_tests {
         ] {
             let (assoc, pdu) = answer_for(container, cause, seq).await;
             assert_eq!(assoc, SOURCE_ASSOC);
-            match nextgcore_ngap::parser::decode_ngap_pdu(&pdu).unwrap() {
-                nextgcore_ngap::NgapMessage::HandoverPreparationFailure(f) => {
-                    assert_eq!((f.amf_ue_ngap_id, f.ran_ue_ngap_id), (UE, RAN_UE));
-                    assert_eq!(
-                        f.cause,
-                        nextgcore_ngap::types::Cause::RadioNetwork(
-                            nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
-                        )
-                    );
-                }
-                other => panic!("cause {cause}, container {container:?}: {other:?}"),
-            }
+            // #417, by hand: unsuccessfulOutcome `40`, id-HandoverPreparation 12,
+            // reject; ids 10 and 85 (ignore); id 15 Cause (ignore), radioNetwork
+            // ho-failure-in-target-5GC-ngran-node-or-target-system, root index 7
+            // `000 0 000111` -> `01 c0`.
+            let mut expected = vec![0x40, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x03];
+            let mut ies = crate::aper_golden::Bits::default();
+            ies.ie(10, 1, &crate::aper_golden::amf_ue_ngap_id(UE))
+                .ie(85, 1, &crate::aper_golden::ran_ue_ngap_id(RAN_UE))
+                .ie(15, 1, &[0x01, 0xc0]);
+            let ies = ies.finish();
+            expected[3] = (ies.len() + 3) as u8;
+            expected.extend_from_slice(&ies);
+            assert_eq!(pdu, expected, "cause {cause}, container {container:?}");
         }
     }
 }
