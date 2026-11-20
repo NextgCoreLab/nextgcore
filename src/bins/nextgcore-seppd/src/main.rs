@@ -114,9 +114,11 @@ struct Args {
     #[arg(long, default_value = "8192")]
     max_assoc: usize,
 
-    /// Serving PLMN IDs as "mcc:mnc" (repeatable, e.g. --serving-plmn 999:70)
-    #[arg(long = "serving-plmn")]
-    serving_plmn: Vec<String>,
+    /// Serving PLMN IDs as "mcc:mnc" (repeatable, e.g. --serving-plmn 999:70).
+    /// #2115: a malformed one fails the command line, so the SEPP does not start
+    /// serving fewer PLMNs than it was given.
+    #[arg(long = "serving-plmn", value_parser = parse_plmn)]
+    serving_plmn: Vec<PlmnId>,
 
     /// Enable PRINS security capability (in addition to TLS)
     #[arg(long)]
@@ -278,14 +280,19 @@ fn n32_peer_client_tls(
     Ok(Some(tls))
 }
 
-/// Parse "mcc:mnc" into a PlmnId
-fn parse_plmn(spec: &str) -> Option<PlmnId> {
-    let (mcc, mnc) = spec.split_once(':')?;
-    Some(PlmnId::new(
-        mcc.parse().ok()?,
-        mnc.parse().ok()?,
-        mnc.len() as u8,
-    ))
+/// Parse "mcc:mnc" into a PlmnId. An MCC is exactly 3 digits and an MNC 2 or 3
+/// (TS 23.003 §2.2): anything else is refused rather than padded, since `1:01`
+/// would otherwise become MCC 001 and MNC 70 and 070 are different PLMNs (#2115).
+fn parse_plmn(spec: &str) -> Result<PlmnId, String> {
+    use nextgcore_core::plmn::{check_digits, PlmnPart};
+    let (mcc, mnc) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("--serving-plmn={spec:?}: want mcc:mnc"))?;
+    check_digits("--serving-plmn mcc", PlmnPart::Mcc, mcc)?;
+    check_digits("--serving-plmn mnc", PlmnPart::Mnc, mnc)?;
+    // Both are 2-3 ASCII digits, so they parse.
+    let number = |digits: &str| digits.parse::<u16>().map_err(|e| format!("{spec:?}: {e}"));
+    Ok(PlmnId::new(number(mcc)?, number(mnc)?, mnc.len() as u8))
 }
 
 /// Global shutdown flag
@@ -351,17 +358,8 @@ async fn main() -> Result<()> {
 
     // Serving PLMN list and security capabilities (from configuration)
     {
-        let plmn_ids: Vec<PlmnId> = args
-            .serving_plmn
-            .iter()
-            .filter_map(|s| {
-                let p = parse_plmn(s);
-                if p.is_none() {
-                    log::warn!("Ignoring malformed --serving-plmn [{s}] (want mcc:mnc)");
-                }
-                p
-            })
-            .collect();
+        // Parsed and checked with the command line (#2115).
+        let plmn_ids: Vec<PlmnId> = args.serving_plmn.clone();
         let ctx = sepp_self();
         if let Ok(mut context) = ctx.write() {
             if !plmn_ids.is_empty() {
@@ -825,6 +823,57 @@ mod lab_flag_tests_1848 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2115: `--serving-plmn` takes exactly a 3-digit MCC and a 2-3 digit MNC.
+    /// A short MCC used to be parsed as a number and padded (`1:01` served MCC
+    /// 001); it is refused now, as is a 4-digit MNC or a non-digit.
+    #[test]
+    fn serving_plmn_takes_only_ts_23_003_digits_2115() {
+        let p = parse_plmn("001:01").expect("2-digit MNC");
+        assert_eq!((p.mcc, p.mnc, p.mnc_len), (1, 1, 2));
+        let p = parse_plmn("999:070").expect("3-digit MNC");
+        assert_eq!((p.mcc, p.mnc, p.mnc_len), (999, 70, 3));
+        for (spec, want) in [
+            ("1:01", "an MCC is 3 digits"),
+            ("0011:01", "an MCC is 3 digits"),
+            ("+01:01", "an MCC is 3 digits"),
+            ("001:1", "an MNC is 2 or 3 digits"),
+            ("001:0700", "an MNC is 2 or 3 digits"),
+            ("001:7a", "an MNC is 2 or 3 digits"),
+            ("00101", "want mcc:mnc"),
+        ] {
+            let err = parse_plmn(spec).expect_err(spec);
+            assert!(err.contains(want), "{spec}: {err}");
+        }
+    }
+
+    /// #2115 (R41 on #2127): a malformed `--serving-plmn` fails the command
+    /// line, naming the rule, instead of being dropped with a WARN; well-formed
+    /// ones reach `Args` parsed.
+    ///
+    /// REVERT-VERIFIED: with the flag back to `Vec<String>` and no
+    /// `value_parser`, `1:01` parses and the `unwrap_err` panics.
+    #[test]
+    fn a_malformed_serving_plmn_fails_the_command_line_2115() {
+        let err = Args::try_parse_from(["nextgcore-seppd", "--serving-plmn", "1:01"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("an MCC is 3 digits"), "{err}");
+        let args = Args::try_parse_from([
+            "nextgcore-seppd",
+            "--serving-plmn",
+            "001:01",
+            "--serving-plmn",
+            "999:070",
+        ])
+        .expect("well-formed");
+        let plmns: Vec<(u16, u16, u8)> = args
+            .serving_plmn
+            .iter()
+            .map(|p| (p.mcc, p.mnc, p.mnc_len))
+            .collect();
+        assert_eq!(plmns, [(1, 1, 2), (999, 70, 3)]);
+    }
 
     #[test]
     fn test_args_default() {

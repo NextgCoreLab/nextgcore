@@ -15642,7 +15642,7 @@ mod tests {
         peers.notified.lock().unwrap().clear();
 
         let s = Settings::from_yaml(&LoopYaml {
-            cells: Some(vec![crate::congestion_loop::CellYaml {
+            cells: Some(vec![crate::congestion_loop::CellConfigYaml {
                 mcc: "001".into(),
                 mnc: "01".into(),
                 nr_cell_id: "000000010".into(),
@@ -16034,7 +16034,7 @@ mod tests {
     fn settings_1453() -> crate::congestion_loop::Settings {
         let mut s =
             crate::congestion_loop::Settings::from_yaml(&crate::congestion_loop::LoopYaml {
-                cells: Some(vec![crate::congestion_loop::CellYaml {
+                cells: Some(vec![crate::congestion_loop::CellConfigYaml {
                     mcc: "001".into(),
                     mnc: "01".into(),
                     nr_cell_id: "000000010".into(),
@@ -16077,7 +16077,7 @@ mod tests {
         seed_subscriber_1383(ue_b);
         let pol = create_for_1383(ue_b, 3, "10.45.65.12", peers.smf_port).await;
         let s = Settings::from_yaml(&LoopYaml {
-            cells: Some(vec![crate::congestion_loop::CellYaml {
+            cells: Some(vec![crate::congestion_loop::CellConfigYaml {
                 mcc: "001".into(),
                 mnc: "01".into(),
                 nr_cell_id: "000000010".into(),

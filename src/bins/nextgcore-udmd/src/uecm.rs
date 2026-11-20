@@ -1540,14 +1540,15 @@ mod tests {
     /// #2109: a deregistration whose UDR DELETE the UDR does not take is never
     /// answered 204 (TS 29.503 §6.2.7, the #2100 mapping): a refusal (403) is
     /// 500 SYSTEM_FAILURE, an unknown subscriber (404) is 404 USER_NOT_FOUND, a
-    /// UDR fault (503) is 503. That holds for the AMF deregistration (the
+    /// UDR fault (503) is 503 SERVICE_UNAVAILABLE (#2129: each cause asserted).
+    /// That holds for the AMF deregistration (the
     /// purgeFlag PATCH and dereg-amf both end there), the SMF, the SMSF and the
     /// IP-SM-GW one. Nothing local changes: the registration is still stored,
     /// and the AMF is still cached as serving the UE. Once the UDR takes the
     /// DELETE (the retry), each is 204 and the record is gone.
     ///
-    /// REVERT-VERIFIED: with the AMF DELETE's outcome ignored again (`(degraded)`),
-    /// the refused AMF deregistration is 204 and the `AMF dereg` assertion fails;
+    /// REVERT-VERIFIED: with the outcome of the AMF registration's UDR DELETE
+    /// ignored again (`(degraded)`), the refused AMF deregistration is 204 and the `AMF dereg` assertion fails;
     /// with the SMF DELETE's ignored, the `SMF dereg` assertion fails.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
@@ -1558,9 +1559,9 @@ mod tests {
         crate::context::udm_context_init(1024, 4096);
         let smf = smf_registration_resource("5");
         for (udr, status, cause) in [
-            (403u16, 500u16, Some("SYSTEM_FAILURE")),
-            (404, 404, Some("USER_NOT_FOUND")),
-            (503, 503, None),
+            (403u16, 500u16, "SYSTEM_FAILURE"),
+            (404, 404, "USER_NOT_FOUND"),
+            (503, 503, "SERVICE_UNAVAILABLE"),
         ] {
             let supi = format!("imsi-00101000002109{}", udr % 10);
             let mock = Arc::new(MockUdr::new().with_delete_status(udr));
@@ -1616,13 +1617,11 @@ mod tests {
                     "{what}, UDR {udr}: {:?}",
                     resp.http.content
                 );
-                if let Some(cause) = cause {
-                    assert_eq!(
-                        problem_cause(resp).as_deref(),
-                        Some(cause),
-                        "{what}, UDR {udr}"
-                    );
-                }
+                assert_eq!(
+                    problem_cause(resp).as_deref(),
+                    Some(cause),
+                    "{what}, UDR {udr}: the ProblemDetails cause"
+                );
             }
             for resource in [
                 access.amf_resource(),
@@ -1660,6 +1659,97 @@ mod tests {
             assert!(ok.stored_doc(access.amf_resource()).is_none());
             assert!(ok.stored_doc(&smf).is_none());
         }
+    }
+
+    /// **#2129** (R41 on #2124): a deregistration the UDR does not take notifies
+    /// nobody. A whole-UE SDM subscriber and a LOSS_OF_CONNECTIVITY EE subscriber
+    /// hear nothing from a refused AMF (and SMF) deregistration, and then hear
+    /// the deregistration once the UDR takes the retry, so the stubs are shown
+    /// to be listening. Every UECM operation awaits its notifications, so the
+    /// counts are read right after each call.
+    ///
+    /// REVERT-VERIFIED: with `process_amf_deregistration` notifying before its
+    /// UDR outcome is checked, "a refused AMF deregistration notifies nobody"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_refused_deregistration_notifies_nobody_2129() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("UDM_NOTIFY_DISABLE");
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000002129";
+        let (_sdm_srv, sdm_uri, sdm_seen) = ee_stub().await;
+        let (_ee_srv, ee_uri, ee_seen) = ee_stub().await;
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            for sub in context.sdm_subscriptions_for_supi(supi) {
+                context.sdm_subscription_remove(&sub.id);
+            }
+            for sub in context.ee_subscriptions_for_supi(supi) {
+                context.ee_subscription_remove(&sub.id);
+            }
+            context.sdm_subscription_insert(crate::context::UdmSdmSubscription::for_supi(
+                supi,
+                Some("nf-2129".to_string()),
+                Some(sdm_uri.clone()),
+                vec![],
+            ));
+            context.ee_subscription_insert(crate::context::UdmEeSubscription::for_ue(
+                supi,
+                ee_uri.clone(),
+                json!({
+                    "callbackReference": ee_uri,
+                    "monitoringConfigurations": { "loc": { "eventType": "LOSS_OF_CONNECTIVITY" } },
+                })
+                .to_string(),
+            ));
+        }
+        let refusing = Arc::new(MockUdr::new().with_delete_status(403));
+        let client = UdrClient::Mock(refusing.clone());
+        let access = UecmAccess::ThreeGpp;
+        let reg = process_amf_registration(supi, &valid_amf_body(), &client, access).await;
+        assert_eq!(reg.status, 201, "{:?}", reg.http.content);
+        let reg = process_smf_registration(supi, "5", &valid_smf_body(), &client).await;
+        assert_eq!(reg.status, 201, "{:?}", reg.http.content);
+        let before = (posts(&sdm_seen), posts(&ee_seen));
+
+        let resp = process_amf_deregistration(supi, &client, access).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(
+            (posts(&sdm_seen), posts(&ee_seen)),
+            before,
+            "a refused AMF deregistration notifies nobody"
+        );
+        let resp = process_smf_deregistration(supi, "5", &client).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(
+            (posts(&sdm_seen), posts(&ee_seen)),
+            before,
+            "a refused SMF deregistration notifies nobody"
+        );
+
+        // The retry, once the UDR takes the DELETE: both subscribers hear it.
+        let ok = Arc::new(MockUdr::new());
+        let doc = refusing.stored_doc(access.amf_resource()).expect("stored");
+        ok.stored
+            .lock()
+            .unwrap()
+            .insert(access.amf_resource().to_string(), doc);
+        let resp = process_amf_deregistration(supi, &UdrClient::Mock(ok), access).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert_eq!(
+            (posts(&sdm_seen), posts(&ee_seen)),
+            (before.0 + 1, before.1 + 1),
+            "the deregistration the UDR took notifies both subscribers"
+        );
+        assert_eq!(
+            reported(&ee_seen).last().map(|(event, _)| event.as_str()),
+            Some("LOSS_OF_CONNECTIVITY")
+        );
     }
 
     /// REVERT-VERIFIED: with a non-5xx UDR status degrading to success again,

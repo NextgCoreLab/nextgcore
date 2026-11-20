@@ -940,45 +940,82 @@ impl AmfApp {
         }
     }
 
-    /// Resolve a PLMN ID from the typed YAML struct (mcc/mnc may be int or string)
-    fn resolve_plmn_id(plmn: PlmnIdYaml) -> Option<context::PlmnId> {
-        let mcc = plmn.mcc.and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_u64().map(|x| x.to_string()),
-            serde_yaml::Value::String(s) => Some(s),
+    /// Resolve a PLMN ID from the typed YAML struct. `field` names the `plmn_id`
+    /// block in the error, e.g. `amf.guami[0].plmn_id`.
+    ///
+    /// `Ok(None)` when the block leaves the MCC or the MNC out: the entry has no
+    /// usable PLMN ID, and the caller skips it as before. `Err` when either is
+    /// present but malformed (#2115): a YAML number (`mcc: 1` used to configure
+    /// MCC **100**, because [`context::PlmnId::new`] reads digits from the left),
+    /// or a string that is not 3 (MCC) / 2-3 (MNC) digits (TS 23.003 §2.2,
+    /// TS 29.571). See [`nextgcore_core::plmn`].
+    fn resolve_plmn_id(field: &str, plmn: PlmnIdYaml) -> Result<Option<context::PlmnId>, String> {
+        use nextgcore_core::plmn::{config_digits, PlmnPart};
+        let digits = |value: Option<serde_yaml::Value>, part: PlmnPart| {
+            value
+                .map(|v| config_digits(&format!("{field}.{}", part.key()), part, &v))
+                .transpose()
+        };
+        let mcc = digits(plmn.mcc, PlmnPart::Mcc)?;
+        let mnc = digits(plmn.mnc, PlmnPart::Mnc)?;
+        Ok(match (mcc, mnc) {
+            (Some(mcc), Some(mnc)) => Some(context::PlmnId::new(&mcc, &mnc)),
             _ => None,
-        })?;
-        let mnc = plmn.mnc.and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_u64().map(|x| x.to_string()),
-            serde_yaml::Value::String(s) => Some(s),
-            _ => None,
-        })?;
-        Some(context::PlmnId::new(&mcc, &mnc))
+        })
     }
 
-    /// Build a runtime Guami from its typed YAML representation
-    fn resolve_guami(entry: GuamiYaml) -> Option<context::Guami> {
-        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
+    /// Build a runtime Guami from its typed YAML representation (`amf.guami[index]`).
+    fn resolve_guami(index: usize, entry: GuamiYaml) -> Result<Option<context::Guami>, String> {
+        let Some(plmn) = entry.plmn_id else {
+            return Ok(None);
+        };
+        let Some(plmn_id) = Self::resolve_plmn_id(&format!("amf.guami[{index}].plmn_id"), plmn)?
+        else {
+            return Ok(None);
+        };
         let amf_id_yaml = entry.amf_id.unwrap_or_default();
-        Some(context::Guami {
+        Ok(Some(context::Guami {
             plmn_id,
             amf_id: context::AmfId {
                 region: amf_id_yaml.region.unwrap_or(0),
                 set: amf_id_yaml.set.unwrap_or(0),
                 pointer: amf_id_yaml.pointer.unwrap_or(0),
             },
-        })
+        }))
     }
 
-    /// Build a runtime ServedTai from its typed YAML representation
-    fn resolve_tai(entry: TaiYaml) -> Option<context::ServedTai> {
-        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
-        Some(context::ServedTai {
+    /// Build a runtime ServedTai from its typed YAML representation (`amf.tai[index]`).
+    fn resolve_tai(index: usize, entry: TaiYaml) -> Result<Option<context::ServedTai>, String> {
+        let Some(plmn) = entry.plmn_id else {
+            return Ok(None);
+        };
+        let Some(plmn_id) = Self::resolve_plmn_id(&format!("amf.tai[{index}].plmn_id"), plmn)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(context::ServedTai {
             list0: context::Tai0List {
                 plmn_id,
                 tac: vec![entry.tac.unwrap_or(0)],
             },
             ..Default::default()
-        })
+        }))
+    }
+
+    /// Resolve every entry of a configured list with `resolve`, which is given the
+    /// entry's index, keeping the usable ones. The first refused entry fails the
+    /// whole list.
+    fn resolve_entries<Y, T>(
+        entries: Vec<Y>,
+        resolve: impl Fn(usize, Y) -> Result<Option<T>, String>,
+    ) -> Result<Vec<T>, String> {
+        let mut resolved = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            if let Some(item) = resolve(index, entry)? {
+                resolved.push(item);
+            }
+        }
+        Ok(resolved)
     }
 
     /// Resolve the configuration's GUAMI, TAI and PLMN support lists, taking them out of
@@ -992,14 +1029,15 @@ impl AmfApp {
     ///   (TS 38.413 §9.2.6.2), so every NG Setup would fail;
     /// - a `guami` list that resolves to no GUAMI, for the same reason: the Served GUAMI
     ///   List is SIZE(1..maxnoofServedGUAMIs);
-    /// - a PLMN with no usable S-NSSAI (see [`AmfApp::resolve_plmn_support`]).
+    /// - a PLMN with no usable S-NSSAI (see [`AmfApp::resolve_plmn_support`]);
+    /// - a malformed MCC or MNC in any GUAMI, TAI or PLMN support entry, a YAML
+    ///   number among them (#2115, see [`AmfApp::resolve_plmn_id`]).
     fn resolve_lists(section: &mut AmfSection) -> Result<ResolvedLists, String> {
-        let guami = section.guami.take().map(|entries| {
-            entries
-                .into_iter()
-                .filter_map(Self::resolve_guami)
-                .collect::<Vec<_>>()
-        });
+        let guami = section
+            .guami
+            .take()
+            .map(|entries| Self::resolve_entries(entries, Self::resolve_guami))
+            .transpose()?;
         if guami.as_ref().is_some_and(Vec::is_empty) {
             return Err(
                 "amf.guami resolves to no GUAMI (empty, or no entry with a usable \
@@ -1008,21 +1046,15 @@ impl AmfApp {
                     .to_string(),
             );
         }
-        let tai = section.tai.take().map(|entries| {
-            entries
-                .into_iter()
-                .filter_map(Self::resolve_tai)
-                .collect::<Vec<_>>()
-        });
+        let tai = section
+            .tai
+            .take()
+            .map(|entries| Self::resolve_entries(entries, Self::resolve_tai))
+            .transpose()?;
         let plmn_support = match section.plmn_support.take() {
             None => None,
             Some(entries) => {
-                let mut resolved = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    if let Some(plmn_support) = Self::resolve_plmn_support(entry)? {
-                        resolved.push(plmn_support);
-                    }
-                }
+                let resolved = Self::resolve_entries(entries, Self::resolve_plmn_support)?;
                 if resolved.is_empty() {
                     return Err("amf.plmn_support resolves to no PLMN (empty, or no entry \
                          with a usable PLMN ID); the NG Setup Response's PLMN Support List \
@@ -1044,9 +1076,15 @@ impl AmfApp {
     /// (#1060 review): TS 38.413 §9.3.1.17 makes the Slice Support List SIZE(1..), so an
     /// NG Setup Response for it could not be built -- the AMF must not start on it.
     fn resolve_plmn_support(
+        index: usize,
         entry: PlmnSupportYaml,
     ) -> Result<Option<context::PlmnSupport>, String> {
-        let Some(plmn_id) = entry.plmn_id.and_then(Self::resolve_plmn_id) else {
+        let Some(plmn) = entry.plmn_id else {
+            return Ok(None);
+        };
+        let Some(plmn_id) =
+            Self::resolve_plmn_id(&format!("amf.plmn_support[{index}].plmn_id"), plmn)?
+        else {
             return Ok(None);
         };
         // #920 follow-up: SST 0 is not a slice (TS 23.501 §5.15.2.2 standardises SST
@@ -1990,7 +2028,7 @@ mod tests {
             "plmn_id: { mcc: 001, mnc: 01 }\ns_nssai:\n  - sst: 0\n    sd: 9\n  - sst: 2\n  - sd: 5\n",
         )
         .expect("yaml");
-        let resolved = AmfApp::resolve_plmn_support(entry)
+        let resolved = AmfApp::resolve_plmn_support(0, entry)
             .expect("a usable S-NSSAI is left")
             .expect("the PLMN resolves");
         assert_eq!(
@@ -2015,7 +2053,7 @@ mod tests {
             "plmn_id: { mcc: 001, mnc: 01 }\n",
         ] {
             let entry: PlmnSupportYaml = serde_yaml::from_str(yaml).expect("yaml");
-            let err = AmfApp::resolve_plmn_support(entry).expect_err(yaml);
+            let err = AmfApp::resolve_plmn_support(0, entry).expect_err(yaml);
             assert!(err.contains("no usable S-NSSAI"), "{err}");
         }
     }
@@ -2454,6 +2492,147 @@ amf:
         assert!(lists.tai.is_none());
     }
 
+    /// **#2115.** A malformed MCC or MNC in any GUAMI, TAI or PLMN support entry fails
+    /// the configuration, naming the field. A YAML number is refused even when it lost
+    /// nothing (`999`), because it cannot be told from one that did: `mcc: 1` used to
+    /// configure MCC **100** (`PlmnId::new` reads digits from the left). The quoted form
+    /// and serde_yaml's string reading of an unquoted `001` are accepted as written.
+    #[test]
+    fn a_numeric_or_malformed_plmn_fails_the_configuration_2115() {
+        let guami = |plmn: &str| format!("guami:\n  - plmn_id: {plmn}\n");
+        let tai = |plmn: &str| {
+            format!("tai:\n  - plmn_id: {{ mcc: \"001\", mnc: \"01\" }}\n  - plmn_id: {plmn}\n")
+        };
+        let plmn_support = |plmn: &str| {
+            format!("plmn_support:\n  - plmn_id: {plmn}\n    s_nssai: [ {{ sst: 1 }} ]\n")
+        };
+        for (yaml, want) in [
+            (
+                guami("{ mcc: 1, mnc: \"01\" }"),
+                "amf.guami[0].plmn_id.mcc=1 reached the configuration as a number",
+            ),
+            (
+                guami("{ mcc: 999, mnc: \"70\" }"),
+                "amf.guami[0].plmn_id.mcc=999 reached the configuration as a number",
+            ),
+            (
+                tai("{ mcc: \"999\", mnc: 70 }"),
+                "amf.tai[1].plmn_id.mnc=70 reached the configuration as a number",
+            ),
+            (
+                plmn_support("{ mcc: \"001\", mnc: 1 }"),
+                "amf.plmn_support[0].plmn_id.mnc=1 reached the configuration as a number",
+            ),
+            (
+                guami("{ mcc: \"1\", mnc: \"01\" }"),
+                "amf.guami[0].plmn_id.mcc=\"1\": an MCC is 3 digits (TS 23.003 §2.2)",
+            ),
+            (
+                tai("{ mcc: \"0011\", mnc: \"01\" }"),
+                "amf.tai[1].plmn_id.mcc=\"0011\": an MCC is 3 digits",
+            ),
+            (
+                plmn_support("{ mcc: \"001\", mnc: \"0700\" }"),
+                "amf.plmn_support[0].plmn_id.mnc=\"0700\": an MNC is 2 or 3 digits",
+            ),
+            (
+                plmn_support("{ mcc: \"001\", mnc: true }"),
+                "amf.plmn_support[0].plmn_id.mnc is not a digit string",
+            ),
+        ] {
+            let mut section: AmfSection = serde_yaml::from_str(&yaml).expect("yaml");
+            let err = AmfApp::resolve_lists(&mut section)
+                .err()
+                .unwrap_or_else(|| panic!("must be refused: {yaml}"));
+            assert!(err.contains(want), "{yaml}: {err}");
+        }
+
+        // Accepted as written, leading zeros and all.
+        let mut section: AmfSection = serde_yaml::from_str(&format!(
+            "{}{}{}",
+            guami("{ mcc: \"001\", mnc: \"070\" }"),
+            tai("{ mcc: 001, mnc: 01 }"),
+            plmn_support("{ mcc: \"999\", mnc: \"70\" }"),
+        ))
+        .expect("yaml");
+        let lists = AmfApp::resolve_lists(&mut section).expect("accepted");
+        let guami = lists.guami.expect("guami");
+        assert_eq!(
+            (guami[0].plmn_id.mcc(), guami[0].plmn_id.mnc()),
+            ("001".into(), "070".into())
+        );
+        let tai = lists.tai.expect("tai");
+        assert_eq!(
+            (tai[1].list0.plmn_id.mcc(), tai[1].list0.plmn_id.mnc()),
+            ("001".into(), "01".into())
+        );
+        let plmns = lists.plmn_support.expect("plmn_support");
+        assert_eq!(
+            (plmns[0].plmn_id.mcc(), plmns[0].plmn_id.mnc()),
+            ("999".into(), "70".into())
+        );
+    }
+
+    /// **#2115.** `load_config` itself refuses a numeric MCC -- the step `AmfApp::init`
+    /// propagates to start-up -- naming the file and the field, and applies nothing.
+    #[tokio::test]
+    async fn a_numeric_mcc_aborts_the_load_2115() {
+        use std::io::Write;
+
+        let yaml = r#"
+amf:
+  amf_name: amf-2115-refused
+  guami:
+    - plmn_id: { mcc: "999", mnc: "70" }
+      amf_id: { region: 9, set: 9, pointer: 9 }
+  plmn_support:
+    - plmn_id: { mcc: 1, mnc: "01" }
+      s_nssai:
+        - sst: 1
+"#;
+        let path = unique_fixture_path("nextgcore-amfd-2115-numeric-mcc.yaml");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+            .expect("write the fixture config");
+        let path_str = path.to_str().expect("utf-8 temp path").to_owned();
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        context::amf_context_init(64, 1024, 4096);
+        let ctx_arc = context::amf_self();
+        let (saved, name_before) = {
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            (save_lists(&c), c.amf_name.clone())
+        };
+        let before = list_fingerprint(&saved);
+
+        let err = AmfApp::new()
+            .load_config(&path_str)
+            .await
+            .expect_err("a numeric MCC must fail the load")
+            .to_string();
+        assert!(err.contains(&path_str), "the error names the file: {err}");
+        assert!(
+            err.contains("amf.plmn_support[0].plmn_id.mcc=1 reached the configuration as a number"),
+            "the error names the field: {err}"
+        );
+        {
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            let after = list_fingerprint(&save_lists(&c));
+            assert_eq!(after, before, "a refused load leaves every list as it was");
+            assert!(
+                !after.iter().any(|entry| entry.contains("plmn 100/")),
+                "MCC 100 is never configured: {after:?}"
+            );
+            assert_eq!(c.amf_name, name_before, "and the AMF name");
+        }
+
+        restore_lists(
+            &mut ctx_arc.write().unwrap_or_else(|e| e.into_inner()),
+            saved,
+        );
+        remove_fixture(&path);
+    }
+
     /// **#1070 review m3.** A list the configuration names replaces the context's list.
     /// `load_config` used to append, so a second load of the same file doubled every
     /// GUAMI, TAI, PLMN and algorithm, and a load after anything else had written them
@@ -2465,13 +2644,13 @@ amf:
         let yaml = r#"
 amf:
   guami:
-    - plmn_id: { mcc: 999, mnc: 70 }
+    - plmn_id: { mcc: "999", mnc: "70" }
       amf_id: { region: 2, set: 1, pointer: 0 }
   tai:
-    - plmn_id: { mcc: 999, mnc: 70 }
+    - plmn_id: { mcc: "999", mnc: "70" }
       tac: 1070
   plmn_support:
-    - plmn_id: { mcc: 999, mnc: 70 }
+    - plmn_id: { mcc: "999", mnc: "70" }
       s_nssai:
         - sst: 1
     - plmn_id: { mcc: 001, mnc: 01 }
@@ -2538,16 +2717,16 @@ amf:
 amf:
   amf_name: amf-1070-refused
   guami:
-    - plmn_id: { mcc: 999, mnc: 70 }
+    - plmn_id: { mcc: "999", mnc: "70" }
       amf_id: { region: 9, set: 9, pointer: 9 }
   tai:
-    - plmn_id: { mcc: 999, mnc: 70 }
+    - plmn_id: { mcc: "999", mnc: "70" }
       tac: 10700
   plmn_support:
     - plmn_id: { mcc: 001, mnc: 01 }
       s_nssai:
         - sst: 1
-    - plmn_id: { mcc: 999, mnc: 70 }
+    - plmn_id: { mcc: "999", mnc: "70" }
       s_nssai:
         - sst: 0
 "#;

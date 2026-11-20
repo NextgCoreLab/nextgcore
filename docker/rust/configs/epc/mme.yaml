@@ -26,14 +26,14 @@ mme:
         - address: 172.24.0.4
   gummei:
     - plmn_id:
-        mcc: 999
-        mnc: 70
+        mcc: "999"
+        mnc: "70"
       mme_gid: 2
       mme_code: 1
   tai:
     - plmn_id:
-        mcc: 999
-        mnc: 70
+        mcc: "999"
+        mnc: "70"
       tac: 1
   security:
     integrity_order: [EIA2, EIA1, EIA0]

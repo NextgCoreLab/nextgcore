@@ -41,6 +41,8 @@ elliptic-curve = { workspace = true, features = ["sec1", "pem"] }
 
 [dev-dependencies]
 proptest.workspace = true
+# #2112: the capturing logger, for the log-line assertions.
+nextgcore-core = { workspace = true, features = ["test-log"] }
 # #1870/#1915: a self-signed TLS target for the N32-f redirect test. Test-only.
 rcgen = "0.13"
 
