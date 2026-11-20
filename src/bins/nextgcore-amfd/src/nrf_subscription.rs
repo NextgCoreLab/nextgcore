@@ -969,12 +969,66 @@ mod tests {
             .with_body(body.to_string(), "application/json")
     }
 
+    /// **#2172** (SECURITY): under production, an NFStatusNotify on a held token
+    /// acts only when the sender is the NRF (an NRF-only certificate) or an SCP
+    /// relaying it. A forged NF_DEREGISTERED from another NF's certificate, a
+    /// mixed `[NRF, AMF]` one, or no certificate is 403 and evicts nothing; the
+    /// NRF's evicts.
+    ///
+    /// REVERT-VERIFIED: with the `refuse_notifier` call removed from
+    /// `handle_nf_status_notify_callback_in`, the forged `[AMF]` notification is
+    /// 204 and "a forged sender evicts nothing" fails.
+    #[tokio::test]
+    async fn only_the_nrf_or_a_relaying_scp_evicts_a_peer_2172() {
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let token = register_token("SMF");
+        let ctx = global_context();
+        ctx.add_nf_instance(cached("smf-2172-target", 42172)).await;
+        ctx.add_nf_instance(cached("smf-2172-other", 42173)).await;
+        let body = json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": uri("smf-2172-target") });
+        let from = |types: &[&str]| {
+            let mut r = notify_on(&token, body.clone());
+            r.peer_cert_present = !types.is_empty();
+            r.peer_cert_nf_instance_id =
+                (!types.is_empty()).then(|| "dddddddd-2172-4000-8000-0000000000d1".to_string());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r
+        };
+        for forged in [&["AMF"][..], &["NRF", "AMF"], &["SCP", "AMF"], &[]] {
+            let resp = crate::namf_server::handle_nf_status_notify_callback_in(
+                &token,
+                &from(forged),
+                true,
+            )
+            .await;
+            assert_eq!(resp.status, 403, "{forged:?}: {:?}", resp.http.content);
+            assert!(
+                ctx.get_nf_instance("smf-2172-target").await.is_some(),
+                "{forged:?}: a forged sender evicts nothing"
+            );
+        }
+        let resp =
+            crate::namf_server::handle_nf_status_notify_callback_in(&token, &from(&["NRF"]), true)
+                .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert!(
+            ctx.get_nf_instance("smf-2172-target").await.is_none(),
+            "the NRF's notification evicts"
+        );
+        unregister_token(&token);
+        ctx.remove_nf_instance("smf-2172-other").await;
+    }
+
     /// #1421: behind an OAuth2-required listener, the NRF's token-less
     /// NFStatusNotify on a token this AMF holds reaches the handler and acts; on
     /// a token it does not hold it is refused 401 and acts on nothing, as is a
     /// service request without a bearer.
     #[tokio::test]
     async fn an_oauth2_listener_admits_the_nrf_status_notify_on_a_held_token_only() {
+        // #2172: the sender rule is production-only and pinned by
+        // `only_the_nrf_or_a_relaying_scp_evicts_a_peer_2172`; this test is about
+        // what an admitted notification does, so it runs under dev.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
         let token = register_token("SMF");
         let ctx = global_context();
@@ -1021,6 +1075,10 @@ mod tests {
     /// instance, and the endpoint in the body's `nfProfile` is not taken.
     #[tokio::test]
     async fn the_callback_evicts_the_named_instance_and_takes_nothing_from_the_body() {
+        // #2172: the sender rule is production-only and pinned by
+        // `only_the_nrf_or_a_relaying_scp_evicts_a_peer_2172`; this test is about
+        // what an admitted notification does, so it runs under dev.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
         let token = register_token("SMF");
         let notify = |body| notify_on(&token, body);
@@ -1079,6 +1137,10 @@ mod tests {
     /// that subscription's type. The pre-#940 tokenless route is gone.
     #[tokio::test]
     async fn an_unknown_token_or_another_types_instance_evicts_nothing() {
+        // #2172: the sender rule is production-only and pinned by
+        // `only_the_nrf_or_a_relaying_scp_evicts_a_peer_2172`; this test is about
+        // what an admitted notification does, so it runs under dev.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
         let ctx = global_context();
         ctx.add_nf_instance(cached("smf-940-a", 40011)).await;
@@ -1176,6 +1238,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_callback_refuses_a_body_without_its_mandatory_members() {
+        // #2172: the sender rule is production-only and pinned by
+        // `only_the_nrf_or_a_relaying_scp_evicts_a_peer_2172`; this test is about
+        // what an admitted notification does, so it runs under dev.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let token = register_token("SMF");
         let resp = crate::namf_server::test_namf_request_handler(notify_on(
             &token,
