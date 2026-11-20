@@ -5559,9 +5559,17 @@ fn remove_app_policy(
     let Some(mut sess) = context.sess_find_by_id(app.sess_id) else {
         return (Vec::new(), None);
     };
+    // #2269: a pre-#2263 rule (from a snapshot written before the upgrade) names
+    // no app session, so it cannot be told whose it was; once the LAST app
+    // session on the PDU session goes it can only have been one of theirs, and
+    // goes too. Rules of the other app sessions are in the current form.
+    let last = sess.app_ids.iter().all(|&a| a == app.id);
     let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut sess.af_pcc_rules)
         .into_iter()
-        .partition(|r| app.pcc_rule_ids.contains(&r.pcc_rule_id));
+        .partition(|r| {
+            app.pcc_rule_ids.contains(&r.pcc_rule_id)
+                || (last && npcf_handler::is_legacy_af_pcc_rule_id(&r.pcc_rule_id))
+        });
     sess.af_pcc_rules = kept;
     let qm_id = sess
         .af_qos_mon

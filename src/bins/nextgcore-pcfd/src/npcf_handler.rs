@@ -439,6 +439,19 @@ pub fn legacy_af_pcc_rule_id(psi: u8, med_comp_n: u32) -> String {
     format!("PccRule-af-{psi}-{med_comp_n}")
 }
 
+/// #2269: whether `id` is an AF PCC rule id of the pre-#2263 form
+/// ([`legacy_af_pcc_rule_id`]): `PccRule-af-<psi>-<medCompN>`, two numbers, where
+/// the current form has three (`<psi>-<appId>-<medCompN>`).
+pub fn is_legacy_af_pcc_rule_id(id: &str) -> bool {
+    id.strip_prefix("PccRule-af-").is_some_and(|rest| {
+        let parts: Vec<&str> = rest.split('-').collect();
+        parts.len() == 2
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 pub fn media_components_to_pcc(req: &AscReqData, sess: &PcfSess, app_id: u64) -> Vec<AfPccRule> {
     let mut rules = Vec::with_capacity(req.med_components.len());
 

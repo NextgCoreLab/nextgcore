@@ -577,3 +577,98 @@ async fn a_modify_replaces_the_pre_upgrade_rule_at_the_smf_2269() {
     assert_eq!(held, vec![new_rule], "the old rule is gone");
     server.stop().await.ok();
 }
+
+/// #2269 (decision on #2278): deleting the LAST app session on a PDU session
+/// removes any pre-#2263 AF rule left on it, which names no app session: the SMF
+/// is sent `null` for it and its QosData in the delete's decision. Deleting an
+/// app session while another remains leaves it (it cannot be told whose it is).
+///
+/// REVERT-VERIFIED: without the last-app-session legacy removal, this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+async fn deleting_the_last_app_session_removes_the_pre_upgrade_rule_2269() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    crate::test_support::init_context();
+    let (seen, port, server) = recorder().await;
+    let ip = "10.45.22.70";
+    let _ = sm_policy(port, "imsi-001010000022270", ip, "0").await;
+    let a = af_session(port, "afA", ip).await;
+    let _ = next_post(&seen, "/update", |_| true).await;
+    let b = af_session(port, "afB", ip).await;
+    let _ = next_post(&seen, "/update", |_| true).await;
+
+    // As restored from a pre-#2263 snapshot: A's rule under the old key, and A
+    // recorded no rule ids. B's rule is in the current form.
+    let (legacy, legacy_qos) = {
+        let ctx = pcf_self();
+        let c = ctx.read().unwrap();
+        let mut sess = c.sess_find_by_ipv4addr(ip).unwrap();
+        let own = rules_of(&a)[0].clone();
+        let rule = sess
+            .af_pcc_rules
+            .iter_mut()
+            .find(|r| r.pcc_rule_id == own)
+            .unwrap();
+        rule.pcc_rule_id = npcf_handler::legacy_af_pcc_rule_id(sess.psi, 1);
+        rule.qos_data.qos_id = format!("QosData-af-{}-1", sess.psi);
+        let ids = (rule.pcc_rule_id.clone(), rule.qos_data.qos_id.clone());
+        c.sess_update(&sess);
+        let mut app = c.app_find_by_app_session_id(&a).unwrap();
+        app.pcc_rule_ids.clear();
+        c.app_update(&app);
+        ids
+    };
+    let held = || -> Vec<String> {
+        pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr(ip)
+            .unwrap()
+            .af_pcc_rules
+            .iter()
+            .map(|r| r.pcc_rule_id.clone())
+            .collect()
+    };
+
+    // A goes first, B remains: the old rule cannot be told to be A's, so it stays.
+    let (status, _) = route(
+        &format!("/npcf-policyauthorization/v1/app-sessions/{a}/delete"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!((200..300).contains(&status), "{status}");
+    assert!(
+        held().contains(&legacy),
+        "kept while B remains: {:?}",
+        held()
+    );
+
+    // B, the last, goes: its rule and the old one, in one decision.
+    let rule_b = rules_of(&b)[0].clone();
+    seen.lock().unwrap().clear();
+    let (status, _) = route(
+        &format!("/npcf-policyauthorization/v1/app-sessions/{b}/delete"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!((200..300).contains(&status), "{status}");
+    let n = next_post(&seen, "/update", |_| true).await;
+    let d = &n["smPolicyDecision"];
+    assert!(
+        d["pccRules"].get(&legacy).is_some_and(|v| v.is_null()),
+        "{d}"
+    );
+    assert!(
+        d["pccRules"].get(&rule_b).is_some_and(|v| v.is_null()),
+        "{d}"
+    );
+    assert!(
+        d["qosDecs"].get(&legacy_qos).is_some_and(|v| v.is_null()),
+        "{d}"
+    );
+    assert!(held().is_empty(), "{:?}", held());
+    server.stop().await.ok();
+}
