@@ -37,6 +37,7 @@ ctrlc.workspace = true
 chrono = "0.4"
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true

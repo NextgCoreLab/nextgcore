@@ -1129,12 +1129,16 @@ async fn route_nudm_ueau(
     uri: &str,
 ) -> SbiResponse {
     // #1866: KAUSF goes to the AUSF only. Refused before the SUPI is parsed or
-    // the UDR is read, so a refusal has no side effect.
-    if let Some(refused) = crate::consumer_gate::refuse_consumer_type(
+    // the UDR is read, so a refusal has no side effect. #2082: by the shared
+    // verified-NF-type rule (CONVENTIONS), so a certificate without NF types,
+    // or a relay's alone, is no AUSF under production.
+    if let Some(refused) = nextgcore_sbi::owner_binding::nf_type_refusal(
         request,
+        nextgcore_sbi::types::NfType::Ausf,
         "nudm-ueau",
-        crate::consumer_gate::UEAU_CONSUMER_NF_TYPES,
-    ) {
+    )
+    .await
+    {
         return refused;
     }
     let supi = parts.get(2).copied().unwrap_or("");
@@ -4352,8 +4356,16 @@ mod tests {
     /// another NF type gets 403 on every Nudm_UEAU operation, before the body is
     /// read; the AUSF reaches the handler (its 400 names the missing IE, which
     /// only the handler produces).
+    ///
+    /// #2082: the gate is the shared `owner_binding::nf_type_refusal`, so the
+    /// certificates carry their NF Instance ID as a verified one does. The
+    /// router reads the process profile; this test asserts the dev routing
+    /// (Dev set and left set, CONVENTIONS), and the production refusals of an
+    /// untyped or relay-only certificate are pinned in sbi
+    /// `the_nf_type_gate_admits_only_a_verified_type_2082`.
     #[tokio::test]
     async fn nudm_ueau_is_refused_to_a_non_ausf_certificate_1866() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         const SUPI: &str = "imsi-001010000000001";
         let gen = format!("/nudm-ueau/v1/{SUPI}/security-information/generate-auth-data");
         let request = |method: &str, uri: &str, types: &[&str], body: serde_json::Value| {
@@ -4364,6 +4376,7 @@ mod tests {
             r.http.set_content(body.to_string());
             r.http.set_header("Content-Type", "application/json");
             r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r.peer_cert_nf_instance_id = Some("dddddddd-1866-4000-8000-00000000000d".to_string());
             r
         };
         let full = serde_json::json!({
@@ -4382,7 +4395,9 @@ mod tests {
                 let pd: serde_json::Value = serde_json::from_str(&body).expect("ProblemDetails");
                 let detail = pd["detail"].as_str().unwrap_or_default();
                 assert!(
-                    detail.contains("served to NF type(s) [\"AUSF\"] only") && detail.contains(t),
+                    detail.contains("nudm-ueau")
+                        && detail.contains(t)
+                        && detail.contains("not AUSF"),
                     "{body}"
                 );
                 assert!(
