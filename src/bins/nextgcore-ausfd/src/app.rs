@@ -3758,6 +3758,11 @@ mod tests {
         // other ausfd test doing the same under parallel `cargo test`.
         let _guard = crate::test_support::lock_context();
         let _lock = TEST_MUTEX.lock().await;
+        // #2089: an anonymous DELETE of an unbound context is the dev
+        // lifecycle; under production the context is frozen (#2065, pinned by
+        // `an_untyped_certificate_and_an_unbound_context_under_production_2065`).
+        // Set and left set (CONVENTIONS): run alone, this used to get 403.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         ausf_context_init(128);
 
         let ctx_id = {
@@ -5051,6 +5056,10 @@ mod tests {
     async fn test_missing_supi_or_suci_is_rejected() {
         let _guard = crate::test_support::lock_context();
         let _lock = TEST_MUTEX.lock().await;
+        // #2089: the body check is what this test is about; under production an
+        // anonymous Authenticate is refused 403 before the body is read (#1964).
+        // Set and left set (CONVENTIONS): run alone, this used to get 403.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         ausf_context_init(64);
 
         // No UDM is configured for this test on purpose: if the handler still

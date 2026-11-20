@@ -5186,7 +5186,10 @@ mod tests {
             (
                 "typeless",
                 with("x2077-3", Some((DIRECT, &[])), None),
-                "names no NF types",
+                // #2089: under production #2065 refuses it as no identity
+                // ("names no NF type (RFC 9310 NFTypes)"), under dev the type
+                // check does ("names no NF types"); refused either way.
+                "names no NF type",
             ),
             (
                 "GMLC",

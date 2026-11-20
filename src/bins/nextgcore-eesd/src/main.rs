@@ -4160,7 +4160,17 @@ mod tests {
                     SbiRequest::post(*path).with_json_body(body).unwrap(),
                     types,
                 )));
-                assert_eq!(r.status, 401, "{path} with only a {types:?} certificate");
+                // #2089: a typeless certificate alone is refused under both
+                // profiles: under production by #2065's shared rule (no
+                // identity, 403), under dev by the ECS's own typeless check
+                // (401). A relay's alone is 401 under both.
+                let want = if types.is_empty() && nextgcore_sbi::owner_binding::identity_required()
+                {
+                    403
+                } else {
+                    401
+                };
+                assert_eq!(r.status, want, "{path} with only a {types:?} certificate");
             }
             // Through the relay with the consumer's token: served.
             let relayed = with_cert(

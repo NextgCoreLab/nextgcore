@@ -29031,7 +29031,10 @@ mod tests {
         let direct_smf = with_cert(change(DIRECT), DIRECT, &["SMF"]);
         for (what, req, expect) in [
             ("direct non-AMF", direct_smf, "not AMF"),
-            ("typeless", typeless, "names no NF types"),
+            // #2089: under production #2065 refuses it as no identity ("names
+            // no NF type (RFC 9310 NFTypes)"), under dev the type check does
+            // ("names no NF types"); refused either way.
+            ("typeless", typeless, "names no NF type"),
             ("token only", token_only, "does not list"),
             ("SCP", scp, "does not list"),
         ] {
