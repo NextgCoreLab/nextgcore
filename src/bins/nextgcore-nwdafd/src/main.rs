@@ -3163,14 +3163,27 @@ mod callback_oauth2_1421_tests {
 
     /// The tokenised NFStatusNotify route checks its token itself too, so a
     /// forged one is 404 even where no listener enforces OAuth2.
+    ///
+    /// #2121: the request carries the NRF's verified certificate (RFC 9310
+    /// NFTypes `NRF`), as a real NFStatusNotify does, so the held token is
+    /// admitted under the production profile (#2081's `refuse_notifier`) as
+    /// well as under dev. The test therefore depends on no sibling having set
+    /// the Dev override: run alone, under the default production profile, it
+    /// used to get 403 for the held token.
+    ///
+    /// REVERT-VERIFIED: with the certificate removed, the test fails alone
+    /// (`left: 403, right: 204`).
     #[tokio::test]
     async fn the_tokenised_route_refuses_a_forged_token_itself() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
         let body =
             json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": "http://nrf/x/nwdaf-1421-r" });
         let req = |token: &str| {
-            SbiRequest::post(format!("/nnwdaf-callback/v1/nf-status-notify/{token}"))
-                .with_body(body.to_string(), "application/json")
+            let mut r = SbiRequest::post(format!("/nnwdaf-callback/v1/nf-status-notify/{token}"))
+                .with_body(body.to_string(), "application/json");
+            r.peer_cert_nf_instance_id = Some("eeeeeeee-2121-4000-8000-00000000000e".to_string());
+            r.peer_cert_nf_types = vec!["NRF".to_string()];
+            r
         };
         let forged = uuid::Uuid::new_v4().simple().to_string();
         assert_eq!(nwdaf_sbi_request_handler(req(&forged)).await.status, 404);
