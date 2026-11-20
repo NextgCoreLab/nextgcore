@@ -92,27 +92,57 @@ pub async fn authorised_app_layer_ids(gpsi: &str) -> Option<Vec<Vec<u8>>> {
         ),
         nextgcore_sbi::types::NfType::Udr,
     );
-    let path = format!(
-        "/nudr-dr/v2/application-data/ueid-mappings?gpsis={}",
-        urlencoding_component(gpsi)
-    );
-    match client.get(&path).await {
-        Ok(r) if r.status == 200 => {
-            let body: Value = serde_json::from_str(r.http.content.as_deref()?).ok()?;
-            body.is_array().then(|| app_layer_ids_for(&body, gpsi))
+    let read = |query: String| {
+        let client = &client;
+        async move {
+            let path = format!("/nudr-dr/v2/application-data/ueid-mappings?{query}");
+            match client.get(&path).await {
+                Ok(r) if r.status == 200 => {
+                    serde_json::from_str::<Value>(r.http.content.as_deref()?)
+                        .ok()
+                        .filter(Value::is_array)
+                }
+                Ok(r) => {
+                    log::warn!(
+                        "#2260: the UDR answered {} to the UE ID mapping read",
+                        r.status
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::warn!("#2260: the UE ID mapping read failed: {e}");
+                    None
+                }
+            }
         }
-        Ok(r) => {
-            log::warn!(
-                "#2260: the UDR answered {} to the UE ID mapping read",
-                r.status
-            );
-            None
-        }
-        Err(e) => {
-            log::warn!("#2260: the UE ID mapping read failed: {e}");
-            None
+    };
+    let by_gpsi = read(format!("gpsis={}", urlencoding_component(gpsi))).await?;
+    let mut ids = Vec::new();
+    for id in app_layer_ids_for(&by_gpsi, gpsi) {
+        // #2260 (R48 on #2265), defence in depth: an ID the UDR also maps to
+        // another GPSI is no one's. The UDR holds 1:1, but a mapping written
+        // around it must not let a second UE report as the first.
+        let Ok(text) = std::str::from_utf8(&id) else {
+            continue;
+        };
+        let by_id = read(format!("app-layer-ids={}", urlencoding_component(text))).await?;
+        if only_mapped_to(&by_id, gpsi) {
+            ids.push(id);
+        } else {
+            log::warn!("#2260: Application Layer ID {text:?} is mapped to another GPSI too; not authorised");
         }
     }
+    Some(ids)
+}
+
+/// Whether every mapping in a TS 29.519 `array(UeIdMappingInfo)` (the answer
+/// for one Application Layer ID) maps it to `gpsi`.
+pub fn only_mapped_to(body: &Value, gpsi: &str) -> bool {
+    body.as_array().is_some_and(|a| {
+        a.iter()
+            .filter_map(|m| m.get("rsUeIdMappingInfo"))
+            .all(|m| m.get("gpsi").and_then(Value::as_str) == Some(gpsi))
+    })
 }
 
 /// Percent-encode a query value (RFC 3986 unreserved characters kept).
@@ -145,6 +175,20 @@ mod tests {
         assert_eq!(app_layer_ids_for(&body, "msisdn-1"), vec![b"ue-a".to_vec()]);
         assert!(app_layer_ids_for(&json!([]), "msisdn-1").is_empty());
         assert_eq!(urlencoding_component("msisdn-1+2"), "msisdn-1%2B2");
+        assert!(only_mapped_to(
+            &json!([{"rsUeIdMappingInfo": {"appLayerId": "a", "gpsi": "msisdn-1"}}]),
+            "msisdn-1"
+        ));
+        assert!(
+            !only_mapped_to(
+                &json!([
+                    {"rsUeIdMappingInfo": {"appLayerId": "a", "gpsi": "msisdn-1"}},
+                    {"rsUeIdMappingInfo": {"appLayerId": "a", "gpsi": "msisdn-2"}}
+                ]),
+                "msisdn-1"
+            ),
+            "1:N is no one's"
+        );
     }
 
     #[test]

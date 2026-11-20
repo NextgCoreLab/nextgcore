@@ -41,14 +41,16 @@ mod namf_client;
 mod nlmf;
 mod nrppa_downlink; // #103: LMF-initiated NRPPa toward NG-RAN
 mod nrppa_positioning; // #807: NRPPa answers of the Multi-RTT procedures
-mod nrppa_uplink;
-mod nudr_client; // #2260: the Application Layer IDs the 5GC maps to a UE // #515: E-CID Measurement Report on the generated codec, TS 38.455 §10
-                 // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
-                 // Wired into `context::compute_location`; solve_tdoa remains available for
-                 // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
+mod nrppa_uplink; // #515: E-CID Measurement Report on the generated codec, TS 38.455 §10
+                  // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
+                  // Wired into `context::compute_location`; solve_tdoa remains available for
+                  // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
 mod site_config;
 mod slpp; // #557: SLPP sidelink positioning (TS 38.355, TS 38.305 §8.15.2) // #103: cell/TRP coordinates from configuration
+
+// #2260: the Application Layer IDs the 5GC maps to a UE.
+mod nudr_client;
 
 pub use context::*;
 
@@ -9037,16 +9039,27 @@ mod positioning_chain_strict_peer {
                         {
                             return SbiResponse::with_status(404);
                         }
-                        let query = req.http.params.get("gpsis").cloned().unwrap_or_default();
-                        let gpsis: Vec<&str> = query.split(',').collect();
+                        // By `gpsis` or by `app-layer-ids` (TS 29.519 Table 6.2.26.3.1-1).
+                        let (member, query) = match req.http.params.get("gpsis") {
+                            Some(q) => ("gpsi", q.clone()),
+                            None => (
+                                "appLayerId",
+                                req.http
+                                    .params
+                                    .get("app-layer-ids")
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            ),
+                        };
+                        let wanted: Vec<&str> = query.split(',').collect();
                         let hits: Vec<serde_json::Value> = table
                             .as_array()
                             .into_iter()
                             .flatten()
                             .filter(|m| {
-                                m["rsUeIdMappingInfo"]["gpsi"]
+                                m["rsUeIdMappingInfo"][member]
                                     .as_str()
-                                    .is_some_and(|g| gpsis.contains(&g))
+                                    .is_some_and(|g| wanted.contains(&g))
                             })
                             .cloned()
                             .collect();
@@ -9621,6 +9634,82 @@ mod positioning_chain_strict_peer {
         let (amf_server, nrf_server, _udr, mut tap_rx) = start_positioning_harness_with_udr(
             supi.clone(),
             Some(serde_json::json!([
+                {"rsUeIdMappingInfo": {"appLayerId": "ue-2260", "gpsi": "msisdn-OTHER"}}
+            ])),
+        )
+        .await;
+        let body = format!(
+            r#"{{"supi":"{supi}","gpsi":"msisdn-12260","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "ecgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"eutraCellId":"0000001"}},
+                "maxRespTime":20,
+                "requestedRangingSlResult":["RANGING"],
+                "relatedUes":[{{"applicationlayerId":"ZZZ","relatedUeType":"REFERENCE_UE"}}]}}"#
+        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+        answer_capability_request(&mut tap_rx, &supi, true, false).await;
+        let (corr, _dl, txn) = next_downlink(&mut tap_rx).await;
+        let ul_lpp = build_ecid_lpp(77, 60, 800, txn);
+        assert_eq!(
+            notify_n1(&amfd_notify_request(&corr, &supi, &ul_lpp))
+                .await
+                .status,
+            204
+        );
+        let resp = tokio::time::timeout(Duration::from_secs(20), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("no panic");
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert!(v["locationEstimate"].is_object(), "the location is kept");
+        assert!(v.get("distanceDirection").is_none(), "no distance: {v}");
+        assert!(
+            tap_rx.try_recv().is_err(),
+            "no SLPP was sent to a target with no authorised ID"
+        );
+        crate::slpp::sl_rtt_store().clear();
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// **#2260 (R48 on #2265), defence in depth.** An Application Layer ID the
+    /// UDR maps to the target's GPSI *and* to another GPSI (a 1:N mapping
+    /// written around the UDR's 1:1 check) is authorised for no one: the LMF
+    /// sends the target no SLPP and returns no distance.
+    ///
+    /// REVERT-VERIFIED: with the second read by `app-layer-ids` skipped (every
+    /// ID read by GPSI kept), lmfd sends RequestCapabilities.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_id_the_udr_maps_to_two_gpsis_is_no_one_s_2260() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _slpp = crate::slpp::SLPP_GLOBALS_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000022602".to_string();
+        lmf_context_init(1024);
+        prime_lmf_self();
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_cell_coord(
+                "pci-77".to_string(),
+                crate::positioning::TrpCoord::new(40.1, -74.5, 0.0),
+            );
+        }
+        seed_amf_connected_ue(&supi);
+        crate::slpp::sl_rtt_store().note(
+            b"ZZZ",
+            &[crate::slpp::SlRttHalf {
+                peer: b"ue-2260".to_vec(),
+                rx_tx_tc: 326.0,
+            }],
+        );
+        let (amf_server, nrf_server, _udr, mut tap_rx) = start_positioning_harness_with_udr(
+            supi.clone(),
+            Some(serde_json::json!([
+                {"rsUeIdMappingInfo": {"appLayerId": "ue-2260", "gpsi": "msisdn-12260"}},
                 {"rsUeIdMappingInfo": {"appLayerId": "ue-2260", "gpsi": "msisdn-OTHER"}}
             ])),
         )

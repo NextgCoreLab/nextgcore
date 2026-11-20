@@ -70,6 +70,14 @@ Everything else is configured by flags.
 An AF provisions the mapping between a Ranging/Sidelink Positioning Application Layer ID and a GPSI (TS 23.586 §4.3.10) with `POST /3gpp-ueid/v1/{afId}/pp` and a TS 29.522 `UeIdMappingInfo` body. The answer is 201 with a Location of `/3gpp-ueid/v1/{afId}/pp/{ppId}`. The resource supports GET, PUT (`UeIdMappingInfo`), PATCH (`UeIdMappingInfoPatch`) and DELETE.
 
 - The NEF stores the mapping in the UDR under the ppId (`PUT /nudr-dr/v2/application-data/ueid-mappings/{ppId}`), where the LMF reads it to authorise SL-RTT reports.
-- Only 1:1 mappings are accepted (TS 29.522 §4.4.32.1 NOTE). An ID or GPSI that is already mapped otherwise is refused with 403.
+- **The AF must be authorised for the GPSI's UE** (TS 29.522 §4.4.32.4).
+  - The NEF reads the UE's Ranging and Sidelink Positioning privacy profile from the UDM by the GPSI: `GET /nudm-sdm/v2/{gpsi}/lcs-privacy-data`, member `rangingSlPrivacyData` (TS 29.503; TS 23.586 §4.3.4).
+  - The AF is authorised only if ranging is not disallowed for the UE, and the profile names the AF in `rangingSlAfExternals` with an action other than `RANGINGSL_NOT_ALLOWED`.
+  - With no profile, or the AF not named, the answer is 403. If the UDM cannot be asked, it is 503.
+  - An update is authorised again for its new GPSI.
+  - The operator provisions the profile in the subscriber record as `ranging_sl_privacy`, a `RangingSlPrivacyData` document. udrd serves it at `subscription-data/{ueId}/lcs-privacy-data`.
+- **Only 1:1 mappings are accepted** (TS 29.522 §4.4.32.1 NOTE). The UDR enforces this for every writer.
+  - Its check and its write are one step.
+  - An ID or GPSI that another mapping already has, even as an exact copy, is refused with 403, and so is the NEF's request.
 - Only the AF that made a provisioning can see or change it, judged by its verified identity. Any other caller gets 404.
 - Provisionings persist in the NEF state file.

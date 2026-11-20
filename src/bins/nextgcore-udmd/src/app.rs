@@ -1093,7 +1093,6 @@ async fn route_nudm_sdm(
             | "sms-data"
             | "sms-mng-data"
             | "trace-data"
-            | "lcs-privacy-data"
             | "lcs-mo-data"
             | "lcs-bca-data"
             | "v2x-data"
@@ -1103,6 +1102,10 @@ async fn route_nudm_sdm(
             "",
             "GET",
         ) => handle_get_sdm_data_set(supi, resource, request).await,
+        // #2260: by SUPI or GPSI, at its own UDR resource (TS 29.505
+        // `/subscription-data/{ueId}/lcs-privacy-data`), not under
+        // provisioned-data.
+        ("lcs-privacy-data", "", "GET") => handle_get_lcs_privacy_data(supi).await,
         _ => unmatched(sdm_allowed_methods(parts), method, uri),
     }
 }
@@ -2386,6 +2389,34 @@ pub async fn handle_get_sdm_data_set(
         }
         Err(e) => {
             log::warn!("[{supi}] UDR {resource} query failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
+
+/// #2260: `GET /nudm-sdm/v2/{ueId}/lcs-privacy-data` (TS 29.503), relayed to
+/// the UDR's `subscription-data/{ueId}/lcs-privacy-data` (TS 29.505). `{ueId}`
+/// is a SUPI or a GPSI; the NEF reads a UE's Ranging/SL privacy profile by its
+/// GPSI before it lets an AF provision that GPSI's UE ID mapping.
+pub async fn handle_get_lcs_privacy_data(ue_id: &str) -> SbiResponse {
+    let request = SbiRequest::get(format!(
+        "/nudr-dr/v2/subscription-data/{ue_id}/lcs-privacy-data"
+    ));
+    match crate::sbi_path::udm_sbi_discover_and_send_nudr_dr(0, 0, request).await {
+        Ok(resp) if resp.is_success() => {
+            let mut response = SbiResponse::with_status(200);
+            if let Some(body) = resp.http.content {
+                response = response.with_body(body, "application/json");
+            }
+            response
+        }
+        Ok(resp) if resp.status == 404 => nextgcore_sbi::server::send_not_found(
+            &format!("no lcs-privacy-data for {ue_id}"),
+            Some("DATA_NOT_FOUND"),
+        ),
+        Ok(resp) => SbiResponse::with_status(resp.status),
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR lcs-privacy-data query failed: {e}");
             nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
@@ -6984,6 +7015,61 @@ mod tests {
         std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
         std::env::set_var("UDR_SBI_PORT", port.to_string());
         (server, store)
+    }
+
+    /// #2260: the NEF reads a UE's Ranging/SL privacy profile by its GPSI
+    /// (`/nudm-sdm/v2/{gpsi}/lcs-privacy-data`). The UDM relays it to the UDR's
+    /// TS 29.505 resource `subscription-data/{ueId}/lcs-privacy-data`, not to
+    /// `provisioned-data`, and returns the profile.
+    ///
+    /// REVERT-VERIFIED: with lcs-privacy-data back on the provisioned-data
+    /// relay, the UDR stub sees `provisioned-data/lcs-privacy-data` and the UDM
+    /// answers 404.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn lcs_privacy_data_is_read_by_gpsi_from_its_udr_resource_2260() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        let profile = serde_json::json!({"rangingSlPrivacyData": {"rangingSlUnrelatedClass":
+            {"rangingSlDefaultUnrelatedClass": {}}}});
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        let body = profile.to_string();
+        udr.start(move |req: SbiRequest| {
+            let body = body.clone();
+            async move {
+                if req.header.uri.split('?').next()
+                    == Some("/nudr-dr/v2/subscription-data/msisdn-4912260/lcs-privacy-data")
+                {
+                    SbiResponse::with_status(200).with_body(body, "application/json")
+                } else {
+                    SbiResponse::with_status(404)
+                }
+            }
+        })
+        .await
+        .expect("UDR stub");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", addr.port().to_string());
+        let (udm, client) = start_real_udm().await;
+        let resp = client
+            .get("/nudm-sdm/v2/msisdn-4912260/lcs-privacy-data")
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(json_body(&resp), profile);
+        let _ = udm.stop().await;
+        let _ = udr.stop().await;
     }
 
     /// Start the real UDM SBI server and return it with a client for it.

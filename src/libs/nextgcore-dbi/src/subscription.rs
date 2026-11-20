@@ -561,6 +561,17 @@ pub(crate) fn parse_subscription_document(document: &Document) -> NextgcoreSubsc
         }
     }
 
+    // #2260: the Ranging/SL privacy profile, a sub-document or its JSON text.
+    subscription_data.ranging_sl_privacy = match document.get(NEXTGCORE_RANGING_SL_PRIVACY_STRING) {
+        Some(mongodb::bson::Bson::Document(d)) => Some(
+            mongodb::bson::Bson::Document(d.clone())
+                .into_relaxed_extjson()
+                .to_string(),
+        ),
+        Some(mongodb::bson::Bson::String(t)) if !t.trim().is_empty() => Some(t.clone()),
+        _ => None,
+    };
+
     // Parse slice array
     parse_subscribed_slices(document, &mut subscription_data);
 
