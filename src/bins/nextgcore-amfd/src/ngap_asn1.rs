@@ -922,7 +922,7 @@ fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
 /// two of those wrong on every production request: it appended the UE AMBR
 /// AFTER the NAS-PDU, where the object set puts it fourth, and it marked the
 /// NAS-PDU "reject" where the object set says "ignore". Every other byte is
-/// unchanged: `initial_context_setup_request_generated_matches_hand_written`.
+/// a hand derivation: `initial_context_setup_request_is_the_derivation`.
 ///
 /// amfd-08: the OPTIONAL Mobility Restriction List and Masked IMEISV IEs are
 /// not emitted. Both are optional in TS 38.413 §9.2.2.1, so omitting them is
@@ -1485,7 +1485,7 @@ pub enum InitialContextSetupOutcomeDecode {
 /// and on a not-comprehended IE marked reject, and accepted one marked "ignore
 /// IE and notify sender" without reporting it. Every message it accepted
 /// decodes to the same IDs:
-/// `initial_context_setup_response_generated_decode_matches_hand_written`.
+/// `initial_context_setup_response_decodes_the_derived_octets`.
 pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContextSetupOutcomeDecode {
     use ngap_gen::{
         InitialContextSetupResponseProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue,
@@ -1576,7 +1576,7 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
 /// As for the Response: the hand-written parser refused a missing ID or a
 /// not-comprehended IE marked reject, accepted a notify one without reporting
 /// it, and every message it accepted decodes to the same IDs and Cause:
-/// `initial_context_setup_failure_generated_decode_matches_hand_written`.
+/// `initial_context_setup_failure_decodes_the_derived_octets`.
 pub fn decode_initial_context_setup_failure_asn1(data: &[u8]) -> InitialContextSetupOutcomeDecode {
     use ngap_gen::{
         InitialContextSetupFailureProtocolIEs_EntryValue as Ie, UnsuccessfulOutcomeValue,
@@ -6822,7 +6822,7 @@ pub const MAX_BIT_RATE: u64 = 4_000_000_000_000;
 /// reference for the transfer the SMF builds the same way.
 ///
 /// The bytes are the hand-written transfer encoder's for every input --
-/// `n2_sm_setup_request_transfer_generated_matches_hand_written` pins it -- and
+/// `n2_sm_setup_request_transfer_is_the_derived_octets` pins them -- and
 /// it refuses what that encoder refused: a QFI past 63, a 5QI past 255, a
 /// Priority Level ARP outside 1..15.
 pub fn build_n2_sm_setup_request_transfer(
@@ -6970,7 +6970,7 @@ pub struct GnbN3Endpoint {
 /// protocol extensions the schema does not know; the hand-written decoder
 /// consumes them too since #469 (it used to read past the extension
 /// container). Every transfer that decoder accepted gives the same endpoint
-/// (`n2_sm_setup_response_transfer_generated_matches_hand_written`).
+/// (`n2_sm_setup_response_transfer_reads_the_derived_octets`).
 ///
 /// It also reads the optional Additional DL QoS Flow per TNL Information as the
 /// list it is (`QosFlowPerTNLInformationList`, §9.3.4.2), as the hand-written
@@ -6980,7 +6980,7 @@ pub struct GnbN3Endpoint {
 /// Since nextgsim #226 the fork octet-aligns a variable-size BIT STRING
 /// whatever its length (X.691 §16.11), as the hand-written codec does, so the
 /// two read a Transport Layer Address of any length the same way, 16 bits or
-/// fewer included (`transport_layer_addresses_of_16_bits_or_fewer_agree`).
+/// fewer included (`transport_layer_addresses_of_16_bits_or_fewer_are_read`).
 ///
 /// A DL tunnel's `iE-Extensions` entries are skipped like the transfer's own
 /// unknown extensions: GTPTunnel's extension object set is empty, so every
@@ -11004,7 +11004,7 @@ pub(crate) mod tests {
     /// form's 128, the longest whose Setup Request still needs no fragmented
     /// outer length with an SD, and the first that does (X.691 §11.9.3.8,
     /// encodable since nextgsim #223; see
-    /// `a_setup_request_past_16k_octets_matches_the_hand_written_fragmenting_encoder`)
+    /// `a_setup_request_past_16k_octets_is_the_derived_fragmented_octets`)
     /// -- and the transfer the SMF actually builds.
     fn setup_transfers() -> Vec<Vec<u8>> {
         vec![
@@ -11578,15 +11578,32 @@ pub(crate) mod tests {
         assert!(build_n2_sm_setup_request_transfer(1, [10, 0, 0, 1], MAX_QFI + 1, 9, 8).is_none());
     }
 
+    /// The production single-flow transfer is the derived one for every QFI,
+    /// 5QI and ARP level, and refused exactly where the derivation has no
+    /// encoding: a QFI past 63 (a six-bit QFI, TS 23.501 §5.7.1.1; the
+    /// extension range of `QosFlowIdentifier` is not a QFI), a 5QI past 255
+    /// (`FiveQI (0..255, ...)`, the root), an ARP level outside
+    /// `PriorityLevelARP (1..15)`, which is not extensible.
     #[test]
-    fn n2_sm_setup_request_transfer_generated_matches_hand_written() {
+    fn n2_sm_setup_request_transfer_is_the_derived_octets() {
+        use crate::amf_pdus::transfer::{
+            setup_request_transfer, single_flow_setup_request_transfer,
+        };
         let mut compared = 0;
         let mut refused = 0;
         let mut check = |teid: u32, addr: [u8; 4], qfi: u8, five_qi: u16, arp: u8| {
             let new = build_n2_sm_setup_request_transfer(teid, addr, qfi, five_qi, arp);
-            let old = hand_written_n2_sm_setup_request_transfer(teid, addr, qfi, five_qi, arp);
+            let derived = (qfi <= 63 && five_qi <= 255 && (1..=15).contains(&arp)).then(|| {
+                setup_request_transfer(&single_flow_setup_request_transfer(
+                    teid,
+                    addr,
+                    qfi,
+                    five_qi as u8,
+                    arp,
+                ))
+            });
             assert_eq!(
-                new, old,
+                new, derived,
                 "TEID {teid} addr {addr:?} QFI {qfi} 5QI {five_qi} ARP {arp}"
             );
             if new.is_none() {
@@ -11613,15 +11630,13 @@ pub(crate) mod tests {
         assert_eq!(refused, 192 + 45 + 1 + 240);
     }
 
-    /// The hand-written transfer `t` as the generated
-    /// PDUSessionResourceSetupRequestTransfer, member for member -- the
-    /// converter the transfer-codec comparison below runs through.
+    /// The derivation's transfer `t` as the generated
+    /// PDUSessionResourceSetupRequestTransfer, member for member, so the
+    /// generated codec can be run on the same value.
     fn generated_request_transfer(
-        t: &PduSessionResourceSetupRequestTransfer,
+        t: &crate::amf_pdus::transfer::SetupRequestTransfer,
     ) -> ngap_gen::PDUSessionResourceSetupRequestTransfer {
-        use nextgcore_ngap::transfer::{
-            Dynamic5qiDescriptor, GbrQosInformation, SecurityIndication,
-        };
+        use crate::amf_pdus::transfer::{Gbr, Qos, Security, Tunnel};
         use ngap_gen::{
             PDUSessionResourceSetupRequestTransferProtocolIEs_Entry as Entry,
             PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue as Ie,
@@ -11632,126 +11647,116 @@ pub(crate) mod tests {
             criticality: reject.clone(),
             value,
         };
-        let tunnel = |info: &UpTransportLayerInformation| {
-            let UpTransportLayerInformation::GtpTunnel(g) = info;
-            generated_gtp_tunnel(
-                &g.transport_layer_address.octets,
-                g.transport_layer_address.bit_len,
-                u32::from_be_bytes(g.gtp_teid),
-            )
-        };
-        let non_dynamic = |d: &NonDynamic5qiDescriptor| ngap_gen::NonDynamic5QIDescriptor {
-            five_qi: ngap_gen::FiveQI(d.five_qi as u8),
-            priority_level_qos: d.priority_level_qos.map(ngap_gen::PriorityLevelQos),
-            averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
-            maximum_data_burst_volume: d
-                .maximum_data_burst_volume
-                .map(ngap_gen::MaximumDataBurstVolume),
+        let tunnel = |g: &Tunnel| generated_gtp_tunnel(&g.address, g.bits, g.teid);
+        let gbr = |g: &Gbr| ngap_gen::GBR_QosInformation {
+            maximum_flow_bit_rate_dl: ngap_gen::BitRate(g.mfbr_dl),
+            maximum_flow_bit_rate_ul: ngap_gen::BitRate(g.mfbr_ul),
+            guaranteed_flow_bit_rate_dl: ngap_gen::BitRate(g.gfbr_dl),
+            guaranteed_flow_bit_rate_ul: ngap_gen::BitRate(g.gfbr_ul),
+            notification_control: g.notification.then_some(ngap_gen::NotificationControl(
+                ngap_gen::NotificationControl::NOTIFICATION_REQUESTED,
+            )),
+            maximum_packet_loss_rate_dl: g.loss_dl.map(ngap_gen::PacketLossRate),
+            maximum_packet_loss_rate_ul: g.loss_ul.map(ngap_gen::PacketLossRate),
             ie_extensions: None,
         };
-        let dynamic = |d: &Dynamic5qiDescriptor| ngap_gen::Dynamic5QIDescriptor {
-            priority_level_qos: ngap_gen::PriorityLevelQos(d.priority_level_qos),
-            packet_delay_budget: ngap_gen::PacketDelayBudget(d.packet_delay_budget),
-            packet_error_rate: ngap_gen::PacketErrorRate {
-                per_scalar: ngap_gen::PacketErrorRatePERScalar(d.per_scalar),
-                per_exponent: ngap_gen::PacketErrorRatePERExponent(d.per_exponent),
-                ie_extensions: None,
-            },
-            five_qi: d.five_qi.map(|q| ngap_gen::FiveQI(q as u8)),
-            delay_critical: d.delay_critical.map(|c| ngap_gen::DelayCritical(c as u8)),
-            averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
-            maximum_data_burst_volume: d
-                .maximum_data_burst_volume
-                .map(ngap_gen::MaximumDataBurstVolume),
-            ie_extensions: None,
-        };
-        let gbr = |g: &GbrQosInformation| ngap_gen::GBR_QosInformation {
-            maximum_flow_bit_rate_dl: ngap_gen::BitRate(g.maximum_flow_bit_rate_dl),
-            maximum_flow_bit_rate_ul: ngap_gen::BitRate(g.maximum_flow_bit_rate_ul),
-            guaranteed_flow_bit_rate_dl: ngap_gen::BitRate(g.guaranteed_flow_bit_rate_dl),
-            guaranteed_flow_bit_rate_ul: ngap_gen::BitRate(g.guaranteed_flow_bit_rate_ul),
-            notification_control: g
-                .notification_control
-                .then_some(ngap_gen::NotificationControl(
-                    ngap_gen::NotificationControl::NOTIFICATION_REQUESTED,
-                )),
-            maximum_packet_loss_rate_dl: g
-                .maximum_packet_loss_rate_dl
-                .map(ngap_gen::PacketLossRate),
-            maximum_packet_loss_rate_ul: g
-                .maximum_packet_loss_rate_ul
-                .map(ngap_gen::PacketLossRate),
-            ie_extensions: None,
-        };
-        let security = |s: &SecurityIndication| ngap_gen::SecurityIndication {
-            integrity_protection_indication: ngap_gen::IntegrityProtectionIndication(
-                s.integrity_protection_indication as u8,
-            ),
+        let security = |s: &Security| ngap_gen::SecurityIndication {
+            integrity_protection_indication: ngap_gen::IntegrityProtectionIndication(s.integrity),
             confidentiality_protection_indication: ngap_gen::ConfidentialityProtectionIndication(
-                s.confidentiality_protection_indication as u8,
+                s.confidentiality,
             ),
             maximum_integrity_protected_data_rate_ul: s
-                .maximum_integrity_protected_data_rate_ul
-                .map(|r| ngap_gen::MaximumIntegrityProtectedDataRate(r as u8)),
+                .max_rate_ul
+                .map(ngap_gen::MaximumIntegrityProtectedDataRate),
             ie_extensions: None,
         };
         let flows = t
-            .qos_flow_setup_request_list
+            .flows
             .iter()
-            .map(|f| {
-                let q = &f.qos_flow_level_qos_parameters;
-                let arp = &q.allocation_and_retention_priority;
-                ngap_gen::QosFlowSetupRequestItem {
-                    qos_flow_identifier: ngap_gen::QosFlowIdentifier(f.qos_flow_identifier),
-                    qos_flow_level_qos_parameters: ngap_gen::QosFlowLevelQosParameters {
-                        qos_characteristics: match &q.qos_characteristics {
-                            QosCharacteristics::NonDynamic5qi(d) => {
-                                ngap_gen::QosCharacteristics::NonDynamic5QI(non_dynamic(d))
-                            }
-                            QosCharacteristics::Dynamic5qi(d) => {
-                                ngap_gen::QosCharacteristics::Dynamic5QI(dynamic(d))
-                            }
-                        },
-                        allocation_and_retention_priority:
-                            ngap_gen::AllocationAndRetentionPriority {
-                                priority_level_arp: ngap_gen::PriorityLevelARP(
-                                    arp.priority_level_arp,
-                                ),
-                                pre_emption_capability: ngap_gen::Pre_emptionCapability(
-                                    arp.pre_emption_capability as u8,
-                                ),
-                                pre_emption_vulnerability: ngap_gen::Pre_emptionVulnerability(
-                                    arp.pre_emption_vulnerability as u8,
-                                ),
+            .map(|f| ngap_gen::QosFlowSetupRequestItem {
+                qos_flow_identifier: ngap_gen::QosFlowIdentifier(f.qfi),
+                qos_flow_level_qos_parameters: ngap_gen::QosFlowLevelQosParameters {
+                    qos_characteristics: match &f.qos {
+                        Qos::NonDynamic {
+                            five_qi,
+                            priority,
+                            window,
+                            burst,
+                        } => ngap_gen::QosCharacteristics::NonDynamic5QI(
+                            ngap_gen::NonDynamic5QIDescriptor {
+                                five_qi: ngap_gen::FiveQI(*five_qi),
+                                priority_level_qos: priority.map(ngap_gen::PriorityLevelQos),
+                                averaging_window: window.map(ngap_gen::AveragingWindow),
+                                maximum_data_burst_volume: burst
+                                    .map(|b| ngap_gen::MaximumDataBurstVolume(u32::from(b))),
                                 ie_extensions: None,
                             },
-                        gbr_qos_information: q.gbr_qos_information.as_ref().map(gbr),
-                        reflective_qos_attribute: q.reflective_qos_attribute.then_some(
-                            ngap_gen::ReflectiveQosAttribute(
-                                ngap_gen::ReflectiveQosAttribute::SUBJECT_TO,
-                            ),
                         ),
-                        additional_qos_flow_information: q
-                            .additional_qos_flow_information
-                            .then_some(ngap_gen::AdditionalQosFlowInformation(
-                                ngap_gen::AdditionalQosFlowInformation::MORE_LIKELY,
-                            )),
+                        Qos::Dynamic {
+                            priority,
+                            delay_budget,
+                            per_scalar,
+                            per_exponent,
+                            five_qi,
+                            delay_critical,
+                            window,
+                            burst,
+                        } => ngap_gen::QosCharacteristics::Dynamic5QI(
+                            ngap_gen::Dynamic5QIDescriptor {
+                                priority_level_qos: ngap_gen::PriorityLevelQos(*priority),
+                                packet_delay_budget: ngap_gen::PacketDelayBudget(*delay_budget),
+                                packet_error_rate: ngap_gen::PacketErrorRate {
+                                    per_scalar: ngap_gen::PacketErrorRatePERScalar(*per_scalar),
+                                    per_exponent: ngap_gen::PacketErrorRatePERExponent(
+                                        *per_exponent,
+                                    ),
+                                    ie_extensions: None,
+                                },
+                                five_qi: five_qi.map(ngap_gen::FiveQI),
+                                delay_critical: delay_critical.map(ngap_gen::DelayCritical),
+                                averaging_window: window.map(ngap_gen::AveragingWindow),
+                                maximum_data_burst_volume: burst
+                                    .map(|b| ngap_gen::MaximumDataBurstVolume(u32::from(b))),
+                                ie_extensions: None,
+                            },
+                        ),
+                    },
+                    allocation_and_retention_priority: ngap_gen::AllocationAndRetentionPriority {
+                        priority_level_arp: ngap_gen::PriorityLevelARP(f.arp),
+                        pre_emption_capability: ngap_gen::Pre_emptionCapability(u8::from(
+                            f.may_trigger_pre_emption,
+                        )),
+                        pre_emption_vulnerability: ngap_gen::Pre_emptionVulnerability(u8::from(
+                            f.pre_emptable,
+                        )),
                         ie_extensions: None,
                     },
-                    e_rab_id: f.e_rab_id.map(ngap_gen::E_RAB_ID),
+                    gbr_qos_information: f.gbr.as_ref().map(gbr),
+                    reflective_qos_attribute: f.reflective.then_some(
+                        ngap_gen::ReflectiveQosAttribute(
+                            ngap_gen::ReflectiveQosAttribute::SUBJECT_TO,
+                        ),
+                    ),
+                    additional_qos_flow_information: f.additional.then_some(
+                        ngap_gen::AdditionalQosFlowInformation(
+                            ngap_gen::AdditionalQosFlowInformation::MORE_LIKELY,
+                        ),
+                    ),
                     ie_extensions: None,
-                }
+                },
+                e_rab_id: f.e_rab_id.map(ngap_gen::E_RAB_ID),
+                ie_extensions: None,
             })
             .collect();
 
         let mut ies = Vec::new();
-        if let Some(ambr) = t.pdu_session_aggregate_maximum_bit_rate {
+        if let Some((dl, ul)) = t.ambr {
             ies.push(entry(
                 ngap_gen::ID_PDU_SESSION_AGGREGATE_MAXIMUM_BIT_RATE,
                 Ie::Id_PDUSessionAggregateMaximumBitRate(
                     ngap_gen::PDUSessionAggregateMaximumBitRate {
-                        pdu_session_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(ambr.dl),
-                        pdu_session_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(ambr.ul),
+                        pdu_session_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(dl),
+                        pdu_session_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(ul),
                         ie_extensions: None,
                     },
                 ),
@@ -11759,7 +11764,7 @@ pub(crate) mod tests {
         }
         ies.push(entry(
             ngap_gen::ID_UL_NGU_UP_TNL_INFORMATION,
-            Ie::Id_UL_NGU_UP_TNLInformation(tunnel(&t.ul_ngu_up_tnl_information)),
+            Ie::Id_UL_NGU_UP_TNLInformation(tunnel(&t.ul)),
         ));
         if t.data_forwarding_not_possible {
             ies.push(entry(
@@ -11771,9 +11776,9 @@ pub(crate) mod tests {
         }
         ies.push(entry(
             ngap_gen::ID_PDU_SESSION_TYPE,
-            Ie::Id_PDUSessionType(ngap_gen::PDUSessionType(t.pdu_session_type as u8)),
+            Ie::Id_PDUSessionType(ngap_gen::PDUSessionType(t.pdu_session_type)),
         ));
-        if let Some(s) = &t.security_indication {
+        if let Some(s) = &t.security {
             ies.push(entry(
                 ngap_gen::ID_SECURITY_INDICATION,
                 Ie::Id_SecurityIndication(security(s)),
@@ -11794,38 +11799,41 @@ pub(crate) mod tests {
         }
     }
 
-    /// A non-GBR flow: `qfi`, non-dynamic `five_qi`, ARP `arp`.
-    fn non_gbr_flow(qfi: u8, five_qi: u16, arp: u8) -> QosFlowSetupRequestItem {
-        QosFlowSetupRequestItem {
-            qos_flow_identifier: qfi,
-            qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                qos_characteristics: QosCharacteristics::NonDynamic5qi(
-                    NonDynamic5qiDescriptor::new(five_qi),
-                ),
-                allocation_and_retention_priority: AllocationAndRetentionPriority {
-                    priority_level_arp: arp,
-                    pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
-                    pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
-                },
-                gbr_qos_information: None,
-                reflective_qos_attribute: false,
-                additional_qos_flow_information: false,
+    /// A non-GBR flow: `qfi`, non-dynamic `five_qi` (no optional member), ARP
+    /// `arp` shall-not-trigger / not-pre-emptable.
+    fn non_gbr_flow(qfi: u8, five_qi: u8, arp: u8) -> crate::amf_pdus::transfer::Flow {
+        crate::amf_pdus::transfer::Flow {
+            qfi,
+            qos: crate::amf_pdus::transfer::Qos::NonDynamic {
+                five_qi,
+                priority: None,
+                window: None,
+                burst: None,
             },
+            arp,
+            may_trigger_pre_emption: false,
+            pre_emptable: false,
+            gbr: None,
+            reflective: false,
+            additional: false,
             e_rab_id: None,
         }
     }
 
-    /// A UL tunnel of `bit_len` address bits taken from `octets`.
-    fn ul_tunnel(octets: &[u8], bit_len: usize, teid: u32) -> UpTransportLayerInformation {
-        let mut octets = octets[..bit_len.div_ceil(8)].to_vec();
-        if !bit_len.is_multiple_of(8) {
-            let last = octets.len() - 1;
-            octets[last] &= 0xff << (8 - bit_len % 8);
+    /// A tunnel of `bits` address bits taken from `octets`, the octets past
+    /// them dropped and the unused low bits of the last one cleared -- the
+    /// form the AMF reports an address in.
+    fn ul_tunnel(octets: &[u8], bits: usize, teid: u32) -> crate::amf_pdus::transfer::Tunnel {
+        let mut address = octets[..bits.div_ceil(8)].to_vec();
+        if !bits.is_multiple_of(8) {
+            let last = address.len() - 1;
+            address[last] &= 0xff << (8 - bits % 8);
         }
-        UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-            transport_layer_address: TransportLayerAddress { octets, bit_len },
-            gtp_teid: teid.to_be_bytes(),
-        })
+        crate::amf_pdus::transfer::Tunnel {
+            address,
+            bits,
+            teid,
+        }
     }
 
     /// The Setup Request Transfer variant matrix: UL tunnels with IPv4, IPv6
@@ -11836,21 +11844,16 @@ pub(crate) mod tests {
     /// with and without its optional members, dynamic 5QI descriptors at their
     /// bounds, every ARP level and pre-emption combination, reflective QoS,
     /// additional-flow and E-RAB ID.
-    fn request_transfer_variants() -> Vec<PduSessionResourceSetupRequestTransfer> {
-        use nextgcore_ngap::transfer::{
-            DelayCritical, Dynamic5qiDescriptor, GbrQosInformation,
-            MaximumIntegrityProtectedDataRate, PduSessionAggregateMaximumBitRate,
-            ProtectionIndication, SecurityIndication,
-        };
-        let base = |flows: Vec<QosFlowSetupRequestItem>| PduSessionResourceSetupRequestTransfer {
-            pdu_session_aggregate_maximum_bit_rate: None,
-            ul_ngu_up_tnl_information: ul_tunnel(&[10, 45, 0, 7], 32, 0x0001_0001),
+    fn request_transfer_variants() -> Vec<crate::amf_pdus::transfer::SetupRequestTransfer> {
+        use crate::amf_pdus::transfer::{Flow, Gbr, Qos, Security, SetupRequestTransfer};
+        let base = |flows: Vec<Flow>| SetupRequestTransfer {
+            ambr: None,
+            ul: ul_tunnel(&[10, 45, 0, 7], 32, 0x0001_0001),
             data_forwarding_not_possible: false,
-            direct_forwarding_path_availability: false,
-            pdu_session_type: PduSessionType::Ipv4,
-            security_indication: None,
+            pdu_session_type: 0,
+            security: None,
             network_instance: None,
-            qos_flow_setup_request_list: flows,
+            flows,
         };
         let mut v = Vec::new();
         let v6: Vec<u8> = (0..16).map(|i| 0x20 + i).collect();
@@ -11869,52 +11872,39 @@ pub(crate) mod tests {
         ] {
             for teid in [0, u32::MAX] {
                 let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
-                t.ul_ngu_up_tnl_information = ul_tunnel(octets, bits, teid);
+                t.ul = ul_tunnel(octets, bits, teid);
                 v.push(t);
             }
         }
-        for ty in [
-            PduSessionType::Ipv4,
-            PduSessionType::Ipv6,
-            PduSessionType::Ipv4v6,
-            PduSessionType::Ethernet,
-            PduSessionType::Unstructured,
-        ] {
+        // ipv4, ipv6, ipv4v6, ethernet, unstructured.
+        for ty in 0..5u8 {
             let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
             t.pdu_session_type = ty;
             v.push(t);
         }
-        for (dl, ul) in [
+        for ambr in [
             (0, 0),
             (1, 1),
             (1 << 32, 1_000_000_000),
             (4_000_000_000_000, 4_000_000_000_000),
         ] {
             let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
-            t.pdu_session_aggregate_maximum_bit_rate =
-                Some(PduSessionAggregateMaximumBitRate { dl, ul });
+            t.ambr = Some(ambr);
             v.push(t);
         }
         let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
         t.data_forwarding_not_possible = true;
         v.push(t);
-        let indications = [
-            ProtectionIndication::Required,
-            ProtectionIndication::Preferred,
-            ProtectionIndication::NotNeeded,
-        ];
-        for integrity in indications {
-            for confidentiality in indications {
-                for rate in [
-                    None,
-                    Some(MaximumIntegrityProtectedDataRate::Bitrate64kbs),
-                    Some(MaximumIntegrityProtectedDataRate::MaximumUeRate),
-                ] {
+        // required, preferred, not-needed; no rate, bitrate64kbs,
+        // maximum-UE-rate.
+        for integrity in 0..3u8 {
+            for confidentiality in 0..3u8 {
+                for max_rate_ul in [None, Some(0), Some(1)] {
                     let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
-                    t.security_indication = Some(SecurityIndication {
-                        integrity_protection_indication: integrity,
-                        confidentiality_protection_indication: confidentiality,
-                        maximum_integrity_protected_data_rate_ul: rate,
+                    t.security = Some(Security {
+                        integrity,
+                        confidentiality,
+                        max_rate_ul,
                     });
                     v.push(t);
                 }
@@ -11926,44 +11916,33 @@ pub(crate) mod tests {
             v.push(t);
         }
         // Every non-dynamic 5QI, and the optional members at their bounds.
-        for five_qi in 0..=255u16 {
-            v.push(base(vec![non_gbr_flow((five_qi % 64) as u8, five_qi, 1)]));
+        for five_qi in 0..=255u8 {
+            v.push(base(vec![non_gbr_flow(five_qi % 64, five_qi, 1)]));
         }
         for (p, w, b) in [(1, 0, 0), (127, 4095, 4095), (64, 2000, 255)] {
             let mut f = non_gbr_flow(5, 9, 8);
-            f.qos_flow_level_qos_parameters.qos_characteristics =
-                QosCharacteristics::NonDynamic5qi(NonDynamic5qiDescriptor {
-                    five_qi: 9,
-                    priority_level_qos: Some(p),
-                    averaging_window: Some(w),
-                    maximum_data_burst_volume: Some(b),
-                });
+            f.qos = Qos::NonDynamic {
+                five_qi: 9,
+                priority: Some(p),
+                window: Some(w),
+                burst: Some(b),
+            };
             v.push(base(vec![f]));
         }
         // Every ARP level and pre-emption combination.
         for arp in 1..=15u8 {
-            for cap in [
-                PreEmptionCapability::ShallNotTriggerPreEmption,
-                PreEmptionCapability::MayTriggerPreEmption,
-            ] {
-                for vul in [
-                    PreEmptionVulnerability::NotPreEmptable,
-                    PreEmptionVulnerability::PreEmptable,
-                ] {
+            for may_trigger in [false, true] {
+                for pre_emptable in [false, true] {
                     let mut f = non_gbr_flow(5, 9, arp);
-                    f.qos_flow_level_qos_parameters
-                        .allocation_and_retention_priority = AllocationAndRetentionPriority {
-                        priority_level_arp: arp,
-                        pre_emption_capability: cap,
-                        pre_emption_vulnerability: vul,
-                    };
+                    f.may_trigger_pre_emption = may_trigger;
+                    f.pre_emptable = pre_emptable;
                     v.push(base(vec![f]));
                 }
             }
         }
         // GBR flows (5QI 1 conversational voice), optional members off and on,
         // loss rates at the root's bounds (#462).
-        for (notification, dl_loss, ul_loss) in [
+        for (notification, loss_dl, loss_ul) in [
             (false, None, None),
             (true, Some(0), None),
             (true, None, Some(1000)),
@@ -11973,54 +11952,45 @@ pub(crate) mod tests {
         ] {
             for rate in [0u64, 64_000, 4_000_000_000_000] {
                 let mut f = non_gbr_flow(1, 1, 2);
-                f.qos_flow_level_qos_parameters.gbr_qos_information = Some(GbrQosInformation {
-                    maximum_flow_bit_rate_dl: rate,
-                    maximum_flow_bit_rate_ul: rate,
-                    guaranteed_flow_bit_rate_dl: rate / 2,
-                    guaranteed_flow_bit_rate_ul: rate / 2,
-                    notification_control: notification,
-                    maximum_packet_loss_rate_dl: dl_loss,
-                    maximum_packet_loss_rate_ul: ul_loss,
+                f.gbr = Some(Gbr {
+                    mfbr_dl: rate,
+                    mfbr_ul: rate,
+                    gfbr_dl: rate / 2,
+                    gfbr_ul: rate / 2,
+                    notification,
+                    loss_dl,
+                    loss_ul,
                 });
                 v.push(base(vec![f]));
             }
         }
-        // Dynamic 5QI descriptors at their bounds.
-        for (p, pdb, s, e, q, dc, w, b) in [
+        // Dynamic 5QI descriptors at their bounds; delay-critical is index 0,
+        // non-delay-critical 1.
+        for (
+            priority,
+            delay_budget,
+            per_scalar,
+            per_exponent,
+            five_qi,
+            delay_critical,
+            window,
+            burst,
+        ) in [
             (1, 0, 0, 0, None, None, None, None),
-            (
-                127,
-                1023,
-                9,
-                9,
-                Some(255),
-                Some(DelayCritical::DelayCritical),
-                Some(4095),
-                Some(4095),
-            ),
-            (
-                20,
-                100,
-                1,
-                6,
-                Some(0),
-                Some(DelayCritical::NonDelayCritical),
-                Some(0),
-                Some(0),
-            ),
+            (127, 1023, 9, 9, Some(255), Some(0), Some(4095), Some(4095)),
+            (20, 100, 1, 6, Some(0), Some(1), Some(0), Some(0)),
         ] {
             let mut f = non_gbr_flow(7, 9, 8);
-            f.qos_flow_level_qos_parameters.qos_characteristics =
-                QosCharacteristics::Dynamic5qi(Dynamic5qiDescriptor {
-                    priority_level_qos: p,
-                    packet_delay_budget: pdb,
-                    per_scalar: s,
-                    per_exponent: e,
-                    five_qi: q,
-                    delay_critical: dc,
-                    averaging_window: w,
-                    maximum_data_burst_volume: b,
-                });
+            f.qos = Qos::Dynamic {
+                priority,
+                delay_budget,
+                per_scalar,
+                per_exponent,
+                five_qi,
+                delay_critical,
+                window,
+                burst,
+            };
             v.push(base(vec![f]));
         }
         // Reflective QoS, additional flow information, E-RAB IDs.
@@ -12030,9 +12000,8 @@ pub(crate) mod tests {
             (true, true, Some(15)),
         ] {
             let mut f = non_gbr_flow(3, 9, 8);
-            f.qos_flow_level_qos_parameters.reflective_qos_attribute = reflective;
-            f.qos_flow_level_qos_parameters
-                .additional_qos_flow_information = additional;
+            f.reflective = reflective;
+            f.additional = additional;
             f.e_rab_id = erab;
             v.push(base(vec![f]));
         }
@@ -12041,41 +12010,36 @@ pub(crate) mod tests {
         v.push(base((0..64u8).map(|q| non_gbr_flow(q, 9, 8)).collect()));
         // Everything at once.
         let mut t = base(vec![non_gbr_flow(1, 9, 8), non_gbr_flow(2, 1, 2)]);
-        t.pdu_session_aggregate_maximum_bit_rate = Some(PduSessionAggregateMaximumBitRate {
-            dl: 1_000_000_000,
-            ul: 500_000_000,
-        });
-        t.ul_ngu_up_tnl_information = ul_tunnel(&dual, 160, 0xdead_beef);
+        t.ambr = Some((1_000_000_000, 500_000_000));
+        t.ul = ul_tunnel(&dual, 160, 0xdead_beef);
         t.data_forwarding_not_possible = true;
-        t.pdu_session_type = PduSessionType::Ipv4v6;
-        t.security_indication = Some(SecurityIndication {
-            integrity_protection_indication: ProtectionIndication::Required,
-            confidentiality_protection_indication: ProtectionIndication::Preferred,
-            maximum_integrity_protected_data_rate_ul: Some(
-                MaximumIntegrityProtectedDataRate::MaximumUeRate,
-            ),
+        t.pdu_session_type = 2;
+        t.security = Some(Security {
+            integrity: 0,
+            confidentiality: 1,
+            max_rate_ul: Some(1),
         });
         t.network_instance = Some(17);
         v.push(t);
         v
     }
 
-    /// #417 stage 6: the generated codec encodes every Setup Request Transfer of
-    /// the variant matrix exactly as the hand-written transfer codec does --
-    /// the codec the SMF builds its transfer with -- and decodes the
-    /// hand-written bytes back to the same value. A list of 65 flows, one past
-    /// maxnoofQosFlows, both refuse.
+    /// The generated codec encodes every Setup Request Transfer of the
+    /// variant matrix as the derivation does, and decodes the derived octets
+    /// back to the same value. A list of 65 flows, one past maxnoofQosFlows,
+    /// is refused.
     #[test]
-    fn setup_request_transfer_codecs_agree_over_the_variant_matrix() {
+    fn setup_request_transfer_generated_codec_is_the_derivation_over_the_variant_matrix() {
+        use crate::amf_pdus::transfer::setup_request_transfer;
         let variants = request_transfer_variants();
         for t in &variants {
-            let old = t.encode().expect("hand-written encode");
+            let derived = setup_request_transfer(t);
             let generated = generated_request_transfer(t);
             let new = nextgcore_ngap_gen::encode_contained(&generated).expect("generated encode");
-            assert_eq!(new, old, "{t:?}");
+            assert_eq!(new, derived, "{t:?}");
             let back = nextgcore_ngap_gen::decode_contained::<
                 ngap_gen::PDUSessionResourceSetupRequestTransfer,
-            >(&old)
+            >(&derived)
             .expect("generated decode");
             assert_eq!(back, generated, "{t:?}");
         }
@@ -12085,52 +12049,137 @@ pub(crate) mod tests {
         );
 
         let mut too_many = variants[0].clone();
-        too_many.qos_flow_setup_request_list =
-            (0..65u8).map(|q| non_gbr_flow(q % 64, 9, 8)).collect();
-        assert!(too_many.encode().is_err());
+        too_many.flows = (0..65u8).map(|q| non_gbr_flow(q % 64, 9, 8)).collect();
         assert!(
             nextgcore_ngap_gen::encode_contained(&generated_request_transfer(&too_many)).is_err()
         );
     }
 
-    /// A PDUSessionResourceSetupResponseTransfer from the hand-written codec:
-    /// DL tunnel `bits` bits of `address`, TEID, and the associated `qfis`.
-    fn hand_written_response_transfer(
+    /// A Setup Response Transfer of DL tunnel `bits` bits of `address`, TEID,
+    /// and the associated `qfis`, nothing else.
+    fn response_transfer(
         address: &[u8],
         bits: usize,
         teid: u32,
         qfis: &[u8],
-    ) -> PduSessionResourceSetupResponseTransfer {
-        use nextgcore_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
-        PduSessionResourceSetupResponseTransfer {
-            dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
-                up_transport_layer_information: ul_tunnel(address, bits, teid),
-                associated_qos_flow_list: qfis
-                    .iter()
-                    .map(|&q| AssociatedQosFlowItem {
-                        qos_flow_identifier: q,
-                        qos_flow_mapping_indication: None,
-                    })
-                    .collect(),
-            },
-            additional_dl_qos_flow_per_tnl_information: Vec::new(),
-            security_result: None,
-            qos_flow_failed_to_setup_list: Vec::new(),
+    ) -> crate::amf_pdus::transfer::SetupResponseTransfer {
+        crate::amf_pdus::transfer::plain_setup_response_transfer(
+            ul_tunnel(address, bits, teid),
+            qfis,
+        )
+    }
+
+    /// The endpoint the AMF reports for a Setup Response Transfer: the DL
+    /// tunnel's TEID, its address octets, its QFIs.
+    fn endpoint_of(t: &crate::amf_pdus::transfer::SetupResponseTransfer) -> GnbN3Endpoint {
+        GnbN3Endpoint {
+            teid: t.dl.tunnel.teid,
+            address: t.dl.tunnel.address.clone(),
+            qfis: t.dl.flows.iter().map(|f| f.qfi).collect(),
         }
     }
 
-    /// #417 stage 6: for every Setup Response Transfer the hand-written decoder
-    /// accepted -- IPv4/IPv6/IPv4v6 and odd-length addresses of more than 16
-    /// bits (shorter ones: `transport_layer_addresses_of_16_bits_or_fewer_agree`), TEID extremes,
-    /// 1, 2 and 64 associated flows with and without a mapping indication, a
-    /// Security Result, a failed-flow list with causes -- the generated decode
-    /// gives the same endpoint; garbage stays refused.
-    #[test]
-    fn n2_sm_setup_response_transfer_generated_matches_hand_written() {
-        use nextgcore_ngap::transfer::{
-            AssociatedQosFlowItem, ProtectionResult, QosFlowMappingIndication,
-            QosFlowWithCauseItem, SecurityResult,
+    /// The (group, number) of a generated Cause.
+    fn generated_cause_numbers(c: &ngap_gen::Cause) -> (u8, i64) {
+        match c {
+            ngap_gen::Cause::RadioNetwork(v) => (0, i64::from(v.0)),
+            ngap_gen::Cause::Transport(v) => (1, i64::from(v.0)),
+            ngap_gen::Cause::Nas(v) => (2, i64::from(v.0)),
+            ngap_gen::Cause::Protocol(v) => (3, i64::from(v.0)),
+            ngap_gen::Cause::Misc(v) => (4, i64::from(v.0)),
+            other => panic!("not derived: {other:?}"),
+        }
+    }
+
+    /// Every value of a Setup Response Transfer as the generated strict
+    /// decode reads it, in the derivation's own terms, so the derived octets
+    /// can be checked member for member: the transfer without its failed
+    /// list, and the failed list as (QFI, cause group and number).
+    #[allow(clippy::type_complexity)]
+    fn generated_response_transfer(
+        bytes: &[u8],
+    ) -> (
+        crate::amf_pdus::transfer::SetupResponseTransfer,
+        Vec<(u8, (u8, i64))>,
+    ) {
+        use crate::amf_pdus::transfer::{AssociatedFlow, PerTnl, SetupResponseTransfer, Tunnel};
+        let t = nextgcore_ngap_gen::decode_contained::<
+            ngap_gen::PDUSessionResourceSetupResponseTransfer,
+        >(bytes)
+        .expect("strict decode");
+        let per_tnl = |p: &ngap_gen::QosFlowPerTNLInformation| {
+            let ngap_gen::UPTransportLayerInformation::GTPTunnel(g) =
+                p.up_transport_layer_information.clone();
+            PerTnl {
+                tunnel: Tunnel {
+                    address: transport_layer_address_octets(&g.transport_layer_address),
+                    bits: g.transport_layer_address.0.len(),
+                    teid: u32::from_be_bytes(g.gtp_teid.0.as_slice().try_into().expect("4")),
+                },
+                flows: p
+                    .associated_qos_flow_list
+                    .0
+                    .iter()
+                    .map(|f| AssociatedFlow {
+                        qfi: f.qos_flow_identifier.0,
+                        mapping: f.qos_flow_mapping_indication.as_ref().map(|m| m.0),
+                    })
+                    .collect(),
+            }
         };
+        let failed = t
+            .qos_flow_failed_to_setup_list
+            .iter()
+            .flat_map(|l| l.0.iter())
+            .map(|f| (f.qos_flow_identifier.0, generated_cause_numbers(&f.cause)))
+            .collect();
+        let read = SetupResponseTransfer {
+            dl: per_tnl(&t.dl_qos_flow_per_tnl_information),
+            additional: t
+                .additional_dl_qos_flow_per_tnl_information
+                .iter()
+                .flat_map(|l| l.0.iter())
+                .map(|i| per_tnl(&i.qos_flow_per_tnl_information))
+                .collect(),
+            security_result: t.security_result.as_ref().map(|s| {
+                (
+                    s.integrity_protection_result.0,
+                    s.confidentiality_protection_result.0,
+                )
+            }),
+            failed: Vec::new(),
+        };
+        (read, failed)
+    }
+
+    /// `t` read back: [`generated_response_transfer`] of its derived octets
+    /// equals it, failed-list causes compared as numbers.
+    fn assert_reads_back(t: &crate::amf_pdus::transfer::SetupResponseTransfer, bytes: &[u8]) {
+        let (read, failed) = generated_response_transfer(bytes);
+        let mut expected = t.clone();
+        expected.failed.clear();
+        assert_eq!(read, expected);
+        assert_eq!(
+            failed,
+            t.failed
+                .iter()
+                .map(|(qfi, c)| (*qfi, crate::amf_pdus::transfer::cause_numbers(c)))
+                .collect::<Vec<_>>(),
+            "{t:?}"
+        );
+    }
+
+    /// For every Setup Response Transfer shape -- IPv4/IPv6/IPv4v6 and
+    /// odd-length addresses of more than 16 bits (shorter ones:
+    /// `transport_layer_addresses_of_16_bits_or_fewer_are_read`), TEID
+    /// extremes, 1, 2 and 64 associated flows with and without a mapping
+    /// indication, a Security Result, a failed-flow list with causes -- the
+    /// derived octets decode, strictly, to every value they were derived
+    /// from, and the AMF reads the DL endpoint off them; garbage stays
+    /// refused.
+    #[test]
+    fn n2_sm_setup_response_transfer_reads_the_derived_octets() {
+        use crate::amf_pdus::transfer::{setup_response_transfer, AssociatedFlow};
         let v6: Vec<u8> = (0..16).map(|i| 0x20 + i).collect();
         let dual: Vec<u8> = [10, 45, 0, 3]
             .into_iter()
@@ -12147,63 +12196,43 @@ pub(crate) mod tests {
             (&ones[..], 159),
         ] {
             for teid in [0, 0xdead_beef, u32::MAX] {
-                corpus.push(hand_written_response_transfer(octets, bits, teid, &[9]));
+                corpus.push(response_transfer(octets, bits, teid, &[9]));
             }
         }
-        corpus.push(hand_written_response_transfer(
-            &[10, 0, 0, 1],
-            32,
-            1,
-            &[1, 2],
-        ));
-        corpus.push(hand_written_response_transfer(
+        corpus.push(response_transfer(&[10, 0, 0, 1], 32, 1, &[1, 2]));
+        corpus.push(response_transfer(
             &[10, 0, 0, 1],
             32,
             1,
             &(0..64).collect::<Vec<u8>>(),
         ));
-        for mapping in [QosFlowMappingIndication::Ul, QosFlowMappingIndication::Dl] {
-            let mut t = hand_written_response_transfer(&[10, 0, 0, 1], 32, 1, &[]);
-            t.dl_qos_flow_per_tnl_information.associated_qos_flow_list =
-                vec![AssociatedQosFlowItem {
-                    qos_flow_identifier: 5,
-                    qos_flow_mapping_indication: Some(mapping),
-                }];
+        // Mapping indication ul (0) and dl (1).
+        for mapping in [0, 1] {
+            let mut t = response_transfer(&[10, 0, 0, 1], 32, 1, &[]);
+            t.dl.flows = vec![AssociatedFlow {
+                qfi: 5,
+                mapping: Some(mapping),
+            }];
             corpus.push(t);
         }
-        for (i, c) in [
-            (ProtectionResult::Performed, ProtectionResult::NotPerformed),
-            (ProtectionResult::NotPerformed, ProtectionResult::Performed),
-        ] {
-            let mut t = hand_written_response_transfer(&[10, 0, 0, 1], 32, 1, &[9]);
-            t.security_result = Some(SecurityResult {
-                integrity_protection_result: i,
-                confidentiality_protection_result: c,
-            });
-            t.qos_flow_failed_to_setup_list = vec![
-                QosFlowWithCauseItem {
-                    qos_flow_identifier: 2,
-                    cause: build_cause(0, 46),
-                },
-                QosFlowWithCauseItem {
-                    qos_flow_identifier: 63,
-                    cause: build_cause(1, 0),
-                },
-            ];
+        // Security Result (performed 0 / not-performed 1), and a failed list.
+        for result in [(0, 1), (1, 0)] {
+            let mut t = response_transfer(&[10, 0, 0, 1], 32, 1, &[9]);
+            t.security_result = Some(result);
+            t.failed = vec![(2, build_cause(0, 46)), (63, build_cause(1, 0))];
             corpus.push(t);
         }
         for t in &corpus {
-            let bytes = t.encode().expect("encode");
-            let old = hand_written_parse_n2_sm_setup_response_transfer(&bytes);
-            assert!(old.is_some(), "the corpus holds accepted transfers: {t:?}");
-            assert_eq!(parse_n2_sm_setup_response_transfer(&bytes), old, "{t:?}");
+            let bytes = setup_response_transfer(t);
+            assert_reads_back(t, &bytes);
+            assert_eq!(
+                parse_n2_sm_setup_response_transfer(&bytes),
+                Some(endpoint_of(t)),
+                "{t:?}"
+            );
         }
         assert_eq!(corpus.len(), 18 + 2 + 2 + 2);
         for garbage in [&[][..], &[0x09, 0x00, 0x00][..], &[0xff; 3][..]] {
-            assert_eq!(
-                hand_written_parse_n2_sm_setup_response_transfer(garbage),
-                None
-            );
             assert_eq!(parse_n2_sm_setup_response_transfer(garbage), None);
         }
     }
@@ -12249,25 +12278,48 @@ pub(crate) mod tests {
         .expect("encode")
     }
 
-    /// The Additional DL QoS Flow per TNL Information is a list, and both
-    /// decoders read it as one. Until #462 the hand-written decoder read a
-    /// single element, without the list's count or the item's preamble, and
-    /// misread the additional tunnel -- a 2-bit address, the second tunnel's
-    /// address octets taken for its TEID, QFI 0. The DL endpoint the AMF logs
-    /// precedes it, so both always gave the same one.
+    /// The Additional DL QoS Flow per TNL Information is a list
+    /// (`QosFlowPerTNLInformationList`, count-1 in two bits, then per item
+    /// its preamble): the generated encoder writes the derived octets, which
+    /// decode to the additional tunnel and its flow, and the DL endpoint the
+    /// AMF logs is the first tunnel's. Until #462 the hand-written decoder read
+    /// a single element without the count or the preamble and misread the
+    /// additional tunnel.
     #[test]
     fn a_dual_connectivity_setup_response_transfer_reads_its_additional_list() {
+        use crate::amf_pdus::transfer::{
+            setup_response_transfer, AssociatedFlow, PerTnl, SetupResponseTransfer, Tunnel,
+        };
+        let per_tnl = |address: [u8; 4], teid: u32| PerTnl {
+            tunnel: Tunnel {
+                address: address.to_vec(),
+                bits: 32,
+                teid,
+            },
+            flows: vec![AssociatedFlow {
+                qfi: 9,
+                mapping: None,
+            }],
+        };
+        let derived = SetupResponseTransfer {
+            dl: per_tnl([10, 45, 0, 3], 0xdead_beef),
+            additional: vec![per_tnl([10, 45, 0, 4], 2)],
+            security_result: Some((0, 0)),
+            failed: Vec::new(),
+        };
         let bytes = dual_connectivity_response_transfer();
+        assert_eq!(
+            bytes,
+            setup_response_transfer(&derived),
+            "the derived octets"
+        );
+        assert_reads_back(&derived, &bytes);
         let endpoint = Some(GnbN3Endpoint {
             teid: 0xdead_beef,
             address: vec![10, 45, 0, 3],
             qfis: vec![9],
         });
         assert_eq!(parse_n2_sm_setup_response_transfer(&bytes), endpoint);
-        assert_eq!(
-            hand_written_parse_n2_sm_setup_response_transfer(&bytes),
-            endpoint
-        );
 
         let generated = nextgcore_ngap_gen::decode_contained::<
             ngap_gen::PDUSessionResourceSetupResponseTransfer,
@@ -12289,46 +12341,29 @@ pub(crate) mod tests {
             vec![10, 45, 0, 4]
         );
         assert_eq!(tunnel.gtp_teid.0, vec![0, 0, 0, 2]);
-
-        let old = PduSessionResourceSetupResponseTransfer::decode(&bytes).expect("old decode");
-        assert_eq!(old.additional_dl_qos_flow_per_tnl_information.len(), 1);
-        let UpTransportLayerInformation::GtpTunnel(ref t) =
-            old.additional_dl_qos_flow_per_tnl_information[0].up_transport_layer_information;
-        assert_eq!(t.transport_layer_address.octets, vec![10, 45, 0, 4]);
-        assert_eq!(t.transport_layer_address.bit_len, 32);
-        assert_eq!(t.gtp_teid, [0, 0, 0, 2]);
-        assert_eq!(
-            old.additional_dl_qos_flow_per_tnl_information[0].associated_qos_flow_list[0]
-                .qos_flow_identifier,
-            9
-        );
-        // And the hand-written encoder produces the generated bytes.
-        assert_eq!(old.encode().expect("old encode"), bytes);
     }
 
     /// X.691 §16.11 octet-aligns a variable-size BIT STRING whatever its
-    /// length, as the hand-written codec does. The fork used to align only
-    /// strings longer than 16 bits, so a Transport Layer Address of 16 bits or
-    /// fewer encoded differently and was misread; since nextgsim #226 (PR #227)
-    /// both codecs give the same bytes and the same endpoint. From 17 bits up
+    /// length. The fork used to align only strings longer than 16 bits, so a
+    /// Transport Layer Address of 16 bits or fewer encoded differently and was
+    /// misread; since nextgsim #226 (PR #227) the generated codec writes the
+    /// derived octets and the AMF reads the endpoint off them. From 17 bits up
     /// the variant matrix above covers it.
     #[test]
-    fn transport_layer_addresses_of_16_bits_or_fewer_agree() {
+    fn transport_layer_addresses_of_16_bits_or_fewer_are_read() {
+        use crate::amf_pdus::transfer::{setup_request_transfer, setup_response_transfer};
         for bits in [1usize, 8, 15, 16] {
             let mut t = request_transfer_variants()[0].clone();
-            t.ul_ngu_up_tnl_information = ul_tunnel(&[0xff; 20], bits, 0);
-            let old = t.encode().expect("hand-written encode");
+            t.ul = ul_tunnel(&[0xff; 20], bits, 0);
             let new = nextgcore_ngap_gen::encode_contained(&generated_request_transfer(&t))
                 .expect("generated encode");
-            assert_eq!(new, old, "{bits} bits");
-            let response = hand_written_response_transfer(&[0xff; 20], bits, 0, &[9])
-                .encode()
-                .expect("encode");
-            let parsed = parse_n2_sm_setup_response_transfer(&response);
-            assert!(parsed.is_some(), "{bits} bits");
+            assert_eq!(new, setup_request_transfer(&t), "{bits} bits");
+            let response = response_transfer(&[0xff; 20], bits, 0, &[9]);
+            let bytes = setup_response_transfer(&response);
+            assert_reads_back(&response, &bytes);
             assert_eq!(
-                parsed,
-                hand_written_parse_n2_sm_setup_response_transfer(&response),
+                parse_n2_sm_setup_response_transfer(&bytes),
+                Some(endpoint_of(&response)),
                 "{bits} bits"
             );
         }
@@ -12339,26 +12374,26 @@ pub(crate) mod tests {
     /// encoded and decoded it as the non-extensible (0..1000); the bit shows
     /// when it lands on an octet boundary, as it does for the UL rate right
     /// after an aligned DL rate, where the conformant encoding is one octet
-    /// longer. Now both codecs give the same bytes and read each other's form.
+    /// longer. The generated codec writes the derived form and reads it back.
     #[test]
     fn packet_loss_rate_carries_its_extension_bit() {
-        use nextgcore_ngap::transfer::GbrQosInformation;
+        use crate::amf_pdus::transfer::{setup_request_transfer, Gbr};
         let mut f = non_gbr_flow(1, 1, 2);
-        f.qos_flow_level_qos_parameters.gbr_qos_information = Some(GbrQosInformation {
-            maximum_flow_bit_rate_dl: 64_000,
-            maximum_flow_bit_rate_ul: 64_000,
-            guaranteed_flow_bit_rate_dl: 32_000,
-            guaranteed_flow_bit_rate_ul: 32_000,
-            notification_control: true,
-            maximum_packet_loss_rate_dl: Some(0),
-            maximum_packet_loss_rate_ul: Some(1000),
+        f.gbr = Some(Gbr {
+            mfbr_dl: 64_000,
+            mfbr_ul: 64_000,
+            gfbr_dl: 32_000,
+            gfbr_ul: 32_000,
+            notification: true,
+            loss_dl: Some(0),
+            loss_ul: Some(1000),
         });
         let mut t = request_transfer_variants()[0].clone();
-        t.qos_flow_setup_request_list = vec![f];
-        let old = t.encode().expect("hand-written encode");
+        t.flows = vec![f];
+        let derived = setup_request_transfer(&t);
         let generated = generated_request_transfer(&t);
         let new = nextgcore_ngap_gen::encode_contained(&generated).expect("generated encode");
-        assert_eq!(new, old);
+        assert_eq!(new, derived);
         // DL rate 0 then UL rate 1000 = 0x03e8: the UL rate's extension bit (0)
         // takes an octet of its own, then the value is aligned.
         assert_eq!(
@@ -12367,30 +12402,22 @@ pub(crate) mod tests {
         );
         let back = nextgcore_ngap_gen::decode_contained::<
             ngap_gen::PDUSessionResourceSetupRequestTransfer,
-        >(&old)
+        >(&derived)
         .expect("generated decode");
         assert_eq!(back, generated);
-        assert_eq!(
-            PduSessionResourceSetupRequestTransfer::decode(&new).expect("hand-written decode"),
-            t,
-            "the hand-written decoder reads the conformant form back"
-        );
     }
 
     /// Past 16,383 octets an APER length determinant is fragmented (X.691
     /// §11.9.3.8): 16K/32K/48K/64K pieces, then the remainder with its own
-    /// determinant. The hand-written encoder always fragmented; the fork has
-    /// since nextgsim #223 (#222), so the 16,383-octet ceiling stage 6 had to
-    /// accept is gone and the generated Setup Request is byte for byte the
-    /// hand-written one on both sides of the boundary -- the transfer alone
-    /// fragmenting (16,384+) and the outer initiating-message value
-    /// fragmenting (16,353+, the transfer plus 31 octets with an SD) -- across
-    /// one, two, three and four 16K fragments and a non-zero remainder past
-    /// 64K. Each also decodes back, through the generated decoder, to the
-    /// transfer it carried. Before #223 every length here but 16,352 was
-    /// refused.
+    /// determinant. The fork fragments since nextgsim #223 (#222), so the
+    /// generated Setup Request is byte for byte the derived one on both sides
+    /// of the boundary -- the transfer alone fragmenting (16,384+) and the
+    /// outer initiating-message value fragmenting (16,353+, the transfer plus
+    /// 31 octets with an SD) -- across one, two, three and four 16K fragments
+    /// and a non-zero remainder past 64K. Each also decodes back, through the
+    /// generated decoder, to the transfer it carried.
     #[test]
-    fn a_setup_request_past_16k_octets_matches_the_hand_written_fragmenting_encoder() {
+    fn a_setup_request_past_16k_octets_is_the_derived_fragmented_octets() {
         for n in [
             16_352, 16_353, 16_383, 16_384, 16_385, 20_000, 32_767, 32_768, 49_152, 65_535, 65_536,
             70_000,
@@ -12406,17 +12433,17 @@ pub(crate) mod tests {
                 &transfer,
             )
             .unwrap_or_else(|| panic!("generated refused a {n}-octet transfer"));
-            let oracle = hand_written_pdu_session_resource_setup_request(
+            let derived = crate::amf_pdus::transfer::pdu_session_resource_setup_request(
                 42,
                 1001,
                 5,
-                1,
-                Some(1),
-                None,
+                &crate::context::SNssai {
+                    sst: 1,
+                    sd: Some(1),
+                },
                 &transfer,
-            )
-            .expect("the hand-written encoder fragments");
-            assert!(generated == oracle, "{n}-octet transfer: bytes differ");
+            );
+            assert!(generated == derived, "{n}-octet transfer: bytes differ");
             if n > 16_352 {
                 // The outer initiating-message length is itself fragmented:
                 // byte 3 is its first octet, 0b11 + multiplier.
@@ -12447,26 +12474,26 @@ pub(crate) mod tests {
     /// The decode side of the same boundary: a Setup Response whose transfers
     /// pass 16,383 octets -- set-up and failed lists, a fragmented transfer
     /// and a fragmented outer length -- decodes through the generated decoder
-    /// to exactly what the hand-written parser reads, whether the hand-written
-    /// or the generated encoder framed it. Before nextgsim #223 the fork read
-    /// the next fragment header as content (#222), so a fragmented open type
-    /// decoded without error to corrupted octets.
+    /// to the IDs and transfers it carries, and the generated encoder frames
+    /// the same message as the derived octets. Before nextgsim #223 the fork
+    /// read the next fragment header as content (#222), so a fragmented open
+    /// type decoded without error to corrupted octets.
     #[test]
-    fn a_setup_response_past_16k_octets_decodes_as_the_hand_written_parser_reads_it() {
+    fn a_setup_response_past_16k_octets_decodes_to_its_transfers() {
         for n in [
             16_383, 16_384, 16_385, 20_000, 32_768, 49_152, 65_536, 70_000,
         ] {
             let t: Vec<u8> = (0..n).map(|i| (i % 241) as u8).collect();
             let expected = Some((7, 9, vec![(3, t.clone())], vec![(6, t.clone())]));
-            let hand_built = setup_response(7, 9, &[(3, t.clone())], &[(6, t.clone())]);
-            assert_eq!(
-                hand_written_parse_pdu_session_resource_setup_response(&hand_built),
-                expected,
-                "{n}: the oracle reads its own framing"
+            let derived = crate::amf_pdus::transfer::pdu_session_resource_setup_response(
+                7,
+                9,
+                &[(3, t.clone())],
+                &[(6, t.clone())],
             );
             assert!(
-                generated_setup_response_view(&hand_built) == expected,
-                "{n}: generated decode of the hand-written framing differs"
+                generated_setup_response_view(&derived) == expected,
+                "{n}: generated decode of the derived octets differs"
             );
             let generated_built = generated_setup_response(vec![
                 ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
@@ -12478,23 +12505,17 @@ pub(crate) mod tests {
                 generated_setup_list(&[(3, t.clone())]),
                 generated_failed_list(&[(6, t.clone())]),
             ]);
-            // The two framings are not byte-identical at ANY length: the
-            // hand-written builder marks both UE NGAP IDs criticality reject,
-            // where §9.2.1.2 gives every IE of this message criticality
-            // ignore. amfd only decodes this message, so the point here is
-            // that both framings decode alike past 16K.
             assert!(
-                generated_setup_response_view(&generated_built) == expected,
-                "{n}: generated decode of the generated framing differs"
+                generated_built == derived,
+                "{n}: the generated framing is not the derived one"
             );
         }
     }
 
     /// A transfer whose iE-Extensions carries an extension the schema does not
     /// know -- here the MBS Support Indicator (id 309) relabelled 9999 on the
-    /// wire -- decodes to the same endpoint: the hand-written decoder never
-    /// read the extension container, and the generated one skips the unknown
-    /// entry. So does one whose DL GTP tunnel carries an iE-Extensions entry:
+    /// wire -- decodes to the same endpoint: the generated decode skips the
+    /// unknown entry. So does one whose DL GTP tunnel carries an iE-Extensions entry:
     /// GTPTunnel's extension object set is empty, and since nextgsim #218 the
     /// codec skips the entry as an open type instead of reading it as zero bits
     /// and the associated QoS flow list after it from the wrong offset.
@@ -12502,11 +12523,9 @@ pub(crate) mod tests {
     fn setup_response_transfer_extensions_are_skipped() {
         let mut transfer = nextgcore_ngap_gen::decode_contained::<
             ngap_gen::PDUSessionResourceSetupResponseTransfer,
-        >(
-            &hand_written_response_transfer(&[10, 45, 0, 3], 32, 7, &[9])
-                .encode()
-                .expect("encode"),
-        )
+        >(&crate::amf_pdus::transfer::setup_response_transfer(
+            &response_transfer(&[10, 45, 0, 3], 32, 7, &[9]),
+        ))
         .expect("decode");
         transfer.ie_extensions = Some(ngap_gen::PDUSessionResourceSetupResponseTransferIE_Extensions(vec![
             ngap_gen::PDUSessionResourceSetupResponseTransferIE_Extensions_Entry {
@@ -12533,10 +12552,6 @@ pub(crate) mod tests {
         });
         assert_eq!(parse_n2_sm_setup_response_transfer(&known), endpoint);
         assert_eq!(parse_n2_sm_setup_response_transfer(&unknown), endpoint);
-        assert_eq!(
-            hand_written_parse_n2_sm_setup_response_transfer(&unknown),
-            endpoint
-        );
         assert!(
             nextgcore_ngap_gen::decode_contained::<ngap_gen::PDUSessionResourceSetupResponseTransfer>(
                 &unknown
@@ -12612,9 +12627,12 @@ pub(crate) mod tests {
                 "the default decode refuses the unknown entry, so the skip is what decodes it"
             );
         }
-        let plain = hand_written_response_transfer(&[10, 45, 0, 3], 32, 7, &[9])
-            .encode()
-            .expect("encode");
+        let plain = crate::amf_pdus::transfer::setup_response_transfer(&response_transfer(
+            &[10, 45, 0, 3],
+            32,
+            7,
+            &[9],
+        ));
         assert_eq!(parse_n2_sm_setup_response_transfer(&plain), endpoint);
     }
 
@@ -12746,12 +12764,6 @@ pub(crate) mod tests {
     // #417 stage 7: Initial Context Setup on the generated codec
     // ====================================================================
 
-    use hand_written_oracle::{
-        hand_written_initial_context_setup_request,
-        hand_written_parse_initial_context_setup_failure,
-        hand_written_parse_initial_context_setup_response,
-    };
-
     /// `InitialContextSetupRequestIEs` object-set order (`ngap-17.9.asn`) of the
     /// IEs the AMF sends: AMF/RAN UE NGAP ID, UE AMBR, GUAMI, Allowed NSSAI, UE
     /// Security Capabilities, Security Key, NAS-PDU.
@@ -12760,51 +12772,20 @@ pub(crate) mod tests {
     /// `BitRate`'s upper bound, INTEGER (0..4000000000000, ...) (§9.3.1.4).
     const BIT_RATE_MAX: u64 = 4_000_000_000_000;
 
-    /// The hand-written ICS Request with its two wire deviations corrected --
-    /// the IEs put in object-set order and the NAS-PDU marked "ignore" -- done
-    /// with the HAND-WRITTEN PDU layer (nextgcore-asn1c), so the expectation owes
-    /// nothing to the generated codec. Every IE value stays the hand-written
-    /// encoder's own octets.
-    fn hand_written_ics_corrected(bytes: &[u8]) -> Vec<u8> {
-        use nextgcore_asn1c::ngap::{InitiatingMessageValue, NgapPdu};
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
-        let mut pdu = NgapPdu::decode_aper(&mut AperDecoder::new(bytes)).expect("decode");
-        let NgapPdu::InitiatingMessage(ref mut msg) = pdu else {
-            panic!("initiatingMessage");
-        };
-        let InitiatingMessageValue::InitialContextSetupRequest(ref mut container) = msg.value
+    /// The IE ids and criticalities (0 reject, 1 ignore, 2 notify) of an
+    /// Initial Context Setup Request, read by the generated strict decode.
+    fn raw_ies(bytes: &[u8]) -> Vec<(u16, u8)> {
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+            value: ngap_gen::InitiatingMessageValue::Id_InitialContextSetup(req),
+            ..
+        }) = nextgcore_ngap_gen::decode(bytes).expect("decode")
         else {
             panic!("Initial Context Setup Request");
         };
-        let rank = |id: u16| {
-            ICS_REQUEST_ORDER
-                .iter()
-                .position(|&known| known == id)
-                .expect("an IE the AMF sends")
-        };
-        container.ies.sort_by_key(|field| rank(field.id.0));
-        for field in &mut container.ies {
-            if field.id.0 == ngap_gen::ID_NAS_PDU {
-                field.criticality = nextgcore_asn1c::ngap::Criticality::Ignore;
-            }
-        }
-        let mut encoder = AperEncoder::new();
-        pdu.encode_aper(&mut encoder).expect("encode");
-        encoder.align();
-        encoder.into_bytes().to_vec()
-    }
-
-    /// The IE ids and criticalities of an encoded PDU, read by the hand-written
-    /// PDU layer.
-    fn raw_ies(bytes: &[u8]) -> Vec<(u16, nextgcore_asn1c::ngap::Criticality)> {
-        use nextgcore_asn1c::ngap::NgapPdu;
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-        NgapPdu::decode_aper(&mut AperDecoder::new(bytes))
-            .expect("decode")
-            .protocol_ies()
-            .ies
+        req.protocol_i_es
+            .0
             .iter()
-            .map(|field| (field.id.0, field.criticality))
+            .map(|field| (field.id.0, field.criticality.0))
             .collect()
     }
 
@@ -12976,47 +12957,41 @@ pub(crate) mod tests {
         cases
     }
 
-    /// #417 stage 7: the generated Initial Context Setup Request is the
-    /// hand-written one with exactly its two wire deviations corrected -- IEs in
-    /// object-set order, NAS-PDU criticality ignore (§9.4.1,
-    /// `InitialContextSetupRequestIEs`) -- across every field variant the AMF
-    /// can produce, and both refuse the same inputs. Where neither deviation
-    /// applies (no NAS-PDU, no UE AMBR) the bytes are identical outright.
+    /// The production Initial Context Setup Request is the derived one
+    /// (`amf_pdus::transfer::initial_context_setup_request`: object-set IE
+    /// order, NAS-PDU criticality ignore, §9.2.2.1) across every field variant
+    /// the AMF can produce -- NAS-PDUs past 16K fragmenting the message value
+    /// included -- and is refused exactly where the derivation has no
+    /// encoding.
     #[test]
-    fn initial_context_setup_request_generated_matches_hand_written() {
-        let (mut compared, mut refused, mut identical, mut fragmented) = (0, 0, 0, 0);
+    fn initial_context_setup_request_is_the_derivation() {
+        let (mut compared, mut refused, mut fragmented) = (0, 0, 0);
         for case in ics_cases() {
             let generated = case.build(build_initial_context_setup_request_asn1);
-            let oracle = case.build(hand_written_initial_context_setup_request);
-            match (generated, oracle) {
-                (Some(generated), Some(oracle)) => {
+            let derived = case.build(crate::amf_pdus::transfer::initial_context_setup_request);
+            match (generated, derived) {
+                (Some(generated), Some(derived)) => {
                     assert!(
-                        generated == hand_written_ics_corrected(&oracle),
-                        "differs beyond IE order and NAS-PDU criticality: {}",
+                        generated == derived,
+                        "differs from the derivation: {}",
                         case.describe()
                     );
-                    if case.nas.is_none() && case.ambr.is_none() {
-                        assert!(generated == oracle, "not identical: {}", case.describe());
-                        identical += 1;
-                    }
                     // A NAS-PDU of ~16 KB fragments the outer initiatingMessage
-                    // length (X.691 §11.9.3.8; byte 3 is its first octet). Since
-                    // nextgsim #223 the generated encoder fragments it too, so
-                    // these are compared byte for byte like every other case.
-                    if oracle[3] >= 0xC0 {
+                    // length (X.691 §11.9.3.8; byte 3 is its first octet).
+                    if generated[3] >= 0xC0 {
                         fragmented += 1;
                     }
                     compared += 1;
                 }
                 (None, None) => refused += 1,
-                (generated, oracle) => panic!(
-                    "generated {} but hand-written {}: {}",
+                (generated, derived) => panic!(
+                    "generated {} but the derivation {}: {}",
                     if generated.is_some() {
                         "encoded"
                     } else {
                         "refused"
                     },
-                    if oracle.is_some() {
+                    if derived.is_some() {
                         "encoded"
                     } else {
                         "refused"
@@ -13026,58 +13001,64 @@ pub(crate) mod tests {
             }
         }
         assert!(
-            compared > 2000 && identical > 500 && refused > 0 && fragmented > 0,
-            "{compared}/{identical}/{refused}/{fragmented}"
+            compared > 2000 && refused > 0 && fragmented > 0,
+            "{compared}/{refused}/{fragmented}"
         );
     }
 
-    /// The two corrections themselves, on the production shape (NAS-PDU and UE
-    /// AMBR both present): the IE order and criticalities are the object set's,
-    /// and they are NOT the hand-written encoder's.
+    /// The production shape (NAS-PDU and UE AMBR both present), read back by
+    /// the generated decode: the IE order and criticalities are the object
+    /// set's. The hand-written encoder this replaced put the UE AMBR last.
     #[test]
     fn initial_context_setup_request_ie_order_and_criticality_are_the_object_sets() {
-        use nextgcore_asn1c::ngap::Criticality::{Ignore, Reject};
-        let case = ics_baseline();
-        let generated = case
+        let (reject, ignore) = (ngap_gen::Criticality::REJECT, ngap_gen::Criticality::IGNORE);
+        let generated = ics_baseline()
             .build(build_initial_context_setup_request_asn1)
             .expect("build");
         assert_eq!(
             raw_ies(&generated),
             vec![
-                (10, Reject),
-                (85, Reject),
-                (110, Reject),
-                (28, Reject),
-                (0, Reject),
-                (119, Reject),
-                (94, Reject),
-                (38, Ignore),
+                (10, reject),
+                (85, reject),
+                (110, reject),
+                (28, reject),
+                (0, reject),
+                (119, reject),
+                (94, reject),
+                (38, ignore),
             ]
         );
-        let oracle = case
-            .build(hand_written_initial_context_setup_request)
-            .expect("build");
         assert_eq!(
-            raw_ies(&oracle),
-            vec![
-                (10, Reject),
-                (85, Reject),
-                (28, Reject),
-                (0, Reject),
-                (119, Reject),
-                (94, Reject),
-                // NAS-PDU criticality is now the object set's (ignore) in the
-                // hand-written encoder too; only its IE order still deviates.
-                (38, Ignore),
-                (110, Reject),
-            ],
-            "the hand-written encoder's remaining deviation (UE AMBR order), pinned"
+            raw_ies(&generated)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            ICS_REQUEST_ORDER
         );
     }
 
-    /// Golden bytes for the production shape, so the generated encoder and the
-    /// corrected oracle cannot drift together. The key is the synthetic
+    /// The production shape worked out octet by octet, so the derivation is
+    /// pinned apart from the code that writes it. The key is the synthetic
     /// 0x00..0x1f, not a derived one.
+    /// - `00` initiatingMessage, `0e` procedure 14, `00` reject, `71` length
+    ///   113; `00` extension, `00 08` eight IEs;
+    /// - `00 0a 00 02 00 01`: AMF-UE-NGAP-ID 1 (n-1 = 0 in three bits, pad,
+    ///   one octet); `00 55 00 02 00 02`: RAN-UE-NGAP-ID 2;
+    /// - `00 6e 00 0a`: UE AMBR, extension and iE-Extensions `00`, DL 1e9 =
+    ///   `3b 9a ca 00` as extension `0` + n-1 = 3 `011` -> `0c`, then UL 5e8
+    ///   `1d cd 65 00` with its preamble `0 011` + pad -> `30`;
+    /// - `00 1c 00 07 00 99 f9 07 02 00 40`: GUAMI, extension and
+    ///   iE-Extensions `00` + pad, PLMN 999/70, then region 2 `00000010`, set 1
+    ///   `0000000001`, pointer 0 `000000` -> `02 00 40`;
+    /// - `00 00 00 05 02 01 01 02 03`: Allowed NSSAI, count-1 `000`, item
+    ///   `00`, S-NSSAI extension `0`, SD present `1`, `0` -> `0000 0010`; SST
+    ///   1 unaligned `01`; SD `01 02 03` aligned;
+    /// - `00 77 00 09 1c 00 0e 00 07 00 03 80 00`: UE Security Capabilities,
+    ///   `00` then four times size extension `0` + `1110 0000 0000 0000`
+    ///   (0xF0 and 0x70 alike: the null-algorithm bit dropped);
+    /// - `00 5e 00 20` + the 32 key octets, aligned, no length;
+    /// - `00 26 40 0b 0a` + the ten NAS octets: NAS-PDU ignore, the open type
+    ///   (11) holding the OCTET STRING length (10) and the octets.
     #[test]
     fn initial_context_setup_request_golden_bytes() {
         let generated = ics_baseline()
@@ -13085,6 +13066,10 @@ pub(crate) mod tests {
             .expect("build");
         let hex: String = generated.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, GOLDEN_ICS_REQUEST);
+        let derived = ics_baseline()
+            .build(crate::amf_pdus::transfer::initial_context_setup_request)
+            .expect("derive");
+        assert_eq!(derived, generated);
         // InitiatingMessage (CHOICE 0), procedure 14, criticality reject.
         assert_eq!(&generated[..3], &[0x00, 0x0e, 0x00]);
     }
@@ -13129,101 +13114,65 @@ pub(crate) mod tests {
         assert!(seen_key);
     }
 
-    /// An ICS Response or Failure with one more IE: `id`, `criticality`, a
-    /// one-octet value -- spliced with the hand-written PDU layer, so any
-    /// length form works.
+    /// An ICS Response or Failure with one more IE: `id`, `criticality` (0
+    /// reject, 1 ignore, 2 notify), a one-octet value `00` -- spliced along
+    /// the PDU's framing (`amf_pdus::transfer::split`/`join`), so any id
+    /// works, one the schema does not know included.
     pub(crate) fn ics_outcome_with_raw_ie(bytes: &[u8], id: u16, criticality: u8) -> Vec<u8> {
-        use nextgcore_asn1c::ngap::{
-            Criticality, NgapPdu, ProtocolIeField, ProtocolIeId, SuccessfulOutcomeValue,
-            UnsuccessfulOutcomeValue,
-        };
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
-        let mut pdu = NgapPdu::decode_aper(&mut AperDecoder::new(bytes)).expect("decode");
-        let container = match pdu {
-            NgapPdu::SuccessfulOutcome(ref mut m) => match m.value {
-                SuccessfulOutcomeValue::InitialContextSetupResponse(ref mut c) => c,
-                _ => panic!("ICS Response"),
-            },
-            NgapPdu::UnsuccessfulOutcome(ref mut m) => match m.value {
-                UnsuccessfulOutcomeValue::InitialContextSetupFailure(ref mut c) => c,
-                _ => panic!("ICS Failure"),
-            },
-            _ => panic!("an outcome"),
-        };
-        container.ies.push(ProtocolIeField {
-            id: ProtocolIeId(id),
-            criticality: match criticality {
-                0 => Criticality::Reject,
-                1 => Criticality::Ignore,
-                _ => Criticality::Notify,
-            },
-            value: vec![0x00],
-        });
-        let mut encoder = AperEncoder::new();
-        pdu.encode_aper(&mut encoder).expect("encode");
-        encoder.align();
-        encoder.into_bytes().to_vec()
+        use crate::amf_pdus::transfer::{join, split};
+        let mut pdu = split(bytes);
+        assert_eq!(pdu.1, 14, "an Initial Context Setup outcome");
+        pdu.3.push((id, criticality, vec![0x00]));
+        join(&pdu)
     }
 
-    /// `bytes` with every IE `id` removed, by the hand-written PDU layer.
+    /// `bytes` with every IE `id` removed, along the PDU's framing.
     pub(crate) fn ics_outcome_without_ie(bytes: &[u8], id: u16) -> Vec<u8> {
-        use nextgcore_asn1c::ngap::{NgapPdu, SuccessfulOutcomeValue, UnsuccessfulOutcomeValue};
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
-        let mut pdu = NgapPdu::decode_aper(&mut AperDecoder::new(bytes)).expect("decode");
-        match pdu {
-            NgapPdu::SuccessfulOutcome(ref mut m) => {
-                if let SuccessfulOutcomeValue::InitialContextSetupResponse(ref mut c) = m.value {
-                    c.ies.retain(|f| f.id.0 != id);
-                }
-            }
-            NgapPdu::UnsuccessfulOutcome(ref mut m) => {
-                if let UnsuccessfulOutcomeValue::InitialContextSetupFailure(ref mut c) = m.value {
-                    c.ies.retain(|f| f.id.0 != id);
-                }
-            }
-            _ => panic!("an outcome"),
-        }
-        let mut encoder = AperEncoder::new();
-        pdu.encode_aper(&mut encoder).expect("encode");
-        encoder.align();
-        encoder.into_bytes().to_vec()
+        use crate::amf_pdus::transfer::{join, split};
+        let mut pdu = split(bytes);
+        assert_eq!(pdu.1, 14, "an Initial Context Setup outcome");
+        pdu.3.retain(|(i, _, _)| *i != id);
+        join(&pdu)
     }
 
+    /// INITIAL CONTEXT SETUP RESPONSE, derived: [`crate::gnb_pdus`].
     pub(crate) fn ics_response_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
-        builder::build_initial_context_setup_response(
+        crate::gnb_pdus::initial_context_setup_response(
             &nextgcore_ngap::types::InitialContextSetupResponse {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
             },
         )
-        .expect("build ICS Response")
     }
 
+    /// INITIAL CONTEXT SETUP FAILURE (§9.2.2.3) with no session list, any
+    /// Cause: unsuccessfulOutcome, id-InitialContextSetup 14, reject; ids 10,
+    /// 85 and id 15 Cause, all ignore -- as `gnb_pdus` derives it, with the
+    /// Cause through `amf_pdus::transfer::cause`, which covers every value.
     pub(crate) fn ics_failure_pdu(
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         cause: Cause,
     ) -> Vec<u8> {
-        builder::build_initial_context_setup_failure(
-            &nextgcore_ngap::types::InitialContextSetupFailure {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id,
-                cause,
-            },
+        crate::aper_golden::pdu(
+            2,
+            14,
+            0,
+            &[
+                (10, 1, crate::aper_golden::amf_ue_ngap_id(amf_ue_ngap_id)),
+                (85, 1, crate::aper_golden::ran_ue_ngap_id(ran_ue_ngap_id)),
+                (15, 1, crate::amf_pdus::transfer::cause_value(&cause)),
+            ],
         )
-        .expect("build ICS Failure")
     }
 
-    /// #417 stage 7: every ICS Response the hand-written parser accepted decodes
-    /// to the same IDs under the generated codec, at every ID length.
+    /// Every derived ICS Response decodes to its IDs, at every ID length.
     #[test]
-    fn initial_context_setup_response_generated_decode_matches_hand_written() {
+    fn initial_context_setup_response_decodes_the_derived_octets() {
         let mut compared = 0;
         for &amf in &AMF_IDS[..AMF_IDS.len() - 1] {
             for &ran in &RAN_IDS {
                 let pdu = ics_response_pdu(amf, ran);
-                let old = hand_written_parse_initial_context_setup_response(&pdu);
-                assert_eq!(old, Some((amf, ran)));
                 assert_eq!(
                     decode_initial_context_setup_response_asn1(&pdu),
                     InitialContextSetupOutcomeDecode::Decoded {
@@ -13241,11 +13190,11 @@ pub(crate) mod tests {
         assert_eq!(compared, 88);
     }
 
-    /// #417 stage 7: every ICS Failure the hand-written parser accepted decodes
-    /// to the same IDs, and to the Cause it carries, for every cause group and
-    /// value the hand-written encoder can produce.
+    /// Every derived ICS Failure decodes to its IDs, and to the Cause it
+    /// carries as (group, the value's position in the schema's list), for
+    /// every cause group and value the AMF's `build_cause` can produce.
     #[test]
-    fn initial_context_setup_failure_generated_decode_matches_hand_written() {
+    fn initial_context_setup_failure_decodes_the_derived_octets() {
         let mut compared = 0;
         for group in 0..=4u8 {
             for value in 0..=50i64 {
@@ -13257,26 +13206,7 @@ pub(crate) mod tests {
                     (65_536, 256),
                 ] {
                     let pdu = ics_failure_pdu(amf, ran, cause);
-                    assert_eq!(
-                        hand_written_parse_initial_context_setup_failure(&pdu),
-                        Some((amf, ran))
-                    );
-                    let expected_cause = match parser::decode_ngap_pdu(&pdu) {
-                        Ok(NgapMessage::InitialContextSetupFailure(f)) => match f.cause {
-                            Cause::RadioNetwork(v) => {
-                                (crate::ngap_handler::cause_group::RADIO_NETWORK, v as i64)
-                            }
-                            Cause::Transport(v) => {
-                                (crate::ngap_handler::cause_group::TRANSPORT, v as i64)
-                            }
-                            Cause::Nas(v) => (crate::ngap_handler::cause_group::NAS, v as i64),
-                            Cause::Protocol(v) => {
-                                (crate::ngap_handler::cause_group::PROTOCOL, v as i64)
-                            }
-                            Cause::Misc(v) => (crate::ngap_handler::cause_group::MISC, v as i64),
-                        },
-                        other => panic!("hand-written parse: {other:?}"),
-                    };
+                    let expected_cause = crate::amf_pdus::transfer::cause_numbers(&cause);
                     assert_eq!(
                         decode_initial_context_setup_failure_asn1(&pdu),
                         InitialContextSetupOutcomeDecode::Decoded {
@@ -13327,17 +13257,6 @@ pub(crate) mod tests {
             ),
         ];
         for (pdu, decode, triggering_message, cause) in cases {
-            // The hand-written parsers, for the record: they refused the reject
-            // case (which comes to the same local handling) and accepted the
-            // other two, reporting nothing.
-            let old = |criticality| {
-                let spliced = ics_outcome_with_raw_ie(&pdu, 9999, criticality);
-                hand_written_parse_initial_context_setup_response(&spliced)
-                    .or(hand_written_parse_initial_context_setup_failure(&spliced))
-            };
-            assert_eq!(old(ngap_gen::Criticality::REJECT), None);
-            assert_eq!(old(ngap_gen::Criticality::IGNORE), Some((7, 9)));
-            assert_eq!(old(ngap_gen::Criticality::NOTIFY), Some((7, 9)));
             let decoded = |criticality| decode(&ics_outcome_with_raw_ie(&pdu, 9999, criticality));
             assert_eq!(
                 decoded(ngap_gen::Criticality::IGNORE),
@@ -13380,8 +13299,8 @@ pub(crate) mod tests {
     }
 
     /// Both IDs are criticality ignore (§10.3.5): a Response or Failure missing
-    /// one still decodes, with that ID `None`, where the hand-written parser
-    /// refused the message.
+    /// one still decodes, with that ID `None` (the hand-written parser refused
+    /// the message).
     #[test]
     fn initial_context_setup_outcomes_missing_ids_still_decode() {
         let response = ics_response_pdu(7, 9);
@@ -13391,14 +13310,12 @@ pub(crate) mod tests {
             (ngap_gen::ID_AMF_UE_NGAP_ID, None, Some(9)),
         ] {
             let r = ics_outcome_without_ie(&response, id);
-            assert_eq!(hand_written_parse_initial_context_setup_response(&r), None);
             assert!(matches!(
                 decode_initial_context_setup_response_asn1(&r),
                 InitialContextSetupOutcomeDecode::Decoded { amf_ue_ngap_id, ran_ue_ngap_id, .. }
                     if amf_ue_ngap_id == amf && ran_ue_ngap_id == ran
             ));
             let f = ics_outcome_without_ie(&failure, id);
-            assert_eq!(hand_written_parse_initial_context_setup_failure(&f), None);
             assert!(matches!(
                 decode_initial_context_setup_failure_asn1(&f),
                 InitialContextSetupOutcomeDecode::Decoded { amf_ue_ngap_id, ran_ue_ngap_id, .. }
