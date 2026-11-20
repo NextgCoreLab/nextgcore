@@ -4156,16 +4156,18 @@ mod tests {
         ];
         for (path, body, scope) in &calls {
             for types in [&["SCP"][..], &["SEPP"][..], &[][..]] {
+                // #2089: a typeless certificate alone is refused under both
+                // profiles: under production by #2065's shared rule (no
+                // identity, 403), under dev by the ECS's own typeless check
+                // (401). A relay's alone is 401 under both. #2162: the profile
+                // is read once, before the handler runs, so the expectation is
+                // the one for the profile the handler sees.
+                let production = nextgcore_sbi::owner_binding::identity_required();
                 let r = block_on(ees_sbi_request_handler(with_cert(
                     SbiRequest::post(*path).with_json_body(body).unwrap(),
                     types,
                 )));
-                // #2089: a typeless certificate alone is refused under both
-                // profiles: under production by #2065's shared rule (no
-                // identity, 403), under dev by the ECS's own typeless check
-                // (401). A relay's alone is 401 under both.
-                let want = if types.is_empty() && nextgcore_sbi::owner_binding::identity_required()
-                {
+                let want = if types.is_empty() && production {
                     403
                 } else {
                     401

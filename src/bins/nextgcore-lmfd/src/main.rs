@@ -5131,6 +5131,17 @@ mod tests {
         assert!(lmf_self().read().unwrap().ldr_find(reference).is_none());
     }
 
+    /// #2162: the exact refusal of a certificate naming no NF types and no
+    /// token under the `dev` profile (#2099's typeless check, `owner_binding`).
+    /// Production's sentence (#2065) is pinned in owner_binding's own tests,
+    /// which pass the profile explicitly.
+    fn typeless_reason_2162(want: &str) -> String {
+        format!(
+            "the requester's certificate names no NF types and it sent no access token, \
+             so it cannot be shown to be an {want}"
+        )
+    }
+
     /// **#2077** (R31 M1 on #2094): a LocationContextTransfer comes from the old
     /// LMF (TS 29.572 §5.2.2.5.2, TS 23.273 §6.4 step 6: LMF1 -> LMF2), and the
     /// caller must be shown to be an LMF (CONVENTIONS: the verified NF type).
@@ -5151,6 +5162,12 @@ mod tests {
     /// test's LMF is refused its own transfer).
     #[tokio::test]
     async fn a_location_context_transfer_needs_a_verified_lmf_2077() {
+        // #2162 (R42 on #2173): the profile is set at the start, not read: sibling tests
+        // set the Dev override concurrently (none sets production), so a
+        // reading taken here could differ from the handler's. Under dev the
+        // handler applies #2099's typeless check, whose exact sentence this
+        // pins; production's is pinned in owner_binding's tests.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         const DIRECT: &str = "dddddddd-2077-4000-8000-00000000000d";
@@ -5172,6 +5189,7 @@ mod tests {
             req.oauth2_subject = token.map(str::to_string);
             req
         };
+        let typeless_reason = typeless_reason_2162("LMF");
         for (what, req, expect) in [
             (
                 "token only",
@@ -5186,10 +5204,7 @@ mod tests {
             (
                 "typeless",
                 with("x2077-3", Some((DIRECT, &[])), None),
-                // #2089: under production #2065 refuses it as no identity
-                // ("names no NF type (RFC 9310 NFTypes)"), under dev the type
-                // check does ("names no NF types"); refused either way.
-                "names no NF type",
+                typeless_reason.as_str(),
             ),
             (
                 "GMLC",
