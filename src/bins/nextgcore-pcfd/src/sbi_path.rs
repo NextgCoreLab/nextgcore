@@ -973,9 +973,17 @@ pub fn pcf_sbi_send_af_smpolicycontrol_update_notify(sess_id: u64) -> bool {
 }
 
 /// Send SM policy control delete notify to the SMF over HTTP: an update
-/// notification removing the PCC rules installed for the app session
-/// (TS 29.512 — a null PCC-rule entry means removal).
-pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: u64) -> bool {
+/// notification removing what a deleted app session installed (TS 29.514
+/// §4.2.4.2; TS 29.512 §4.2.6.1, a null map entry means removal), built by
+/// [`crate::npcf_handler::build_af_removal_notification`].
+///
+/// #2221 (R47): before, this sent a null for `PccRule-app-<id>`, a rule id no
+/// path installs, so the SMF kept the deleted app session's rules.
+pub fn pcf_sbi_send_smpolicycontrol_delete_notify(
+    sess_id: u64,
+    removed: &[crate::npcf_handler::AfPccRule],
+    qm_id: Option<&str>,
+) -> bool {
     let sess = crate::context::pcf_self()
         .read()
         .ok()
@@ -988,11 +996,11 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
         log::warn!("[sess_id={sess_id}] SM policy delete notify: no notification URI stored");
         return false;
     };
-    let rule_id = format!("PccRule-app-{app_session_id}");
-    let body = serde_json::json!({
-        "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
-        "smPolicyDecision": { "pccRules": { rule_id: null } },
-    });
+    let mut body = crate::npcf_handler::build_af_removal_notification(&sess, removed, qm_id);
+    body["resourceUri"] = serde_json::json!(pcf_resource_uri(&format!(
+        "/npcf-smpolicycontrol/v1/sm-policies/{}",
+        sess.sm_policy_id
+    )));
     spawn_notification(uri, "/update", body, "SM policy delete")
 }
 
@@ -1344,6 +1352,13 @@ fn record_terminate_for_test(app: &crate::context::PcfApp) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((app.app_session_id.clone(), still_present));
+}
+
+/// #2221: send an AF `EventsNotification` already built (`body`, TS 29.514
+/// §4.2.5) to `uri` + `/notify`, as [`pcf_sbi_send_policyauthorization_events_notify`]
+/// sends the ones that carry only events.
+pub fn pcf_sbi_send_af_events_notification(uri: String, body: serde_json::Value) -> bool {
+    spawn_notification(uri, "/notify", body, "AF QoS monitoring")
 }
 
 /// POST an `EventsNotification` to the AF for `app_id` (TS 29.514 §4.2.6:

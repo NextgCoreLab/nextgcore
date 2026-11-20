@@ -3344,6 +3344,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-nas",
  "nextgcore-ngap-gen",
+ "nextgcore-pcfd",
  "nextgcore-pfcp",
  "nextgcore-sbi",
  "nextgcore-sgwcd",

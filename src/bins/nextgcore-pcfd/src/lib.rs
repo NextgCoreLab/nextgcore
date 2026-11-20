@@ -43,6 +43,7 @@ pub mod npcf_handler;
 pub mod nudr_handler;
 pub mod pcf_sm;
 pub mod policy_data_sub; // #1458: the UDR policy-data subscription maintainer
+pub mod qos_mon; // #2221: the authorised QoS monitoring policy (qosMonDecs / refQosMon)
 pub mod sbi_path;
 /// #1402: the operator setting `pcf.policy.session_ambr_cap`.
 pub mod session_ambr_cap;

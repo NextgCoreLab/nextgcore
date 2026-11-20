@@ -1268,13 +1268,21 @@ const AM_FEATURE_UE_AMBR_AUTHORIZATION: u64 = 1 << 2;
 /// [`handle_pcscf_restoration`] signals with `pcscfRestIndication`.
 /// #1541: plus VPLMN-QoS-Control (feature 49), which bounds the decision by the
 /// SMF's `vplmnQos` ([`crate::vplmn_qos`]).
-const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 =
-    0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT | crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL;
+/// #2221: plus QosMonitoring (feature 24), the `qosMonDecs` / `refQosMon` of
+/// [`crate::qos_mon`]. PacketDelayFailureReport (feature 73) is past 64 bits and
+/// negotiated on its own ([`negotiate_sm_features`]).
+const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3
+    | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT
+    | crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL
+    | crate::qos_mon::SM_FEATURE_QOS_MONITORING;
 /// TS 29.512 Table 5.8-1 feature 9, PCSCF-Restoration-Enhancement: bit 8, since
 /// feature 1 is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
 pub(crate) const SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT: u64 = 1 << 8;
-/// PolicyAuthorization (TS 29.514): no optional features negotiated → "0".
-const PCF_PA_SUPPORTED_FEATURES: u64 = 0x0;
+/// PolicyAuthorization (TS 29.514 §5.8). #2221: QoSMonitoring (feature 16) and
+/// PacketDelayFailureReport (feature 44), the AF session level QoS monitoring
+/// subscription of [`crate::qos_mon`]; nothing else.
+const PCF_PA_SUPPORTED_FEATURES: u64 = crate::qos_mon::PA_FEATURE_QOS_MONITORING
+    | crate::qos_mon::PA_FEATURE_PACKET_DELAY_FAILURE_REPORT;
 /// UEPolicyControl (TS 29.525 §5.8): no optional features negotiated -> "0".
 const PCF_UE_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 
@@ -1285,6 +1293,26 @@ const PCF_UE_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 /// that omits `suppFeat` still gets a conformant, working feature set.
 fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
     format!("{:x}", negotiated_feature_bits(consumer_hex, supported))
+}
+
+/// The SM policy `suppFeat` answered to `consumer_hex` (#2221): the 64-bit
+/// negotiation, plus PacketDelayFailureReport (feature 73) when the SMF offers it
+/// together with QosMonitoring, which it qualifies (TS 29.512 Table 5.8-1).
+/// Returns the string and whether 73 was negotiated.
+fn negotiate_sm_features(consumer_hex: Option<&str>) -> (String, bool) {
+    let bits = negotiated_feature_bits(consumer_hex, PCF_SM_POLICY_SUPPORTED_FEATURES);
+    let pdfr = bits & crate::qos_mon::SM_FEATURE_QOS_MONITORING != 0
+        && crate::qos_mon::has_feature(
+            consumer_hex,
+            crate::qos_mon::SM_FEATURE_NUMBER_PACKET_DELAY_FAILURE_REPORT,
+        );
+    let hex = format!("{bits:x}");
+    if pdfr {
+        let n = crate::qos_mon::SM_FEATURE_NUMBER_PACKET_DELAY_FAILURE_REPORT;
+        (crate::qos_mon::with_feature(&hex, n), true)
+    } else {
+        (hex, false)
+    }
 }
 
 /// [`negotiate_features`] as the bitmask, for a session that keeps what it
@@ -3526,6 +3554,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 policy_data.get("suppFeat").and_then(|v| v.as_str()),
                 PCF_SM_POLICY_SUPPORTED_FEATURES,
             );
+            sess.sm_packet_delay_failure_report =
+                negotiate_sm_features(policy_data.get("suppFeat").and_then(|v| v.as_str())).1;
             sess.vplmn_qos = vplmn_qos.clone();
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
@@ -3658,6 +3688,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     stored.policy_dnn_data = udr_dnn_data.clone();
                     // #1383: what a re-evaluation falls back to when its DB read fails.
                     stored.authorised_session_data = session_data.clone();
+                    // #2221: restated when a QoS monitoring policy adds QOS_MONITORING.
+                    stored.policy_triggers = decision.triggers.clone();
                     ctx.sess_update(&stored);
                 }
             }
@@ -3679,10 +3711,9 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     "policyCtrlReqTriggers": decision.triggers,
                     // TS 29.512 §5.8: negotiated (consumer ∩ producer) features,
                     // not an echo of the SMF-requested value (pcfd-05).
-                    "suppFeat": negotiate_features(
+                    "suppFeat": negotiate_sm_features(
                         policy_data.get("suppFeat").and_then(|v| v.as_str()),
-                        PCF_SM_POLICY_SUPPORTED_FEATURES,
-                    ),
+                    ).0,
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -3796,7 +3827,15 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str, request: &SbiRequest) -> S
                         "qosDecs": decision.qos_decs,
                         "chgDecs": decision.chg_decs,
                         "traffContDecs": decision.traff_cont_decs,
-                        "policyCtrlReqTriggers": decision.triggers,
+                        // #2221: and QOS_MONITORING while a QoS monitoring
+                        // policy is in force (`build_af_sm_policy_notification`).
+                        "policyCtrlReqTriggers": if sess.af_qos_mon.is_empty() {
+                            decision.triggers
+                        } else {
+                            let mut t = decision.triggers;
+                            t.push("QOS_MONITORING".to_string());
+                            t
+                        },
                     },
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -4393,6 +4432,35 @@ pub async fn handle_sm_policy_update_notify(
                 triggers,
                 sess.psi
             );
+
+            // #2221: TS 29.512 §4.2.4.24, the SMF reporting QoS monitoring results.
+            // They go on to the AFs whose policy they are for (TS 29.514 §4.2.5.14).
+            // An update that reports nothing else is answered with an empty
+            // decision: the reports change no policy, and the SMF applies the
+            // answer as a delta (§4.2.6.1).
+            if triggers.iter().any(|t| t == "QOS_MONITORING") {
+                let reports: Vec<serde_json::Value> = update_data
+                    .get("qosMonReports")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let sent = forward_qos_mon_reports(&sess, &reports);
+                log::info!(
+                    "QOS_MONITORING for smPolicyId={sm_policy_id}: {} report(s), {sent} AF \
+                     notification(s)",
+                    reports.len()
+                );
+                let only_reports = triggers.iter().all(|t| t == "QOS_MONITORING")
+                    && update_data.as_object().is_some_and(|o| {
+                        o.keys()
+                            .all(|k| k == "repPolicyCtrlReqTriggers" || k == "qosMonReports")
+                    });
+                if only_reports {
+                    return SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({}))
+                        .unwrap_or_else(|_| SbiResponse::with_status(200));
+                }
+            }
 
             // TS 29.513 §6: the BSF binding advertises this session's UE IP, so a
             // change has to reach it (Nbsf_Management_Update) or an AF-influenced
@@ -5212,6 +5280,11 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         Ok(a) => a,
         Err(resp) => return *resp,
     };
+    // #2221: an `evSubsc` creates the events subscription with the app session
+    // (TS 29.514 §4.2.2.2), so it is held to what the sub-resource's PUT is.
+    if let Some(refused) = req_root.get("evSubsc").and_then(refuse_events_subsc) {
+        return refused;
+    }
 
     // Bind the AF session to the PCC session via the UE address so AF-triggered
     // PCC rule changes can be pushed to the SMF. TS 29.514 §4.2.2.2: when the
@@ -5231,6 +5304,12 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
             let mut app = app0;
             app.notif_uri = notif_uri.clone();
             app.owner = owner.clone();
+            // #2221: what the AF may be sent, and what it subscribed to.
+            app.pa_features = negotiated_feature_bits(
+                req_root.get("suppFeat").and_then(|v| v.as_str()),
+                PCF_PA_SUPPORTED_FEATURES,
+            );
+            app.events_subsc = req_root.get("evSubsc").filter(|v| v.is_object()).cloned();
             context.app_update(&app);
             app
         })
@@ -5274,14 +5353,17 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         // AF media components → PCC rules persisted on the bound session and
         // pushed to the SMF in an SM policy update notify (TS 29.514 §4.2.2.2).
         if let Some(ref sess) = bound_sess {
-            let new_rules = media_components_to_pcc(&asc, sess);
+            let new_rules = media_components_to_pcc(&asc, sess, app.id);
             let installed = new_rules.len();
+            let rule_ids: Vec<String> = new_rules.iter().map(|r| r.pcc_rule_id.clone()).collect();
             if let Ok(context) = ctx.read() {
                 if let Some(mut latest) = context.sess_find_by_id(sess.id) {
                     merge_af_pcc_rules(&mut latest, new_rules);
                     context.sess_update(&latest);
                 }
             }
+            record_app_pcc_rules(app.id, rule_ids);
+            refresh_af_qos_mon(app.id);
             pcf_sbi_send_af_smpolicycontrol_update_notify(sess.id);
             log::info!(
                 "App session create installed {installed} AF PCC rule(s) on sess_id={}",
@@ -5363,6 +5445,171 @@ async fn route_policy_authorization(
 /// PCF can actually observe, and reporting the second as the first would tell an
 /// IMS AF a bearer exists that does not. Delivery is skipped when the AF did not
 /// subscribe to the event.
+/// A `400` for an `EventsSubscReqData` the PCF cannot hold (TS 29.514 §5.6.2.6):
+/// `events` is required with at least one entry, and each `AfEventSubscription`
+/// requires `event`. A subscription naming no event would be stored and then
+/// never match anything.
+fn refuse_events_subsc(body: &serde_json::Value) -> Option<SbiResponse> {
+    let events_ok = body
+        .get("events")
+        .and_then(|v| v.as_array())
+        .is_some_and(|list| {
+            !list.is_empty()
+                && list
+                    .iter()
+                    .all(|e| e.get("event").and_then(|v| v.as_str()).is_some())
+        });
+    (!events_ok).then(|| {
+        send_bad_request(
+            "EventsSubscReqData.events must carry at least one entry with an `event`",
+            Some("MANDATORY_IE_MISSING"),
+        )
+    })
+}
+
+/// #2221: add `rule_ids` to the PCC rules app session `app_id` installed.
+fn record_app_pcc_rules(app_id: u64, rule_ids: Vec<String>) {
+    if let Ok(context) = pcf_self().read() {
+        if let Some(mut app) = context.app_find_by_id(app_id) {
+            for id in rule_ids {
+                if !app.pcc_rule_ids.contains(&id) {
+                    app.pcc_rule_ids.push(id);
+                }
+            }
+            context.app_update(&app);
+        }
+    }
+}
+
+/// #2221: the QoS monitoring policy app session `app` asks for on `sess`
+/// (TS 23.503 §6.1.3.21, TS 29.514 §4.2.2.23.1): its QOS_MONITORING events
+/// subscription as a `QosMonitoringData` referenced from its PCC rules, when
+/// QosMonitoring is negotiated with both the AF and the SMF.
+fn af_qos_mon_for(
+    app: &crate::context::PcfApp,
+    sess: &PcfSess,
+) -> Option<crate::qos_mon::AfQosMon> {
+    let subsc = app.events_subsc.as_ref()?;
+    let qm_id = crate::qos_mon::qm_id_for(&app.app_session_id);
+    let pdfr = app.pa_features & crate::qos_mon::PA_FEATURE_PACKET_DELAY_FAILURE_REPORT != 0
+        && sess.sm_packet_delay_failure_report;
+    let data = crate::qos_mon::policy_from_subscription(&qm_id, subsc, pdfr)?;
+    let why_not = if app.pa_features & crate::qos_mon::PA_FEATURE_QOS_MONITORING == 0 {
+        Some("the AF did not negotiate QoSMonitoring (TS 29.514 feature 16)")
+    } else if sess.smpolicycontrol_features & crate::qos_mon::SM_FEATURE_QOS_MONITORING == 0 {
+        Some("the SMF did not negotiate QosMonitoring (TS 29.512 feature 24)")
+    } else if app.pcc_rule_ids.is_empty() {
+        Some("the app session installed no PCC rule to reference it from")
+    } else {
+        None
+    };
+    if let Some(why) = why_not {
+        log::warn!(
+            "App session {}: QoS monitoring is not authorised: {why}",
+            app.app_session_id
+        );
+        return None;
+    }
+    Some(crate::qos_mon::AfQosMon {
+        qm_id,
+        data,
+        app_session_id: app.app_session_id.clone(),
+        pcc_rule_ids: app.pcc_rule_ids.clone(),
+    })
+}
+
+/// #2221: bring app session `app_id`'s QoS monitoring policy on its PDU session
+/// in line with its subscription. Returns whether it changed, which is when the
+/// SMF has to be told.
+fn refresh_af_qos_mon(app_id: u64) -> bool {
+    let ctx = pcf_self();
+    let Ok(context) = ctx.read() else {
+        return false;
+    };
+    let Some(app) = context.app_find_by_id(app_id) else {
+        return false;
+    };
+    let Some(mut sess) = context.sess_find_by_id(app.sess_id) else {
+        return false;
+    };
+    let before = sess.af_qos_mon.clone();
+    sess.af_qos_mon
+        .retain(|q| q.app_session_id != app.app_session_id);
+    if let Some(q) = af_qos_mon_for(&app, &sess) {
+        sess.af_qos_mon.push(q);
+        sess.qos_mon_provisioned = true;
+    }
+    let changed = sess.af_qos_mon != before;
+    if changed {
+        context.sess_update(&sess);
+    }
+    changed
+}
+
+/// #2221 (R47): remove what app session `app` installed on its PDU session: its
+/// PCC rules (TS 29.514 §4.2.4.2) and its QoS monitoring policy. Returns the
+/// removed rules and the removed instance's `qmId`, for the SMF to be told.
+fn remove_app_policy(
+    app: &crate::context::PcfApp,
+) -> (Vec<npcf_handler::AfPccRule>, Option<String>) {
+    let ctx = pcf_self();
+    let Ok(context) = ctx.read() else {
+        return (Vec::new(), None);
+    };
+    let Some(mut sess) = context.sess_find_by_id(app.sess_id) else {
+        return (Vec::new(), None);
+    };
+    let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut sess.af_pcc_rules)
+        .into_iter()
+        .partition(|r| app.pcc_rule_ids.contains(&r.pcc_rule_id));
+    sess.af_pcc_rules = kept;
+    let qm_id = sess
+        .af_qos_mon
+        .iter()
+        .find(|q| q.app_session_id == app.app_session_id)
+        .map(|q| q.qm_id.clone());
+    sess.af_qos_mon
+        .retain(|q| q.app_session_id != app.app_session_id);
+    if !removed.is_empty() || qm_id.is_some() {
+        context.sess_update(&sess);
+    }
+    (removed, qm_id)
+}
+
+/// #2221: the SMF's QoS monitoring reports (TS 29.512 §4.2.4.24, `qosMonReports`
+/// with QOS_MONITORING) for `sess`, sent on to each app session whose policy they
+/// are for and whose AF subscribed to QOS_MONITORING (TS 29.514 §4.2.5.14).
+/// Returns how many AF notifications were sent.
+fn forward_qos_mon_reports(sess: &PcfSess, reports: &[serde_json::Value]) -> usize {
+    let mut sent = 0;
+    for q in &sess.af_qos_mon {
+        let app = pcf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.app_find_by_app_session_id(&q.app_session_id));
+        let Some(app) = app.filter(|a| a.subscribed_to("QOS_MONITORING")) else {
+            continue;
+        };
+        let pdfr = app.pa_features & crate::qos_mon::PA_FEATURE_PACKET_DELAY_FAILURE_REPORT != 0;
+        let af = crate::qos_mon::af_reports(reports, &q.pcc_rule_ids, pdfr);
+        if af.is_empty() {
+            continue;
+        }
+        let Some(uri) = app.events_notif_uri() else {
+            log::warn!(
+                "App session {}: a QoS monitoring report, but no notification URI",
+                app.app_session_id
+            );
+            continue;
+        };
+        let body = crate::qos_mon::af_notification(&app.app_session_id, &af);
+        if sbi_path::pcf_sbi_send_af_events_notification(uri, body) {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 fn notify_af_resource_allocation(app_id: u64, installed: bool) {
     let event = if installed {
         "SUCCESSFUL_RESOURCE_ALLOCATION"
@@ -5394,20 +5641,8 @@ pub async fn handle_events_subscription_put(
     // EventsSubscReqData requires `events` with minItems 1, and each
     // AfEventSubscription requires `event` — a subscription naming no event
     // would be stored and then never match anything.
-    let events_ok = body
-        .get("events")
-        .and_then(|v| v.as_array())
-        .is_some_and(|list| {
-            !list.is_empty()
-                && list
-                    .iter()
-                    .all(|e| e.get("event").and_then(|v| v.as_str()).is_some())
-        });
-    if !events_ok {
-        return send_bad_request(
-            "EventsSubscReqData.events must carry at least one entry with an `event`",
-            Some("MANDATORY_IE_MISSING"),
-        );
+    if let Some(refused) = refuse_events_subsc(&body) {
+        return refused;
     }
 
     let ctx = pcf_self();
@@ -5433,6 +5668,10 @@ pub async fn handle_events_subscription_put(
     app.events_subsc = Some(body.clone());
     if let Ok(context) = ctx.read() {
         context.app_update(&app);
+    }
+    // #2221: a QOS_MONITORING subscription is the PCF's QoS monitoring policy.
+    if refresh_af_qos_mon(app.id) {
+        pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
     }
     let location =
         format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/events-subscription");
@@ -5471,6 +5710,10 @@ pub async fn handle_events_subscription_delete(
             app.events_subsc = None;
             if let Ok(context) = ctx.read() {
                 context.app_update(&app);
+            }
+            // #2221: and its QoS monitoring policy is withdrawn.
+            if refresh_af_qos_mon(app.id) {
+                pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
             }
             SbiResponse::with_status(204)
         }
@@ -5884,7 +6127,12 @@ pub async fn handle_app_session_delete(app_session_id: &str, request: &SbiReques
         Some(app) => {
             // Removing AF media components revokes their PCC rules at the
             // SMF: push the SM policy delete/update notification.
-            pcf_sbi_send_smpolicycontrol_delete_notify(app.sess_id, app.id);
+            // #2221 (R47): its PCC rules and QoS monitoring policy are removed
+            // from the session and, in one decision, from the SMF.
+            let (removed, qm_id) = remove_app_policy(&app);
+            if !removed.is_empty() || qm_id.is_some() {
+                pcf_sbi_send_smpolicycontrol_delete_notify(app.sess_id, &removed, qm_id.as_deref());
+            }
             if let Ok(context) = ctx.read() {
                 context.app_remove(app.id);
             }
@@ -5921,6 +6169,15 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
     // either the nested `ascReqData` or the flat form.
     let req_root = modify_data.get("ascReqData").unwrap_or(&modify_data);
     let asc = parse_asc_req_data(req_root);
+    // #2221: `evSubsc` (EventsSubscReqDataRm) replaces the events subscription,
+    // and `null` removes it (TS 29.514 §4.2.3.2).
+    if let Some(refused) = req_root
+        .get("evSubsc")
+        .filter(|v| !v.is_null())
+        .and_then(refuse_events_subsc)
+    {
+        return refused;
+    }
 
     let ctx = pcf_self();
     let app = if let Ok(context) = ctx.read() {
@@ -5959,24 +6216,37 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
                 );
             }
 
+            if let Some(ev) = req_root.get("evSubsc") {
+                if let Ok(context) = ctx.read() {
+                    if let Some(mut latest) = context.app_find_by_id(app.id) {
+                        latest.events_subsc = ev.is_object().then(|| ev.clone());
+                        context.app_update(&latest);
+                    }
+                }
+            }
             if !asc.med_components.is_empty() {
                 // Re-derive the AF PCC rules and push them to the SMF.
                 let mut installed = 0usize;
+                let mut rule_ids = Vec::new();
                 if let Ok(context) = ctx.read() {
                     if let Some(mut sess) = context.sess_find_by_id(app.sess_id) {
-                        let new_rules = media_components_to_pcc(&asc, &sess);
+                        let new_rules = media_components_to_pcc(&asc, &sess, app.id);
                         installed = new_rules.len();
+                        rule_ids = new_rules.iter().map(|r| r.pcc_rule_id.clone()).collect();
                         merge_af_pcc_rules(&mut sess, new_rules);
                         context.sess_update(&sess);
                     }
                 }
+                record_app_pcc_rules(app.id, rule_ids);
+                refresh_af_qos_mon(app.id);
                 pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
                 log::info!(
                     "App session modify updated {installed} AF PCC rule(s) on sess_id={}",
                     app.sess_id
                 );
                 notify_af_resource_allocation(app.id, installed > 0);
-            } else if carries_tsc {
+            } else if refresh_af_qos_mon(app.id) || carries_tsc {
+                // #2221: an `evSubsc` alone changes the QoS monitoring policy.
                 pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
             }
 
@@ -17458,3 +17728,7 @@ mod sbi_profile_tests_1795 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "qos_mon_app_tests.rs"]
+mod qos_mon_app_tests;

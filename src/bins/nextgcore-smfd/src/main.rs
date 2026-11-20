@@ -37437,6 +37437,187 @@ mod tests {
         drop(upf);
     }
 
+    /// #2221: this SMF against the REAL pcfd (its router over HTTP, its process
+    /// context), end to end:
+    /// - the create, through this SMF's PCF client, negotiates QosMonitoring (24)
+    ///   and PacketDelayFailureReport (73);
+    /// - an AF app session subscribing to QOS_MONITORING (TS 29.514 §4.2.2.23.1)
+    ///   has pcfd notify `qosMonDecs` / `refQosMon` / QOS_MONITORING, which this
+    ///   SMF installs as the PSA's SRR (IE 242);
+    /// - the PSA's report goes to pcfd as `qosMonReports` (TS 29.512 §4.2.4.24)
+    ///   and from pcfd to the AF (TS 29.514 §4.2.5.14).
+    ///
+    /// One hop is bridged: pcfd's UpdateNotify is recorded at the notification URI
+    /// and handed to [`handle_sm_policy_notify`], which the tokened callback route
+    /// dispatches to, because the token is minted by the PDU session create this
+    /// test does not run.
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn this_smf_and_the_real_pcfd_carry_an_af_s_qos_monitoring_end_to_end_2221() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        let _pcf_ctx = nextgcore_pcfd::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
+        nextgcore_pcfd::test_support::init_context();
+        let supi = "imsi-001010000022211";
+        let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, false).await;
+
+        // The real pcfd, and a recorder standing in for this SMF's callback and the AF.
+        let (pcfd, pcfd_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|req: SbiRequest| async move {
+                nextgcore_pcfd::app::pcf_sbi_request_handler(req).await
+            })
+            .await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        let sink = seen.clone();
+        let (rec, rec_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    sink.lock().unwrap().push((req.header.uri.clone(), body));
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let taken = |suffix: &'static str| {
+            let seen = seen.clone();
+            async move {
+                for _ in 0..300 {
+                    let hit = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(u, _)| u.ends_with(suffix))
+                        .map(|(_, b)| b.clone());
+                    if let Some(b) = hit {
+                        seen.lock().unwrap().clear();
+                        return b;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("nothing POSTed to *{suffix}");
+            }
+        };
+        let pcf = policy::PcfEndpoint {
+            host: "127.0.0.1".into(),
+            port: pcfd_addr.port(),
+            nf_instance_id: None,
+            nf_set_ids: Vec::new(),
+        };
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", pcfd_addr.port()));
+
+        // Npcf_SMPolicyControl_Create through this SMF's client.
+        let notification_uri = format!("http://127.0.0.1:{}/smf-cb", rec_addr.port());
+        let decision = policy::sm_policy_create(
+            &pcf,
+            &policy::SmPolicyCreateContext {
+                supi,
+                psi: 5,
+                pdu_session_type: 1,
+                dnn: "internet",
+                sst: 1,
+                sd: None,
+                ue_ipv4: [10, 45, 22, 11],
+                notification_uri: &notification_uri,
+                subs_sess_ambr: None,
+                origination_timestamp: None,
+            },
+        )
+        .await
+        .expect("the real pcfd authorises the session");
+        assert_eq!(
+            decision.qos_mon.packet_delay_failure_report,
+            Some(true),
+            "73 negotiated"
+        );
+        pcc_qos_mon::apply(&reference, &decision.qos_mon);
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.sm_policy_id = Some(decision.sm_policy_id.clone());
+            }
+        }
+
+        // The AF subscribes; pcfd's UpdateNotify reaches this SMF.
+        let resp = nextgcore_pcfd::app::pcf_sbi_request_handler(
+            SbiRequest::post("/npcf-policyauthorization/v1/app-sessions")
+                .with_json_body(&serde_json::json!({
+                    "notifUri": format!("http://127.0.0.1:{}/af", rec_addr.port()),
+                    "suppFeat": "8000",
+                    "ueIpv4": "10.45.22.11",
+                    "medComponents": { "1": {
+                        "medCompN": 1,
+                        "medType": "AUDIO",
+                        "marBwDl": "256 Kbps",
+                        "marBwUl": "128 Kbps",
+                        "medSubComps": { "1": { "fNum": 1, "fDescs": ["permit out ip from any to assigned"] } },
+                    }},
+                    "evSubsc": {
+                        "events": [{ "event": "QOS_MONITORING", "notifMethod": "PERIODIC", "repPeriod": 4 }],
+                        "reqQosMonParams": ["DOWNLINK", "UPLINK", "ROUND_TRIP"],
+                    },
+                }))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let notify = taken("/smf-cb/update").await;
+        let request = SbiRequest::post("/").with_body(
+            notify.to_string(),
+            nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+        );
+        assert_eq!(
+            handle_sm_policy_notify(&reference, &request).await.status,
+            204
+        );
+        wait_until(|| !qos_mon::srr_ids(&reference).is_empty()).await;
+
+        // The PSA reports; the AF is told.
+        let srr_id = qos_mon::srr_ids(&reference)[0];
+        let m = nextgcore_pfcp::qos_monitoring::QosMonitoringMeasurement {
+            downlink_packet_delay: Some(13),
+            uplink_packet_delay: Some(14),
+            round_trip_packet_delay: Some(27),
+            ..Default::default()
+        };
+        let seid = smf_n4_seid_for(&reference);
+        qos_mon::on_session_report(seid, &qos_mon::tests::sesr_body(srr_id, m)).await;
+        let af = taken("/af/notify").await;
+        assert_eq!(af["evNotifs"][0]["event"], "QOS_MONITORING");
+        assert_eq!(
+            af["qosMonReports"],
+            serde_json::json!([{ "flows": [{ "medCompN": 1 }], "ulDelays": [14], "dlDelays": [13], "rtDelays": [27] }])
+        );
+
+        std::env::remove_var("PCF_URI");
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        qos_mon::forget(&reference);
+        forget_seeded_session(&reference);
+        pcc_qos_mon::clear_for_test();
+        pcfd.stop().await.ok();
+        rec.stop().await.ok();
+        amf.stop().await.ok();
+        drop(upf);
+    }
+
     /// #2208: the PCF's QoS monitoring policy in the create answer (TS 29.512
     /// §4.2.3.25.1: "together with the PCC rule") is held for the session, and the
     /// SRR is installed at the PSA once the user plane is active, as a QOS_MON
