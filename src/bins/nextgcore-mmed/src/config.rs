@@ -194,11 +194,24 @@ struct MmeYaml {
 /// config cannot take the daemon down. The warning names the file, because the
 /// previous silence is what let this go unnoticed.
 pub fn load_config(ctx: &mut MmeContext, path: &str) -> bool {
+    load_config_checked(ctx, path).unwrap_or_else(|why| {
+        log::error!("{why}");
+        true
+    })
+}
+
+/// [`load_config`], refusing the one outcome its fail-soft contract must not
+/// cover (#2115, R41 on #2127): a file whose `mme.gummei` entries were ALL
+/// dropped, a malformed PLMN among the reasons. The MME would start serving no
+/// GUMMEI and answer every S1 Setup with S1 Setup Failure (TS 36.413
+/// §8.7.3.4). `Err` fails start-up; a file that names no GUMMEI at all is
+/// still accepted, as before.
+pub fn load_config_checked(ctx: &mut MmeContext, path: &str) -> Result<bool, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) => {
             log::warn!("Could not read config file '{path}': {e}. Using defaults.");
-            return false;
+            return Ok(false);
         }
     };
 
@@ -206,21 +219,30 @@ pub fn load_config(ctx: &mut MmeContext, path: &str) -> bool {
         Ok(yaml) => yaml,
         Err(e) => {
             log::warn!("Failed to parse YAML config '{path}': {e}. Using defaults.");
-            return false;
+            return Ok(false);
         }
     };
 
     let Some(mme) = yaml.mme else {
         log::warn!("Config '{path}' has no 'mme' section. Using defaults.");
-        return false;
+        return Ok(false);
     };
 
-    apply(ctx, mme);
+    let dropped_gummei = apply(ctx, mme);
+    if dropped_gummei > 0 && ctx.served_gummei.is_empty() {
+        return Err(format!(
+            "{path}: all {dropped_gummei} mme.gummei entries were refused (no usable PLMN), so \
+             the MME would serve no GUMMEI and fail every S1 Setup (TS 36.413 §8.7.3.4)"
+        ));
+    }
     log::info!("Configuration loaded from {path}");
-    true
+    Ok(true)
 }
 
-fn apply(ctx: &mut MmeContext, mme: MmeSection) {
+/// Apply `mme` to `ctx`. Returns how many GUMMEI entries were dropped for
+/// having no usable PLMN (#2115).
+fn apply(ctx: &mut MmeContext, mme: MmeSection) -> usize {
+    let mut dropped_gummei = 0usize;
     if let Some(name) = mme.mme_name {
         log::info!("MME name: {name}");
         ctx.mme_name = Some(name);
@@ -401,9 +423,9 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
 
     // Served GUMMEI. Without at least one of these the MME rejects every S1
     // Setup (TS 36.413 §8.7.3.4), which is the headline defect in #157.
-    for entry in mme.gummei.unwrap_or_default() {
-        let Some(plmn_id) = entry.plmn_id.and_then(resolve_plmn_id) else {
-            log::warn!("Ignoring GUMMEI entry with no usable plmn_id");
+    for (index, entry) in mme.gummei.unwrap_or_default().into_iter().enumerate() {
+        let Some(plmn_id) = usable_plmn_id(&format!("mme.gummei[{index}]"), entry.plmn_id) else {
+            dropped_gummei += 1;
             continue;
         };
         let mme_gid = entry.mme_gid.unwrap_or(0);
@@ -425,9 +447,8 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
 
     // Served TAI, as a TAI0 list (one PLMN, a list of TACs) which is what
     // `find_served_tai` matches against.
-    for entry in mme.tai.unwrap_or_default() {
-        let Some(plmn_id) = entry.plmn_id.and_then(resolve_plmn_id) else {
-            log::warn!("Ignoring TAI entry with no usable plmn_id");
+    for (index, entry) in mme.tai.unwrap_or_default().into_iter().enumerate() {
+        let Some(plmn_id) = usable_plmn_id(&format!("mme.tai[{index}]"), entry.plmn_id) else {
             continue;
         };
         let tac = entry.tac.unwrap_or(0);
@@ -470,6 +491,7 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
             ctx.time.t3423 = value;
         }
     }
+    dropped_gummei
 }
 
 /// Read the freeDiameter `.conf` at `path` into the S6a fields of the context.
@@ -535,24 +557,46 @@ fn apply_fd_conf(ctx: &mut MmeContext, path: &str) {
 /// Default unsecured Diameter port (RFC 6733 §2.1).
 const DIAMETER_PORT: u16 = 3868;
 
-/// Build a `PlmnId` from the YAML `plmn_id` block.
-///
-/// MCC and MNC are accepted as either numbers or strings, because YAML reads an
-/// unquoted `mnc: 70` as an integer while a quoted `mnc: "070"` is a string —
-/// and the leading zero matters: MNC 070 is three digits, MNC 70 is two.
-fn resolve_plmn_id(plmn: PlmnIdYaml) -> Option<PlmnId> {
-    let mcc = scalar_digits(plmn.mcc.as_ref()?)?;
-    let mnc = scalar_digits(plmn.mnc.as_ref()?)?;
-    Some(PlmnId::new(&mcc, &mnc))
+/// The PLMN ID of the GUMMEI or TAI entry `entry` (e.g. `mme.gummei[0]`), or
+/// `None` when the entry has none the MME may serve, in which case the entry is
+/// dropped with a log line saying why. The MME's load is fail-soft (see
+/// [`load_config`]), so a refused PLMN drops its entry rather than the file.
+fn usable_plmn_id(entry: &str, plmn: Option<PlmnIdYaml>) -> Option<PlmnId> {
+    let field = format!("{entry}.plmn_id");
+    match plmn.map(|plmn| resolve_plmn_id(&field, plmn)) {
+        Some(Ok(Some(plmn_id))) => Some(plmn_id),
+        Some(Err(why)) => {
+            log::error!("Ignoring {entry}: {why}");
+            None
+        }
+        None | Some(Ok(None)) => {
+            log::warn!("Ignoring {entry} with no usable plmn_id");
+            None
+        }
+    }
 }
 
-/// Render a YAML scalar as its digit string, preserving a quoted form verbatim.
-fn scalar_digits(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
+/// Build a `PlmnId` from the YAML `plmn_id` block named `field`.
+///
+/// `Ok(None)` when the block leaves the MCC or the MNC out. `Err` when either
+/// is present but malformed (#2115): a YAML number, or a string that is not 3
+/// (MCC) / 2-3 (MNC) digits (TS 23.003 §2.2). A number is never read as digits:
+/// its leading zeros, if it had any, are already lost, and MNC 70 and 070 are
+/// different PLMNs; `PlmnId::new` reads digits from the left, so `mcc: 1` used
+/// to configure MCC 100. See [`nextgcore_core::plmn`].
+fn resolve_plmn_id(field: &str, plmn: PlmnIdYaml) -> Result<Option<PlmnId>, String> {
+    use nextgcore_core::plmn::{config_digits, PlmnPart};
+    let digits = |value: Option<serde_yaml::Value>, part: PlmnPart| {
+        value
+            .map(|v| config_digits(&format!("{field}.{}", part.key()), part, &v))
+            .transpose()
+    };
+    let mcc = digits(plmn.mcc, PlmnPart::Mcc)?;
+    let mnc = digits(plmn.mnc, PlmnPart::Mnc)?;
+    Ok(match (mcc, mnc) {
+        (Some(mcc), Some(mnc)) => Some(PlmnId::new(&mcc, &mnc)),
         _ => None,
-    }
+    })
 }
 
 /// `<host>` or `<host>:<port>` to a socket address, defaulting the port.
@@ -816,17 +860,17 @@ mod tests {
         );
     }
 
+    /// A PLMN written as strings keeps its leading zeros. serde_yaml 0.9 reads an
+    /// unquoted `001` as the string "001" (YAML 1.2), so that form works too.
     #[test]
-    fn test_plmn_id_accepts_numeric_and_quoted_mnc() {
-        // Unquoted YAML numbers lose a leading zero, so an operator writing a
-        // three-digit MNC has to quote it; both forms must work.
-        let mut numeric = MmeContext::new();
+    fn test_plmn_id_keeps_the_leading_zeros_as_written() {
+        let mut unquoted = MmeContext::new();
         let path = write_temp(
             "nextgcore-mmed-plmn-num.yaml",
             "mme:\n  gummei:\n    - plmn_id:\n        mcc: 001\n        mnc: 01\n",
         );
-        assert!(load_config(&mut numeric, path.to_str().unwrap()));
-        assert_eq!(numeric.served_gummei[0].plmn_id[0].to_bcd(), "00101");
+        assert!(load_config(&mut unquoted, path.to_str().unwrap()));
+        assert_eq!(unquoted.served_gummei[0].plmn_id[0].to_bcd(), "00101");
 
         let mut quoted = MmeContext::new();
         let path = write_temp(
@@ -835,6 +879,96 @@ mod tests {
         );
         assert!(load_config(&mut quoted, path.to_str().unwrap()));
         assert_eq!(quoted.served_gummei[0].plmn_id[0].to_bcd(), "001010");
+    }
+
+    /// #2115: a GUMMEI or TAI whose MCC or MNC is a YAML number, or a string of
+    /// the wrong length, is dropped with an ERROR naming the field, instead of
+    /// being read from the left (`mcc: 1` used to configure MCC 100). Its
+    /// well-formed siblings are still served: the MME's load is fail-soft.
+    #[test]
+    fn test_a_numeric_or_malformed_plmn_drops_its_entry_2115() {
+        nextgcore_core::test_log::init();
+        let path = write_temp(
+            "nextgcore-mmed-plmn-2115.yaml",
+            "mme:\n  gummei:\n    - plmn_id: { mcc: 1, mnc: \"01\" }\n      mme_gid: 1\n    \
+             - plmn_id: { mcc: \"999\", mnc: \"70\" }\n      mme_gid: 2\n  tai:\n    \
+             - plmn_id: { mcc: \"999\", mnc: 70 }\n      tac: 1\n    \
+             - plmn_id: { mcc: \"9999\", mnc: \"70\" }\n      tac: 2\n    \
+             - plmn_id: { mcc: \"001\", mnc: \"01\" }\n      tac: 3\n",
+        );
+        let watch_number = nextgcore_core::test_log::watch("reached the configuration as a number");
+        let watch_length = nextgcore_core::test_log::watch("an MCC is 3 digits");
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+
+        let gummei: Vec<(String, u16)> = ctx
+            .served_gummei
+            .iter()
+            .map(|g| (g.plmn_id[0].to_bcd(), g.mme_gid[0]))
+            .collect();
+        assert_eq!(gummei, [("99970".to_string(), 2)], "only the quoted GUMMEI");
+        let tai: Vec<(String, u16)> = ctx
+            .served_tai
+            .iter()
+            .map(|t| (t.list0.plmn_id.to_bcd(), t.list0.tac[0]))
+            .collect();
+        assert_eq!(tai, [("00101".to_string(), 3)], "only the well-formed TAI");
+
+        let numbers = watch_number.records();
+        for field in ["mme.gummei[0].plmn_id.mcc=1 ", "mme.tai[0].plmn_id.mnc=70 "] {
+            assert!(
+                numbers.iter().any(|r| r.contains(field)),
+                "an ERROR names {field}: {numbers:?}"
+            );
+        }
+        let lengths = watch_length.records();
+        assert!(
+            lengths
+                .iter()
+                .any(|r| r.contains("mme.tai[1].plmn_id.mcc=\"9999\"")),
+            "an ERROR names the 4-digit MCC: {lengths:?}"
+        );
+    }
+
+    /// #2115 (R41 on #2127): when every GUMMEI the file names is refused for its
+    /// PLMN, the checked load (start-up) fails, naming the count and the
+    /// consequence. One usable GUMMEI among refused ones loads as before, and a
+    /// file naming no GUMMEI at all is still accepted.
+    ///
+    /// REVERT-VERIFIED: with the empty-after-refusal check removed, the
+    /// all-refused file loads and the `expect_err` panics.
+    #[test]
+    fn test_a_file_whose_every_gummei_is_refused_fails_start_up_2115() {
+        let refused = write_temp(
+            "nextgcore-mmed-2115-no-gummei.yaml",
+            "mme:\n  gummei:\n    - plmn_id: { mcc: 1, mnc: \"01\" }\n    \
+             - plmn_id: { mcc: \"999\", mnc: 70 }\n",
+        );
+        let err = load_config_checked(&mut MmeContext::new(), refused.to_str().unwrap())
+            .expect_err("no GUMMEI left");
+        assert!(
+            err.contains("all 2 mme.gummei entries were refused (no usable PLMN)"),
+            "{err}"
+        );
+        assert!(err.contains("fail every S1 Setup"), "{err}");
+
+        let one_left = write_temp(
+            "nextgcore-mmed-2115-one-gummei.yaml",
+            "mme:\n  gummei:\n    - plmn_id: { mcc: 1, mnc: \"01\" }\n    \
+             - plmn_id: { mcc: \"999\", mnc: \"70\" }\n",
+        );
+        let mut ctx = MmeContext::new();
+        assert_eq!(
+            load_config_checked(&mut ctx, one_left.to_str().unwrap()),
+            Ok(true)
+        );
+        assert_eq!(ctx.served_gummei[0].plmn_id[0].to_bcd(), "99970");
+
+        let none = write_temp("nextgcore-mmed-2115-none.yaml", "mme:\n  mme_name: x\n");
+        assert_eq!(
+            load_config_checked(&mut MmeContext::new(), none.to_str().unwrap()),
+            Ok(true)
+        );
     }
 
     /// #1071: SBc-AP is off unless configured, binds only the configured address
@@ -948,7 +1082,7 @@ mod tests {
         let mut ctx = MmeContext::new();
         let path = write_temp(
             "nextgcore-mmed-partial-entries.yaml",
-            "mme:\n  gummei:\n    - mme_gid: 7\n    - plmn_id:\n        mcc: 999\n        mnc: 70\n      \
+            "mme:\n  gummei:\n    - mme_gid: 7\n    - plmn_id:\n        mcc: \"999\"\n        mnc: \"70\"\n      \
              mme_gid: 2\n  s1ap:\n    server:\n      - address: not-an-address\n      - address: 10.0.0.1\n",
         );
         assert!(load_config(&mut ctx, path.to_str().unwrap()));
