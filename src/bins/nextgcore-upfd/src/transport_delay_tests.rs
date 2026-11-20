@@ -179,7 +179,6 @@ fn pdr(peer: &str) -> TransportDelayPdr {
     TransportDelayPdr {
         peer: ip(peer),
         dscp: None,
-        n9_peer: false,
     }
 }
 
@@ -198,7 +197,6 @@ fn the_ie_names_the_peer_and_the_dscp() {
         Some(TransportDelayPdr {
             peer: ip("10.45.0.7"),
             dscp: Some(34),
-            n9_peer: false,
         })
     );
     // An IPv4-mapped IPv6 peer is the IPv4 peer (the probe's answer comes from it).
@@ -375,7 +373,6 @@ fn each_dscp_is_probed_and_measured_on_its_own() {
     let ef = TransportDelayPdr {
         peer: ip("10.0.0.5"),
         dscp: Some(46),
-        n9_peer: false,
     };
     m.set_pdr(1, 1, Some(pdr("10.0.0.5")));
     m.set_pdr(1, 2, Some(ef));
@@ -388,21 +385,34 @@ fn each_dscp_is_probed_and_measured_on_its_own() {
     assert_eq!((m.delay_for(1, 1), m.delay_for(1, 2)), (Some(10), Some(2)));
 }
 
-/// #2208: a Preceding UL GTP-U Peer with the Destination Interface Core is one
-/// the SMF names an N9 peer (another UPF); without DI, or with Access, it is not.
+/// #2208 (R43 M1 on #2249): a PDI's Source Interface Type (IE 160, TS 29.244
+/// §8.2.118) is parsed, its 6-bit value, so the data plane can tell an N3
+/// preceding peer from an N9 one.
 #[test]
-fn a_preceding_peer_with_di_core_is_an_n9_peer_2208() {
-    use nextgcore_pfcp::qos_monitoring::TransportDelayReporting;
-    use nextgcore_pfcp::types::RemoteGtpUPeer;
-    let with = |di: Option<u8>| TransportDelayReporting {
-        preceding_ul_gtpu_peer: RemoteGtpUPeer {
-            ipv4: Some([10, 45, 0, 7]),
-            destination_interface: di,
-            ..Default::default()
-        },
-        ..Default::default()
+fn a_pdi_s_source_interface_type_is_parsed_2208() {
+    let tlv = |t: u16, v: &[u8]| {
+        let mut b = t.to_be_bytes().to_vec();
+        b.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        b.extend_from_slice(v);
+        b
     };
-    assert!(TransportDelayPdr::from_ie(&with(Some(1))).unwrap().n9_peer);
-    assert!(!TransportDelayPdr::from_ie(&with(Some(0))).unwrap().n9_peer);
-    assert!(!TransportDelayPdr::from_ie(&with(None)).unwrap().n9_peer);
+    let mut pdi = tlv(20, &[0]);
+    pdi.extend(tlv(160, &[0xcf])); // spare bits set: value 15 (N9)
+    let mut pdr = tlv(56, &1u16.to_be_bytes());
+    pdr.extend(tlv(29, &100u32.to_be_bytes()));
+    pdr.extend(tlv(2, &pdi));
+    pdr.extend(tlv(108, &1u32.to_be_bytes()));
+    let p = crate::n4_build::parse_create_pdr(&pdr).unwrap();
+    assert_eq!(p.pdi.source_interface_type, Some(15));
+    let mut bare = tlv(56, &1u16.to_be_bytes());
+    bare.extend(tlv(29, &100u32.to_be_bytes()));
+    bare.extend(tlv(2, &tlv(20, &[0])));
+    bare.extend(tlv(108, &1u32.to_be_bytes()));
+    assert_eq!(
+        crate::n4_build::parse_create_pdr(&bare)
+            .unwrap()
+            .pdi
+            .source_interface_type,
+        None
+    );
 }

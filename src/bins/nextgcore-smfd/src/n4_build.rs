@@ -1481,6 +1481,9 @@ pub struct PdrParams {
     /// #982: ask the UP function to CHOOSE an IPv4 F-TEID with this CHOOSE ID (TS 29.244
     /// §8.2.3, §5.5.3), instead of `f_teid`. PDRs sharing the CHOOSE ID share the F-TEID.
     pub f_teid_choose: Option<u8>,
+    /// #2208: the PDI's Source Interface Type (3GPP Interface Type IE 160, TS 29.244
+    /// §8.2.118, Table 7.5.2.2-2), e.g. 15 for N9. Omitted when `None`.
+    pub source_interface_type: Option<u8>,
 }
 
 /// Build Create PDR IE
@@ -1524,6 +1527,11 @@ pub fn build_create_pdr(params: &PdrParams) -> Vec<u8> {
     // Network Instance
     if let Some(ref ni) = params.network_instance {
         pdi_builder.add_tlv(pfcp_ie::NETWORK_INSTANCE, ni.as_bytes());
+    }
+
+    // #2208: Source Interface Type (3GPP Interface Type, §8.2.118: spare bits 7-8).
+    if let Some(t) = params.source_interface_type {
+        pdi_builder.add_tlv(pfcp_ie::TGPP_INTERFACE_TYPE, &[t & 0x3f]);
     }
 
     // Add PDI to Create PDR

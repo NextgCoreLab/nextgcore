@@ -161,7 +161,6 @@ impl Rig {
                 Some(TransportDelayPdr {
                     peer: IpAddr::V4(peer),
                     dscp: None,
-                    n9_peer: false,
                 }),
             );
             if let Some(rtt) = rtt_ms {
@@ -421,7 +420,6 @@ async fn a_psa_reports_the_gtpupm_delay_of_the_flow() {
             Some(TransportDelayPdr {
                 peer: IpAddr::V4(i_upf_ip),
                 dscp: None,
-                n9_peer: false,
             }),
         );
         let t0 = std::time::Instant::now();
@@ -587,7 +585,6 @@ async fn a_packet_the_gates_drop_is_not_a_gtpupm_sample() {
             Some(TransportDelayPdr {
                 peer: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 dscp: None,
-                n9_peer: false,
             }),
         );
         let t0 = std::time::Instant::now();
@@ -633,7 +630,6 @@ async fn a_psa_on_n3_ignores_an_n3_n9_value_from_the_ran() {
             Some(TransportDelayPdr {
                 peer: IpAddr::V4(gnb_ip),
                 dscp: None,
-                n9_peer: false,
             }),
         );
         let t0 = std::time::Instant::now();
@@ -699,7 +695,6 @@ async fn a_probe_carries_the_dscp_the_ie_names() {
             Some(TransportDelayPdr {
                 peer: IpAddr::V4(peer_ip),
                 dscp: Some(46),
-                n9_peer: false,
             }),
         )
     });

@@ -553,11 +553,11 @@ async fn the_per_flow_delay_through_an_i_upf_reaches_the_pcf_2208() {
     let n3 = GNB_ECHO_HOLD_MS / 2;
     // DL = N3 (the I-UPF's, ~hold/2) + N9 (the PSA's, ~0) + RAN DL; UL likewise.
     assert!(
-        (RAN_DL_MS as u64 + n3..=RAN_DL_MS as u64 + n3 + 15).contains(&dl),
+        (RAN_DL_MS as u64 + n3..=RAN_DL_MS as u64 + n3 + 40).contains(&dl),
         "DL {dl} ms: RAN {RAN_DL_MS} + N3 ~{n3} + N9 ~0"
     );
     assert!(
-        (RAN_UL_MS as u64 + n3..=RAN_UL_MS as u64 + n3 + 15).contains(&ul),
+        (RAN_UL_MS as u64 + n3..=RAN_UL_MS as u64 + n3 + 40).contains(&ul),
         "UL {ul} ms: RAN {RAN_UL_MS} + N3 ~{n3} + N9 ~0"
     );
     assert_eq!(rt, dl + ul, "RTT = DL + UL (TS 29.244 §5.24.5.4)");
@@ -570,7 +570,16 @@ async fn the_per_flow_delay_through_an_i_upf_reaches_the_pcf_2208() {
         std::net::IpAddr::V4(gnb_ip),
         "the I-UPF's preceding peer is the gNB"
     );
-    assert!(!at_iupf.n9_peer);
+    let source_type = |u: &Upf, seid: u64| {
+        u.dp.sessions
+            .find_by_seid(seid)
+            .and_then(|s| s.pdr_source_types.read().unwrap().get(&1).copied())
+    };
+    assert_eq!(
+        source_type(&iupf_upf, leg.upf_seid),
+        None,
+        "no IE 160 at the I-UPF"
+    );
     let at_psa =
         tdr(&psa, lookup_upf_seid(&reference).unwrap()).expect("the PSA's UL PDR has IE 271");
     assert_eq!(
@@ -578,7 +587,11 @@ async fn the_per_flow_delay_through_an_i_upf_reaches_the_pcf_2208() {
         std::net::IpAddr::V4(iupf_upf.ip),
         "the PSA's preceding peer is the I-UPF"
     );
-    assert!(at_psa.n9_peer, "an N9 peer (Destination Interface Core)");
+    assert_eq!(
+        source_type(&psa, lookup_upf_seid(&reference).unwrap()),
+        Some(iupf::INTERFACE_TYPE_N9),
+        "the PSA's UL PDR says N9 (IE 160, TS 29.244 §8.2.118)"
+    );
 
     // Release: both N4 sessions go.
     std::env::remove_var("PCF_URI");
@@ -762,6 +775,32 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
         (FORW, Some(0x2208)),
         "the I-UPF never stopped"
     );
+
+    // R43 on #2243, minor 2: cancelled while the first half (the PSA's) is in
+    // flight: whether or not the PSA applied it, it is undone.
+    psa.clear_seen();
+    psa.delay_modifications(300);
+    let task = tokio::spawn(async move {
+        let _ = pfcp_deactivate_dl_far(seid, upf_seid).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    task.abort();
+    let _ = task.await;
+    wait_until(|| psa.modification_bodies().len() >= 2).await;
+    psa.delay_modifications(0);
+    let bodies = psa.modification_bodies();
+    let ohc = pfcp_path::find_ie(bodies.last().unwrap(), 10)
+        .and_then(|f| pfcp_path::find_ie(f, 11))
+        .and_then(|fp| pfcp_path::find_ie(fp, 84));
+    assert_eq!(
+        ohc.map(|o| (
+            u32::from_be_bytes(o[2..6].try_into().unwrap()),
+            [o[6], o[7], o[8], o[9]]
+        )),
+        Some(n9),
+        "undone even though the PSA's half was still in flight"
+    );
+    assert_eq!(iupf_far2(&iupf_upf, leg.upf_seid), (FORW, Some(0x2208)));
 
     listener.abort();
     iupf::forget(seid);

@@ -57,13 +57,6 @@ pub struct TransportDelayPdr {
     pub peer: IpAddr,
     /// The DSCP to measure with (O); not applied to the probes (module docs).
     pub dscp: Option<u8>,
-    /// #2208: the SMF named the peer an N9 peer, another UPF (the Remote GTP-U
-    /// Peer's Destination Interface Core, TS 29.244 §8.2.70 / §8.2.24), so the
-    /// N3/N9 Delay Result on its packets is one a UPF wrote and is summed into.
-    /// Without it, a peer that is the session's NG-RAN tunnel endpoint is taken
-    /// for the NG-RAN (#2197 review m2), which a PSA behind an I-UPF cannot tell
-    /// from its I-UPF: that endpoint is the I-UPF.
-    pub n9_peer: bool,
 }
 
 impl TransportDelayPdr {
@@ -85,7 +78,6 @@ impl TransportDelayPdr {
         Some(Self {
             peer,
             dscp: ie.dscp.as_ref().map(|t| t.dscp()),
-            n9_peer: p.destination_interface == Some(1),
         })
     }
 }

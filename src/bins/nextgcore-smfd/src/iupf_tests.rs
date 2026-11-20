@@ -10,6 +10,7 @@ const LEG: IupfLeg = IupfLeg {
     n9: (0x2222, [127, 0, 0, 22]),
     psa_ul: (0x3333, [127, 0, 0, 31]),
     dl_tunnel: Some((0x77, [10, 0, 0, 4])),
+    idle_action: None,
 };
 
 fn top(body: &[u8]) -> Vec<(u16, Vec<u8>)> {
@@ -309,4 +310,64 @@ async fn a_split_session_over_an_i_upf_is_refused_2208() {
         "refused for the I-UPF: {why}"
     );
     assert_eq!(cause, SmfCause::TransportResourceUnavailable);
+}
+
+/// R43 M1 on #2249: the Source Interface Type (IE 160, TS 29.244 §8.2.118) goes in
+/// the PDI when set (N9 = 15), and is absent otherwise, so a session without an
+/// I-UPF is on the wire as before.
+#[test]
+fn the_source_interface_type_is_in_the_pdi_only_when_set_2208() {
+    let pdi_of = |t: Option<u8>| {
+        let pdr = crate::n4_build::build_create_pdr(&PdrParams {
+            pdr_id: 1,
+            source_interface: 0,
+            source_interface_type: t,
+            ..Default::default()
+        });
+        top(tlvs(&pdr).into_iter().find(|(t, _)| *t == 2).unwrap().1)
+    };
+    assert_eq!(
+        pdi_of(Some(INTERFACE_TYPE_N9))
+            .into_iter()
+            .find(|(t, _)| *t == pfcp_ie::TGPP_INTERFACE_TYPE)
+            .map(|(_, v)| v),
+        Some(vec![15])
+    );
+    assert!(pdi_of(None)
+        .iter()
+        .all(|(t, _)| *t != pfcp_ie::TGPP_INTERFACE_TYPE));
+    assert_eq!(INTERFACE_TYPE_N9, 15, "TS 29.244 Table 8.2.118-1: N9");
+}
+
+/// R43 on #2243, minor 1: a restore while FAR 2 is idle puts back its last full
+/// Apply Action (BUFF|NOCP after an AN release), not bare BUFF, so the UE is
+/// still paged.
+#[test]
+fn an_idle_restore_keeps_nocp_2208() {
+    use crate::n4_build::apply_action::{BUFF, NOCP};
+    let idle = IupfLeg {
+        dl_tunnel: None,
+        idle_action: Some(BUFF | NOCP),
+        ..LEG
+    };
+    let body = build_session_modification_request(&SessionModificationParams {
+        update_fars_activate: vec![(2, 0, Some((0x0100, 0x77, Some([10, 0, 0, 5]), None)), true)],
+        ..Default::default()
+    });
+    let sp = split_modification(&body, &idle);
+    let action = |b: &[u8]| {
+        let far = top(b)
+            .into_iter()
+            .find(|(t, _)| *t == pfcp_ie::UPDATE_FAR)
+            .unwrap()
+            .1;
+        let a = top(&far)
+            .into_iter()
+            .find(|(t, _)| *t == pfcp_ie::APPLY_ACTION)
+            .unwrap()
+            .1;
+        u16::from(a[0]) | (u16::from(a.get(1).copied().unwrap_or(0)) << 8)
+    };
+    assert_eq!(action(&sp.iupf_restore), BUFF | NOCP);
+    assert_eq!(action(&sp.psa_restore), BUFF | NOCP);
 }

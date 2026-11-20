@@ -1109,21 +1109,12 @@ pub async fn sync_transport_delay(r: &str) {
         let mut sent_psa = None;
         let mut sent_iupf = None;
         if let (Some(want), Some(upf_seid)) = (psa, crate::lookup_upf_seid(r)) {
-            if send_transport_delay(
-                r,
-                crate::smf_n4_seid_for(r),
-                upf_seid,
-                want,
-                leg.is_some(),
-                "PSA",
-            )
-            .await
-            {
+            if send_transport_delay(r, crate::smf_n4_seid_for(r), upf_seid, want, "PSA").await {
                 sent_psa = Some(want);
             }
         }
         if let (Some(want), Some(l)) = (iupf, leg) {
-            if send_transport_delay(r, l.smf_seid, l.upf_seid, want, false, "I-UPF").await {
+            if send_transport_delay(r, l.smf_seid, l.upf_seid, want, "I-UPF").await {
                 sent_iupf = Some(want);
             }
         }
@@ -1154,28 +1145,19 @@ pub async fn sync_transport_delay(r: &str) {
 
 /// Send the UL PDR's Transport Delay Reporting `want` (or its deactivation) to
 /// the UPF of N4 session (`smf_seid`, `upf_seid`), the `role` of session `r`.
-/// `n9`: the preceding peer is another UPF (a PSA behind an I-UPF). Its Remote
-/// GTP-U Peer then carries the Destination Interface Core (TS 29.244 §8.2.70,
-/// §8.2.24), so the UPF sums into the N3/N9 Delay Result the I-UPF wrote rather
-/// than take the I-UPF, its NG-RAN tunnel endpoint, for the NG-RAN.
 async fn send_transport_delay(
     r: &str,
     smf_seid: u64,
     upf_seid: u64,
     want: Option<std::net::IpAddr>,
-    n9: bool,
     role: &str,
 ) -> bool {
-    let ie = want.map(|ip| {
-        let mut peer = crate::n4_build::remote_gtpu_peer(ip);
-        if n9 {
-            peer.destination_interface = Some(1);
-        }
-        nextgcore_pfcp::qos_monitoring::TransportDelayReporting {
-            preceding_ul_gtpu_peer: peer,
+    let ie = want.map(
+        |ip| nextgcore_pfcp::qos_monitoring::TransportDelayReporting {
+            preceding_ul_gtpu_peer: crate::n4_build::remote_gtpu_peer(ip),
             ..Default::default()
-        }
-    });
+        },
+    );
     let params = crate::n4_build::SessionModificationParams {
         update_pdr_transport_delay: vec![(crate::UL_PDR_ID, ie)],
         ..Default::default()

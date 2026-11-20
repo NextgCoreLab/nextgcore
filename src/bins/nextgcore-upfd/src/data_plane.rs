@@ -2626,6 +2626,10 @@ pub struct DataPlaneSession {
     /// created with their own F-TEID. A PDR absent here is an establishment PDR, which
     /// detects on the session's `ul_teid` as before.
     pub pdr_teids: RwLock<HashMap<u16, u32>>,
+    /// #2208: each PDR's Source Interface Type (IE 160, TS 29.244 §8.2.118),
+    /// when its PDI carried one: what tells an NG-RAN preceding peer from a UPF
+    /// (an I-UPF) for Transport Delay Reporting.
+    pub pdr_source_types: RwLock<HashMap<u16, u8>>,
 }
 
 impl DataPlaneSession {
@@ -2688,6 +2692,7 @@ impl DataPlaneSession {
             dl_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ddn_sent: AtomicBool::new(false),
             pdr_teids: RwLock::new(HashMap::new()),
+            pdr_source_types: RwLock::new(HashMap::new()),
         }
     }
 
@@ -6023,7 +6028,7 @@ impl DataPlane {
         let seid = session.upf_seid;
         let (cfg, d) = self
             .with_transport_delay(|m| Some((m.pdr(seid, pdr_id)?, m.delay_for(seid, pdr_id)?)))?;
-        let from_ran = preceding_is_ran(session, &cfg);
+        let from_ran = preceding_is_ran(session, pdr_id, &cfg);
         let out = crate::transport_delay::add_n3_n9_delay(content, d, from_ran)?;
         log::trace!("SEID {seid:#x} PDR {pdr_id}: {d} ms added to the N3/N9 Delay Result");
         Some(out)
@@ -6165,7 +6170,7 @@ impl DataPlane {
         // #2197 review m2: directly on N3, an N3/N9 Delay Result on the packet
         // is none a UPF wrote (TS 38.415 §5.5.3.21, TS 29.244 §5.24.5.3 NOTE):
         // the PSA's own N3 delay is the transport delay.
-        let upstream = if preceding_is_ran(session, &cfg) {
+        let upstream = if preceding_is_ran(session, pdr_id, &cfg) {
             0
         } else {
             ul.n3_n9_delay_result.unwrap_or(0)
@@ -6567,11 +6572,21 @@ pub fn build_relay_gpdu(teid: u32, container: Option<&[u8]>, payload: &[u8]) -> 
 
 /// #2197 review m2: whether `peer`, a PDR's preceding UL GTP-U peer, is the
 /// session's NG-RAN (its N3 downlink endpoint): then no UPF precedes this one.
+///
+/// #2208 (R43 M1 on #2249): the PDR's Source Interface Type (IE 160, TS 29.244
+/// §8.2.118) decides when the SMF sent one: N3 (11 to 14) is the NG-RAN, any other
+/// type (N9: an I-UPF precedes) is not. Without it, the peer is the NG-RAN when it
+/// is the session's NG-RAN tunnel endpoint, which a PSA behind an I-UPF cannot
+/// tell from its I-UPF.
 fn preceding_is_ran(
     session: &DataPlaneSession,
+    pdr_id: u16,
     cfg: &crate::transport_delay::TransportDelayPdr,
 ) -> bool {
-    !cfg.n9_peer && session.gnb_addr().ip().to_canonical() == cfg.peer.to_canonical()
+    match session.pdr_source_types.read().unwrap().get(&pdr_id) {
+        Some(t) => (11..=14).contains(t),
+        None => session.gnb_addr().ip().to_canonical() == cfg.peer.to_canonical(),
+    }
 }
 
 // ============================================================================

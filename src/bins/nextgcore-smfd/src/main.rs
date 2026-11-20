@@ -3546,6 +3546,9 @@ async fn pfcp_session_establish(
         // #80: bound to the URR, which is what makes the UPF measure this PDR's traffic
         // against it. A URR created and referenced by nothing measures nothing.
         urr_ids: vec![SESSION_URR_ID],
+        // #2208: N9 when an I-UPF will precede this PSA; omitted otherwise, so a
+        // session without one is on the wire as before.
+        source_interface_type: iupf::will_insert(dnn).then_some(iupf::INTERFACE_TYPE_N9),
         ..Default::default()
     };
     let ul_pdr_bytes = n4_build::build_create_pdr(&ul_pdr);

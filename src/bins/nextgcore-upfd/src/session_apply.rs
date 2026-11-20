@@ -5,6 +5,25 @@ use crate::data_plane::{self, DataPlane};
 use crate::pfcp_path::PfcpSessionEvent;
 use std::net::SocketAddr;
 
+/// #2208: record the Source Interface Type of each `(PDR ID, PDI)`: the PDI's
+/// IE 160 when it has one, else none; `None` for a removed PDR.
+fn note_source_types<'a>(
+    session: &data_plane::DataPlaneSession,
+    pdrs: impl Iterator<Item = (u16, Option<&'a crate::n4_build::ParsedPdi>)>,
+) {
+    let mut m = session.pdr_source_types.write().unwrap();
+    for (id, pdi) in pdrs {
+        match pdi.and_then(|p| p.source_interface_type) {
+            Some(t) => {
+                m.insert(id, t);
+            }
+            None => {
+                m.remove(&id);
+            }
+        }
+    }
+}
+
 /// Build a data-plane PDR from a wire-parsed Create/Update PDR.
 ///
 /// Extracted by #306 so the establishment path and the modification path install
@@ -296,6 +315,8 @@ pub async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessio
                         bars: dp_bars,
                     },
                 );
+                // #2208: each PDR's Source Interface Type (IE 160), when its PDI has one.
+                note_source_types(&session, pdrs.iter().map(|p| (p.pdr_id, Some(&p.pdi))));
                 // #1450: an I-UPF's downlink PDR detects on its N9 F-TEID (the PFCP
                 // layer wrote the chosen TEID into its PDI).
                 {
@@ -425,6 +446,19 @@ pub async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessio
 
                 // Creates: rules added to a session that is already running.
                 // Provisioning charging mid-session is the normal way it is added.
+                // #2208: the Source Interface Types follow the PDRs and their PDIs.
+                note_source_types(
+                    &session,
+                    removed_pdr_ids
+                        .iter()
+                        .map(|id| (*id, None))
+                        .chain(created_pdrs.iter().map(|p| (p.pdr_id, Some(&p.pdi))))
+                        .chain(
+                            updated_pdrs
+                                .iter()
+                                .filter_map(|u| u.pdi.as_ref().map(|pdi| (u.pdr_id, Some(pdi)))),
+                        ),
+                );
                 if !removed_pdr_ids.is_empty() {
                     let mut tunnels = session.pdr_teids.write().unwrap();
                     for id in &removed_pdr_ids {

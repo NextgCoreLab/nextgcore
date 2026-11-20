@@ -5706,6 +5706,7 @@ mod tests {
             n9: (0x2, [127, 0, 0, 2]),
             psa_ul: (0x3, [127, 0, 0, 3]),
             dl_tunnel: Some((0x4, [10, 0, 0, 4])),
+            idle_action: None,
         };
         let derived = {
             let ctx = ctx_with_state(&path);

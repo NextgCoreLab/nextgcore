@@ -13575,7 +13575,6 @@ mod tests {
                 Some(crate::transport_delay::TransportDelayPdr {
                     peer: "10.45.0.7".parse().unwrap(),
                     dscp: None,
-                    n9_peer: false,
                 }),
             )
         });
