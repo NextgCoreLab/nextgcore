@@ -3175,7 +3175,7 @@ mod callback_oauth2_1421_tests {
         let forged = uuid::Uuid::new_v4().simple().to_string();
         assert_eq!(nwdaf_sbi_request_handler(req(&forged)).await.status, 404);
         let held = nrf_collector::callback_token();
-        assert_eq!(nwdaf_sbi_request_handler(req(held)).await.status, 204);
+        assert_eq!(nwdaf_sbi_request_handler(req(&held)).await.status, 204);
     }
 
     /// Every registered exemption refuses a token this NWDAF does not hold, so a
