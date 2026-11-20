@@ -4670,12 +4670,6 @@ mod tests {
         );
     }
 
-    /// #2164: two live sessions never share an S5/S8-C TEID, even when their
-    /// SEIDs are 2^32 apart (the same low 32 bits), and a removed session's
-    /// TEID stops resolving.
-    ///
-    /// REVERT-VERIFIED: with `next_n4_seid_with_teid` back to `next_n4_seid`,
-    /// the second session gets the first's TEID and the inequality fails.
     /// #2184: releasing a session takes its S5/S8-C TEID out of the index
     /// itself, not merely out of reach of a lookup (which misses once the
     /// session is gone whether or not the index leaks); and once the SEID
@@ -4717,6 +4711,12 @@ mod tests {
         assert_eq!(ctx.sess_find_by_teid(teid).map(|s| s.id), Some(reused.id));
     }
 
+    /// #2164: two live sessions never share an S5/S8-C TEID, even when their
+    /// SEIDs are 2^32 apart (the same low 32 bits), and a removed session's
+    /// TEID stops resolving.
+    ///
+    /// REVERT-VERIFIED: with `next_n4_seid_with_teid` back to `next_n4_seid`,
+    /// the second session gets the first's TEID and the inequality fails.
     #[test]
     fn live_sessions_never_share_an_s5c_teid_2164() {
         let mut ctx = SmfContext::new();

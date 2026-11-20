@@ -1918,16 +1918,20 @@ fn confirmed_expiry(producer: SouthboundProducer, response: &SbiResponse) -> Opt
         .as_array()?
         .iter()
         .find(|item| item["path"].as_str() == Some("/reportingOptions/expiry"))?;
-    let granted = item["reason"].as_str()?.rsplit(' ').next()?;
+    // #2156: the convention is pinned, `granted <DateTime>` exactly (udmd
+    // `ee_modify_answer`); any other reason is not read as a grant.
+    let granted = item["reason"].as_str()?.strip_prefix("granted ")?;
     nextgcore_sbi::datetime::rfc3339_to_epoch(granted)
 }
 
 /// #2163 (R42 on #2158): whether a UDM's answer to the member-form refresh is
-/// the refusal of the PATH itself, the one an older udmd gives: a 400 whose
-/// ProblemDetails `invalidParams` names `/reportingOptions/expiry`, or whose
-/// `detail` does (a udmd from before #2133 says the path "must address a
-/// top-level EeSubscription member"). Any other 400 is a genuine refusal of the
-/// refresh, so the whole-object form is not tried for it.
+/// the refusal of the PATH itself: a 400 whose ProblemDetails `invalidParams`
+/// names `/reportingOptions/expiry`, or whose `detail` does. A udmd that takes
+/// only top-level paths (before #2133) says the path "must address a top-level
+/// EeSubscription member"; the current udmd, for a stored subscription without
+/// `reportingOptions`, says it has "no member" to descend into. Any other 400 is
+/// a genuine refusal of the refresh, so the whole-object form is not tried for
+/// it.
 fn refuses_the_member_path(resp: &SbiResponse) -> bool {
     const PATH: &str = "/reportingOptions/expiry";
     if resp.status != 400 {
@@ -2213,17 +2217,18 @@ async fn refresh_producer_legs(
             sub.southbound_expiry.is_some(),
         );
         let mut answer = client.patch_json(&southbound.delete_path, &patch).await;
-        // #2154 (R42 on #2152): a UDM from before #2133 accepts only top-level
-        // patch paths and answers the member form 400. Fall back, once, to the
-        // whole-object form it does accept, so its legs are refreshed rather than
-        // left to lapse during a rolling upgrade (nef.md: upgrade udmd first).
+        // #2154 (R42 on #2152): a UDM that refuses the member path itself with a
+        // 400 (one that takes only top-level patch paths, as udmd did before
+        // #2133, or a stored subscription with no `reportingOptions` to descend
+        // into) is sent the whole-object form once, so the leg is refreshed
+        // rather than left to lapse (nef.md: upgrade udmd before nefd).
         if southbound.producer == SouthboundProducer::Udm
             && sub.southbound_expiry.is_some()
             && matches!(&answer, Ok(resp) if refuses_the_member_path(resp))
         {
             log::warn!(
-                "monitoring subscription {}: the UDM refused `add /reportingOptions/expiry` \
-                 (400; a udmd older than #2133?); retrying with the whole reportingOptions",
+                "monitoring subscription {}: the UDM refused the path of `add \
+                 /reportingOptions/expiry` (400); retrying with the whole reportingOptions",
                 sub.id
             );
             let whole = refresh_patch(southbound.producer, requested, false);
@@ -4238,6 +4243,18 @@ mod tests {
                 SouthboundProducer::Udm,
                 &answer(serde_json::json!({ "report": [{
                     "path": "/monitoringConfigurations", "reason": format!("granted {at}")
+                }]}))
+            ),
+            None
+        );
+        // #2156: the reason convention is pinned exactly; a reason that merely
+        // ends in a DateTime is not a grant. REVERT-VERIFIED: with the last
+        // word of any reason parsed again (`rsplit(' ')`), this is `Some`.
+        assert_eq!(
+            confirmed_expiry(
+                SouthboundProducer::Udm,
+                &answer(serde_json::json!({ "report": [{
+                    "path": "/reportingOptions/expiry", "reason": format!("refused, kept {at}")
                 }]}))
             ),
             None

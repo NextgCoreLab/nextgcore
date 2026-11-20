@@ -558,6 +558,10 @@ pub struct AmfEeLeg {
     /// Nudm_EE subscription's granted expiry (TS 29.518 §6.2.6.2.4
     /// AmfEventMode). `None` for a subscription with no expiry.
     pub expiry: Option<u64>,
+    /// #2156 (R42 on #2155): the expiry the AMF granted (TS 29.518 lets it
+    /// answer a shorter `options.expiry`), else the one asked for: when the AMF
+    /// stops reporting on this leg unless it is renewed.
+    pub amf_expiry: Option<u64>,
 }
 
 impl UdmEeSubscription {
@@ -1563,6 +1567,18 @@ impl UdmContext {
                 .filter(|s| s.ue_identity == supi || s.ue_identity == "anyUE")
                 // #2125: a lapsed subscription is reported nothing.
                 .filter(|s| !s.is_expired(now_unix_secs()))
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// #2156: every EE subscription with an AMF leg, for the leg renewal.
+    pub fn ee_subscriptions_with_amf_leg(&self) -> Vec<UdmEeSubscription> {
+        match self.ee_subscription_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|s| s.amf_leg.is_some())
                 .cloned()
                 .collect(),
             Err(_) => Vec::new(),
