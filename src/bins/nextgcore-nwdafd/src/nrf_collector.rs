@@ -41,6 +41,14 @@ pub use nextgcore_sbi::nf_status_notify::{TokenBook, RETIRED_TOKEN_GRACE};
 
 static TOKENS: std::sync::Mutex<TokenBook> = std::sync::Mutex::new(TokenBook::new());
 
+/// #2215: taken by every test that subscribes (mints and activates tokens in
+/// [`TOKENS`]) or asserts which token is current. Without it, a test that
+/// subscribes while `each_subscribe_names_its_own_token_2093` runs changes the
+/// current token under its "the accepted one is current" assertion, and the
+/// book's cap can prune a token a sibling still delivers on.
+#[cfg(test)]
+pub(crate) static TOKENS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn tokens() -> std::sync::MutexGuard<'static, TokenBook> {
     TOKENS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -589,12 +597,19 @@ pub fn refuse_notifier(
 /// (`correlated`) or the legacy token-less one, after [`refuse_notifier`] under
 /// the process's SBI profile (#2081): refused before anything is parsed or
 /// ingested.
-pub async fn handle_nf_status_notify_from(request: &SbiRequest, correlated: bool) -> SbiResponse {
+///
+/// #2215: `profile` is the router's (`nwdaf_sbi_request_handler_with`), not
+/// resolved here, so the router decides the profile in one place.
+pub async fn handle_nf_status_notify_from(
+    request: &SbiRequest,
+    correlated: bool,
+    profile: nextgcore_sbi::security::SbiProfile,
+) -> SbiResponse {
     handle_nf_status_notify_gated_with_ctx(
         &crate::context::nwdaf_self(),
         request,
         correlated,
-        nextgcore_sbi::security::SbiProfile::resolve().is_production(),
+        profile.is_production(),
     )
     .await
 }
@@ -878,6 +893,7 @@ mod tests {
     /// and the one it replaces stays held through its grace window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_subscribe_names_its_own_token_2093() {
+        let _tokens = TOKENS_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -943,12 +959,12 @@ mod tests {
     fn both_nf_status_routes_go_through_the_gate_2081() {
         let main = include_str!("main.rs");
         assert_eq!(
-            main.matches("nrf_collector::handle_nf_status_notify_from(&request, true)")
+            main.matches("nrf_collector::handle_nf_status_notify_from(&request, true, profile)")
                 .count(),
             1
         );
         assert_eq!(
-            main.matches("nrf_collector::handle_nf_status_notify_from(&request, false)")
+            main.matches("nrf_collector::handle_nf_status_notify_from(&request, false, profile)")
                 .count(),
             1
         );
