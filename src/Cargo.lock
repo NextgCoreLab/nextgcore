@@ -3235,6 +3235,7 @@ name = "nextgcore-scpd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
@@ -3247,6 +3248,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tokio",
 ]
 
