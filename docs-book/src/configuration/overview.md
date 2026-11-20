@@ -213,6 +213,11 @@ Every artefact this repo ships — `docker/rust/docker-compose.yml`,
 `dev` opt-out, because none of them mount SBI certificates. Local development and
 the matched-simulator E2E are therefore unchanged.
 
+In a Helm values file, write the profile out: a bare `sbiProfile:` (null) renders
+`dev`, not production, because helm drops a null key before the chart sees it and
+the chart's default applies. An operator who means production must write
+`sbiProfile: production` (#2136).
+
 **Mixed deployments are not supported:** the scheme comes from the profile, not
 from a peer's advertised URI, so run either a uniformly `production` or a
 uniformly `dev` core. (Before this, the scheme was hardcoded `http` regardless of
