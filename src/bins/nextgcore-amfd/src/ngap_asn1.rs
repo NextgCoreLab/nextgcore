@@ -1,12 +1,13 @@
 //! NGAP ASN.1 Encoding for AMF
 //!
-//! This module provides ASN.1 APER encoding for NGAP messages
-//! using the nextgcore-ngap crate. This ensures wire compatibility with
-//! the gNB (nextgsim-gnb) which also uses proper ASN.1 encoding.
+//! This module provides ASN.1 APER encoding and decoding for NGAP messages
+//! through the codec generated from the TS 38.413 ASN.1
+//! (`nextgcore-ngap-gen`), mapping its PDUs to and from amfd's domain values
+//! ([`crate::ngap_types`]).
 //!
-//! #417 is migrating these builders, one procedure family at a time, onto the
-//! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated so
-//! far: the whole NG Setup family -- the Response and Failure encoders (stage 2)
+//! #417 moved these builders, one procedure family at a time, onto the
+//! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated, in
+//! order: the whole NG Setup family -- the Response and Failure encoders (stage 2)
 //! and the Request decoder (stage 3), which applies TS 38.413 §10.3.4/§10.3.5 to
 //! not-comprehended and missing IEs ([`decode_ng_setup_request_asn1`]) -- and
 //! the UE Context Release family (stage 4): the Command encoder and the Request

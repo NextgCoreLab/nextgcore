@@ -2418,7 +2418,6 @@ dependencies = [
  "log",
  "mongodb",
  "nextgcore-app",
- "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-crypt",
  "nextgcore-demo",
@@ -3333,6 +3332,17 @@ dependencies = [
  "serde",
  "serde_yaml",
  "tokio",
+]
+
+[[package]]
+name = "nextgcore-slpp-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
 ]
 
 [[package]]

@@ -972,7 +972,7 @@ pub struct PwsResponseRequest {
     pub nf_id: Option<String>,
     /// The NGAP procedure code of the request (51 WriteReplaceWarning or
     /// 32 PWSCancel), so a response can be checked against what was asked.
-    /// `u8`, matching `nextgcore_asn1c::ngap::types::ProcedureCode`'s own width.
+    /// `u8`, as the generated `ProcedureCode` (`INTEGER (0..255)`, NGAP-CommonDataTypes).
     pub procedure_code: u8,
 }
 
