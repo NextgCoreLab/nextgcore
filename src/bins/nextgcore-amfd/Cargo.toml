@@ -99,7 +99,6 @@ mongodb = { workspace = true }
 # #2005: the stand-in OAuth2 client for the DECREASE token-bound test.
 nextgcore-sbi = { workspace = true, features = ["test-support"] }
 nextgcore-core = { workspace = true, features = ["test-log"] }
-nextgcore-asn1c = { workspace = true }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true
