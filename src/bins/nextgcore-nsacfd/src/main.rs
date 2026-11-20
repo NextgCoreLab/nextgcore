@@ -5654,9 +5654,17 @@ nsacf:
     /// notification, and a first subscription is distinguishable from a repeat.
     #[test]
     fn eac_mode_list_and_first_subscription_detection() {
+        // #2196: it read and wrote the process-wide context without the lock
+        // every other context test holds, and with S-NSSAI 96 and AMF "amf-96e",
+        // which the #96 EAC notification tests drive to ACTIVE: under one thread
+        // their spawned notification work could still run here, and in parallel
+        // they ran alongside. So hold the lock and use a slice and an AMF of its
+        // own.
+        let _guard = GLOBAL_CTX_TEST_LOCK.blocking_lock();
         nsacf_context_init(64);
+        let slice = SNssai::new(96, Some(0x002196));
         with_nsacf_context(|c| {
-            c.quota_add(SNssai::new(96, None), 10, 10);
+            c.quota_add(slice.clone(), 10, 10);
         });
 
         // The mode list covers every NSAC-subject slice, not only the one that
@@ -5664,20 +5672,21 @@ nsacf:
         // for the subscribed S-NSSAIs".
         let modes = with_nsacf_context(|c| c.eac_mode_list()).expect("ctx");
         assert!(
-            modes.contains_key(&SNssai::new(96, None).to_key()),
+            modes.contains_key(&slice.to_key()),
             "every configured slice must have a mode: {modes:?}"
         );
-        assert_eq!(modes[&SNssai::new(96, None).to_key()], "DEACTIVE");
+        assert_eq!(modes[&slice.to_key()], "DEACTIVE");
 
         // First-subscription detection: false before, true after.
-        assert!(!with_nsacf_context(|c| c.eac_subscription_exists("amf-96e")).unwrap());
-        with_nsacf_context(|c| c.eac_subscription_set("amf-96e", "http://127.0.0.1:9/eac"));
+        const AMF: &str = "amf-2196-eac";
+        assert!(!with_nsacf_context(|c| c.eac_subscription_exists(AMF)).unwrap());
+        with_nsacf_context(|c| c.eac_subscription_set(AMF, "http://127.0.0.1:9/eac"));
         assert!(
-            with_nsacf_context(|c| c.eac_subscription_exists("amf-96e")).unwrap(),
+            with_nsacf_context(|c| c.eac_subscription_exists(AMF)).unwrap(),
             "a re-registering AMF must be recognised as already subscribed, so it \
              is not re-notified on every NumOfUEsUpdate"
         );
-        with_nsacf_context(|c| c.eac_subscription_remove("amf-96e"));
+        with_nsacf_context(|c| c.eac_subscription_remove(AMF));
     }
 
     /// #96 criterion 8: the typed service variant round-trips.
