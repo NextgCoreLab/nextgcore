@@ -67,14 +67,72 @@ pub fn build_nrppa_dl_non_ue_associated(routing_id: &[u8], nrppa_pdu: &[u8]) -> 
     crate::ngap_asn1::build_downlink_non_ue_nrppa_transport_asn1(routing_id, nrppa_pdu)
 }
 
+/// Additional information IEI (TS 24.501 §9.11.2.1, a type 4 TLV): IEI 0x24 in
+/// both DL NAS TRANSPORT (Table 8.2.11.1.1) and UL NAS TRANSPORT (Table
+/// 8.2.10.1.1). For LPP and SLPP it carries the routing information (#2256).
+pub const ADDITIONAL_INFORMATION_IEI: u8 = 0x24;
+
+/// Append an Additional information IE carrying `lcs_correlation_id` to a DL
+/// NAS TRANSPORT (TS 24.501 §5.4.5.3.2 case c: "set the Additional information
+/// IE to an LCS correlation identifier received from the LMF from which the LPP
+/// message was received"). The value is the identifier's octets, which is what
+/// the UE hands back in the UL NAS TRANSPORT's Additional information (§5.4.5.2.2
+/// case c) and [`routing_correlation`] reads.
+///
+/// Every IE ahead of it in Table 8.2.11.1.1 is absent from a positioning
+/// downlink, so it goes right after the payload container. An identifier that
+/// does not fit the one-octet length (TS 29.572 allows 255 characters, the IE
+/// 255 octets) or is empty is left out and logged, never truncated: a cut
+/// identifier would route the UE's answer to no LMF at all.
+pub fn append_additional_information(nas: &mut Vec<u8>, lcs_correlation_id: &str) {
+    match u8::try_from(lcs_correlation_id.len()) {
+        Ok(0) => {}
+        Ok(len) => {
+            nas.push(ADDITIONAL_INFORMATION_IEI);
+            nas.push(len);
+            nas.extend_from_slice(lcs_correlation_id.as_bytes());
+        }
+        Err(_) => log::warn!(
+            "DL NAS Transport: LCS correlation id of {} octets does not fit the Additional \
+             information IE (max 255); sent without it",
+            lcs_correlation_id.len()
+        ),
+    }
+}
+
+/// The LCS correlation identifier a UL NAS TRANSPORT's Additional information
+/// value names (TS 24.501 §5.4.5.2.5 cases c and c1: the AMF sends the
+/// container "to the LMF associated with the routing information included in
+/// the Additional information IE"). The inverse of
+/// [`append_additional_information`]. `None` for an empty value or one that is
+/// not UTF-8: no downlink of this AMF put it there, and TS 29.572 CorrelationID
+/// is a string.
+pub fn routing_correlation(value: &[u8]) -> Option<String> {
+    std::str::from_utf8(value)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Build a DL NAS Transport (TS 24.501 §8.2.10) carrying an LMF-provided LPP
 /// message toward the UE. Thin, positioning-typed wrapper over the generic
 /// 5GMM DL NAS Transport builder with payload container type `LPP`; no PDU
 /// session ID and no 5GMM cause (the container is being *forwarded*, not
-/// rejected). The returned NAS PDU still needs NAS security protection by the
-/// caller before it goes on the wire.
-pub fn build_lpp_dl_nas(lpp_pdu: &[u8]) -> Option<Vec<u8>> {
-    crate::gmm_build::build_dl_nas_transport(None, PAYLOAD_CONTAINER_TYPE_LPP, lpp_pdu, None, None)
+/// rejected). `lcs_correlation_id`, the LMF's, goes in Additional information
+/// (§5.4.5.3.2 case c, #2256). The returned NAS PDU still needs NAS security
+/// protection by the caller before it goes on the wire.
+pub fn build_lpp_dl_nas(lpp_pdu: &[u8], lcs_correlation_id: Option<&str>) -> Option<Vec<u8>> {
+    let mut nas = crate::gmm_build::build_dl_nas_transport(
+        None,
+        PAYLOAD_CONTAINER_TYPE_LPP,
+        lpp_pdu,
+        None,
+        None,
+    )?;
+    if let Some(corr) = lcs_correlation_id {
+        append_additional_information(&mut nas, corr);
+    }
+    Some(nas)
 }
 
 #[cfg(test)]
@@ -123,7 +181,7 @@ mod tests {
     fn lpp_dl_nas_frames_lpp_container() {
         // A small opaque LPP body (envelope bytes are irrelevant to framing).
         let lpp = [0x90u8, 0x01, 0x20];
-        let nas = build_lpp_dl_nas(&lpp).expect("build LPP DL NAS Transport");
+        let nas = build_lpp_dl_nas(&lpp, None).expect("build LPP DL NAS Transport");
         // 5GMM EPD, plain header, then DL NAS Transport framing.
         assert_eq!(nas[0], 0x7E, "extended protocol discriminator = 5GMM");
         // Payload container type octet must select LPP ...
@@ -132,5 +190,34 @@ mod tests {
         assert_eq!(nas[4], 0x00);
         assert_eq!(nas[5], 0x03);
         assert_eq!(&nas[6..9], &lpp);
+        assert_eq!(nas.len(), 9, "no correlation, so no Additional information");
+    }
+
+    /// #2256, TS 24.501 §5.4.5.3.2 case c: the LMF's LCS correlation id rides in
+    /// Additional information (IEI 0x24), and the UL reader gets it back. One that
+    /// cannot fit the one-octet length is left out, not truncated.
+    #[test]
+    fn lpp_dl_nas_carries_the_lcs_correlation_id_in_additional_information() {
+        let lpp = [0x90u8, 0x01, 0x20];
+        let nas = build_lpp_dl_nas(&lpp, Some("corr-A")).expect("builds");
+        let mut want = vec![0x7E, 0x00, 0x68, PAYLOAD_CONTAINER_TYPE_LPP, 0x00, 0x03];
+        want.extend_from_slice(&lpp);
+        want.extend_from_slice(&[0x24, 0x06]);
+        want.extend_from_slice(b"corr-A");
+        assert_eq!(nas, want);
+        assert_eq!(routing_correlation(&nas[11..]).as_deref(), Some("corr-A"));
+
+        let long = "x".repeat(256);
+        assert_eq!(
+            build_lpp_dl_nas(&lpp, Some(&long)).expect("builds").len(),
+            9
+        );
+        assert_eq!(build_lpp_dl_nas(&lpp, Some("")).expect("builds").len(), 9);
+        let max = "y".repeat(255);
+        let nas = build_lpp_dl_nas(&lpp, Some(&max)).expect("builds");
+        assert_eq!(&nas[9..11], &[0x24, 0xFF]);
+        assert_eq!(routing_correlation(&nas[11..]), Some(max));
+        assert_eq!(routing_correlation(&[]), None);
+        assert_eq!(routing_correlation(&[0xFF, 0xFE]), None);
     }
 }

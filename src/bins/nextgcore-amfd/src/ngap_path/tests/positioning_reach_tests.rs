@@ -1007,3 +1007,184 @@ async fn two_lmf_transfers_sharing_one_callback_uri_are_each_told_1858() {
     server.forget_ue(ue);
     sink.stop().await.expect("sink stop");
 }
+
+/// #2256: the verified NF instance IDs of two LMFs serving one UE at once.
+const LMF_A_2256: &str = "6f1d0a52-2256-4a00-8000-00000000000a";
+const LMF_B_2256: &str = "6f1d0a52-2256-4b00-8000-00000000000b";
+
+/// An LMF's N1N2MessageSubscribe for the UE's uplink LPP, as LMF `lmf`, with
+/// its notify callback on `port`.
+fn lpp_subscription_as(supi: &str, lmf: &str, port: u16) -> nextgcore_sbi::SbiRequest {
+    let mut req = nextgcore_sbi::SbiRequest::post(format!(
+        "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions"
+    ))
+    .with_json_body(&serde_json::json!({
+        "n1MessageClass": "LPP",
+        "n1NotifyCallbackUri": format!("http://127.0.0.1:{port}/nlmf-loc/v1/n1-notify"),
+    }))
+    .expect("json");
+    req.oauth2_subject = Some(lmf.to_string());
+    req
+}
+
+/// An LMF's LPP-only N1N2MessageTransfer as LMF `lmf`, for LCS correlation
+/// `correlation`.
+fn lpp_transfer_as(supi: &str, lmf: &str, correlation: &str) -> nextgcore_sbi::SbiRequest {
+    let mut req =
+        nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&serde_json::json!({
+                "n1MessageContainer": {
+                    "n1MessageClass": "LPP",
+                    "n1MessageContent": { "contentId": "lpp-pdu" }
+                },
+                "lcsCorrelationId": correlation,
+            }))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "lpp-pdu",
+                "application/vnd.3gpp.lpp",
+                bytes::Bytes::from_static(&[0x92, 0x22, 0x56]),
+            ));
+    req.oauth2_subject = Some(lmf.to_string());
+    req
+}
+
+/// A protected UL NAS TRANSPORT (TS 24.501 §8.2.10) with an LPP container
+/// `lpp`, and `routing` in Additional information (IEI 0x24) when given.
+fn ul_lpp(lpp: &[u8], routing: Option<&[u8]>, count: u8) -> Vec<u8> {
+    let mut inner = vec![0x7E, 0x00, 0x67, 0x03];
+    inner.extend_from_slice(&(lpp.len() as u16).to_be_bytes());
+    inner.extend_from_slice(lpp);
+    if let Some(r) = routing {
+        inner.push(0x24);
+        inner.push(r.len() as u8);
+        inner.extend_from_slice(r);
+    }
+    ue_protect(&inner, count)
+}
+
+/// The next N1MessageNotify a sink received: its JSON root and its N1 part.
+async fn next_notify(
+    rx: &mut mpsc::Receiver<(String, String, Vec<nextgcore_sbi::message::SbiPart>)>,
+) -> (serde_json::Value, Vec<u8>) {
+    let (_uri, json, parts) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an N1MessageNotify arrives")
+        .expect("sink open");
+    let n1 = parts
+        .iter()
+        .find(|p| p.content_id.as_deref() == Some(crate::namf_server::N1_MESSAGE_NOTIFY_CONTENT_ID))
+        .map(|p| p.data.to_vec())
+        .unwrap_or_default();
+    (serde_json::from_str(&json).expect("json root"), n1)
+}
+
+/// #2256, TS 24.501 §5.4.5.3.2 case c and §5.4.5.2.5 case c. Two LMFs run a
+/// location session each for one UE. Each LPP downlink carries its LMF's LCS
+/// correlation in Additional information, and the UE's answer, naming it
+/// again, reaches that LMF, tagged with that correlation, whichever LMF spoke
+/// last. An answer with no Additional information keeps the single-session
+/// fallback: the most recent LPP subscription and correlation.
+///
+/// Revert-verified: with the uplink routed as before #2256 (the most recent
+/// subscription, the last correlation), LMF A's answer reaches LMF B and the
+/// first wait on A's sink times out, as it does with IEI 0x24 left unparsed;
+/// with the downlink built without Additional information, the downlink
+/// assertion fails; with the notification tagged with the last correlation
+/// rather than the one the UE named, A's `lcsCorrelationId` assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_lmfs_sessions_for_one_ue_each_get_their_own_uplink() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_225_601u64, 96, "imsi-001010022560001");
+    live_ue(&mut server, ue, ran, supi);
+    // The sinks are plain-HTTP peers, which only the dev SBI profile calls.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (sink_a, port_a, mut rx_a) = super::start_lmf_callback_sink().await;
+    let (sink_b, port_b, mut rx_b) = super::start_lmf_callback_sink().await;
+
+    for (lmf, port) in [(LMF_A_2256, port_a), (LMF_B_2256, port_b)] {
+        let resp =
+            crate::namf_server::test_namf_request_handler(lpp_subscription_as(supi, lmf, port))
+                .await;
+        assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    }
+    // B's transfer comes last, so B is what the last-writer fallback names.
+    for (lmf, corr) in [
+        (LMF_A_2256, "corr-2256-a"),
+        (LMF_B_2256, "corr-2256-b-longer"),
+    ] {
+        let resp =
+            crate::namf_server::test_namf_request_handler(lpp_transfer_as(supi, lmf, corr)).await;
+        assert_eq!(resp.status, 200, "{}", cause_of(&resp));
+    }
+
+    // Each downlink carries its own LMF's correlation in Additional information.
+    server.process_positioning_downlinks().await;
+    let downlinks: Vec<Vec<u8>> = take_sent_ngap(&mut server)
+        .into_iter()
+        .filter_map(|(_, pdu)| match decode_sent(&pdu) {
+            Sent::DownlinkNas {
+                amf_ue_ngap_id,
+                nas_pdu,
+            } if amf_ue_ngap_id == ue => Some(nas_pdu),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(downlinks.len(), 2, "one LPP downlink per transfer");
+    for (protected, corr) in downlinks
+        .iter()
+        .zip([&b"corr-2256-a"[..], &b"corr-2256-b-longer"[..]])
+    {
+        // NEA0: the plain DL NAS TRANSPORT follows the 7-octet security header.
+        let plain = &protected[7..];
+        let mut want = vec![0x7E, 0x00, 0x68, 0x03, 0x00, 0x03, 0x92, 0x22, 0x56];
+        want.extend_from_slice(&[0x24, corr.len() as u8]);
+        want.extend_from_slice(corr);
+        assert_eq!(
+            plain,
+            want.as_slice(),
+            "LPP downlink with Additional information"
+        );
+    }
+
+    // The UE answers A's session, then B's, each naming its correlation.
+    let answers = [
+        (&b"corr-2256-a"[..], [0xA1u8, 0x01], &mut rx_a, "A"),
+        (&b"corr-2256-b-longer"[..], [0xB2u8, 0x02], &mut rx_b, "B"),
+    ];
+    for (count, (corr, lpp, rx, lmf)) in (0u8..).zip(answers) {
+        let ul = ul_lpp(&lpp, Some(corr), count);
+        server
+            .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ul))
+            .await
+            .expect("handled");
+        let (json, n1) = next_notify(rx).await;
+        assert_eq!(n1, lpp, "LMF {lmf} gets its own session's answer, verbatim");
+        assert_eq!(
+            json["lcsCorrelationId"].as_str().map(str::as_bytes),
+            Some(corr),
+            "LMF {lmf}: {json}"
+        );
+        assert_eq!(json["n1MessageContainer"]["n1MessageClass"], "LPP");
+        assert_eq!(json["supi"], supi);
+    }
+
+    // No Additional information: the single-session fallback, the most recent
+    // LPP subscription (B's) with the most recent correlation (B's).
+    let ul = ul_lpp(&[0xC3, 0x03], None, 2);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ul))
+        .await
+        .expect("handled");
+    let (json, n1) = next_notify(&mut rx_b).await;
+    assert_eq!(n1, [0xC3, 0x03]);
+    assert_eq!(json["lcsCorrelationId"], "corr-2256-b-longer", "{json}");
+
+    // Each uplink made exactly one notification, so nothing else is in flight.
+    assert!(rx_a.try_recv().is_err(), "LMF A got only its own answer");
+    assert!(rx_b.try_recv().is_err(), "LMF B got only its own answers");
+    sink_a.stop().await.expect("stop");
+    sink_b.stop().await.expect("stop");
+    server.forget_ue(ue);
+}

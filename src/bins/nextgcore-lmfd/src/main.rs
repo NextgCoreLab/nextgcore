@@ -8863,7 +8863,9 @@ mod positioning_chain_strict_peer {
                                         g.positioning_dl_drain().into_iter().find_map(|d| match d
                                             .kind
                                         {
-                                            PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
+                                            PositioningDlKind::LppToUe { lpp_pdu, .. } => {
+                                                Some(lpp_pdu)
+                                            }
                                             _ => None,
                                         });
                                     corr.zip(lpp)
@@ -10289,7 +10291,7 @@ mod positioning_chain_strict_peer {
             g.positioning_dl_drain()
                 .into_iter()
                 .find_map(|d| match d.kind {
-                    PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
+                    PositioningDlKind::LppToUe { lpp_pdu, .. } => Some(lpp_pdu),
                     _ => None,
                 })
         }

@@ -10746,6 +10746,9 @@ impl NgapServer {
         let mut dnn_value: Option<String> = None;
         // #1036: the Request type (IEI 8-, TS 24.501 §9.11.3.47), value bits 3..1.
         let mut request_type: Option<u8> = None;
+        // #2256: Additional information (IEI 0x24, TLV, TS 24.501 §8.2.10.7): the
+        // routing information of an LPP/SLPP container (§5.4.5.2.5 cases c/c1).
+        let mut additional_information: Option<Vec<u8>> = None;
         let mut pos = 6 + container_len;
         while pos < nas.len() {
             match nas[pos] {
@@ -10765,6 +10768,13 @@ impl NgapServer {
                     let l = nas[pos + 1] as usize;
                     if pos + 2 + l <= nas.len() {
                         dnn_value = decode_dnn_labels(&nas[pos + 2..pos + 2 + l]);
+                    }
+                    pos += 2 + l;
+                }
+                crate::positioning::ADDITIONAL_INFORMATION_IEI if pos + 1 < nas.len() => {
+                    let l = nas[pos + 1] as usize;
+                    if pos + 2 + l <= nas.len() {
+                        additional_information = Some(nas[pos + 2..pos + 2 + l].to_vec());
                     }
                     pos += 2 + l;
                 }
@@ -10857,6 +10867,7 @@ impl NgapServer {
                     ran_ue_ngap_id,
                     container_type,
                     lpp,
+                    additional_information.as_deref(),
                 )
                 .await?;
             }
@@ -10888,10 +10899,28 @@ impl NgapServer {
     /// callback for this UE via `N1N2MessageSubscribe` (Wave-6 A3). The LPP PDU
     /// is opaque to the AMF and forwarded **verbatim** (transparent relay).
     ///
+    /// #2256, TS 24.501 §5.4.5.2.5 case c: the container goes "to the LMF
+    /// associated with the routing information included in the Additional
+    /// information IE". `additional_information` is that IE's value: the LCS
+    /// correlation id the LPP downlink carried (§5.4.5.3.2 case c), so the
+    /// notification goes to the subscription of the LMF that sent that downlink
+    /// ([`crate::context::AmfContext::n1n2_subscription_find_n1_routed`]) and
+    /// carries that correlation as `lcsCorrelationId`. Several LMFs, or several
+    /// sessions of one UE, each get their own answers.
+    ///
+    /// Fallback, the single-session behaviour from before #2256: an uplink with
+    /// no Additional information, one naming a correlation this AMF never sent,
+    /// or one whose LMF named no identity goes to the most recent LPP
+    /// subscription, tagged with the most recent correlation recorded for the UE
+    /// (last writer wins). That is right with one LMF and one session at a time,
+    /// and only then.
+    ///
     /// Fail-OPEN toward the UE: with NO registered LPP subscription the legacy
     /// abnormal action is preserved byte-for-byte — a Downlink NAS TRANSPORT
     /// echoing the payload with 5GMM cause #90 (TS 24.501 §5.4.5.3.1) — so the
     /// default matched-sim reg/PDU/ping path (UEs never send LPP) is unchanged.
+    /// So is an uplink whose routing information names an LMF that has no
+    /// subscription of its own: it is not handed to another LMF.
     async fn forward_ul_lpp_to_lmf(
         &mut self,
         association_id: u64,
@@ -10899,7 +10928,9 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         container_type: u8,
         lpp: Vec<u8>,
+        additional_information: Option<&[u8]>,
     ) -> Result<()> {
+        let routing = additional_information.and_then(crate::positioning::routing_correlation);
         // Resolve the UE's ueContextId (SUPI) — the N1N2 subscription registry
         // key (the NGAP server's own per-UE state first, the shared AMF context
         // as fallback), mirroring the uplink NRPPa relay.
@@ -10915,31 +10946,41 @@ impl NgapServer {
                     .and_then(|ue| ue.supi.clone())
             });
 
-        // A3 registry lookup (exact-class "LPP", fail-closed) + fallback LCS
-        // correlation captured from the originating N1N2MessageTransfer.
-        let (sub, fallback_corr) = {
+        // A3 registry lookup (exact-class "LPP", fail-closed), routed by the
+        // LMF the Additional information names (#2256), + the fallback LCS
+        // correlation captured from the latest N1N2MessageTransfer.
+        let (sub, fallback_corr, named_lmf) = {
             let ctx = crate::context::amf_self();
             let Ok(guard) = ctx.read() else {
                 return Ok(());
             };
             match supi.as_deref() {
-                Some(s) => (
-                    guard.n1n2_subscription_find_n1(s, "LPP"),
-                    guard.lcs_correlation_find(s),
-                ),
-                None => (None, None),
+                Some(s) => {
+                    let named_lmf = routing
+                        .as_deref()
+                        .and_then(|corr| guard.lcs_uplink_route_find(s, corr))
+                        .and_then(|route| route.lmf_id);
+                    (
+                        guard.n1n2_subscription_find_n1_routed(s, "LPP", named_lmf.as_deref()),
+                        guard.lcs_correlation_find(s),
+                        named_lmf,
+                    )
+                }
+                None => (None, None, None),
             }
         };
 
         if let Some(callback_uri) = sub.as_ref().and_then(|s| s.n1_notify_callback_uri.clone()) {
             let sub = sub.expect("callback_uri implies subscription");
-            let lcs_correlation_id = sub
-                .lcs_correlation_id
+            // The correlation the UE named is the session's; the rest is the
+            // single-session fallback.
+            let lcs_correlation_id = routing
                 .clone()
+                .or_else(|| sub.lcs_correlation_id.clone())
                 .or_else(|| fallback_corr.map(|r| r.lcs_correlation_id));
             log::info!(
                 "LCS: relaying uplink LPP N1 ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) to LMF \
-                 callback {callback_uri} (sub={})",
+                 callback {callback_uri} (sub={}, routing {routing:?}, LMF {named_lmf:?})",
                 lpp.len(),
                 sub.subscription_id,
                 callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
@@ -10959,8 +11000,12 @@ impl NgapServer {
         // DL NAS TRANSPORT echoing the payload with 5GMM cause #90.
         log::info!(
             "UL LPP positioning container ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) — no LMF N1 \
-             'LPP' subscription registered; replying 5GMM #90 (payload not forwarded)",
-            lpp.len()
+             'LPP' subscription registered{}; replying 5GMM #90 (payload not forwarded)",
+            lpp.len(),
+            named_lmf
+                .as_deref()
+                .map(|l| format!(" for LMF {l}, which its routing information names"))
+                .unwrap_or_default()
         );
         let plain = gmm_build::build_dl_nas_transport(
             None,
@@ -14065,8 +14110,14 @@ impl NgapServer {
                         Err(e) => log::warn!("LCS positioning DL NRPPa send failed: {e}"),
                     }
                 }
-                crate::context::PositioningDlKind::LppToUe { lpp_pdu } => {
-                    let Some(plain) = crate::positioning::build_lpp_dl_nas(&lpp_pdu) else {
+                crate::context::PositioningDlKind::LppToUe {
+                    lpp_pdu,
+                    lcs_correlation_id,
+                } => {
+                    let Some(plain) = crate::positioning::build_lpp_dl_nas(
+                        &lpp_pdu,
+                        lcs_correlation_id.as_deref(),
+                    ) else {
                         log::warn!(
                             "LCS positioning DL LPP build failed for UE {}",
                             item.amf_ue_ngap_id

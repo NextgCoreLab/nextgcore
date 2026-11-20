@@ -629,8 +629,17 @@ pub struct AmfContext {
     /// lcsCorrelationId / servingLMFIdentification): ueContextId -> the most
     /// recent correlation captured from an incoming positioning
     /// N1N2MessageTransfer, so the uplink leg can route back to the
-    /// originating LMF even without an explicit subscription.
+    /// originating LMF even without an explicit subscription. Last writer wins,
+    /// so it is only the fallback for an uplink that names no correlation of
+    /// [`Self::lcs_uplink_routes`] (#2256).
     lcs_correlations: RwLock<HashMap<String, LcsCorrelationRecord>>,
+
+    /// #2256, TS 24.501 §5.4.5.2.5 cases c/c1: ueContextId -> every LCS
+    /// correlation a positioning downlink carried to the UE in Additional
+    /// information, each with the LMF that sent it, oldest first and at most
+    /// [`MAX_LCS_UPLINK_ROUTES_PER_UE`]. An uplink LPP/SLPP's Additional
+    /// information names one of them, and so the LMF it goes to.
+    lcs_uplink_routes: RwLock<HashMap<String, Vec<LcsUplinkRoute>>>,
 
     /// AMFStatusChange subscriptions (TS 29.518 §5.2.2.5.1): subscriptionId ->
     /// the consumer's `amfStatusUri` + GUAMI interest. Drained by
@@ -749,8 +758,13 @@ pub enum PositioningDlKind {
         routing_id: Vec<u8>,
         nrppa_pdu: Vec<u8>,
     },
-    /// LPP message → UE (N1, DL NAS Transport with payload container type LPP).
-    LppToUe { lpp_pdu: Vec<u8> },
+    /// LPP message → UE (N1, DL NAS Transport with payload container type LPP),
+    /// with the LMF's LCS correlation id for the Additional information IE
+    /// (TS 24.501 §5.4.5.3.2 case c), which the UE's answer routes by (#2256).
+    LppToUe {
+        lpp_pdu: Vec<u8>,
+        lcs_correlation_id: Option<String>,
+    },
     /// UPDP message (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) → UE
     /// (N1, DL NAS Transport with payload container type "UE policy
     /// container" 0x05, TS 24.501 §9.11.3.40). Wave-6 E5: the PCF pushes it
@@ -1018,6 +1032,28 @@ pub struct LcsCorrelationRecord {
     /// Serving LMF identification (TS 29.572 LMFIdentification)
     pub serving_lmf_identification: Option<String>,
 }
+
+/// #2256: the LMF an LCS correlation id belongs to, for routing the UE's uplink
+/// LPP/SLPP that names it in Additional information (TS 24.501 §5.4.5.2.5
+/// cases c/c1). Recorded from each positioning N1N2MessageTransfer that carries
+/// `lcsCorrelationId` (TS 29.518 §6.1.6.2.3), which is what the AMF puts in the
+/// downlink's Additional information (§5.4.5.3.2 case c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LcsUplinkRoute {
+    /// The LCS correlation identifier (TS 29.572 CorrelationID).
+    pub lcs_correlation_id: String,
+    /// The NF Instance ID of the LMF that sent the downlink: its verified
+    /// identity, else the `n1MessageContainer.nfId` it declared (TS 29.518
+    /// §6.1.6.2.17, "shall be present when the n1MessageClass IE is set to
+    /// LPP"). `None` when it gave neither, so the AMF cannot tell its
+    /// subscription from another LMF's.
+    pub lmf_id: Option<String>,
+}
+
+/// The most LCS correlations [`AmfContext::lcs_uplink_route_record`] keeps per UE
+/// (#2256); past it the oldest is dropped. Bounds what an LMF minting a fresh
+/// correlation per downlink can make the AMF hold for one UE.
+pub const MAX_LCS_UPLINK_ROUTES_PER_UE: usize = 16;
 
 /// Which `AmfEventArea` alternative a consumer named that this AMF cannot evaluate
 /// the UE against (#400).
@@ -1525,6 +1561,7 @@ impl AmfContext {
             positioning_dl_queue: RwLock::new(Vec::new()),
             n1n2_subscriptions: RwLock::new(HashMap::new()),
             lcs_correlations: RwLock::new(HashMap::new()),
+            lcs_uplink_routes: RwLock::new(HashMap::new()),
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
             connected_downlink_queue: RwLock::new(Vec::new()),
@@ -1897,6 +1934,7 @@ impl AmfContext {
         if let Some(ref supi) = removed.supi {
             self.n1n2_subscriptions_remove_for_ue(supi);
             self.lcs_correlation_remove(supi);
+            self.lcs_uplink_routes_remove(supi);
         }
 
         log::debug!("AMF UE removed (id={id})");
@@ -1923,6 +1961,9 @@ impl AmfContext {
         }
         if let Ok(mut corr) = self.lcs_correlations.write() {
             corr.clear();
+        }
+        if let Ok(mut routes) = self.lcs_uplink_routes.write() {
+            routes.clear();
         }
     }
 
@@ -4052,6 +4093,103 @@ impl AmfContext {
         if let Ok(mut corr) = self.lcs_correlations.write() {
             corr.remove(ue_context_id);
         }
+    }
+
+    /// #2256: record that `route.lcs_correlation_id` belongs to `route.lmf_id`
+    /// for the UE's uplink. A correlation already bound to another LMF keeps
+    /// that binding and `false` is returned: the LMF that first used it owns the
+    /// UE's answers to it, and another cannot redirect them by reusing the id.
+    /// A re-record by the same LMF (or one naming none) is a no-op that keeps the
+    /// first identity it learnt. Past [`MAX_LCS_UPLINK_ROUTES_PER_UE`] the oldest
+    /// correlation is dropped.
+    pub fn lcs_uplink_route_record(&self, ue_context_id: &str, route: LcsUplinkRoute) -> bool {
+        let Ok(mut routes) = self.lcs_uplink_routes.write() else {
+            return false;
+        };
+        let list = routes.entry(ue_context_id.to_string()).or_default();
+        if let Some(known) = list
+            .iter_mut()
+            .find(|r| r.lcs_correlation_id == route.lcs_correlation_id)
+        {
+            return match (known.lmf_id.as_deref(), route.lmf_id.as_deref()) {
+                (Some(a), Some(b)) => nextgcore_sbi::owner_binding::same_nf_instance_id(a, b),
+                (None, Some(_)) => {
+                    known.lmf_id = route.lmf_id;
+                    true
+                }
+                (_, None) => true,
+            };
+        }
+        if list.len() >= MAX_LCS_UPLINK_ROUTES_PER_UE {
+            list.remove(0);
+        }
+        list.push(route);
+        true
+    }
+
+    /// #2256: the route recorded for `lcs_correlation_id` on a UE (clone-out).
+    pub fn lcs_uplink_route_find(
+        &self,
+        ue_context_id: &str,
+        lcs_correlation_id: &str,
+    ) -> Option<LcsUplinkRoute> {
+        self.lcs_uplink_routes.read().ok().and_then(|routes| {
+            routes
+                .get(ue_context_id)?
+                .iter()
+                .find(|r| r.lcs_correlation_id == lcs_correlation_id)
+                .cloned()
+        })
+    }
+
+    /// #2256: drop every uplink route of a UE (UE-context release path).
+    pub fn lcs_uplink_routes_remove(&self, ue_context_id: &str) {
+        if let Ok(mut routes) = self.lcs_uplink_routes.write() {
+            routes.remove(ue_context_id);
+        }
+    }
+
+    /// #2256, TS 24.501 §5.4.5.2.5 cases c/c1: the subscription an uplink
+    /// positioning N1 message of `n1_message_class` goes to when its routing
+    /// information names the LMF `lmf_id`.
+    ///
+    /// - `lmf_id` given: the most recent subscription of that class whose
+    ///   verified owner is that LMF; else the most recent one with no owner,
+    ///   which may be that LMF's (the AMF cannot tell). Never one another LMF
+    ///   owns: that would hand this LMF's session to the wrong LMF.
+    /// - `lmf_id` absent (no Additional information, a correlation this AMF never
+    ///   sent, or an LMF that named no identity): the single-session fallback,
+    ///   the most recent subscription of the class
+    ///   ([`Self::n1n2_subscription_find_n1`]).
+    pub fn n1n2_subscription_find_n1_routed(
+        &self,
+        ue_context_id: &str,
+        n1_message_class: &str,
+        lmf_id: Option<&str>,
+    ) -> Option<UeN1N2InfoSubscription> {
+        let Some(lmf_id) = lmf_id else {
+            return self.n1n2_subscription_find_n1(ue_context_id, n1_message_class);
+        };
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            let candidates: Vec<&UeN1N2InfoSubscription> = subs
+                .get(ue_context_id)?
+                .iter()
+                .rev()
+                .filter(|s| {
+                    s.n1_message_class.as_deref() == Some(n1_message_class)
+                        && s.n1_notify_callback_uri.is_some()
+                })
+                .collect();
+            candidates
+                .iter()
+                .find(|s| {
+                    s.owner.as_deref().is_some_and(|o| {
+                        nextgcore_sbi::owner_binding::same_nf_instance_id(o, lmf_id)
+                    })
+                })
+                .or_else(|| candidates.iter().find(|s| s.owner.is_none()))
+                .map(|s| (*s).clone())
+        })
     }
 
     // ========================================================================
@@ -7873,6 +8011,7 @@ mod tests {
             amf_ue_ngap_id: 9,
             kind: PositioningDlKind::LppToUe {
                 lpp_pdu: vec![0x90, 0x01],
+                lcs_correlation_id: None,
             },
         });
         // Wave-6 E5: the UPDP UE-policy downlink rides the same queue.
@@ -8013,12 +8152,110 @@ mod tests {
                 serving_lmf_identification: Some("LMF-1".to_string()),
             },
         );
+        assert!(ctx.lcs_uplink_route_record(
+            supi,
+            LcsUplinkRoute {
+                lcs_correlation_id: "corr-42".to_string(),
+                lmf_id: Some("LMF-1".to_string()),
+            },
+        ));
         assert_eq!(ctx.n1n2_subscription_count(supi), 1);
         assert!(ctx.lcs_correlation_find(supi).is_some());
+        assert!(ctx.lcs_uplink_route_find(supi, "corr-42").is_some());
 
         ctx.amf_ue_remove(amf_ue.id);
         assert_eq!(ctx.n1n2_subscription_count(supi), 0);
         assert!(ctx.lcs_correlation_find(supi).is_none());
+        assert!(ctx.lcs_uplink_route_find(supi, "corr-42").is_none());
+    }
+
+    /// #2256: each LCS correlation keeps the LMF that first used it, a second
+    /// LMF cannot take it over, and a UE holds at most
+    /// MAX_LCS_UPLINK_ROUTES_PER_UE of them, oldest dropped first.
+    #[test]
+    fn lcs_uplink_routes_keep_their_first_lmf_and_are_bounded() {
+        let ctx = AmfContext::new();
+        let supi = "imsi-001010000072256";
+        let route = |corr: &str, lmf: Option<&str>| LcsUplinkRoute {
+            lcs_correlation_id: corr.to_string(),
+            lmf_id: lmf.map(str::to_string),
+        };
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-a", Some("lmf-a"))));
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-b", Some("lmf-b"))));
+        assert!(
+            !ctx.lcs_uplink_route_record(supi, route("c-a", Some("lmf-b"))),
+            "another LMF cannot take a correlation over"
+        );
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-a", Some("LMF-A"))));
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-a", None)));
+        assert_eq!(
+            ctx.lcs_uplink_route_find(supi, "c-a"),
+            Some(route("c-a", Some("lmf-a")))
+        );
+        assert_eq!(
+            ctx.lcs_uplink_route_find(supi, "c-b"),
+            Some(route("c-b", Some("lmf-b")))
+        );
+        assert!(ctx.lcs_uplink_route_find(supi, "c-x").is_none());
+        assert!(ctx.lcs_uplink_route_find("imsi-other", "c-a").is_none());
+
+        // An identity learnt later fills one that was unknown.
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-n", None)));
+        assert!(ctx.lcs_uplink_route_record(supi, route("c-n", Some("lmf-n"))));
+        assert_eq!(
+            ctx.lcs_uplink_route_find(supi, "c-n"),
+            Some(route("c-n", Some("lmf-n")))
+        );
+
+        for n in 0..MAX_LCS_UPLINK_ROUTES_PER_UE {
+            assert!(ctx.lcs_uplink_route_record(supi, route(&format!("c-{n}"), None)));
+        }
+        assert!(
+            ctx.lcs_uplink_route_find(supi, "c-a").is_none(),
+            "the oldest is dropped past the bound"
+        );
+        assert!(ctx.lcs_uplink_route_find(supi, "c-0").is_some());
+        assert!(ctx
+            .lcs_uplink_route_find(supi, &format!("c-{}", MAX_LCS_UPLINK_ROUTES_PER_UE - 1))
+            .is_some());
+    }
+
+    /// #2256: a routed uplink goes to the subscription the named LMF owns, else
+    /// to an ownerless one, never to one another LMF owns; with no LMF named it
+    /// is the most recent subscription of the class, as before.
+    #[test]
+    fn a_routed_uplink_finds_the_named_lmfs_subscription() {
+        let ctx = AmfContext::new();
+        let supi = "imsi-001010000072257";
+        let sub = |id: &str, owner: Option<&str>| UeN1N2InfoSubscription {
+            owner: owner.map(str::to_string),
+            subscription_id: id.to_string(),
+            n1_message_class: Some("LPP".to_string()),
+            n1_notify_callback_uri: Some(format!("http://{id}/n1")),
+            n2_information_class: None,
+            n2_notify_callback_uri: None,
+            lcs_correlation_id: None,
+        };
+        let found = |lmf: Option<&str>| {
+            ctx.n1n2_subscription_find_n1_routed(supi, "LPP", lmf)
+                .map(|s| s.subscription_id)
+        };
+        assert!(ctx.n1n2_subscription_add(supi, sub("a", Some("lmf-a"))));
+        assert!(ctx.n1n2_subscription_add(supi, sub("b", Some("lmf-b"))));
+        assert_eq!(found(Some("lmf-a")).as_deref(), Some("a"));
+        assert_eq!(found(Some("LMF-B")).as_deref(), Some("b"));
+        assert_eq!(found(None).as_deref(), Some("b"), "the fallback");
+        assert_eq!(
+            found(Some("lmf-c")),
+            None,
+            "never a subscription another LMF owns"
+        );
+        assert!(ctx.n1n2_subscription_add(supi, sub("anon", None)));
+        assert_eq!(found(Some("lmf-c")).as_deref(), Some("anon"));
+        assert_eq!(found(Some("lmf-a")).as_deref(), Some("a"));
+        assert!(ctx
+            .n1n2_subscription_find_n1_routed(supi, "SMS", Some("lmf-a"))
+            .is_none());
     }
 
     #[test]

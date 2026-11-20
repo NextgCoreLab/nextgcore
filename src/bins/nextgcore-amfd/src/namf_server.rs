@@ -5809,6 +5809,43 @@ fn try_positioning_relay(
         }
     }
 
+    // #2256, TS 24.501 §5.4.5.3.2 case c: the LPP downlink carries this
+    // correlation in Additional information and the UE's answer names it again
+    // (§5.4.5.2.5 case c), so remember which LMF it belongs to. That is the
+    // caller's verified identity, else the nfId it declared (TS 29.518
+    // §6.1.6.2.17, "shall be present when the n1MessageClass IE is set to LPP").
+    let lcs_correlation_id = body
+        .get("lcsCorrelationId")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    if let (true, Some(corr)) = (is_lpp, lcs_correlation_id.as_deref()) {
+        let lmf_id = nextgcore_sbi::owner_binding::verified_consumer_id(request)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                body.pointer("/n1MessageContainer/nfId")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(String::from)
+            });
+        let route = crate::context::LcsUplinkRoute {
+            lcs_correlation_id: corr.to_string(),
+            lmf_id: lmf_id.clone(),
+        };
+        let recorded = amf_self()
+            .read()
+            .map(|context| context.lcs_uplink_route_record(ue_context_id, route))
+            .unwrap_or(false);
+        if !recorded {
+            log::warn!(
+                "[{ue_context_id}] LPP transfer from LMF {lmf_id:?} reuses LCS correlation \
+                 {corr:?}, which belongs to another LMF: the UE's answers to it still go to \
+                 that LMF"
+            );
+        }
+    }
+
     let mut downlinks: Vec<PendingPositioningDl> = Vec::new();
 
     // LPP → UE (N1, DL NAS Transport, payload container type LPP).
@@ -5825,7 +5862,10 @@ fn try_positioning_relay(
         };
         downlinks.push(PendingPositioningDl {
             amf_ue_ngap_id: ue.id,
-            kind: PositioningDlKind::LppToUe { lpp_pdu },
+            kind: PositioningDlKind::LppToUe {
+                lpp_pdu,
+                lcs_correlation_id,
+            },
         });
     }
 
@@ -5938,7 +5978,7 @@ fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> 
     body.to_string().hash(&mut h);
     for dl in downlinks {
         match &dl.kind {
-            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::LppToUe { lpp_pdu, .. } => (0u8, lpp_pdu).hash(&mut h),
             PositioningDlKind::NrppaToGnb {
                 routing_id,
                 nrppa_pdu,
