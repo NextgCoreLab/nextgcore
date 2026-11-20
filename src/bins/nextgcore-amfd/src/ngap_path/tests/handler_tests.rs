@@ -3549,7 +3549,6 @@ fn decoded_error_indication(pdu: &[u8]) -> Option<(Option<u64>, Option<u32>, Opt
 /// Every gNB->AMF UE-associated message of the #739 table and of the #787 / #805
 /// follow-ups, naming `(amf, ran)`.
 fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
-    use nextgcore_ngap::builder as b;
     use nextgcore_ngap::types as t;
     let uli = super::test_user_location(1, 0x10);
     let radio_cap = nextgcore_ngap_gen::encode(&g::NGAP_PDU::InitiatingMessage(
@@ -3602,16 +3601,15 @@ fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
     vec![
         (
             "InitialContextSetupResponse",
-            b::build_initial_context_setup_response(&t::InitialContextSetupResponse {
+            crate::gnb_pdus::initial_context_setup_response(&t::InitialContextSetupResponse {
                 amf_ue_ngap_id: amf,
                 ran_ue_ngap_id: ran,
-            })
-            .unwrap(),
+            }),
         ),
         ("UplinkUEAssociatedNRPPaTransport", nrppa),
         (
             "PDUSessionResourceNotify",
-            b::build_pdu_session_resource_notify(&t::PduSessionResourceNotify {
+            crate::gnb_pdus::pdu_session_resource_notify(&t::PduSessionResourceNotify {
                 amf_ue_ngap_id: amf,
                 ran_ue_ngap_id: ran,
                 notify_list: vec![t::PduSessionResourceNotifyItem {
@@ -3619,19 +3617,17 @@ fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
                     transfer: vec![0x00],
                 }],
                 released_list: Vec::new(),
-            })
-            .unwrap(),
+            }),
         ),
         ("UERadioCapabilityInfoIndication", radio_cap),
         (
             "UplinkNASTransport",
-            b::build_uplink_nas_transport(&t::UplinkNasTransport {
+            crate::gnb_pdus::uplink_nas_transport(&t::UplinkNasTransport {
                 amf_ue_ngap_id: amf,
                 ran_ue_ngap_id: ran,
                 nas_pdu: vec![0x7E, 0x00, 0x67],
                 user_location_info: uli,
-            })
-            .unwrap(),
+            }),
         ),
         (
             "UplinkRANStatusTransfer",
@@ -3639,21 +3635,19 @@ fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "UEContextReleaseRequest",
-            b::build_ue_context_release_request(&t::UeContextReleaseRequest {
+            crate::gnb_pdus::ue_context_release_request(&t::UeContextReleaseRequest {
                 amf_ue_ngap_id: amf,
                 ran_ue_ngap_id: ran,
                 cause: t::Cause::RadioNetwork(t::CauseRadioNetwork::RadioConnectionWithUeLost),
-            })
-            .unwrap(),
+            }),
         ),
         (
             "HandoverCancel",
-            b::build_handover_cancel(&t::HandoverCancel {
+            crate::gnb_pdus::handover_cancel(&t::HandoverCancel {
                 amf_ue_ngap_id: amf,
                 ran_ue_ngap_id: ran,
                 cause: t::Cause::RadioNetwork(t::CauseRadioNetwork::HandoverCancelled),
-            })
-            .unwrap(),
+            }),
         ),
     ]
 }
@@ -5348,7 +5342,7 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
     let sent = take_sent_ngap(&mut server);
     assert!(decode_ics(&sent[0].1).is_some(), "the ICS went out");
 
-    let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
+    let failure = crate::gnb_pdus::initial_context_setup_failure(
         &nextgcore_ngap::types::InitialContextSetupFailure {
             amf_ue_ngap_id: new_id,
             ran_ue_ngap_id: 512,
@@ -5356,8 +5350,7 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
                 nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
             ),
         },
-    )
-    .expect("encode an Initial Context Setup Failure");
+    );
     server
         .handle_initial_context_setup_failure(ASSOC, &failure)
         .await

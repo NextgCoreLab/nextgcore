@@ -615,6 +615,271 @@ pub(crate) fn path_switch_request(m: &t::PathSwitchRequest) -> Vec<u8> {
     )
 }
 
+/// An NR-CGIList `SIZE(1..16384)`: count-1 in two aligned octets (range
+/// 16384, §11.5.7.3), then each NR-CGI.
+fn nr_cgi_list(b: &mut Bits, cells: &[t::NrCgi]) {
+    assert!(!cells.is_empty());
+    b.octets(&(cells.len() as u16 - 1).to_be_bytes());
+    for c in cells {
+        nr_cgi(b, c.plmn_identity, c.nr_cell_identity);
+    }
+}
+
+fn nr_cells(list: &t::PwsCellList) -> &[t::NrCgi] {
+    match list {
+        t::PwsCellList::Nr(cells) => cells,
+        t::PwsCellList::Eutra(_) => panic!("E-UTRA cell lists are not derived here"),
+    }
+}
+
+fn global_ran_node_id_value(id: &t::GlobalRanNodeId) -> Vec<u8> {
+    let mut b = Bits::default();
+    global_ran_node_id(&mut b, id);
+    b.finish()
+}
+
+/// PWS RESTART INDICATION (§9.2.8.4) from a gNB: initiatingMessage,
+/// id-PWSRestartIndication 34, ignore:
+/// - id 16 CellIDListForRestart (reject): CHOICE of three (not extensible)
+///   nR-CGIListforRestart `01`, padded, then [`nr_cgi_list`];
+/// - id 27 GlobalRANNodeID (reject): [`global_ran_node_id`];
+/// - id 104 TAIListForRestart (reject): `SIZE(1..2048)`, count-1 in two
+///   aligned octets (range 2048); per TAI extension `0`, iE-Extensions `0`,
+///   the PLMN and TAC. No Emergency Area ID list.
+pub(crate) fn pws_restart_indication(m: &t::PwsRestartIndication) -> Vec<u8> {
+    assert!(
+        m.emergency_area_id_list_for_restart.is_empty(),
+        "the Emergency Area ID list is not derived here"
+    );
+    let mut cells = Bits::default();
+    cells.field(1, 2);
+    nr_cgi_list(&mut cells, nr_cells(&m.cell_list));
+    let mut tais = Bits::default();
+    tais.octets(&(m.tai_list_for_restart.len() as u16 - 1).to_be_bytes());
+    for tai in &m.tai_list_for_restart {
+        tais.field(0, 2).octets(&tai.tai_plmn).octets(&tai.tai_tac);
+    }
+    pdu(
+        0,
+        34,
+        1,
+        &[
+            (16, 0, cells.finish()),
+            (27, 0, global_ran_node_id_value(&m.global_ran_node_id)),
+            (104, 0, tais.finish()),
+        ],
+    )
+}
+
+/// PWS FAILURE INDICATION (§9.2.8.6) for any number of failed NR cells: as
+/// [`pws_failure_indication`], with the list's count-1 in its two octets.
+pub(crate) fn pws_failure(m: &t::PwsFailureIndication) -> Vec<u8> {
+    let mut cells = Bits::default();
+    cells.field(1, 2);
+    nr_cgi_list(&mut cells, nr_cells(&m.failed_cell_list));
+    pdu(
+        0,
+        33,
+        1,
+        &[
+            (81, 0, cells.finish()),
+            (27, 0, global_ran_node_id_value(&m.global_ran_node_id)),
+        ],
+    )
+}
+
+/// [`write_replace_warning_request`] from the domain struct: only the members
+/// that derivation covers may be set.
+pub(crate) fn write_replace_warning(m: &t::WriteReplaceWarningRequest) -> Vec<u8> {
+    assert!(
+        m.warning_area_list.is_none()
+            && m.warning_type.is_none()
+            && m.warning_security_info.is_none()
+            && !m.concurrent_warning_message_indicator
+            && m.warning_area_coordinates.is_none(),
+        "only the Data Coding Scheme and Warning Message Contents options are derived here"
+    );
+    write_replace_warning_request(
+        m.message_identifier,
+        m.serial_number,
+        m.repetition_period,
+        m.number_of_broadcasts_requested,
+        m.data_coding_scheme.expect("a Data Coding Scheme"),
+        m.warning_message_contents.as_deref().expect("contents"),
+    )
+}
+
+/// [`write_replace_warning_response`] from the domain struct, with no
+/// Broadcast Completed Area List and no Criticality Diagnostics.
+pub(crate) fn write_replace_warning_answer(m: &t::WriteReplaceWarningResponse) -> Vec<u8> {
+    assert!(
+        m.broadcast_completed_area_list.is_none() && m.criticality_diagnostics.is_none(),
+        "the optional lists are not derived here"
+    );
+    write_replace_warning_response(m.message_identifier, m.serial_number, None)
+}
+
+/// PWS CANCEL RESPONSE (§9.2.8.4): successfulOutcome, id-PWSCancel 32,
+/// reject; ids 35 and 95 (reject). No Broadcast Cancelled Area List, no
+/// Criticality Diagnostics.
+pub(crate) fn pws_cancel_response(m: &t::PwsCancelResponse) -> Vec<u8> {
+    assert!(
+        m.broadcast_cancelled_area_list.is_none() && m.criticality_diagnostics.is_none(),
+        "the optional lists are not derived here"
+    );
+    pdu(
+        1,
+        32,
+        0,
+        &[
+            (35, 0, sixteen_bits(m.message_identifier)),
+            (95, 0, sixteen_bits(m.serial_number)),
+        ],
+    )
+}
+
+/// The PDU session item lists of a session-management response: each
+/// `SEQUENCE (SIZE(1..256)) OF` an item of the same shape (pDUSessionID, its
+/// transfer as an `OCTET STRING (CONTAINING ...)`, iE-Extensions, `...`), so
+/// [`session_list`]; an empty list is the optional IE left out.
+macro_rules! items {
+    ($list:expr) => {
+        $list
+            .iter()
+            .map(|i| (i.pdu_session_id, i.transfer.as_slice()))
+            .collect::<Vec<(u8, &[u8])>>()
+    };
+}
+
+/// The two UE NGAP IDs at `criticality`, then each non-empty list as its IE.
+fn session_response(
+    amf: u64,
+    ran: u32,
+    id_criticality: u8,
+    lists: &[(u16, u8, Vec<(u8, &[u8])>)],
+) -> Vec<(u16, u8, Vec<u8>)> {
+    let mut ies = vec![
+        (10, id_criticality, crate::aper_golden::amf_ue_ngap_id(amf)),
+        (85, id_criticality, crate::aper_golden::ran_ue_ngap_id(ran)),
+    ];
+    for (id, criticality, items) in lists {
+        if !items.is_empty() {
+            ies.push((*id, *criticality, session_list(items)));
+        }
+    }
+    ies
+}
+
+/// PDU SESSION RESOURCE SETUP RESPONSE (§9.2.1.2): successfulOutcome,
+/// id-PDUSessionResourceSetup 29, reject; ids 10, 85 (ignore); id 75
+/// PDUSessionResourceSetupListSURes and id 58
+/// PDUSessionResourceFailedToSetupListSURes (ignore).
+pub(crate) fn pdu_session_resource_setup_response(
+    m: &t::PduSessionResourceSetupResponse,
+) -> Vec<u8> {
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        1,
+        &[
+            (75, 1, items!(m.setup_list)),
+            (58, 1, items!(m.failed_list)),
+        ],
+    );
+    pdu(1, 29, 0, &ies)
+}
+
+/// PDU SESSION RESOURCE MODIFY RESPONSE (§9.2.1.4): successfulOutcome,
+/// id-PDUSessionResourceModify 26, reject; ids 10, 85 (ignore); id 65
+/// PDUSessionResourceModifyListModRes and id 54
+/// PDUSessionResourceFailedToModifyListModRes (ignore).
+pub(crate) fn pdu_session_resource_modify_response(
+    m: &t::PduSessionResourceModifyResponse,
+) -> Vec<u8> {
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        1,
+        &[
+            (65, 1, items!(m.modify_list)),
+            (54, 1, items!(m.failed_list)),
+        ],
+    );
+    pdu(1, 26, 0, &ies)
+}
+
+/// PDU SESSION RESOURCE RELEASE RESPONSE (§9.2.1.6): successfulOutcome,
+/// id-PDUSessionResourceRelease 28, reject; ids 10, 85 (ignore); id 70
+/// PDUSessionResourceReleasedListRelRes (ignore, mandatory).
+pub(crate) fn pdu_session_resource_release_response(
+    m: &t::PduSessionResourceReleaseResponse,
+) -> Vec<u8> {
+    assert!(
+        !m.released_list.is_empty(),
+        "the released list is mandatory"
+    );
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        1,
+        &[(70, 1, items!(m.released_list))],
+    );
+    pdu(1, 28, 0, &ies)
+}
+
+/// PDU SESSION RESOURCE NOTIFY (§9.2.1.7): initiatingMessage,
+/// id-PDUSessionResourceNotify 30, ignore; ids 10, 85 (reject); id 66
+/// PDUSessionResourceNotifyList (reject); id 67
+/// PDUSessionResourceReleasedListNot (ignore).
+pub(crate) fn pdu_session_resource_notify(m: &t::PduSessionResourceNotify) -> Vec<u8> {
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        0,
+        &[
+            (66, 0, items!(m.notify_list)),
+            (67, 1, items!(m.released_list)),
+        ],
+    );
+    pdu(0, 30, 1, &ies)
+}
+
+/// PDU SESSION RESOURCE MODIFY INDICATION (§9.2.1.8): initiatingMessage,
+/// id-PDUSessionResourceModifyIndication 27, reject; ids 10, 85 (reject); id
+/// 63 PDUSessionResourceModifyListModInd (reject, mandatory).
+pub(crate) fn pdu_session_resource_modify_indication(
+    m: &t::PduSessionResourceModifyIndication,
+) -> Vec<u8> {
+    assert!(!m.modify_list.is_empty(), "the modify list is mandatory");
+    let ies = session_response(
+        m.amf_ue_ngap_id,
+        m.ran_ue_ngap_id,
+        0,
+        &[(63, 0, items!(m.modify_list))],
+    );
+    pdu(0, 27, 0, &ies)
+}
+
+/// INITIAL CONTEXT SETUP RESPONSE (§9.2.2.2) with no session lists:
+/// successfulOutcome, id-InitialContextSetup 14, reject; ids 10, 85 (ignore).
+pub(crate) fn initial_context_setup_response(m: &t::InitialContextSetupResponse) -> Vec<u8> {
+    pdu(
+        1,
+        14,
+        0,
+        &session_response(m.amf_ue_ngap_id, m.ran_ue_ngap_id, 1, &[]),
+    )
+}
+
+/// INITIAL CONTEXT SETUP FAILURE (§9.2.2.3) with no session list:
+/// unsuccessfulOutcome, id-InitialContextSetup 14, reject; ids 10, 85 and id
+/// 15 Cause, all ignore.
+pub(crate) fn initial_context_setup_failure(m: &t::InitialContextSetupFailure) -> Vec<u8> {
+    let mut ies = session_response(m.amf_ue_ngap_id, m.ran_ue_ngap_id, 1, &[]);
+    ies.push((15, 1, cause_value(&m.cause)));
+    pdu(2, 14, 0, &ies)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,16 +905,27 @@ mod tests {
                 g::InitiatingMessageValue::Id_HandoverCancel(v) => (10, ies!(v)),
                 g::InitiatingMessageValue::Id_HandoverNotification(v) => (11, ies!(v)),
                 g::InitiatingMessageValue::Id_PathSwitchRequest(v) => (25, ies!(v)),
+                g::InitiatingMessageValue::Id_PWSRestartIndication(v) => (34, ies!(v)),
+                g::InitiatingMessageValue::Id_PDUSessionResourceNotify(v) => (30, ies!(v)),
+                g::InitiatingMessageValue::Id_PDUSessionResourceModifyIndication(v) => {
+                    (27, ies!(v))
+                }
                 other => panic!("unexpected {other:?}"),
             },
             g::NGAP_PDU::SuccessfulOutcome(m) => match m.value {
                 g::SuccessfulOutcomeValue::Id_WriteReplaceWarning(v) => (51, ies!(v)),
                 g::SuccessfulOutcomeValue::Id_UEContextRelease(v) => (41, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PWSCancel(v) => (32, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(v) => (29, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PDUSessionResourceModify(v) => (26, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(v) => (28, ies!(v)),
+                g::SuccessfulOutcomeValue::Id_InitialContextSetup(v) => (14, ies!(v)),
                 g::SuccessfulOutcomeValue::Id_HandoverResourceAllocation(v) => (13, ies!(v)),
                 other => panic!("unexpected {other:?}"),
             },
             g::NGAP_PDU::UnsuccessfulOutcome(m) => match m.value {
                 g::UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(v) => (13, ies!(v)),
+                g::UnsuccessfulOutcomeValue::Id_InitialContextSetup(v) => (14, ies!(v)),
                 other => panic!("unexpected {other:?}"),
             },
         }
@@ -1076,5 +1352,192 @@ mod tests {
         expected.extend_from_slice(&[0x00, 0x4c, 0x00, 0x05, 0x00, 0x00, 0x01, 0x01, 0x00]);
         assert_eq!(pdu, expected);
         assert_eq!(ids(&pdu), (25, vec![85, 100, 121, 119, 76]));
+    }
+
+    #[test]
+    fn pws_restart_and_cancel_response_are_the_worked_octets() {
+        let gnb = t::GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: plmn(),
+            gnb_id: 0x686,
+            gnb_id_len: 32,
+        };
+        let restart = pws_restart_indication(&t::PwsRestartIndication {
+            cell_list: t::PwsCellList::Nr(vec![t::NrCgi {
+                plmn_identity: plmn(),
+                nr_cell_identity: 0x686,
+            }]),
+            global_ran_node_id: gnb.clone(),
+            tai_list_for_restart: vec![t::TaiListItem {
+                tai_plmn: plmn(),
+                tai_tac: [0x00, 0x00, 0x74],
+            }],
+            emergency_area_id_list_for_restart: Vec::new(),
+        });
+        assert_eq!(
+            restart,
+            [
+                0x00, 0x22, 0x40, 0x2d, 0x00, 0x00, 0x03, // initiatingMessage, 34, ignore, 45
+                // CellIDListForRestart (reject, 12): `01` + pad, count-1 `00 00`,
+                // NR-CGI `00` + pad, PLMN, NCI 0x686 in 36 bits.
+                0x00, 0x10, 0x00, 0x0c, 0x40, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00,
+                0x68, 0x60, //
+                // GlobalRANNodeID (reject, 9): `00 00` + pad, PLMN, `0 1010` + pad, 32 bits.
+                0x00, 0x1b, 0x00, 0x09, 0x00, 0x00, 0xf1, 0x10, 0x50, 0x00, 0x00, 0x06, 0x86,
+                // TAIListForRestart (reject, 9): count-1 `00 00`, `00` + pad, PLMN, TAC.
+                0x00, 0x68, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x74,
+            ]
+        );
+        assert_eq!(ids(&restart), (34, vec![16, 27, 104]));
+        // The two-cell failure indication: count-1 `00 01`.
+        let failure = pws_failure(&t::PwsFailureIndication {
+            failed_cell_list: t::PwsCellList::Nr(vec![
+                t::NrCgi {
+                    plmn_identity: plmn(),
+                    nr_cell_identity: 1,
+                },
+                t::NrCgi {
+                    plmn_identity: plmn(),
+                    nr_cell_identity: 2,
+                },
+            ]),
+            global_ran_node_id: gnb,
+        });
+        assert_eq!(&failure[11..14], [0x40, 0x00, 0x01]);
+        assert_eq!(ids(&failure), (33, vec![81, 27]));
+        let cancel = pws_cancel_response(&t::PwsCancelResponse {
+            message_identifier: 0xB399,
+            serial_number: 0xC399,
+            broadcast_cancelled_area_list: None,
+            criticality_diagnostics: None,
+        });
+        assert_eq!(
+            cancel,
+            [
+                0x20, 0x20, 0x00, 0x0f, 0x00, 0x00, 0x02, // successfulOutcome, 32, reject
+                0x00, 0x23, 0x00, 0x02, 0xb3, 0x99, //
+                0x00, 0x5f, 0x00, 0x02, 0xc3, 0x99,
+            ]
+        );
+        assert_eq!(ids(&cancel), (32, vec![35, 95]));
+    }
+
+    #[test]
+    fn session_management_responses_are_the_worked_octets() {
+        // Setup Response, one set-up session (PSI 1, transfer `a1`) and one
+        // failed (PSI 2, `c1`): successfulOutcome `20`, 29 `1d`, reject.
+        let setup = pdu_session_resource_setup_response(&t::PduSessionResourceSetupResponse {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            setup_list: vec![t::PduSessionResourceSetupResponseItem {
+                pdu_session_id: 1,
+                transfer: vec![0xa1],
+            }],
+            failed_list: vec![t::PduSessionResourceFailedItem {
+                pdu_session_id: 2,
+                transfer: vec![0xc1],
+            }],
+        });
+        assert_eq!(
+            setup,
+            [
+                0x20, 0x1d, 0x00, 0x21, 0x00, 0x00, 0x04, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x4b, 0x40, 0x05, 0x00, 0x00, 0x01, 0x01, 0xa1, // id 75
+                0x00, 0x3a, 0x40, 0x05, 0x00, 0x00, 0x02, 0x01, 0xc1, // id 58
+            ]
+        );
+        assert_eq!(ids(&setup), (29, vec![10, 85, 75, 58]));
+        // Notify: initiatingMessage, 30 `1e`, ignore; ids at reject; the notify
+        // list at reject, no released list.
+        let notify = pdu_session_resource_notify(&t::PduSessionResourceNotify {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            notify_list: vec![t::PduSessionResourceNotifyItem {
+                pdu_session_id: 5,
+                transfer: vec![0x51],
+            }],
+            released_list: Vec::new(),
+        });
+        assert_eq!(
+            notify,
+            [
+                0x00, 0x1e, 0x40, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x02, //
+                0x00, 0x42, 0x00, 0x05, 0x00, 0x00, 0x05, 0x01, 0x51, // id 66
+            ]
+        );
+        assert_eq!(ids(&notify), (30, vec![10, 85, 66]));
+        let modify = pdu_session_resource_modify_response(&t::PduSessionResourceModifyResponse {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            modify_list: vec![t::PduSessionResourceModifyResponseItem {
+                pdu_session_id: 2,
+                transfer: vec![0x21],
+            }],
+            failed_list: Vec::new(),
+        });
+        assert_eq!(&modify[..4], [0x20, 0x1a, 0x00, 0x18]);
+        assert_eq!(ids(&modify), (26, vec![10, 85, 65]));
+        let release =
+            pdu_session_resource_release_response(&t::PduSessionResourceReleaseResponse {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 2,
+                released_list: vec![t::PduSessionResourceReleasedItem {
+                    pdu_session_id: 3,
+                    transfer: Vec::new(),
+                }],
+            });
+        // An empty transfer is its zero length octet.
+        assert_eq!(
+            &release[release.len() - 8..],
+            [0x00, 0x46, 0x40, 0x04, 0x00, 0x00, 0x03, 0x00]
+        );
+        assert_eq!(ids(&release), (28, vec![10, 85, 70]));
+        let indication =
+            pdu_session_resource_modify_indication(&t::PduSessionResourceModifyIndication {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 2,
+                modify_list: vec![t::PduSessionResourceModifyIndicationItem {
+                    pdu_session_id: 6,
+                    transfer: vec![0x61],
+                }],
+            });
+        assert_eq!(&indication[..4], [0x00, 0x1b, 0x00, 0x18]);
+        assert_eq!(ids(&indication), (27, vec![10, 85, 63]));
+    }
+
+    #[test]
+    fn initial_context_setup_outcomes_are_the_worked_octets() {
+        let response = initial_context_setup_response(&t::InitialContextSetupResponse {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+        });
+        assert_eq!(
+            response,
+            [
+                0x20, 0x0e, 0x00, 0x0f, 0x00, 0x00, 0x02, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02,
+            ]
+        );
+        assert_eq!(ids(&response), (14, vec![10, 85]));
+        let failure = initial_context_setup_failure(&t::InitialContextSetupFailure {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            cause: t::Cause::RadioNetwork(t::CauseRadioNetwork::Unspecified),
+        });
+        // unsuccessfulOutcome `40`; Cause radioNetwork 0 `000 0 000000` -> `00 00`.
+        assert_eq!(
+            failure,
+            [
+                0x40, 0x0e, 0x00, 0x15, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x0f, 0x40, 0x02, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(ids(&failure), (14, vec![10, 85, 15]));
     }
 }

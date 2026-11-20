@@ -25546,13 +25546,12 @@ mod tests {
         assert!(!state.initial_context_setup_response_received);
 
         // The gNB confirms: parse a real ICS Response and apply the gate.
-        let resp = nextgcore_ngap::builder::build_initial_context_setup_response(
+        let resp = crate::gnb_pdus::initial_context_setup_response(
             &nextgcore_ngap::types::InitialContextSetupResponse {
                 amf_ue_ngap_id: 1,
                 ran_ue_ngap_id: 2,
             },
-        )
-        .expect("build resp");
+        );
         let parsed = crate::ngap_asn1::decode_initial_context_setup_response_asn1(&resp);
         assert!(matches!(
             parsed,
@@ -28408,7 +28407,7 @@ mod tests {
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_480u64, 1_442_007u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 67).await;
-        let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
+        let failure = crate::gnb_pdus::initial_context_setup_failure(
             &nextgcore_ngap::types::InitialContextSetupFailure {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 67,
@@ -28416,8 +28415,7 @@ mod tests {
                     nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
                 ),
             },
-        )
-        .expect("encode an Initial Context Setup Failure");
+        );
         ngap.handle_initial_context_setup_failure(base + 1, &failure)
             .await
             .expect("handled");
@@ -29305,22 +29303,19 @@ mod tests {
 
     /// A conformant WRITE-REPLACE WARNING REQUEST, as the CBCF's container.
     fn pws_warning_pdu(message_identifier: u16, serial_number: u16) -> Vec<u8> {
-        nextgcore_ngap::builder::build_write_replace_warning_request(
-            &nextgcore_ngap::types::WriteReplaceWarningRequest {
-                message_identifier,
-                serial_number,
-                warning_area_list: None,
-                repetition_period: 32,
-                number_of_broadcasts_requested: 2,
-                warning_type: None,
-                warning_security_info: None,
-                data_coding_scheme: Some(0x01),
-                warning_message_contents: Some(b"FLOOD".to_vec()),
-                concurrent_warning_message_indicator: false,
-                warning_area_coordinates: None,
-            },
-        )
-        .expect("build WRITE-REPLACE WARNING REQUEST")
+        crate::gnb_pdus::write_replace_warning(&nextgcore_ngap::types::WriteReplaceWarningRequest {
+            message_identifier,
+            serial_number,
+            warning_area_list: None,
+            repetition_period: 32,
+            number_of_broadcasts_requested: 2,
+            warning_type: None,
+            warning_security_info: None,
+            data_coding_scheme: Some(0x01),
+            warning_message_contents: Some(b"FLOOD".to_vec()),
+            concurrent_warning_message_indicator: false,
+            warning_area_coordinates: None,
+        })
     }
 
     /// The whole point of criterion 3: **assert the encoded NGAP PDU the gNB
@@ -29773,15 +29768,12 @@ mod tests {
             );
         }
 
-        let pdu = nextgcore_ngap::builder::build_pws_cancel_response(
-            &nextgcore_ngap::types::PwsCancelResponse {
-                message_identifier: mid,
-                serial_number: sn,
-                broadcast_cancelled_area_list: None,
-                criticality_diagnostics: None,
-            },
-        )
-        .expect("build PWS CANCEL RESPONSE");
+        let pdu = crate::gnb_pdus::pws_cancel_response(&nextgcore_ngap::types::PwsCancelResponse {
+            message_identifier: mid,
+            serial_number: sn,
+            broadcast_cancelled_area_list: None,
+            criticality_diagnostics: None,
+        });
         assert_eq!(pdu[0], 0x20);
         assert_eq!(pdu[1], 32, "id-PWSCancel = 32 (`38413-j30.txt:59077`)");
 
@@ -29848,15 +29840,14 @@ mod tests {
         // --- (1) subscription present, no sendRanResponse record ---
         let (mid1, sn1) = (0x5399u16, 0x6399u16);
         let sub_id = add_pws_subscription("PWS-BCAL", &callback_uri, None, "sub-399-neg");
-        let pdu1 = nextgcore_ngap::builder::build_write_replace_warning_response(
+        let pdu1 = crate::gnb_pdus::write_replace_warning_answer(
             &nextgcore_ngap::types::WriteReplaceWarningResponse {
                 message_identifier: mid1,
                 serial_number: sn1,
                 broadcast_completed_area_list: None,
                 criticality_diagnostics: None,
             },
-        )
-        .expect("build response");
+        );
         ngap.process_ngap_message(association_id, &pdu1)
             .await
             .expect("dispatch");
@@ -29889,15 +29880,14 @@ mod tests {
                 "this half needs the subscription genuinely absent"
             );
         }
-        let pdu2 = nextgcore_ngap::builder::build_write_replace_warning_response(
+        let pdu2 = crate::gnb_pdus::write_replace_warning_answer(
             &nextgcore_ngap::types::WriteReplaceWarningResponse {
                 message_identifier: mid2,
                 serial_number: sn2,
                 broadcast_completed_area_list: None,
                 criticality_diagnostics: None,
             },
-        )
-        .expect("build response");
+        );
         ngap.process_ngap_message(association_id, &pdu2)
             .await
             .expect("dispatch");
@@ -29936,8 +29926,8 @@ mod tests {
             &[("001", "01", 0x74)],
         )
         .await;
-        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
-            &nextgcore_ngap::types::PwsRestartIndication {
+        let restart =
+            crate::gnb_pdus::pws_restart_indication(&nextgcore_ngap::types::PwsRestartIndication {
                 cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
                     nextgcore_ngap::types::NrCgi {
                         plmn_identity: [0x00, 0xF1, 0x10],
@@ -29954,9 +29944,7 @@ mod tests {
                     tai_tac: [0x00, 0x00, 0x74],
                 }],
                 emergency_area_id_list_for_restart: Vec::new(),
-            },
-        )
-        .expect("build PWS RESTART INDICATION");
+            });
         ngap.process_ngap_message(association_id, &restart)
             .await
             .expect("dispatch");
@@ -30021,8 +30009,8 @@ mod tests {
         };
 
         // --- PWS RESTART INDICATION, procedure 34 ---
-        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
-            &nextgcore_ngap::types::PwsRestartIndication {
+        let restart =
+            crate::gnb_pdus::pws_restart_indication(&nextgcore_ngap::types::PwsRestartIndication {
                 cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
                     nextgcore_ngap::types::NrCgi {
                         plmn_identity: [0x00, 0xF1, 0x10],
@@ -30035,9 +30023,7 @@ mod tests {
                     tai_tac: [0x00, 0x00, 0x74],
                 }],
                 emergency_area_id_list_for_restart: Vec::new(),
-            },
-        )
-        .expect("build PWS RESTART INDICATION");
+            });
         // An indication is an InitiatingMessage (0x00) of procedure **34** -- NOT 33.
         // The ASN.1 table is alphabetical (Failure 33, Restart 34), the reverse of
         // the clause order (Restart §9.2.8.5, Failure §9.2.8.6).
@@ -30085,18 +30071,15 @@ mod tests {
         assert!(json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"].is_null());
 
         // --- PWS FAILURE INDICATION, procedure 33 ---
-        let failure = nextgcore_ngap::builder::build_pws_failure_indication(
-            &nextgcore_ngap::types::PwsFailureIndication {
-                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
-                    nextgcore_ngap::types::NrCgi {
-                        plmn_identity: [0x00, 0xF1, 0x10],
-                        nr_cell_identity: 0x39A,
-                    },
-                ]),
-                global_ran_node_id: pdu_node,
-            },
-        )
-        .expect("build PWS FAILURE INDICATION");
+        let failure = crate::gnb_pdus::pws_failure(&nextgcore_ngap::types::PwsFailureIndication {
+            failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                nextgcore_ngap::types::NrCgi {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    nr_cell_identity: 0x39A,
+                },
+            ]),
+            global_ran_node_id: pdu_node,
+        });
         assert_eq!(failure[0], 0x00);
         assert_eq!(
             failure[1], 33,
@@ -30158,22 +30141,19 @@ mod tests {
             );
         }
 
-        let failure = nextgcore_ngap::builder::build_pws_failure_indication(
-            &nextgcore_ngap::types::PwsFailureIndication {
-                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
-                    nextgcore_ngap::types::NrCgi {
-                        plmn_identity: [0x00, 0xF1, 0x10],
-                        nr_cell_identity: 0x39B,
-                    },
-                ]),
-                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+        let failure = crate::gnb_pdus::pws_failure(&nextgcore_ngap::types::PwsFailureIndication {
+            failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                nextgcore_ngap::types::NrCgi {
                     plmn_identity: [0x00, 0xF1, 0x10],
-                    gnb_id: 0x888,
-                    gnb_id_len: 32,
+                    nr_cell_identity: 0x39B,
                 },
+            ]),
+            global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x00, 0xF1, 0x10],
+                gnb_id: 0x888,
+                gnb_id_len: 32,
             },
-        )
-        .expect("build PWS FAILURE INDICATION");
+        });
 
         // Reaching the PWS arm at all is the claim: the `_` fallthrough would have
         // tried to SEND an ErrorIndication on this (synthetic) association.
@@ -30219,33 +30199,29 @@ mod tests {
         // (pdu, expected byte 0, expected procedure code)
         let fixtures: Vec<(Vec<u8>, u8, u8)> = vec![
             (
-                nextgcore_ngap::builder::build_write_replace_warning_response(
+                crate::gnb_pdus::write_replace_warning_answer(
                     &nextgcore_ngap::types::WriteReplaceWarningResponse {
                         message_identifier: 0x9399,
                         serial_number: 0xA399,
                         broadcast_completed_area_list: None,
                         criticality_diagnostics: None,
                     },
-                )
-                .expect("build"),
+                ),
                 0x20,
                 51,
             ),
             (
-                nextgcore_ngap::builder::build_pws_cancel_response(
-                    &nextgcore_ngap::types::PwsCancelResponse {
-                        message_identifier: 0xB399,
-                        serial_number: 0xC399,
-                        broadcast_cancelled_area_list: None,
-                        criticality_diagnostics: None,
-                    },
-                )
-                .expect("build"),
+                crate::gnb_pdus::pws_cancel_response(&nextgcore_ngap::types::PwsCancelResponse {
+                    message_identifier: 0xB399,
+                    serial_number: 0xC399,
+                    broadcast_cancelled_area_list: None,
+                    criticality_diagnostics: None,
+                }),
                 0x20,
                 32,
             ),
             (
-                nextgcore_ngap::builder::build_pws_restart_indication(
+                crate::gnb_pdus::pws_restart_indication(
                     &nextgcore_ngap::types::PwsRestartIndication {
                         cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell.clone()),
                         global_ran_node_id: node.clone(),
@@ -30255,19 +30231,15 @@ mod tests {
                         }],
                         emergency_area_id_list_for_restart: Vec::new(),
                     },
-                )
-                .expect("build"),
+                ),
                 0x00,
                 34,
             ),
             (
-                nextgcore_ngap::builder::build_pws_failure_indication(
-                    &nextgcore_ngap::types::PwsFailureIndication {
-                        failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell),
-                        global_ran_node_id: node,
-                    },
-                )
-                .expect("build"),
+                crate::gnb_pdus::pws_failure(&nextgcore_ngap::types::PwsFailureIndication {
+                    failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell),
+                    global_ran_node_id: node,
+                }),
                 0x00,
                 33,
             ),
@@ -32578,10 +32550,10 @@ mod tests {
         ] {
             server.sm_context_refs.insert((ue, psi), r.to_string());
         }
-        use nextgcore_ngap::{builder as b, types as t};
+        use nextgcore_ngap::types as t;
 
-        let setup =
-            b::build_pdu_session_resource_setup_response(&t::PduSessionResourceSetupResponse {
+        let setup = crate::gnb_pdus::pdu_session_resource_setup_response(
+            &t::PduSessionResourceSetupResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
                 setup_list: vec![],
@@ -32589,15 +32561,15 @@ mod tests {
                     pdu_session_id: 1,
                     transfer: vec![0x11],
                 }],
-            })
-            .expect("setup response");
+            },
+        );
         server
             .handle_pdu_session_resource_setup_response(9525, &setup)
             .await
             .expect("handled");
 
-        let modify =
-            b::build_pdu_session_resource_modify_response(&t::PduSessionResourceModifyResponse {
+        let modify = crate::gnb_pdus::pdu_session_resource_modify_response(
+            &t::PduSessionResourceModifyResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
                 modify_list: vec![t::PduSessionResourceModifyResponseItem {
@@ -32608,29 +32580,29 @@ mod tests {
                     pdu_session_id: 3,
                     transfer: vec![0x31],
                 }],
-            })
-            .expect("modify response");
+            },
+        );
         server
             .handle_pdu_session_resource_modify_response(9525, &modify)
             .await
             .expect("handled");
 
-        let release =
-            b::build_pdu_session_resource_release_response(&t::PduSessionResourceReleaseResponse {
+        let release = crate::gnb_pdus::pdu_session_resource_release_response(
+            &t::PduSessionResourceReleaseResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
                 released_list: vec![t::PduSessionResourceReleasedItem {
                     pdu_session_id: 4,
                     transfer: vec![0x41],
                 }],
-            })
-            .expect("release response");
+            },
+        );
         server
             .handle_pdu_session_resource_release_response(9525, &release)
             .await
             .expect("handled");
 
-        let notify = b::build_pdu_session_resource_notify(&t::PduSessionResourceNotify {
+        let notify = crate::gnb_pdus::pdu_session_resource_notify(&t::PduSessionResourceNotify {
             amf_ue_ngap_id: ue,
             ran_ue_ngap_id: 1,
             notify_list: vec![t::PduSessionResourceNotifyItem {
@@ -32641,8 +32613,7 @@ mod tests {
                 pdu_session_id: 6,
                 transfer: vec![0x61],
             }],
-        })
-        .expect("notify");
+        });
         server
             .handle_pdu_session_resource_notify(9525, &notify)
             .await
@@ -35578,7 +35549,7 @@ mod tests {
         );
 
         // The gNB reports PSI 3 released.
-        let notify = nextgcore_ngap::builder::build_pdu_session_resource_notify(
+        let notify = crate::gnb_pdus::pdu_session_resource_notify(
             &nextgcore_ngap::types::PduSessionResourceNotify {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 11,
@@ -35588,8 +35559,7 @@ mod tests {
                     transfer: vec![0x03],
                 }],
             },
-        )
-        .expect("build Notify");
+        );
         server
             .handle_pdu_session_resource_notify(assoc, &notify)
             .await
@@ -36179,7 +36149,7 @@ mod tests {
             .sm_context_refs
             .insert((amf_ue_ngap_id, 9), "smf-ref-gamma".to_string());
 
-        let pdu = nextgcore_ngap::builder::build_pdu_session_resource_setup_response(
+        let pdu = crate::gnb_pdus::pdu_session_resource_setup_response(
             &nextgcore_ngap::types::PduSessionResourceSetupResponse {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: 12,
@@ -36198,8 +36168,7 @@ mod tests {
                     transfer: vec![0xc1, 0xc2],
                 }],
             },
-        )
-        .expect("build PDUSessionResourceSetupResponse");
+        );
 
         server
             .handle_pdu_session_resource_setup_response(9301, &pdu)
@@ -36241,7 +36210,7 @@ mod tests {
         }
 
         // Modify Response (TS 38.413 Section 8.2.2) — used to be logged and dropped.
-        let modify = nextgcore_ngap::builder::build_pdu_session_resource_modify_response(
+        let modify = crate::gnb_pdus::pdu_session_resource_modify_response(
             &nextgcore_ngap::types::PduSessionResourceModifyResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36253,15 +36222,14 @@ mod tests {
                 ],
                 failed_list: vec![],
             },
-        )
-        .expect("build modify response");
+        );
         server
             .handle_pdu_session_resource_modify_response(9401, &modify)
             .await
             .expect("handled");
 
         // Release Response (Section 8.2.3) — likewise.
-        let release = nextgcore_ngap::builder::build_pdu_session_resource_release_response(
+        let release = crate::gnb_pdus::pdu_session_resource_release_response(
             &nextgcore_ngap::types::PduSessionResourceReleaseResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36278,15 +36246,14 @@ mod tests {
                     },
                 ],
             },
-        )
-        .expect("build release response");
+        );
         server
             .handle_pdu_session_resource_release_response(9401, &release)
             .await
             .expect("handled");
 
         // Notify (Section 8.2.5).
-        let notify = nextgcore_ngap::builder::build_pdu_session_resource_notify(
+        let notify = crate::gnb_pdus::pdu_session_resource_notify(
             &nextgcore_ngap::types::PduSessionResourceNotify {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36296,15 +36263,14 @@ mod tests {
                 }],
                 released_list: vec![],
             },
-        )
-        .expect("build notify");
+        );
         server
             .handle_pdu_session_resource_notify(9401, &notify)
             .await
             .expect("handled");
 
         // Modify Indication (Section 8.2.4).
-        let indication = nextgcore_ngap::builder::build_pdu_session_resource_modify_indication(
+        let indication = crate::gnb_pdus::pdu_session_resource_modify_indication(
             &nextgcore_ngap::types::PduSessionResourceModifyIndication {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36315,8 +36281,7 @@ mod tests {
                     },
                 ],
             },
-        )
-        .expect("build modify indication");
+        );
         // Class 1 since #525: the handler now answers with a Modify Confirm, and
         // this test's association does not exist, so drive the answer directly.
         let _ = server.modify_indication_answer(9401, &indication).await;
@@ -36561,7 +36526,7 @@ mod tests {
         let mut server = test_ngap_server().await;
         let ue = 79_003u64;
         // Deliberately store NO ref for PSI 1.
-        let pdu = nextgcore_ngap::builder::build_pdu_session_resource_setup_response(
+        let pdu = crate::gnb_pdus::pdu_session_resource_setup_response(
             &nextgcore_ngap::types::PduSessionResourceSetupResponse {
                 amf_ue_ngap_id: ue,
                 ran_ue_ngap_id: 1,
@@ -36571,8 +36536,7 @@ mod tests {
                 }],
                 failed_list: vec![],
             },
-        )
-        .expect("build setup response");
+        );
         server
             .handle_pdu_session_resource_setup_response(9501, &pdu)
             .await
