@@ -7364,8 +7364,14 @@ mod tests {
     /// A stub AUSF that counts the Nausf_SoRProtection / UPUProtection requests
     /// it receives. Registered in the shared SBI context under `instance_id` so
     /// udmd's AUSF selection can resolve it.
+    /// A stand-in AUSF serving SoR/UPU protection. It counts only the requests
+    /// for `supi`: the NF cache it registers in is process-wide, and a sibling
+    /// test that injects SoR/UPU for its own UE meanwhile can reach it through
+    /// the "any cached AUSF" fallback (#2082: seen as a stray hit on `ausf-a`
+    /// under shuffle seed 9001).
     async fn start_stub_ausf(
         instance_id: &str,
+        supi: &'static str,
     ) -> (SbiServer, Arc<std::sync::atomic::AtomicUsize>) {
         use nextgcore_sbi::context::{global_context, NfInstance, NfService};
         use nextgcore_sbi::types::{NfType, SbiServiceType};
@@ -7377,10 +7383,12 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
         server
-            .start(move |_req: SbiRequest| {
+            .start(move |req: SbiRequest| {
                 let counter = Arc::clone(&counter);
                 async move {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if req.header.uri.contains(&format!("/{supi}/")) {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     // 204 with no SorSecurityInfo: the injector then withholds
                     // (fail-closed). WHICH AUSF was asked is the whole question
                     // here, so a successful protection is not needed.
@@ -7545,14 +7553,17 @@ mod tests {
         std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
 
         let (udm_server, client) = start_real_udm().await;
-        let supi = "imsi-001010000000001";
+        // A SUPI of this test's own (#2082): the stand-in AUSFs count only its
+        // requests, so a sibling's SoR/UPU for another UE cannot be mistaken
+        // for the fallback firing here.
+        let supi = "imsi-001010000002082";
         let gen_path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
 
         // --- criterion 5a: the request's ausfInstanceId is PERSISTED ---------
         // Two AUSFs exist; "ausf-a" is registered first, so it is what the
         // "any cached AUSF" fallback would pick.
-        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a").await;
-        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b").await;
+        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a", supi).await;
+        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b", supi).await;
 
         let resp = client
             .post_json(
