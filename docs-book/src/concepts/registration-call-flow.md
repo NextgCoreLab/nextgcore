@@ -40,10 +40,9 @@ peer on the far side of the N2 (NGAP) association.
 
 Supporting libraries: `nextgcore-nas` (5GMM message codec, SUCI, NAS security),
 `nextgcore-ngap-gen` (the NGAP APER codec generated from the TS 38.413 ASN.1;
-the AMF's wrappers around it live in `src/bins/nextgcore-amfd/src/ngap_asn1.rs`),
-`nextgcore-ngap` (the typed message structs those wrappers fill in; its
-hand-written APER builders and `nextgcore-asn1c` survive only as test oracles,
-deletion tracked in #417), and `nextgcore-sctp` (the N2 transport). The NSSF (`nextgcore-nssfd`) is listed here only to say what does
+the AMF's wrappers around it live in `src/bins/nextgcore-amfd/src/ngap_asn1.rs`,
+with the NGAP domain values they fill in, in `ngap_types.rs` beside them),
+and `nextgcore-sctp` (the N2 transport). The NSSF (`nextgcore-nssfd`) is listed here only to say what does
 **not** happen: it is **not** consulted during registration (see step 12).
 
 ## The N2 transport underneath

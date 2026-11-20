@@ -56,7 +56,7 @@
 <tr><td>UAV tracking (Rel-18)</td><td>UAV tracking report handling</td><td>TS 23.256</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>SBI consumer side</td><td>NRF register/discover, AUSF auth, UDM UECM/SDM, SMF PDU session, PCF AM/UE policy, NSACF admission</td><td>TS 29.510/29.509/29.503/29.502/29.507/29.525/29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
-<p class="fm-notes">SCTP transports: userspace sctp-proto over UDP (default) or native kernel SCTP (<code>--features kernel-sctp</code>, <code>--sctp-backend kernel</code>), port 38412. The hand-written nextgcore-ngap types are still used beside the generated codec; their deletion is #417.</p>
+<p class="fm-notes">SCTP transports: userspace sctp-proto over UDP (default) or native kernel SCTP (<code>--features kernel-sctp</code>, <code>--sctp-backend kernel</code>), port 38412. NGAP runs on the generated codec alone; the hand-written nextgcore-ngap and nextgcore-asn1c crates are deleted (#417).</p>
 <h3 class="group-heading">SMF</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>

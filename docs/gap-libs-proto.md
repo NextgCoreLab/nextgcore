@@ -4,7 +4,7 @@
 
 Analysis of 9 protocol libraries under `nextgcore/src/libs/` assessing 5G completeness and 6G readiness.
 
-> **STALENESS NOTICE (updated 2026-10, pre-0.2.0):** This snapshot is badly out of date and, for NGAP/S1AP/PFCP/5GSM, misleading. The biggest change since 0.1.0: NGAP, S1AP, NRPPa, LPP, NR RRC and LTE RRC are now **codecs generated from the 3GPP ASN.1** (`nextgcore-ngap-gen`, `-s1ap-gen`, `-nrppa-gen`, `-lpp-gen`, `-nr-rrc-gen`, `-lte-rrc-gen`, built by NextgCoreLab/asn1-codegen; each `asn/PROVENANCE.md` names the spec version). The hand-written S1AP codec (#555, #560), NRPPa codec (#527), LPP codec and the UPER engine only it used (#563) are deleted, and so are the E1AP/F1AP/XnAP modules (#459). `nextgcore-s1ap` now holds only the typed S1AP structs mmed works with. `nextgcore-ngap` and the APER engine `nextgcore-asn1c` remain, with their hand-written builders kept as test oracles for the generated codec; deleting them is tracked in #417. Other changes since 0.1.0: every NAS decoder returns `Err` on short input (#612), fixed-layout IEs decode within their length (#631), TV IEs are coded as TV (#639); the PFCP Cause table is complete (#128) and 65 IE numbers were corrected (#327); the SCTP userspace backend carries the PPID verbatim with a patched `sctp-proto` in `src/vendor/` (#468), the kernel server reassembles partial deliveries (#517), and the dead userspace client was removed (#441); Diameter rejects a Message Length below 20 (#617); SBI has a feature-gated HTTP/3 prototype (`http3`, #28) and hybrid X25519MLKEM768 TLS (`pqc-tls`, #30).
+> **STALENESS NOTICE (updated 2026-10, pre-0.2.0):** This snapshot is badly out of date and, for NGAP/S1AP/PFCP/5GSM, misleading. The biggest change since 0.1.0: NGAP, S1AP, NRPPa, LPP, NR RRC and LTE RRC are now **codecs generated from the 3GPP ASN.1** (`nextgcore-ngap-gen`, `-s1ap-gen`, `-nrppa-gen`, `-lpp-gen`, `-nr-rrc-gen`, `-lte-rrc-gen`, built by NextgCoreLab/asn1-codegen; each `asn/PROVENANCE.md` names the spec version). The hand-written S1AP codec (#555, #560), NRPPa codec (#527), LPP codec and the UPER engine only it used (#563) are deleted, and so are the E1AP/F1AP/XnAP modules (#459). `nextgcore-s1ap` now holds only the typed S1AP structs mmed works with. `nextgcore-ngap` and the APER engine `nextgcore-asn1c` remained for a while, their hand-written builders kept as test oracles for the generated codec; #417 deleted both. Other changes since 0.1.0: every NAS decoder returns `Err` on short input (#612), fixed-layout IEs decode within their length (#631), TV IEs are coded as TV (#639); the PFCP Cause table is complete (#128) and 65 IE numbers were corrected (#327); the SCTP userspace backend carries the PPID verbatim with a patched `sctp-proto` in `src/vendor/` (#468), the kernel server reassembles partial deliveries (#517), and the dead userspace client was removed (#441); Diameter rejects a Message Length below 20 (#617); SBI has a feature-gated HTTP/3 prototype (`http3`, #28) and hybrid X25519MLKEM768 TLS (`pqc-tls`, #30).
 >
 > State at 0.1.0 (2026-07): `nextgcore-ngap` is NOT a stub - its hand-written builders/parsers drove the live N2 interface then. `nextgcore-s1ap` had builder/parser/ie/types, not a 6-LOC stub. `nextgcore-nas` implements 5GSM (`FiveGsmMessage`: PDU Session Establishment/Modification/Release) in addition to 5GMM (`FiveGmmMessage`). `nextgcore-pfcp` (~8,900 LOC) has grouped IEs (`CreatePdr/CreateFar/CreateQer/CreateUrr/CreateBar`) and Session Establishment/Modification/Deletion. `nextgcore-sbi` has working OAuth2 (`oauth.rs`), TLS (`tls.rs`), SCP (`scp.rs`), heartbeat, multipart, and gRPC modules. The table and per-library sections below are a historical baseline.
 
@@ -12,13 +12,13 @@ Analysis of 9 protocol libraries under `nextgcore/src/libs/` assessing 5G comple
 |---------|----------|--------------|-------|-------------|----------|
 | nextgcore-sbi | High | ~1800 | 5 | 70% | Low |
 | nextgcore-nas | Medium | ~3500 | 6+ | 40% | None |
-| nextgcore-ngap | High | ~13,300 | 20+ | typed NGAP structs; hand-written builders/parsers kept as test oracles (live N2 is `nextgcore-ngap-gen` since 0.2.0) | Low |
+| nextgcore-ngap | High | ~13,300 | 20+ | deleted in #417; its builders/parsers were test oracles once live N2 moved to `nextgcore-ngap-gen` (0.2.0) | Low |
 | nextgcore-gtp | Medium | ~2200 | 8+ | 55% | None |
 | nextgcore-pfcp | Low | ~1200 | 4+ | 25% | None |
 | nextgcore-sctp | High | ~2750 | 60+ | 85% | Low |
 | nextgcore-s1ap | Medium | ~5,700 | - | typed S1AP structs only since #514; codec is `nextgcore-s1ap-gen` | None |
 | nextgcore-diameter | High | ~3800 | 15+ | 75% | N/A |
-| nextgcore-asn1c | High | ~3200 | 20+ | 65% | None |
+| nextgcore-asn1c | High | ~3200 | 20+ | deleted in #417 | None |
 
 ---
 
@@ -69,7 +69,7 @@ Analysis of 9 protocol libraries under `nextgcore/src/libs/` assessing 5G comple
 
 ## 3. nextgcore-ngap
 
-At 0.1.0: ~13,300 LOC across `builder.rs`, `parser.rs`, `ie.rs`, `types.rs`, `transfer.rs`, `mbs_transfer.rs`, driving the live N2 interface (alongside the APER core in `nextgcore-asn1c/src/ngap/`). Since then amfd, smfd and mbsmfd build and decode NGAP with the generated `nextgcore-ngap-gen` codec; the hand-written builders/parsers are the oracles its tests compare against (#417).
+At 0.1.0: ~13,300 LOC across `builder.rs`, `parser.rs`, `ie.rs`, `types.rs`, `transfer.rs`, `mbs_transfer.rs`, driving the live N2 interface (alongside the APER core, the `ngap` module of `nextgcore-asn1c`). Since then amfd, smfd and mbsmfd build and decode NGAP with the generated `nextgcore-ngap-gen` codec; the hand-written builders/parsers were the oracles its tests compared against until #417 deleted the crate.
 
 ---
 
@@ -111,9 +111,9 @@ At the 2026-02-07 snapshot: no transport layer and no peer state machine. Both e
 
 ## 9. nextgcore-asn1c (ASN.1 Codec)
 
-Full APER encoder/decoder (`per.rs`) and the hand-written NGAP module (`src/ngap/`). Its S1AP module is gone (#555), as is the NRPPa module (#527). Production code no longer calls it directly (#576); it is reached through `nextgcore-ngap` and as a test dependency, until #417 deletes it.
+Full APER encoder/decoder (`per.rs`) and the hand-written NGAP module (`src/ngap/`). Its S1AP module is gone (#555), as is the NRPPa module (#527). Production code no longer calls it directly (#576); it was reached through `nextgcore-ngap` and as a test dependency until #417 deleted both crates.
 
-Missing: XnAP/F1AP/E1AP codecs.
+Missing (now a gap for new `*-gen` crates, not for this deleted one): XnAP/F1AP/E1AP codecs.
 
 The earlier hand-written E1AP/F1AP/XnAP modules were removed (#457): they were not
 ASN.1 PDUs (no PDU CHOICE, open type or ProtocolIE-Container) and had no consumers.
@@ -141,4 +141,4 @@ with the forked compiler, as `nextgcore-ngap-gen` does for NGAP (#417).
 | SBI 2.0 / gRPC support | nextgcore-sbi | Service mesh, event-driven architecture |
 | QUIC transport option | nextgcore-sctp | Potential SCTP replacement in 6G |
 | UPF programmability (P4-like) | nextgcore-pfcp | In-network computing |
-| XnAP/F1AP/E1AP codecs | nextgcore-asn1c | RAN disaggregation support |
+| XnAP/F1AP/E1AP codecs | new `nextgcore-xnap-gen` / `-f1ap-gen` / `-e1ap-gen` (none yet) | RAN disaggregation support |

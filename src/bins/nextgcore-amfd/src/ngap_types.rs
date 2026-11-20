@@ -2,7 +2,7 @@
 //! handlers fill from, and build, the generated `nextgcore-ngap-gen` PDUs.
 //! `ngap_asn1.rs` maps them onto the generated types in both directions.
 //!
-//! #417 stage B3.1: moved here from `nextgcore-ngap/src/types.rs`, the only
+//! #417 stage B3.1: moved here from the `types` module of `nextgcore-ngap`, the only
 //! part of that crate production code still used. The cause groups,
 //! Criticality and DirectForwardingPathAvailability, which that file
 //! re-exported from `nextgcore-asn1c`, are plain enums now, without the

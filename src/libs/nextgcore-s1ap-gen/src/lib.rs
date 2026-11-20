@@ -11,9 +11,9 @@
 //! could complete S1 Setup. A generated codec cannot make that mistake
 //! symmetrically, because the bit comes from the schema's `...`, not from code.
 //!
-//! Stage 1 adds this crate with no call sites; mmed still goes through
-//! `nextgcore-s1ap` and `nextgcore-asn1c`'s `s1ap` module. The following stages
-//! move mmed's S1AP one message family at a time.
+//! Stage 1 added this crate with no call sites, while mmed still went through
+//! `nextgcore-s1ap` and the hand-written `s1ap` codec (deleted in #555). The
+//! following stages moved mmed's S1AP one message family at a time.
 
 /// The generated S1AP types. Names follow the ASN.1 with hyphens mapped to
 /// underscores (`S1AP-PDU` is [`generated::S1AP_PDU`]), so the usual naming

@@ -18,7 +18,7 @@ The following inventory reflects what the codebase implements today. Behaviour i
 
 **4G/EPC interworking:** MME, HSS, SGW-C, SGW-U, PCRF.
 
-**Shared libraries (17):** `nextgcore-sbi` (SBI HTTP/2), `nextgcore-pfcp`, `nextgcore-nas`, `nextgcore-ngap`, `nextgcore-s1ap`, `nextgcore-sctp`, `nextgcore-gtp`, `nextgcore-diameter`, `nextgcore-crypt`, `nextgcore-dbi`, `nextgcore-tun`, `nextgcore-ipfw`, `nextgcore-asn1c`, `nextgcore-app`, `nextgcore-proto`, `nextgcore-metrics`, `nextgcore-core`.
+**Shared libraries (16):** `nextgcore-sbi` (SBI HTTP/2), `nextgcore-pfcp`, `nextgcore-nas`, `nextgcore-ngap-gen` (the NGAP codec generated from the TS 38.413 ASN.1), `nextgcore-s1ap`, `nextgcore-sctp`, `nextgcore-gtp`, `nextgcore-diameter`, `nextgcore-crypt`, `nextgcore-dbi`, `nextgcore-tun`, `nextgcore-ipfw`, `nextgcore-app`, `nextgcore-proto`, `nextgcore-metrics`, `nextgcore-core`.
 
 Security and service-based-architecture baselines already in place include SBI OAuth2 (`/oauth2/token`), TLS on the SBI plane, NRF-based registration/discovery, and wired NAS security.
 
