@@ -292,64 +292,94 @@ fn outbound_oauth2_client(
 }
 
 fn northbound_auth() -> NorthboundAuth {
+    #[cfg(test)]
+    if let Ok(auth) = TEST_NORTHBOUND_AUTH.try_with(|a| *a) {
+        return auth;
+    }
     NORTHBOUND_AUTH.get().copied().unwrap_or_default()
 }
 
-/// The authenticated identity of the caller, or `None` when the request carries
-/// no identity this process verified (issue #110).
-///
-/// Order matters. A certificate **this process** verified outranks a token,
-/// which in turn outranks anything in the URL:
-///
-/// 1. `peer_cert_nf_instance_id` — the URI SAN of a chain-verified client
-///    certificate (issue #186). Only ever populated under `verify_client`.
-/// 2. the `sub` claim of the bearer token.
-/// 3. nothing.
-///
-/// **Why reading `sub` without re-verifying is sound, and only here.** The server
-/// rejects an invalid token with 401 *before dispatch*, so by the time a handler
-/// runs under `auth.oauth2` the signature, audience, scope and expiry have all
-/// been checked and the claims are trustworthy. When `auth.oauth2` is false
-/// nothing was checked, and an attacker could set any `sub` it liked — so the
-/// claim is ignored entirely in that case. The `auth.oauth2` guard below is
-/// therefore load-bearing, not defensive: dropping it turns this function into an
-/// impersonation primitive.
-fn authenticated_client_id(request: &SbiRequest, auth: NorthboundAuth) -> Option<String> {
-    if auth.mtls {
-        if let Some(id) = request.peer_cert_nf_instance_id.as_deref() {
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
-        }
-    }
-    if auth.oauth2 {
-        return bearer_subject(request.http.get_header("authorization")?);
-    }
-    None
+#[cfg(test)]
+tokio::task_local! {
+    /// #2132 (R41 on #2159): the northbound enforcement [`northbound_auth`]
+    /// returns inside `TEST_NORTHBOUND_AUTH.scope(..)`, so a handler test can
+    /// run under mTLS/OAuth2 enforcement without setting the process-wide
+    /// `NORTHBOUND_AUTH` once and for every other test.
+    pub(crate) static TEST_NORTHBOUND_AUTH: NorthboundAuth;
 }
 
-/// The `sub` claim of a Bearer token, without verifying it.
+/// The authenticated identity of the caller, `Ok(None)` when the request carries
+/// no identity this process verified (issue #110), or `Err(why)` when what it
+/// carries is no identity (#2132).
 ///
-/// **Never call this outside [`authenticated_client_id`]'s `auth.oauth2` branch**
-/// — see that function for why the guard is what makes reading unverified claims
-/// safe. Split out only so the claim decoding is unit-testable.
-fn bearer_subject(authorization: &str) -> Option<String> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
+/// The shared rule, `nextgcore_sbi::owner_binding::verified_consumer_id`
+/// (CONVENTIONS: caller identity always comes from it), over the identity THIS
+/// PROCESS verified, never anything in the URL:
+///
+/// - `peer_cert_nf_instance_id`, the URI SAN of a chain-verified client
+///   certificate (issue #186), only under `auth.mtls` (`verify_client`), and
+///   only when the certificate is not a relay's (SCP/SEPP, RFC 9310 NFTypes);
+/// - `oauth2_subject`, the `sub` the SBI server set after verifying the bearer
+///   token's signature, audience, scope and expiry (#94), only under
+///   `auth.oauth2`. The raw `Authorization` header is never read here, so an
+///   unverified `sub` can never become an identity;
+/// - a certificate and a token naming different instances refuse;
+/// - under the production SBI profile, a certificate naming no NF type is no
+///   identity on its own (#2065): it cannot be told from a relay's.
+///
+/// The `auth` guards are kept although the server populates both fields only
+/// when it verified them, so a listener started without enforcement can never
+/// admit an identity.
+fn authenticated_client_id(
+    request: &SbiRequest,
+    auth: NorthboundAuth,
+) -> Result<Option<String>, String> {
+    authenticated_client_id_with(
+        request,
+        auth,
+        nextgcore_sbi::owner_binding::identity_required(),
+    )
+}
 
-    let token = authorization
-        .strip_prefix("Bearer ")
-        .or_else(|| authorization.strip_prefix("bearer "))?
-        .trim();
-    // header.payload.signature — the claims are the middle segment.
-    let payload = token.split('.').nth(1)?;
-    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    claims
-        .get("sub")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// [`authenticated_client_id`] under the profile `production` says.
+fn authenticated_client_id_with(
+    request: &SbiRequest,
+    auth: NorthboundAuth,
+    production: bool,
+) -> Result<Option<String>, String> {
+    let mut verified = SbiRequest::get("/");
+    if auth.mtls {
+        verified.peer_cert_nf_instance_id = request.peer_cert_nf_instance_id.clone();
+        verified.peer_cert_nf_types = request.peer_cert_nf_types.clone();
+    }
+    if auth.oauth2 {
+        verified.oauth2_subject = request.oauth2_subject.clone();
+    }
+    let identity = nextgcore_sbi::owner_binding::verified_consumer_id_with(&verified, production)?;
+    // #2132 (R41 on #2159): under mTLS enforcement every caller presents a
+    // certificate, so `None` here means a relay's (SCP/SEPP) certificate with
+    // no verified token behind it. Taking that as anonymous would let the relay
+    // create an ownerless (scsAsId-keyed) subscription whenever OAuth2 is not
+    // also enforced; refuse it instead.
+    if identity.is_none()
+        && nextgcore_sbi::owner_binding::is_relay_certificate(&verified.peer_cert_nf_types)
+    {
+        return Err(
+            "the requester's client certificate is a relay's (SCP/SEPP), which is no caller \
+             identity, and no verified access token names the consumer behind it"
+                .to_string(),
+        );
+    }
+    Ok(identity)
+}
+
+/// #2132: the 403 for a request whose credentials are no identity (see
+/// [`authenticated_client_id`]). Every route checks identity first, before
+/// any validation, southbound call or subscription lookup, so the refusal says
+/// nothing about whether a UE or a subscription exists.
+fn refuse_unidentified(operation: &str, why: &str) -> SbiResponse {
+    log::debug!("{operation} refused: {why}");
+    nextgcore_sbi::server::send_forbidden(&format!("{operation}: {why}"), None)
 }
 
 /// Parse the opt-in `sbi.oauth2.require` knob (dccfd/nwdafd parity). Default
@@ -963,6 +993,11 @@ async fn handle_nnef_event_exposure_create(request: &SbiRequest) -> SbiResponse 
 
 /// DELETE /nnef-eventexposure/v1/subscriptions/{subId} — TS 29.591 Unsubscribe.
 async fn handle_nnef_event_exposure_delete(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #2132: identity first, so a caller whose credentials are no identity
+    // cannot tell a 404 from a 403.
+    if let Err(why) = authenticated_client_id(request, northbound_auth()) {
+        return refuse_unidentified("Nnef_EventExposure unsubscribe", &why);
+    }
     // Ownership is checked against the subscription's stored `scs_as_id`, which for
     // this API is the consumer's `notifId` -- so the delete resolves it from the
     // stored subscription rather than from the path, which carries no consumer id.
@@ -1098,6 +1133,15 @@ async fn handle_monitoring_subscription_create(
     request: &SbiRequest,
     api: NorthboundApi,
 ) -> SbiResponse {
+    // #2132: identity first, before validation and before the southbound UDM
+    // GPSI lookup, so a caller whose credentials are no identity learns
+    // nothing (no 404 UE_NOT_FOUND) and causes no southbound call. Issue #110:
+    // ownership is keyed to an identity this process verified, not to the
+    // caller-supplied {scsAsId} path segment.
+    let owner_id = match authenticated_client_id(request, northbound_auth()) {
+        Ok(id) => id,
+        Err(why) => return refuse_unidentified("monitoring subscription create", &why),
+    };
     let handoff = Arc::new(Mutex::new(CreateHandoff::Pending));
     let mut guard = CreateAbandonGuard {
         handoff: handoff.clone(),
@@ -1105,7 +1149,8 @@ async fn handle_monitoring_subscription_create(
     };
     let (scs_as_id, request) = (scs_as_id.to_string(), request.clone());
     let task = spawn_detached(async move {
-        let response = handle_monitoring_subscription_create_inner(&scs_as_id, &request, api).await;
+        let response =
+            handle_monitoring_subscription_create_inner(&scs_as_id, &request, api, owner_id).await;
         CreateHandoff::finish(&handoff, &response);
         response
     });
@@ -1121,6 +1166,7 @@ async fn handle_monitoring_subscription_create_inner(
     scs_as_id: &str,
     request: &SbiRequest,
     api: NorthboundApi,
+    owner_id: Option<String>,
 ) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
@@ -1270,10 +1316,6 @@ async fn handle_monitoring_subscription_create_inner(
         },
     };
 
-    // Issue #110: ownership is keyed to an identity this process verified, not to
-    // the caller-supplied {scsAsId} path segment.
-    let owner_id = authenticated_client_id(request, northbound_auth());
-
     let sub = NefMonitoringSubscription::new(
         scs_as_id,
         &monitoring_type,
@@ -1398,12 +1440,15 @@ async fn handle_monitoring_subscription_delete(
     sub_id: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
+    let caller_id = match authenticated_client_id(request, northbound_auth()) {
+        Ok(id) => id,
+        Err(why) => return refuse_unidentified("monitoring subscription delete", &why),
+    };
     let ctx = nef_self();
     let (sub, amf_uri, udm_uri) = match ctx.read() {
         Ok(c) => (c.subscription_find(sub_id), c.amf_uri(), c.udm_uri()),
         Err(_) => return send_internal_error("NEF context lock poisoned"),
     };
-    let caller_id = authenticated_client_id(request, northbound_auth());
     let sub = match sub {
         Some(s) if s.is_owned_by(caller_id.as_deref(), scs_as_id) => s,
         Some(_) => {
@@ -6552,6 +6597,130 @@ mod tests {
         reset_context();
     }
 
+    /// **#2132 (R41 on #2159)**: under northbound mTLS + OAuth2 enforcement, a
+    /// caller whose credentials are no identity (a certificate and a token
+    /// naming different instances, or a relay's certificate with no token) is
+    /// refused 403 FIRST: the monitoring create makes no southbound UDM GPSI
+    /// lookup and stores nothing, and the Nnef unsubscribe answers the same 403
+    /// for a subscription that exists and one that does not, so neither route
+    /// tells a 404 from a 403.
+    ///
+    /// REVERT-VERIFIED: with the create's identity check moved back after the
+    /// GPSI resolution, the UDM stub sees an id-translation-result request and
+    /// the "no southbound call" assertion fails; with the Nnef delete's check
+    /// removed, the unknown subscription answers 404.
+    #[test]
+    fn a_caller_with_no_identity_is_refused_before_any_lookup_2132() {
+        let _guard = lock_globals();
+        reset_context();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                nextgcore_sbi::security::set_sbi_profile_override(
+                    nextgcore_sbi::security::SbiProfile::Dev,
+                );
+                let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+                let sink = Arc::clone(&seen);
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let udm = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+                udm.start(move |req: SbiRequest| {
+                    let sink = Arc::clone(&sink);
+                    async move {
+                        sink.lock().expect("seen").push(req.header.uri.clone());
+                        SbiResponse::with_status(404)
+                    }
+                })
+                .await
+                .expect("UDM stub starts");
+                let udm_uri = format!("http://127.0.0.1:{}", addr.port());
+                if let Ok(mut c) = nef_self().write() {
+                    c.set_endpoints(None, Some(udm_uri.clone()), None, None);
+                    c.set_udm_sdm_uri(Some(udm_uri));
+                }
+                let enforced = NorthboundAuth {
+                    oauth2: true,
+                    mtls: true,
+                };
+                let mismatch = |mut r: SbiRequest| {
+                    r.peer_cert_nf_instance_id =
+                        Some("aaaaaaaa-2132-4000-8000-00000000000a".into());
+                    r.peer_cert_nf_types = vec!["AF".into()];
+                    r.oauth2_subject = Some("bbbbbbbb-2132-4000-8000-00000000000b".into());
+                    r
+                };
+                let relay_alone = |mut r: SbiRequest| {
+                    r.peer_cert_nf_instance_id =
+                        Some("55555555-2132-4000-8000-000000000005".into());
+                    r.peer_cert_nf_types = vec!["SCP".into()];
+                    r
+                };
+                for (what, credentials) in [
+                    ("mismatch", &mismatch as &dyn Fn(SbiRequest) -> SbiRequest),
+                    ("relay alone", &relay_alone),
+                ] {
+                    let create = credentials(monitoring_request(serde_json::json!({
+                        "monitoringType": "LOSS_OF_CONNECTIVITY",
+                        "externalId": "ue2132@fl.nextg",
+                        "notificationDestination": "http://127.0.0.1:9/af/v1/notify/x"
+                    })));
+                    let response = TEST_NORTHBOUND_AUTH
+                        .scope(
+                            enforced,
+                            handle_monitoring_subscription_create(
+                                "af-2132",
+                                &create,
+                                NorthboundApi::T8MonitoringEvent,
+                            ),
+                        )
+                        .await;
+                    assert_eq!(response.status, 403, "{what}: {:?}", response.http.content);
+                    assert!(
+                        seen.lock().expect("seen").is_empty(),
+                        "{what}: no southbound call before the identity check"
+                    );
+                    assert_eq!(
+                        nef_self().read().unwrap().subscription_count(),
+                        0,
+                        "{what}: nothing stored"
+                    );
+                }
+
+                // The Nnef unsubscribe: an existing subscription and an unknown
+                // one get the same 403.
+                let stored = NefMonitoringSubscription::new(
+                    "notif-2132",
+                    "LOSS_OF_CONNECTIVITY",
+                    "http://127.0.0.1:9/af/v1/notify/x",
+                    "{}",
+                );
+                let stored_id = stored.id.clone();
+                nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_insert(stored)
+                    .expect("stored");
+                for id in [stored_id.as_str(), "no-such-subscription-2132"] {
+                    let del = mismatch(SbiRequest::delete(format!(
+                        "/nnef-eventexposure/v1/subscriptions/{id}"
+                    )));
+                    let response = TEST_NORTHBOUND_AUTH
+                        .scope(enforced, handle_nnef_event_exposure_delete(id, &del))
+                        .await;
+                    assert_eq!(response.status, 403, "{id}: {:?}", response.http.content);
+                }
+                assert!(nef_self()
+                    .read()
+                    .unwrap()
+                    .subscription_find(&stored_id)
+                    .is_some());
+                drop(udm);
+            });
+        reset_context();
+    }
+
     /// **Issue #1439, at the handler.** A producer notification whose reports are
     /// all of another type is answered 204 and forwards NOTHING to the AF; the
     /// matching one is delivered to the AF's notificationDestination over the
@@ -6918,72 +7087,123 @@ mod tests {
         assert!(!unauthenticated.is_owned_by(None, "af-a"));
     }
 
-    /// The `sub` claim is read only when the server actually verified the token.
+    /// The identity is only what this process verified: the `sub` the server
+    /// set after verifying the token, never a claim read from the raw header,
+    /// and each only under its own enforcement.
     ///
-    /// The guard in `authenticated_client_id` is load-bearing: without it, an
-    /// unauthenticated caller could set any `sub` and impersonate another client.
+    /// REVERT-VERIFIED: with the `auth.oauth2` guard dropped, the
+    /// "enforcement off" case gets `client-a` and fails.
     #[test]
     fn a_bearer_subject_is_trusted_only_under_enforcement() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
+        let both = NorthboundAuth {
+            oauth2: true,
+            mtls: true,
+        };
         let claims = URL_SAFE_NO_PAD.encode(br#"{"sub":"client-a","aud":"NEF"}"#);
         let token = format!("aGRy.{claims}.c2ln");
-        let request = SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions")
+        // An unverified bearer: the header is present, the server set no `sub`.
+        let unverified = SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions")
             .with_header("Authorization", format!("Bearer {token}"));
-
-        assert_eq!(
-            bearer_subject(&format!("Bearer {token}")).as_deref(),
-            Some("client-a")
-        );
-
-        // Enforcement on: the server already verified this token, so the claim
-        // is usable.
-        assert_eq!(
-            authenticated_client_id(
-                &request,
-                NorthboundAuth {
-                    oauth2: true,
-                    mtls: false
-                }
-            )
-            .as_deref(),
-            Some("client-a")
-        );
-        // Enforcement off: nothing verified it, so it must be ignored entirely.
-        assert_eq!(
-            authenticated_client_id(&request, NorthboundAuth::default()),
-            None,
-            "an unverified `sub` must never become an identity -- that is an \
-             impersonation primitive"
-        );
-
-        // A verified client certificate outranks the token.
-        let mut with_cert = request.clone();
-        with_cert.peer_cert_nf_instance_id = Some("cert-identity".to_string());
-        assert_eq!(
-            authenticated_client_id(
-                &with_cert,
-                NorthboundAuth {
-                    oauth2: true,
-                    mtls: true
-                }
-            )
-            .as_deref(),
-            Some("cert-identity"),
-            "an identity this process verified beats a claim in a token"
-        );
-
-        // Malformed authorization headers yield nothing rather than panicking.
-        for bad in [
-            "",
-            "Bearer",
-            "Bearer notatoken",
-            "Basic dXNlcjpwdw==",
-            "Bearer a.!!!.c",
-        ] {
-            assert_eq!(bearer_subject(bad), None, "input {bad:?}");
+        for production in [true, false] {
+            assert_eq!(
+                authenticated_client_id_with(&unverified, both, production),
+                Ok(None),
+                "a claim the server did not verify is never an identity"
+            );
         }
+        let mut verified = unverified.clone();
+        verified.oauth2_subject = Some("client-a".to_string());
+        let oauth2_only = NorthboundAuth {
+            oauth2: true,
+            mtls: false,
+        };
+        assert_eq!(
+            authenticated_client_id_with(&verified, oauth2_only, true),
+            Ok(Some("client-a".to_string())),
+            "the verified sub is the identity"
+        );
+        assert_eq!(
+            authenticated_client_id_with(&verified, NorthboundAuth::default(), true),
+            Ok(None),
+            "enforcement off: nothing was verified, so nothing is an identity"
+        );
+    }
+
+    /// **#2132**: the caller identity is the shared `owner_binding` rule, not
+    /// "any verified certificate". A typed consumer certificate is the caller;
+    /// a relay's (SCP/SEPP) never is, the relayed token decides; a certificate
+    /// and token naming different instances refuse; under production an
+    /// untyped certificate alone is no identity (#2065), under dev it still is.
+    ///
+    /// REVERT-VERIFIED: with `authenticated_client_id_with` back to "any
+    /// verified certificate's id, else the token" (the pre-#2132 rule), the
+    /// test fails on its first relay case, "an SCP certificate alone is no
+    /// identity".
+    #[test]
+    fn the_caller_is_the_shared_verified_identity_2132() {
+        let mtls = NorthboundAuth {
+            oauth2: true,
+            mtls: true,
+        };
+        let req = |cert: Option<&str>, types: &[&str], sub: Option<&str>| {
+            let mut r = SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions");
+            r.peer_cert_nf_instance_id = cert.map(str::to_string);
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            r.oauth2_subject = sub.map(str::to_string);
+            r
+        };
+        const AF: &str = "aaaaaaaa-2132-4000-8000-00000000000a";
+        const SCP: &str = "55555555-2132-4000-8000-000000000005";
+        for production in [true, false] {
+            let id = |r: SbiRequest| authenticated_client_id_with(&r, mtls, production);
+            assert_eq!(id(req(Some(AF), &["AF"], None)), Ok(Some(AF.into())));
+            for relay in ["SCP", "SEPP"] {
+                assert!(
+                    id(req(Some(SCP), &[relay], None))
+                        .unwrap_err()
+                        .contains("is a relay's"),
+                    "a {relay} certificate alone is no identity, and is refused rather \
+                     than taken as anonymous (production={production})"
+                );
+            }
+            assert_eq!(
+                id(req(Some(SCP), &["SCP"], Some(AF))),
+                Ok(Some(AF.into())),
+                "through an SCP the relayed token decides"
+            );
+            assert!(
+                id(req(Some(SCP), &["AF"], Some(AF))).is_err(),
+                "a certificate and a token naming different instances refuse"
+            );
+        }
+        assert!(
+            authenticated_client_id_with(&req(Some(AF), &[], None), mtls, true)
+                .unwrap_err()
+                .contains("names no NF type"),
+            "production: an untyped certificate alone is no identity"
+        );
+        assert_eq!(
+            authenticated_client_id_with(&req(Some(AF), &[], Some(AF)), mtls, true),
+            Ok(Some(AF.into())),
+            "production: with a token, the token's sub"
+        );
+        assert_eq!(
+            authenticated_client_id_with(&req(Some(AF), &[], None), mtls, false),
+            Ok(Some(AF.into())),
+            "dev: as before"
+        );
+        // Without mTLS enforcement the certificate is not read at all.
+        let oauth2_only = NorthboundAuth {
+            oauth2: true,
+            mtls: false,
+        };
+        assert_eq!(
+            authenticated_client_id_with(&req(Some(AF), &["AF"], None), oauth2_only, true),
+            Ok(None)
+        );
     }
 
     /// The startup guard: `--verify-client` without `--tls` is refused.
