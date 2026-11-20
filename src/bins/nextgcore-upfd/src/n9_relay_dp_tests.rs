@@ -751,8 +751,9 @@ fn recv_tos(s: &std::net::UdpSocket) -> Option<u8> {
 /// find that UE's session by address: it is an unknown TEID, answered with an
 /// Error Indication (TS 29.281 §7.3.1), and nothing goes back up to the PSA.
 ///
-/// REVERT-VERIFIED: with the UE-address lookup applied to I-UPF sessions, the
-/// packet passes anti-spoofing and the PSA receives it as this UE's uplink.
+/// REVERT-VERIFIED: with the UE-address lookup applied to I-UPF sessions (as before
+/// #2197; #2234 removed it for every session), the packet passes anti-spoofing
+/// and the PSA receives it as this UE's uplink.
 #[tokio::test]
 async fn a_psa_downlink_on_an_unknown_n9_teid_is_not_found_by_ue_address() {
     let ue = Ipv4Addr::new(10, 45, 14, 51);
