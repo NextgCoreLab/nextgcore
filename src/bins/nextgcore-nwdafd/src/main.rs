@@ -797,8 +797,10 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// [`nwdaf_sbi_request_handler`] under `profile`, passed in rather than
 /// resolved from the process-wide override (#2215), so a test can drive the
 /// real router under production while sibling tests hold the Dev override.
-/// The NFStatusNotify routes apply the sender check (`refuse_notifier`) under
-/// this profile.
+/// Only the NFStatusNotify routes use `profile` (their sender check,
+/// `refuse_notifier`). The subscription owner checks in `sbi_handler` and
+/// `model_monitor::route` still read the process profile (#2239), so a test
+/// of those routes cannot rely on this argument yet.
 async fn nwdaf_sbi_request_handler_with(
     request: SbiRequest,
     profile: nextgcore_sbi::security::SbiProfile,
@@ -3440,6 +3442,16 @@ mod nf_status_sender_backstop_2215_tests {
         &rest[rest.find('/').expect("an absolute URI with a path")..]
     }
 
+    /// #2238 (R45): each refused notification is also checked for having
+    /// changed nothing in the state the router ingests into (a seeded NF in
+    /// `nwdaf_self()`), and the NRF controls for having changed it.
+    ///
+    /// REVERT-VERIFIED (act before the check, R45's two plants): ingesting in
+    /// `handle_nf_status_notify_gated_with_ctx` before `refuse_notifier` and
+    /// then returning its 403, and ingesting at the top of
+    /// `nwdaf_sbi_request_handler_with` for a POST to an NF-status path, each
+    /// fail "a refused notification changed nothing".
+    ///
     /// REVERT-VERIFIED: with `refuse_notifier` given `production = false` in
     /// `nrf_collector::handle_nf_status_notify_gated_with_ctx`, the forged
     /// `[AMF]` sender on the advertised path is 204 (`left: 204, right: 403`).
@@ -3484,9 +3496,35 @@ mod nf_status_sender_backstop_2215_tests {
             .collect();
         assert_eq!(advertised.len(), 1, "one NFStatusSubscribe: {advertised:?}");
 
-        let body =
-            json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": "http://nrf/x/nwdaf-2215-r" });
-        let from = |path: &str, types: &[&str]| {
+        // #2238 (R45): state the router ingests into, so a notification that
+        // acts before (or despite) the check is seen, not only its status code.
+        // A real instance with a known load, in `nwdaf_self()`.
+        const ID: &str = "nwdaf-2215-seeded-amf";
+        let seeded = || {
+            nwdaf_self()
+                .read()
+                .unwrap()
+                .lock_engine()
+                .nf_meta(ID)
+                .map(|m| (m.nf_type.clone(), m.nf_status.clone(), m.last_load))
+        };
+        nwdaf_self().read().unwrap().lock_engine().upsert_nf_meta(
+            ID,
+            analytics::NfProfileMeta {
+                nf_type: "AMF".to_string(),
+                nf_status: "REGISTERED".to_string(),
+                last_load: Some(42),
+            },
+        );
+        let want = Some(("AMF".to_string(), "REGISTERED".to_string(), Some(42)));
+        assert_eq!(seeded(), want);
+        let uri = format!("http://nrf.test:7777/nnrf-nfm/v1/nf-instances/{ID}");
+        let dereg = json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": uri });
+        let changed = json!({
+            "event": "NF_PROFILE_CHANGED", "nfInstanceUri": uri,
+            "nfProfile": { "nfInstanceId": ID, "nfType": "AMF", "nfStatus": "SUSPENDED", "load": 99 },
+        });
+        let with = |body: &Value, path: &str, types: &[&str]| {
             let mut r =
                 SbiRequest::post(path.to_string()).with_body(body.to_string(), "application/json");
             r.peer_cert_present = !types.is_empty();
@@ -3510,23 +3548,40 @@ mod nf_status_sender_backstop_2215_tests {
                 &["SCP", "AMF"],
                 &[],
             ] {
-                let resp = route(from(path, forged)).await;
-                assert_eq!(
-                    resp.status, 403,
-                    "{path}, sender {forged:?}: {:?}",
-                    resp.http.content
-                );
+                for body in [&dereg, &changed] {
+                    let resp = route(with(body, path, forged)).await;
+                    assert_eq!(
+                        resp.status, 403,
+                        "{path}, sender {forged:?}, {}: {:?}",
+                        body["event"], resp.http.content
+                    );
+                    assert_eq!(
+                        seeded(),
+                        want,
+                        "{path}, sender {forged:?}, {}: a refused notification changed nothing",
+                        body["event"]
+                    );
+                }
             }
         }
 
-        // Control: the NRF's certificate on the advertised path gets past the
-        // check, so the 403s above are the sender check and not an earlier
-        // refusal (an unheld token would be 404).
-        let resp = route(from(&paths[0], &["NRF"])).await;
+        // Controls: the NRF's certificate on the advertised path gets past the
+        // check AND acts, so the 403s above are the sender check, not an earlier
+        // refusal (an unheld token would be 404), and "changed nothing" above
+        // could have failed. The profile change takes, then the deregistration.
+        let resp = route(with(&changed, &paths[0], &["NRF"])).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
         assert_eq!(
-            resp.status, 204,
-            "the NRF's own notification is admitted: {:?}",
-            resp.http.content
+            seeded(),
+            Some(("AMF".to_string(), "SUSPENDED".to_string(), Some(99))),
+            "the NRF's NF_PROFILE_CHANGED is ingested"
+        );
+        let resp = route(with(&dereg, &paths[0], &["NRF"])).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert_eq!(
+            seeded(),
+            None,
+            "the NRF's NF_DEREGISTERED drops the instance"
         );
     }
 }
