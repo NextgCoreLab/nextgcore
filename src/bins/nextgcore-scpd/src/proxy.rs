@@ -610,12 +610,13 @@ fn is_scp_consumed(name: &str) -> bool {
 /// terminator, #1990) would believe it as the SCP's word. They are never
 /// forwarded as received: `x-forwarded-client-cert` is set again from the
 /// certificate this SCP verified ([`forwarded_client_cert`]); `x-caller-supi`
-/// and `3gpp-Sbi-Consumer-Info` the SCP cannot vouch for, so they go.
-const CALLER_IDENTITY_HEADERS: &[&str] = &[
-    "x-forwarded-client-cert",
-    "x-caller-supi",
-    custom_header::CONSUMER_INFO,
-];
+/// the SCP cannot vouch for, so it goes.
+///
+/// #2103 (R30 on #2095): `3gpp-Sbi-Consumer-Info` is not one of them. It is the
+/// consumer's TS 29.500 §5.2.3.3.7 consumer information (supported services, API
+/// versions and features, accepted encodings, callback roots) that a producer may
+/// use for the notifications it sends, not an identity claim, so it is forwarded.
+const CALLER_IDENTITY_HEADERS: &[&str] = &["x-forwarded-client-cert", "x-caller-supi"];
 
 fn is_caller_identity(name: &str) -> bool {
     CALLER_IDENTITY_HEADERS
@@ -5610,9 +5611,13 @@ mod tests {
     }
 
     /// #2080 (R32's audit): the probe. A consumer forges
-    /// `x-forwarded-client-cert`, `x-caller-supi` and `3gpp-Sbi-Consumer-Info`
-    /// (in any case) and sends them through the SCP. The producer sees none of
-    /// them. With a client certificate the SCP verified, the producer sees the
+    /// `x-forwarded-client-cert` and `x-caller-supi` (in any case) and sends them
+    /// through the SCP. The producer sees neither. #2103: the
+    /// `3gpp-Sbi-Consumer-Info` it also sends is consumer information, not an
+    /// identity claim, and reaches the producer as sent.
+    ///
+    /// REVERT-VERIFIED (#2103): with `3gpp-Sbi-Consumer-Info` back in
+    /// `CALLER_IDENTITY_HEADERS`, "forwarded as sent" fails. With a client certificate the SCP verified, the producer sees the
     /// SCP's own XFCC for that certificate (its SHA-256 in `Hash=`, its PEM in
     /// `Cert=`), not the forged one.
     ///
@@ -5650,7 +5655,8 @@ mod tests {
             "a forged XFCC is not forwarded: {seen}"
         );
         assert!(seen["callerSupi"].is_null(), "{seen}");
-        assert!(seen["consumerInfo"].is_null(), "{seen}");
+        // #2103: consumer information, not an identity claim: forwarded as sent.
+        assert_eq!(seen["consumerInfo"], "forged", "{seen}");
 
         let der = b"a verified client certificate".to_vec();
         let mut verified = forged();
@@ -5667,7 +5673,7 @@ mod tests {
             !xfcc.contains("forged") && !xfcc.contains("victim"),
             "{xfcc}"
         );
-        assert!(seen["callerSupi"].is_null() && seen["consumerInfo"].is_null());
+        assert!(seen["callerSupi"].is_null() && seen["consumerInfo"] == "forged");
 
         producer.stop().await.expect("producer stop");
     }

@@ -70,7 +70,7 @@ spec:
               # REFUSES TO START without the certificates it names. The chart
               # mounts none by default, so it opts out explicitly. Set
               # global.sbiProfile=production once certs are provisioned.
-              value: {{ .Values.global.sbiProfile | default "dev" | quote }}
+              value: {{ include "nextgcore.sbiProfile" . | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
             {{- if .Values.udm.metrics.enabled }}

@@ -417,6 +417,76 @@ claim shared ReadWriteMany, would be two processes rewriting one snapshot.
 {{- end -}}
 
 {{/*
+#2069: global.plmn.mcc and global.plmn.mnc, validated, as their digit strings.
+Every template renders the PLMN through these, and quoted (see
+"nextgcore.plmnId"): unquoted, an NF parses mcc: 001 as the integer 1.
+
+An MCC is 3 digits and an MNC 2 or 3 (TS 23.003 §2.2; TS 29.571 Mcc ^\d{3}$,
+Mnc ^\d{2,3}$). The value must reach the chart as a STRING: one that arrives
+as a number has already lost its leading zeros (an unquoted `mcc: 001` in a
+values file is 1, and `mnc: 070` is even octal 56), so the chart cannot know
+which PLMN was meant and refuses it. It never pads: MNC 70 and 070 are
+different PLMNs (TS 23.003 §2.2, "MNC 012 and MNC 12"). Helm's --set keeps a
+value with a leading zero a string, but parses any other digits (999, 70) as a
+number, so those need --set-string too.
+*/}}
+{{- define "nextgcore.plmnDigits" -}}
+{{- $root := index . 0 -}}
+{{- $field := index . 1 -}}
+{{- $v := index ($root.Values.global.plmn | default dict) $field -}}
+{{- $isMcc := eq $field "mcc" -}}
+{{- $rule := ternary "an MCC is 3 digits" "an MNC is 2 or 3 digits" $isMcc -}}
+{{- $example := ternary "001" "01" $isMcc -}}
+{{- if kindIs "invalid" $v -}}
+{{- fail (printf "global.plmn.%s is not set: %s (TS 23.003 §2.2)" $field $rule) -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "global.plmn.%s=%v reached the chart as a number, not a string: its leading zeros, if it had any, are already lost (an unquoted 070 even reads as octal 56), and the chart will not guess them, since MNC 70 and 070 are different PLMNs. Quote it in the values file (for example %s: \"%s\") or pass it with --set-string global.plmn.%s=%s (#2069)" $field $v $field $example $field $example) -}}
+{{- end -}}
+{{- if not (regexMatch (ternary "^[0-9]{3}$" "^[0-9]{2,3}$" $isMcc) $v) -}}
+{{- fail (printf "global.plmn.%s=%q: %s (TS 23.003 §2.2)" $field $v $rule) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}
+
+{{- define "nextgcore.mcc" -}}
+{{- include "nextgcore.plmnDigits" (list . "mcc") -}}
+{{- end -}}
+
+{{- define "nextgcore.mnc" -}}
+{{- include "nextgcore.plmnDigits" (list . "mnc") -}}
+{{- end -}}
+
+{{/*
+#2069: the body of a plmn_id map, global.plmn's MCC and MNC as quoted strings.
+*/}}
+{{- define "nextgcore.plmnId" -}}
+mcc: {{ include "nextgcore.mcc" . | quote }}
+mnc: {{ include "nextgcore.mnc" . | quote }}
+{{- end -}}
+
+{{/*
+#2069: subscriber.imsi, validated: a string of at most 15 digits (TS 23.003
+§2.2; TS 29.571 SUPI imsi-[0-9]{5,15}) whose MCC and MNC are global.plmn's,
+since the seeded subscriber registers with this core, which serves that PLMN
+only. A number is refused as the MCC and MNC are: its leading zeros are lost.
+*/}}
+{{- define "nextgcore.subscriberImsi" -}}
+{{- $imsi := .Values.subscriber.imsi -}}
+{{- if not (kindIs "string" $imsi) -}}
+{{- fail (printf "subscriber.imsi reached the chart as a number (%v), not a string: its leading zeros, if it had any, are already lost. Quote it in the values file or pass it with --set-string subscriber.imsi=<digits> (#2069)" $imsi) -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]{5,15}$" $imsi) -}}
+{{- fail (printf "subscriber.imsi=%q: an IMSI is 5 to 15 digits, the MCC, MNC and MSIN (TS 23.003 §2.2, TS 29.571 Supi)" $imsi) -}}
+{{- end -}}
+{{- $plmn := printf "%s%s" (include "nextgcore.mcc" .) (include "nextgcore.mnc" .) -}}
+{{- if not (hasPrefix $plmn $imsi) -}}
+{{- fail (printf "subscriber.imsi=%q is not of global.plmn %s-%s: an IMSI starts with its home PLMN's MCC and MNC (TS 23.003 §2.2), and this core serves global.plmn only, so the seeded subscriber could not register (#2069)" $imsi (include "nextgcore.mcc" .) (include "nextgcore.mnc" .)) -}}
+{{- end -}}
+{{- $imsi -}}
+{{- end -}}
+
+{{/*
 #2052: the AMF Set NF Set ID of the chart's AMF (TS 23.003 §28.12), as nrfd
 derives it from the AMF's GUAMI (#2035): set<AMF Set ID>.region<AMF Region
 ID>.amfset.5gc.mnc<MNC>.mcc<MCC>, the IDs in the hex form of the published
@@ -432,15 +502,44 @@ The GUAMI is the one amf.yaml renders: global.plmn and amf.config.amfId.
 {{- if or (not (regexMatch "^[0-9]{1,4}$" $set)) (gt (atoi $set) 1023) -}}
 {{- fail (printf "amf.config.amfId.set=%s: an AMF Set ID is an integer 0-1023 (TS 23.003 §2.10.1)" $set) -}}
 {{- end -}}
-{{- $mcc := toString .Values.global.plmn.mcc -}}
-{{- $mnc := toString .Values.global.plmn.mnc -}}
-{{- if not (regexMatch "^[0-9]{3}$" $mcc) -}}
-{{- fail (printf "global.plmn.mcc=%s: an MCC is 3 digits (TS 23.003 §2.2)" $mcc) -}}
-{{- end -}}
-{{- if not (regexMatch "^[0-9]{2,3}$" $mnc) -}}
-{{- fail (printf "global.plmn.mnc=%s: an MNC is 2 or 3 digits (TS 23.003 §2.2)" $mnc) -}}
-{{- end -}}
+{{- $mcc := include "nextgcore.mcc" . -}}
+{{- $mnc := include "nextgcore.mnc" . -}}
 {{- printf "set%03x.region%02x.amfset.5gc.mnc%03s.mcc%s" (atoi $set) (atoi $region) $mnc $mcc -}}
+{{- end -}}
+
+{{/*
+#2069 (R32's #2064 minor 1): global.sbiProfile, normalised as the NFs read it
+(nextgcore_sbi::security::SbiProfile::from_env_value): "dev" for dev,
+development, insecure, local or test; "production" for production or prod,
+any case, trimmed. Any other value fails the render: the NFs would run it as
+production while a chart branch on the raw value (the NSSF's OAuth2 opt-out)
+would take it as dev.
+
+Only an ABSENT key takes the chart's default, dev (R41 on #2114). An empty
+value (`--set global.sbiProfile=` with the variable unset), or one that is not
+a string (`false`, `0`), fails the render too: the NFs read each of them as
+production, so defaulting them to dev would fail open, rendering plaintext SBI
+and the NSSF's OAuth2 opt-out.
+*/}}
+{{- define "nextgcore.sbiProfile" -}}
+{{- $v := index (.Values.global | default dict) "sbiProfile" -}}
+{{- if kindIs "invalid" $v -}}
+{{- $v = "dev" -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "global.sbiProfile=%v reached the chart as a %s, not a string: the NFs would read it as production. Set it to production (or prod) or dev (or development, insecure, local, test), with --set-string if it comes from a variable (#2069)" $v (kindOf $v)) -}}
+{{- end -}}
+{{- $raw := $v | trim | lower -}}
+{{- if eq $raw "" -}}
+{{- fail "global.sbiProfile is empty: the NFs would read it as production. Set it to production (or prod) or dev (or development, insecure, local, test), or leave the key out for dev (#2069)" -}}
+{{- end -}}
+{{- if has $raw (list "dev" "development" "insecure" "local" "test") -}}
+dev
+{{- else if has $raw (list "production" "prod") -}}
+production
+{{- else -}}
+{{- fail (printf "global.sbiProfile=%q is not a profile: use production (or prod) or dev (or development, insecure, local, test)" (toString .Values.global.sbiProfile)) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -474,6 +573,9 @@ NRF then has no allowlist, as before #2052).
 {{- if and (hasKey $e $k) (not (kindIs "slice" (get $e $k))) -}}
 {{- fail (printf "nrf.nfSetAllowlist[%d].%s must be a list" $i $k) -}}
 {{- end -}}
+{{- end -}}
+{{- if and (eq (include "nextgcore.sbiProfile" $) "production") (not $e.nf_instance_ids) -}}
+{{- fail (printf "nrf.nfSetAllowlist[%d] (%s) names no nf_instance_ids: under global.sbiProfile=production an entry must name the NF instances that may claim its set, or any certificate of its type could (#2069)" $i $e.nf_set_id) -}}
 {{- end -}}
 {{- end -}}
 {{- if $.Values.amf.enabled -}}

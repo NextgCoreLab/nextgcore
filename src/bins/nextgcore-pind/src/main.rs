@@ -33,8 +33,8 @@ use std::time::Duration;
 /// cryptographically verified (signature + expiry) at the server layer, so
 /// the token's `sub` claim can be trusted as the caller identity (PIND-10).
 static OAUTH2_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Whether the bespoke, unverified `x-caller-supi` / `3gpp-Sbi-Consumer-Info`
-/// headers may be trusted as a caller-identity source. Default false; enabled
+/// Whether the bespoke, unverified `x-caller-supi` header may be trusted as a
+/// caller-identity source. Default false; enabled
 /// only via `--trust-caller-supi-header` for mutually-authenticated intra-core
 /// transports (PIND-10).
 static TRUST_CALLER_SUPI_HEADER: AtomicBool = AtomicBool::new(false);
@@ -385,8 +385,11 @@ fn caller_supi_from_token(request: &SbiRequest) -> Option<String> {
 /// 2. **`x-caller-supi`** — a bespoke, unverified intra-core header. Honored
 ///    only when `trust_header` is set (`--trust-caller-supi-header`, default
 ///    off), as it is forgeable on an untrusted transport.
-/// 3. **`3gpp-Sbi-Consumer-Info`** — TS 29.500 §5.2.3 consumer header, also
-///    unverified; honored under the same `trust_header` gate.
+///
+/// #2103 (R30 on #2095): `3gpp-Sbi-Consumer-Info` is NOT an identity source, under
+/// any profile. It is TS 29.500 §5.2.3.3.7 consumer information (supported
+/// services, API versions and features, accepted encodings, callback roots), which
+/// never names a SUPI; reading it as one let any value there act as the caller.
 ///
 /// With neither trusted source available the caller is anonymous (`None`) and
 /// every management/state-changing operation denies it.
@@ -404,15 +407,9 @@ fn extract_caller_supi(
     if let Some(sub) = caller_supi_from_token(request) {
         return Some(sub);
     }
-    // 2/3. Bespoke / consumer-info headers — only when explicitly trusted.
+    // 2. The bespoke header -- only when explicitly trusted (dev only, #1849).
     if trust_header {
         if let Some(v) = request.http.get_header("x-caller-supi") {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-        if let Some(v) = request.http.get_header("3gpp-Sbi-Consumer-Info") {
             let v = v.trim();
             if !v.is_empty() {
                 return Some(v.to_string());
@@ -1226,13 +1223,17 @@ mod tests {
     }
 
     #[test]
-    fn extract_caller_supi_consumer_info_fallback_when_trusted() {
+    /// #2103 (R30 on #2095): `3gpp-Sbi-Consumer-Info` is consumer information
+    /// (TS 29.500 §5.2.3.3.7), never a caller identity, even with the dev-only
+    /// header trust on.
+    ///
+    /// REVERT-VERIFIED: with the Consumer-Info fallback restored, this fails: the
+    /// header's value is taken as the caller's SUPI.
+    fn consumer_info_is_not_a_caller_identity_2103() {
         let request = SbiRequest::post("/pinapp/v1/pins")
             .with_header("3gpp-Sbi-Consumer-Info", "imsi-001010000000008");
-        assert_eq!(
-            extract_caller_supi(&request, false, true).as_deref(),
-            Some("imsi-001010000000008")
-        );
+        assert_eq!(extract_caller_supi(&request, false, true), None);
+        assert_eq!(extract_caller_supi(&request, false, false), None);
     }
 
     #[test]
