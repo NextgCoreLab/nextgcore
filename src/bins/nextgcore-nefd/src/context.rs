@@ -286,11 +286,15 @@ pub struct NefTriggerTransaction {
     pub id: String,
     /// AF identifier from the request path (`{scsAsId}`).
     pub scs_as_id: String,
-    /// TS 29.122 DeliveryResult. Stays `TRIGGERED` until an SMS delivery
-    /// path exists (no SMSF NF is implemented in this repo).
+    /// TS 29.122 DeliveryResult. `UNKNOWN` until a delivery leg exists (see
+    /// `handle_device_triggering_create`).
     pub delivery_result: String,
     /// Raw DeviceTriggering JSON as received.
     pub raw: String,
+    /// The verified identity of the SCS/AS that created it (#2276). `None` only
+    /// for a transaction persisted before #2276, which no caller then owns.
+    #[serde(default)]
+    pub owner_id: Option<String>,
 }
 
 impl NefTriggerTransaction {
@@ -304,7 +308,16 @@ impl NefTriggerTransaction {
             scs_as_id: scs_as_id.into(),
             delivery_result: delivery_result.into(),
             raw: raw.into(),
+            owner_id: None,
         }
+    }
+
+    /// Whether the verified `caller` owns this transaction under `scs_as_id`
+    /// (#2276): it is the identity that created it, through the same
+    /// `{scsAsId}`. A transaction with no recorded owner (persisted before
+    /// #2276) is nobody's.
+    pub fn is_owned_by(&self, caller: &str, scs_as_id: &str) -> bool {
+        self.owner_id.as_deref() == Some(caller) && self.scs_as_id == scs_as_id
     }
 }
 
@@ -752,6 +765,48 @@ impl NefContext {
         txns.get(id).cloned()
     }
 
+    /// The device triggering transactions stored under `scs_as_id` (#2276).
+    pub fn transactions_of(&self, scs_as_id: &str) -> Vec<NefTriggerTransaction> {
+        self.transactions
+            .read()
+            .map(|t| {
+                t.values()
+                    .filter(|x| x.scs_as_id == scs_as_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Replace a stored transaction's DeviceTriggering JSON (#2276). False when
+    /// there is no such transaction.
+    pub fn transaction_replace(&self, id: &str, raw: String) -> bool {
+        let replaced = self
+            .transactions
+            .write()
+            .ok()
+            .and_then(|mut t| t.get_mut(id).map(|x| x.raw = raw))
+            .is_some();
+        if replaced {
+            self.persist();
+        }
+        replaced
+    }
+
+    /// Remove a stored transaction (#2276). False when there was none.
+    pub fn transaction_remove(&self, id: &str) -> bool {
+        let removed = self
+            .transactions
+            .write()
+            .ok()
+            .and_then(|mut t| t.remove(id))
+            .is_some();
+        if removed {
+            self.persist();
+        }
+        removed
+    }
+
     /// Number of stored device triggering transactions.
     pub fn transaction_count(&self) -> usize {
         self.transactions.read().map(|t| t.len()).unwrap_or(0)
@@ -865,6 +920,7 @@ mod tests {
                 scs_as_id: "af-1".to_string(),
                 delivery_result: "TRIGGERED".to_string(),
                 raw: r#"{"validityPeriod":"x"}"#.to_string(),
+                owner_id: Some("af-1".to_string()),
             };
             txn_id = txn.id.clone();
             ctx.transaction_insert(txn).expect("insert txn");

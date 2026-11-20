@@ -22,8 +22,11 @@
 //!   `POST/DELETE /3gpp-monitoring-event/v1/{scsAsId}/subscriptions[/{subId}]`.
 //!   A create is translated into a southbound subscription toward AMF
 //!   `Namf_EventExposure` (TS 29.518) or UDM `Nudm_EE` (TS 29.503).
-//! - **Device Triggering** northbound API (TS 29.122 §5.10):
-//!   `POST /3gpp-device-triggering/v1/{scsAsId}/transactions`.
+//! - **Device Triggering** northbound API (TS 29.122 §5.7):
+//!   `GET/POST /3gpp-device-triggering/v1/{scsAsId}/transactions` and
+//!   `GET/PUT/PATCH/DELETE .../transactions/{transactionId}`, each for the
+//!   verified SCS/AS whose identity `{scsAsId}` is (#2276). No trigger is
+//!   delivered (no SMS delivery leg): see `handle_device_triggering_create`.
 //! - **Producer notification sink** under the advertised
 //!   `nnef-eventexposure` service: `POST /nnef-eventexposure/v1/notify/{subId}`
 //!   receives AMF/UDM event notifications and forwards them to the AF's
@@ -801,7 +804,15 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Device Triggering northbound API (TS 29.122 §5.10)
         ["3gpp-device-triggering", "v1", scs_as_id, "transactions"] => match method {
             "POST" => handle_device_triggering_create(scs_as_id, &request).await,
+            "GET" => handle_device_triggering_transaction(method, scs_as_id, None, &request).await,
             _ => send_method_not_allowed(method, "transactions"),
+        },
+        ["3gpp-device-triggering", "v1", scs_as_id, "transactions", txn_id] => match method {
+            "GET" | "PUT" | "PATCH" | "DELETE" => {
+                handle_device_triggering_transaction(method, scs_as_id, Some(txn_id), &request)
+                    .await
+            }
+            _ => send_method_not_allowed(method, "transactions/{transactionId}"),
         },
         // Nnef_EventExposure (TS 29.591) -- the service the NF profile advertises
         // (issue #111). Declared BEFORE the notify sink so the more specific
@@ -1497,13 +1508,265 @@ async fn handle_monitoring_subscription_delete(
     SbiResponse::with_status(204)
 }
 
-/// POST /3gpp-device-triggering/v1/{scsAsId}/transactions — TS 29.122 §5.10
-/// Device Triggering create. Validates and stores the transaction.
+/// The verified SCS/AS behind a device triggering request (#2276, TS 29.122
+/// §4.4.6: "the SCEF shall check if the SCS/AS is authorised"). Every verb needs
+/// a verified identity, and `{scsAsId}` must be that identity, the rule #2265
+/// applies to `{afId}`. `Err` is the answer: 403 for an anonymous caller or one
+/// naming another SCS/AS, 400 for a malformed path segment.
+#[allow(clippy::result_large_err)] // answered at once, never propagated far
+fn device_triggering_caller(
+    operation: &str,
+    scs_as_id: &str,
+    request: &SbiRequest,
+) -> Result<String, SbiResponse> {
+    let caller = authenticated_client_id(request, northbound_auth())
+        .map_err(|why| refuse_unidentified(operation, &why))?;
+    if !valid_ue_identity(scs_as_id) {
+        return Err(send_bad_request(
+            "Invalid scsAsId",
+            Some("INVALID_MSG_FORMAT"),
+        ));
+    }
+    let Some(verified) = caller else {
+        return Err(nextgcore_sbi::server::send_forbidden(
+            &format!("{operation}: device triggering requires a verified SCS/AS identity"),
+            None,
+        ));
+    };
+    if verified != scs_as_id {
+        log::warn!("{operation} refused: caller {verified} used scsAsId {scs_as_id}");
+        return Err(nextgcore_sbi::server::send_forbidden(
+            &format!("{operation}: the scsAsId is not the requesting SCS/AS's verified identity"),
+            None,
+        ));
+    }
+    Ok(verified)
+}
+
+/// Table 5.7.2.1.2-1's mandatory IEs this NEF checks: a target UE (NOTE 2:
+/// externalId or msisdn; supi accepted as an internal extension) and the
+/// trigger payload.
+fn device_triggering_body_error(data: &serde_json::Value) -> Option<SbiResponse> {
+    let has_target = ["msisdn", "externalId", "supi"].iter().any(|key| {
+        data.get(*key)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    });
+    if !has_target {
+        return Some(send_bad_request(
+            "target UE identifier (msisdn / externalId) is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        ));
+    }
+    match data.get("triggerPayload").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => None,
+        _ => Some(send_bad_request(
+            "triggerPayload is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        )),
+    }
+}
+
+/// A stored transaction as TS 29.122 `DeviceTriggering`: the stored JSON with
+/// `self` and `deliveryResult`.
+fn device_triggering_view(txn: &NefTriggerTransaction) -> serde_json::Value {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&txn.raw).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "self".to_string(),
+            serde_json::json!(format!(
+                "/3gpp-device-triggering/v1/{}/transactions/{}",
+                txn.scs_as_id, txn.id
+            )),
+        );
+        obj.insert(
+            "deliveryResult".to_string(),
+            serde_json::json!(txn.delivery_result),
+        );
+    }
+    v
+}
+
+/// The DeviceTriggeringPatch members (TS 29.122 Table 5.7.2.1.4-1). The UE is
+/// not among them.
+const DEVICE_TRIGGERING_PATCH_MEMBERS: [&str; 6] = [
+    "validityPeriod",
+    "priority",
+    "applicationPortId",
+    "appSrcPortId",
+    "triggerPayload",
+    "notificationDestination",
+];
+
+/// `GET .../transactions` and `GET|PUT|PATCH|DELETE .../transactions/{id}`
+/// (TS 29.122 Table 5.7.3.1-1), each for the verified SCS/AS that owns them
+/// (#2276). A transaction of another SCS/AS is not found (404), so its existence
+/// is not disclosed.
+async fn handle_device_triggering_transaction(
+    method: &str,
+    scs_as_id: &str,
+    txn_id: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let caller = match device_triggering_caller("device triggering", scs_as_id, request) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let json = |status: u16, v: &serde_json::Value| {
+        SbiResponse::with_status(status)
+            .with_json_body(v)
+            .unwrap_or_else(|_| send_internal_error("could not encode the response"))
+    };
+    let Some(txn_id) = txn_id else {
+        let list: Vec<serde_json::Value> = nef_self()
+            .read()
+            .map(|c| c.transactions_of(scs_as_id))
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t.is_owned_by(&caller, scs_as_id))
+            .map(device_triggering_view)
+            .collect();
+        return json(200, &serde_json::Value::Array(list));
+    };
+    if !valid_ue_identity(txn_id) {
+        return send_bad_request("Invalid transactionId", Some("INVALID_MSG_FORMAT"));
+    }
+    let Some(txn) = nef_self()
+        .read()
+        .ok()
+        .and_then(|c| c.transaction_find(txn_id))
+        .filter(|t| t.is_owned_by(&caller, scs_as_id))
+    else {
+        return send_not_found("Individual Device Triggering Transaction not found", None);
+    };
+    #[allow(clippy::result_large_err)]
+    let body = || -> Result<serde_json::Value, SbiResponse> {
+        let c = request
+            .http
+            .content
+            .as_deref()
+            .ok_or_else(|| send_bad_request("Missing request body", Some("MISSING_BODY")))?;
+        serde_json::from_str(c)
+            .map_err(|e| send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")))
+    };
+    let stored: serde_json::Value =
+        serde_json::from_str(&txn.raw).unwrap_or_else(|_| serde_json::json!({}));
+    match method {
+        "GET" => json(200, &device_triggering_view(&txn)),
+        "DELETE" => {
+            nef_self()
+                .read()
+                .map(|c| c.transaction_remove(txn_id))
+                .unwrap_or(false);
+            log::info!("Device triggering transaction deleted: id={txn_id}, scsAsId={scs_as_id}");
+            SbiResponse::with_status(204)
+        }
+        "PUT" => {
+            let new = match body() {
+                Ok(v) => v,
+                Err(r) => return r,
+            };
+            if let Some(r) = device_triggering_body_error(&new) {
+                return r;
+            }
+            // §4.4.6: "The properties msisdn or externalId shall remain unchanged".
+            for key in ["msisdn", "externalId", "supi"] {
+                if new.get(key) != stored.get(key) {
+                    return send_bad_request(
+                        &format!("{key} cannot change in a replacement (TS 29.122 §4.4.6)"),
+                        Some("MANDATORY_IE_INCORRECT"),
+                    );
+                }
+            }
+            let mut new = new;
+            if let Some(o) = new.as_object_mut() {
+                o.remove("self");
+                o.remove("deliveryResult");
+            }
+            save_device_triggering(&txn, new, scs_as_id)
+        }
+        "PATCH" => {
+            let patch = match body() {
+                Ok(serde_json::Value::Object(m)) => m,
+                Ok(_) => {
+                    return send_bad_request(
+                        "DeviceTriggeringPatch must be an object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(r) => return r,
+            };
+            if let Some(k) = patch
+                .keys()
+                .find(|k| !DEVICE_TRIGGERING_PATCH_MEMBERS.contains(&k.as_str()))
+            {
+                return send_bad_request(
+                    &format!(
+                        "{k} is not a DeviceTriggeringPatch member (TS 29.122 Table 5.7.2.1.4-1)"
+                    ),
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            }
+            let mut merged = stored;
+            if let Some(o) = merged.as_object_mut() {
+                for (k, v) in patch {
+                    if v.is_null() {
+                        o.remove(&k);
+                    } else {
+                        o.insert(k, v);
+                    }
+                }
+            }
+            if let Some(r) = device_triggering_body_error(&merged) {
+                return r;
+            }
+            save_device_triggering(&txn, merged, scs_as_id)
+        }
+        _ => send_method_not_allowed(method, "transactions/{transactionId}"),
+    }
+}
+
+/// Store a replaced or modified transaction and answer 200 with it.
+fn save_device_triggering(
+    txn: &NefTriggerTransaction,
+    raw: serde_json::Value,
+    scs_as_id: &str,
+) -> SbiResponse {
+    let saved = nef_self()
+        .read()
+        .map(|c| c.transaction_replace(&txn.id, raw.to_string()))
+        .unwrap_or(false);
+    if !saved {
+        return send_not_found("Individual Device Triggering Transaction not found", None);
+    }
+    log::info!(
+        "Device triggering transaction updated: id={}, scsAsId={scs_as_id}",
+        txn.id
+    );
+    let mut updated = txn.clone();
+    updated.raw = raw.to_string();
+    SbiResponse::with_status(200)
+        .with_json_body(&device_triggering_view(&updated))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// POST /3gpp-device-triggering/v1/{scsAsId}/transactions — TS 29.122 §5.7
+/// Device Triggering create. Validates and stores the transaction, owned by the
+/// verified SCS/AS (#2276).
 ///
-/// **No delivery leg exists**, so the reported `deliveryResult` is `UNKNOWN`
-/// (issue #111). Forwarding the trigger toward SMS delivery is stubbed -- no SMSF
-/// NF exists in this repo (`NfType::Smsf` is a routing label only) -- and this used
-/// to report `TRIGGERED`.
+/// **Deviation, stated (#2276): no delivery leg exists.** TS 29.122 §4.4.6 has
+/// the SCEF resolve the UE, get the routing information and "perform the device
+/// trigger procedure over Tsp ... and T4" before creating the resource, and in
+/// the 5GS TS 23.502 §4.13.2.2 has the NEF go through the UDM to the SMS-SC.
+/// This tree has no SMS-SC, MTC-IWF or SMSF delivery path (`NfType::Smsf` is a
+/// routing label only), so the trigger is stored and never delivered. The
+/// response therefore carries `deliveryResult` `UNKNOWN`, which Table
+/// 5.7.2.2.3-1 defines for notifications only; `TRIGGERED`, the value it gives a
+/// successful request, would claim an acceptance for delivery that did not
+/// happen (issue #111). No delivery report is ever sent. Tracked by #2276's
+/// deviation note; retire it when an SMS delivery leg lands.
 ///
 /// `TRIGGERED` is a POSITIVE lifecycle state in TS 29.122 §5.10: it means the
 /// trigger was accepted for delivery. Reporting it with no delivery path told the
@@ -1513,6 +1776,10 @@ async fn handle_monitoring_subscription_delete(
 /// and stored, and the NEF genuinely does not know the delivery outcome because it
 /// never attempted one. Retire this once an SMSF/T4 leg lands.
 async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) -> SbiResponse {
+    let owner = match device_triggering_caller("device triggering create", scs_as_id, request) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
@@ -1522,27 +1789,13 @@ async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) 
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    // Mandatory IEs per TS 29.122 Table 5.10.2.1.2-1: a target UE identifier
-    // (msisdn / externalId; supi accepted as an internal extension) and the
-    // trigger payload.
-    let has_target = ["msisdn", "externalId", "supi"].iter().any(|key| {
-        data.get(*key)
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    });
-    if !has_target {
-        return send_bad_request(
-            "target UE identifier (msisdn / externalId) is mandatory",
-            Some("MANDATORY_IE_MISSING"),
-        );
-    }
-    match data.get("triggerPayload").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => {}
-        _ => return send_bad_request("triggerPayload is mandatory", Some("MANDATORY_IE_MISSING")),
+    if let Some(r) = device_triggering_body_error(&data) {
+        return r;
     }
 
-    let txn = NefTriggerTransaction::new(scs_as_id, DEVICE_TRIGGERING_STUB_RESULT, body.clone());
+    let mut txn =
+        NefTriggerTransaction::new(scs_as_id, DEVICE_TRIGGERING_STUB_RESULT, body.clone());
+    txn.owner_id = Some(owner);
     let txn_id = txn.id.clone();
     let ctx = nef_self();
     let insert = match ctx.read() {
@@ -3543,6 +3796,203 @@ mod tests {
             .block_on(fut)
     }
 
+    /// `request` as one whose bearer token the server verified for `sub` (#2276).
+    fn verified(mut request: SbiRequest, sub: &str) -> SbiRequest {
+        request.oauth2_subject = Some(sub.to_string());
+        request
+    }
+
+    /// Run `fut` under OAuth2 enforcement, so a verified `sub` is an identity.
+    fn as_scs_as<F: std::future::Future>(fut: F) -> F::Output {
+        block_on(TEST_NORTHBOUND_AUTH.scope(
+            NorthboundAuth {
+                oauth2: true,
+                mtls: false,
+            },
+            fut,
+        ))
+    }
+
+    fn trigger_body() -> serde_json::Value {
+        serde_json::json!({
+            "msisdn": "491700002276",
+            "validityPeriod": 3600,
+            "priority": "NO_PRIORITY",
+            "applicationPortId": 5000,
+            "notificationDestination": "http://127.0.0.1:9/scs/notify",
+            "triggerPayload": "cGF5bG9hZA==",
+        })
+    }
+
+    /// Create a transaction as `owner` under `/{owner}/transactions`; its id.
+    fn create_trigger_as(owner: &str) -> String {
+        let request = SbiRequest::post(format!("/3gpp-device-triggering/v1/{owner}/transactions"))
+            .with_json_body(&trigger_body())
+            .unwrap();
+        let response = as_scs_as(handle_device_triggering_create(
+            owner,
+            &verified(request, owner),
+        ));
+        assert_eq!(response.status, 201, "the owner creates");
+        let location = response.http.get_header("location").unwrap().clone();
+        location.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// #2276 criteria 1 and 4: every device triggering verb needs a verified
+    /// SCS/AS identity, and the `{scsAsId}` must be that identity. An anonymous
+    /// caller and a verified caller naming another SCS/AS are refused with 403,
+    /// and nothing is created.
+    #[test]
+    fn device_triggering_refuses_anonymous_and_foreign_callers_2276() {
+        let _guard = lock_globals();
+        reset_context();
+        let post = || {
+            SbiRequest::post("/3gpp-device-triggering/v1/scs-a/transactions")
+                .with_json_body(&trigger_body())
+                .unwrap()
+        };
+        let before = nef_self().read().unwrap().transaction_count();
+        // Anonymous.
+        let r = as_scs_as(handle_device_triggering_create("scs-a", &post()));
+        assert_eq!(r.status, 403, "an anonymous caller");
+        // Verified, but as another SCS/AS than the path names.
+        let r = as_scs_as(handle_device_triggering_create(
+            "scs-a",
+            &verified(post(), "scs-b"),
+        ));
+        assert_eq!(r.status, 403, "a foreign scsAsId");
+        assert_eq!(
+            nef_self().read().unwrap().transaction_count(),
+            before,
+            "nothing stored"
+        );
+
+        let id = create_trigger_as("scs-a");
+        let path = format!("/3gpp-device-triggering/v1/scs-a/transactions/{id}");
+        for method in ["GET", "PUT", "PATCH", "DELETE"] {
+            let mut anon = SbiRequest::get(&path);
+            anon.header.method = method.to_string();
+            let r = as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-a",
+                Some(&id),
+                &anon,
+            ));
+            assert_eq!(r.status, 403, "{method} by an anonymous caller");
+            let r = as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-a",
+                Some(&id),
+                &verified(anon.clone(), "scs-b"),
+            ));
+            assert_eq!(r.status, 403, "{method} under scs-a by scs-b");
+        }
+        let list = SbiRequest::get("/3gpp-device-triggering/v1/scs-a/transactions");
+        let r = as_scs_as(handle_device_triggering_transaction(
+            "GET", "scs-a", None, &list,
+        ));
+        assert_eq!(r.status, 403, "the collection GET by an anonymous caller");
+        assert!(
+            nef_self().read().unwrap().transaction_find(&id).is_some(),
+            "the owner's transaction is untouched"
+        );
+    }
+
+    /// #2276 criterion 2: a transaction is its creator's. Another SCS/AS, under
+    /// its own `{scsAsId}`, does not see it (404, existence not disclosed), in
+    /// the collection or by id, and cannot replace, modify or delete it.
+    #[test]
+    fn a_device_triggering_transaction_is_its_owner_s_2276() {
+        let _guard = lock_globals();
+        reset_context();
+        let id = create_trigger_as("scs-a");
+        let _other = create_trigger_as("scs-b");
+        for method in ["GET", "PUT", "PATCH", "DELETE"] {
+            let mut r = SbiRequest::get(format!(
+                "/3gpp-device-triggering/v1/scs-b/transactions/{id}"
+            ));
+            r.header.method = method.to_string();
+            r = r
+                .with_json_body(&serde_json::json!({"priority": "PRIORITY"}))
+                .unwrap();
+            let resp = as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-b",
+                Some(&id),
+                &verified(r, "scs-b"),
+            ));
+            assert_eq!(resp.status, 404, "{method} of scs-a's transaction by scs-b");
+        }
+        let list = |who: &str| {
+            let r = SbiRequest::get(format!("/3gpp-device-triggering/v1/{who}/transactions"));
+            let resp = as_scs_as(handle_device_triggering_transaction(
+                "GET",
+                who,
+                None,
+                &verified(r, who),
+            ));
+            assert_eq!(resp.status, 200);
+            let v: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            v.as_array().unwrap().len()
+        };
+        assert_eq!(list("scs-a"), 1, "scs-a sees only its own");
+        assert_eq!(list("scs-b"), 1, "scs-b sees only its own");
+        assert!(nef_self().read().unwrap().transaction_find(&id).is_some());
+    }
+
+    /// #2276 criterion 4, the owner's success: GET, PUT (the UE unchanged),
+    /// PATCH (DeviceTriggeringPatch members only) and DELETE.
+    #[test]
+    fn the_owner_reads_replaces_modifies_and_recalls_its_trigger_2276() {
+        let _guard = lock_globals();
+        reset_context();
+        let id = create_trigger_as("scs-a");
+        let path = format!("/3gpp-device-triggering/v1/scs-a/transactions/{id}");
+        let call = |method: &str, body: Option<serde_json::Value>| {
+            let mut r = SbiRequest::get(&path);
+            r.header.method = method.to_string();
+            if let Some(b) = body {
+                r = r.with_json_body(&b).unwrap();
+            }
+            as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-a",
+                Some(&id),
+                &verified(r, "scs-a"),
+            ))
+        };
+        let get = call("GET", None);
+        assert_eq!(get.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(get.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["self"], path);
+        assert_eq!(v["deliveryResult"], DEVICE_TRIGGERING_STUB_RESULT);
+
+        let mut replaced = trigger_body();
+        replaced["triggerPayload"] = serde_json::json!("bmV3");
+        assert_eq!(call("PUT", Some(replaced.clone())).status, 200);
+        let mut moved = replaced.clone();
+        moved["msisdn"] = serde_json::json!("491700009999");
+        assert_eq!(call("PUT", Some(moved)).status, 400, "§4.4.6: the UE stays");
+
+        let patched = call("PATCH", Some(serde_json::json!({"priority": "PRIORITY"})));
+        assert_eq!(patched.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(patched.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["priority"], "PRIORITY");
+        assert_eq!(v["triggerPayload"], "bmV3", "the replacement is kept");
+        assert_eq!(
+            call("PATCH", Some(serde_json::json!({"msisdn": "491700009999"}))).status,
+            400,
+            "the UE is no DeviceTriggeringPatch member"
+        );
+
+        assert_eq!(call("DELETE", None).status, 204);
+        assert!(nef_self().read().unwrap().transaction_find(&id).is_none());
+        assert_eq!(call("GET", None).status, 404, "recalled");
+    }
+
     fn monitoring_request(body: serde_json::Value) -> SbiRequest {
         SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions")
             .with_json_body(&body)
@@ -4100,7 +4550,10 @@ mod tests {
                 "triggerPayload": "cGF5bG9hZA==",
             }))
             .expect("serialize test body");
-        let response = block_on(handle_device_triggering_create("af1", &request));
+        let response = as_scs_as(handle_device_triggering_create(
+            "af1",
+            &verified(request, "af1"),
+        ));
         assert_eq!(response.status, 201);
 
         let location = response
@@ -6637,7 +7090,10 @@ mod tests {
                 "triggerPayload": "cGF5bG9hZA==",
             }))
             .expect("serialize test body");
-        let response = block_on(handle_device_triggering_create("af1", &request));
+        let response = as_scs_as(handle_device_triggering_create(
+            "af1",
+            &verified(request, "af1"),
+        ));
         assert_eq!(
             response.status, 400,
             "missing target identifier must be 400"
@@ -6651,7 +7107,10 @@ mod tests {
                 "msisdn": "491700000001",
             }))
             .expect("serialize test body");
-        let response = block_on(handle_device_triggering_create("af1", &request));
+        let response = as_scs_as(handle_device_triggering_create(
+            "af1",
+            &verified(request, "af1"),
+        ));
         assert_eq!(response.status, 400, "missing triggerPayload must be 400");
     }
 
@@ -7963,6 +8422,10 @@ mod northbound_auth_tests {
             SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions"),
             SbiRequest::delete("/3gpp-monitoring-event/v1/af1/subscriptions/sub-1"),
             SbiRequest::post("/3gpp-device-triggering/v1/af1/transactions"),
+            // #2276: and every verb of the transactions.
+            SbiRequest::get("/3gpp-device-triggering/v1/af1/transactions"),
+            SbiRequest::get("/3gpp-device-triggering/v1/af1/transactions/t-1"),
+            SbiRequest::delete("/3gpp-device-triggering/v1/af1/transactions/t-1"),
             SbiRequest::post("/nnef-eventexposure/v1/notify/sub-1"),
         ]
     }
