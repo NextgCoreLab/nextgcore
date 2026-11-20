@@ -3500,13 +3500,19 @@ impl NgapServer {
         let affected: Vec<u64> = match &reset.reset_type {
             // `snapshot` and not `iter`: the loop below re-enters the store, so a live
             // guard here would DEADLOCK. See `ue_store`'s module docs.
-            ResetType::NgInterface => self
-                .ue_auth_state
-                .snapshot()
-                .into_iter()
-                .filter(|(_, state)| state.association_id == association_id)
-                .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
-                .collect(),
+            ResetType::NgInterface => {
+                #[cfg(test)]
+                crate::test_support::refuse_releasing_the_shared_test_association(
+                    association_id,
+                    "a whole-interface NG Reset",
+                );
+                self.ue_auth_state
+                    .snapshot()
+                    .into_iter()
+                    .filter(|(_, state)| state.association_id == association_id)
+                    .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
+                    .collect()
+            }
             ResetType::PartOfNgInterface(connections) => {
                 let on_this_gnb: Vec<(u64, u32)> = self
                     .ue_auth_state
@@ -3666,6 +3672,8 @@ impl NgapServer {
     /// UE-associated connection it carried is gone. Each UE of `association_id` is
     /// released as by a whole-interface NG Reset, and its SMF calls start at once.
     async fn reset_ue_associations_of(&mut self, association_id: u64, why: &str) {
+        #[cfg(test)]
+        crate::test_support::refuse_releasing_the_shared_test_association(association_id, why);
         self.drop_contextless_ue_ids_for_reset(
             association_id,
             &nextgcore_ngap::types::ResetType::NgInterface,
@@ -44109,8 +44117,12 @@ mod tests {
     /// in this Accept and the assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_registration_without_nsac_sends_no_stale_rejected_nssai_2022() {
-        crate::context::amf_context_init(64, 1024, 4096);
         let _policy = crate::emergency::emergency_policy_test_guard().await;
+        // #2039: it replaces the process-wide served GUAMIs, which every GUTI test
+        // reads under CONTEXT_GUARD; without it, its restore emptied them mid-test.
+        // After the emergency-policy guard, the order lib.rs's config tests use.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
         let _guami = handler_tests::ServeOneGuami::install();
         let mut ngap = capturing_ngap_server().await;
         seed_gnb_session(&ngap, 1).await;
@@ -45130,7 +45142,9 @@ mod tests {
     /// Serve only [`local_guami`] until the returned guard drops, which puts back
     /// the GUAMIs served before, even on a panic (#1636, R5's #1624 review).
     #[must_use = "the served GUAMIs are put back when this is dropped"]
+    #[track_caller]
     fn serve_only_local_guami() -> ServedGuamiGuard {
+        crate::test_support::assert_context_guard_held("serve_only_local_guami");
         let ctx_arc = crate::context::amf_self();
         let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
         let saved = std::mem::take(&mut ctx.served_guami);

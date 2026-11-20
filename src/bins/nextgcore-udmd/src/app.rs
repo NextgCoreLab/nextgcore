@@ -7364,17 +7364,17 @@ mod tests {
             .unwrap_or_else(|_| SbiResponse::with_status(500))
     }
 
-    /// A stub AUSF that counts the Nausf_SoRProtection / UPUProtection requests
-    /// it receives. Registered in the shared SBI context under `instance_id` so
-    /// udmd's AUSF selection can resolve it.
-    /// A stand-in AUSF serving SoR/UPU protection. It counts only the requests
-    /// for `supi`: the NF cache it registers in is process-wide, and a sibling
-    /// test that injects SoR/UPU for its own UE meanwhile can reach it through
-    /// the "any cached AUSF" fallback (#2082: seen as a stray hit on `ausf-a`
-    /// under shuffle seed 9001).
+    /// A stub AUSF that counts every Nausf_SoRProtection / UPUProtection request
+    /// it receives. Registered in the process-wide SBI NF cache under
+    /// `instance_id` so udmd's AUSF selection can resolve it, so the caller must
+    /// hold `CONTEXT_GUARD` and remove it again (`remove_stub_ausfs`).
+    ///
+    /// #2210: it counts all requests, not only its test's SUPI. The stray hit
+    /// #2082 saw on `ausf-a` (shuffle seed 9001) came from sor.rs's
+    /// "AUSF unreachable" tests reading the cache without the guard. They take
+    /// it now, so isolation needs no filter.
     async fn start_stub_ausf(
         instance_id: &str,
-        supi: &'static str,
     ) -> (SbiServer, Arc<std::sync::atomic::AtomicUsize>) {
         use nextgcore_sbi::context::{global_context, NfInstance, NfService};
         use nextgcore_sbi::types::{NfType, SbiServiceType};
@@ -7389,7 +7389,7 @@ mod tests {
             .start(move |req: SbiRequest| {
                 let counter = Arc::clone(&counter);
                 async move {
-                    if req.header.uri.contains(&format!("/{supi}/")) {
+                    if req.header.uri.contains("/nausf-") {
                         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     // 204 with no SorSecurityInfo: the injector then withholds
@@ -7414,6 +7414,20 @@ mod tests {
         instance.add_service(svc);
         global_context().add_nf_instance(instance).await;
         (server, hits)
+    }
+
+    /// #2210: take every AUSF out of the process-wide NF cache. The pinning test
+    /// calls it first, so the "any cached AUSF" fallback can only find its own
+    /// stand-ins, and last, so no sibling reaches a stopped stand-in through
+    /// that fallback. The caller holds `CONTEXT_GUARD`.
+    async fn remove_stub_ausfs() {
+        let ctx = nextgcore_sbi::context::global_context();
+        for inst in ctx
+            .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Ausf)
+            .await
+        {
+            ctx.remove_nf_instance(&inst.id).await;
+        }
     }
 
     /// #1811: the UDM's real 5G AKA (Nudm_UEAU generate-auth-data: the
@@ -7556,17 +7570,17 @@ mod tests {
         std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
 
         let (udm_server, client) = start_real_udm().await;
-        // A SUPI of this test's own (#2082): the stand-in AUSFs count only its
-        // requests, so a sibling's SoR/UPU for another UE cannot be mistaken
-        // for the fallback firing here.
         let supi = "imsi-001010000002082";
         let gen_path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
 
         // --- criterion 5a: the request's ausfInstanceId is PERSISTED ---------
-        // Two AUSFs exist; "ausf-a" is registered first, so it is what the
-        // "any cached AUSF" fallback would pick.
-        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a", supi).await;
-        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b", supi).await;
+        // #2210: isolated, not filtered. Under CONTEXT_GUARD, with every other
+        // AUSF taken out of the cache, exactly two AUSFs exist; "ausf-a" is
+        // registered first, so it is what the "any cached AUSF" fallback would
+        // pick. Both stand-ins count every request they get.
+        remove_stub_ausfs().await;
+        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a").await;
+        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b").await;
 
         let resp = client
             .post_json(
@@ -7717,6 +7731,14 @@ mod tests {
         udr_server.stop().await.expect("stop udr");
         ausf_a_server.stop().await.expect("stop ausf-a");
         ausf_b_server.stop().await.expect("stop ausf-b");
+        remove_stub_ausfs().await;
+        assert!(
+            nextgcore_sbi::context::global_context()
+                .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Ausf)
+                .await
+                .is_empty(),
+            "no stand-in AUSF is left for a sibling's fallback"
+        );
     }
 
     // ========================================================================

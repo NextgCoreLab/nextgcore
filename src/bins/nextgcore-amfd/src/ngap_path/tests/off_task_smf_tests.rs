@@ -2486,7 +2486,13 @@ async fn an_association_loss_that_supersedes_waiting_activations_closes_their_jo
     let mut server = capturing_ngap_server().await;
     // No permits: every offloaded exchange waits, as under heavy load.
     server.sbi_offload = crate::sbi_offload::SbiOffload::new(0);
-    seed_gnb_session(&server, 1).await;
+    // #2039: an association of this test's own. The UE store is process-wide,
+    // so losing association 1 idled every sibling test's UE on it (about sixty
+    // in a full run), and their activations were rolled back, their Accepts not
+    // sent and their downlinks answered as for CM-IDLE UEs: the SMF-session
+    // flakes of #2039.
+    const ASSOCIATION: u64 = 1_924_101;
+    seed_gnb_session(&server, ASSOCIATION).await;
     let (old, new) = (19_240_011u64, 19_240_012u64);
     let pdu = idle_ue_with_two_sessions(
         &mut server,
@@ -2497,7 +2503,7 @@ async fn an_association_loss_that_supersedes_waiting_activations_closes_their_jo
         ("isr-1924-assoc-fast", "isr-1924-assoc-slow"),
     );
     server
-        .handle_initial_ue_message(1, &pdu)
+        .handle_initial_ue_message(ASSOCIATION, &pdu)
         .await
         .expect("handled");
     assert_eq!(
@@ -2507,7 +2513,7 @@ async fn an_association_loss_that_supersedes_waiting_activations_closes_their_jo
     );
 
     server
-        .reset_ue_associations_of(1, "SCTP association lost (test)")
+        .reset_ue_associations_of(ASSOCIATION, "SCTP association lost (test)")
         .await;
     assert!(
         server.smf_joins.is_empty(),

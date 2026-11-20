@@ -16033,6 +16033,9 @@ mod tests_nf_set_ids_1719 {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_enforcement_notifies_the_stripped_profile_1822() {
         use std::sync::Mutex as StdMutex;
+        // #2227: the subscriber is plaintext loopback, so the dev profile, or the
+        // notification client will not send (set, never reset).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let own = "18220a0a-0000-4000-8000-00000000000a";
         let mixed = "18220b0b-0000-4000-8000-00000000000b";
         let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -16371,6 +16374,9 @@ mod unverified_registrant_tests_1617 {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_the_restored_self_entry_notifies_nf_deregistered_1821() {
         use std::sync::Mutex as StdMutex;
+        // #2227: the subscriber is plaintext loopback, so the dev profile, or the
+        // notification client will not send (set, never reset).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _self_entry = self_entry_test_lock().lock().await;
 
         let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
