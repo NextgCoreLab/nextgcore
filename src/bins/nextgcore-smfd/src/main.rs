@@ -28967,6 +28967,20 @@ mod tests {
         );
     }
 
+    /// #2162: the exact refusal of a certificate naming no NF types and no
+    /// token, by the rule the profile applies (`owner_binding`): under
+    /// production #2065's no-identity rule, under dev #2099's typeless check.
+    fn typeless_reason_2162(production: bool, want: &str) -> String {
+        if production {
+            "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it cannot be told from a relay's, and it presented no access token".to_string()
+        } else {
+            format!(
+                "the requester's certificate names no NF types and it sent no access token, \
+                 so it cannot be shown to be an {want}"
+            )
+        }
+    }
+
     /// **#2078**: an AMF change is admitted only from a caller shown to be an AMF
     /// (CONVENTIONS: the verified NF type), never assumed from a token or a
     /// certificate without NF types. On one context, owned by A:
@@ -29029,12 +29043,15 @@ mod tests {
         let scp = with_cert(as_nf_1860(change(NOT_AMF), Some(NOT_AMF)), SCP, &["SCP"]);
         // #2097: the new AMF's own id, but a certificate naming another type.
         let direct_smf = with_cert(change(DIRECT), DIRECT, &["SMF"]);
+        // #2162: the profile is read once, before any request, and the typeless
+        // case asserts the exact reason of the rule that profile applies: under
+        // production #2065's (no identity at all), under dev #2099's typeless
+        // check. A substring both share could not tell which rule refused.
+        let typeless_reason =
+            typeless_reason_2162(nextgcore_sbi::owner_binding::identity_required(), "AMF");
         for (what, req, expect) in [
             ("direct non-AMF", direct_smf, "not AMF"),
-            // #2089: under production #2065 refuses it as no identity ("names
-            // no NF type (RFC 9310 NFTypes)"), under dev the type check does
-            // ("names no NF types"); refused either way.
-            ("typeless", typeless, "names no NF type"),
+            ("typeless", typeless, typeless_reason.as_str()),
             ("token only", token_only, "does not list"),
             ("SCP", scp, "does not list"),
         ] {

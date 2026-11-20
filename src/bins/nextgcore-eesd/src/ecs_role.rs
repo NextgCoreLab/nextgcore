@@ -147,10 +147,17 @@ pub const API_TARGET_EES_DISCOVERY: &str = "eecs-targeteesdiscovery/v1";
 /// no EES could never be returned by discovery, which is the un-discoverable state
 /// worth refusing rather than accepting and never matching.
 pub fn handle_registration_create(request: &SbiRequest) -> SbiResponse {
+    handle_registration_create_with(request, nextgcore_sbi::owner_binding::identity_required())
+}
+
+/// [`handle_registration_create`] under the profile `production` says, read once per request by
+/// [`route`] (#2162).
+fn handle_registration_create_with(request: &SbiRequest, production: bool) -> SbiResponse {
     // #1937: the EES this registration is bound to, before anything is stored.
-    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource(
+    let owner = match nextgcore_sbi::owner_binding::owner_for_new_resource_with(
         request,
         "CreateEESRegistration",
+        production,
     ) {
         Ok(owner) => owner,
         Err(refused) => return *refused,
@@ -199,6 +206,20 @@ pub fn handle_registration_create(request: &SbiRequest) -> SbiResponse {
 /// an ECS restart produces. Answering 200 for an unknown id, or silently
 /// re-creating it, would hide the very case #107's criterion 4 is about.
 pub fn handle_registration_update(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    handle_registration_update_with(
+        registration_id,
+        request,
+        nextgcore_sbi::owner_binding::identity_required(),
+    )
+}
+
+/// [`handle_registration_update`] under the profile `production` says, read once per request by
+/// [`route`] (#2162).
+fn handle_registration_update_with(
+    registration_id: &str,
+    request: &SbiRequest,
+    production: bool,
+) -> SbiResponse {
     let Some(body) = &request.http.content else {
         return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING"));
     };
@@ -216,10 +237,11 @@ pub fn handle_registration_update(registration_id: &str, request: &SbiRequest) -
             Ok(mut r) => match r.get_mut(registration_id) {
                 Some(existing) => {
                     // #1937: only the EES that registered, under the same lock.
-                    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                    if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner_with(
                         existing.owner.as_deref(),
                         request,
                         "UpdateEESRegistration",
+                        production,
                     ) {
                         return refused;
                     }
@@ -244,6 +266,20 @@ pub fn handle_registration_update(registration_id: &str, request: &SbiRequest) -
 
 /// `GET`/`DELETE /eecs-eesregistration/v1/registrations/{registrationId}`.
 pub fn handle_registration_get(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    handle_registration_get_with(
+        registration_id,
+        request,
+        nextgcore_sbi::owner_binding::identity_required(),
+    )
+}
+
+/// [`handle_registration_get`] under the profile `production` says, read once per request by
+/// [`route`] (#2162).
+fn handle_registration_get_with(
+    registration_id: &str,
+    request: &SbiRequest,
+    production: bool,
+) -> SbiResponse {
     match registry()
         .lock()
         .ok()
@@ -251,10 +287,11 @@ pub fn handle_registration_get(registration_id: &str, request: &SbiRequest) -> S
     {
         // #1937: only the EES that registered.
         Some(stored) => {
-            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+            if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner_with(
                 stored.owner.as_deref(),
                 request,
                 "GetEESRegistration",
+                production,
             ) {
                 return refused;
             }
@@ -271,14 +308,29 @@ pub fn handle_registration_get(registration_id: &str, request: &SbiRequest) -> S
 
 /// `DELETE` — 204, or 404 for an unknown id.
 pub fn handle_registration_delete(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    handle_registration_delete_with(
+        registration_id,
+        request,
+        nextgcore_sbi::owner_binding::identity_required(),
+    )
+}
+
+/// [`handle_registration_delete`] under the profile `production` says, read once per request by
+/// [`route`] (#2162).
+fn handle_registration_delete_with(
+    registration_id: &str,
+    request: &SbiRequest,
+    production: bool,
+) -> SbiResponse {
     // #1937: only the EES that registered, checked and removed under one lock.
     let removed = match registry().lock() {
         Ok(mut r) => match r.get(registration_id) {
             Some(existing) => {
-                if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner(
+                if let Some(refused) = nextgcore_sbi::owner_binding::refuse_non_owner_with(
                     existing.owner.as_deref(),
                     request,
                     "DeleteEESRegistration",
+                    production,
                 ) {
                     return refused;
                 }
@@ -437,7 +489,11 @@ pub const SCOPE_TARGET_EES_DISCOVERY: &str = "eecs-targeteesdiscovery";
 /// A token that is presented is always verified, even with a certificate, so
 /// a bad token is never ignored. `Some` is the refusal to send (401 for no or
 /// a bad credential, 403 for a token without the scope); nothing has run yet.
-fn require_verified_caller(request: &mut SbiRequest, scope: &str) -> Option<SbiResponse> {
+fn require_verified_caller(
+    request: &mut SbiRequest,
+    scope: &str,
+    production: bool,
+) -> Option<SbiResponse> {
     let unauthorized = |why: &str| {
         Some(nextgcore_sbi::server::send_unauthorized(
             &format!(
@@ -455,7 +511,7 @@ fn require_verified_caller(request: &mut SbiRequest, scope: &str) -> Option<SbiR
     // R30 on #2053: the shared identity rule (`owner_binding`). A relay's
     // certificate (SCP, SEPP) is not the caller's, so it counts only through
     // the token `sub` it carries; a certificate and a token must agree.
-    match nextgcore_sbi::owner_binding::verified_consumer_id(request) {
+    match nextgcore_sbi::owner_binding::verified_consumer_id_with(request, production) {
         Err(why) => Some(nextgcore_sbi::server::send_forbidden(&why, None)),
         Ok(None) => unauthorized("no verified identity"),
         Ok(Some(_)) => {
@@ -510,8 +566,12 @@ pub fn route(parts: &[&str], request: &SbiRequest) -> Option<SbiResponse> {
         Some(&"eecs-targeteesdiscovery") => SCOPE_TARGET_EES_DISCOVERY,
         _ => return None,
     };
+    // #2162: the SBI profile is read once, before anything runs, and every
+    // identity decision of this request (the caller check, the owner binding)
+    // applies that one value: a profile change mid-request cannot split them.
+    let production = nextgcore_sbi::owner_binding::identity_required();
     let mut verified = request.clone();
-    if let Some(refused) = require_verified_caller(&mut verified, scope) {
+    if let Some(refused) = require_verified_caller(&mut verified, scope, production) {
         return Some(refused);
     }
     let request = &verified;
@@ -522,13 +582,13 @@ pub fn route(parts: &[&str], request: &SbiRequest) -> Option<SbiResponse> {
     }
     match parts {
         ["eecs-eesregistration", "v1", "registrations"] => Some(match method {
-            "POST" => handle_registration_create(request),
+            "POST" => handle_registration_create_with(request, production),
             _ => send_method_not_allowed(method, "registrations"),
         }),
         ["eecs-eesregistration", "v1", "registrations", registration_id] => Some(match method {
-            "PUT" => handle_registration_update(registration_id, request),
-            "GET" => handle_registration_get(registration_id, request),
-            "DELETE" => handle_registration_delete(registration_id, request),
+            "PUT" => handle_registration_update_with(registration_id, request, production),
+            "GET" => handle_registration_get_with(registration_id, request, production),
+            "DELETE" => handle_registration_delete_with(registration_id, request, production),
             _ => send_method_not_allowed(method, "registrations/{registrationId}"),
         }),
         ["eecs-serviceprovisioning", "v1", "provisioning-requests"] => Some(match method {
@@ -987,6 +1047,34 @@ mod tests {
                 uri: Some("http://10.0.0.9:7814".to_string()),
                 ..Default::default()
             }
+        );
+    }
+
+    /// #2162 (R40 on #2089): the caller check applies the profile it is given,
+    /// read once per request by `route`, not one it reads again itself. The
+    /// same typeless certificate alone is 403 (no identity, #2065) when the
+    /// request was read as production and 401 (the ECS's own typeless check)
+    /// when read as dev, whatever the process-wide profile is meanwhile.
+    ///
+    /// REVERT-VERIFIED: with `require_verified_caller` back on
+    /// `verified_consumer_id` (it reads the profile itself), one of the two
+    /// cases follows the process-wide profile instead and its assertion fails.
+    #[test]
+    fn the_caller_check_applies_the_profile_read_for_the_request_2162() {
+        let typeless = || {
+            let mut r = SbiRequest::post("/eecs-serviceprovisioning/v1/provisioning-requests");
+            r.peer_cert_nf_instance_id = Some("21620000-0000-4000-8000-0000000000c1".into());
+            r
+        };
+        let status = |production: bool| {
+            require_verified_caller(&mut typeless(), SCOPE_SERVICE_PROVISIONING, production)
+                .map(|r| r.status)
+        };
+        assert_eq!(status(true), Some(403), "read as production: no identity");
+        assert_eq!(
+            status(false),
+            Some(401),
+            "read as dev: the ECS's typeless check"
         );
     }
 }

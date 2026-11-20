@@ -5131,6 +5131,20 @@ mod tests {
         assert!(lmf_self().read().unwrap().ldr_find(reference).is_none());
     }
 
+    /// #2162: the exact refusal of a certificate naming no NF types and no
+    /// token, by the rule the profile applies (`owner_binding`): under
+    /// production #2065's no-identity rule, under dev #2099's typeless check.
+    fn typeless_reason_2162(production: bool, want: &str) -> String {
+        if production {
+            "the requester's client certificate names no NF type (RFC 9310 NFTypes), so it cannot be told from a relay's, and it presented no access token".to_string()
+        } else {
+            format!(
+                "the requester's certificate names no NF types and it sent no access token, \
+                 so it cannot be shown to be an {want}"
+            )
+        }
+    }
+
     /// **#2077** (R31 M1 on #2094): a LocationContextTransfer comes from the old
     /// LMF (TS 29.572 §5.2.2.5.2, TS 23.273 §6.4 step 6: LMF1 -> LMF2), and the
     /// caller must be shown to be an LMF (CONVENTIONS: the verified NF type).
@@ -5172,6 +5186,11 @@ mod tests {
             req.oauth2_subject = token.map(str::to_string);
             req
         };
+        // #2162: the profile is read once, before any request, and the typeless
+        // case asserts the exact reason of the rule that profile applies: under
+        // production #2065's (no identity at all), under dev #2099's typeless
+        // check. A substring both share could not tell which rule refused.
+        let typeless_reason = typeless_reason_2162(owner_binding::identity_required(), "LMF");
         for (what, req, expect) in [
             (
                 "token only",
@@ -5186,10 +5205,7 @@ mod tests {
             (
                 "typeless",
                 with("x2077-3", Some((DIRECT, &[])), None),
-                // #2089: under production #2065 refuses it as no identity
-                // ("names no NF type (RFC 9310 NFTypes)"), under dev the type
-                // check does ("names no NF types"); refused either way.
-                "names no NF type",
+                typeless_reason.as_str(),
             ),
             (
                 "GMLC",
