@@ -1900,3 +1900,42 @@ async fn another_lmfs_correlations_never_evict_a_session_and_unknown_ones_abort(
     sink_b.stop().await.expect("stop");
     server.forget_ue(ue);
 }
+
+/// #2256 follow-up: under a profile that admits unverified callers, a caller
+/// declaring an nfId cannot take over a correlation bound with no identity, so
+/// it cannot capture that session's answers. (lmfd names its nfId in its LPP
+/// container, TS 29.518 Table 6.1.6.2.17-1, so its own correlations are never
+/// anonymous.)
+///
+/// Revert-verified: with "a declared nfId fills an anonymous binding" restored,
+/// the declared transfer gets 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_nfid_cannot_take_over_an_anonymous_correlation() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_225_607u64, 102, "imsi-001010022560007");
+    live_ue(&mut server, ue, ran, supi);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    // (Not the test handler, which would make each caller a verified consumer.)
+    let resp =
+        crate::namf_request_handler(lpp_transfer_with(supi, None, None, None, "corr-anon")).await;
+    assert_eq!(resp.status, 200, "{}", cause_of(&resp));
+    let resp = crate::namf_request_handler(lpp_transfer_with(
+        supi,
+        None,
+        Some(LMF_B_2256),
+        None,
+        "corr-anon",
+    ))
+    .await;
+    assert_eq!(resp.status, 403, "{}", cause_of(&resp));
+    assert_eq!(cause_of(&resp), "UNSPECIFIED");
+    let bound = crate::context::amf_self()
+        .read()
+        .ok()
+        .and_then(|g| g.lcs_uplink_route_find(supi, "corr-anon"));
+    assert_eq!(bound.and_then(|r| r.lmf_id), None, "still nobody's");
+    server.process_positioning_downlinks().await;
+    let _ = take_sent_ngap(&mut server);
+    server.forget_ue(ue);
+}

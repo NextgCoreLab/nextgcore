@@ -9358,6 +9358,21 @@ mod positioning_chain_strict_peer {
             .await
             .expect("amfd accepted the N1N2MessageTransfer within budget")
             .expect("harness captured the correlation + downlink LPP");
+        // #2256: lmfd names its nfId in the LPP N1 container (TS 29.518 Table
+        // 6.1.6.2.17-1), so amfd binds the correlation to this LMF, not to no
+        // identity that another caller's declaration could take over.
+        // Revert-verified: with lmfd's N1 nfId removed, the binding names no
+        // LMF and this assertion fails.
+        assert_eq!(
+            amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.lcs_uplink_route_find(&supi, &corr))
+                .and_then(|r| r.lmf_id)
+                .as_deref(),
+            Some("lmf-strict-peer"),
+            "amfd binds lmfd's correlation to lmfd"
+        );
 
         // Transparent-relay proof (DL leg): amfd extracted EXACTLY lmfd's encoder
         // output. Decode the relayed PDU for its LPP transactionID, then re-encode
