@@ -189,6 +189,19 @@ fn prune_backoff(set: &VecDeque<Parked>) {
     BACKOFF.retain(|peer| live.contains(peer));
 }
 
+/// #2175: whether the delete of `c` is parked. For tests, which share
+/// [`pending`] with production code that parks on its own schedule (a session
+/// release's detached retry task, `release_retries`, parks its failures after
+/// its last retry, possibly after the test that started it has finished), so a
+/// test asserts on its own record rather than on [`pending_count`].
+#[cfg(test)]
+pub fn is_parked(c: &AmfMbsContext) -> bool {
+    pending()
+        .lock()
+        .map(|s| s.iter().any(|p| same_context(&p.ctx, c)))
+        .unwrap_or(false)
+}
+
 /// How many ContextDeletes are parked: the
 /// `nextgcore_mbsmf_amf_context_deletes_pending` gauge.
 pub fn pending_count() -> usize {

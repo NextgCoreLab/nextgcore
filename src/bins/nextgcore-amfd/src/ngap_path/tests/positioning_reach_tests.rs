@@ -404,8 +404,8 @@ async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acq
     );
 
     let before = epoch_secs_now();
-    let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
-        &nextgcore_ngap::types::UplinkNasTransport {
+    let ul_pdu =
+        crate::gnb_pdus::uplink_nas_transport(&nextgcore_ngap::types::UplinkNasTransport {
             amf_ue_ngap_id: ue,
             ran_ue_ngap_id: ran,
             nas_pdu: vec![
@@ -414,9 +414,7 @@ async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acq
                 message_type::CONFIGURATION_UPDATE_COMPLETE,
             ],
             user_location_info: super::test_user_location(0x04_88_01, 0x0004_8801),
-        },
-    )
-    .expect("encode an Uplink NAS Transport");
+        });
     server
         .handle_uplink_nas_transport(1, &ul_pdu)
         .await
