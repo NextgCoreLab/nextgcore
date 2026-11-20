@@ -61,6 +61,9 @@ base64.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# #2099: `owner_binding::seed_nf_type_for_test`, the NRF stand-in for the
+# verified-NF-type rule. Dev-only.
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 # #475 strict-peer test: drive amfd's REAL N26 → NGAP EPS→5GS handover path against this
 # SMF's REAL SBI handlers, so the two sides of TS 23.502 §4.11.1.2.2 cannot drift — the same
 # dev-only edge lmfd, pcfd, udmd and mmed already have. Not linked into the binary.
