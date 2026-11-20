@@ -70,10 +70,40 @@ pub(crate) async fn send_to_marked(
 ) -> io::Result<usize> {
     let fd = sock.as_raw_fd();
     let tos = libc::c_int::from(dscp_tos(dscp));
-    sock.async_io(tokio::io::Interest::WRITABLE, || {
-        sendmsg_marked(fd, buf, dst, tos)
-    })
-    .await
+    match sock
+        .async_io(tokio::io::Interest::WRITABLE, || {
+            sendmsg_marked(fd, buf, dst, tos)
+        })
+        .await
+    {
+        // #2234 (R43 minor 1 on #2197): a kernel that refuses the marking
+        // control message must not black-hole the user plane. The datagram goes
+        // out unmarked instead, as it did when the marking was a socket option
+        // ("non-fatal; the packet is still sent, just without outer marking").
+        Err(e) if marking_refused(&e) => {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "The kernel refuses per-datagram DSCP marking toward {dst} ({e}); \
+                     GTP-U goes out unmarked (TS 23.501 §5.7.4 not honoured). Logged once."
+                );
+            } else {
+                log::debug!("DSCP marking toward {dst} refused ({e}); sent unmarked");
+            }
+            sock.send_to(buf, dst).await
+        }
+        r => r,
+    }
+}
+
+/// Whether `e` is the kernel refusing the IP_TOS / IPV6_TCLASS control message
+/// itself, rather than the send failing: the errors `sendmsg` returns for an
+/// ancillary data type or option the socket does not support.
+fn marking_refused(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+    )
 }
 
 /// One `sendmsg` of `buf` to `dst` carrying `tos` as the datagram's IP_TOS or
@@ -137,6 +167,13 @@ fn sendmsg_marked(fd: RawFd, buf: &[u8], dst: SocketAddr, tos: libc::c_int) -> i
         let c = libc::CMSG_FIRSTHDR(&msg);
         (*c).cmsg_level = level;
         (*c).cmsg_type = kind;
+        // A destination a test registered: an ancillary type no protocol knows,
+        // so the kernel itself refuses the send (EINVAL), as a restricted one
+        // would refuse the marking.
+        #[cfg(test)]
+        if tos_test_support::marking_refused_toward(dst) {
+            (*c).cmsg_type = 0x7ffe;
+        }
         (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(c) as *mut libc::c_int, tos);
     }
@@ -3360,19 +3397,6 @@ impl DataPlaneSession {
         })
     }
 
-    /// #2197 (R43 minor 2): whether this session forwards its uplink over GTP-U
-    /// toward the Core (an I-UPF: a FORW FAR toward the Core with a GTP-U Outer
-    /// Header Creation).
-    pub fn forwards_uplink_over_gtpu(&self) -> bool {
-        self.fars.read().unwrap().values().any(|f| {
-            f.apply_action & FAR_ACTION_DROP == 0
-                && f.apply_action & FAR_ACTION_FORW != 0
-                && f.destination_interface == SRC_INTF_CORE
-                && f.ohc_teid.is_some()
-                && f.ohc_addr.is_some()
-        })
-    }
-
     /// Look up a FAR and derive the forwarding decision (TS 29.244 8.2.26).
     ///
     /// Unknown FAR IDs yield Drop: forwarding traffic that has no
@@ -4552,33 +4576,14 @@ impl DataPlane {
         let ip_payload = &pkt[header.header_len..];
         let payload_len = ip_payload.len() as u64;
 
-        // Look up session by UL TEID first, then by source IP.
-        //
-        // #2197 (R43 minor 2): never by source IP for an I-UPF session (one that
-        // forwards its uplink over GTP-U toward the Core). A PSA's downlink on a
-        // stale or unknown N9 TEID whose inner source is another UE of this
-        // I-UPF would otherwise find that UE's session, pass its anti-spoofing
-        // check and go back up to the PSA. It is an unknown TEID (§7.3.1).
-        let session = self.sessions.find_by_ul_teid(header.teid).or_else(|| {
-            if ip_payload.len() >= 20 {
-                let ip_version = (ip_payload[0] >> 4) & 0x0F;
-                if ip_version == IP_VERSION_4 {
-                    let src_ip = Ipv4Addr::new(
-                        ip_payload[12],
-                        ip_payload[13],
-                        ip_payload[14],
-                        ip_payload[15],
-                    );
-                    self.sessions
-                        .find_by_ue_ip(src_ip)
-                        .filter(|s| !s.forwards_uplink_over_gtpu())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
+        // The session is the one holding the TEID the G-PDU arrived on, and only
+        // that one (#2234, TS 29.281 §7.3.1): a TEID this UPF did not allocate has
+        // no PDU session, whatever the inner source address is. Before, a miss
+        // fell back to the session of the UE owning the inner source address
+        // (#2197 had already ruled that out for an I-UPF session), so a gNB on a
+        // stale TEID, or anyone on N3 sending with a UE's address, had the packet
+        // forwarded as that UE's uplink and got no Error Indication.
+        let session = self.sessions.find_by_ul_teid(header.teid);
 
         // No session for this TEID: per TS 29.281 §7.3.1 send an Error Indication
         // — but ONLY when TEID != 0. A G-PDU with TEID=0 must be silently dropped
@@ -9618,6 +9623,73 @@ mod tests {
         v
     }
 
+    /// #2234 (R43 minor 2 on #2197): a transport delay probe toward an IPv6 peer
+    /// carries the DSCP the IE names in the outer IPv6 Traffic Class
+    /// (Table 7.5.2.2-6, `IPV6_TCLASS` on the datagram), leaves from the IPv6
+    /// GTP-U socket and is a GTP-U Echo Request (TS 29.281 §7.2.1).
+    ///
+    /// REVERT-VERIFIED: with the IPv6 control message sent as `IP_TOS`, the
+    /// probe arrives with Traffic Class 0 (the refusal fallback sends it
+    /// unmarked).
+    #[tokio::test]
+    async fn an_ipv6_probe_carries_the_dscp_the_ie_names_2234() {
+        if ipv6_loopback_socket().await.is_none() {
+            return;
+        }
+        // A probe goes to port 2152 (TS 29.281 §4.4.2.0); IPv6 loopback has the
+        // one address, so wait for it to be free rather than collide.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let peer = loop {
+            match TokioUdpSocket::bind((Ipv6Addr::LOCALHOST, GTPU_PORT)).await {
+                Ok(s) => break s,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    log::debug!("[::1]:2152 busy ({e}); waiting");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("[::1]:2152 stays taken: {e}"),
+            }
+        };
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        dp.bind_gtpu6("[::1]:0".parse().unwrap()).await.unwrap();
+        dp.with_transport_delay(|m| {
+            m.set_pdr(
+                0x2234,
+                1,
+                Some(crate::transport_delay::TransportDelayPdr {
+                    peer: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                    dscp: Some(46),
+                }),
+            )
+        });
+        crate::data_plane::tos_test_support::enable_recv_marking(peer.as_raw_fd(), true);
+        assert_eq!(dp.transport_delay_round().await, 1, "one probe sent");
+        let mut got = None;
+        while let Some((buf, tclass)) = crate::data_plane::tos_test_support::recv_marked(
+            &peer,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            // Only this test's probe: an Echo Request (type 1).
+            if buf.len() >= 8 && buf[1] == 1 {
+                got = Some((buf, tclass));
+                break;
+            }
+        }
+        let (buf, tclass) = got.expect("the probe reaches the IPv6 peer");
+        assert_eq!(buf[0] & 0xE0, 0x20, "GTPv1");
+        assert_eq!(tclass, Some(46 << 2), "DSCP EF in the outer Traffic Class");
+        assert_eq!(
+            crate::data_plane::tos_test_support::socket_marking(
+                dp.gtpu_socket6.as_ref().unwrap(),
+                true
+            ),
+            0,
+            "marked on the datagram, not the socket"
+        );
+    }
+
     /// #985: downlink DSCP to an IPv6 gNB marks the outer IPv6 Traffic Class
     /// (IPV6_TCLASS, per datagram since #2197), and leaves the IPv4 socket's IP_TOS alone. Before, only IP_TOS on
     /// the IPv4 socket was set, so an IPv6 N3 path went out unmarked.
@@ -10169,6 +10241,76 @@ mod tests {
             .is_err(),
             "oversize DL packet must not be forwarded"
         );
+    }
+
+    /// #2234 (R43 minor 1 on #2197): when the kernel refuses the per-datagram
+    /// marking (here a refused ancillary type toward this gNB only), the
+    /// downlink G-PDU still goes out, unmarked, instead of being dropped as a
+    /// send error. A downlink to another gNB in the same process stays marked.
+    ///
+    /// REVERT-VERIFIED: without the fallback the G-PDU never arrives and the
+    /// drop is counted as SendError.
+    #[tokio::test]
+    async fn a_refused_marking_sends_the_downlink_unmarked_2234() {
+        let ue_ip = Ipv4Addr::new(10, 45, 22, 34);
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        dp.add_session_from_pfcp(
+            0x2234,
+            0x12234,
+            ue_ip,
+            0x22341,
+            0x22342,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x2234).unwrap();
+        let mut qer = DataPlaneQer::new(5);
+        qer.set_qfi(9);
+        qer.dscp = 46;
+        session.qers.write().unwrap().insert(5, qer);
+        for far in session.fars.write().unwrap().values_mut() {
+            far.ohc_addr = None;
+        }
+        for p in session.pdrs.write().unwrap().iter_mut() {
+            if p.source_interface == SRC_INTF_CORE {
+                p.qer_ids = vec![5].into();
+            }
+        }
+        let mut inner = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut inner);
+        let gtpu = dp.gtpu_socket.as_ref().unwrap().clone();
+        crate::data_plane::tos_test_support::enable_recv_marking(gnb_sock.as_raw_fd(), false);
+
+        // Positive control: marked while the kernel accepts the marking.
+        dp.handle_downlink_packet(&inner, &gtpu).await;
+        let (_, tos) = crate::data_plane::tos_test_support::recv_marked(
+            &gnb_sock,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("the marked DL G-PDU arrives");
+        assert_eq!(tos, Some(46 << 2));
+
+        crate::data_plane::tos_test_support::refuse_marking_toward(gnb_addr);
+        dp.handle_downlink_packet(&inner, &gtpu).await;
+        let (buf, tos) = crate::data_plane::tos_test_support::recv_marked(
+            &gnb_sock,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("the DL G-PDU still arrives when the marking is refused");
+        assert_eq!(tos, Some(0), "sent unmarked");
+        assert_eq!(
+            &buf[buf.len() - inner.len()..],
+            &inner[..],
+            "the same T-PDU"
+        );
+        assert_eq!(dp.stats.drops(DropReason::SendError), 0);
+        assert_eq!(dp.stats.dl_packets.load(Ordering::Relaxed), 2);
     }
 
     /// Downlink DSCP marking is applied to the OUTER transport header via the
@@ -11330,6 +11472,115 @@ mod tests {
         rig.assert_only(DropReason::UnknownTeid, 2);
     }
 
+    /// A non-blocking pipe standing in for the TUN (N6): what the uplink path
+    /// writes to `.1` can be read back from `.0`.
+    fn n6_pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: a two-element array for pipe2 to fill.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2: {}", io::Error::last_os_error());
+        // SAFETY: both fds were just created and are owned by nothing else.
+        unsafe {
+            (
+                std::os::unix::io::FromRawFd::from_raw_fd(fds[0]),
+                std::os::unix::io::FromRawFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    /// Everything written to the N6 pipe so far.
+    fn n6_written(r: &mut std::fs::File) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::Read::read(r, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("N6 pipe: {e}"),
+            }
+        }
+        out
+    }
+
+    /// #2234: a G-PDU on a TEID no session holds, whose inner source is the
+    /// address of a UE that has a PSA session on N3, is not processed against
+    /// that UE's session (TS 29.281 §7.3.1: no PDU session exists for the TEID).
+    /// The sender gets an Error Indication naming the TEID, and the packet
+    /// reaches neither N6 nor the UE's uplink counters.
+    ///
+    /// The positive control at the end sends the same packet on the session's
+    /// own TEID: it does reach N6, so the pipe would have shown the first one.
+    ///
+    /// REVERT-VERIFIED: with the UE-address fallback restored, the first packet
+    /// is written to N6 and no Error Indication arrives.
+    #[tokio::test]
+    async fn a_g_pdu_on_an_unknown_teid_from_a_ue_address_gets_an_error_indication_2234() {
+        let rig = drop_rig().await;
+        let (mut n6_r, n6_w) = n6_pipe();
+        let n6 = std::os::unix::io::AsRawFd::as_raw_fd(&n6_w);
+        let mut inner = make_ipv4_udp_packet(rig.ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+
+        let unknown = 0x0002_2234;
+        rig.dp
+            .handle_uplink_packet(
+                &encapsulate_dl_gpdu(&inner, unknown, None),
+                rig.gnb_addr,
+                n6,
+            )
+            .await;
+        let mut buf = [0u8; 256];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rig.gnb.recv_from(&mut buf),
+        )
+        .await
+        .expect("an Error Indication must reach the sender")
+        .unwrap();
+        assert_eq!(buf[1], 26, "an Error Indication, not a forwarded G-PDU");
+        let (teid, _) = parse_gtpu_error_indication(&buf[12..len]).unwrap();
+        assert_eq!(teid, unknown, "the offending TEID in TEID Data I");
+        assert!(n6_written(&mut n6_r).is_empty(), "nothing reaches N6");
+        rig.assert_only(DropReason::UnknownTeid, 1);
+        assert_eq!(rig.dp.stats.ul_packets.load(Ordering::Relaxed), 0);
+
+        rig.dp
+            .handle_uplink_packet(&rig.ul_gpdu(rig.ue_ip), rig.gnb_addr, n6)
+            .await;
+        assert_eq!(
+            n6_written(&mut n6_r),
+            inner,
+            "the session's own TEID reaches N6"
+        );
+        assert_eq!(rig.dp.stats.ul_packets.load(Ordering::Relaxed), 1);
+    }
+
+    /// #2234: a G-PDU with TEID 0 carrying a UE's source address is discarded
+    /// silently (TS 29.281 §7.3.1: an Error Indication only for a TEID other
+    /// than all zeros), and not processed against that UE's session either.
+    ///
+    /// REVERT-VERIFIED: with the UE-address fallback restored, the packet is
+    /// written to N6 and counted as uplink.
+    #[tokio::test]
+    async fn a_g_pdu_on_teid_0_from_a_ue_address_is_discarded_silently_2234() {
+        let rig = drop_rig().await;
+        let (mut n6_r, n6_w) = n6_pipe();
+        let n6 = std::os::unix::io::AsRawFd::as_raw_fd(&n6_w);
+        let mut inner = make_ipv4_udp_packet(rig.ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+        rig.dp
+            .handle_uplink_packet(&encapsulate_dl_gpdu(&inner, 0, None), rig.gnb_addr, n6)
+            .await;
+        assert!(n6_written(&mut n6_r).is_empty(), "nothing reaches N6");
+        assert!(
+            !rig.gnb_received(300).await,
+            "no Error Indication for TEID 0"
+        );
+        rig.assert_only(DropReason::UnknownTeid, 1);
+        assert_eq!(rig.dp.stats.ul_packets.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn drop_reason_no_pdr_match_both_directions() {
         let rig = drop_rig().await;
@@ -11950,6 +12201,20 @@ mod n9_relay_dp_tests;
 #[cfg(test)]
 pub(crate) mod tos_test_support {
     use super::*;
+
+    /// #2234: destinations toward which `sendmsg_marked` sends an ancillary type
+    /// the kernel refuses. Keyed by destination, so concurrent tests (each on its
+    /// own ephemeral port) never see each other's refusal.
+    static REFUSE_MARKING: std::sync::Mutex<Vec<SocketAddr>> = std::sync::Mutex::new(Vec::new());
+
+    /// From now on the kernel refuses the marking of datagrams toward `dst`.
+    pub(crate) fn refuse_marking_toward(dst: SocketAddr) {
+        REFUSE_MARKING.lock().unwrap().push(dst);
+    }
+
+    pub(super) fn marking_refused_toward(dst: SocketAddr) -> bool {
+        REFUSE_MARKING.lock().unwrap().contains(&dst)
+    }
 
     /// Ask the kernel to hand back each received datagram's IPv4 ToS
     /// (`IP_RECVTOS`) or IPv6 Traffic Class (`IPV6_RECVTCLASS`).

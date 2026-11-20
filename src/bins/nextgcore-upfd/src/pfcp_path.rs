@@ -9067,10 +9067,10 @@ mod tests {
 
     /// **#1682, TS 29.244 Table 7.5.4.2-1.** An Update PDR whose PDI names a new
     /// Local F-TEID moves the PDR onto it: G-PDUs on the new TEID are forwarded,
-    /// G-PDUs on the old one are dropped as `no_pdr_match` (the UE-IP fallback
-    /// still finds the session, but no PDR detects on that tunnel any more), and
-    /// the old TEID no longer routes to the session (§5.5.3: freed once no PDR
-    /// uses it). The session's other PDR, its FARs and its UE IP are untouched.
+    /// G-PDUs on the old one are dropped as `unknown_teid`, because the old TEID
+    /// no longer routes to the session (§5.5.3: freed once no PDR uses it), and
+    /// #2234 removed the UE-IP fallback that used to find it anyway (TS 29.281
+    /// §7.3.1). The session's other PDR, its FARs and its UE IP are untouched.
     /// upfd replaced the PDR's PDI fields and left the tunnel map alone, so the
     /// old TEID kept forwarding and the new one routed nowhere.
     #[tokio::test]
@@ -9117,16 +9117,18 @@ mod tests {
             "a G-PDU on the new TEID is forwarded"
         );
         let no_match = dp.stats.drops(DropReason::NoPdrMatch);
+        let unknown = dp.stats.drops(DropReason::UnknownTeid);
         assert!(
             !forwarded_1682(&dp, &tun, seid, 0x1234, ue).await,
             "a G-PDU on the old TEID is not forwarded"
         );
         assert_eq!(
-            dp.stats.drops(DropReason::NoPdrMatch),
-            no_match + 1,
-            "it is dropped because no PDR detects on the old tunnel: {}",
+            dp.stats.drops(DropReason::UnknownTeid),
+            unknown + 1,
+            "it is dropped as an unknown TEID, not found by its UE address (#2234): {}",
             dp.stats.summary()
         );
+        assert_eq!(dp.stats.drops(DropReason::NoPdrMatch), no_match);
         assert!(
             dp.sessions
                 .find_by_ul_teid(0x1234)
