@@ -27,7 +27,7 @@ fn the_delay_is_inserted_where_figure_5_5_2_2_1_puts_it() {
     // (no UL QFI Sequence Number, SNP 0). Fourteen octets: 16 with length and
     // next type, still a multiple of 4.
     let want = [0x16, 0x89, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 7];
-    assert_eq!(add_n3_n9_delay(&RAN_FRAME, 7).unwrap(), want);
+    assert_eq!(add_n3_n9_delay(&RAN_FRAME, 7, false).unwrap(), want);
     assert_eq!(n3_n9_delay(&want), Some(7));
     assert_eq!(n3_n9_delay(&RAN_FRAME), None);
     // The library codec reads the field back where it was put.
@@ -44,14 +44,14 @@ fn the_delay_is_inserted_where_figure_5_5_2_2_1_puts_it() {
 #[test]
 fn a_second_i_upf_sums_into_the_field_the_first_wrote() {
     // The first I-UPF's 7 ms, then 5 ms more: 00 00 00 0c, nothing else moves.
-    let first = add_n3_n9_delay(&RAN_FRAME, 7).unwrap();
-    let second = add_n3_n9_delay(&first, 5).unwrap();
+    let first = add_n3_n9_delay(&RAN_FRAME, 7, false).unwrap();
+    let second = add_n3_n9_delay(&first, 5, false).unwrap();
     assert_eq!(second, [0x16, 0x89, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 12]);
     // Saturating, never wrapping to a small delay.
     let mut big = first.clone();
     big[10..14].copy_from_slice(&u32::MAX.to_be_bytes());
     assert_eq!(
-        n3_n9_delay(&add_n3_n9_delay(&big, 5).unwrap()),
+        n3_n9_delay(&add_n3_n9_delay(&big, 5, false).unwrap()),
         Some(u32::MAX)
     );
 }
@@ -69,7 +69,7 @@ fn the_offset_counts_time_stamps_and_the_sequence_number() {
     frame.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 3]);
     frame.extend_from_slice(&[0x0a, 0x0b, 0x0c]);
     frame.push(0); // padding
-    let out = add_n3_n9_delay(&frame, 9).unwrap();
+    let out = add_n3_n9_delay(&frame, 9, false).unwrap();
     assert_eq!(out.len(), frame.len() + 4);
     assert_eq!(out[1], 0x89);
     assert_eq!(&out[..1], &frame[..1]);
@@ -93,7 +93,7 @@ fn new_ie_flags_and_what_follows_are_kept() {
     // to 14. The N3/N9 Delay Result goes BEFORE the New IE Flags octet (Figure
     // 5.5.2.2-1), so they and the congestion field move up four octets intact.
     let frame = [0x16, 0x49, 0, 0, 0, 2, 0, 0, 0, 3, 0x02, 0xaa, 0xbb, 0];
-    let out = add_n3_n9_delay(&frame, 7).unwrap();
+    let out = add_n3_n9_delay(&frame, 7, false).unwrap();
     assert_eq!(
         out,
         [0x16, 0xc9, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 7, 0x02, 0xaa, 0xbb, 0]
@@ -105,22 +105,22 @@ fn only_a_ul_frame_with_a_ran_delay_result_is_changed() {
     // §5.24.5.3: "for UL GTP-U packets with the PDU Session Container extension
     // header including the RAN Uplink and/or Downlink fields".
     let ul_only = [0x12, 0x09, 0, 0, 0, 3];
-    assert!(add_n3_n9_delay(&ul_only, 1).is_some());
+    assert!(add_n3_n9_delay(&ul_only, 1, false).is_some());
     let dl_only = [0x14, 0x09, 0, 0, 0, 2];
-    assert!(add_n3_n9_delay(&dl_only, 1).is_some());
+    assert!(add_n3_n9_delay(&dl_only, 1, false).is_some());
     // No RAN Delay Result (just a QFI): unchanged.
     let bare = PduSessionContainer::Ul(UlPduSessionInformation {
         qfi: 9,
         ..Default::default()
     })
     .encode_content();
-    assert_eq!(add_n3_n9_delay(&bare, 1), None);
+    assert_eq!(add_n3_n9_delay(&bare, 1, false), None);
     // A DL frame (PDU Type 0) whose bits would read as delay flags: unchanged.
     let dl = [0x06, 0x09];
-    assert_eq!(add_n3_n9_delay(&dl, 1), None);
+    assert_eq!(add_n3_n9_delay(&dl, 1, false), None);
     // Truncated: unchanged, not a panic.
-    assert_eq!(add_n3_n9_delay(&[0x16, 0x89, 0, 0], 1), None);
-    assert_eq!(add_n3_n9_delay(&[0x16], 1), None);
+    assert_eq!(add_n3_n9_delay(&[0x16, 0x89, 0, 0], 1, false), None);
+    assert_eq!(add_n3_n9_delay(&[0x16], 1, false), None);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn a_relayed_g_pdu_is_laid_out_per_ts_29_281() {
     // - 04: the container is 16 octets = 4 units; the 14 content octets; 00: no
     //   further extension header; then the T-PDU.
     let content = [0x16, 0x89, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 7];
-    let got = build_relay_gpdu(0xabcd, Some(&content), &[0xde, 0xad, 0xbe, 0xef]);
+    let got = build_relay_gpdu(0xabcd, Some(&content), &[0xde, 0xad, 0xbe, 0xef]).unwrap();
     let mut want = vec![
         0x34, 0xff, 0x00, 0x18, 0, 0, 0xab, 0xcd, 0, 0, 0, 0x85, 0x04,
     ];
@@ -145,19 +145,30 @@ fn a_relayed_g_pdu_is_laid_out_per_ts_29_281() {
     want.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
     assert_eq!(got, want);
     // A dummy (no T-PDU) keeps the container: Length = 4 + 16 = 20.
-    let dummy = build_relay_gpdu(0xabcd, Some(&content), &[]);
+    let dummy = build_relay_gpdu(0xabcd, Some(&content), &[]).unwrap();
     assert_eq!(&dummy[2..4], &[0x00, 0x14]);
     assert_eq!(dummy.len(), 8 + 20);
     // Unpadded content is padded: 11 octets + 2 = 13 -> 16, three zeros.
-    let odd = build_relay_gpdu(1, Some(&[0x10; 11]), &[]);
+    let odd = build_relay_gpdu(1, Some(&[0x10; 11]), &[]).unwrap();
     assert_eq!(odd[12], 4);
     assert_eq!(&odd[13 + 11..13 + 14], &[0, 0, 0]);
     assert_eq!(odd[13 + 14], 0, "next extension header type");
     // No container: the plain 8-octet header (§5.1), Length = payload.
     assert_eq!(
         build_relay_gpdu(1, None, &[9, 9]),
-        [0x30, 0xff, 0, 2, 0, 0, 0, 1, 9, 9]
+        Some(vec![0x30, 0xff, 0, 2, 0, 0, 0, 1, 9, 9])
     );
+    // #2197 review m1: what does not fit one extension header (255 units) or the
+    // 16-bit Length is refused, not sent with a wrapped length.
+    assert_eq!(
+        build_relay_gpdu(1, Some(&[0x10; MAX_CONTAINER_CONTENT]), &[]).map(|p| p[12]),
+        Some(255)
+    );
+    assert_eq!(
+        build_relay_gpdu(1, Some(&[0x10; MAX_CONTAINER_CONTENT + 1]), &[]),
+        None
+    );
+    assert_eq!(build_relay_gpdu(1, None, &vec![0; 65_536]), None);
 }
 
 fn ip(s: &str) -> IpAddr {
@@ -222,8 +233,9 @@ fn the_delay_is_half_the_echo_round_trip_of_that_peer() {
     let t0 = Instant::now();
     let probes = m.probes(t0);
     assert_eq!(probes.len(), 1);
-    let (to, seq) = probes[0];
+    let (to, dscp, seq) = probes[0];
     assert_eq!(to, "10.0.0.5:2152".parse().unwrap());
+    assert_eq!(dscp, None);
     // Another peer, or another sequence number, answers nothing.
     assert_eq!(
         m.on_echo_response("10.0.0.6:2152".parse().unwrap(), seq, t0),
@@ -250,7 +262,7 @@ fn an_unanswered_probe_makes_the_delay_unknown() {
     let mut m = TransportDelayMonitor::default();
     m.set_pdr(1, 1, Some(pdr("10.0.0.5")));
     let t0 = Instant::now();
-    let (to, seq) = m.probes(t0)[0];
+    let (to, _, seq) = m.probes(t0)[0];
     m.on_echo_response(to, seq, t0 + Duration::from_millis(4));
     assert_eq!(m.delay_for(1, 1), Some(2));
     // The next probe goes unanswered for PROBE_TIMEOUT: the round after drops it,
@@ -270,7 +282,7 @@ fn one_probe_per_peer_and_state_follows_the_pdrs() {
     m.set_pdr(2, 1, Some(pdr("10.0.0.9")));
     let t0 = Instant::now();
     let probes = m.probes(t0);
-    let to: Vec<SocketAddr> = probes.iter().map(|(a, _)| *a).collect();
+    let to: Vec<SocketAddr> = probes.iter().map(|(a, _, _)| *a).collect();
     assert_eq!(
         to,
         vec![
@@ -279,7 +291,7 @@ fn one_probe_per_peer_and_state_follows_the_pdrs() {
         ]
     );
     // One answer serves both PDRs naming that peer.
-    m.on_echo_response(probes[0].0, probes[0].1, t0 + Duration::from_millis(6));
+    m.on_echo_response(probes[0].0, probes[0].2, t0 + Duration::from_millis(6));
     assert_eq!((m.delay_for(1, 1), m.delay_for(1, 2)), (Some(3), Some(3)));
     // Deactivated on one PDR: the other keeps it.
     m.set_pdr(1, 1, None);
@@ -303,9 +315,72 @@ fn the_probe_sequence_space_is_disjoint_from_the_path_qos_one() {
     let peer: SocketAddr = "10.0.0.5:2152".parse().unwrap();
     let t0 = Instant::now();
     for _ in 0..0x4001 {
-        let s = m.probes(t0)[0].1;
+        let s = m.probes(t0)[0].2;
         assert!(s >= 0xC000, "transport delay probe {s:#x}");
         let p = q.probe_sent(peer, t0, true);
         assert!((0x8000..0xC000).contains(&p), "path QoS probe {p:#x}");
     }
+}
+
+/// #2197 review m2: from the NG-RAN, a present N3/N9 Delay Result is not one a
+/// UPF wrote (TS 38.415 §5.5.3.21 "reported by the I-UPF"; TS 29.244 §5.24.5.3
+/// NOTE "The RAN does not report the N3 path delay"): it is overwritten, not
+/// summed. Behind an I-UPF it is summed.
+///
+/// REVERT-VERIFIED: with `from_ran` ignored (always summed), the RAN's 500 ms
+/// survives into the field.
+#[test]
+fn a_value_the_ran_set_is_overwritten_not_summed() {
+    let forged = [0x16, 0x89, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0x01, 0xf4]; // 500 ms
+    let out = add_n3_n9_delay(&forged, 7, true).unwrap();
+    assert_eq!(n3_n9_delay(&out), Some(7));
+    let out = add_n3_n9_delay(&forged, 7, false).unwrap();
+    assert_eq!(n3_n9_delay(&out), Some(507));
+}
+
+/// #2197 review m1: the length octet counts 4-octet units (TS 29.281 §5.2.1), so
+/// a container is at most 1018 content octets. One that the inserted field would
+/// push past that goes on unchanged, rather than with a wrapped length octet.
+///
+/// REVERT-VERIFIED: without the bound, a 1022-octet content comes back.
+#[test]
+fn an_insert_that_would_not_fit_one_extension_header_is_refused() {
+    assert_eq!(MAX_CONTAINER_CONTENT, 1018);
+    let mut full = RAN_FRAME.to_vec();
+    full.resize(MAX_CONTAINER_CONTENT, 0);
+    assert_eq!(add_n3_n9_delay(&full, 7, false), None);
+    // A present field is overwritten in place, which always fits.
+    let mut present = add_n3_n9_delay(&RAN_FRAME, 7, false).unwrap();
+    present.resize(MAX_CONTAINER_CONTENT, 0);
+    assert!(add_n3_n9_delay(&present, 1, false).is_some());
+    // Four octets short of the limit still fits.
+    let mut room = RAN_FRAME.to_vec();
+    room.resize(MAX_CONTAINER_CONTENT - 4, 0);
+    assert_eq!(
+        add_n3_n9_delay(&room, 7, false).map(|c| c.len()),
+        Some(MAX_CONTAINER_CONTENT)
+    );
+}
+
+/// #2197 review (DSCP): one probe series per (peer, DSCP), each marked with its
+/// DSCP, and a PDR's delay is the one measured with its own DSCP.
+///
+/// REVERT-VERIFIED: with the peers keyed by address alone, one probe goes out
+/// and both PDRs read the same delay.
+#[test]
+fn each_dscp_is_probed_and_measured_on_its_own() {
+    let mut m = TransportDelayMonitor::default();
+    let ef = TransportDelayPdr {
+        peer: ip("10.0.0.5"),
+        dscp: Some(46),
+    };
+    m.set_pdr(1, 1, Some(pdr("10.0.0.5")));
+    m.set_pdr(1, 2, Some(ef));
+    let t0 = Instant::now();
+    let probes = m.probes(t0);
+    let marks: Vec<Option<u8>> = probes.iter().map(|(_, d, _)| *d).collect();
+    assert_eq!(marks, vec![None, Some(46)]);
+    m.on_echo_response(probes[0].0, probes[0].2, t0 + Duration::from_millis(20));
+    m.on_echo_response(probes[1].0, probes[1].2, t0 + Duration::from_millis(4));
+    assert_eq!((m.delay_for(1, 1), m.delay_for(1, 2)), (Some(10), Some(2)));
 }

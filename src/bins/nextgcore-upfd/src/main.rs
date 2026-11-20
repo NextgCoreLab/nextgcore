@@ -1503,7 +1503,15 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 if !removed_pdr_ids.is_empty() {
                     let mut tunnels = session.pdr_teids.write().unwrap();
                     for id in &removed_pdr_ids {
-                        tunnels.remove(id);
+                        // #2197 review M1: a removed PDR's own F-TEID stops routing
+                        // to the session once no PDR of it detects on that TEID
+                        // (TS 29.244 §5.5.3), so a stale N9 TEID is no longer
+                        // matched (a G-PDU on it is an unknown TEID, §7.3.1).
+                        if let Some(teid) = tunnels.remove(id) {
+                            if teid != session.ul_teid && !tunnels.values().any(|t| *t == teid) {
+                                data_plane.sessions.unbind_ul_teid(teid, upf_seid);
+                            }
+                        }
                         apply_transport_delay(data_plane, upf_seid, *id, None);
                     }
                 }
@@ -2042,6 +2050,48 @@ mod tests {
         };
         handle_pfcp_session_event(&dp, removal).await;
         assert!(!dp.transport_delay_active(), "gone with its PDR");
+        // #2197 review M1: Remove PDR 2 (the Core PDR on the N9 F-TEID): the N9
+        // TEID no longer routes to the session, the N3 one still does.
+        handle_pfcp_session_event(&dp, i_upf_established(seid + 3)).await;
+        assert_eq!(
+            dp.sessions.find_by_ul_teid(0x1450b).map(|s| s.upf_seid),
+            Some(seid + 3)
+        );
+        let remove_dl = PfcpSessionEvent::SessionModified {
+            upf_seid: seid + 3,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: vec![2],
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: Vec::new(),
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        handle_pfcp_session_event(&dp, remove_dl).await;
+        assert!(
+            dp.sessions.find_by_ul_teid(0x1450b).is_none(),
+            "a stale N9 TEID routes nowhere"
+        );
+        assert!(dp.sessions.find_by_ul_teid(0x1450a).is_some());
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionDeleted {
+                upf_seid: seid + 3,
+                ue_ipv4: None,
+            },
+        )
+        .await;
         // Provisioned again, then gone with the session.
         handle_pfcp_session_event(&dp, i_upf_established(seid + 1)).await;
         assert!(dp.transport_delay_active());

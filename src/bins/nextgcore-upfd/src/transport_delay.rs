@@ -19,8 +19,12 @@
 //! to) is set: without it IE 271 is ignored, nothing is probed, and no G-PDU
 //! changes.
 //!
+//! The probes to a peer are sent with the DSCP the IE names (Table 7.5.2.2-6:
+//! "the DSCP to use to measure the GTP-U path delay"), one probe series per
+//! (peer, DSCP), on the GTP-U socket whose outer marking is set for the probe
+//! and put back after it (#2197 review).
+//!
 //! Limitations, stated honestly:
-//! - The probes are not marked with the IE's DSCP (as #1389 part 1's are not).
 //! - Until the first Echo Response from the preceding peer, and again once a
 //!   probe to it goes unanswered for [`PROBE_TIMEOUT`], the delay is unknown:
 //!   an I-UPF then forwards the field unchanged and a PSA takes no sample (a
@@ -90,7 +94,8 @@ struct PeerState {
 #[derive(Debug, Default)]
 pub struct TransportDelayMonitor {
     pdrs: HashMap<(u64, u16), TransportDelayPdr>,
-    peers: HashMap<IpAddr, PeerState>,
+    /// Per (preceding peer, DSCP): the delay is measured per marking.
+    peers: HashMap<(IpAddr, Option<u8>), PeerState>,
     next_seq: u16,
 }
 
@@ -133,10 +138,11 @@ impl TransportDelayMonitor {
 
     /// Keep peer state for the peers some PDR names, and only those.
     fn sync_peers(&mut self) {
-        let wanted: HashSet<IpAddr> = self.pdrs.values().map(|c| c.peer).collect();
-        self.peers.retain(|ip, _| wanted.contains(ip));
-        for ip in wanted {
-            self.peers.entry(ip).or_default();
+        let wanted: HashSet<(IpAddr, Option<u8>)> =
+            self.pdrs.values().map(|c| (c.peer, c.dscp)).collect();
+        self.peers.retain(|k, _| wanted.contains(k));
+        for k in wanted {
+            self.peers.entry(k).or_default();
         }
     }
 
@@ -150,20 +156,20 @@ impl TransportDelayMonitor {
     /// known (yet, or any more).
     pub fn delay_for(&self, seid: u64, pdr_id: u16) -> Option<u32> {
         let c = self.pdrs.get(&(seid, pdr_id))?;
-        self.peers.get(&c.peer)?.delay_ms
+        self.peers.get(&(c.peer, c.dscp))?.delay_ms
     }
 
-    /// The probes to send at `now`: one Echo Request per preceding peer, each
-    /// with its sequence number. A probe outstanding past [`PROBE_TIMEOUT`] is
-    /// forgotten, and the peer's delay with it.
-    pub fn probes(&mut self, now: Instant) -> Vec<(SocketAddr, u16)> {
-        let mut peers: Vec<IpAddr> = self.peers.keys().copied().collect();
+    /// The probes to send at `now`: one Echo Request per preceding peer and
+    /// DSCP, each with the DSCP to mark it with and its sequence number. A probe
+    /// outstanding past [`PROBE_TIMEOUT`] is forgotten, and the delay with it.
+    pub fn probes(&mut self, now: Instant) -> Vec<(SocketAddr, Option<u8>, u16)> {
+        let mut peers: Vec<(IpAddr, Option<u8>)> = self.peers.keys().copied().collect();
         peers.sort();
         let mut out = Vec::with_capacity(peers.len());
-        for ip in peers {
+        for (ip, dscp) in peers {
             let seq = SEQ_BASE | (self.next_seq & 0x3fff);
             self.next_seq = self.next_seq.wrapping_add(1);
-            let st = self.peers.get_mut(&ip).expect("listed above");
+            let st = self.peers.get_mut(&(ip, dscp)).expect("listed above");
             let before = st.pending.len();
             st.pending
                 .retain(|(_, sent)| now.saturating_duration_since(*sent) < PROBE_TIMEOUT);
@@ -175,7 +181,7 @@ impl TransportDelayMonitor {
                 st.pending.remove(0);
             }
             st.pending.push((seq, now));
-            out.push((SocketAddr::new(ip, crate::path_qos::GTPU_PORT), seq));
+            out.push((SocketAddr::new(ip, crate::path_qos::GTPU_PORT), dscp, seq));
         }
         out
     }
@@ -183,7 +189,12 @@ impl TransportDelayMonitor {
     /// An Echo Response from `from` with `seq` at `now`. Returns the new delay
     /// when it answers one of these probes.
     pub fn on_echo_response(&mut self, from: SocketAddr, seq: u16, now: Instant) -> Option<u32> {
-        let st = self.peers.get_mut(&from.ip().to_canonical())?;
+        let ip = from.ip().to_canonical();
+        let st = self
+            .peers
+            .iter_mut()
+            .find(|((p, _), st)| *p == ip && st.pending.iter().any(|(s, _)| *s == seq))?
+            .1;
         let i = st.pending.iter().position(|(s, _)| *s == seq)?;
         let (_, sent) = st.pending.remove(i);
         let delay = crate::path_qos::path_delay_ms(now.saturating_duration_since(sent));
@@ -208,14 +219,31 @@ fn n3_n9_offset(content: &[u8]) -> Option<usize> {
     Some(2 + 24 * qmp as usize + 4 * dl as usize + 4 * ul as usize + 3 * snp as usize)
 }
 
+/// The most content octets one extension header carries: its length octet
+/// counts 4-octet units (TS 29.281 §5.2.1), so 255 x 4 less the length and
+/// next-type octets.
+pub const MAX_CONTAINER_CONTENT: usize = 255 * 4 - 2;
+
 /// Add `add_ms` to the N3/N9 Delay Result of a UL PDU SESSION INFORMATION frame
 /// (`content`: the PDU Session Container extension header content, padding
 /// included) that carries the RAN DL and/or UL Delay Result (TS 29.244
 /// §5.24.5.3: only those packets). The field is created when absent (N3/N9
 /// Delay Ind set, four octets inserted where Figure 5.5.2.2-1 puts them, so the
 /// New IE Flags and whatever follows are kept as they are), else summed,
-/// saturating. Returns `None`, changing nothing, for any other frame.
-pub fn add_n3_n9_delay(content: &[u8], add_ms: u32) -> Option<Vec<u8>> {
+/// saturating.
+///
+/// `from_ran`: the preceding UL GTP-U peer is the NG-RAN. The field is then
+/// SET to `add_ms`, never summed: TS 38.415 §5.5.3.21 has the N3/N9 Delay
+/// Result "reported by the I-UPF", and TS 29.244 §5.24.5.3 NOTE says "The RAN
+/// does not report the N3 path delay. The intermediate UPF connected to the
+/// RAN adds the N3 delay", so a value present on a packet from the RAN is not
+/// one any UPF wrote and is overwritten (#2197 review m2). Behind an I-UPF the
+/// field is the upstream UPFs' accumulation and is summed into.
+///
+/// Returns `None`, changing nothing, for any other frame, and when the
+/// inserted field would not fit one extension header
+/// ([`MAX_CONTAINER_CONTENT`]): the container then goes on as it came.
+pub fn add_n3_n9_delay(content: &[u8], add_ms: u32, from_ran: bool) -> Option<Vec<u8>> {
     let o0 = *content.first()?;
     if o0 & 0x06 == 0 {
         return None;
@@ -225,9 +253,14 @@ pub fn add_n3_n9_delay(content: &[u8], add_ms: u32) -> Option<Vec<u8>> {
     let mut out = content.to_vec();
     if present {
         let old = u32::from_be_bytes(content.get(at..at + 4)?.try_into().ok()?);
-        out[at..at + 4].copy_from_slice(&old.saturating_add(add_ms).to_be_bytes());
+        let new = if from_ran {
+            add_ms
+        } else {
+            old.saturating_add(add_ms)
+        };
+        out[at..at + 4].copy_from_slice(&new.to_be_bytes());
     } else {
-        if at > content.len() {
+        if at > content.len() || content.len() + 4 > MAX_CONTAINER_CONTENT {
             return None;
         }
         out[1] |= 0x80;

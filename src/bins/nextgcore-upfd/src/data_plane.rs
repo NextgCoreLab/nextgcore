@@ -2751,6 +2751,15 @@ impl SessionManager {
         self.extra_ul_teids.write().unwrap().insert(teid, seid);
     }
 
+    /// #2197 review M1: stop routing `teid` to `seid` (a removed PDR's F-TEID),
+    /// unless it routes to another session.
+    pub fn unbind_ul_teid(&self, teid: u32, seid: u64) {
+        let mut extra = self.extra_ul_teids.write().unwrap();
+        if extra.get(&teid) == Some(&seid) {
+            extra.remove(&teid);
+        }
+    }
+
     /// #583: forget every F-TEID a modification bound to `seid`.
     pub fn forget_ul_teids(&self, seid: u64) {
         self.extra_ul_teids
@@ -3155,6 +3164,15 @@ impl DataPlaneSession {
                 && (p.source_interface == SRC_INTF_ACCESS || p.source_interface == SRC_INTF_CORE)
         })
         .or_else(|| {
+            // #2197 review M1: the establishment uplink PDRs detect on the
+            // session's uplink TEID only, never on a tunnel a PDR of its own
+            // holds: a G-PDU on an I-UPF's N9 F-TEID that misses its Core PDR
+            // (no DL PDR for its QFI) is dropped, not taken as the UE's uplink
+            // and reflected to the PSA. A packet on no TEID of the session (one
+            // found by its UE address) matches them as before.
+            if teid != self.ul_teid && tunnels.values().any(|t| *t == teid) {
+                return None;
+            }
             self.find_pdr(Some(SRC_INTF_ACCESS), packet, pkt_qfi, |p| {
                 !tunnels.contains_key(&p.pdr_id)
             })
@@ -4666,11 +4684,6 @@ impl DataPlane {
             // #1450: where an I-UPF sends the packet on over N9 or N3, else `None`
             // (the PSA's uplink, toward the data network).
             let onward = far_id.and_then(|f| session.gtpu_forward(f, downlink));
-            // #1450: the PSA's per QoS flow delay from GTP-U path monitoring
-            // (TS 29.244 §5.24.5.4), taken from the uplink packets themselves.
-            if !downlink && onward.is_none() && self.transport_delay_active() {
-                self.on_psa_transport_delay(&session, pdr_id, pkt);
-            }
             // Every QER of the PDR gates the packet (#1672); DSCP for marking.
             if let Some(qid) = session.check_qer_gates(&qer_ids, !downlink, payload_len) {
                 self.stats.record_drop(DropReason::QerGate, || {
@@ -4752,6 +4765,13 @@ impl DataPlane {
                     }
                     return;
                 }
+            }
+            // #1450: the PSA's per QoS flow delay from GTP-U path monitoring
+            // (TS 29.244 §5.24.5.4), taken from the uplink packets themselves:
+            // only those the QERs, FAR and URRs let through (#2197 review m4),
+            // the packets "related to the requested QoS flow(s)" the PSA serves.
+            if !downlink && onward.is_none() && self.transport_delay_active() {
+                self.on_psa_transport_delay(&session, pdr_id, pkt);
             }
             if let Some(fwd) = onward {
                 // #1450: the I-UPF's onward G-PDU, N3 to N9 or N9 to N3.
@@ -5913,13 +5933,33 @@ impl DataPlane {
         let now = std::time::Instant::now();
         let probes = self.with_transport_delay(|m| m.probes(now));
         let mut sent = 0;
-        for (peer, seq) in probes {
+        for (peer, dscp, seq) in probes {
             let Some(sock) = self.socket_for(&peer) else {
                 continue;
             };
+            // #2197 review: marked with the IE's DSCP (Table 7.5.2.2-6), then the
+            // socket's outer marking is put back for the sends that follow (the
+            // same socket-level marking the downlink uses, #985).
+            let restore = dscp.map(|d| {
+                let cache = if peer.is_ipv6() {
+                    &self.gtpu_tclass
+                } else {
+                    &self.gtpu_tos
+                };
+                let prev = cache.load(Ordering::Relaxed);
+                self.set_gtpu_outer_tos(d, peer.is_ipv6());
+                if prev == GTPU_TOS_UNSET {
+                    0
+                } else {
+                    (prev >> 2) as u8
+                }
+            });
             match sock.send_to(&build_gtpu_echo_request(seq), peer).await {
                 Ok(_) => sent += 1,
                 Err(e) => log::debug!("Transport delay probe to {peer} failed: {e}"),
+            }
+            if let Some(prev) = restore {
+                self.set_gtpu_outer_tos(prev, peer.is_ipv6());
             }
         }
         sent
@@ -5930,12 +5970,20 @@ impl DataPlane {
     /// PDR, summed into the N3/N9 Delay Result, when the PDR carries Transport
     /// Delay Reporting, the delay is known and the container carries the RAN
     /// DL and/or UL Delay Result. Otherwise the container goes on unchanged.
-    fn onward_container(&self, seid: u64, pdr_id: u16, content: &[u8]) -> Option<Vec<u8>> {
+    fn onward_container(
+        &self,
+        session: &DataPlaneSession,
+        pdr_id: u16,
+        content: &[u8],
+    ) -> Option<Vec<u8>> {
         if !self.transport_delay_active() {
             return None;
         }
-        let d = self.with_transport_delay(|m| m.delay_for(seid, pdr_id))?;
-        let out = crate::transport_delay::add_n3_n9_delay(content, d)?;
+        let seid = session.upf_seid;
+        let (cfg, d) = self
+            .with_transport_delay(|m| Some((m.pdr(seid, pdr_id)?, m.delay_for(seid, pdr_id)?)))?;
+        let from_ran = preceding_is_ran(session, cfg.peer);
+        let out = crate::transport_delay::add_n3_n9_delay(content, d, from_ran)?;
         log::trace!("SEID {seid:#x} PDR {pdr_id}: {d} ms added to the N3/N9 Delay Result");
         Some(out)
     }
@@ -5959,7 +6007,7 @@ impl DataPlane {
         use nextgcore_gtp::v1::types::PduSessionContainer;
         let received = pdu_session_container_content(pkt);
         let raised = match received {
-            Some(c) if !downlink => self.onward_container(session.upf_seid, pdr_id, c),
+            Some(c) if !downlink => self.onward_container(session, pdr_id, c),
             _ => None,
         };
         let made;
@@ -5979,8 +6027,13 @@ impl DataPlane {
                 made.as_deref()
             }
         };
-        let out = build_relay_gpdu(fwd.teid, container, payload);
         let to = SocketAddr::new(fwd.addr, GTPU_PORT);
+        let Some(out) = build_relay_gpdu(fwd.teid, container, payload) else {
+            self.stats.record_drop(DropReason::Oversize, || {
+                format!("I-UPF forward to {to}: the G-PDU does not fit a GTP-U header")
+            });
+            return;
+        };
         let len = payload.len() as u64;
         let Some(sock) = self.socket_for(&to) else {
             self.stats.record_drop(DropReason::NoGtpuSocket, || {
@@ -6063,10 +6116,20 @@ impl DataPlane {
             return;
         }
         let seid = session.upf_seid;
-        let Some(own) = self.with_transport_delay(|m| m.delay_for(seid, pdr_id)) else {
+        let Some((cfg, own)) =
+            self.with_transport_delay(|m| Some((m.pdr(seid, pdr_id)?, m.delay_for(seid, pdr_id)?)))
+        else {
             return;
         };
-        let accumulated = ul.n3_n9_delay_result.unwrap_or(0).saturating_add(own);
+        // #2197 review m2: directly on N3, an N3/N9 Delay Result on the packet
+        // is none a UPF wrote (TS 38.415 §5.5.3.21, TS 29.244 §5.24.5.3 NOTE):
+        // the PSA's own N3 delay is the transport delay.
+        let upstream = if preceding_is_ran(session, cfg.peer) {
+            0
+        } else {
+            ul.n3_n9_delay_result.unwrap_or(0)
+        };
+        let accumulated = upstream.saturating_add(own);
         let sample = crate::qos_flow_mon::TransportSample {
             qfi: ul.qfi,
             accumulated_ms: accumulated,
@@ -6430,30 +6493,41 @@ pub fn pdu_session_container_content(gtp_bytes: &[u8]) -> Option<&[u8]> {
 /// them again in the outer header it adds; so the container goes out as it came
 /// in (or as changed by Transport Delay Reporting), with the padding that keeps
 /// it a multiple of 4 octets (TS 29.281 §5.2.1).
-pub fn build_relay_gpdu(teid: u32, container: Option<&[u8]>, payload: &[u8]) -> Vec<u8> {
+///
+/// `None` when it does not fit (#2197 review m1): a container past one
+/// extension header's 255 4-octet units, or a Length past 65535.
+pub fn build_relay_gpdu(teid: u32, container: Option<&[u8]>, payload: &[u8]) -> Option<Vec<u8>> {
     let Some(content) = container else {
-        let mut pkt = build_gtpu_header(teid, payload.len() as u16).to_vec();
+        let len = u16::try_from(payload.len()).ok()?;
+        let mut pkt = build_gtpu_header(teid, len).to_vec();
         pkt.extend_from_slice(payload);
-        return pkt;
+        return Some(pkt);
     };
     let mut padded = content.to_vec();
     while !(padded.len() + 2).is_multiple_of(4) {
         padded.push(0);
     }
     let ext_len = padded.len() + 2;
+    let units = u8::try_from(ext_len / 4).ok()?;
+    let total_len = u16::try_from(4 + ext_len + payload.len()).ok()?;
     let mut pkt = Vec::with_capacity(12 + ext_len + payload.len());
     // Version 1, PT 1, E 1 (TS 29.281 §5.1).
     pkt.push(0x34);
     pkt.push(gtpu_msg_type::GPDU);
-    let total_len = (4 + ext_len + payload.len()) as u16;
     pkt.extend_from_slice(&total_len.to_be_bytes());
     pkt.extend_from_slice(&teid.to_be_bytes());
     pkt.extend_from_slice(&[0, 0, 0, 0x85]);
-    pkt.push((ext_len / 4) as u8);
+    pkt.push(units);
     pkt.extend_from_slice(&padded);
     pkt.push(0);
     pkt.extend_from_slice(payload);
-    pkt
+    Some(pkt)
+}
+
+/// #2197 review m2: whether `peer`, a PDR's preceding UL GTP-U peer, is the
+/// session's NG-RAN (its N3 downlink endpoint): then no UPF precedes this one.
+fn preceding_is_ran(session: &DataPlaneSession, peer: IpAddr) -> bool {
+    session.gnb_addr().ip().to_canonical() == peer.to_canonical()
 }
 
 // ============================================================================

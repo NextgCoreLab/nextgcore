@@ -77,6 +77,12 @@ fn far(far_id: u32, destination_interface: u8, teid: u32, ip: Ipv4Addr) -> DataP
 /// (Core, on the N9 F-TEID) -> FAR 2 FORW toward the Access side to the gNB. No
 /// UE address: an I-UPF needs none.
 async fn i_upf() -> Rig {
+    i_upf_with_ue(None).await
+}
+
+/// [`i_upf`], with a UE address when `ue` names one (an SMF may put the UE IP
+/// Address in an I-UPF's PDI: Table 7.5.2.2-2, conditional).
+async fn i_upf_with_ue(ue: Option<Ipv4Addr>) -> Rig {
     let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
     dp.gtpu_socket = Some(Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap()));
     let (gnb, gnb_ip) = bind_2152(14).await;
@@ -88,7 +94,7 @@ async fn i_upf() -> Rig {
     let session = dp.add_established_session(
         SEID,
         0x11450,
-        None,
+        ue,
         UL_TEID,
         DL_TEID,
         SocketAddr::new(IpAddr::V4(gnb_ip), GTPU_PORT),
@@ -159,7 +165,7 @@ impl Rig {
             );
             if let Some(rtt) = rtt_ms {
                 let t0 = std::time::Instant::now();
-                let (to, seq) = m.probes(t0)[0];
+                let (to, _, seq) = m.probes(t0)[0];
                 m.on_echo_response(to, seq, t0 + std::time::Duration::from_millis(rtt));
             }
         });
@@ -168,7 +174,7 @@ impl Rig {
 
 /// A G-PDU on `teid` with the PDU Session Container `c` and `inner`.
 fn gpdu(teid: u32, c: &PduSessionContainer, inner: &[u8]) -> Vec<u8> {
-    build_relay_gpdu(teid, Some(&c.encode_content()), inner)
+    build_relay_gpdu(teid, Some(&c.encode_content()), inner).unwrap()
 }
 
 fn ran_ul(dl: Option<u32>, ul: Option<u32>, n3n9: Option<u32>) -> PduSessionContainer {
@@ -225,7 +231,8 @@ async fn an_i_upf_forwards_the_uplink_over_n9_with_its_container() {
 /// QFI 9; the delay is the 14 ms echo round trip / 2.)
 ///
 /// REVERT-VERIFIED: with `onward_container` returning `None`, the PSA receives
-/// the container without the N3/N9 Delay Result.
+/// the container without the N3/N9 Delay Result; with the RAN case summed
+/// (`preceding_is_ran` false), the forged 500 ms survives.
 #[tokio::test]
 async fn an_i_upf_with_transport_delay_reporting_adds_its_n3_delay_toward_the_psa() {
     let r = i_upf().await;
@@ -240,13 +247,26 @@ async fn an_i_upf_with_transport_delay_reporting_adds_its_n3_delay_toward_the_ps
     ];
     want.extend_from_slice(&inner);
     assert_eq!(got, want);
-    // A second I-UPF upstream already wrote 5 ms: the sum goes on.
+    // #2197 review m2: from the RAN, an N3/N9 Delay Result is none a UPF wrote:
+    // overwritten with this I-UPF's 7 ms, not summed onto.
+    r.send_as_gnb(&gpdu(UL_TEID, &ran_ul(Some(2), Some(3), Some(500)), &inner))
+        .await;
+    let got = recv(&r.psa).await.unwrap();
+    assert_eq!(
+        pdu_session_container_of(&got),
+        Some(ran_ul(Some(2), Some(3), Some(7)))
+    );
+    // Behind an I-UPF (the preceding peer is an upstream UPF, not the gNB), the
+    // 5 ms it wrote is summed with this one's 10 (a 20 ms round trip).
+    let upstream = Ipv4Addr::new(127, 0, 0, 9);
+    r.dp.with_transport_delay(|m| m.set_pdr(SEID, 1, None));
+    r.transport_delay(1, upstream, Some(20));
     r.send_as_gnb(&gpdu(UL_TEID, &ran_ul(Some(2), Some(3), Some(5)), &inner))
         .await;
     let got = recv(&r.psa).await.unwrap();
     assert_eq!(
         pdu_session_container_of(&got),
-        Some(ran_ul(Some(2), Some(3), Some(12)))
+        Some(ran_ul(Some(2), Some(3), Some(15)))
     );
 }
 
@@ -314,7 +334,8 @@ async fn an_i_upf_forwards_n9_downlink_and_dummies_with_their_containers() {
     assert_eq!(recv(&r.psa).await.unwrap(), gpdu(PSA_TEID, &answer, &[]));
     assert_eq!(r.dp.stats.dropped_packets.load(Ordering::Relaxed), 0);
     // A dummy with no container, or on a TEID no session holds, is malformed.
-    r.send_as_psa(&build_relay_gpdu(N9_TEID, None, &[])).await;
+    r.send_as_psa(&build_relay_gpdu(N9_TEID, None, &[]).unwrap())
+        .await;
     r.send_as_psa(&gpdu(0x7777, &dl, &[])).await;
     assert_eq!(r.dp.stats.drops(DropReason::MalformedGtpu), 2);
 }
@@ -402,7 +423,7 @@ async fn a_psa_reports_the_gtpupm_delay_of_the_flow() {
             }),
         );
         let t0 = std::time::Instant::now();
-        let (to, seq) = m.probes(t0)[0];
+        let (to, _, seq) = m.probes(t0)[0];
         m.on_echo_response(to, seq, t0 + std::time::Duration::from_millis(8));
     });
     assert_eq!(dp.qos_flow_round().await, 0, "no dummy for a GTPUPM flow");
@@ -491,4 +512,233 @@ async fn the_probe_round_measures_the_preceding_peer_over_real_sockets() {
         .dp
         .with_transport_delay(|m| m.delay_for(SEID, 1))
         .is_some());
+}
+
+/// #2197 review M1: an N9 G-PDU whose QFI no Core PDR detects is dropped. It is
+/// not taken as the UE's uplink by the establishment UL PDR and sent back to the
+/// PSA (the I-UPF session has no UE address, so no anti-spoofing would stop it).
+///
+/// REVERT-VERIFIED: with the uplink fallback open to every TEID, the PSA gets
+/// its own downlink back.
+#[tokio::test]
+async fn an_n9_g_pdu_its_core_pdr_misses_is_dropped_not_reflected_to_the_psa() {
+    let r = i_upf().await;
+    let session = r.dp.sessions.find_by_seid(SEID).unwrap();
+    for p in session.pdrs.write().unwrap().iter_mut() {
+        if p.pdr_id == 2 {
+            p.qfi = Some(5);
+        }
+    }
+    let dl = PduSessionContainer::dl(QFI);
+    let mut inner = inner_ul();
+    inner[12..16].copy_from_slice(&[8, 8, 8, 8]);
+    inner[16..20].copy_from_slice(&[10, 45, 14, 50]);
+    r.send_as_psa(&gpdu(N9_TEID, &dl, &inner)).await;
+    assert!(recv(&r.psa).await.is_none(), "not reflected to the PSA");
+    assert!(recv(&r.gnb).await.is_none());
+    assert_eq!(r.dp.stats.drops(DropReason::NoPdrMatch), 1);
+    assert_eq!(r.dp.stats.ul_packets.load(Ordering::Relaxed), 0);
+}
+
+/// #2197 review m3: the PSA's downlink over N9 is addressed TO the UE, so an
+/// I-UPF that knows the UE's address does not apply the UE-source
+/// anti-spoofing check to it.
+///
+/// REVERT-VERIFIED: with the check applied to the downlink too, the packet is a
+/// Spoofed drop.
+#[tokio::test]
+async fn an_n9_downlink_is_not_judged_by_the_ue_source_check() {
+    let ue = Ipv4Addr::new(10, 45, 14, 50);
+    let r = i_upf_with_ue(Some(ue)).await;
+    let dl = PduSessionContainer::dl(QFI);
+    let mut inner = inner_ul();
+    inner[12..16].copy_from_slice(&[8, 8, 8, 8]);
+    inner[16..20].copy_from_slice(&ue.octets());
+    r.send_as_psa(&gpdu(N9_TEID, &dl, &inner)).await;
+    assert_eq!(
+        recv(&r.gnb).await.expect("to the gNB"),
+        gpdu(DL_TEID, &dl, &inner)
+    );
+    assert_eq!(r.dp.stats.drops(DropReason::Spoofed), 0);
+    // The uplink still is: a spoofed source from the gNB is dropped.
+    let mut spoofed = inner_ul();
+    spoofed[12..16].copy_from_slice(&[10, 45, 99, 99]);
+    r.send_as_gnb(&gpdu(UL_TEID, &PduSessionContainer::ul(QFI), &spoofed))
+        .await;
+    assert!(recv(&r.psa).await.is_none());
+    assert_eq!(r.dp.stats.drops(DropReason::Spoofed), 1);
+}
+
+/// #2197 review m4: a PSA sample comes only from a packet the QERs, FAR and
+/// URRs let through: one a closed UL gate drops measures nothing.
+///
+/// REVERT-VERIFIED: with the sample taken before the gates (where it was), the
+/// dropped packet reports.
+#[tokio::test]
+async fn a_packet_the_gates_drop_is_not_a_gtpupm_sample() {
+    let (dp, _gnb, _ip, mut reports) = psa().await;
+    gtpupm_control(&dp, 1);
+    dp.with_transport_delay(|m| {
+        m.set_pdr(
+            SEID,
+            1,
+            Some(TransportDelayPdr {
+                peer: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                dscp: None,
+            }),
+        );
+        let t0 = std::time::Instant::now();
+        let (to, _, seq) = m.probes(t0)[0];
+        m.on_echo_response(to, seq, t0 + std::time::Duration::from_millis(8));
+    });
+    let session = dp.sessions.find_by_seid(SEID).unwrap();
+    let mut qer = DataPlaneQer::new(77);
+    qer.ul_gate_open = false;
+    session.qers.write().unwrap().insert(77, qer);
+    for p in session.pdrs.write().unwrap().iter_mut() {
+        if p.pdr_id == 1 {
+            p.qer_ids = vec![77].into();
+        }
+    }
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .unwrap();
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+    let pkt = gpdu(UL_TEID, &ran_ul(Some(2), Some(3), Some(7)), &inner_ul());
+    dp.handle_uplink_packet(&pkt, "127.0.0.1:2152".parse().unwrap(), fd)
+        .await;
+    assert_eq!(dp.stats.drops(DropReason::QerGate), 1);
+    assert!(
+        reports.try_recv().is_err(),
+        "no sample from a dropped packet"
+    );
+}
+
+/// #2197 review m2 (PSA): directly on N3 (the preceding peer is the gNB), an
+/// N3/N9 Delay Result the gNB put in is ignored: the delay is the PSA's own.
+///
+/// REVERT-VERIFIED: with the received field trusted, DL reads 504 + 2.
+#[tokio::test]
+async fn a_psa_on_n3_ignores_an_n3_n9_value_from_the_ran() {
+    let (dp, _gnb, gnb_ip, mut reports) = psa().await;
+    gtpupm_control(&dp, 1);
+    dp.with_transport_delay(|m| {
+        m.set_pdr(
+            SEID,
+            1,
+            Some(TransportDelayPdr {
+                peer: IpAddr::V4(gnb_ip),
+                dscp: None,
+            }),
+        );
+        let t0 = std::time::Instant::now();
+        let (to, _, seq) = m.probes(t0)[0];
+        m.on_echo_response(to, seq, t0 + std::time::Duration::from_millis(8));
+    });
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .unwrap();
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+    let from = SocketAddr::new(IpAddr::V4(gnb_ip), GTPU_PORT);
+    let pkt = gpdu(UL_TEID, &ran_ul(Some(2), Some(3), Some(500)), &inner_ul());
+    dp.handle_uplink_packet(&pkt, from, fd).await;
+    let Ok(UpfReportEvent::QosMonitoringReport { reports: r, .. }) = reports.try_recv() else {
+        panic!("a report");
+    };
+    assert_eq!(
+        r[0].1.qos_monitoring_measurement.downlink_packet_delay,
+        Some(4 + 2)
+    );
+}
+
+/// The DSCP the IE names marks the probe's outer IPv4 header (Table 7.5.2.2-6),
+/// read here from the received datagram's TOS (IP_RECVTOS); and the socket's
+/// marking is put back after it.
+///
+/// REVERT-VERIFIED: with the probe not marked, the TOS reads 0.
+#[tokio::test]
+async fn a_probe_carries_the_dscp_the_ie_names() {
+    let r = i_upf().await;
+    // A receiver of its own on another loopback address, with IP_RECVTOS.
+    let (peer, peer_ip) = {
+        let mut found = None;
+        for x in 1..=254u8 {
+            let ip = Ipv4Addr::new(127, 17, x, 1);
+            if let Ok(s) = std::net::UdpSocket::bind((ip, GTPU_PORT)) {
+                found = Some((s, ip));
+                break;
+            }
+        }
+        found.expect("a free 127.17.x.1:2152")
+    };
+    let on: libc::c_int = 1;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&peer);
+    // SAFETY: a valid socket and a c_int option value.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_RECVTOS,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    r.dp.with_transport_delay(|m| {
+        m.set_pdr(
+            SEID,
+            1,
+            Some(TransportDelayPdr {
+                peer: IpAddr::V4(peer_ip),
+                dscp: Some(46),
+            }),
+        )
+    });
+    assert_eq!(r.dp.transport_delay_round().await, 1);
+    let tos = tokio::task::spawn_blocking(move || recv_tos(&peer))
+        .await
+        .unwrap();
+    assert_eq!(tos, Some(46 << 2), "DSCP EF in the outer TOS");
+    assert_eq!(
+        r.dp.gtpu_tos.load(Ordering::Relaxed),
+        0,
+        "the socket's marking is put back"
+    );
+}
+
+/// The TOS octet of the next datagram on `s` (IP_RECVTOS control message).
+fn recv_tos(s: &std::net::UdpSocket) -> Option<u8> {
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(s);
+    let mut buf = [0u8; 2048];
+    let mut ctrl = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    // SAFETY: msghdr is plain data; every pointer below outlives the call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = ctrl.len() as _;
+    // SAFETY: a valid fd and msghdr.
+    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if n < 0 {
+        return None;
+    }
+    // SAFETY: walking the control buffer recvmsg filled, with the libc macros.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::IPPROTO_IP && (*c).cmsg_type == libc::IP_TOS {
+                return Some(*libc::CMSG_DATA(c));
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    None
 }
