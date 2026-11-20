@@ -716,8 +716,107 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// #2079: the NF types that write the UDM's context data in the UDR: the
+/// NF-registration documents (TS 29.505 §5.2.6.1 "AMF registrations to be
+/// stored in the UDR by the UDM", §5.2.7-§5.2.12), the authentication status
+/// (§5.2.24, §5.2.24A, the AuthEvent of Nudm_UEAU ConfirmAuth) and the UDM's own
+/// SDM / EE subscriptions (§5.2.16-§5.2.19). TS 23.501 §6.2.11: the UDR stores
+/// and retrieves "subscription data by the UDM".
+const UDM_CONTEXT_WRITER_NF_TYPES: &[&str] = &["UDM"];
+
+/// #2079: why `request`, a write of the UDM's context data, may not be applied,
+/// or `None` if it may (or is not such a write). TS 29.504 §5.2.1.2: the UDR
+/// authorizes per data set and answers an illegal data access with an explicit
+/// cause.
+///
+/// Which writes: those [`nextgcore_sbi::resource_scope::required_resource_scope`]
+/// puts under `nudr-dr:subscription-data` or `...:registrations:write`, the
+/// same table the SBI server's scope gate and every consumer's token request
+/// read. GETs are not touched.
+///
+/// The caller is read only from what this process verified
+/// (`owner_binding::verified_consumer_id` and the certificate's RFC 9310 NF
+/// types), in this order:
+/// 1. a certificate and token naming different NF instances: refused;
+/// 2. the direct peer's verified certificate names NF types and none is a relay
+///    (SCP, SEPP): one of them must be UDM;
+/// 3. a verified access token (direct, or relayed by an SCP, TS 33.501 §13.3):
+///    its scope must carry the resource scope (`token_grants`), which the NRF
+///    grants to the UDM alone (`UDR_RESOURCE_SCOPES`, TS 29.510 NOTE 11);
+/// 4. no token, and no non-relay certificate to type the caller by: refused
+///    under the `production` SBI profile (nothing proves a UDM), admitted under
+///    `dev` (plaintext, nothing to verify).
+fn udm_context_write_refusal(request: &SbiRequest, production: bool) -> Option<SbiResponse> {
+    use nextgcore_sbi::owner_binding;
+    use nextgcore_sbi::resource_scope::{
+        required_resource_scope, token_grants, NUDR_DR_REGISTRATIONS_WRITE,
+        NUDR_DR_SUBSCRIPTION_DATA,
+    };
+    let scope = match required_resource_scope(&request.header.method, &request.header.uri) {
+        Some(s) if s == NUDR_DR_SUBSCRIPTION_DATA || s == NUDR_DR_REGISTRATIONS_WRITE => s,
+        _ => return None,
+    };
+    let refuse = |detail: String| {
+        // debug, not warn: a peer can send these at will (#1620 review m7).
+        log::debug!("UDM context write refused: {detail}");
+        Some(nextgcore_sbi::server::send_forbidden(&detail, None))
+    };
+    if let Err(why) = owner_binding::verified_consumer_id(request) {
+        return refuse(why);
+    }
+    let types = &request.peer_cert_nf_types;
+    let relayed = types.iter().any(|t| {
+        owner_binding::RELAY_NF_TYPES
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(t))
+    });
+    let typed_direct = !types.is_empty() && !relayed;
+    if typed_direct
+        && !types.iter().any(|t| {
+            UDM_CONTEXT_WRITER_NF_TYPES
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(t))
+        })
+    {
+        return refuse(format!(
+            "only the UDM writes this subscription-data context resource (TS 29.505); \
+             the requester's certificate names {types:?}"
+        ));
+    }
+    match request.oauth2_scope.as_deref() {
+        Some(granted) if !token_grants(granted, scope) => {
+            // The scope is a constant, but it is derived from the request URI, which
+            // the #1018 log lint treats as a callback URI: the 403 body names it.
+            log::debug!("UDM context write refused: the token lacks the resource scope");
+            Some(
+                nextgcore_sbi::server::BearerRefusal::InsufficientScope {
+                    scope: scope.to_string(),
+                    detail: format!(
+                        "the access token's scope does not include {scope}, which this \
+                         resource requires in addition to the service scope"
+                    ),
+                }
+                .into_response(),
+            )
+        }
+        Some(_) => None,
+        None if production && !typed_direct => refuse(
+            "the requester proved no UDM identity (no access token, and no client \
+             certificate naming its NF type), which this resource requires under the \
+             production profile"
+                .to_string(),
+        ),
+        None => None,
+    }
+}
+
 /// SBI request handler for UDR
 async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    // #2079: a write of the UDM's context data from any other NF is refused
+    // before anything is routed, counted, stored or notified.
+    if let Some(refused) = udm_context_write_refusal(&request, production_profile()) {
+        return refused;
+    }
     // #1334: Nudr operations, counted by outcome.
     let operation = nextgcore_udrd::metrics::classify(&request.header.method, &request.header.uri);
     let response = udr_sbi_route(request).await;
@@ -4936,6 +5035,19 @@ const UDR_RESOURCE_SCOPES: &[(&str, &str, &str)] = &[
         nextgcore_sbi::resource_scope::NUDR_DR_AUTH_SUBSCRIPTION_MODIFY,
         "UDM",
     ),
+    // #2079: the UDM's context data (NF registrations, authentication status,
+    // its SDM / EE subscriptions): TS 29.505 §5.2.6.1 "stored in the UDR by the
+    // UDM", TS 23.501 §6.2.11. The SCP relays and is not granted them itself.
+    (
+        "nudr-dr",
+        nextgcore_sbi::resource_scope::NUDR_DR_SUBSCRIPTION_DATA,
+        "UDM",
+    ),
+    (
+        "nudr-dr",
+        nextgcore_sbi::resource_scope::NUDR_DR_REGISTRATIONS_WRITE,
+        "UDM",
+    ),
 ];
 
 /// The `allowedOperationsPerNfType` of UDR service `name`, or `None` when the
@@ -5437,7 +5549,16 @@ mod tests {
         let ops = dr["allowedOperationsPerNfType"]
             .as_object()
             .expect("nudr-dr registers allowedOperationsPerNfType");
-        assert_eq!(ops["UDM"], json!(["nudr-dr", READ, MODIFY]));
+        assert_eq!(
+            ops["UDM"],
+            json!([
+                "nudr-dr",
+                READ,
+                MODIFY,
+                nextgcore_sbi::resource_scope::NUDR_DR_SUBSCRIPTION_DATA,
+                nextgcore_sbi::resource_scope::NUDR_DR_REGISTRATIONS_WRITE
+            ])
+        );
         let allowed: Vec<&str> = dr["allowedNfTypes"]
             .as_array()
             .expect("allowedNfTypes")
@@ -5991,6 +6112,9 @@ udr:
         u16,
         mpsc::UnboundedReceiver<(String, String)>,
     ) {
+        // #2079: these loopback peers prove no identity, so the UDM-context write
+        // gate admits them under `dev` only. Set, never reset (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let udr_server =
             SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
@@ -7350,6 +7474,9 @@ udr:
 
     /// Spin up the UDR SBI server and return a client for it.
     async fn start_udr() -> (SbiServer, SbiClient) {
+        // #2079: an anonymous loopback peer writes UDM context data under `dev`
+        // only. Set, never reset (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         udr.start(udr_sbi_request_handler)
@@ -8044,6 +8171,490 @@ udr:
         }
 
         udr.stop().await.expect("stop");
+    }
+
+    /// #2079: the bodies the UDM context writes below carry.
+    fn ctx_write_2079(method: &str, path: &str, body: Option<serde_json::Value>) -> SbiRequest {
+        let req = match method {
+            "PUT" => SbiRequest::put(path),
+            "PATCH" => SbiRequest::patch(path),
+            "POST" => SbiRequest::post(path),
+            _ => SbiRequest::delete(path),
+        };
+        match body {
+            Some(b) => req.with_json_body(&b).expect("json"),
+            None => req,
+        }
+    }
+
+    /// #2079: every UDM context-data write a non-UDM may attempt, with the
+    /// resource scope its refusal names: `(method, path under the UE, body,
+    /// scope)`.
+    fn udm_context_writes_2079(
+        ue: &str,
+    ) -> Vec<(
+        &'static str,
+        String,
+        Option<serde_json::Value>,
+        &'static str,
+    )> {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_REGISTRATIONS_WRITE as WRITE, NUDR_DR_SUBSCRIPTION_DATA as DATA,
+        };
+        let amf = json!({
+            "amfInstanceId": "amf-intruder",
+            "deregCallbackUri": "http://intruder.example.org/dereg",
+            "guami": {"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "cafe00"},
+            "ratType": "NR",
+            "imsVoPs": "HOMOGENEOUS_NON_SUPPORT"
+        });
+        let smf = json!({
+            "smfInstanceId": "smf-intruder", "pduSessionId": 5,
+            "singleNssai": {"sst": 1}, "dnn": "internet",
+            "plmnId": {"mcc": "001", "mnc": "01"}
+        });
+        let smsf =
+            json!({"smsfInstanceId": "smsf-intruder", "plmnId": {"mcc": "001", "mnc": "01"}});
+        let sub = json!({"nfInstanceId": "nf-intruder", "callbackReference": "http://intruder/cb"});
+        let event = json!({
+            "nfInstanceId": "nf-intruder", "success": false,
+            "timeStamp": "2026-11-19T00:00:00Z", "authType": "5G_AKA",
+            "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+        });
+        let c = |r: &str| format!("{ue}/context-data/{r}");
+        vec![
+            ("PUT", c("amf-3gpp-access"), Some(amf.clone()), WRITE),
+            ("PATCH", c("amf-3gpp-access"), Some(json!({"purgeFlag": true})), WRITE),
+            ("DELETE", c("amf-3gpp-access"), None, WRITE),
+            ("PUT", c("amf-non-3gpp-access"), Some(amf.clone()), WRITE),
+            ("PUT", format!("{ue}/00101/context-data/amf-3gpp-access"), Some(amf), WRITE),
+            ("PUT", c("smf-registrations/5"), Some(smf), WRITE),
+            ("DELETE", c("smf-registrations/5"), None, WRITE),
+            ("PUT", c("smsf-3gpp-access"), Some(smsf.clone()), WRITE),
+            ("DELETE", c("smsf-3gpp-access"), None, WRITE),
+            ("PUT", c("smsf-non-3gpp-access"), Some(smsf), WRITE),
+            ("PUT", c("ip-sm-gw"), Some(json!({"ipsmgwFqdn": "intruder.example.org"})), WRITE),
+            ("DELETE", c("ip-sm-gw"), None, WRITE),
+            ("PUT", c("sdm-subscriptions/s1"), Some(sub.clone()), DATA),
+            ("POST", c("sdm-subscriptions"), Some(sub.clone()), DATA),
+            ("DELETE", c("sdm-subscriptions/s1"), None, DATA),
+            ("PUT", c("ee-subscriptions/e1"), Some(sub.clone()), DATA),
+            ("POST", c("ee-subscriptions"), Some(sub), DATA),
+            ("DELETE", c("ee-subscriptions/e1"), None, DATA),
+            (
+                "PUT",
+                format!("{ue}/authentication-data/authentication-status"),
+                Some(event.clone()),
+                DATA,
+            ),
+            (
+                "PUT",
+                format!("{ue}/authentication-data/authentication-status/5G:mnc001.mcc001.3gppnetwork.org"),
+                Some(event),
+                DATA,
+            ),
+            ("DELETE", format!("{ue}/authentication-data/authentication-status"), None, DATA),
+        ]
+    }
+
+    /// #2079: the REAL router behind the UDR's OAuth2 listener (`udr_oauth2_listener`,
+    /// the one `main` builds). A PCF, NEF or AUSF holds `nudr-dr` alone on this
+    /// service (UDR_RESOURCE_SCOPES; TS 29.510 NOTE 11), so every write of the
+    /// UDM's context data -- the NF registrations, the authentication status and
+    /// the UDM's SDM / EE subscriptions -- is refused 403 `insufficient_scope`
+    /// naming its TS 29.505 scope, a retry is refused the same way, and nothing
+    /// is applied: each resource the UDM stored reads back unchanged (GETs stay on
+    /// the service scope), and none the refused writes would have created exists.
+    /// The UDM's token writes them all, `subscription-data` alone standing in for
+    /// `registrations:write` as the yaml allows, and a repeated PUT stores one
+    /// record.
+    ///
+    /// REVERT-VERIFIED: with `required_resource_scope` answering `None` for the
+    /// context-data writes, the PCF's amf-3gpp-access PUT is applied and the
+    /// `refused` assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_udm_token_writes_no_udm_context_data_2079() {
+        use nextgcore_sbi::resource_scope::{
+            NUDR_DR_REGISTRATIONS_WRITE as WRITE, NUDR_DR_SUBSCRIPTION_DATA as DATA,
+        };
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = udr_oauth2_listener(NextgcoreSbiServerConfig::new(udr_addr));
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr = SbiServer::on_listener(cfg, udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let bearer = |scope: &str| {
+            format!(
+                "Bearer {}",
+                stand_in::es256_access_token(&sk, stand_in::TEST_NRF_KID, "UDR", scope)
+            )
+        };
+        // What the NRF grants a PCF, NEF or AUSF on nudr-dr, and the UDM.
+        let other = bearer("nudr-dr");
+        let udm = bearer(&format!("nudr-dr {DATA} {WRITE}"));
+        let udm_alt = bearer(&format!("nudr-dr {DATA}"));
+        let send = |req: SbiRequest, auth: &str| {
+            let req = req.with_header("authorization", auth.to_string());
+            let client = &client;
+            async move { client.send_request(req).await.expect("response") }
+        };
+        let supi = "imsi-001010000020791";
+        let ue = format!("/nudr-dr/v2/subscription-data/{supi}");
+        let c = |r: &str| format!("{ue}/context-data/{r}");
+
+        // The UDM's own records, which the refused writes must leave alone.
+        let amf = json!({
+            "amfInstanceId": "amf-udm",
+            "deregCallbackUri": "http://amf.example.org/dereg",
+            "guami": {"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "cafe00"},
+            "ratType": "NR"
+        });
+        let smf = json!({
+            "smfInstanceId": "smf-udm", "pduSessionId": 5,
+            "singleNssai": {"sst": 1}, "dnn": "internet",
+            "plmnId": {"mcc": "001", "mnc": "01"}
+        });
+        let smsf = json!({"smsfInstanceId": "smsf-udm", "plmnId": {"mcc": "001", "mnc": "01"}});
+        let ipsmgw = json!({"ipsmgwFqdn": "ipsmgw.example.org"});
+        let sub = json!({"nfInstanceId": "udm-1", "callbackReference": "http://udm/cb"});
+        let event = json!({
+            "nfInstanceId": "udm-1", "success": true,
+            "timeStamp": "2026-11-19T00:00:00Z", "authType": "5G_AKA",
+            "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+        });
+        let auth_status = format!("{ue}/authentication-data/authentication-status");
+        let baseline = [
+            (c("amf-3gpp-access"), amf.clone()),
+            (c("smf-registrations/5"), smf.clone()),
+            (c("smsf-3gpp-access"), smsf.clone()),
+            (c("ip-sm-gw"), ipsmgw.clone()),
+            (c("sdm-subscriptions/s1"), sub.clone()),
+            (c("ee-subscriptions/e1"), sub.clone()),
+            (auth_status.clone(), event.clone()),
+        ];
+        for (path, doc) in &baseline {
+            let r = send(ctx_write_2079("PUT", path, Some(doc.clone())), &udm).await;
+            assert!(
+                r.status == 201 || r.status == 204,
+                "the UDM provisions {path}: {} {:?}",
+                r.status,
+                r.http.content
+            );
+        }
+
+        // Every write, twice (a retry is refused the same way).
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            for (method, path, body, scope) in udm_context_writes_2079(&ue) {
+                let r = send(ctx_write_2079(method, &path, body), &other).await;
+                answers.push((method, path, scope, r));
+            }
+        }
+        let mut after = Vec::new();
+        for (path, _) in &baseline {
+            after.push(send(SbiRequest::get(path), &other).await);
+        }
+        let absent_non3gpp = send(SbiRequest::get(c("amf-non-3gpp-access")), &other).await;
+        let absent_plmn = send(
+            SbiRequest::get(format!("{ue}/00101/context-data/amf-3gpp-access")),
+            &other,
+        )
+        .await;
+        let absent_smsf_n3 = send(SbiRequest::get(c("smsf-non-3gpp-access")), &other).await;
+        let sdm_collection = send(SbiRequest::get(c("sdm-subscriptions")), &other).await;
+        let ee_collection = send(SbiRequest::get(c("ee-subscriptions")), &other).await;
+
+        // The UDM writes; `subscription-data` alone stands in for
+        // `registrations:write`; a repeated PUT stores one record.
+        let mut non3 = amf.clone();
+        non3["imsVoPs"] = json!("HOMOGENEOUS_NON_SUPPORT");
+        let alt = send(
+            ctx_write_2079("PUT", &c("amf-non-3gpp-access"), Some(non3.clone())),
+            &udm_alt,
+        )
+        .await;
+        let first = send(
+            ctx_write_2079("PUT", &c("smsf-non-3gpp-access"), Some(smsf.clone())),
+            &udm,
+        )
+        .await;
+        let again = send(
+            ctx_write_2079("PUT", &c("smsf-non-3gpp-access"), Some(smsf.clone())),
+            &udm,
+        )
+        .await;
+        let stored = send(SbiRequest::get(c("smsf-non-3gpp-access")), &other).await;
+        let udm_delete = send(ctx_write_2079("DELETE", &c("ip-sm-gw"), None), &udm).await;
+        udr.stop().await.expect("stop");
+
+        let challenge = |r: &SbiResponse| {
+            r.http
+                .get_header("www-authenticate")
+                .cloned()
+                .unwrap_or_default()
+        };
+        for (method, path, scope, r) in &answers {
+            assert_eq!(
+                r.status, 403,
+                "refused: a non-UDM token must not {method} {path}: {:?}",
+                r.http.content
+            );
+            assert!(
+                challenge(r).contains(&format!("scope=\"{scope}\"")),
+                "{method} {path}: {}",
+                challenge(r)
+            );
+        }
+        for ((path, doc), r) in baseline.iter().zip(&after) {
+            assert_eq!(r.status, 200, "{path} reads on the service scope");
+            assert_eq!(
+                &json_of(r),
+                doc,
+                "{path} is unchanged by the refused writes"
+            );
+        }
+        for r in [&absent_non3gpp, &absent_smsf_n3] {
+            assert_eq!(r.status, 404, "a refused PUT created nothing");
+        }
+        // The servingPlmnId layout addresses the same AMF slot: still the UDM's.
+        assert_eq!(
+            json_of(&absent_plmn),
+            amf,
+            "the PLMN-scoped PUT changed nothing"
+        );
+        assert_eq!(
+            json_of(&sdm_collection),
+            json!([sub]),
+            "no refused POST added a member"
+        );
+        assert_eq!(
+            json_of(&ee_collection),
+            json!([sub]),
+            "no refused POST added a member"
+        );
+        assert_eq!(
+            alt.status, 201,
+            "subscription-data grants a registration write: {:?}",
+            alt.http.content
+        );
+        assert_eq!(first.status, 201);
+        assert_eq!(again.status, 204, "a repeated PUT replaces the one record");
+        assert_eq!(json_of(&stored), smsf);
+        assert_eq!(udm_delete.status, 204, "the UDM deletes its record");
+    }
+
+    /// #2079: the NF-type half of the gate, over the verified identity alone
+    /// (`owner_binding::verified_consumer_id` and the certificate's RFC 9310 NF
+    /// types). On the direct path the certificate decides: a PCF, NEF or AUSF
+    /// certificate is refused even with a UDM-scoped token, a UDM certificate is
+    /// admitted. Behind an SCP the token decides. With neither a token nor a
+    /// typed certificate only `dev` admits. A certificate and token naming
+    /// different NF instances are refused. GETs are never gated.
+    ///
+    /// REVERT-VERIFIED: with the certificate-type check removed, the PCF
+    /// certificate carrying a UDM-scoped token is admitted and the
+    /// `direct certificate decides` assertion fails.
+    #[test]
+    fn the_verified_nf_type_decides_a_udm_context_write_2079() {
+        use nextgcore_sbi::resource_scope::NUDR_DR_REGISTRATIONS_WRITE as WRITE;
+        let path =
+            "/nudr-dr/v2/subscription-data/imsi-001010000020792/context-data/amf-3gpp-access";
+        let req = |method: &str, cert: Option<(&str, &[&str])>, token: Option<(&str, &str)>| {
+            let mut r = ctx_write_2079(method, path, None);
+            if method == "GET" {
+                r = SbiRequest::get(path);
+            }
+            if let Some((id, types)) = cert {
+                r.peer_cert_nf_instance_id = Some(id.to_string());
+                r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+            }
+            if let Some((sub, scope)) = token {
+                r.oauth2_subject = Some(sub.to_string());
+                r.oauth2_scope = Some(scope.to_string());
+            }
+            r
+        };
+        let udm_scope = format!("nudr-dr {WRITE}");
+        let refused = |r: &SbiRequest, production: bool| {
+            udm_context_write_refusal(r, production).map(|resp| resp.status)
+        };
+        let (pcf, udm, scp) = ("pcf-0001", "udm-0001", "scp-0001");
+        for t in ["PCF", "NEF", "AUSF", "AMF", "SMF"] {
+            assert_eq!(
+                refused(
+                    &req("PUT", Some((pcf, &[t])), Some((pcf, &udm_scope))),
+                    true
+                ),
+                Some(403),
+                "direct certificate decides: a {t} certificate with a UDM-scoped token"
+            );
+            assert_eq!(
+                refused(&req("PUT", Some((pcf, &[t])), None), false),
+                Some(403),
+                "{t} certificate, no token"
+            );
+        }
+        assert_eq!(
+            refused(&req("PUT", Some((udm, &["UDM"])), None), true),
+            None
+        );
+        assert_eq!(
+            refused(
+                &req("PUT", Some((udm, &["udm"])), Some((udm, &udm_scope))),
+                true
+            ),
+            None
+        );
+        // Behind an SCP: the relayed consumer's token.
+        assert_eq!(
+            refused(
+                &req("PUT", Some((scp, &["SCP"])), Some((pcf, "nudr-dr"))),
+                true
+            ),
+            Some(403),
+            "a PCF's token relayed by an SCP"
+        );
+        assert_eq!(
+            refused(
+                &req("PATCH", Some((scp, &["SCP"])), Some((udm, &udm_scope))),
+                true
+            ),
+            None,
+            "a UDM's token relayed by an SCP"
+        );
+        assert_eq!(
+            refused(&req("PUT", Some((scp, &["SCP"])), None), true),
+            Some(403),
+            "an SCP with no token proves no UDM"
+        );
+        // No token and no typed certificate: production refuses, dev admits.
+        assert_eq!(refused(&req("PUT", None, None), true), Some(403));
+        assert_eq!(
+            refused(&req("PUT", Some((udm, &[])), None), true),
+            Some(403)
+        );
+        assert_eq!(refused(&req("PUT", None, None), false), None);
+        // A token without the scope, even on a typeless path.
+        assert_eq!(
+            refused(&req("DELETE", None, Some((pcf, "nudr-dr"))), false),
+            Some(403)
+        );
+        // Certificate and token naming different instances.
+        assert_eq!(
+            refused(
+                &req("PUT", Some((udm, &["UDM"])), Some((pcf, &udm_scope))),
+                true
+            ),
+            Some(403)
+        );
+        // GETs stay on the service scope.
+        assert_eq!(
+            refused(
+                &req("GET", Some((pcf, &["PCF"])), Some((pcf, "nudr-dr"))),
+                true
+            ),
+            None
+        );
+        assert_eq!(refused(&req("GET", None, None), true), None);
+        // Resources outside the table are not gated here.
+        let mut pp =
+            SbiRequest::patch("/nudr-dr/v2/subscription-data/imsi-001010000020792/pp-data");
+        pp.peer_cert_nf_types = vec!["PCF".to_string()];
+        assert_eq!(refused(&pp, true), None);
+    }
+
+    /// #2079: through the real handler (`udr_sbi_request_handler`) a PCF
+    /// certificate's amf-3gpp-access PUT is refused before any side effect: no
+    /// record, no UE context, and no data-change notification to a subscriber
+    /// of that resource; and it returns before the operation counter
+    /// (`metrics::classify`) runs. The refusal is decided before the
+    /// handler's first `.await`, so it completes on its first poll and a
+    /// dropped (cancelled) refused request cannot have started anything. The
+    /// UDM's PUT, on the same path, is stored and notified (the control).
+    ///
+    /// REVERT-VERIFIED: with the gate call removed from `udr_sbi_request_handler`,
+    /// the PCF's PUT is stored and notified, and the `refused before routing`
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_write_has_no_side_effect_2079() {
+        use std::future::Future;
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let supi = "imsi-001010000020793";
+        let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &json!({
+                    "ueId": supi,
+                    "callbackReference": format!("http://127.0.0.1:{cb_port}/cb/2079"),
+                    "monitoredResourceUris": [format!("http://udr{path}")]
+                }),
+            )
+            .await
+            .expect("subscribe");
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let amf = |id: &str| {
+            json!({
+                "amfInstanceId": id,
+                "deregCallbackUri": "http://amf.example.org/dereg",
+                "guami": {"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "cafe00"},
+                "ratType": "NR"
+            })
+        };
+        let as_peer = |id: &str, t: &str| {
+            let mut r = ctx_write_2079("PUT", &path, Some(amf(id)));
+            r.peer_cert_nf_instance_id = Some(format!("{id}-instance"));
+            r.peer_cert_nf_types = vec![t.to_string()];
+            r
+        };
+        let ue_known = || {
+            nextgcore_udrd::context::udr_self()
+                .read()
+                .map(|c| c.ue_find(supi).is_some())
+                .unwrap_or(false)
+        };
+        let ue_before = ue_known();
+
+        let mut fut = Box::pin(udr_sbi_request_handler(as_peer("amf-pcf", "PCF")));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first_poll = fut.as_mut().poll(&mut cx);
+        let refused = match first_poll {
+            std::task::Poll::Ready(r) => r,
+            std::task::Poll::Pending => panic!("a refusal completes on its first poll"),
+        };
+        // A refused request dropped before it is polled (a cancelled one) leaves
+        // nothing either.
+        drop(udr_sbi_request_handler(as_peer("amf-pcf-2", "PCF")));
+        let stray = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        let stored_after_refusal = AmfAccessSlot::ThreeGpp.get(supi);
+        let ue_after = ue_known();
+
+        let accepted = udr_sbi_request_handler(as_peer("amf-udm", "UDM")).await;
+        let (notified, _) = recv_notification(&mut rx).await;
+        udr.stop().await.expect("stop");
+        listener.stop().await.expect("stop");
+
+        assert_eq!(
+            refused.status, 403,
+            "refused before routing: {:?}",
+            refused.http.content
+        );
+        assert!(stray.is_err(), "a refused write notifies nobody: {stray:?}");
+        assert_eq!(stored_after_refusal, None, "a refused write stores nothing");
+        assert_eq!(ue_after, ue_before, "a refused write adds no UE context");
+        assert_eq!(accepted.status, 201, "{:?}", accepted.http.content);
+        assert!(notified.contains("/cb/2079"), "{notified}");
+        assert_eq!(
+            AmfAccessSlot::ThreeGpp
+                .get(supi)
+                .map(|d| d["amfInstanceId"].clone()),
+            Some(json!("amf-udm"))
+        );
     }
 
     /// #85's producers need these: the Parameter Provision documents and the
