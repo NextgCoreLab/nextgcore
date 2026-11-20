@@ -648,6 +648,8 @@ pub async fn run() -> Result<()> {
     crate::sdm_udr::spawn_leg_refresh();
     // #1877: AMF unsubscribes that failed are retried until delivered.
     drop(crate::ee_amf::spawn_unsubscribe_reconciler());
+    // #2125: and EE subscriptions lapse at their granted expiry.
+    spawn_ee_expiry_sweep();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -2709,10 +2711,18 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
         Some(content) => content,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
-    let ee_sub: serde_json::Value = match serde_json::from_str(body) {
+    let mut ee_sub: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
+    // #2125: the expiry asked for, granted (capped) before anything is stored;
+    // the granted one is what is stored and echoed (TS 29.503 §5.5.2.2.2).
+    if let Err(detail) =
+        crate::context::ee_grant_expiry(&mut ee_sub, crate::context::now_unix_secs())
+    {
+        return send_bad_request(&detail, Some("MANDATORY_IE_INCORRECT"));
+    }
+    let body = &ee_sub.to_string();
     // EeSubscription mandatory IEs: callbackReference + monitoringConfigurations (TS29503_Nudm_EE.yaml:472-474).
     let callback_reference = match ee_sub.get("callbackReference").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -2804,6 +2814,39 @@ pub async fn handle_ee_unsubscribe(
     SbiResponse::with_status(204)
 }
 
+/// #2125: remove every EE subscription lapsed at `now` (its granted
+/// `reportingOptions.expiry` passed) and release the subscription this UDM held
+/// at the AMF for it (#1440). Returns how many were removed.
+pub async fn sweep_expired_ee_subscriptions(now: u64) -> usize {
+    let expired = {
+        let ctx = udm_self();
+        let guard = ctx.read().ok();
+        guard
+            .map(|c| c.ee_subscriptions_take_expired(now))
+            .unwrap_or_default()
+    };
+    for sub in &expired {
+        log::info!("EE subscription {} lapsed at its expiry; removed", sub.id);
+        crate::ee_amf::release(sub).await;
+    }
+    expired.len()
+}
+
+/// #2125: how often lapsed EE subscriptions are swept.
+const EE_EXPIRY_SWEEP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #2125: sweep lapsed EE subscriptions every [`EE_EXPIRY_SWEEP`].
+fn spawn_ee_expiry_sweep() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(EE_EXPIRY_SWEEP);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            sweep_expired_ee_subscriptions(crate::context::now_unix_secs()).await;
+        }
+    });
+}
+
 /// Nudm_EE UpdateEeSubscription (TS 29.503 §5.5.2.4.2).
 ///
 /// #83: this used to answer 204 and discard the patch, so a consumer could
@@ -2825,6 +2868,9 @@ pub async fn handle_ee_modify(
             .and_then(|c| c.ee_subscription_find_by_id(subscription_id))
             // #1865: a subscription under another ueIdentity is not this resource.
             .filter(|sub| sub.ue_identity == ue_identity)
+            // #2125: nor is one that has lapsed; a refresh after the expiry
+            // finds it gone (the sweep releases it).
+            .filter(|sub| !sub.is_expired(crate::context::now_unix_secs()))
     }) else {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     };
@@ -2853,6 +2899,13 @@ pub async fn handle_ee_modify(
 
     if let Err(detail) = apply_ee_patch(&mut stored, &patch) {
         return send_bad_request(&detail, Some("INVALID_MSG_FORMAT"));
+    }
+    // #2125: a patched expiry (the consumer's refresh) is granted, capped, as on
+    // create; nothing is stored when it is refused.
+    if let Err(detail) =
+        crate::context::ee_grant_expiry(&mut stored, crate::context::now_unix_secs())
+    {
+        return send_bad_request(&detail, Some("MANDATORY_IE_INCORRECT"));
     }
 
     // The callbackReference is cached alongside the raw body, so a patch that
@@ -5872,6 +5925,189 @@ mod tests {
         let Ok(context) = ctx.read() else { return };
         for sub in context.sdm_subscriptions_for_supi(supi) {
             context.sdm_subscription_remove(&sub.id);
+        }
+    }
+
+    /// #2125 (TS 29.503 §5.5.2.2.2, §6.4.6.2.2 ReportingOptions.expiry): an EE
+    /// subscription's expiry is granted, capped at `ee_max_lifetime_secs`, and
+    /// echoed; an expiry already passed is refused 400 and nothing is stored; a
+    /// PATCH moves it (the consumer's refresh), capped the same way, and a past one
+    /// leaves the stored expiry alone. Once lapsed, a subscription is reported
+    /// nothing, a refresh finds it gone (404), and the sweep removes it and
+    /// deletes the subscription it held at the AMF. One without an expiry stays.
+    ///
+    /// REVERT-VERIFIED: with the cap dropped in `ee_grant_expiry`, the `capped`
+    /// assertion fails; with the `is_expired` filter dropped from
+    /// `ee_subscriptions_for_supi`, the `lapsed is reported nothing` assertion
+    /// fails; with `ee_subscriptions_take_expired` taking nothing, the `swept`
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize process-global UDM state
+    async fn an_ee_subscription_lapses_at_its_granted_expiry_2125() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let ue = "imsi-001010000002125";
+        let at = |secs: u64| nextgcore_sbi::datetime::epoch_to_rfc3339(secs);
+        let body = |expiry: Option<String>| {
+            let mut b = serde_json::json!({
+                "callbackReference": "http://nef.example.org/ee-notify",
+                "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}}
+            });
+            if let Some(e) = expiry {
+                b["reportingOptions"] = serde_json::json!({ "expiry": e });
+            }
+            b
+        };
+        let subscribe = |b: serde_json::Value| async move {
+            let mut req = SbiRequest::post(format!("/nudm-ee/v1/{ue}/ee-subscriptions"));
+            req.http.content = Some(b.to_string());
+            handle_ee_subscribe(ue, &crate::app::as_test_consumer(&req)).await
+        };
+        let modify = |id: String, patch: serde_json::Value| async move {
+            let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{id}"));
+            req.http.content = Some(patch.to_string());
+            handle_ee_modify(ue, &id, &crate::app::as_test_consumer(&req)).await
+        };
+        let json = |r: &SbiResponse| -> serde_json::Value {
+            serde_json::from_str(r.http.content.as_deref().unwrap_or("{}")).unwrap_or_default()
+        };
+        let stored = |id: &str| udm_self().read().unwrap().ee_subscription_find_by_id(id);
+        let max = crate::context::ee_max_lifetime_secs();
+        let now = crate::context::now_unix_secs();
+
+        // Asked ten years ahead: granted at most the cap, echoed.
+        let far = subscribe(body(Some(at(now + 10 * 365 * 86_400)))).await;
+        assert_eq!(far.status, 201, "{:?}", far.http.content);
+        let far_echo = json(&far);
+        let far_id = far_echo["eeSubscription"]["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let granted = far_echo
+            .pointer("/eeSubscription/reportingOptions/expiry")
+            .and_then(|v| v.as_str())
+            .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch)
+            .expect("the granted expiry is echoed");
+        assert!(
+            (now + max..=crate::context::now_unix_secs() + max).contains(&granted),
+            "capped: {granted} vs {now}+{max}"
+        );
+        assert_eq!(stored(&far_id).and_then(|s| s.expiry), Some(granted));
+
+        // Already passed: refused, nothing stored.
+        let before = udm_self()
+            .read()
+            .unwrap()
+            .ee_subscriptions_for_supi(ue)
+            .len();
+        let past = subscribe(body(Some(at(now - 1)))).await;
+        assert_eq!(past.status, 400, "{:?}", past.http.content);
+        assert_eq!(
+            udm_self()
+                .read()
+                .unwrap()
+                .ee_subscriptions_for_supi(ue)
+                .len(),
+            before
+        );
+
+        // Short-lived, and one with no expiry at all.
+        let short = subscribe(body(Some(at(now + 120)))).await;
+        assert_eq!(short.status, 201);
+        let short_id = json(&short)["eeSubscription"]["subscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(stored(&short_id).and_then(|s| s.expiry), Some(now + 120));
+        let open = subscribe(body(None)).await;
+        assert_eq!(open.status, 201);
+        let open_id = json(&open)["eeSubscription"]["subscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(stored(&open_id).and_then(|s| s.expiry), None);
+
+        // The refresh: moved, capped; a past one changes nothing.
+        let refresh = |e: String| serde_json::json!([{ "op": "add", "path": "/reportingOptions", "value": { "expiry": e } }]);
+        let r = modify(short_id.clone(), refresh(at(now + 300))).await;
+        assert_eq!(r.status, 204, "{:?}", r.http.content);
+        assert_eq!(stored(&short_id).and_then(|s| s.expiry), Some(now + 300));
+        let r = modify(short_id.clone(), refresh(at(now + 10 * 365 * 86_400))).await;
+        assert_eq!(r.status, 204);
+        let capped = stored(&short_id).and_then(|s| s.expiry).unwrap();
+        assert!(
+            capped <= crate::context::now_unix_secs() + max,
+            "capped on refresh"
+        );
+        let r = modify(short_id.clone(), refresh(at(now - 1))).await;
+        assert_eq!(r.status, 400);
+        assert_eq!(stored(&short_id).and_then(|s| s.expiry), Some(capped));
+
+        // A lapsed one (stored with an expiry a second ago, with an AMF leg).
+        let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = deletes.clone();
+        let (amf, amf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    if req.header.method == "DELETE" {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let mut lapsed = crate::context::UdmEeSubscription::for_ue(
+            ue,
+            "http://nef.example.org/ee-notify",
+            body(Some(at(now - 1))).to_string(),
+        );
+        lapsed.owner = Some(TEST_CONSUMER_1865.to_string());
+        lapsed.amf_leg = Some(crate::context::AmfEeLeg {
+            subscription_uri: format!(
+                "http://127.0.0.1:{}/namf-evts/v1/subscriptions/s-2125",
+                amf_addr.port()
+            ),
+            change_token: "t".to_string(),
+            amf_instance_id: Some("amf-2125".to_string()),
+            notify_uri: "http://nef.example.org/ee-notify".to_string(),
+            events: vec!["LOSS_OF_CONNECTIVITY_REPORT".to_string()],
+        });
+        let lapsed_id = lapsed.id.clone();
+        udm_self().read().unwrap().ee_subscription_insert(lapsed);
+        let reported: Vec<String> = udm_self()
+            .read()
+            .unwrap()
+            .ee_subscriptions_for_supi(ue)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            !reported.contains(&lapsed_id),
+            "lapsed is reported nothing: {reported:?}"
+        );
+        assert!(reported.contains(&open_id) && reported.contains(&short_id));
+        let r = modify(lapsed_id.clone(), refresh(at(now + 300))).await;
+        assert_eq!(r.status, 404, "a refresh after the expiry finds it gone");
+
+        let swept = sweep_expired_ee_subscriptions(crate::context::now_unix_secs()).await;
+        amf.stop().await.ok();
+        assert_eq!(swept, 1, "swept");
+        assert!(stored(&lapsed_id).is_none());
+        assert_eq!(
+            deletes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "its AMF subscription is deleted"
+        );
+        for id in [&far_id, &short_id, &open_id] {
+            assert!(stored(id).is_some(), "{id} is not swept");
+        }
+        for id in [far_id, short_id, open_id] {
+            udm_self().read().unwrap().ee_subscription_remove(&id);
         }
     }
 
