@@ -130,6 +130,8 @@ impl StateStore {
         let Some(path) = self.path.clone() else {
             return Ok(Loaded::Absent);
         };
+        // #2170: temporaries a crashed write left behind, before the first read.
+        sweep_stale_temps(&path, STALE_TEMP_AGE);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Absent),
@@ -196,13 +198,160 @@ pub fn write_snapshot_with(
     path: &Path,
     snapshot: impl FnOnce() -> serde_json::Value,
 ) -> Result<(), StateStoreError> {
-    let lock = path_write_lock(path);
-    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let doc = snapshot();
-    write_atomic_locked(path, &doc).map_err(|source| StateStoreError::WriteFailed {
-        path: path.to_path_buf(),
-        source,
-    })
+    // #2170: group commit. Concurrent persists of one path share writes: each
+    // caller is numbered; one at a time leads, takes the snapshot (after every
+    // waiting caller's mutation, since each mutated before calling) and writes
+    // it; every caller whose number that write covers returns its result. So a
+    // caller still returns only once a durable write includes its change, in
+    // snapshot order, but N concurrent callers cost about two writes, not N
+    // queued ones (measured on #2170: p99 under 8 writers went from ~1 s to the
+    // single-write cost).
+    let group = commit_group(path);
+    let (state, turn) = &*group;
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    st.requested += 1;
+    let mine = st.requested;
+    loop {
+        if let Some(result) = st.take_result(mine) {
+            return result.map_err(|e| StateStoreError::WriteFailed {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(e),
+            });
+        }
+        if !st.leading {
+            st.leading = true;
+            let covers = st.requested;
+            drop(st);
+            // #2181 (R42): if `snapshot` (or the write) panics, the guard ends
+            // the lead on unwind (clears `leading`, fails every caller this
+            // write covered, wakes the waiters), so the path is not wedged for
+            // the rest of the process.
+            let mut lead = LeadGuard {
+                group: &group,
+                covers,
+                mine,
+                done: false,
+            };
+            let written = {
+                let lock = path_write_lock(path);
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let doc = snapshot();
+                write_atomic_locked(path, &doc)
+            };
+            lead.finish(written.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+            return written.map_err(|source| StateStoreError::WriteFailed {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+        st = turn.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+type CommitGroupRef = std::sync::Arc<(std::sync::Mutex<CommitGroup>, std::sync::Condvar)>;
+
+/// #2181: ends a group-commit lead, normally ([`LeadGuard::finish`]) or, if
+/// the leader unwinds, from `Drop`, recording a failure for the callers it
+/// covered.
+struct LeadGuard<'a> {
+    group: &'a CommitGroupRef,
+    covers: u64,
+    mine: u64,
+    done: bool,
+}
+
+impl LeadGuard<'_> {
+    fn finish(&mut self, result: Result<(), String>) {
+        self.done = true;
+        let (state, turn) = &**self.group;
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.leading = false;
+        st.record(self.covers, self.mine, result);
+        turn.notify_all();
+    }
+}
+
+impl Drop for LeadGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.finish(Err(
+                "the snapshot or its write panicked; nothing was written".to_string(),
+            ));
+        }
+    }
+}
+
+/// #2170: the group-commit state of one path (see [`write_snapshot_with`]).
+#[derive(Default)]
+struct CommitGroup {
+    /// Callers numbered so far.
+    requested: u64,
+    /// A caller is taking the snapshot and writing it.
+    leading: bool,
+    /// Writes whose covered callers have not all read their result yet:
+    /// (first caller covered, last caller covered, result, callers yet to
+    /// read). #2181: an entry is dropped only once every covered caller has
+    /// read it, so a slow waiter always finds its own write's result.
+    pending: std::collections::VecDeque<(u64, u64, Result<(), String>, u64)>,
+    /// The last caller any write covered.
+    flushed: u64,
+}
+
+impl CommitGroup {
+    /// Record the write that covered every caller up to `covers`, led by
+    /// `leader` (who takes its result directly, not from here).
+    fn record(&mut self, covers: u64, leader: u64, result: Result<(), String>) {
+        let from = self.flushed + 1;
+        self.flushed = covers;
+        let waiting =
+            (covers + 1 - from).saturating_sub(u64::from((from..=covers).contains(&leader)));
+        if waiting > 0 {
+            self.pending.push_back((from, covers, result, waiting));
+        }
+    }
+
+    /// The result of the write that covered caller `n`, once there is one,
+    /// consumed: each covered caller reads it once.
+    fn take_result(&mut self, n: u64) -> Option<Result<(), String>> {
+        if n > self.flushed {
+            return None;
+        }
+        let Some(at) = self
+            .pending
+            .iter()
+            .position(|(from, to, _, _)| (*from..=*to).contains(&n))
+        else {
+            // Unreachable by construction; fail closed rather than report a
+            // write that may not have happened.
+            return Some(Err(
+                "the result of this write is no longer known".to_string()
+            ));
+        };
+        let entry = &mut self.pending[at];
+        entry.3 -= 1;
+        let result = entry.2.clone();
+        if entry.3 == 0 {
+            self.pending.remove(at);
+        }
+        Some(result)
+    }
+}
+
+fn commit_group(
+    path: &Path,
+) -> std::sync::Arc<(std::sync::Mutex<CommitGroup>, std::sync::Condvar)> {
+    type Groups = std::collections::HashMap<
+        PathBuf,
+        std::sync::Arc<(std::sync::Mutex<CommitGroup>, std::sync::Condvar)>,
+    >;
+    static GROUPS: std::sync::OnceLock<std::sync::Mutex<Groups>> = std::sync::OnceLock::new();
+    GROUPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// #2151: [`write_snapshot`] of a document numbered `seq`, skipped when this
@@ -350,6 +499,83 @@ fn write_atomic_locked(path: &Path, doc: &serde_json::Value) -> std::io::Result<
     Ok(())
 }
 
+/// #2170: a temporary file older than this is a crashed write's, not one in
+/// flight: a write holds its temporary for one serialise, write and fsync.
+/// Another process sharing the directory (a rolling restart) may be mid-write,
+/// so a fresh one is never touched.
+///
+/// The age is the file's mtime against this host's clock. On a network volume
+/// whose clock is skewed from this host's, a fresh temporary can look old and
+/// be swept; the worst case is that its writer's rename fails (ENOENT, a failed
+/// persist), and the state file itself stays intact.
+pub const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// #2170: remove the temporaries of `path` ([`write_atomic`]'s
+/// `.<name>.<pid>.<seq>.tmp`, and the `.<name>.tmp` of before #2148) that are
+/// older than `older_than`. Only this file's own temp-name pattern is matched,
+/// never another file's. Returns how many were removed. Failures are logged
+/// and skipped: a stale temporary is litter, not state.
+pub fn sweep_stale_temps(path: &Path, older_than: std::time::Duration) -> usize {
+    let Some(file_name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return 0;
+    };
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let prefix = format!(".{file_name}.");
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(middle) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix("tmp"))
+        else {
+            continue;
+        };
+        // "" (the pre-#2148 `.<name>.tmp`) or "<pid>.<seq>." exactly.
+        let ours = middle.is_empty()
+            || middle
+                .strip_suffix('.')
+                .and_then(|m| m.split_once('.'))
+                .is_some_and(|(pid, seq)| {
+                    !pid.is_empty()
+                        && !seq.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && seq.bytes().all(|b| b.is_ascii_digit())
+                });
+        if !ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if !stale {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => log::warn!(
+                "could not remove stale temporary {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    if removed > 0 {
+        log::info!(
+            "removed {removed} stale temporary file(s) of {} left by an interrupted write",
+            path.display()
+        );
+    }
+    removed
+}
+
 /// #2148: the lock serialising the writes of `path` within this process.
 /// Paths are compared as given; one store writes one path.
 fn path_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
@@ -435,6 +661,196 @@ mod tests {
             on_disk["gen"].as_u64(),
             Some(generation.load(Ordering::SeqCst)),
             "the newest snapshot is the one on disk"
+        );
+    }
+
+    /// **#2170** (R42 on #2165): loading a store sweeps the temporaries a
+    /// crashed write left behind, before the first read: this file's own
+    /// stale `.<name>.<pid>.<seq>.tmp` and pre-#2148 `.<name>.tmp`. A fresh
+    /// temporary (another process mid-write), a sibling file's and a
+    /// look-alike that is not one of ours are kept.
+    ///
+    /// REVERT-VERIFIED: with the sweep call removed from `load`, the stale
+    /// temporaries remain and the `swept` assertion fails.
+    #[test]
+    fn loading_sweeps_this_files_stale_temporaries_2170() {
+        let dir = tmpdir("sweep-2170");
+        let path = dir.join("nf.json");
+        std::fs::write(&path, b"{\"v\":1}").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        let make = |name: &str, aged: bool| {
+            let p = dir.join(name);
+            let f = std::fs::File::create(&p).unwrap();
+            if aged {
+                f.set_modified(old).unwrap();
+            }
+            p
+        };
+        let stale = [
+            make(".nf.json.4242.7.tmp", true),
+            make(".nf.json.tmp", true),
+        ];
+        let kept = [
+            make(".nf.json.4243.8.tmp", false),   // in flight elsewhere
+            make(".other.json.4242.7.tmp", true), // a sibling store's
+            make(".nf.json.backup.tmp", true),    // not our pattern
+            make("nf.json.4242.7.tmp", true),     // not hidden: not ours
+        ];
+        let loaded = StateStore::new(Some(path.clone())).load().expect("load");
+        let left = |p: &PathBuf| p.exists();
+        let swept = stale.iter().filter(|p| !left(p)).count();
+        let kept_all = kept.iter().all(left);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(loaded, Loaded::Snapshot(_)));
+        assert_eq!(swept, 2, "swept");
+        assert!(
+            kept_all,
+            "fresh, sibling and look-alike temporaries are kept"
+        );
+    }
+
+    /// **#2170** (R42 on #2165) item 3: concurrent `persist_with`s of one path
+    /// share writes (group commit). 8 threads × 20 persists each succeed, the
+    /// file ends at the last generation, and far fewer snapshots are taken
+    /// than persists made: a caller that arrives while a write is out is
+    /// covered by the next one rather than queuing a write of its own.
+    ///
+    /// REVERT-VERIFIED: with `write_snapshot_with` back to one locked write
+    /// per call, every persist takes its own snapshot and `coalesced` fails.
+    #[test]
+    fn concurrent_persists_share_writes_2170() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = tmpdir("group-2170");
+        let path = dir.join("nf.json");
+        let generation = Arc::new(AtomicU64::new(0));
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, generation, snapshots) =
+                    (path.clone(), generation.clone(), snapshots.clone());
+                std::thread::spawn(move || {
+                    let store = StateStore::new(Some(path));
+                    for _ in 0..20 {
+                        generation.fetch_add(1, Ordering::SeqCst);
+                        store
+                            .persist_with(|| {
+                                snapshots.fetch_add(1, Ordering::SeqCst);
+                                let g = generation.load(Ordering::SeqCst);
+                                serde_json::json!({ "gen": g, "pad": vec![g; 20_000] })
+                            })
+                            .expect("persist");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer");
+        }
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on_disk["gen"].as_u64(),
+            Some(generation.load(Ordering::SeqCst))
+        );
+        let taken = snapshots.load(Ordering::SeqCst);
+        assert!(taken < 160, "coalesced: {taken} snapshots for 160 persists");
+    }
+
+    /// **#2181** (R42 on #2181): a snapshot that panics while its caller leads
+    /// does not wedge the path. Its callers get an error (or the panic), none an
+    /// `Ok`, and a later persist of the same path completes. Before, `leading`
+    /// stayed set on unwind and every later persist waited forever.
+    ///
+    /// REVERT-VERIFIED: with the guard's `Drop` doing nothing, the later persist
+    /// never completes and `a later persist completes` fails on its timeout.
+    #[test]
+    fn a_panicking_leader_does_not_wedge_the_path_2181() {
+        use std::sync::mpsc;
+        let dir = tmpdir("panic-2181");
+        let path = dir.join("nf.json");
+        // A slow, good write leads first, so the two panicking callers arrive
+        // while it is out and one of them leads the next write, covering both.
+        let slow = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                StateStore::new(Some(path)).persist_with(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    serde_json::json!({ "v": 0 })
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Each reports Some(is_ok) when it returns, None when it panicked.
+        let (done_tx, done_rx) = mpsc::channel();
+        for _ in 0..2 {
+            let (path, done_tx) = (path.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                let r = std::panic::catch_unwind(|| {
+                    StateStore::new(Some(path)).persist_with(|| panic!("a poisoned lock"))
+                });
+                let _ = done_tx.send(r.ok().map(|r| r.is_ok()));
+            });
+        }
+        assert!(slow.join().expect("slow writer").is_ok());
+        for _ in 0..2 {
+            // Either it led and panicked, or it was covered and got an error;
+            // either way it returns, and never with Ok.
+            let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+            assert!(
+                matches!(outcome, Ok(None) | Ok(Some(false))),
+                "a panicking or covered caller returns, and not with Ok: {outcome:?}"
+            );
+        }
+        let (tx, rx) = mpsc::channel();
+        {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let r = StateStore::new(Some(path)).persist_with(|| serde_json::json!({ "v": 2 }));
+                let _ = tx.send(r.is_ok());
+            });
+        }
+        let later = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let on_disk = std::fs::read(&path).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(later, Ok(true), "a later persist completes");
+        let on_disk: serde_json::Value = serde_json::from_slice(&on_disk.unwrap()).unwrap();
+        assert_eq!(on_disk["v"], 2);
+    }
+
+    /// **#2170**: a write that fails fails every caller it covered, not just
+    /// its leader: none returns `Ok` for a change that is not on disk.
+    ///
+    /// REVERT-VERIFIED: with `result_for` answering `Ok` for every covered
+    /// caller, a waiting caller returns `Ok` and `every caller` fails.
+    #[test]
+    fn a_failed_shared_write_fails_every_caller_it_covered_2170() {
+        let dir = tmpdir("group-fail-2170");
+        // The parent "directory" is a file, so every write fails.
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("nf.json");
+        let results: Vec<bool> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    StateStore::new(Some(path))
+                        .persist_with(|| {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            serde_json::json!({ "v": 1 })
+                        })
+                        .is_err()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            results.iter().all(|failed| *failed),
+            "every caller sees the failure"
         );
     }
 
