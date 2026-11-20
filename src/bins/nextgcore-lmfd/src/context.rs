@@ -1976,6 +1976,17 @@ impl LmfContext {
         found
     }
 
+    /// The AMF holding `ue_context_id`'s N1N2 subscription, its serving AMF, when
+    /// there is one (#557, R45 m1 on #2254: an answer to a UE's unsolicited
+    /// SLPP message goes there, not to any AMF the NRF lists).
+    pub fn amf_for_ue(&self, ue_context_id: &str) -> Option<crate::namf_client::DiscoveredAmf> {
+        let subs = self.amf_subscriptions.read().ok()?;
+        subs.values()
+            .filter(|s| s.ue_context_id.as_deref() == Some(ue_context_id))
+            .max_by_key(|s| s.seq)
+            .map(|s| s.amf.clone())
+    }
+
     /// Whether `key` holds a subscription, created or in flight.
     pub fn amf_subscription_holds(&self, key: &str) -> bool {
         self.amf_subscriptions
@@ -3906,6 +3917,32 @@ mod tests_real_solve {
     ///
     /// REVERT-VERIFIED: with the cap check removed the store grows past it; with
     /// the in-flight filter removed, an in-flight entry is evicted.
+    /// R45 m1 on #2254: a UE's serving AMF is the one its subscription is on,
+    /// the latest when it has moved.
+    #[test]
+    fn a_ue_s_serving_amf_is_its_subscription_s_557() {
+        let ctx = LmfContext::new();
+        let amf = |h: &str| crate::namf_client::DiscoveredAmf {
+            host: h.into(),
+            port: 80,
+            scheme: "http".into(),
+            nf_instance_id: None,
+        };
+        assert_eq!(ctx.amf_for_ue("imsi-1"), None);
+        ctx.amf_subscription_begin("a|imsi-1", &amf("10.0.0.1"), Some("imsi-1"))
+            .unwrap();
+        ctx.amf_subscription_begin("b|imsi-2", &amf("10.0.0.2"), Some("imsi-2"))
+            .unwrap();
+        assert_eq!(ctx.amf_for_ue("imsi-1"), Some(amf("10.0.0.1")));
+        ctx.amf_subscription_begin("c|imsi-1", &amf("10.0.0.3"), Some("imsi-1"))
+            .unwrap();
+        assert_eq!(
+            ctx.amf_for_ue("imsi-1"),
+            Some(amf("10.0.0.3")),
+            "the latest"
+        );
+    }
+
     #[test]
     fn the_subscription_store_is_capped_and_evicts_the_oldest_created_1518() {
         let ctx = LmfContext::new();

@@ -1572,7 +1572,10 @@ async fn sl_rtt_range(input: &nlmf::InputData, peer: &str, budget: Duration) -> 
     // One location session for the whole run: both transactions travel under
     // its LCS correlation identifier, and its sequence numbers are deleted when
     // the run ends (TS 38.355 §4.3.2).
-    let session = slpp::SessionGuard::begin(target);
+    let Some(session) = slpp::SessionGuard::begin(target) else {
+        log::warn!("SLPP ranging for {target}: too many SLPP location sessions are live");
+        return None;
+    };
 
     match slpp_exchange(
         &amf,
@@ -1612,7 +1615,7 @@ async fn sl_rtt_range(input: &nlmf::InputData, peer: &str, budget: Duration) -> 
             return None;
         }
     };
-    let range = slpp::sl_rtt_store().range_between(&reporter, peer.as_bytes());
+    let range = slpp::range_for(target, &reporter, peer.as_bytes());
     if range.is_none() {
         log::warn!(
             "SLPP ranging for {target}: SL-RTT needs both UEs' Rx-Tx (TS 38.305 §8.15.2); \
@@ -1731,18 +1734,36 @@ fn slpp_uplink_answers(ue: &str, session: Option<&str>, bytes: &[u8]) -> Vec<Vec
             }
         }
         Ok(uplink) => {
+            // R45 M1 on #2254: only an answer to an exchange this LMF started binds
+            // an applicationLayerID or adds halves, and only under the ID of the UE
+            // it arrived from.
+            let solicited = slpp::exchanges().is_waiting(ue, uplink.transaction());
+            let app_id = match &uplink {
+                slpp::Uplink::Capabilities { app_id, .. }
+                | slpp::Uplink::Location { app_id, .. } => app_id.as_deref(),
+                _ => None,
+            };
+            let owns_id = solicited && app_id.is_some_and(|a| slpp::app_id_bindings().claim(a, ue));
+            if solicited && app_id.is_some() && !owns_id {
+                log::warn!(
+                    "SLPP from {ue}: its applicationLayerID is bound to another UE; its \
+                     report is not held"
+                );
+            }
             if let slpp::Uplink::Location {
                 app_id: Some(app_id),
                 halves,
                 ..
             } = &uplink
             {
-                if !halves.is_empty() {
+                if !halves.is_empty() && owns_id {
                     log::info!(
                         "SLPP SL-RTT report from {ue}: {} peer measurement(s) held",
                         halves.len()
                     );
                     slpp::sl_rtt_store().note(app_id, halves);
+                } else if !halves.is_empty() && !solicited {
+                    log::info!("SLPP from {ue}: an unsolicited SL-RTT report is not held");
                 }
             }
             if !slpp::exchanges().complete(ue, uplink.clone()) {
@@ -1757,9 +1778,17 @@ fn slpp_uplink_answers(ue: &str, session: Option<&str>, bytes: &[u8]) -> Vec<Vec
 /// is acknowledged without waiting for the AMF.
 fn spawn_slpp_downlink(ue: String, corr: Option<String>, pdus: Vec<Vec<u8>>) {
     tokio::spawn(async move {
-        let Some(amf) = namf_client::discover_amf(None).await else {
-            log::warn!("SLPP answer to {ue}: no AMF discoverable");
-            return;
+        // R45 m1 on #2254: the UE's serving AMF, the one its subscription is on.
+        let serving = lmf_self().read().ok().and_then(|c| c.amf_for_ue(&ue));
+        let amf = match serving {
+            Some(amf) => amf,
+            None => match namf_client::discover_amf(None).await {
+                Some(amf) => amf,
+                None => {
+                    log::warn!("SLPP answer to {ue}: no AMF discoverable");
+                    return;
+                }
+            },
         };
         let lmf_id = lmf_self()
             .read()
@@ -9354,6 +9383,9 @@ mod positioning_chain_strict_peer {
             );
         }
         seed_amf_connected_ue(&supi);
+        // R45 M1 on #2254: A5A5A5 is bound to whichever UE first answered with it;
+        // here that must be this target.
+        crate::slpp::app_id_bindings().forget(&[0xA5, 0xA5, 0xA5]);
         crate::slpp::sl_rtt_store().note(
             b"ZZZ",
             &[crate::slpp::SlRttHalf {

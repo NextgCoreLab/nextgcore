@@ -18,6 +18,11 @@
 //! - A location session is named by its LCS correlation identifier. The LMF
 //!   mints one per SL-RTT run and sends every DL message of that run under it.
 //!   The AMF reports it back on the UE's uplink.
+//! - Sequence state is bounded. A live session (a [`SessionGuard`]) is never
+//!   evicted, and at most [`MAX_PENDING_EXCHANGES`] are live at once. Any other
+//!   session, such as the one a UE's unsolicited message opens, is forgotten after
+//!   [`SESSION_IDLE`] without activity, or evicted oldest first when the map is
+//!   full.
 //! - A UE message that asks for an acknowledgement gets a bare one (§4.3.3),
 //!   duplicates and undecodable bodies included (§4.3.4.2 step 4).
 //! - **Deviation: the LMF never asks for an acknowledgement and never
@@ -38,6 +43,18 @@
 //! A single UE's report is half a measurement. [`SlRttStore`] therefore holds
 //! each half under (reporter, peer) application layer IDs and produces a range
 //! once the reverse half exists.
+//!
+//! # Whose half it is (R45 M1 on #2254)
+//!
+//! A UE names itself by the applicationLayerID in its own SLPP-Message, and
+//! nothing on the wire ties that to its SUPI. The LMF therefore binds an ID to
+//! the SUPI of the first UE whose solicited answer carries it ([`AppIdBindings`],
+//! bounded, idle entries expire). A half is held only when:
+//! - it comes from a ProvideLocationInformation that answers an exchange this
+//!   LMF started, and
+//! - its reporter ID is bound to the UE it arrived from.
+//!
+//! A range is computed only when the target's reporter ID is the target's own.
 //!
 //! # Report mapping (TS 38.133 §10.4A.4.1.1)
 //!
@@ -542,6 +559,29 @@ pub fn range_m(rx_tx_ab_tc: f64, rx_tx_ba_tc: f64) -> f64 {
     SPEED_OF_LIGHT_M_S * (rx_tx_ab_tc + rx_tx_ba_tc) * TC_SECONDS / 2.0
 }
 
+/// The largest range two halves can give: both at the top of the reporting
+/// range, +985024 Tc each (TS 38.133 §10.4A.4.1.1), about 150 km.
+pub fn max_range_m() -> f64 {
+    range_m(RX_TX_RANGE_TC as f64, RX_TX_RANGE_TC as f64)
+}
+
+/// [`range_m`], when it is a distance (R45 M2 on #2254). The halves are signed,
+/// so measurement error or a mismatched pair can sum below zero. TS 29.572's
+/// distance is a magnitude, so a negative, non-finite or out-of-range value is
+/// no range at all.
+pub fn valid_range_m(rx_tx_ab_tc: f64, rx_tx_ba_tc: f64) -> Option<f64> {
+    let r = range_m(rx_tx_ab_tc, rx_tx_ba_tc);
+    if r.is_finite() && (0.0..=max_range_m()).contains(&r) {
+        Some(r)
+    } else {
+        log::warn!(
+            "SL-RTT halves {rx_tx_ab_tc} Tc and {rx_tx_ba_tc} Tc give {r} m, which is no \
+             distance; no range is reported"
+        );
+        None
+    }
+}
+
 /// SL-RTT halves, keyed by (reporter, peer) application layer ID.
 #[derive(Debug, Default)]
 pub struct SlRttStore {
@@ -597,13 +637,36 @@ impl SlRttStore {
         };
         let ab = fresh((a.to_vec(), b.to_vec()))?;
         let ba = fresh((b.to_vec(), a.to_vec()))?;
-        Some(range_m(ab, ba))
+        valid_range_m(ab, ba)
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().map(|s| s.halves.len()).unwrap_or(0)
     }
+
+    /// Forget every half (tests that use the process-global store).
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.halves.clear();
+            s.order.clear();
+        }
+    }
+}
+
+/// The range between the UE `target`, which reported as `reporter`, and `peer`
+/// (R45 M1 on #2254): only when `reporter` is bound to `target`, so a UE that
+/// names another UE's ID as its own is not given that UE's range.
+pub fn range_for(target: &str, reporter: &[u8], peer: &[u8]) -> Option<f64> {
+    if !app_id_bindings().is_bound_to(reporter, target) {
+        log::warn!(
+            "SLPP ranging for {target}: its report names an applicationLayerID bound to \
+             another UE; no range"
+        );
+        return None;
+    }
+    sl_rtt_store().range_between(reporter, peer)
 }
 
 /// The LMF's SL-RTT halves.
@@ -670,6 +733,16 @@ impl SlppExchanges {
         ))
     }
 
+    /// Whether an exchange waits on (`ue`, `tid`).
+    pub fn is_waiting(&self, ue: &str, tid: Option<u8>) -> bool {
+        let Some(tid) = tid else {
+            return false;
+        };
+        self.waiting
+            .lock()
+            .is_ok_and(|w| w.contains_key(&(ue.to_string(), tid)))
+    }
+
     /// Hand `uplink` to the exchange waiting on it. Returns whether one was.
     pub fn complete(&self, ue: &str, uplink: Uplink) -> bool {
         let Some(tid) = uplink.transaction() else {
@@ -706,6 +779,48 @@ fn session_key(ue: &str, session: Option<&str>) -> SessionKey {
     (ue.to_string(), session.map(str::to_string))
 }
 
+/// A session that no live [`SessionGuard`] holds, such as the one a UE's
+/// unsolicited message opens, is forgotten after this long without activity
+/// (R45 m2 on #2254). It matches the 10 minutes §4.3.2 gives the UE.
+pub const SESSION_IDLE: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, Default)]
+struct SequencesInner {
+    /// Per session: the last number sent, and the last activity.
+    sent: HashMap<SessionKey, (u8, Instant)>,
+    /// Per session: the last number received, and the last activity.
+    received: HashMap<SessionKey, (u8, Instant)>,
+    /// Sessions a live [`SessionGuard`] holds: never evicted.
+    live: std::collections::HashSet<SessionKey>,
+}
+
+/// Make room in `map` for `key`, at `now`: entries idle for [`SESSION_IDLE`]
+/// go, and then, while the map is still full, the oldest entry no live session
+/// holds (R45 M3 on #2254). A live session is never evicted.
+fn make_room(
+    map: &mut HashMap<SessionKey, (u8, Instant)>,
+    live: &std::collections::HashSet<SessionKey>,
+    key: &SessionKey,
+    now: Instant,
+) {
+    if map.contains_key(key) || map.len() < MAX_PENDING_EXCHANGES {
+        return;
+    }
+    map.retain(|k, (_, at)| live.contains(k) || now.saturating_duration_since(*at) < SESSION_IDLE);
+    while map.len() >= MAX_PENDING_EXCHANGES {
+        let Some(oldest) = map
+            .iter()
+            .filter(|(k, _)| !live.contains(*k))
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(k, _)| k.clone())
+        else {
+            // Only live sessions: they are capped at MAX_PENDING_EXCHANGES.
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
 /// TS 38.355 §4.3.2 on both sides of the LMF's SLPP location sessions.
 ///
 /// - Sending: the LMF "shall include a sequence number in all SLPP messages
@@ -717,27 +832,29 @@ fn session_key(ue: &str, session: Option<&str>) -> SessionKey {
 /// - Both "shall be deleted in a server when the associated location session
 ///   is terminated" ([`end_session`]).
 ///
-/// A session is named by (UE, LCS correlation identifier). Both maps are also
-/// capped at [`MAX_PENDING_EXCHANGES`] sessions and cleared once full. That
-/// bounds sessions the LMF never ended itself, such as a UE's unsolicited
-/// messages.
+/// A session is named by (UE, LCS correlation identifier). Each map holds at
+/// most [`MAX_PENDING_EXCHANGES`] sessions besides live ones (see
+/// [`make_room`]).
 #[derive(Debug, Default)]
 pub struct SlppSequences {
-    sent: Mutex<HashMap<SessionKey, u8>>,
-    received: Mutex<HashMap<SessionKey, u8>>,
+    inner: Mutex<SequencesInner>,
 }
 
 impl SlppSequences {
     /// The next sequence number to send to `ue` in location session `session`.
     pub fn next_sequence(&self, ue: &str, session: Option<&str>) -> Option<u8> {
+        self.next_sequence_at(ue, session, Instant::now())
+    }
+
+    fn next_sequence_at(&self, ue: &str, session: Option<&str>, now: Instant) -> Option<u8> {
         let key = session_key(ue, session);
-        let mut m = self.sent.lock().ok()?;
-        if m.len() >= MAX_PENDING_EXCHANGES && !m.contains_key(&key) {
-            m.clear();
-        }
-        let n = m.entry(key).or_insert(u8::MAX);
-        *n = n.wrapping_add(1);
-        Some(*n)
+        let mut guard = self.inner.lock().ok()?;
+        let s = &mut *guard;
+        make_room(&mut s.sent, &s.live, &key, now);
+        let e = s.sent.entry(key).or_insert((u8::MAX, now));
+        e.0 = e.0.wrapping_add(1);
+        e.1 = now;
+        Some(e.0)
     }
 
     /// Whether a message from `ue` in `session` with sequence number `seq`
@@ -745,45 +862,73 @@ impl SlppSequences {
     /// message without a sequence number cannot be checked and is not a
     /// duplicate.
     pub fn is_duplicate(&self, ue: &str, session: Option<&str>, seq: Option<u8>) -> bool {
+        self.is_duplicate_at(ue, session, seq, Instant::now())
+    }
+
+    fn is_duplicate_at(
+        &self,
+        ue: &str,
+        session: Option<&str>,
+        seq: Option<u8>,
+        now: Instant,
+    ) -> bool {
         let Some(seq) = seq else {
             return false;
         };
-        let Ok(mut m) = self.received.lock() else {
+        let Ok(mut guard) = self.inner.lock() else {
             return false;
         };
+        let s = &mut *guard;
         let key = session_key(ue, session);
-        if m.get(&key) == Some(&seq) {
-            return true;
+        if let Some(e) = s.received.get_mut(&key) {
+            e.1 = now;
+            if e.0 == seq {
+                return true;
+            }
+            e.0 = seq;
+            return false;
         }
-        if m.len() >= MAX_PENDING_EXCHANGES && !m.contains_key(&key) {
-            m.clear();
-        }
-        m.insert(key, seq);
+        make_room(&mut s.received, &s.live, &key, now);
+        s.received.insert(key, (seq, now));
         false
     }
 
+    /// Mark `session` with `ue` live. `false` when [`MAX_PENDING_EXCHANGES`]
+    /// sessions are live already.
+    fn begin_live(&self, ue: &str, session: &str) -> bool {
+        let Ok(mut s) = self.inner.lock() else {
+            return false;
+        };
+        if s.live.len() >= MAX_PENDING_EXCHANGES {
+            return false;
+        }
+        s.live.insert(session_key(ue, Some(session)));
+        true
+    }
+
     /// The LMF ended location session `session` with `ue`: both its sequence
-    /// numbers are deleted (§4.3.2).
+    /// numbers are deleted (§4.3.2), and it is no longer live.
     pub fn end_session(&self, ue: &str, session: Option<&str>) {
         let key = session_key(ue, session);
-        if let Ok(mut m) = self.sent.lock() {
-            m.remove(&key);
-        }
-        if let Ok(mut m) = self.received.lock() {
-            m.remove(&key);
+        if let Ok(mut s) = self.inner.lock() {
+            s.sent.remove(&key);
+            s.received.remove(&key);
+            s.live.remove(&key);
         }
     }
 
     #[cfg(test)]
     fn tracks(&self, ue: &str, session: Option<&str>) -> bool {
         let key = session_key(ue, session);
-        self.sent.lock().is_ok_and(|m| m.contains_key(&key))
-            || self.received.lock().is_ok_and(|m| m.contains_key(&key))
+        self.inner
+            .lock()
+            .is_ok_and(|s| s.sent.contains_key(&key) || s.received.contains_key(&key))
     }
 }
 
-/// Ends a location session's sequence numbers when dropped, so a SL-RTT run
-/// that fails, times out or is cancelled still deletes them (§4.3.2).
+/// A live location session: its sequence numbers are never evicted while it
+/// lasts, and are deleted when it is dropped, so a SL-RTT run that fails, times
+/// out or is cancelled still deletes them (§4.3.2).
 pub struct SessionGuard {
     ue: String,
     session: String,
@@ -791,14 +936,15 @@ pub struct SessionGuard {
 
 impl SessionGuard {
     /// A new location session with `ue`, under a fresh LCS correlation
-    /// identifier.
-    pub fn begin(ue: &str) -> Self {
+    /// identifier. `None` when [`MAX_PENDING_EXCHANGES`] sessions are live.
+    pub fn begin(ue: &str) -> Option<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
+        let session = format!("slpp-{n}-{ue}");
+        sequences().begin_live(ue, &session).then(|| Self {
             ue: ue.to_string(),
-            session: format!("slpp-{n}-{ue}"),
-        }
+            session,
+        })
     }
 
     /// The session's LCS correlation identifier.
@@ -813,6 +959,81 @@ impl Drop for SessionGuard {
     }
 }
 
+/// An applicationLayerID binding is forgotten after this long unused.
+pub const APP_ID_BINDING_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// At most this many applicationLayerIDs are bound. Beyond that the binding
+/// unused longest goes first.
+pub const APP_ID_BINDING_CAP: usize = 4096;
+
+/// Which UE (SUPI or other UE context id) each applicationLayerID belongs to
+/// (R45 M1 on #2254): the first UE whose solicited answer carried it. A UE
+/// cannot then write halves, or be ranged, under another UE's ID.
+#[derive(Debug, Default)]
+pub struct AppIdBindings {
+    inner: Mutex<HashMap<Vec<u8>, (String, Instant)>>,
+}
+
+impl AppIdBindings {
+    /// Whether `app_id` is `ue`'s: bound to it already, or free and now bound.
+    pub fn claim(&self, app_id: &[u8], ue: &str) -> bool {
+        self.claim_at(app_id, ue, Instant::now())
+    }
+
+    fn claim_at(&self, app_id: &[u8], ue: &str, now: Instant) -> bool {
+        let Ok(mut m) = self.inner.lock() else {
+            return false;
+        };
+        if let Some((owner, at)) = m.get_mut(app_id) {
+            if now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE {
+                if owner != ue {
+                    return false;
+                }
+                *at = now;
+                return true;
+            }
+        }
+        if !m.contains_key(app_id) && m.len() >= APP_ID_BINDING_CAP {
+            m.retain(|_, (_, at)| now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE);
+            if m.len() >= APP_ID_BINDING_CAP {
+                if let Some(oldest) = m
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(k, _)| k.clone())
+                {
+                    m.remove(&oldest);
+                }
+            }
+        }
+        m.insert(app_id.to_vec(), (ue.to_string(), now));
+        true
+    }
+
+    /// Whether `app_id` is bound to `ue` now.
+    pub fn is_bound_to(&self, app_id: &[u8], ue: &str) -> bool {
+        let now = Instant::now();
+        self.inner.lock().is_ok_and(|m| {
+            m.get(app_id).is_some_and(|(owner, at)| {
+                owner == ue && now.saturating_duration_since(*at) < APP_ID_BINDING_IDLE
+            })
+        })
+    }
+
+    /// Forget `app_id`'s binding (tests that use the process-global bindings).
+    #[cfg(test)]
+    pub(crate) fn forget(&self, app_id: &[u8]) {
+        if let Ok(mut m) = self.inner.lock() {
+            m.remove(app_id);
+        }
+    }
+}
+
+/// The LMF's applicationLayerID bindings.
+pub fn app_id_bindings() -> &'static AppIdBindings {
+    static B: OnceLock<AppIdBindings> = OnceLock::new();
+    B.get_or_init(AppIdBindings::default)
+}
+
 /// The LMF's SLPP sequence numbers.
 pub fn sequences() -> &'static SlppSequences {
     static SEQ: OnceLock<SlppSequences> = OnceLock::new();
@@ -825,7 +1046,8 @@ pub fn next_transaction() -> u8 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Serialises tests that touch [`sl_rtt_store`], [`exchanges`] or [`sequences`], which are
+/// Serialises tests that touch [`sl_rtt_store`], [`exchanges`], [`sequences`] or
+/// [`app_id_bindings`], which are
 /// process-global and would otherwise see each other's halves and exchanges.
 #[cfg(test)]
 pub static SLPP_GLOBALS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
