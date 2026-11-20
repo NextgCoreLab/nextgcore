@@ -2646,10 +2646,11 @@ mod tests {
         );
     }
 
-    /// An AMF that answers every request after `delay`, counting how many of
-    /// its (and its siblings') requests are in flight at once in `peak`.
-    async fn slow_amf(
-        delay: Duration,
+    /// An AMF that holds every request until `gate` opens, counting how many
+    /// of its (and its siblings') requests are in flight at once in `in_flight`
+    /// and the most there ever were in `peak`.
+    async fn gated_amf(
+        gate: Arc<tokio::sync::Semaphore>,
         in_flight: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
         expiry: u64,
@@ -2658,11 +2659,11 @@ mod tests {
         let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(move |_req: SbiRequest| {
-                let (in_flight, peak) = (in_flight.clone(), peak.clone());
+                let (gate, in_flight, peak) = (gate.clone(), in_flight.clone(), peak.clone());
                 async move {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(delay).await;
+                    drop(gate.acquire().await.expect("gate"));
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     SbiResponse::with_status(200)
                         .with_json_body(&json!({ "subscription": { "options": {
@@ -2679,14 +2680,21 @@ mod tests {
     }
 
     /// **#2182** (R42 minor on #2182): legs at different AMFs are renewed in
-    /// parallel, [`LEG_RENEW_MAX_AMFS`] (8) AMFs at once and no more. Nine slow
-    /// AMFs, each holding one due leg and answering after 300 ms: the
-    /// renewals overlap up to the cap, and the pass takes two waves, not one
-    /// per AMF.
+    /// parallel, [`LEG_RENEW_MAX_AMFS`] (8) AMFs at once and no more. Nine AMFs,
+    /// each holding one due leg and holding its renewal until the test opens
+    /// the gate: eight renewals are in flight at once, the ninth is not sent
+    /// while they are held, and once the gate opens all nine are renewed.
     ///
-    /// REVERT-VERIFIED: with `LEG_RENEW_MAX_AMFS` = 1, "renewals overlap" and
-    /// "two waves" fail; with no cap (a semaphore of 64), "renewals overlap"
-    /// fails at 9.
+    /// #2235: no wall clock. The AMFs used to answer after 300 ms, and the test
+    /// timed the pass ("two waves": under 900 ms). On a loaded host the eight
+    /// renewals did not all reach their AMFs within 300 ms of the first, so
+    /// "renewals overlap, up to the cap" read 6 or 7 (3 of 6 runs at seed 2121,
+    /// `--test-threads=1`), and "two waves" failed once in parallel. Overlap and
+    /// the cap are now read from the AMFs' in-flight count while they hold.
+    ///
+    /// REVERT-VERIFIED: with `LEG_RENEW_MAX_AMFS` = 1, "eight renewals in
+    /// flight at once" times out (one at a time); with no cap (a semaphore of
+    /// 64), "the ninth waits for a slot" fails at 9.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
     async fn legs_at_different_amfs_are_renewed_in_parallel_2182() {
@@ -2696,16 +2704,17 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         crate::context::udm_context_init(1024, 4096);
         AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
-        const DELAY: Duration = Duration::from_millis(300);
         // Pinned as numbers, not from the constant, so lowering it fails here.
         const AMFS: usize = 9;
         const CAP: usize = 8;
         let now = crate::context::now_unix_secs();
         let (in_flight, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut amfs = Vec::new();
         let mut ids = Vec::new();
         for n in 0..AMFS {
-            let (server, addr) = slow_amf(DELAY, in_flight.clone(), peak.clone(), now + 600).await;
+            let (server, addr) =
+                gated_amf(gate.clone(), in_flight.clone(), peak.clone(), now + 600).await;
             amfs.push(server);
             let mut sub = UdmEeSubscription::for_ue(
                 format!("imsi-00101000002183{n}"),
@@ -2732,20 +2741,28 @@ mod tests {
             udm_self().read().unwrap().ee_subscription_insert(sub);
         }
 
-        let started = std::time::Instant::now();
-        let renewed = renew_amf_legs(now).await;
-        let took = started.elapsed();
+        let pass = tokio::spawn(renew_amf_legs(now));
+        // Every slot is taken: eight renewals are held at their AMFs at once.
+        let all_in = tokio::time::timeout(Duration::from_secs(4), async {
+            while in_flight.load(Ordering::SeqCst) < CAP {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        // While they are held, the ninth is not sent. (A pass with no cap sends
+        // it at once; this window only lets a broken cap show.)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = in_flight.load(Ordering::SeqCst);
+        gate.add_permits(AMFS);
+        let renewed = pass.await.expect("the pass");
         for id in &ids {
             udm_self().read().unwrap().ee_subscription_remove(id);
         }
 
+        assert!(all_in.is_ok(), "eight renewals in flight at once");
+        assert_eq!(held, CAP, "the ninth waits for a slot");
         assert_eq!(renewed, AMFS, "every leg is renewed");
-        assert_eq!(
-            peak.load(Ordering::SeqCst),
-            CAP,
-            "renewals overlap, up to the cap"
-        );
-        assert!(took < DELAY * 3, "two waves: {took:?}");
+        assert_eq!(peak.load(Ordering::SeqCst), CAP, "never more than the cap");
     }
 
     /// **#2149** (R42 on #2144): the AMF leg carries the Nudm_EE subscription's
