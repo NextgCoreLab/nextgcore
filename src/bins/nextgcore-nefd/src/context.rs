@@ -184,6 +184,13 @@ pub struct NefMonitoringSubscription {
     /// `notify/{id}`; that URI is served for it alone ([`Self::admits_notify`]).
     #[serde(default)]
     pub notify_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
+    /// #2102: UNIX seconds the live southbound leg lapses at the producer
+    /// unless refreshed (AmfEventMode.expiry, TS 29.518; ReportingOptions.expiry
+    /// of the UDM EeSubscription, TS 29.503): the expiry the producer confirmed,
+    /// else the one requested. `None` for a leg made before #2102, which the
+    /// first refresh sweep bounds.
+    #[serde(default)]
+    pub southbound_expiry: Option<u64>,
 }
 
 impl NefMonitoringSubscription {
@@ -224,6 +231,7 @@ impl NefMonitoringSubscription {
             owner_id: None,
             raw: raw.into(),
             notify_token: Some(nextgcore_sbi::callback_auth::CallbackToken::mint()),
+            southbound_expiry: None,
         }
     }
 
@@ -631,7 +639,12 @@ impl NefContext {
     /// Returns false when the subscription has gone -- the AF deleted it while the
     /// reconciler was mid-retry -- so the caller can tear the producer-side
     /// subscription down instead of leaving it orphaned.
-    pub fn subscription_promote(&self, id: &str, southbound: SouthboundRef) -> bool {
+    pub fn subscription_promote(
+        &self,
+        id: &str,
+        southbound: SouthboundRef,
+        expiry: Option<u64>,
+    ) -> bool {
         let promoted = {
             let Ok(mut subs) = self.subscriptions.write() else {
                 return false;
@@ -639,6 +652,7 @@ impl NefContext {
             match subs.get_mut(id) {
                 Some(sub) => {
                     sub.southbound = Some(southbound);
+                    sub.southbound_expiry = expiry;
                     sub.pending = None;
                     true
                 }
@@ -649,6 +663,49 @@ impl NefContext {
             self.persist();
         }
         promoted
+    }
+
+    /// #2102: every subscription with a live southbound leg, soonest expiry
+    /// first (an unbounded one, made before #2102, first of all). The refresh
+    /// sweep's work list.
+    pub fn subscriptions_live(&self) -> Vec<NefMonitoringSubscription> {
+        let Ok(subs) = self.subscriptions.read() else {
+            return Vec::new();
+        };
+        let mut live: Vec<NefMonitoringSubscription> = subs
+            .values()
+            .filter(|s| s.southbound.is_some())
+            .cloned()
+            .collect();
+        live.sort_by_key(|s| (s.southbound_expiry.unwrap_or(0), s.id.clone()));
+        live
+    }
+
+    /// #2102: record the expiry a refresh of `id`'s southbound leg obtained, if
+    /// that leg is still `southbound` (the AF may have deleted the subscription
+    /// while the refresh was out). Returns whether it was recorded.
+    pub fn subscription_refreshed(
+        &self,
+        id: &str,
+        southbound: &SouthboundRef,
+        expiry: u64,
+    ) -> bool {
+        let refreshed = {
+            let Ok(mut subs) = self.subscriptions.write() else {
+                return false;
+            };
+            match subs.get_mut(id) {
+                Some(sub) if sub.southbound.as_ref() == Some(southbound) => {
+                    sub.southbound_expiry = Some(expiry);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if refreshed {
+            self.persist();
+        }
+        refreshed
     }
 
     /// Number of stored monitoring subscriptions (NRF `/load` gauge source).

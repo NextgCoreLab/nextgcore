@@ -659,6 +659,8 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(period).await;
             reconcile_pending_subscriptions().await;
+            // #2102: and live legs are refreshed before they lapse.
+            refresh_live_subscriptions_at(now_unix_secs()).await;
         }
     });
     // #1877: and southbound unsubscribes that failed are retried until delivered.
@@ -1292,7 +1294,7 @@ async fn handle_monitoring_subscription_create_inner(
                 SouthboundProducer::Udm => udm_uri.clone(),
             };
             match attempt_southbound_subscribe(producer_uri, req).await {
-                SouthboundOutcome::Live(reference) => (Some(reference), None),
+                SouthboundOutcome::Live(reference, expiry) => (Some((reference, expiry)), None),
                 SouthboundOutcome::Deferred => (
                     None,
                     Some(PendingSouthbound {
@@ -1315,9 +1317,14 @@ async fn handle_monitoring_subscription_create_inner(
         None => (None, None),
     };
 
+    let (southbound, southbound_expiry) = match southbound {
+        Some((reference, expiry)) => (Some(reference), Some(expiry)),
+        None => (None, None),
+    };
     let sub = NefMonitoringSubscription {
         southbound,
         pending,
+        southbound_expiry,
         ..sub
     };
     let sub_id = sub.id.clone();
@@ -1701,9 +1708,9 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
             body: leg.body.clone(),
         };
         match attempt_southbound_subscribe(producer_uri, &req).await {
-            SouthboundOutcome::Live(reference) => {
+            SouthboundOutcome::Live(reference, expiry) => {
                 if let Ok(c) = ctx.read() {
-                    if c.subscription_promote(&sub.id, reference.clone()) {
+                    if c.subscription_promote(&sub.id, reference.clone(), Some(expiry)) {
                         log::info!(
                             "deferred southbound leg promoted to live: sub={} producer={}",
                             sub.id,
@@ -1752,6 +1759,216 @@ pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
             report.promoted,
             report.expired,
             report.still_pending
+        );
+    }
+    report
+}
+
+/// #2102: the lifetime asked for every southbound subscription, and granted
+/// again by each refresh (`NEF_SOUTHBOUND_LIFETIME_SECS`, default one hour, at
+/// least one minute). A subscription the NEF holds no record of -- its create
+/// timed out after the producer took it, and neither TS 29.518 nor TS 29.503
+/// gives the NEF a way to learn its id -- is never refreshed and lapses at the
+/// producer within this.
+fn southbound_lifetime_secs() -> u64 {
+    std::env::var("NEF_SOUTHBOUND_LIFETIME_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
+        .max(60)
+}
+
+/// #2102: a live leg is refreshed once at most this much of its lifetime is
+/// left: half of it, so several missed sweeps ([`reconcile_interval_secs`])
+/// still refresh it in time.
+fn southbound_refresh_margin_secs() -> u64 {
+    southbound_lifetime_secs() / 2
+}
+
+/// #2102: `body` asking for `expiry` (UNIX seconds): the AMF's
+/// `subscription.options.expiry` (AmfEventMode, TS 29.518 §6.2.6.2.4; `trigger`
+/// is mandatory there, CONTINUOUS when the body names none), the UDM's
+/// `reportingOptions.expiry` (TS 29.503 §6.4.6.2.2 EeSubscription).
+fn with_requested_expiry(
+    producer: SouthboundProducer,
+    body: &serde_json::Value,
+    expiry: u64,
+) -> serde_json::Value {
+    let mut body = body.clone();
+    let at = serde_json::json!(nextgcore_sbi::datetime::epoch_to_rfc3339(expiry));
+    let holder = match producer {
+        SouthboundProducer::Amf => body
+            .get_mut("subscription")
+            .and_then(serde_json::Value::as_object_mut)
+            .map(|sub| {
+                sub.entry("options")
+                    .or_insert_with(|| serde_json::json!({ "trigger": "CONTINUOUS" }))
+            }),
+        SouthboundProducer::Udm => body.as_object_mut().map(|b| {
+            b.entry("reportingOptions")
+                .or_insert_with(|| serde_json::json!({}))
+        }),
+    };
+    if let Some(options) = holder.and_then(serde_json::Value::as_object_mut) {
+        options.insert("expiry".to_string(), at);
+    }
+    body
+}
+
+/// #2102: the expiry a producer's subscribe or modify answer confirms, if it
+/// names one: AmfCreatedEventSubscription / AmfUpdatedEventSubscription
+/// `subscription.options.expiry`, CreatedEeSubscription
+/// `eeSubscription.reportingOptions.expiry` or a bare EeSubscription's.
+fn confirmed_expiry(producer: SouthboundProducer, response: &SbiResponse) -> Option<u64> {
+    let body: serde_json::Value = serde_json::from_str(response.http.content.as_deref()?).ok()?;
+    let text = match producer {
+        SouthboundProducer::Amf => body.pointer("/subscription/options/expiry"),
+        SouthboundProducer::Udm => body
+            .pointer("/eeSubscription/reportingOptions/expiry")
+            .or_else(|| body.pointer("/reportingOptions/expiry")),
+    }?;
+    nextgcore_sbi::datetime::rfc3339_to_epoch(text.as_str()?)
+}
+
+/// #2102: the modification that moves a live leg's expiry to `expiry`: the
+/// AMF's AmfUpdateEventOptionItem (TS 29.518 §6.2.6.2.7, `replace` of
+/// `/options/expiry`), the UDM's PatchItem on `reportingOptions` (TS 29.503
+/// §5.5.2.4 UpdateEeSubscription; `add` sets the member whether or not the
+/// subscription carried one, so a leg made before #2102 is bounded too).
+fn refresh_patch(producer: SouthboundProducer, expiry: u64) -> serde_json::Value {
+    let at = nextgcore_sbi::datetime::epoch_to_rfc3339(expiry);
+    match producer {
+        SouthboundProducer::Amf => serde_json::json!([
+            { "op": "replace", "path": "/options/expiry", "value": at }
+        ]),
+        SouthboundProducer::Udm => serde_json::json!([
+            { "op": "add", "path": "/reportingOptions", "value": { "expiry": at } }
+        ]),
+    }
+}
+
+/// What one refresh sweep did (#2102).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RefreshReport {
+    /// Legs the producer took a new expiry for.
+    pub refreshed: usize,
+    /// Subscriptions removed because their leg is gone: the producer answered
+    /// 404, or the expiry passed before a refresh got through.
+    pub lapsed: usize,
+    /// Refreshes that failed and are tried again next sweep.
+    pub failed: usize,
+}
+
+/// #2102: refresh every live southbound leg within
+/// [`southbound_refresh_margin_secs`] of its expiry, as of `now` (UNIX seconds).
+///
+/// - A leg made before #2102 (no expiry recorded) is refreshed at once, which
+///   bounds it.
+/// - The producer taking the modification (2xx) records the expiry it confirms,
+///   else the one asked for.
+/// - A 404 means the producer no longer holds it, and a leg whose expiry has
+///   passed is gone at a producer that honours expiry. Either way the
+///   northbound subscription can never notify again and is removed, as an
+///   expired pending leg is (#111). A passed one is also unsubscribed, in case
+///   the producer ignored the expiry.
+/// - Any other failure is retried next sweep.
+///
+/// Only subscriptions this NEF holds are refreshed, so an orphan lapses.
+pub async fn refresh_live_subscriptions_at(now: u64) -> RefreshReport {
+    let live = match nef_self().read() {
+        Ok(c) => c.subscriptions_live(),
+        Err(_) => return RefreshReport::default(),
+    };
+    let margin = southbound_refresh_margin_secs();
+    let mut report = RefreshReport::default();
+    for sub in live {
+        let Some(southbound) = sub.southbound.clone() else {
+            continue;
+        };
+        if sub
+            .southbound_expiry
+            .is_some_and(|e| e > now.saturating_add(margin))
+        {
+            continue;
+        }
+        let remove = |why: &str| {
+            log::warn!(
+                "monitoring subscription {}: its {} leg {why}; removing it",
+                sub.id,
+                southbound.producer.as_str()
+            );
+            if let Ok(c) = nef_self().read() {
+                c.subscription_remove(&sub.id);
+            }
+        };
+        if sub.southbound_expiry.is_some_and(|e| e <= now) {
+            // #2086: owed before the removal is persisted, in the same snapshot.
+            southbound_reconcile::owe(southbound.clone());
+            remove("expired before a refresh got through");
+            let uri = southbound
+                .producer_base
+                .clone()
+                .or_else(|| producer_uri(southbound.producer));
+            southbound_unsubscribe(uri, southbound).await;
+            report.lapsed += 1;
+            continue;
+        }
+        let base = southbound
+            .producer_base
+            .clone()
+            .or_else(|| producer_uri(southbound.producer));
+        let Some((host, port)) = base.as_deref().and_then(parse_host_port) else {
+            log::warn!(
+                "monitoring subscription {}: no usable {} URI to refresh its leg at",
+                sub.id,
+                southbound.producer.as_str()
+            );
+            report.failed += 1;
+            continue;
+        };
+        let requested = now.saturating_add(southbound_lifetime_secs());
+        let client = service_client(&host, port, southbound.producer.nf_type());
+        let patch = refresh_patch(southbound.producer, requested);
+        match client.patch_json(&southbound.delete_path, &patch).await {
+            Ok(resp) if resp.is_success() => {
+                let expiry = confirmed_expiry(southbound.producer, &resp).unwrap_or(requested);
+                let recorded = nef_self()
+                    .read()
+                    .map(|c| c.subscription_refreshed(&sub.id, &southbound, expiry))
+                    .unwrap_or(false);
+                if recorded {
+                    report.refreshed += 1;
+                }
+            }
+            Ok(resp) if resp.status == 404 => {
+                remove("is gone at the producer (404 on refresh)");
+                report.lapsed += 1;
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "monitoring subscription {}: {} refresh returned {}",
+                    sub.id,
+                    southbound.producer.as_str(),
+                    resp.status
+                );
+                report.failed += 1;
+            }
+            Err(e) => {
+                log::warn!(
+                    "monitoring subscription {}: {} refresh failed: {e}",
+                    sub.id,
+                    southbound.producer.as_str()
+                );
+                report.failed += 1;
+            }
+        }
+    }
+    if report != RefreshReport::default() {
+        log::info!(
+            "refresh sweep: {} refreshed, {} lapsed, {} failed",
+            report.refreshed,
+            report.lapsed,
+            report.failed
         );
     }
     report
@@ -1950,8 +2167,9 @@ async fn resolve_gpsi_to_supi(udm_uri: Option<String>, gpsi: &str) -> Option<Str
 /// of #111.
 #[derive(Debug)]
 enum SouthboundOutcome {
-    /// The producer accepted and gave a usable reference.
-    Live(SouthboundRef),
+    /// The producer accepted and gave a usable reference, and the UNIX second
+    /// the subscription lapses at unless refreshed (#2102).
+    Live(SouthboundRef, u64),
     /// No producer URI is configured, so the leg has not been ATTEMPTED yet. The
     /// northbound create is accepted and the leg is retried by the reconciler --
     /// distinguished from a failure because a deployment that has not wired its
@@ -2015,14 +2233,22 @@ async fn attempt_southbound_subscribe(
         };
     };
     let client = service_client(&host, port, producer.nf_type());
-    match client.post_json(&req.path, &req.body).await {
+    // #2102: every subscription asks for an expiry, stamped at send time (a
+    // deferred leg's body is built long before), so one this NEF never learns
+    // of -- the create timed out after the producer took it -- lapses on its own.
+    let requested = now_unix_secs().saturating_add(southbound_lifetime_secs());
+    let body = with_requested_expiry(producer, &req.body, requested);
+    match client.post_json(&req.path, &body).await {
         Ok(response) if response.status == 200 || response.status == 201 => {
             match extract_southbound_ref(producer, &req.path, &response) {
                 // #1877 (R27): remember where it was made.
-                Some(southbound) => SouthboundOutcome::Live(SouthboundRef {
-                    producer_base: Some(uri.clone()),
-                    ..southbound
-                }),
+                Some(southbound) => SouthboundOutcome::Live(
+                    SouthboundRef {
+                        producer_base: Some(uri.clone()),
+                        ..southbound
+                    },
+                    confirmed_expiry(producer, &response).unwrap_or(requested),
+                ),
                 None => {
                     // The producer created something and did not say what. The NEF
                     // cannot unsubscribe it later, so accepting the northbound
@@ -3447,6 +3673,376 @@ mod tests {
             })
             .await;
         (srv, format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// #2102: what a stand-in producer saw: (method, uri, JSON body).
+    type Seen2102 = Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    /// #2102: a stand-in AMF or UDM. A subscribe is answered 201 after
+    /// `post_delay`, with a Location and the body it took (the expiry it asked
+    /// for, confirmed); a PATCH with `patch` as it stands, echoing the expiry the
+    /// patch set.
+    async fn producer_2102(
+        producer: SouthboundProducer,
+        post_delay: Duration,
+        patch: Arc<std::sync::atomic::AtomicU16>,
+    ) -> (nextgcore_sbi::server::SbiServer, String, Seen2102) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Seen2102 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                let patch = patch.load(Ordering::SeqCst);
+                async move {
+                    let body: serde_json::Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    sink.lock().unwrap().push((
+                        req.header.method.clone(),
+                        req.header.uri.clone(),
+                        body.clone(),
+                    ));
+                    match (req.header.method.as_str(), producer) {
+                        ("PATCH", SouthboundProducer::Amf) => {
+                            let expiry = body[0]["value"].clone();
+                            SbiResponse::with_status(patch)
+                                .with_json_body(&serde_json::json!({
+                                    "subscription": { "options": { "expiry": expiry } }
+                                }))
+                                .expect("json")
+                        }
+                        ("PATCH", SouthboundProducer::Udm) => SbiResponse::with_status(patch),
+                        ("POST", SouthboundProducer::Amf) => {
+                            tokio::time::sleep(post_delay).await;
+                            SbiResponse::with_status(201)
+                                .with_header("location", "/namf-evts/v1/subscriptions/s-2102")
+                                .with_json_body(&serde_json::json!({
+                                    "subscription": body["subscription"].clone(),
+                                    "subscriptionId": "s-2102"
+                                }))
+                                .expect("json")
+                        }
+                        ("POST", SouthboundProducer::Udm) => {
+                            tokio::time::sleep(post_delay).await;
+                            SbiResponse::with_status(201)
+                                .with_header(
+                                    "location",
+                                    "/nudm-ee/v1/imsi-001010000002102/ee-subscriptions/ee-2102",
+                                )
+                                .with_json_body(&body)
+                                .expect("json")
+                        }
+                        _ => SbiResponse::with_status(204),
+                    }
+                }
+            })
+            .await;
+        (srv, format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    fn requests_2102(seen: &Seen2102, method: &str) -> Vec<(String, serde_json::Value)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _, _)| m == method)
+            .map(|(_, u, b)| (u.clone(), b.clone()))
+            .collect()
+    }
+
+    fn epoch_2102(v: &serde_json::Value) -> u64 {
+        nextgcore_sbi::datetime::rfc3339_to_epoch(v.as_str().expect("an RFC 3339 expiry"))
+            .expect("a parsable expiry")
+    }
+
+    /// #2102 (split out of #2086): a create whose 3 s request timeout fires after
+    /// the AMF took the subscription leaves an orphan the NEF cannot name. It is
+    /// bounded: the subscribe asked for an expiry one lifetime ahead
+    /// (`subscription.options.expiry`), the NEF holds no record of it, and no
+    /// refresh sweep -- even one run just before that expiry -- ever extends it,
+    /// so it lapses at the AMF on its own.
+    ///
+    /// REVERT-VERIFIED: with `with_requested_expiry` returning the body as built,
+    /// the subscribe carries no expiry and this test fails (as does the live-leg
+    /// test, at "the expiry asked for is the one recorded").
+    #[test]
+    fn a_timed_out_creates_orphan_is_bounded_and_never_refreshed_2102() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let (amf, amf_uri, seen) = producer_2102(
+                SouthboundProducer::Amf,
+                Duration::from_millis(SOUTHBOUND_REQUEST_TIMEOUT_SECS * 1000 + 500),
+                Arc::new(std::sync::atomic::AtomicU16::new(200)),
+            )
+            .await;
+            set_producers(Some(&amf_uri), None);
+            let before = now_unix_secs();
+            let resp = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            let after = now_unix_secs();
+            // Let the AMF finish taking it (the orphan now exists there).
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let held = nef_self().read().unwrap().subscription_count();
+            let posts = requests_2102(&seen, "POST");
+            let asked = posts
+                .first()
+                .and_then(|(_, b)| b.pointer("/subscription/options/expiry").cloned());
+            let lifetime = southbound_lifetime_secs();
+            let mut sweeps = Vec::new();
+            if let Some(expiry) = asked.as_ref().map(epoch_2102) {
+                for now in [after, expiry.saturating_sub(1)] {
+                    sweeps.push(refresh_live_subscriptions_at(now).await);
+                }
+            }
+            let patches = requests_2102(&seen, "PATCH");
+            amf.stop().await.ok();
+
+            assert_eq!(resp.status, 503, "{:?}", resp.http.content);
+            assert_eq!(held, 0, "the NEF holds no record of the orphan");
+            assert_eq!(posts.len(), 1);
+            let asked = asked.expect("the subscribe asked for an expiry");
+            assert_eq!(
+                posts[0].1.pointer("/subscription/options/trigger"),
+                Some(&serde_json::json!("CONTINUOUS"))
+            );
+            let expiry = epoch_2102(&asked);
+            assert!(
+                (before + lifetime..=after + lifetime).contains(&expiry),
+                "one lifetime ahead: {expiry} vs {before}+{lifetime}"
+            );
+            assert!(
+                sweeps.iter().all(|r| *r == RefreshReport::default()),
+                "{sweeps:?}"
+            );
+            assert!(
+                patches.is_empty(),
+                "the orphan is never refreshed: {patches:?}"
+            );
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2102: a live leg, AMF and UDM, is made with an expiry and refreshed
+    /// before it lapses, by the spec modification: the AMF's
+    /// AmfUpdateEventOptionItem `replace /options/expiry`, the UDM's PatchItem on
+    /// `reportingOptions`. Not before it is due (more than half its lifetime
+    /// left). The new expiry is recorded. A producer answering a refresh 404
+    /// no longer holds it, so the subscription is removed. A leg whose expiry
+    /// passed before any refresh got through is removed, and its DELETE is sent
+    /// in case the producer ignored the expiry.
+    ///
+    /// REVERT-VERIFIED: with `refresh_live_subscriptions_at` skipping every leg,
+    /// no PATCH is sent and the `refreshed when due` assertion fails; with the
+    /// 404 arm counted as a failure, the 404 sweep lapses nothing and its
+    /// `lapsed` assertion fails.
+    #[test]
+    fn a_live_leg_is_refreshed_before_it_lapses_2102() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        for producer in [SouthboundProducer::Amf, SouthboundProducer::Udm] {
+            reset_context();
+            block_on(async {
+                let patch_status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+                let (srv, uri, seen) =
+                    producer_2102(producer, Duration::ZERO, patch_status.clone()).await;
+                let body = match producer {
+                    SouthboundProducer::Amf => {
+                        set_producers(Some(&uri), None);
+                        valid_monitoring_body()
+                    }
+                    SouthboundProducer::Udm => {
+                        set_producers(None, Some(&uri));
+                        serde_json::json!({
+                            "monitoringType": "LOSS_OF_CONNECTIVITY",
+                            "notificationDestination": "http://af.example.com:8080/notifications",
+                            "supi": "imsi-001010000002102",
+                        })
+                    }
+                };
+                let before = now_unix_secs();
+                let resp = handle_monitoring_subscription_create(
+                    "af1",
+                    &monitoring_request(body),
+                    NorthboundApi::T8MonitoringEvent,
+                )
+                .await;
+                assert_eq!(resp.status, 201, "{producer:?}: {:?}", resp.http.content);
+                let id = created_subscription_id(&resp).expect("id");
+                let stored = || nef_self().read().unwrap().subscription_find(&id);
+                let (lifetime, margin) =
+                    (southbound_lifetime_secs(), southbound_refresh_margin_secs());
+                let e0 = stored()
+                    .and_then(|s| s.southbound_expiry)
+                    .expect("an expiry");
+                assert!(e0 >= before + lifetime, "{producer:?}: {e0}");
+                let asked = match producer {
+                    SouthboundProducer::Amf => "/subscription/options/expiry",
+                    SouthboundProducer::Udm => "/reportingOptions/expiry",
+                };
+                let posts = requests_2102(&seen, "POST");
+                assert_eq!(
+                    posts[0].1.pointer(asked).map(epoch_2102),
+                    Some(e0),
+                    "{producer:?}: the expiry asked for is the one recorded"
+                );
+
+                // Not due yet.
+                let early = refresh_live_subscriptions_at(e0 - margin - 1).await;
+                assert_eq!(early, RefreshReport::default(), "{producer:?}");
+                assert!(requests_2102(&seen, "PATCH").is_empty(), "{producer:?}");
+
+                // Due: refreshed one lifetime past the sweep.
+                let due = e0 - margin;
+                let report = refresh_live_subscriptions_at(due).await;
+                let patches = requests_2102(&seen, "PATCH");
+                assert_eq!(report.refreshed, 1, "{producer:?}: refreshed when due");
+                assert_eq!(patches.len(), 1, "{producer:?}");
+                let (path, patch) = &patches[0];
+                let e1 = due + lifetime;
+                let at = serde_json::json!(nextgcore_sbi::datetime::epoch_to_rfc3339(e1));
+                match producer {
+                    SouthboundProducer::Amf => {
+                        assert!(
+                            path.ends_with("/namf-evts/v1/subscriptions/s-2102"),
+                            "{path}"
+                        );
+                        assert_eq!(
+                            patch,
+                            &serde_json::json!([
+                                { "op": "replace", "path": "/options/expiry", "value": at }
+                            ])
+                        );
+                    }
+                    SouthboundProducer::Udm => {
+                        assert!(path.ends_with("/ee-subscriptions/ee-2102"), "{path}");
+                        assert_eq!(
+                            patch,
+                            &serde_json::json!([{
+                                "op": "add", "path": "/reportingOptions",
+                                "value": { "expiry": at }
+                            }])
+                        );
+                    }
+                }
+                assert_eq!(stored().and_then(|s| s.southbound_expiry), Some(e1));
+
+                // A 404 on refresh: the producer no longer holds it.
+                patch_status.store(404, Ordering::SeqCst);
+                let gone = refresh_live_subscriptions_at(e1 - margin).await;
+                assert_eq!(gone.lapsed, 1, "{producer:?}");
+                assert!(stored().is_none(), "{producer:?}: 404 removes it");
+                srv.stop().await.ok();
+            });
+        }
+
+        // An expiry that passed before a refresh got through.
+        reset_context();
+        block_on(async {
+            let (srv, uri, seen) = producer_2102(
+                SouthboundProducer::Amf,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(503)),
+            )
+            .await;
+            set_producers(Some(&uri), None);
+            let resp = handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(valid_monitoring_body()),
+                NorthboundApi::T8MonitoringEvent,
+            )
+            .await;
+            assert_eq!(resp.status, 201);
+            let id = created_subscription_id(&resp).expect("id");
+            let e0 = nef_self()
+                .read()
+                .unwrap()
+                .subscription_find(&id)
+                .and_then(|s| s.southbound_expiry)
+                .expect("expiry");
+            let failed = refresh_live_subscriptions_at(e0 - 1).await;
+            assert_eq!(failed.failed, 1, "a 503 refresh is retried");
+            assert!(nef_self().read().unwrap().subscription_find(&id).is_some());
+            let lapsed = refresh_live_subscriptions_at(e0).await;
+            let deletes = requests_2102(&seen, "DELETE");
+            srv.stop().await.ok();
+            assert_eq!(lapsed.lapsed, 1);
+            assert!(nef_self().read().unwrap().subscription_find(&id).is_none());
+            assert_eq!(deletes.len(), 1, "its DELETE is sent: {deletes:?}");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
+    }
+
+    /// #2102: a leg restored from a snapshot written before #2102 has no
+    /// recorded expiry (`southbound_expiry` defaults to `None`). The first sweep
+    /// refreshes it, which bounds it, and the expiry it obtained survives a
+    /// snapshot round trip.
+    ///
+    /// REVERT-VERIFIED: with `subscriptions_live` sorting but skipping legs with
+    /// no expiry (`filter(.. && s.southbound_expiry.is_some())`), no PATCH is sent
+    /// and the `bounded on the first sweep` assertion fails.
+    #[test]
+    fn a_restored_leg_without_an_expiry_is_bounded_on_the_first_sweep_2102() {
+        let _guard = lock_globals();
+        southbound_reconcile::clear_for_test();
+        reset_context();
+        block_on(async {
+            let (amf, amf_uri, seen) = producer_2102(
+                SouthboundProducer::Amf,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU16::new(200)),
+            )
+            .await;
+            set_producers(Some(&amf_uri), None);
+            let mut legacy = serde_json::to_value(NefMonitoringSubscription::new(
+                "af1",
+                "LOCATION_REPORTING",
+                "http://af.example.com/cb",
+                "{}",
+            ))
+            .expect("serialize");
+            legacy["southbound"] = serde_json::json!({
+                "producer": "Amf",
+                "subscription_id": "s-2102",
+                "delete_path": "/namf-evts/v1/subscriptions/s-2102",
+                "producer_base": amf_uri,
+            });
+            legacy.as_object_mut().unwrap().remove("southbound_expiry");
+            let restored: NefMonitoringSubscription =
+                serde_json::from_value(legacy).expect("a pre-#2102 record restores");
+            assert_eq!(restored.southbound_expiry, None);
+            let id = restored.id.clone();
+            nef_self()
+                .read()
+                .unwrap()
+                .subscription_insert(restored)
+                .expect("insert");
+
+            let now = now_unix_secs();
+            let report = refresh_live_subscriptions_at(now).await;
+            let patches = requests_2102(&seen, "PATCH");
+            amf.stop().await.ok();
+            assert_eq!(report.refreshed, 1, "bounded on the first sweep");
+            assert_eq!(patches.len(), 1);
+            let stored = nef_self().read().unwrap().subscription_find(&id).unwrap();
+            let expiry = now + southbound_lifetime_secs();
+            assert_eq!(stored.southbound_expiry, Some(expiry));
+            let round: NefMonitoringSubscription =
+                serde_json::from_value(serde_json::to_value(&stored).unwrap()).unwrap();
+            assert_eq!(round.southbound_expiry, Some(expiry), "it is persisted");
+        });
+        southbound_reconcile::clear_for_test();
+        reset_context();
     }
 
     fn deletes_1877(seen: &Seen1877) -> usize {
@@ -5711,7 +6307,7 @@ mod southbound_oauth2_1661_tests {
             .await;
 
         assert_eq!(gpsi, None);
-        assert!(!matches!(sub, SouthboundOutcome::Live(_)), "{sub:?}");
+        assert!(!matches!(sub, SouthboundOutcome::Live(..)), "{sub:?}");
         assert_eq!(
             seen.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -5773,12 +6369,12 @@ mod southbound_oauth2_1661_tests {
             .scope(stand_in::oauth2_client_for(nrf_port, NfType::Nef), async {
                 let gpsi = resolve_gpsi_to_supi(Some(udm_uri.clone()), "msisdn-1661").await;
                 let sub = attempt_southbound_subscribe(Some(amf_uri.clone()), &subscribe).await;
-                if let SouthboundOutcome::Live(southbound) = &sub {
+                if let SouthboundOutcome::Live(southbound, _) = &sub {
                     southbound_unsubscribe(Some(amf_uri.clone()), southbound.clone()).await;
                 }
                 let udm_sub =
                     attempt_southbound_subscribe(Some(udm_uri.clone()), &udm_subscribe).await;
-                if let SouthboundOutcome::Live(southbound) = &udm_sub {
+                if let SouthboundOutcome::Live(southbound, _) = &udm_sub {
                     southbound_unsubscribe(Some(udm_uri.clone()), southbound.clone()).await;
                 }
                 (gpsi, sub, udm_sub)
@@ -5787,17 +6383,20 @@ mod southbound_oauth2_1661_tests {
 
         assert_eq!(bare_gpsi, None, "refused 401 without a token");
         assert!(
-            !matches!(bare_sub, SouthboundOutcome::Live(_)),
+            !matches!(bare_sub, SouthboundOutcome::Live(..)),
             "{bare_sub:?}"
         );
         assert!(
-            !matches!(bare_udm_sub, SouthboundOutcome::Live(_)),
+            !matches!(bare_udm_sub, SouthboundOutcome::Live(..)),
             "{bare_udm_sub:?}"
         );
         match udm_sub {
-            SouthboundOutcome::Live(SouthboundRef {
-                subscription_id, ..
-            }) => {
+            SouthboundOutcome::Live(
+                SouthboundRef {
+                    subscription_id, ..
+                },
+                _,
+            ) => {
                 assert_eq!(subscription_id, "ee-1661")
             }
             other => panic!("the tokened UDM subscribe must be live: {other:?}"),
@@ -5812,9 +6411,12 @@ mod southbound_oauth2_1661_tests {
         );
         assert_eq!(gpsi.as_deref(), Some("imsi-001010000001661"));
         match sub {
-            SouthboundOutcome::Live(SouthboundRef {
-                subscription_id, ..
-            }) => {
+            SouthboundOutcome::Live(
+                SouthboundRef {
+                    subscription_id, ..
+                },
+                _,
+            ) => {
                 assert_eq!(subscription_id, "s-1661")
             }
             other => panic!("the tokened subscribe must be live: {other:?}"),
