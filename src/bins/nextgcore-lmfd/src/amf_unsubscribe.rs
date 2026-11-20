@@ -329,6 +329,21 @@ pub fn spawn_reconciler() -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// #2104 (R30 on #2111): the shutdown unsubscribe pass, over the live subscriptions
+/// `held` and the parked ones. It runs when EITHER is not empty: an LMF that held
+/// only parked unsubscribes skipped the pass, so their DELETEs were never sent.
+/// `Some((delivered, at most how many were sent))`, or `None` with nothing to send.
+pub async fn unsubscribe_at_shutdown(
+    held: Vec<(DiscoveredAmf, String)>,
+    budget: Duration,
+) -> Option<(usize, usize)> {
+    let total = held.len() + parked_count();
+    if total == 0 {
+        return None;
+    }
+    Some((unsubscribe_all(held, budget).await, total))
+}
+
 /// #2085: at shutdown, unsubscribe every subscription this LMF holds at its AMF,
 /// all at once and within `budget`. amfd's non-UE N2 subscriptions never expire,
 /// so one not unsubscribed here would outlive this LMF for good. Returns how
@@ -567,6 +582,29 @@ mod tests {
         assert_eq!(got, want, "each once");
         assert_eq!(done, 2);
         assert_eq!(left, 0, "taken from the set");
+    }
+
+    /// **#2104** (R30 on #2111): an LMF holding ONLY parked unsubscribes, no live
+    /// subscription, still sends them at shutdown.
+    ///
+    /// REVERT-VERIFIED: with the pass run only when a live subscription is held (as
+    /// main.rs had it), this fails: nothing is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_sends_parked_unsubscribes_with_no_live_one_2104() {
+        let _g = TEST_LOCK.lock().await;
+        clear_for_test();
+        let (_server, amf, seen) = scripted_amf(&[]).await;
+        let parked_only = subscription_path(None, "parked-only-2104");
+        park(&amf, &parked_only);
+
+        let ran = unsubscribe_at_shutdown(Vec::new(), Duration::from_secs(3)).await;
+        let got = seen.lock().unwrap().clone();
+        let nothing = unsubscribe_at_shutdown(Vec::new(), Duration::from_secs(3)).await;
+        clear_for_test();
+
+        assert_eq!(ran, Some((1, 1)), "the pass runs for a parked one alone");
+        assert_eq!(got, vec![parked_only]);
+        assert_eq!(nothing, None, "and not at all with nothing held");
     }
 
     /// **#2104** (R32 on #2098): a pass forgets the backoff of an AMF with nothing

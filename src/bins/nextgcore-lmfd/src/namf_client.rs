@@ -583,7 +583,10 @@ fn subscription_id_from_location(location: &str, expected_prefix: &str) -> Optio
         None => location,
     };
     let id = path.strip_prefix(expected_prefix)?;
-    (!id.is_empty() && !id.contains('/')).then(|| id.to_string())
+    // R30 on #2111: not a dot segment, plain or percent-encoded (RFC 3986 §5.2.4
+    // would resolve it to another resource).
+    let dot_segment = matches!(id, "." | "..") || id.to_ascii_lowercase().contains("%2e");
+    (!id.is_empty() && !id.contains('/') && !dot_segment).then(|| id.to_string())
 }
 
 /// POST the multipart N1N2MessageTransfer to the serving AMF
@@ -1138,6 +1141,9 @@ mod tests {
             "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/s-1/",
             "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/a/b",
             "http://amf",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/..",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/.",
+            "http://amf/namf-comm/v1/non-ue-n2-messages/subscriptions/%2E%2E",
         ] {
             assert_eq!(id(refused, &non_ue), None, "{refused}");
         }
