@@ -15598,11 +15598,13 @@ mod tests_shipped_nf_set_allowlist_2052 {
             "the derived entry follows amf.config.amfId and global.plmn: {nrf}"
         );
 
-        // An operator's list replaces the derived entry.
+        // An operator's list replaces the derived entry. #2069: under production
+        // every entry names its NF instances (an id-less one fails the render).
         let explicit = format!(
             "nrf.nfSetAllowlist=[{{\"nf_set_id\":\"SET001.region02.amfset.5gc.mnc070.mcc999\",\
              \"nf_types\":[\"AMF\"],\"nf_instance_ids\":[\"{amf_id}\"]}},\
-             {{\"nf_set_id\":\"set1.pcfset.5gc.mnc070.mcc999\",\"nf_types\":[\"PCF\"]}}]"
+             {{\"nf_set_id\":\"set1.pcfset.5gc.mnc070.mcc999\",\"nf_types\":[\"PCF\"],\
+             \"nf_instance_ids\":[\"6b1d7e3c-0000-4000-8000-000000000cf0\"]}}]"
         );
         let rendered = helm_render::render_chart_with(
             &root,

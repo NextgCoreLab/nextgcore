@@ -292,7 +292,7 @@ data:
         # is not rendered, so the listener verifies Bearer tokens against the
         # NRF's JWKS (TS 33.501 §13.4.1) like the production profile's other NFs.
         oauth2:
-          require: {{ ne (.Values.global.sbiProfile | default "dev") "production" | ternary "false" "true" }}
+          require: {{ ne (include "nextgcore.sbiProfile" .) "production" | ternary "false" "true" }}
 
   bsf.yaml: |
     logger:

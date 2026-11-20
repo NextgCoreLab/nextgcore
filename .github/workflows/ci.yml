@@ -439,6 +439,16 @@ jobs:
           refuse 'admits no AMF' \
             --set-json 'nrf.nfSetAllowlist=[{"nf_set_id":"set002.region02.amfset.5gc.mnc070.mcc999"}]'
           refuse 'nf_set_id must be a non-empty' --set-json 'nrf.nfSetAllowlist=[{"nf_types":["AMF"]}]'
+          # #2069 (R32's #2064 minors): an id-less entry under production, and
+          # an unknown profile.
+          refuse 'names no nf_instance_ids' --set global.sbiProfile=production \
+            --set-json 'nrf.nfSetAllowlist=[{"nf_set_id":"set001.region02.amfset.5gc.mnc070.mcc999","nf_types":["AMF"]}]'
+          refuse 'is not a profile' --set global.sbiProfile=prd
+          # An alias of production drops the NSSF's opt-out too.
+          if helm template t deploy/helm/nextgcore --set global.siteId=ci --set global.sbiProfile=prod \
+              | grep -q 'require: false'; then
+            echo "global.sbiProfile=prod renders an oauth2 opt-out (#2069)"; exit 1
+          fi
           refuse 'an AMF Set ID is an integer 0-1023' --set amf.config.amfId.set=1024
       - name: helm template quotes global.plmn and refuses a numeric or malformed one (#2069)
         run: |

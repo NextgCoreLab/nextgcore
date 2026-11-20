@@ -508,6 +508,25 @@ The GUAMI is the one amf.yaml renders: global.plmn and amf.config.amfId.
 {{- end -}}
 
 {{/*
+#2069 (R32's #2064 minor 1): global.sbiProfile, normalised as the NFs read it
+(nextgcore_sbi::security::SbiProfile::from_env_value): "dev" for dev,
+development, insecure, local or test; "production" for production or prod,
+any case, trimmed. Any other value fails the render: the NFs would run it as
+production while a chart branch on the raw value (the NSSF's OAuth2 opt-out)
+would take it as dev.
+*/}}
+{{- define "nextgcore.sbiProfile" -}}
+{{- $raw := .Values.global.sbiProfile | default "dev" | toString | trim | lower -}}
+{{- if has $raw (list "dev" "development" "insecure" "local" "test") -}}
+dev
+{{- else if has $raw (list "production" "prod") -}}
+production
+{{- else -}}
+{{- fail (printf "global.sbiProfile=%q is not a profile: use production (or prod) or dev (or development, insecure, local, test)" (toString .Values.global.sbiProfile)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 #2052: nrf.nf_set_allowlist (#1719, #2035), as a YAML list, or nothing.
 
 nrf.nfSetAllowlist set (a list): that list, verbatim, in place of the derived
@@ -538,6 +557,9 @@ NRF then has no allowlist, as before #2052).
 {{- if and (hasKey $e $k) (not (kindIs "slice" (get $e $k))) -}}
 {{- fail (printf "nrf.nfSetAllowlist[%d].%s must be a list" $i $k) -}}
 {{- end -}}
+{{- end -}}
+{{- if and (eq (include "nextgcore.sbiProfile" $) "production") (not $e.nf_instance_ids) -}}
+{{- fail (printf "nrf.nfSetAllowlist[%d] (%s) names no nf_instance_ids: under global.sbiProfile=production an entry must name the NF instances that may claim its set, or any certificate of its type could (#2069)" $i $e.nf_set_id) -}}
 {{- end -}}
 {{- end -}}
 {{- if $.Values.amf.enabled -}}

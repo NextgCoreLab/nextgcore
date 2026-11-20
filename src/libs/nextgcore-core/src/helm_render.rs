@@ -28,6 +28,13 @@ pub fn render_chart(repo_root: &Path) -> Option<String> {
 /// [`HELM_RENDERED_ENV`] names one render, of the default values only. `None`
 /// when helm is not installed and [`HELM_REQUIRED_ENV`] is unset.
 pub fn render_chart_with(repo_root: &Path, extra: &[&str]) -> Option<String> {
+    try_render_chart_with(repo_root, extra)
+        .map(|r| r.unwrap_or_else(|stderr| panic!("helm template failed: {stderr}")))
+}
+
+/// #2069: [`render_chart_with`], but a failed render is `Some(Err(stderr))`
+/// rather than a panic, for the values the chart must refuse.
+pub fn try_render_chart_with(repo_root: &Path, extra: &[&str]) -> Option<Result<String, String>> {
     let out = match Command::new("helm")
         .arg("template")
         .arg("t")
@@ -47,12 +54,12 @@ pub fn render_chart_with(repo_root: &Path, extra: &[&str]) -> Option<String> {
         }
         Err(e) => panic!("helm template: {e}"),
     };
-    assert!(
-        out.status.success(),
-        "helm template failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8(out.stdout).expect("helm template output is UTF-8"))
+    if !out.status.success() {
+        return Some(Err(String::from_utf8_lossy(&out.stderr).into_owned()));
+    }
+    Some(Ok(
+        String::from_utf8(out.stdout).expect("helm template output is UTF-8")
+    ))
 }
 
 /// The env var `name` of container `container` in the rendered Deployment
@@ -272,6 +279,72 @@ mod tests {
     /// REVERT-VERIFIED: with configmap.yaml's `nextgcore.plmnId` include put
     /// back to the unquoted `mcc: {{ .Values.global.plmn.mcc }}` (and mnc), the
     /// "carries the exact digits ..., quoted" assertion fails (`mcc: 001`).
+    /// #2069 (R32's #2064 minors): `global.sbiProfile` is read as the NFs read
+    /// it, so an alias of production (`prod`, any case) also drops the NSSF's
+    /// OAuth2 opt-out and reaches every NF as `production`; an unknown value
+    /// fails the render. Under production an `nrf.nfSetAllowlist` entry must
+    /// name its NF instances.
+    ///
+    /// REVERT-VERIFIED: with the NSSF branch on the raw value, "prod renders
+    /// the NSSF opt-out" fails; without the production id check, "an id-less
+    /// entry is refused under production" fails.
+    #[test]
+    fn profile_aliases_and_id_less_allowlist_entries_2069() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for alias in ["prod", "PROD", " Production "] {
+            let set = format!("global.sbiProfile={alias}");
+            let Some(r) = super::try_render_chart_with(&root, &["--set-string", &set]) else {
+                return;
+            };
+            let rendered = r.unwrap_or_else(|e| panic!("{alias:?} renders: {e}"));
+            let nssf = super::config_in(&rendered, "nssf.yaml").expect("nssf.yaml");
+            let nssf: serde_yaml::Value = serde_yaml::from_str(&nssf).unwrap();
+            assert_eq!(
+                nssf["nssf"]["sbi"]["oauth2"]["require"],
+                serde_yaml::Value::Bool(true),
+                "{alias:?}: prod renders the NSSF opt-out"
+            );
+            assert!(
+                !rendered.contains(&format!("value: {:?}", alias)),
+                "{alias:?} reaches an NF unnormalised"
+            );
+        }
+        for (args, want) in [
+            (
+                vec!["--set-string", "global.sbiProfile=prd"],
+                "is not a profile",
+            ),
+            (
+                vec![
+                    "--set-string",
+                    "global.sbiProfile=production",
+                    "--set-json",
+                    r#"nrf.nfSetAllowlist=[{"nf_set_id":"set001.region02.amfset.5gc.mnc070.mcc999","nf_types":["AMF"]}]"#,
+                ],
+                "names no nf_instance_ids",
+            ),
+        ] {
+            let Some(r) = super::try_render_chart_with(&root, &args) else {
+                return;
+            };
+            match r {
+                Ok(_) => panic!("{args:?}: an id-less entry is refused under production"),
+                Err(e) => assert!(e.contains(want), "{args:?}: failed for another reason: {e}"),
+            }
+        }
+        // Dev keeps accepting the id-less entry (it enforces the set, not the ids).
+        let dev = super::try_render_chart_with(
+            &root,
+            &[
+                "--set-json",
+                r#"nrf.nfSetAllowlist=[{"nf_set_id":"set001.region02.amfset.5gc.mnc070.mcc999","nf_types":["AMF"]}]"#,
+            ],
+        );
+        if let Some(r) = dev {
+            r.expect("dev renders an id-less entry");
+        }
+    }
+
     #[test]
     fn every_rendered_config_carries_the_plmn_digits_quoted_2069() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
