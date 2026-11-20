@@ -9,7 +9,7 @@
 
 use crate::aper_golden::{amf_ue_ngap_id, pdu, ran_ue_ngap_id, Bits};
 use crate::ngap_asn1::IeDiagnostic;
-use nextgcore_ngap::types as t;
+use crate::ngap_types as t;
 
 /// The root of each Cause group's `ENUMERATED`, read off the V17.9 ASN.1
 /// lists (§9.3.1.2): radioNetwork 45 (`unspecified` ..

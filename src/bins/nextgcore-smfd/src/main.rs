@@ -31021,8 +31021,8 @@ mod tests {
             .expect("HANDOVER_PREP_FAIL n2SmInfo");
         assert_eq!(
             nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
-            Some(nextgcore_ngap::types::Cause::RadioNetwork(
-                nextgcore_ngap::types::CauseRadioNetwork::RadioResourcesNotAvailable
+            Some(nextgcore_amfd::ngap_types::Cause::RadioNetwork(
+                nextgcore_amfd::ngap_types::CauseRadioNetwork::RadioResourcesNotAvailable
             )),
             "the target's cause"
         );
@@ -38642,8 +38642,8 @@ mod path_switch_ack_tests {
             .expect("HANDOVER_PREP_FAIL n2SmInfo");
         assert_eq!(
             nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
-            Some(nextgcore_ngap::types::Cause::RadioNetwork(
-                nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+            Some(nextgcore_amfd::ngap_types::Cause::RadioNetwork(
+                nextgcore_amfd::ngap_types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
             ))
         );
 

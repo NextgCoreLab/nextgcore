@@ -151,11 +151,11 @@ pub(crate) fn write_replace_warning_response(
 
 // ---------------------------------------------------------------------------
 // UE-associated stand-ins (#417 stage B3.3b). These take amfd's NGAP domain
-// values (`nextgcore_ngap::types`, which move into amfd in stage B3.1) and
+// values (`crate::ngap_types`, moved into amfd by stage B3.1) and
 // derive the bytes themselves; no hand-written builder is involved.
 // ---------------------------------------------------------------------------
 
-use nextgcore_ngap::types as t;
+use crate::ngap_types as t;
 
 /// A Cause (§9.3.1.2): CHOICE of six (not extensible) in three bits, then the
 /// group ENUMERATED's extension bit `0` and its root index in the fewest bits

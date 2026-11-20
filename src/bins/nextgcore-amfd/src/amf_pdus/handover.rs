@@ -21,7 +21,7 @@
 
 use crate::aper_golden::{amf_ue_ngap_id, pdu, ran_ue_ngap_id, Bits};
 use crate::ngap_asn1::IeDiagnostic;
-use nextgcore_ngap::types as t;
+use crate::ngap_types as t;
 use nextgcore_ngap_gen::generated as g;
 
 /// The vendored V17.9.0 module the generated codec compiles.
