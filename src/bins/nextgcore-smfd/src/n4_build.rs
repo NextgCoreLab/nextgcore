@@ -1170,6 +1170,51 @@ pub struct SessionModificationParams {
         u8,
         Vec<nextgcore_pfcp::qos_monitoring::QosMonitoringPerQosFlowControlInformation>,
     )>,
+    /// #2208: Update PDRs carrying only Transport Delay Reporting (IE 271, TS
+    /// 29.244 Table 7.5.4.2-1, "present if Transport Delay Reporting is to be
+    /// activated or deactivated"): `Some` activates it with that preceding UL
+    /// GTP-U peer, `None` deactivates it (the IE with no value).
+    pub update_pdr_transport_delay: Vec<(
+        u16,
+        Option<nextgcore_pfcp::qos_monitoring::TransportDelayReporting>,
+    )>,
+}
+
+/// The Remote GTP-U Peer (TS 29.244 §8.2.70) of GTP-U peer `ip`, by address only.
+pub fn remote_gtpu_peer(ip: std::net::IpAddr) -> nextgcore_pfcp::types::RemoteGtpUPeer {
+    let mut p = nextgcore_pfcp::types::RemoteGtpUPeer::default();
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => p.ipv4 = Some(v4.octets()),
+        std::net::IpAddr::V6(v6) => p.ipv6 = Some(v6.octets()),
+    }
+    p
+}
+
+/// An Update PDR (TS 29.244 Table 7.5.4.2-1) with the PDR ID and Transport Delay
+/// Reporting only (#2208): the IE 271 of `tdr`, or an IE 271 with no value to
+/// deactivate it.
+pub fn build_update_pdr_transport_delay(
+    pdr_id: u16,
+    tdr: Option<&nextgcore_pfcp::qos_monitoring::TransportDelayReporting>,
+) -> Vec<u8> {
+    use nextgcore_pfcp::qos_monitoring::TypedIe;
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_pdr_id(pdr_id);
+    let mut body = builder.build();
+    match tdr {
+        Some(t) => {
+            let mut v = bytes::BytesMut::new();
+            t.encode_ie(&mut v);
+            body.extend_from_slice(&v);
+        }
+        None => {
+            body.extend_from_slice(
+                &(nextgcore_pfcp::ie::IeType::TransportDelayReporting as u16).to_be_bytes(),
+            );
+            body.extend_from_slice(&0u16.to_be_bytes());
+        }
+    }
+    body
 }
 
 /// Build PFCP Session Modification Request
@@ -1201,6 +1246,13 @@ pub fn build_session_modification_request(params: &SessionModificationParams) ->
 
     for pdr in &params.replace_pdrs {
         builder.add_tlv(pfcp_ie::UPDATE_PDR, &build_create_pdr(pdr));
+    }
+
+    for (pdr_id, tdr) in &params.update_pdr_transport_delay {
+        builder.add_tlv(
+            pfcp_ie::UPDATE_PDR,
+            &build_update_pdr_transport_delay(*pdr_id, tdr.as_ref()),
+        );
     }
 
     // Remove PDRs

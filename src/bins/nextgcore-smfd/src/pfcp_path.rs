@@ -1564,6 +1564,10 @@ impl PfcpClient {
         let (result, generation) = self.request_on(msg_type, upf_seid, body).await;
         if let Ok((_, response)) = &result {
             crate::up_path::note_session_request(smf_seid, msg_type, body, response);
+            // #2208: the PSA's Transport Delay Reporting follows its access peer.
+            if msg_type != pfcp_message_type::SESSION_DELETION_REQUEST {
+                crate::qos_mon::on_session_request(smf_seid);
+            }
             // #966 review M1, TS 29.244 §8.2.1 cause 72 "No established PFCP
             // Association": the UP function holds no association with this CP function,
             // so none of its sessions either. A UPF that restarted after the Association

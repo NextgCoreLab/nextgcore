@@ -17,7 +17,7 @@ NextGCore is a Rust implementation of a 5G/LTE mobile core network, derived from
 
 Since 0.1.0 (2026-07-02); see [CHANGELOG.md](CHANGELOG.md) for the full list.
 
-- **Generated codecs.** NGAP, S1AP, NRPPa and LPP traffic in amfd, smfd, mbsmfd, mmed and lmfd is encoded and decoded by codecs generated from the 3GPP ASN.1, pinned to NextgCoreLab/asn1-codegen v0.1.0. The hand-written S1AP, NRPPa, LPP, E1AP, F1AP and XnAP codecs are deleted. The hand-written NGAP crates (`nextgcore-ngap` and the `nextgcore-asn1c` APER engine under it) are still in the tree; deleting them is tracked in #417.
+- **Generated codecs.** NGAP, S1AP, NRPPa and LPP traffic in amfd, smfd, mbsmfd, mmed and lmfd is encoded and decoded by codecs generated from the 3GPP ASN.1, pinned to NextgCoreLab/asn1-codegen v0.1.0. The hand-written S1AP, NRPPa, LPP, E1AP, F1AP and XnAP codecs are deleted. The hand-written NGAP crates (`nextgcore-ngap` and its `nextgcore-asn1c` APER engine) are deleted too (#417); amfd's NGAP domain values live in `ngap_types.rs`.
 - **A real LTE attach.** The EPC stage attaches nextgsim's LTE UE through its eNB to mmed, with SGW-C/SGW-U and a PGW-C/PGW-U (`smfd`/`upfd` in their EPC roles), and pings through the default bearer.
 - **Paging and Service Request.** CM-IDLE UEs are paged on downlink data, and a Service Request from CM-IDLE or CM-CONNECTED re-activates the user plane.
 - **EPS-5GS interworking over N26.** Idle-mode context transfer and connected-mode handover in both directions (Forward Relocation, Relocation Cancel, data-forwarding tunnels), with the AMF and the MME each as source and target. Off by default: set `AMF_N26_INTERWORKING` / `MME_N26_INTERWORKING`. The nightly E2E does not run a handover yet.

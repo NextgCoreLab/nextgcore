@@ -12788,9 +12788,9 @@ pub(crate) mod tests {
     }
 
     /// #418: the EPS→5GS HandoverRequest, against TS 38.413 §9.2.3.4 and TS 33.501 §8.4.2
-    /// step 4, decoded by an INDEPENDENT codec — `nextgcore-ngap`'s hand-written parser —
-    /// for every IE it models, and by the generated decoder for the two it has no member
-    /// for (NSCI and NASC). An encoder checked only against its own decoder proves nothing
+    /// step 4, checked against an INDEPENDENT half — octets derived by hand from the
+    /// ASN.1 (#417 B3.3; this was the hand-written parser until that crate was
+    /// deleted) — and by the generated decoder. An encoder checked only against its own decoder proves nothing
     /// about the wire (the S1AP lesson of #455).
     #[test]
     fn the_eps_to_5gs_handover_request_carries_ts33501_8_4_2_step_4() {
@@ -13485,6 +13485,107 @@ pub(crate) mod tests {
             panic!("decodes");
         };
         assert_eq!(message.rrc_establishment_cause, 11);
+    }
+
+    /// nextgsim's gNB InitialUEMessage on the wire, without and with AllowedNSSAI
+    /// (IE 0, criticality reject), produced by `nextgsim-ngap`'s own encoder with
+    /// the deployed gNB's parameters (PLMN 999-70, TAC 1, NR cell identity 0x10,
+    /// RAN UE NGAP ID 1, a 23-octet Registration Request stand-in). The 76-octet
+    /// one is the live regression the hand-written parser had: no arm for IE 0,
+    /// so its reject criticality failed the PDU and no UE could attach. The same
+    /// captures are in `nextgcore-ngap-gen`'s tests (round trip only).
+    const SIM_INITIAL_UE: &str = "000f404200000500550002000100260018177e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e0079000f4099f907000000010099f907000001005a4001180070400100";
+    const SIM_INITIAL_UE_WITH_ALLOWED_NSSAI: &str = "000f404800000600550002000100260018177e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e0079000f4099f907000000010099f907000001005a4001180070400100000000020001";
+
+    /// #417 R47 minor 4: the production decoder reads a real gNB's captures to
+    /// their values, not only derived vectors: RAN UE NGAP ID 1, the 23-octet
+    /// NAS PDU, the NR ULI (PLMN 999-70, NCI 0x10, TAC 1), mo-Signalling and
+    /// UEContextRequest. AllowedNSSAI (SST 1) is comprehended, so it neither
+    /// stops the message nor is reported, and the mandatory IEs decode the
+    /// same with and without it. Ported from the deleted
+    /// `decode_sim_initial_ue.rs`, which read them with the hand-written parser.
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    #[test]
+    fn the_nextgsim_initial_ue_captures_decode_to_their_values() {
+        let unhex = |hex: &str| -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let mut decoded = Vec::new();
+        for (capture, len) in [
+            (SIM_INITIAL_UE, 70),
+            (SIM_INITIAL_UE_WITH_ALLOWED_NSSAI, 76),
+        ] {
+            let bytes = unhex(capture);
+            assert_eq!(bytes.len(), len, "the observed wire length");
+            let NasTransportDecode::Proceed {
+                message,
+                error_indication: None,
+            } = decode_initial_ue_message_asn1(&bytes)
+            else {
+                panic!("the gNB's {len}-octet InitialUEMessage is delivered, unreported");
+            };
+            assert_eq!(message.ran_ue_ngap_id, 1);
+            assert_eq!(message.nas_pdu, [0x7e; 23], "the 23-octet NAS PDU survives");
+            assert_eq!(
+                message.plmn_id,
+                PlmnId::new("999", "70"),
+                "NR-CGI PLMN 999-70"
+            );
+            // nrCellIdentity is the 36 bits `00 00 00 01 0` on the wire.
+            assert_eq!(message.nr_cell_identity, 0x10, "NCI 0x000000010");
+            assert_eq!(message.tac, 1, "TAC 1");
+            assert_eq!(
+                message.rrc_establishment_cause,
+                ngap_gen::RRCEstablishmentCause::MO_SIGNALLING
+            );
+            assert!(message.ue_context_request, "UEContextRequest");
+            decoded.push(message);
+        }
+        let (without, with) = (&decoded[0], &decoded[1]);
+        assert_eq!(
+            (
+                with.ran_ue_ngap_id,
+                &with.nas_pdu,
+                &with.plmn_id,
+                with.nr_cell_identity,
+                with.tac
+            ),
+            (
+                without.ran_ue_ngap_id,
+                &without.nas_pdu,
+                &without.plmn_id,
+                without.nr_cell_identity,
+                without.tac
+            ),
+            "AllowedNSSAI does not shift the mandatory IEs"
+        );
+
+        // amfd takes the slices from the NAS, so the decoder does not surface
+        // AllowedNSSAI; the generated decode it runs on reads it as SST 1.
+        let pdu =
+            nextgcore_ngap_gen::decode(&unhex(SIM_INITIAL_UE_WITH_ALLOWED_NSSAI)).expect("decodes");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+            value: ngap_gen::InitiatingMessageValue::Id_InitialUEMessage(msg),
+            ..
+        }) = pdu
+        else {
+            panic!("an InitialUEMessage");
+        };
+        let sst: Vec<Vec<u8>> = msg
+            .protocol_i_es
+            .0
+            .into_iter()
+            .filter_map(|e| match e.value {
+                ngap_gen::InitialUEMessageProtocolIEs_EntryValue::Id_AllowedNSSAI(a) => Some(a),
+                _ => None,
+            })
+            .flat_map(|a| a.0.into_iter().map(|i| i.s_nssai.sst.0))
+            .collect();
+        assert_eq!(sst, [vec![1u8]], "AllowedNSSAI is one slice, SST 1");
     }
 
     /// §10.3.4.2 and §10.3.5 for the Uplink NAS Transport. Its User Location
@@ -16052,9 +16153,9 @@ mod ue_association_key_tests {
 #[cfg(test)]
 mod object_set_conformance_tests {
     //! #417 stage B3.2: the schema id/criticality check that
-    //! `libs/nextgcore-ngap/tests/builder_conformance.rs` ran against the
+    //! `nextgcore-ngap`'s `builder_conformance` test ran against the
     //! hand-written builders, re-targeted at amfd's production builders before
-    //! that crate is deleted. For each AMF->gNB message, built with its
+    //! that crate was deleted (#417 B4). For each AMF->gNB message, built with its
     //! optional IEs present:
     //!
     //! 1. every IE's (id, criticality) is the pair the message's object set in
