@@ -2131,7 +2131,6 @@ pub async fn refresh_live_subscriptions_with(
     // pass budget, and the clock read afresh for each leg.
     let margin = southbound_refresh_margin_secs();
     let budget = refresh_pass_budget();
-    let started = tokio::time::Instant::now();
     let mut due = Vec::new();
     let mut lapsed: Vec<(String, SouthboundRef)> = Vec::new();
     for (base, legs) in by_producer {
@@ -2197,17 +2196,18 @@ pub async fn refresh_live_subscriptions_with(
     }
     // #2148: the lapsed legs' DELETEs, owed (and persisted) already by
     // `remove_lapsed_leg`. Sent after the refreshes, per producer in the same
-    // bounded sweep, and not to a producer parked in this pass nor once the pass
-    // budget is spent: whatever is not sent stays owed, and the #1877 reconciler
+    // bounded sweep with its own budget, and not to a producer parked in this
+    // pass: whatever is not sent stays owed, and the #1877 reconciler
     // sends it with its backoff.
     let deletes: Vec<(String, SouthboundRef)> = lapsed
         .into_iter()
         .filter(|(base, _)| !parked_producers.contains(base))
         .collect();
-    let limits = nextgcore_sbi::sweep::SweepLimits {
-        budget: budget.saturating_sub(started.elapsed()),
-        ..limits
-    };
+    // #2186 (R44): the DELETEs have a budget of their own (one more tick), not
+    // what the refreshes left: a refresh still in flight at the budget's end
+    // (up to a request timeout past it) would otherwise leave none, deferring
+    // every producer's lapse DELETEs to the reconciler.
+    let limits = nextgcore_sbi::sweep::SweepLimits { budget, ..limits };
     nextgcore_sbi::sweep::sweep(
         limits,
         deletes,

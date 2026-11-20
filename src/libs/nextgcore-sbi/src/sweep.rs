@@ -93,8 +93,9 @@ impl<K, I, R> SweepReport<K, I, R> {
 
 /// Run `work` for every `(peer, item)` of `items` under `limits` (see the
 /// module docs). `clock` is read once per item, just before its work starts,
-/// and the value is handed to the work. Peers are visited in key order, and a
-/// peer's items in the order given.
+/// and the value is handed to the work. Peers START in a randomly rotated key
+/// order each pass (so none is always last); the report lists them in key
+/// order, and a peer's items in the order given.
 ///
 /// A panic in `work` is resumed here, after the pass's other tasks are aborted.
 pub async fn sweep<K, I, R, N, C, F, Fut>(
@@ -123,7 +124,23 @@ where
     let work = Arc::new(work);
     let mut peers = JoinSet::new();
     let n_peers = by_peer.len();
-    for (idx, (k, list)) in by_peer.into_iter().enumerate() {
+    // #2186 (R44): the peers start in an order rotated by a random offset each
+    // pass. The global slots are handed out first come first served, so in key
+    // order the same peers would start first in every pass: with enough dead
+    // peers ahead of it, a healthy one would never start before the budget ran
+    // out, pass after pass. Rotated, every peer is first in some pass.
+    let offset = if n_peers == 0 {
+        0
+    } else {
+        use std::hash::{BuildHasher, Hasher};
+        (std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish() as usize)
+            % n_peers
+    };
+    let mut peers_in_order: Vec<(usize, (K, Vec<I>))> = by_peer.into_iter().enumerate().collect();
+    peers_in_order.rotate_left(offset);
+    for (idx, (k, list)) in peers_in_order {
         let (global, clock, work) = (global.clone(), clock.clone(), work.clone());
         peers.spawn(async move {
             let r = peer_pass(k, list, limits, started, global, clock, work).await;

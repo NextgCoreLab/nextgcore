@@ -212,44 +212,439 @@ async fn zero_limits_mean_one() {
     assert_eq!(report.done.len(), 2);
 }
 
-/// The functions that hand-rolled a bounded sweep before #2186 and still hold a
-/// semaphore for a reason that is not a peer sweep, each with that reason.
-const NOT_SWEEPS: &[(&str, &str, &str)] = &[
+/// #2186 (R44): peers start in a rotated order each pass, so with more dead
+/// peers ahead than the budget covers a given peer is still first in some
+/// pass. Here only the first-started peer runs per pass (global 1, budget
+/// shorter than one item); over 30 passes more than one peer gets to run.
+///
+/// REVERT-VERIFIED: with the rotation offset 0 (key order), peer "a" runs in
+/// every pass.
+#[tokio::test(start_paused = true)]
+async fn the_start_order_rotates_between_passes() {
+    let mut first = std::collections::BTreeSet::new();
+    for _ in 0..30 {
+        let report = sweep(
+            limits(1, 1, Duration::from_millis(500)),
+            vec![("a", 0u8), ("b", 0), ("c", 0)],
+            Instant::now,
+            |_, _, _| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                (Verdict::Answered, ())
+            },
+        )
+        .await;
+        assert_eq!(report.done.len(), 1, "one item per pass");
+        first.insert(report.done[0].0);
+    }
+    assert!(first.len() > 1, "always the same peer first: {first:?}");
+}
+
+/// Why a flagged fn is not a hand-rolled peer sweep (or is one still to move).
+const TIMER: &str = "a timer loop that drives a pass; the pass is checked on its own";
+const PROCEDURE: &str = "one request's or one UE's procedure, not a periodic pass over peers";
+const SHUTDOWN: &str =
+    "a shutdown drain that waits, bounded by the shutdown budget, for tasks already in flight";
+const ONE_PEER: &str = "every call goes to one peer, so no peer can hold another back";
+const CONCURRENT: &str =
+    "all calls already run at once on a JoinSet, each bounded by its own timeout";
+const LOCAL: &str = "no remote call per peer in the loop";
+/// Serial reconcilers, each a pass over parked work at many peers, bounded by
+/// `PeerBackoff` but still one at a time: to move onto `sweep` (#2186 follow-up).
+const PENDING: &str = "a serial multi-peer reconciler still to move onto sweep: tracked in #2223";
+
+/// Every production fn the guard flags today, with the reason it is not (yet) a
+/// shared sweep. A NEW flagged fn fails `no_hand_rolled_sweeps_remain`.
+const ALLOWED: &[(&str, &str, &str)] = &[
     (
-        "nextgcore-smfd/src/main.rs",
-        "release_side_effect_permits",
-        "a process-wide fan-out bound for session release side effects, not a pass",
+        "nextgcore-amfd/src/nrf_subscription.rs",
+        "unsubscribe_all",
+        CONCURRENT,
+    ),
+    (
+        "nextgcore-amfd/src/nsac.rs",
+        "a_cancelled_admission_leaves_its_slot_and_parks_what_it_owed_2036",
+        PROCEDURE,
+    ),
+    ("nextgcore-amfd/src/nsac.rs", "reconcile_once", PENDING),
+    ("nextgcore-amfd/src/nsac.rs", "spawn_reconciler", TIMER),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "apply_release_complete",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "handle_ue_context_release",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "offload_release_held_sessions",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "offload_superseded_releases",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "process_pending_source_releases",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "process_release_guards",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "reconcile_update_sessions",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "release_all_pdu_sessions",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "release_ng_connections",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/ngap_path.rs",
+        "send_registration_accept_reconciled",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-amfd/src/sbi_path.rs",
+        "retry_peer_update",
+        ONE_PEER,
+    ),
+    (
+        "nextgcore-eesd/src/ecs_registration.rs",
+        "refresh_once",
+        ONE_PEER,
+    ),
+    (
+        "nextgcore-eesd/src/ecs_registration.rs",
+        "spawn_refresh",
+        TIMER,
+    ),
+    ("nextgcore-eesd/src/main.rs", "spawn_lifecycle_sweep", TIMER),
+    (
+        "nextgcore-hssd/src/s6a_path.rs",
+        "sweep_pending_requests",
+        PENDING,
+    ),
+    (
+        "nextgcore-lmfd/src/amf_unsubscribe.rs",
+        "spawn_reconciler",
+        TIMER,
+    ),
+    (
+        "nextgcore-lmfd/src/amf_unsubscribe.rs",
+        "unsubscribe_all",
+        CONCURRENT,
+    ),
+    (
+        "nextgcore-mbsmfd/src/main.rs",
+        "handle_mbs_session_release",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-mbsmfd/src/main.rs",
+        "release_amf_contexts",
+        PROCEDURE,
+    ),
+    ("nextgcore-mbsmfd/src/main.rs", "release_retries", PROCEDURE),
+    (
+        "nextgcore-mbsmfd/src/reconcile.rs",
+        "reconcile_once",
+        PENDING,
+    ),
+    (
+        "nextgcore-mbsmfd/src/reconcile.rs",
+        "spawn_reconciler",
+        TIMER,
+    ),
+    (
+        "nextgcore-nefd/src/main.rs",
+        "reconcile_pending_subscriptions",
+        PENDING,
+    ),
+    (
+        "nextgcore-nefd/src/southbound_reconcile.rs",
+        "reconcile_once",
+        PENDING,
+    ),
+    (
+        "nextgcore-nefd/src/southbound_reconcile.rs",
+        "spawn_reconciler",
+        TIMER,
+    ),
+    (
+        "nextgcore-nwdafd/src/model_monitor.rs",
+        "subscribe_at_anlf_retrying",
+        ONE_PEER,
+    ),
+    (
+        "nextgcore-pcfd/src/bsf_reconcile.rs",
+        "reconcile_once",
+        PENDING,
+    ),
+    (
+        "nextgcore-pcfd/src/bsf_reconcile.rs",
+        "spawn_reconciler",
+        TIMER,
     ),
     (
         "nextgcore-smfd/src/main.rs",
-        "udm_release_permits",
-        "a process-wide fan-out bound, not a pass",
+        "await_release_in_flight_on",
+        SHUTDOWN,
     ),
     (
         "nextgcore-smfd/src/main.rs",
-        "nsac_release_permits",
-        "a process-wide fan-out bound, not a pass",
+        "drain_release_side_effects",
+        SHUTDOWN,
+    ),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "drain_s5s8_requests",
+        SHUTDOWN,
+    ),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "drain_sm_policy_deletes",
+        SHUTDOWN,
+    ),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "handle_sm_context_release",
+        PROCEDURE,
     ),
     (
         "nextgcore-smfd/src/main.rs",
         "nsac_count_out_unreleased",
-        "a one-shot shutdown count-out bounded by the shutdown budget, not a periodic \
-         pass; left for smfd's owner (#2186 PR)",
+        SHUTDOWN,
+    ),
+    ("nextgcore-smfd/src/main.rs", "nsac_release_permits", LOCAL),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "release_side_effect_permits",
+        LOCAL,
     ),
     (
-        "nextgcore-udmd/src/sdm_udr.rs",
-        "refresh_legs",
-        "every leg is at the one UDR, so no peer can hold another back; its \
-         `Refreshed::Failed` does not tell a dead UDR from a refused leg, which parking \
-         needs (#2186 PR)",
+        "nextgcore-smfd/src/main.rs",
+        "release_side_effects",
+        PROCEDURE,
     ),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "release_udm_cleanup",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "retry_n1n2_after_paging_conflict",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-smfd/src/main.rs",
+        "spawn_release_side_effects_with",
+        PROCEDURE,
+    ),
+    ("nextgcore-smfd/src/main.rs", "udm_release_permits", LOCAL),
+    (
+        "nextgcore-smfd/src/pfcp_path.rs",
+        "drain_restart_fanouts",
+        SHUTDOWN,
+    ),
+    ("nextgcore-smfd/src/qos_mon.rs", "reconcile", LOCAL),
+    ("nextgcore-smfd/src/reconcile.rs", "reconcile_once", PENDING),
+    ("nextgcore-smfd/src/reconcile.rs", "spawn_reconciler", TIMER),
+    (
+        "nextgcore-smfd/src/restoration.rs",
+        "reconcile_session_not_found",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-smfd/src/restoration.rs",
+        "release_epc_pdn_connections_scoped",
+        PROCEDURE,
+    ),
+    (
+        "nextgcore-tsctsf/src/actuation.rs",
+        "delete_with_retry",
+        ONE_PEER,
+    ),
+    (
+        "nextgcore-tsctsf/src/reconcile.rs",
+        "reconcile_once",
+        PENDING,
+    ),
+    (
+        "nextgcore-tsctsf/src/reconcile.rs",
+        "spawn_reconciler",
+        TIMER,
+    ),
+    (
+        "nextgcore-udmd/src/app.rs",
+        "handle_ee_unsubscribe",
+        PROCEDURE,
+    ),
+    ("nextgcore-udmd/src/app.rs", "spawn_ee_expiry_sweep", TIMER),
+    ("nextgcore-udmd/src/ee_amf.rs", "reconcile", PROCEDURE),
+    (
+        "nextgcore-udmd/src/ee_amf.rs",
+        "spawn_unsubscribe_reconciler",
+        TIMER,
+    ),
+    ("nextgcore-udmd/src/sdm_udr.rs", "drain", CONCURRENT),
+    ("nextgcore-udmd/src/sdm_udr.rs", "refresh_legs", ONE_PEER),
+    ("nextgcore-udmd/src/sdm_udr.rs", "spawn_leg_refresh", TIMER),
 ];
 
-/// **#2186, source guard.** No production fn named for a refresh, renew,
-/// release, reconcile, sweep or unsubscribe pass in any `bins/*` crate builds
-/// its own `Semaphore`: such a pass uses [`sweep`]. A new hand-rolled one fails
-/// here; a semaphore that is not a peer sweep goes in [`NOT_SWEEPS`] with its
-/// reason.
+/// The words that name a pass over peers.
+const PASS_WORDS: &[&str] = &[
+    "refresh",
+    "renew",
+    "release",
+    "reconcile",
+    "sweep",
+    "unsubscribe",
+    "drain",
+    "expire",
+    "retry",
+    "owed",
+];
+
+/// The `{...}` block starting at or after `from` in `s`.
+fn block_at(s: &str, from: usize) -> &str {
+    let Some(open) = s[from..].find('{').map(|i| from + i) else {
+        return "";
+    };
+    let mut depth = 0usize;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[open..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    &s[open..]
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether `body` has a `for`, `while` or `loop` whose block awaits.
+fn loop_awaits(body: &str) -> bool {
+    for kw in ["for", "while", "loop"] {
+        for (at, _) in body.match_indices(kw) {
+            let before = body[..at].chars().next_back();
+            let after = body[at + kw.len()..].chars().next();
+            if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+                continue;
+            }
+            if block_at(body, at + kw.len()).contains(".await") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The fns of `src` (production code: cut at `#[cfg(test)] mod tests`) that look
+/// like a hand-rolled pass over peers: named for one ([`PASS_WORDS`]) and
+/// either building a semaphore (`Semaphore::new` / `const_new`) or awaiting
+/// inside a loop, and not running on [`sweep`].
+fn hand_rolled(src: &str) -> Vec<String> {
+    let src = match src.find("\n#[cfg(test)]\nmod tests") {
+        Some(cut) => &src[..cut],
+        None => src,
+    };
+    let heads: Vec<(usize, String)> = src
+        .match_indices("fn ")
+        .filter(|(at, _)| *at == 0 || !src[..*at].ends_with(is_ident))
+        .map(|(at, _)| {
+            let rest = &src[at + 3..];
+            let end = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
+            (at, rest[..end].to_string())
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (i, (at, name)) in heads.iter().enumerate() {
+        if !PASS_WORDS.iter().any(|w| name.contains(w)) {
+            continue;
+        }
+        let end = heads.get(i + 1).map_or(src.len(), |(n, _)| *n);
+        let body = &src[*at..end];
+        let semaphore = body.contains("Semaphore::new(") || body.contains("Semaphore::const_new(");
+        if (semaphore || loop_awaits(body)) && !body.contains("sweep::sweep(") {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// R44's three planted shapes are flagged: the #2155 serial `for ... .await`,
+/// a `drain_*` fn with a semaphore, and `Semaphore::const_new`. A pass on the
+/// shared sweep, and a fn not named for a pass, are not.
+///
+/// REVERT-VERIFIED: with the loop check dropped, the serial shape passes; with
+/// only `Semaphore::new(` matched, `const_new` passes; with the old six words,
+/// `drain_owed_deletes` passes.
+#[test]
+fn the_guard_flags_the_serial_and_bounded_shapes() {
+    let src = r#"
+async fn release_expired_legs(subs: Vec<Sub>) {
+    for sub in &subs {
+        release(sub).await;
+    }
+}
+async fn drain_owed_deletes() {
+    let gate = tokio::sync::Semaphore::new(8);
+    let _ = gate;
+}
+static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+async fn renew_all_legs() {
+    let _ = &GATE;
+    let g = tokio::sync::Semaphore::const_new(4);
+    let _ = g;
+}
+async fn refresh_on_the_sweep(items: Vec<(String, u32)>) {
+    for _ in 0..1 {}
+    nextgcore_sbi::sweep::sweep(limits(), items, || (), |_, _, _| async { todo!() }).await;
+}
+async fn serve_requests(reqs: Vec<Req>) {
+    for r in reqs {
+        answer(r).await;
+    }
+}
+"#;
+    assert_eq!(
+        hand_rolled(src),
+        vec![
+            "release_expired_legs",
+            "drain_owed_deletes",
+            "renew_all_legs"
+        ]
+    );
+}
+
+/// **#2186, source guard.** No production fn named for a pass over peers in any
+/// `bins/*` crate runs it by hand (see [`hand_rolled`]): such a pass uses
+/// [`sweep`]. A fn that is flagged and is not a peer sweep, or is one still to
+/// move, is in [`ALLOWED`] with its reason; an entry that no longer matches
+/// fails too, so the list cannot rot.
 #[test]
 fn no_hand_rolled_sweeps_remain() {
     let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bins");
@@ -271,53 +666,34 @@ fn no_hand_rolled_sweeps_remain() {
             if !name.ends_with(".rs") || name.ends_with("_tests.rs") || name == "tests.rs" {
                 continue;
             }
-            let src = std::fs::read_to_string(&path).unwrap();
-            let src = match src.find("\n#[cfg(test)]\nmod tests") {
-                Some(cut) => &src[..cut],
-                None => &src[..],
-            };
             let rel = path
                 .strip_prefix(&bins)
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            let heads: Vec<(usize, String)> = src
-                .match_indices("fn ")
-                .filter(|(at, _)| *at == 0 || src[..*at].ends_with([' ', '\n']))
-                .map(|(at, _)| {
-                    let rest = &src[at + 3..];
-                    let end = rest
-                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .unwrap_or(rest.len());
-                    (at, rest[..end].to_string())
-                })
-                .collect();
-            for (i, (at, fname)) in heads.iter().enumerate() {
-                let end = heads.get(i + 1).map_or(src.len(), |(n, _)| *n);
-                let body = &src[*at..end];
-                let named = [
-                    "refresh",
-                    "renew",
-                    "release",
-                    "reconcile",
-                    "sweep",
-                    "unsubscribe",
-                ]
-                .iter()
-                .any(|w| fname.contains(w));
-                if named
-                    && body.contains("Semaphore::new(")
-                    && !NOT_SWEEPS
-                        .iter()
-                        .any(|(f, n, _)| *f == rel && *n == fname.as_str())
-                {
-                    found.push(format!("{rel}: fn {fname}"));
-                }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for f in hand_rolled(&src) {
+                found.push((rel.clone(), f));
             }
         }
     }
+    let new: Vec<String> = found
+        .iter()
+        .filter(|(f, n)| !ALLOWED.iter().any(|(af, an, _)| af == f && an == n))
+        .map(|(f, n)| format!("{f}: fn {n}"))
+        .collect();
     assert!(
-        found.is_empty(),
-        "hand-rolled sweeps: use nextgcore_sbi::sweep::sweep (#2186): {found:?}"
+        new.is_empty(),
+        "hand-rolled passes over peers: use nextgcore_sbi::sweep::sweep (#2186), or list \
+         one that is not a peer sweep in ALLOWED with its reason: {new:?}"
+    );
+    let stale: Vec<String> = ALLOWED
+        .iter()
+        .filter(|(af, an, _)| !found.iter().any(|(f, n)| f == af && n == an))
+        .map(|(f, n, _)| format!("{f}: fn {n}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "ALLOWED entries that no longer match: {stale:?}"
     );
 }

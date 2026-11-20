@@ -525,7 +525,7 @@ fn evict_unsubscribes(set: &mut std::collections::VecDeque<ParkedUnsubscribe>) {
 }
 
 /// Park an AMF unsubscribe that failed. One already parked is not added twice.
-fn park_unsubscribe(subscription_uri: &str) {
+pub(crate) fn park_unsubscribe(subscription_uri: &str) {
     let mut set = lock_parked();
     if set.iter().any(|p| p.uri == subscription_uri) {
         return;
@@ -1768,6 +1768,83 @@ mod tests {
         );
         assert!(!still.contains(&live));
         assert_eq!(still.len(), 8, "the dead AMFs' stay parked: {still:?}");
+    }
+
+    /// **#2186** (R44 minor 3): a release sweep dropped mid-pass (shutdown) parks
+    /// every leg it had not settled, the one in flight included, for the
+    /// unsubscribe reconciler: the records are already gone, so nothing else
+    /// would release them.
+    ///
+    /// REVERT-VERIFIED: without `UnsettledLegs`' drop parking them, the legs
+    /// behind the one in flight are lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the UDM state guard, held across the test
+    async fn a_cancelled_release_sweep_parks_what_it_had_not_settled_2186() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_parked_unsubscribes_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::udm_context_init(1024, 4096);
+        AMF_CALL_TIMEOUT_MS.store(2_000, Ordering::Relaxed);
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = hole.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = hole.accept().await {
+                conns.push(c);
+            }
+        });
+        let now = crate::context::now_unix_secs();
+        let mut uris = Vec::new();
+        for n in 0..3 {
+            let uri = format!("http://{addr}/namf-evts/v1/subscriptions/cancel-2186-{n}");
+            let mut sub = UdmEeSubscription::for_ue(
+                "imsi-001010000021860",
+                "http://nef.example.org/ee-notify",
+                json!({
+                    "callbackReference": "http://nef.example.org/ee-notify",
+                    "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}},
+                    "reportingOptions": {
+                        "expiry": nextgcore_sbi::datetime::epoch_to_rfc3339(now - 1)
+                    },
+                })
+                .to_string(),
+            );
+            sub.amf_leg = Some(AmfEeLeg {
+                subscription_uri: uri.clone(),
+                change_token: "t".to_string(),
+                amf_instance_id: Some("amf".to_string()),
+                notify_uri: "http://nef.example.org/ee-notify".to_string(),
+                events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+                expiry: Some(now - 1),
+            });
+            udm_self().read().unwrap().ee_subscription_insert(sub);
+            uris.push(uri);
+        }
+        let pass = crate::app::sweep_expired_ee_subscriptions(now);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), pass)
+                .await
+                .is_err(),
+            "the pass is still in flight when dropped"
+        );
+        // The aborted tasks drop their state on the runtime; give it a moment.
+        let mut parked = 0;
+        for _ in 0..50 {
+            parked = lock_parked()
+                .iter()
+                .filter(|p| uris.contains(&p.uri))
+                .count();
+            if parked == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        clear_parked_unsubscribes_for_test();
+        AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
+        held.abort();
+        assert_eq!(parked, 3, "every unsettled leg is parked");
     }
 
     /// **#2186.** The unsubscribe reconciler runs on the shared sweep: an AMF that

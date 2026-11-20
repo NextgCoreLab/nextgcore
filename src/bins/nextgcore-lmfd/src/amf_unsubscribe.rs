@@ -39,8 +39,11 @@ pub const RECONCILE_PERIOD: Duration = Duration::from_millis(20);
 /// The longest one pass sends for.
 #[cfg(not(test))]
 pub const MAX_PASS: Duration = Duration::from_secs(30);
+/// #2186 (R44 minor 4): 2 s in tests, not 500 ms. The pass budget gates when a
+/// DELETE may START (the shared sweep), and a loaded test host delayed the
+/// first one past 500 ms (2 of 12 suite runs).
 #[cfg(test)]
-pub const MAX_PASS: Duration = Duration::from_millis(500);
+pub const MAX_PASS: Duration = Duration::from_millis(2000);
 
 /// An entry parked this long is given up (`expired`): an AMF that has not
 /// answered for a day is decommissioned, not restarting.
