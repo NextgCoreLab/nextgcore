@@ -401,9 +401,8 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
 
     // Served GUMMEI. Without at least one of these the MME rejects every S1
     // Setup (TS 36.413 §8.7.3.4), which is the headline defect in #157.
-    for entry in mme.gummei.unwrap_or_default() {
-        let Some(plmn_id) = entry.plmn_id.and_then(resolve_plmn_id) else {
-            log::warn!("Ignoring GUMMEI entry with no usable plmn_id");
+    for (index, entry) in mme.gummei.unwrap_or_default().into_iter().enumerate() {
+        let Some(plmn_id) = usable_plmn_id(&format!("mme.gummei[{index}]"), entry.plmn_id) else {
             continue;
         };
         let mme_gid = entry.mme_gid.unwrap_or(0);
@@ -425,9 +424,8 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
 
     // Served TAI, as a TAI0 list (one PLMN, a list of TACs) which is what
     // `find_served_tai` matches against.
-    for entry in mme.tai.unwrap_or_default() {
-        let Some(plmn_id) = entry.plmn_id.and_then(resolve_plmn_id) else {
-            log::warn!("Ignoring TAI entry with no usable plmn_id");
+    for (index, entry) in mme.tai.unwrap_or_default().into_iter().enumerate() {
+        let Some(plmn_id) = usable_plmn_id(&format!("mme.tai[{index}]"), entry.plmn_id) else {
             continue;
         };
         let tac = entry.tac.unwrap_or(0);
@@ -535,24 +533,46 @@ fn apply_fd_conf(ctx: &mut MmeContext, path: &str) {
 /// Default unsecured Diameter port (RFC 6733 §2.1).
 const DIAMETER_PORT: u16 = 3868;
 
-/// Build a `PlmnId` from the YAML `plmn_id` block.
-///
-/// MCC and MNC are accepted as either numbers or strings, because YAML reads an
-/// unquoted `mnc: 70` as an integer while a quoted `mnc: "070"` is a string —
-/// and the leading zero matters: MNC 070 is three digits, MNC 70 is two.
-fn resolve_plmn_id(plmn: PlmnIdYaml) -> Option<PlmnId> {
-    let mcc = scalar_digits(plmn.mcc.as_ref()?)?;
-    let mnc = scalar_digits(plmn.mnc.as_ref()?)?;
-    Some(PlmnId::new(&mcc, &mnc))
+/// The PLMN ID of the GUMMEI or TAI entry `entry` (e.g. `mme.gummei[0]`), or
+/// `None` when the entry has none the MME may serve, in which case the entry is
+/// dropped with a log line saying why. The MME's load is fail-soft (see
+/// [`load_config`]), so a refused PLMN drops its entry rather than the file.
+fn usable_plmn_id(entry: &str, plmn: Option<PlmnIdYaml>) -> Option<PlmnId> {
+    let field = format!("{entry}.plmn_id");
+    match plmn.map(|plmn| resolve_plmn_id(&field, plmn)) {
+        Some(Ok(Some(plmn_id))) => Some(plmn_id),
+        Some(Err(why)) => {
+            log::error!("Ignoring {entry}: {why}");
+            None
+        }
+        None | Some(Ok(None)) => {
+            log::warn!("Ignoring {entry} with no usable plmn_id");
+            None
+        }
+    }
 }
 
-/// Render a YAML scalar as its digit string, preserving a quoted form verbatim.
-fn scalar_digits(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
+/// Build a `PlmnId` from the YAML `plmn_id` block named `field`.
+///
+/// `Ok(None)` when the block leaves the MCC or the MNC out. `Err` when either
+/// is present but malformed (#2115): a YAML number, or a string that is not 3
+/// (MCC) / 2-3 (MNC) digits (TS 23.003 §2.2). A number is never read as digits:
+/// its leading zeros, if it had any, are already lost, and MNC 70 and 070 are
+/// different PLMNs; `PlmnId::new` reads digits from the left, so `mcc: 1` used
+/// to configure MCC 100. See [`nextgcore_core::plmn`].
+fn resolve_plmn_id(field: &str, plmn: PlmnIdYaml) -> Result<Option<PlmnId>, String> {
+    use nextgcore_core::plmn::{config_digits, PlmnPart};
+    let digits = |value: Option<serde_yaml::Value>, part: PlmnPart| {
+        value
+            .map(|v| config_digits(&format!("{field}.{}", part.key()), part, &v))
+            .transpose()
+    };
+    let mcc = digits(plmn.mcc, PlmnPart::Mcc)?;
+    let mnc = digits(plmn.mnc, PlmnPart::Mnc)?;
+    Ok(match (mcc, mnc) {
+        (Some(mcc), Some(mnc)) => Some(PlmnId::new(&mcc, &mnc)),
         _ => None,
-    }
+    })
 }
 
 /// `<host>` or `<host>:<port>` to a socket address, defaulting the port.
@@ -816,17 +836,17 @@ mod tests {
         );
     }
 
+    /// A PLMN written as strings keeps its leading zeros. serde_yaml 0.9 reads an
+    /// unquoted `001` as the string "001" (YAML 1.2), so that form works too.
     #[test]
-    fn test_plmn_id_accepts_numeric_and_quoted_mnc() {
-        // Unquoted YAML numbers lose a leading zero, so an operator writing a
-        // three-digit MNC has to quote it; both forms must work.
-        let mut numeric = MmeContext::new();
+    fn test_plmn_id_keeps_the_leading_zeros_as_written() {
+        let mut unquoted = MmeContext::new();
         let path = write_temp(
             "nextgcore-mmed-plmn-num.yaml",
             "mme:\n  gummei:\n    - plmn_id:\n        mcc: 001\n        mnc: 01\n",
         );
-        assert!(load_config(&mut numeric, path.to_str().unwrap()));
-        assert_eq!(numeric.served_gummei[0].plmn_id[0].to_bcd(), "00101");
+        assert!(load_config(&mut unquoted, path.to_str().unwrap()));
+        assert_eq!(unquoted.served_gummei[0].plmn_id[0].to_bcd(), "00101");
 
         let mut quoted = MmeContext::new();
         let path = write_temp(
@@ -835,6 +855,55 @@ mod tests {
         );
         assert!(load_config(&mut quoted, path.to_str().unwrap()));
         assert_eq!(quoted.served_gummei[0].plmn_id[0].to_bcd(), "001010");
+    }
+
+    /// #2115: a GUMMEI or TAI whose MCC or MNC is a YAML number, or a string of
+    /// the wrong length, is dropped with an ERROR naming the field, instead of
+    /// being read from the left (`mcc: 1` used to configure MCC 100). Its
+    /// well-formed siblings are still served: the MME's load is fail-soft.
+    #[test]
+    fn test_a_numeric_or_malformed_plmn_drops_its_entry_2115() {
+        nextgcore_core::test_log::init();
+        let path = write_temp(
+            "nextgcore-mmed-plmn-2115.yaml",
+            "mme:\n  gummei:\n    - plmn_id: { mcc: 1, mnc: \"01\" }\n      mme_gid: 1\n    \
+             - plmn_id: { mcc: \"999\", mnc: \"70\" }\n      mme_gid: 2\n  tai:\n    \
+             - plmn_id: { mcc: \"999\", mnc: 70 }\n      tac: 1\n    \
+             - plmn_id: { mcc: \"9999\", mnc: \"70\" }\n      tac: 2\n    \
+             - plmn_id: { mcc: \"001\", mnc: \"01\" }\n      tac: 3\n",
+        );
+        let watch_number = nextgcore_core::test_log::watch("reached the configuration as a number");
+        let watch_length = nextgcore_core::test_log::watch("an MCC is 3 digits");
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+
+        let gummei: Vec<(String, u16)> = ctx
+            .served_gummei
+            .iter()
+            .map(|g| (g.plmn_id[0].to_bcd(), g.mme_gid[0]))
+            .collect();
+        assert_eq!(gummei, [("99970".to_string(), 2)], "only the quoted GUMMEI");
+        let tai: Vec<(String, u16)> = ctx
+            .served_tai
+            .iter()
+            .map(|t| (t.list0.plmn_id.to_bcd(), t.list0.tac[0]))
+            .collect();
+        assert_eq!(tai, [("00101".to_string(), 3)], "only the well-formed TAI");
+
+        let numbers = watch_number.records();
+        for field in ["mme.gummei[0].plmn_id.mcc=1 ", "mme.tai[0].plmn_id.mnc=70 "] {
+            assert!(
+                numbers.iter().any(|r| r.contains(field)),
+                "an ERROR names {field}: {numbers:?}"
+            );
+        }
+        let lengths = watch_length.records();
+        assert!(
+            lengths
+                .iter()
+                .any(|r| r.contains("mme.tai[1].plmn_id.mcc=\"9999\"")),
+            "an ERROR names the 4-digit MCC: {lengths:?}"
+        );
     }
 
     /// #1071: SBc-AP is off unless configured, binds only the configured address
@@ -948,7 +1017,7 @@ mod tests {
         let mut ctx = MmeContext::new();
         let path = write_temp(
             "nextgcore-mmed-partial-entries.yaml",
-            "mme:\n  gummei:\n    - mme_gid: 7\n    - plmn_id:\n        mcc: 999\n        mnc: 70\n      \
+            "mme:\n  gummei:\n    - mme_gid: 7\n    - plmn_id:\n        mcc: \"999\"\n        mnc: \"70\"\n      \
              mme_gid: 2\n  s1ap:\n    server:\n      - address: not-an-address\n      - address: 10.0.0.1\n",
         );
         assert!(load_config(&mut ctx, path.to_str().unwrap()));

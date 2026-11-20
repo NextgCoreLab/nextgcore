@@ -43,14 +43,14 @@ mme:
         port: 9090
   gummei:
     - plmn_id:
-        mcc: 999
-        mnc: 70
+        mcc: "999"
+        mnc: "70"
       mme_gid: 2
       mme_code: 1
   tai:
     - plmn_id:
-        mcc: 999
-        mnc: 70
+        mcc: "999"
+        mnc: "70"
       tac: 1
   security:
     integrity_order: [EIA2, EIA1, EIA0]
@@ -74,7 +74,7 @@ All keys live under `mme:`. Every field is optional.
 | `gtpc.client.sgwc[].address` / `.port` | string / u16 | none / `2123` | SGW-C S11 peer. The first is used for every session (TS 23.401 SGW selection by DNS is not implemented; a second entry is named in a warning). `gtpc.client.smf` is accepted and unused (the PGW-C is the SGW-C's peer, not the MME's). |
 | `n26.server[].address` / `.port` | string / u16 | none / `2123` | N26 GTP-C bind address toward an AMF (#347). Read always, bound only when `MME_N26_INTERWORKING` is on. |
 | `n26.client.amf[].address` / `.port` | string / u16 | none / `2123` | AMF N26 peer for Context Request / Forward Relocation. |
-| `gummei[]` | list | empty | Served GUMMEIs: `plmn_id.{mcc,mnc}` (string or int), `mme_gid` (u16), `mme_code` (u8). With none configured every S1 Setup is answered with S1 Setup Failure (TS 36.413 §8.7.3.4). |
+| `gummei[]` | list | empty | Served GUMMEIs: `plmn_id.{mcc,mnc}` (quoted digit strings: an MCC is 3 digits, an MNC 2 or 3, TS 23.003 §2.2; a YAML number or a malformed string drops the entry with an error, #2115), `mme_gid` (u16), `mme_code` (u8). With none configured every S1 Setup is answered with S1 Setup Failure (TS 36.413 §8.7.3.4). |
 | `tai[]` | list | empty | Served TAIs: `plmn_id`, `tac` (u16). |
 | `security.integrity_order` / `.ciphering_order` | list of strings | built-in order | `EIA0`–`EIA3` / `EEA0`–`EEA3`. A configured list replaces the built-in one. |
 | `network_name.full` / `.short` | string | none | Network names sent to the UE. |
