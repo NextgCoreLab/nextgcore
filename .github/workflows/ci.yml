@@ -1022,6 +1022,8 @@ jobs:
             | tee -a "$GITHUB_STEP_SUMMARY"
       - name: the stale sweep spares a live run (R43 on #2275)
         run: bash docker/iupf-delay-e2e/check-sweep.sh "$RUNNER_TEMP/iupf-delay-bin" "$IUPF_DELAY_OUT/sweep"
+      - name: the lease survives hammered renewals (R43 on #2286)
+        run: bash docker/iupf-delay-e2e/check-lease.sh "$RUNNER_TEMP/iupf-delay-bin" "$IUPF_DELAY_OUT/lease"
       - name: upload the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -221,12 +221,27 @@ mkdir -p "$ctx/binaries"
 cp "$BIN/nextgcore-smfd" "$BIN/nextgcore-upfd" "$ctx/binaries/"
 
 # The lease: this run's lock and liveness signal, before anything else.
-# It runs until its heartbeat (/tmp/hb, epoch seconds) is LEASE_S old.
+# It runs until its heartbeat (/tmp/hb, epoch seconds) is LEASE_S ($1) old.
+# R43 on #2286: the writer replaces the file atomically (a temporary file in
+# the same directory, then mv), and the reader never aborts. An empty or
+# non-numeric read (which `$((...))` would turn into a dash abort, ending the
+# lease of a live run) keeps the last good value instead.
+HB_WRITE='date +%s > /tmp/hb.n && mv -f /tmp/hb.n /tmp/hb'
+# shellcheck disable=SC2016 # expanded by the lease's own shell
+LEASE_LOOP='
+  date +%s > /tmp/hb
+  last=$(date +%s)
+  while :; do
+    v=$(cat /tmp/hb 2>/dev/null)
+    case $v in "" | *[!0-9]*) v=$last ;; esac
+    last=$v
+    [ $(($(date +%s) - v)) -lt "$1" ] || break
+    sleep 2
+  done'
 LEASE="iupf-delay-$RUN_ID-lease"
 if ! err="$(docker run -d --rm --name "$LEASE" \
   --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --label "$LEASE_LABEL=1" \
-  --entrypoint /bin/sh "$CORE_IMAGE" -c \
-  "date +%s > /tmp/hb; while [ \$((\$(date +%s) - \$(cat /tmp/hb))) -lt $LEASE_S ]; do sleep 2; done" \
+  --entrypoint /bin/sh "$CORE_IMAGE" -c "$LEASE_LOOP" lease "$LEASE_S" \
   2>&1 >/dev/null)"; then
   if grep -q 'is already in use' <<<"$err"; then
     echo "run $RUN_ID has live resources (its lease is held); refusing to start (pick another RUN_ID)" >&2
@@ -235,16 +250,25 @@ if ! err="$(docker run -d --rm --name "$LEASE" \
   echo "cannot start the lease $LEASE: $err" >&2
   exit 3
 fi
-# Renew it while this shell lives; a SIGKILL stops the loop too.
+# Renew it every RENEW_EVERY_S (LEASE_S/4; 0, a test hook, renews back to
+# back) while this shell lives; a SIGKILL stops the loop too. Its fds are
+# not run.sh's, so nothing it leaves holds a caller's pipe, and on TERM it
+# takes its in-flight sleep with it.
+RENEW_EVERY_S="${RENEW_EVERY_S:-$((LEASE_S / 4))}"
 (
+  trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+  nap=
   while kill -0 "$$" 2>/dev/null; do
-    docker exec "$LEASE" sh -c 'date +%s > /tmp/hb' >/dev/null 2>&1 || true
-    sleep $((LEASE_S / 4))
+    docker exec "$LEASE" sh -c "$HB_WRITE" || true
+    sleep "$RENEW_EVERY_S" &
+    nap=$!
+    wait "$nap"
   done
-) &
+) >/dev/null 2>&1 </dev/null &
 RENEW=$!
 names=(harness smf iupf psa)
 cleanup() {
+  pkill -P "$RENEW" 2>/dev/null || true
   kill "$RENEW" 2>/dev/null || true
   for c in "${names[@]}"; do
     docker logs "iupf-delay-$RUN_ID-$c" > "$OUT/$c.log" 2>&1 || true
