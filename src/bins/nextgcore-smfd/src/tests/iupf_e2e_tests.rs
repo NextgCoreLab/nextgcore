@@ -367,6 +367,14 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
         .is_err(),
         "nothing reaches the gNB while the session is idle"
     );
+    // #2287: the I-UPF applies slowly. The SMF updates it before the PSA, so the
+    // PSA's flushed buffer meets an I-UPF already forwarding toward the new gNB
+    // tunnel; that holds only while a UPF answers once its change is in effect.
+    // Answered on receipt, the PSA flushed into an I-UPF still idle, which
+    // dropped the packet (1 in 1000 runs without the delay; every run with it).
+    iupf_upf
+        .dp
+        .set_apply_delay_for_test(Some(std::time::Duration::from_millis(300)));
     pfcp_session_modify(
         smf_seid,
         lookup_upf_seid(&reference).unwrap(),
@@ -375,6 +383,7 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     )
     .await
     .expect("the user plane is re-activated");
+    iupf_upf.dp.set_apply_delay_for_test(None);
     // The I-UPF first sends the End Marker on the old tunnel (SNDEM, TS 29.281
     // §7.3.2), then the buffered G-PDU on the new one.
     let mut end_marker_on_old = false;

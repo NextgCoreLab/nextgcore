@@ -3698,6 +3698,10 @@ pub struct DataPlane {
     pub sessions: SessionManager,
     /// Shutdown flag
     pub shutdown: Arc<AtomicBool>,
+    /// #2287, tests: how long the runtime waits before applying each session
+    /// event, to make a slow data plane deterministic.
+    #[cfg(any(test, feature = "test-support"))]
+    apply_delay_for_test: std::sync::Mutex<Option<std::time::Duration>>,
     /// Statistics
     pub stats: DataPlaneStats,
     /// Channel toward the PFCP layer for Session Report triggers
@@ -4086,8 +4090,28 @@ pub const DROPS_BY_REASON_METRIC: &str = "upf_dataplane_dropped_packets_by_reaso
 
 impl DataPlane {
     /// Create a new data plane context
+    /// #2287, tests: delay the runtime's apply of each session event by `d`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_apply_delay_for_test(&self, d: Option<std::time::Duration>) {
+        *self
+            .apply_delay_for_test
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    /// The delay [`Self::set_apply_delay_for_test`] set.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn apply_delay_for_test(&self) -> Option<std::time::Duration> {
+        *self
+            .apply_delay_for_test
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn new(shutdown: Arc<AtomicBool>) -> Self {
         Self {
+            #[cfg(any(test, feature = "test-support"))]
+            apply_delay_for_test: std::sync::Mutex::new(None),
             tun: None,
             nat_exclude: Vec::new(),
             gtpu_socket: None,

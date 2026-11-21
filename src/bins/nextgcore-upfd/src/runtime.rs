@@ -65,6 +65,10 @@ pub fn start(
 ) -> Runtime {
     // Let the PFCP server read final URR counters on session deletion
     pfcp_server.set_data_plane(data_plane.clone());
+    // #2287: and know which session events are in effect, so it answers a Session
+    // Establishment, Modification or Deletion only once its change is applied.
+    let (events_applied, applied_events) = crate::pfcp_path::applied_events();
+    pfcp_server.set_applied_events(applied_events);
 
     // Data plane → PFCP report channel (Downlink Data Reports on first
     // buffered packet, Error Indication Reports from GTP-U)
@@ -250,7 +254,12 @@ pub fn start(
             if shutdown_events.load(Ordering::SeqCst) {
                 break;
             }
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(d) = dp_for_pfcp.apply_delay_for_test() {
+                tokio::time::sleep(d).await;
+            }
             crate::handle_pfcp_session_event(&dp_for_pfcp, event).await;
+            events_applied.mark_applied();
         }
         log::info!("PFCP session event handler finished");
     });

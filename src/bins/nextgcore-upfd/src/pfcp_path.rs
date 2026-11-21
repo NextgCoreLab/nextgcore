@@ -374,6 +374,30 @@ pub fn pfcp_close(ctx: &mut PfcpPathContext) {
 
 /// Event sent to data plane when PFCP session is created/modified/deleted
 #[derive(Debug, Clone)]
+/// #2287: the data plane's side of [`AppliedEvents`]: the consumer of the
+/// session event channel marks each event applied, in order.
+pub struct EventsApplied(tokio::sync::watch::Sender<u64>);
+
+impl EventsApplied {
+    /// One more event of the channel is in effect in the data plane.
+    pub fn mark_applied(&self) {
+        self.0.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// #2287: the PFCP server's side: how many of the events it sent the data plane
+/// has applied. A pair from [`applied_events`]; the server waits on it before it
+/// answers, so a response means the change is in effect (TS 29.244 §6.3.2.3,
+/// §6.3.3.3, §6.3.4.3).
+#[derive(Clone)]
+pub struct AppliedEvents(tokio::sync::watch::Receiver<u64>);
+
+/// A connected [`EventsApplied`] / [`AppliedEvents`] pair.
+pub fn applied_events() -> (EventsApplied, AppliedEvents) {
+    let (tx, rx) = tokio::sync::watch::channel(0);
+    (EventsApplied(tx), AppliedEvents(rx))
+}
+
 pub enum PfcpSessionEvent {
     /// Session established - create forwarding rules
     SessionEstablished {
@@ -808,6 +832,13 @@ pub struct PfcpServer {
     shutdown: Arc<AtomicBool>,
     /// Channel to send session events to data plane
     session_tx: mpsc::Sender<PfcpSessionEvent>,
+    /// #2287: how many events have been sent on `session_tx`, counted under the
+    /// lock the send is made under, so the count is the event's place in the
+    /// channel.
+    events_sent: tokio::sync::Mutex<u64>,
+    /// #2287: how many of them the data plane has applied, when its consumer
+    /// reports it ([`Self::set_applied_events`]; `runtime::start` does).
+    applied: std::sync::RwLock<Option<AppliedEvents>>,
     /// Active sessions: UPF SEID -> SessionInfo
     sessions: tokio::sync::RwLock<HashMap<u64, PfcpSessionInfo>>,
     /// How many sessions [`Self::sessions`] holds, published for
@@ -1287,6 +1318,8 @@ impl PfcpServer {
             next_seq: AtomicU32::new(1),
             shutdown,
             session_tx,
+            events_sent: tokio::sync::Mutex::new(0),
+            applied: std::sync::RwLock::new(None),
             sessions: tokio::sync::RwLock::new(HashMap::new()),
             session_count: Arc::new(AtomicUsize::new(0)),
             association: tokio::sync::RwLock::new(None),
@@ -1515,8 +1548,7 @@ impl PfcpServer {
             dp.with_transport_delay(|m| m.clear());
         }
         let _ = self
-            .session_tx
-            .send(PfcpSessionEvent::PeerFailure { peer })
+            .send_session_event(PfcpSessionEvent::PeerFailure { peer })
             .await;
     }
 
@@ -1569,9 +1601,7 @@ impl PfcpServer {
                 upf_seid: *upf_seid,
                 ue_ipv4: *ue_ipv4,
             };
-            if let Err(e) = self.session_tx.send(event).await {
-                log::error!("Failed to send session event: {e}");
-            }
+            let _ = self.send_session_event(event).await;
         }
         log::info!(
             "PFCP Session Retention Information from {new_peer}: kept {kept} session(s), \
@@ -2857,13 +2887,6 @@ impl PfcpServer {
             true,
         );
 
-        if let Err(e) = self.reply(&response, src_addr).await {
-            // #1815: the session is not stored, so nothing would ever give its TEIDs
-            // back; the CP function's retransmission chooses afresh.
-            self.release_teids(chosen_teids);
-            return Err(format!("Send error: {e}"));
-        }
-
         // Store session info, including which rule ids the session now holds so a
         // later modification's Update/Remove can be validated against them (#306).
         let session_info = PfcpSessionInfo {
@@ -2919,8 +2942,19 @@ impl PfcpServer {
             bars: parsed_bars,
         };
 
-        if let Err(e) = self.session_tx.send(event).await {
-            log::error!("Failed to send session event: {e}");
+        // #2287: answered once the session is in effect in the data plane
+        // (TS 29.244 §6.3.2.3: "stored and applied"), not on receipt. #1815 answered first and stored
+        // after, releasing the TEIDs when the answer could not be sent; now the
+        // session is stored and applied before. A response that cannot be sent is
+        // in the duplicate cache (`reply` records it first, #1851), so the CP
+        // function's retransmission is answered with it and both ends hold the
+        // same session, as when the datagram is lost on the way.
+        self.apply_session_event(event).await;
+        if let Err(e) = self.reply(&response, src_addr).await {
+            log::warn!(
+                "Session Establishment Response for SEID {upf_seid:#x} not sent ({e}); \
+                 a retransmitted request is answered from the duplicate cache"
+            );
         }
 
         log::info!(
@@ -3886,28 +3920,18 @@ impl PfcpServer {
             true,
         );
 
-        self.reply(&response, src_addr)
-            .await
-            .map_err(|e| format!("Send error: {e}"))?;
-
-        // A rejected modification applies NOTHING. Sending the event anyway would
-        // leave the data plane holding rules the response just said were refused,
-        // which is the same divergence in the other direction.
+        // A rejected modification applies NOTHING, and is answered at once.
+        // Sending the event anyway would leave the data plane holding rules the
+        // response just said were refused, which is the same divergence in the
+        // other direction.
         if failure.is_some() {
+            self.reply(&response, src_addr)
+                .await
+                .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
         }
 
-        // #1389 part 3: what a stopped QoS monitoring measured is reported once
-        // more (§5.24.4.3), after the response.
         let stop_reports = self.apply_srrs(upf_seid, &removed_srr_ids, &created_srrs, &mod_srrs);
-        if !stop_reports.is_empty() {
-            if let Err(e) = self
-                .send_qos_monitoring_report(upf_seid, &stop_reports)
-                .await
-            {
-                log::warn!("QoS monitoring stop report was NOT sent: {e}");
-            }
-        }
 
         // Notify data plane
         let has_changes = updated_dl_teid.is_some()
@@ -3951,8 +3975,23 @@ impl PfcpServer {
                 old_dl_tunnel,
             };
 
-            if let Err(e) = self.session_tx.send(event).await {
-                log::error!("Failed to send session event: {e}");
+            // #2287: in effect before it is answered (TS 29.244 §6.3.3.3:
+            // "accepted and performed successfully").
+            self.apply_session_event(event).await;
+        }
+
+        self.reply(&response, src_addr)
+            .await
+            .map_err(|e| format!("Send error: {e}"))?;
+
+        // #1389 part 3: what a stopped QoS monitoring measured is reported once
+        // more (§5.24.4.3), after the response.
+        if !stop_reports.is_empty() {
+            if let Err(e) = self
+                .send_qos_monitoring_report(upf_seid, &stop_reports)
+                .await
+            {
+                log::warn!("QoS monitoring stop report was NOT sent: {e}");
             }
         }
 
@@ -4019,19 +4058,63 @@ impl PfcpServer {
             true,
         );
 
+        // #2287: removed from the data plane before it is answered (TS 29.244
+        // §6.3.4.3: "deleted successfully"), so a CP function that reuses what the response released finds
+        // nothing of this session still forwarding.
+        let event = PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4 };
+        self.apply_session_event(event).await;
+
         self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
-        // Notify data plane
-        let event = PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4 };
-
-        if let Err(e) = self.session_tx.send(event).await {
-            log::error!("Failed to send session event: {e}");
-        }
-
         log::info!("Session {upf_seid:#x} deleted");
         Ok(())
+    }
+
+    /// #2287: the data plane reports which session events it has applied; from
+    /// now on a Session Establishment, Modification or Deletion is answered only
+    /// once its event is in effect (TS 29.244 §6.3.2.3, §6.3.3.3, §6.3.4.3).
+    pub fn set_applied_events(&self, applied: AppliedEvents) {
+        *self.applied.write().unwrap_or_else(|e| e.into_inner()) = Some(applied);
+    }
+
+    /// Send `event` to the data plane, counted ([`Self::events_sent`]). Returns
+    /// its place in the channel, `None` when it could not be sent.
+    async fn send_session_event(&self, event: PfcpSessionEvent) -> Option<u64> {
+        let mut sent = self.events_sent.lock().await;
+        if let Err(e) = self.session_tx.send(event).await {
+            log::error!("Failed to send session event: {e}");
+            return None;
+        }
+        *sent = sent.wrapping_add(1);
+        Some(*sent)
+    }
+
+    /// #2287: send `event` and wait until the data plane has applied it, so the
+    /// response that follows is about a change in effect. TS 29.244 answers
+    /// success when the rules "are stored and applied" (§6.3.2.3), the
+    /// modifications "accepted and performed successfully" (§6.3.3.3), the session
+    /// and its rules "deleted successfully" (§6.3.4.3). A
+    /// CP function orders its requests on the responses (the SMF updates an
+    /// I-UPF before the PSA it relays for, so the PSA's flushed buffer meets an
+    /// I-UPF already forwarding); answering on receipt let the PSA's change
+    /// overtake the I-UPF's. Without a data plane reporting (a test reading the
+    /// channel itself) it is only sent.
+    async fn apply_session_event(&self, event: PfcpSessionEvent) {
+        let Some(place) = self.send_session_event(event).await else {
+            return;
+        };
+        let applied = self
+            .applied
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(AppliedEvents(mut rx)) = applied {
+            if rx.wait_for(|n| *n >= place).await.is_err() {
+                log::warn!("the data plane stopped before applying a session event");
+            }
+        }
     }
 
     /// Attach the data plane so PFCP handlers can pull final URR counters
