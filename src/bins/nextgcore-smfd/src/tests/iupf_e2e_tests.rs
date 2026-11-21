@@ -261,7 +261,7 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     let smf_seid = smf_n4_seid_for(&reference);
     let leg = iupf::leg_of(smf_seid).expect("the I-UPF is inserted");
     assert_eq!(
-        iupf_upf.sessions.load(Ordering::SeqCst),
+        settled(|| iupf_upf.sessions.load(Ordering::SeqCst), |n| n == 1).await,
         1,
         "a session at the I-UPF"
     );
@@ -283,7 +283,14 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     let n3 = lookup_upf_ul_endpoint(&reference).expect("an N3 endpoint for the NG-RAN");
     assert_eq!(n3, leg.n3, "the NG-RAN's uplink tunnel is the I-UPF's");
 
-    // Uplink: gNB -> I-UPF (N3) -> PSA (N9) -> N6.
+    // Uplink: gNB -> I-UPF (N3) -> PSA (N9) -> N6. Sent once the session is in
+    // both data planes: each upfd answers its Establishment before it applies it.
+    let psa_seid = lookup_upf_seid(&reference).unwrap();
+    wait_until(|| {
+        psa.dp.sessions.find_by_seid(psa_seid).is_some()
+            && iupf_upf.dp.sessions.find_by_seid(leg.upf_seid).is_some()
+    })
+    .await;
     let (gnb, gnb_ip) = bind_2152(27).await;
     let ul = ul_gpdu(n3.0, b.qfi, b.ue_ip);
     gnb.send_to(&ul, (iupf_upf.ip, 2152)).await.unwrap();
@@ -349,6 +356,15 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     pfcp_deactivate_dl_far(smf_seid, lookup_upf_seid(&reference).unwrap())
         .await
         .expect("the user plane is released");
+    // In both data planes before the probe (each upfd answers, then applies).
+    settled_far2(&psa, psa_seid, |(a, _)| {
+        a & crate::n4_build::apply_action::FORW == 0
+    })
+    .await;
+    settled_far2(&iupf_upf, leg.upf_seid, |(a, _)| {
+        a & crate::n4_build::apply_action::FORW == 0
+    })
+    .await;
     let mut marked = dl;
     marked[4] = 0x22; // an IP identification that tells this packet apart
     marked[5] = 0x08;
@@ -638,6 +654,31 @@ async fn the_per_flow_delay_through_an_i_upf_reaches_the_pcf_2208() {
 }
 
 /// The I-UPF's FAR 2, as its data plane holds it: (Apply Action, OHC TEID).
+/// #2270 follow-up (B13's `..._applies_nothing_2208` flake): upfd answers a PFCP
+/// request before its own state shows it. A Session Establishment is answered,
+/// then the session is recorded and counted. A Modification is answered, then its
+/// rules go to the data plane on another task. So the I-UPF's state read the
+/// moment the SMF has its answer can still be the old one. Wait until `done`
+/// (bounded, as [`wait_until`]) and return what is there, for the assertion to
+/// judge. Only for a state the SMF's step makes; a state that must stay is read
+/// at once.
+async fn settled<T: Copy>(read: impl Fn() -> T, done: impl Fn(T) -> bool) -> T {
+    wait_until(|| done(read())).await;
+    read()
+}
+
+/// [`settled`] for the I-UPF's FAR 2, waiting first for the session itself to
+/// reach the data plane.
+async fn settled_far2(
+    u: &Upf,
+    upf_seid: u64,
+    done: impl Fn((u16, Option<u32>)) -> bool,
+) -> (u16, Option<u32>) {
+    wait_until(|| u.dp.sessions.find_by_seid(upf_seid).is_some() && done(iupf_far2(u, upf_seid)))
+        .await;
+    iupf_far2(u, upf_seid)
+}
+
 fn iupf_far2(u: &Upf, upf_seid: u64) -> (u16, Option<u32>) {
     let s =
         u.dp.sessions
@@ -737,7 +778,10 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
         session_with_refusing_psa(&iupf_upf, "imsi-001010000022087", 6).await;
     let upf_seid = lookup_upf_seid(&reference).unwrap();
     assert_eq!(
-        iupf_far2(&iupf_upf, leg.upf_seid).0 & FORW,
+        settled_far2(&iupf_upf, leg.upf_seid, |(a, _)| a & BUFF != 0)
+            .await
+            .0
+            & FORW,
         0,
         "buffering at first"
     );
@@ -747,7 +791,7 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
     assert!(pfcp_session_modify(seid, upf_seid, 0x2208, [127, 0, 0, 77])
         .await
         .is_err());
-    let (action, ohc) = iupf_far2(&iupf_upf, leg.upf_seid);
+    let (action, ohc) = settled_far2(&iupf_upf, leg.upf_seid, |(a, _)| a & FORW == 0).await;
     assert_eq!(
         (action & FORW, action & BUFF),
         (0, BUFF),
@@ -758,7 +802,10 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
     pfcp_session_modify(seid, upf_seid, 0x2208, [127, 0, 0, 77])
         .await
         .expect("activated");
-    assert_eq!(iupf_far2(&iupf_upf, leg.upf_seid), (FORW, Some(0x2208)));
+    assert_eq!(
+        settled_far2(&iupf_upf, leg.upf_seid, |f| f == (FORW, Some(0x2208))).await,
+        (FORW, Some(0x2208))
+    );
 
     // Toward active, cancelled between the halves: back to the previous tunnel.
     let hold = iupf::BetweenLegs::arm();
@@ -767,14 +814,16 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
     });
     hold.reached.notified().await;
     assert_eq!(
-        iupf_far2(&iupf_upf, leg.upf_seid).1,
+        settled_far2(&iupf_upf, leg.upf_seid, |(_, t)| t == Some(0x2209))
+            .await
+            .1,
         Some(0x2209),
         "the I-UPF half is applied"
     );
     task.abort();
     let _ = task.await;
     drop(hold);
-    wait_until(|| iupf_far2(&iupf_upf, leg.upf_seid).1 == Some(0x2208)).await;
+    settled_far2(&iupf_upf, leg.upf_seid, |(_, t)| t == Some(0x2208)).await;
     assert_eq!(
         iupf_far2(&iupf_upf, leg.upf_seid),
         (FORW, Some(0x2208)),
@@ -872,7 +921,10 @@ async fn a_psa_teardown_deletes_the_i_upf_session_2208() {
     let iupf_upf = upf(29).await;
     let (psa, reference, seid, _leg, listener) =
         session_with_refusing_psa(&iupf_upf, "imsi-001010000022086", 7).await;
-    assert_eq!(iupf_upf.sessions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        settled(|| iupf_upf.sessions.load(Ordering::SeqCst), |n| n == 1).await,
+        1
+    );
     psa.client
         .teardown_association("test: the PSA restarted")
         .await;
@@ -922,7 +974,10 @@ async fn an_i_upf_loss_releases_its_sessions_at_the_psa_2225() {
     let iupf_upf = upf(30).await;
     let (psa, reference, seid, _leg, listener) =
         session_with_refusing_psa(&iupf_upf, "imsi-001010000022250", 5).await;
-    assert_eq!(iupf_upf.sessions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        settled(|| iupf_upf.sessions.load(Ordering::SeqCst), |n| n == 1).await,
+        1
+    );
     let client = iupf::client().expect("the I-UPF");
     assert!(
         pfcp_path::holds_session_seid(iupf::leg_seid(seid)),
@@ -1000,7 +1055,10 @@ async fn an_i_upf_path_failure_deactivates_then_releases_its_sessions_2225() {
     pfcp_session_modify(seid, upf_seid, 0x2251, gnb)
         .await
         .expect("activated");
-    assert_eq!(iupf_far2(&iupf_upf, leg.upf_seid), (FORW, Some(0x2251)));
+    assert_eq!(
+        settled_far2(&iupf_upf, leg.upf_seid, |f| f == (FORW, Some(0x2251))).await,
+        (FORW, Some(0x2251))
+    );
     psa.clear_seen();
     up_path::set_hold_for_test(Some(std::time::Duration::from_millis(600)));
 
@@ -1026,7 +1084,7 @@ async fn an_i_upf_path_failure_deactivates_then_releases_its_sessions_2225() {
         (0, BUFF, NOCP),
         "the PSA buffers"
     );
-    wait_until(|| iupf_far2(&iupf_upf, leg.upf_seid).0 & FORW == 0).await;
+    settled_far2(&iupf_upf, leg.upf_seid, |(a, _)| a & FORW == 0).await;
     assert_eq!(
         iupf_far2(&iupf_upf, leg.upf_seid).0 & FORW,
         0,
@@ -1114,7 +1172,7 @@ async fn an_i_upf_error_indication_report_is_its_psa_session_s_2225() {
     wait_until(|| last_psa_far2_action(&psa).is_some_and(|a| a & NOCP != 0)).await;
     let a = last_psa_far2_action(&psa).expect("the PSA's FAR 2 is updated");
     assert_eq!((a & FORW, a & BUFF), (0, BUFF), "the PSA buffers");
-    wait_until(|| iupf_far2(&iupf_upf, leg.upf_seid).0 & FORW == 0).await;
+    settled_far2(&iupf_upf, leg.upf_seid, |(a, _)| a & FORW == 0).await;
     assert_eq!(iupf_far2(&iupf_upf, leg.upf_seid).0 & FORW, 0);
     assert!(
         !psa.seen()
@@ -1305,6 +1363,9 @@ async fn a_restarted_i_upf_gets_no_stale_deletion_and_its_new_leg_survives_2225(
     let reference_b = root["smContextRef"].as_str().unwrap().to_string();
     let leg_b = iupf::leg_of(smf_n4_seid_for(&reference_b)).expect("a new leg");
     assert_eq!(leg_b.upf_seid, leg.upf_seid, "the SEID is reused");
+    // The new leg is recorded by the restarted I-UPF (upfd answers its
+    // Establishment, then records it); a stale deletion would remove it from here.
+    wait_until(|| fresh.sessions.load(Ordering::SeqCst) == 1).await;
     drop(hold);
     iupf::retry_pending_deletions();
     assert!(!iupf::retry_running(), "nothing to resend");
