@@ -1559,6 +1559,9 @@ fn device_triggering_caller(
     Ok(verified)
 }
 
+/// TS 29.122 Table 5.7.2.2.4-1, enumeration Priority.
+const DEVICE_TRIGGERING_PRIORITIES: [&str; 2] = ["NO_PRIORITY", "PRIORITY"];
+
 /// TS 29.122 Table 5.7.2.1.2-1's mandatory (cardinality 1) members of
 /// `DeviceTriggering`, with their types: `validityPeriod` (DurationSec, an
 /// unsigned integer), `priority` (Priority), `applicationPortId` (Port, 0..65535),
@@ -1592,7 +1595,12 @@ fn device_triggering_invalid_params(data: &serde_json::Value) -> Vec<(String, St
     }
     match data.get("priority") {
         None => bad("priority", "mandatory"),
-        Some(v) if v.as_str().is_none_or(|s| s.is_empty()) => {
+        // Table 5.7.2.2.4-1 defines exactly these two values.
+        Some(v)
+            if !v
+                .as_str()
+                .is_some_and(|p| DEVICE_TRIGGERING_PRIORITIES.contains(&p)) =>
+        {
             bad("priority", "must be a Priority (NO_PRIORITY or PRIORITY)")
         }
         _ => {}
@@ -1725,13 +1733,12 @@ async fn handle_device_triggering_transaction(
     };
     #[allow(clippy::result_large_err)]
     let body = || -> Result<serde_json::Value, SbiResponse> {
-        let c = request
-            .http
-            .content
-            .as_deref()
-            .ok_or_else(|| send_bad_request("Missing request body", Some("MISSING_BODY")))?;
-        serde_json::from_str(c)
-            .map_err(|e| send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")))
+        let c = request.http.content.as_deref().ok_or_else(|| {
+            send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING"))
+        })?;
+        serde_json::from_str(c).map_err(|e| {
+            send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT"))
+        })
     };
     let stored: serde_json::Value =
         serde_json::from_str(&txn.raw).unwrap_or_else(|_| serde_json::json!({}));
@@ -1864,11 +1871,13 @@ async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) 
     };
     let body = match &request.http.content {
         Some(c) => c,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
     };
     let data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        Err(e) => {
+            return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT"))
+        }
     };
 
     if let Some(r) = device_triggering_body_error(&data) {
@@ -3983,6 +3992,8 @@ mod tests {
             ("validityPeriod", serde_json::json!(-1)),
             ("applicationPortId", serde_json::json!(70000)),
             ("priority", serde_json::json!(1)),
+            // R48 on #2279: Table 5.7.2.2.4-1's two values only.
+            ("priority", serde_json::json!("URGENT")),
             ("notificationDestination", serde_json::json!("")),
         ] {
             let mut body = trigger_body();
@@ -4007,6 +4018,112 @@ mod tests {
             create(trigger_body()).status,
             201,
             "the complete body is taken"
+        );
+    }
+
+    /// R48 on #2279: a body that is absent or not JSON gets the TS 29.500
+    /// Table 5.2.7.2-1 causes, MANDATORY_IE_MISSING and INVALID_MSG_FORMAT, on
+    /// create, PUT and PATCH alike.
+    #[test]
+    fn device_triggering_body_errors_use_the_standard_causes_2276() {
+        let _guard = lock_globals();
+        reset_context();
+        let id = create_trigger_as("scs-a");
+        let cause = |r: &SbiResponse| -> String {
+            let v: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            v["cause"].as_str().unwrap_or_default().to_string()
+        };
+        let path = format!("/3gpp-device-triggering/v1/scs-a/transactions/{id}");
+        for method in ["PUT", "PATCH"] {
+            let mut r = SbiRequest::get(&path);
+            r.header.method = method.to_string();
+            let none = as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-a",
+                Some(&id),
+                &verified(r.clone(), "scs-a"),
+            ));
+            assert_eq!(
+                (none.status, cause(&none)),
+                (400, "MANDATORY_IE_MISSING".into()),
+                "{method}"
+            );
+            r.http.content = Some("{not json".into());
+            let bad = as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-a",
+                Some(&id),
+                &verified(r, "scs-a"),
+            ));
+            assert_eq!(
+                (bad.status, cause(&bad)),
+                (400, "INVALID_MSG_FORMAT".into()),
+                "{method}"
+            );
+        }
+        let mut post = SbiRequest::post("/3gpp-device-triggering/v1/scs-a/transactions");
+        let none = as_scs_as(handle_device_triggering_create(
+            "scs-a",
+            &verified(post.clone(), "scs-a"),
+        ));
+        assert_eq!(cause(&none), "MANDATORY_IE_MISSING");
+        post.http.content = Some("{not json".into());
+        let bad = as_scs_as(handle_device_triggering_create(
+            "scs-a",
+            &verified(post, "scs-a"),
+        ));
+        assert_eq!(cause(&bad), "INVALID_MSG_FORMAT");
+    }
+
+    /// R48 on #2279: a transaction persisted before #2276 has no verified owner,
+    /// and is denied to every caller, its `{scsAsId}` included: not listed, and
+    /// 404 for every verb. It stays stored.
+    #[test]
+    fn an_ownerless_transaction_is_denied_to_every_caller_2276() {
+        let _guard = lock_globals();
+        reset_context();
+        let legacy = NefTriggerTransaction::new(
+            "scs-a",
+            DEVICE_TRIGGERING_STUB_RESULT,
+            trigger_body().to_string(),
+        );
+        assert!(legacy.owner_id.is_none());
+        let id = legacy.id.clone();
+        nef_self()
+            .read()
+            .unwrap()
+            .transaction_insert(legacy)
+            .unwrap();
+        let path = format!("/3gpp-device-triggering/v1/scs-a/transactions/{id}");
+        for method in ["GET", "PUT", "PATCH", "DELETE"] {
+            let mut r = SbiRequest::get(&path);
+            r.header.method = method.to_string();
+            r = r.with_json_body(&trigger_body()).unwrap();
+            let resp = as_scs_as(handle_device_triggering_transaction(
+                method,
+                "scs-a",
+                Some(&id),
+                &verified(r, "scs-a"),
+            ));
+            assert_eq!(
+                resp.status, 404,
+                "{method} by scs-a of its ownerless transaction"
+            );
+        }
+        let list = SbiRequest::get("/3gpp-device-triggering/v1/scs-a/transactions");
+        let resp = as_scs_as(handle_device_triggering_transaction(
+            "GET",
+            "scs-a",
+            None,
+            &verified(list, "scs-a"),
+        ));
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!([]), "not listed");
+        assert!(
+            nef_self().read().unwrap().transaction_find(&id).is_some(),
+            "still stored"
         );
     }
 
