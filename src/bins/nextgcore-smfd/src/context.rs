@@ -6483,6 +6483,83 @@ mod tests {
         out
     }
 
+    /// Sets every global [`AmbientRestore`] covers, for its test.
+    fn set_every_ambient_global_2270(
+        client: &Arc<crate::pfcp_path::PfcpClient>,
+        udm: bool,
+        eps_iwk: bool,
+    ) {
+        for k in AMBIENT_ENV {
+            std::env::set_var(k, "set-2270");
+        }
+        crate::udm::set_for_test(udm);
+        crate::easdf::set_for_test(Some(crate::easdf::EasdfConfig {
+            nrf_uri: "http://127.0.0.1:2270".to_string(),
+            edge_fqdn_patterns: vec!["edge.2270.example".to_string()],
+        }));
+        crate::eps_iwk::set_for_test(eps_iwk);
+        crate::iupf::set(Some((client.clone(), Vec::new())));
+        crate::up_path::set_hold_for_test(Some(std::time::Duration::from_millis(2270)));
+        nextgcore_amfd::sbi_path::set_pgw_discovery_nrf_for_test(Some(
+            "http://127.0.0.1:2270".to_string(),
+        ));
+    }
+
+    /// **#2270** (R47 on #2285, 2): [`AmbientRestore`] puts back every global it
+    /// covers, when it drops and when a panic drops it. Every test that sets one
+    /// of them relies on this.
+    ///
+    /// REVERT-VERIFIED: with `AmbientRestore::drop` emptied, "put back when the
+    /// guard drops" fails.
+    #[tokio::test]
+    async fn ambient_restore_puts_every_global_back_on_drop_and_on_panic_2270() {
+        let state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = sock.local_addr().unwrap();
+        let client = Arc::new(crate::pfcp_path::PfcpClient::new(
+            sock,
+            peer,
+            [127, 0, 0, 1],
+        ));
+        let now = || {
+            (
+                AMBIENT_ENV.iter().map(std::env::var_os).collect::<Vec<_>>(),
+                crate::udm::enabled(),
+                crate::easdf::config_for_test().map(|c| (c.nrf_uri, c.edge_fqdn_patterns)),
+                crate::eps_iwk::enabled(),
+                crate::iupf::client().map(|c| Arc::as_ptr(&c) as usize),
+                crate::up_path::hold_for_test(),
+                nextgcore_amfd::sbi_path::pgw_discovery_nrf_for_test(),
+            )
+        };
+        let before = now();
+        {
+            let _restore = AmbientRestore::new(&state);
+            set_every_ambient_global_2270(&client, !before.1, !before.3);
+            let set = now();
+            assert!(
+                set.0
+                    .iter()
+                    .all(|v| v.as_deref() == Some("set-2270".as_ref()))
+                    && set.1 != before.1
+                    && set.2.is_some()
+                    && set.3 != before.3
+                    && set.4.is_some()
+                    && set.5.is_some()
+                    && set.6.is_some(),
+                "every global is set"
+            );
+        }
+        assert_eq!(now(), before, "put back when the guard drops");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _restore = AmbientRestore::new(&state);
+            set_every_ambient_global_2270(&client, !before.1, !before.3);
+            panic!("a test fails while it holds the guard (#2270)");
+        }));
+        assert!(panicked.is_err(), "the body panicked");
+        assert_eq!(now(), before, "put back when a panic drops it");
+    }
+
     /// **#2270** (R47 on #2282, b): every environment knob an smfd test sets is
     /// one [`AmbientRestore`] puts back, and every fn that takes the process-state
     /// lock and sets one of its globals, itself or through a helper, holds an
@@ -6568,19 +6645,69 @@ mod tests {
             }
             helpers.extend(more);
         }
+        // R47 on #2285 (1): a guard counts only bound to a name. `let _ = ...` (or
+        // no `let`) drops it at once, restoring before the test sets anything.
+        let named_guard_at = |b: &str| -> Option<usize> {
+            let mut off = 0;
+            for line in b.split_inclusive('\n') {
+                if line.contains("AmbientRestore::new(") {
+                    let t = line.trim_start();
+                    if let Some(rest) = t.strip_prefix("let ") {
+                        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+                        let name: String = rest
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        if !name.is_empty() && name != "_" {
+                            return Some(off);
+                        }
+                    }
+                }
+                off += line.len();
+            }
+            None
+        };
+        // Where the fn first sets a global, itself or through a helper.
+        let first_set_at = |b: &str| -> Option<usize> {
+            std::iter::once("std::env::set_var(".to_string())
+                .chain(SETTERS.iter().map(|s| s.to_string()))
+                .chain(helpers.iter().map(|h| format!("{h}(")))
+                .filter_map(|p| b.find(&p))
+                .min()
+        };
         let unguarded: Vec<&String> = all
             .iter()
             .filter(|(_, _, b)| {
                 LOCKS.iter().any(|l| b.contains(l))
-                    && (direct(b) || helpers.iter().any(|h| b.contains(&format!("{h}("))))
-                    && !b.contains("AmbientRestore::new(")
+                    && first_set_at(b).is_some_and(|set| {
+                        // Named, and made before the first set (R47's option).
+                        named_guard_at(b).is_none_or(|g| g > set)
+                    })
             })
             .map(|(n, _, _)| n)
             .collect();
         assert!(
             unguarded.is_empty(),
-            "take the process-state lock and set its globals without an AmbientRestore: \
-             {unguarded:#?}"
+            "take the process-state lock and set its globals without a named \
+             AmbientRestore made before the first set: {unguarded:#?}"
+        );
+        let dropped_at_once: Vec<&String> = all
+            .iter()
+            .filter(|(_, _, b)| {
+                b.lines().any(|l| {
+                    l.contains("AmbientRestore::new(") && {
+                        let t = l.trim_start();
+                        !t.starts_with("let ")
+                            || t.starts_with("let _ =")
+                            || t.starts_with("let _=")
+                    }
+                })
+            })
+            .map(|(n, _, _)| n)
+            .collect();
+        assert!(
+            dropped_at_once.is_empty(),
+            "an AmbientRestore not bound to a name drops at once: {dropped_at_once:#?}"
         );
     }
 }

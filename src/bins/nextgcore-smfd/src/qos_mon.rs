@@ -165,31 +165,65 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
 /// ([`SessionMon::tdr_busy`]), for [`transport_delay_in_place`].
 static TDR_IDLE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// #2270 follow-up: test-only, holds session `r`'s IE 271 leg as another task's
-/// [`sync_transport_delay`] would while its Update PDR is in flight. Let go when
-/// dropped.
-#[cfg(test)]
-#[must_use = "the leg is held until this drops"]
-pub(crate) struct TransportDelayLegHeld(String);
+/// #2270 follow-up (R47 on #2285): a task's claim on session `r`'s IE 271 leg
+/// ([`SessionMon::tdr_busy`]). Dropping it lets go: it clears the flag, tidies
+/// the entry and tells [`TDR_IDLE`]. A panic in the owner is included, so it
+/// cannot leave the leg owned and park the session's later installs in
+/// [`transport_delay_in_place`].
+#[must_use = "the leg is let go when this drops"]
+pub(crate) struct TdrClaim(String);
 
-#[cfg(test)]
-impl TransportDelayLegHeld {
-    pub(crate) fn hold(r: &str) -> Self {
-        with(|m| m.entry(r.to_string()).or_default().tdr_busy = true);
-        Self(r.to_string())
+impl TdrClaim {
+    /// Claim `r`'s leg, or (`None`) flag its owner to look again.
+    pub(crate) fn try_claim(r: &str) -> Option<Self> {
+        let claimed = with(|m| {
+            let Some(s) = m.get_mut(r) else {
+                return false;
+            };
+            if s.tdr_busy {
+                s.tdr_dirty = true;
+                return false;
+            }
+            s.tdr_busy = true;
+            true
+        });
+        claimed.then(|| Self(r.to_string()))
     }
 }
 
-#[cfg(test)]
-impl Drop for TransportDelayLegHeld {
+impl Drop for TdrClaim {
     fn drop(&mut self) {
         with(|m| {
             if let Some(s) = m.get_mut(&self.0) {
                 s.tdr_busy = false;
             }
+            tidy(m, &self.0);
         });
         TDR_IDLE.notify_waiters();
     }
+}
+
+/// #2270 follow-up: test-only, holds session `r`'s IE 271 leg as another task's
+/// [`sync_transport_delay`] would while its Update PDR is in flight. Let go when
+/// dropped.
+#[cfg(test)]
+#[must_use = "the leg is held until this drops"]
+pub(crate) struct TransportDelayLegHeld(#[allow(dead_code)] TdrClaim);
+
+#[cfg(test)]
+impl TransportDelayLegHeld {
+    pub(crate) fn hold(r: &str) -> Self {
+        with(|m| {
+            m.entry(r.to_string()).or_default();
+        });
+        Self(TdrClaim::try_claim(r).expect("the leg is free"))
+    }
+}
+
+/// #2270 follow-up: whether a task owns session `r`'s IE 271 leg.
+#[cfg(test)]
+pub(crate) fn leg_owned_for_test(r: &str) -> bool {
+    with(|m| m.get(r).is_some_and(|s| s.tdr_busy))
 }
 
 /// Drop a session's entry once it holds nothing.
@@ -1093,9 +1127,11 @@ fn transport_delay_wanted(
 /// SRR goes. One task per session sends, looking again after each request, so the
 /// last Update PDR the PSA gets names the current peer.
 pub async fn sync_transport_delay(r: &str) {
-    sync_transport_delay_once(r).await;
-    // Whoever lets go of the leg says so, for `transport_delay_in_place`.
-    TDR_IDLE.notify_waiters();
+    // Let go when it drops, however this returns or unwinds (R47 on #2285).
+    let Some(_claim) = TdrClaim::try_claim(r) else {
+        return;
+    };
+    sync_transport_delay_claimed(r).await;
 }
 
 /// #2270 follow-up: [`sync_transport_delay`], waiting first for another task that
@@ -1105,7 +1141,7 @@ pub async fn sync_transport_delay(r: &str) {
 /// (spawned by `on_session_request` after the policy's own N4 request) was still
 /// on its way: the PSA got the SRR first ("IE 271 before the GTPUPM SRR" failed
 /// under load).
-async fn transport_delay_in_place(r: &str) {
+pub(crate) async fn transport_delay_in_place(r: &str) {
     loop {
         let idle = TDR_IDLE.notified();
         tokio::pin!(idle);
@@ -1123,21 +1159,8 @@ async fn transport_delay_in_place(r: &str) {
     }
 }
 
-async fn sync_transport_delay_once(r: &str) {
-    let claimed = with(|m| {
-        let Some(s) = m.get_mut(r) else {
-            return false;
-        };
-        if s.tdr_busy {
-            s.tdr_dirty = true;
-            return false;
-        }
-        s.tdr_busy = true;
-        true
-    });
-    if !claimed {
-        return;
-    }
+/// The loop of [`sync_transport_delay`], run while its caller holds the claim.
+async fn sync_transport_delay_claimed(r: &str) {
     loop {
         let psa_seid = crate::lookup_upf_seid(r).map(|_| crate::smf_n4_seid_for(r));
         let peer = psa_seid.and_then(preceding_peer);
@@ -1159,8 +1182,6 @@ async fn sync_transport_delay_once(r: &str) {
             let psa = (want != s.tdr_peer).then_some(want);
             let iupf = (want_iupf != s.tdr_iupf_peer).then_some(want_iupf);
             if psa.is_none() && iupf.is_none() {
-                s.tdr_busy = false;
-                tidy(m, r);
                 return None;
             }
             Some((psa, iupf))
@@ -1195,8 +1216,6 @@ async fn sync_transport_delay_once(r: &str) {
             if ok || std::mem::take(&mut s.tdr_dirty) {
                 return true;
             }
-            s.tdr_busy = false;
-            tidy(m, r);
             false
         });
         if !again {

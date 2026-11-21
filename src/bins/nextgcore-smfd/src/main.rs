@@ -37416,6 +37416,33 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// #2270 follow-up (R47 on #2285, hardening): an IE 271 owner that panics
+    /// lets go of the leg ([`qos_mon::TdrClaim`]'s drop), so a later install's
+    /// wait for the leg is not parked for good.
+    ///
+    /// REVERT-VERIFIED: with `TdrClaim::drop` not clearing the flag, "the leg is
+    /// let go" fails (and the install would wait for ever).
+    #[tokio::test]
+    async fn a_panicking_ie_271_owner_lets_go_of_the_leg_2270() {
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        qos_mon::clear_for_test();
+        let r = "ref-2270-ie271-claim";
+        let owner = tokio::spawn(async move {
+            let _held = qos_mon::TransportDelayLegHeld::hold(r);
+            assert!(qos_mon::leg_owned_for_test(r), "owned while held");
+            panic!("the owner fails while it sends IE 271 (#2270)");
+        });
+        assert!(owner.await.is_err(), "the owner panicked");
+        assert!(!qos_mon::leg_owned_for_test(r), "the leg is let go");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            qos_mon::transport_delay_in_place(r),
+        )
+        .await
+        .expect("a later install's wait for the leg ends");
+        qos_mon::clear_for_test();
+    }
+
     /// #2208, off unless configured: with the default per QoS flow method (and
     /// with `gtpu_path` toward a PSA that did not advertise GPQM) the PCF's policy
     /// is a GTPUPM 0 SRR and no UL PDR is updated. And a decision with no
