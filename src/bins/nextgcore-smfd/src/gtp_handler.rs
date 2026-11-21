@@ -2637,25 +2637,26 @@ mod tests {
         let ue = sgwc
             .ue_add(&[0x09, 0x91, 0x07, 0x00, 0x00, 0x11, 0x13])
             .unwrap();
-        let mut ue = sgwc.ue_find_by_id(ue.id).unwrap();
-        ue.mme_s11_teid = 0x0a0b_0c0d;
-        ue.rat_type = gtp2_rat_type::EUTRAN;
-        sgwc.ue_update(&ue);
+        // In place: sgwcd's whole-copy writers are test-only within sgwcd (#2288).
+        sgwc.ue_modify(ue.id, |ue| {
+            ue.mme_s11_teid = 0x0a0b_0c0d;
+            ue.rat_type = gtp2_rat_type::EUTRAN;
+        });
+        let ue = sgwc.ue_find_by_id(ue.id).unwrap();
         let sgw_sess = sgwc.sess_add(ue.id, "internet").unwrap();
-        let mut sgw_sess = sgwc.sess_find_by_id(sgw_sess.id).unwrap();
-        sgw_sess.paa.pdn_type = 1;
-        sgwc.sess_update(&sgw_sess);
+        sgwc.sess_modify(sgw_sess.id, |s| s.paa.pdn_type = 1);
         let sgw_bearer = sgwc.bearer_add(sgw_sess.id).unwrap();
-        let mut sgw_bearer = sgwc.bearer_find_by_id(sgw_bearer.id).unwrap();
-        sgw_bearer.ebi = 5;
-        sgw_bearer.qci = 9;
-        sgw_bearer.arp_priority_level = 8;
-        sgwc.bearer_update(&sgw_bearer);
+        sgwc.bearer_modify(sgw_bearer.id, |b| {
+            b.ebi = 5;
+            b.qci = 9;
+            b.arp_priority_level = 8;
+        });
+        let sgw_bearer = sgwc.bearer_find_by_id(sgw_bearer.id).unwrap();
         for tunnel_id in &sgw_bearer.tunnel_ids {
-            let mut tunnel = sgwc.tunnel_find_by_id(*tunnel_id).unwrap();
-            tunnel.local_teid = 0x1113_0000 + *tunnel_id as u32;
-            tunnel.local_addr = Some(Ipv4Addr::new(10, 10, 0, 65));
-            sgwc.tunnel_update(&tunnel);
+            sgwc.tunnel_modify(*tunnel_id, |tunnel| {
+                tunnel.local_teid = 0x1113_0000 + *tunnel_id as u32;
+                tunnel.local_addr = Some(Ipv4Addr::new(10, 10, 0, 65));
+            });
         }
         let sgw_sess = sgwc.sess_find_by_id(sgw_sess.id).unwrap();
         let sgw_s5u = sgwc.dl_tunnel_in_bearer(sgw_bearer.id).unwrap().local_teid;

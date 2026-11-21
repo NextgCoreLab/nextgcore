@@ -497,7 +497,18 @@ pub(crate) fn on_pgw_request(
         bearer.mbr_dl = r.qos.mbr_dl;
         bearer.gbr_ul = r.qos.gbr_ul;
         bearer.gbr_dl = r.qos.gbr_dl;
-        ctx.bearer_update(&bearer);
+        // In place (#2288): the store's entry, not a copy written back.
+        ctx.bearer_modify(bearer.id, |b| {
+            b.ebi = bearer.ebi;
+            b.qci = bearer.qci;
+            b.arp_priority_level = bearer.arp_priority_level;
+            b.arp_pci = bearer.arp_pci;
+            b.arp_pvi = bearer.arp_pvi;
+            b.mbr_ul = bearer.mbr_ul;
+            b.mbr_dl = bearer.mbr_dl;
+            b.gbr_ul = bearer.gbr_ul;
+            b.gbr_dl = bearer.gbr_dl;
+        });
         for tunnel in [
             ctx.dl_tunnel_in_bearer(bearer.id),
             ctx.ul_tunnel_in_bearer(bearer.id),
@@ -505,22 +516,24 @@ pub(crate) fn on_pgw_request(
         .into_iter()
         .flatten()
         {
-            let mut tunnel = tunnel;
-            tunnel.local_teid = ctx.next_gtpu_teid();
-            tunnel.pdr_id = Some(ctx.next_pdr_id());
-            tunnel.far_id = Some(ctx.next_far_id());
-            tunnel.local_addr = Some(gtpu_addr);
-            ctx.tunnel_update(&tunnel);
+            let (teid, pdr, far) = (ctx.next_gtpu_teid(), ctx.next_pdr_id(), ctx.next_far_id());
+            ctx.tunnel_modify(tunnel.id, |t| {
+                t.local_teid = teid;
+                t.pdr_id = Some(pdr);
+                t.far_id = Some(far);
+                t.local_addr = Some(gtpu_addr);
+            });
         }
         // The uplink forwards to the PGW's S5/S8-U F-TEID. The downlink has no endpoint
         // yet, so its FAR buffers (`sxa_build::apply_action_for`).
-        if let Some(mut ul) = ctx.ul_tunnel_in_bearer(bearer.id) {
-            ul.remote_teid = r.pgw_s5u.teid;
-            ul.remote_ip = TunnelIp {
-                ipv4: r.pgw_s5u.ipv4_addr.map(std::net::Ipv4Addr::from),
-                ipv6: r.pgw_s5u.ipv6_addr.map(std::net::Ipv6Addr::from),
-            };
-            ctx.tunnel_update(&ul);
+        if let Some(ul) = ctx.ul_tunnel_in_bearer(bearer.id) {
+            ctx.tunnel_modify(ul.id, |ul| {
+                ul.remote_teid = r.pgw_s5u.teid;
+                ul.remote_ip = TunnelIp {
+                    ipv4: r.pgw_s5u.ipv4_addr.map(std::net::Ipv4Addr::from),
+                    ipv6: r.pgw_s5u.ipv6_addr.map(std::net::Ipv6Addr::from),
+                };
+            });
         }
         bearer_ids.push(bearer.id);
     }
@@ -712,17 +725,15 @@ pub(crate) fn on_mme_answer(server: &GtpcServer, msg: &Gtp2Message, mme_peer: So
                     && (5..=15).contains(&ebi)
                     && ebi_free =>
             {
-                if let Some(mut bearer) = ctx.bearer_find_by_id(bearer_id) {
-                    bearer.ebi = ebi;
-                    ctx.bearer_update(&bearer);
-                }
-                if let Some(mut dl) = ctx.dl_tunnel_in_bearer(bearer_id) {
-                    dl.remote_teid = enb.teid;
-                    dl.remote_ip = TunnelIp {
-                        ipv4: enb.ipv4_addr.map(std::net::Ipv4Addr::from),
-                        ipv6: enb.ipv6_addr.map(std::net::Ipv6Addr::from),
-                    };
-                    ctx.tunnel_update(&dl);
+                ctx.bearer_modify(bearer_id, |b| b.ebi = ebi);
+                if let Some(dl) = ctx.dl_tunnel_in_bearer(bearer_id) {
+                    ctx.tunnel_modify(dl.id, |dl| {
+                        dl.remote_teid = enb.teid;
+                        dl.remote_ip = TunnelIp {
+                            ipv4: enb.ipv4_addr.map(std::net::Ipv4Addr::from),
+                            ipv6: enb.ipv6_addr.map(std::net::Ipv6Addr::from),
+                        };
+                    });
                 }
                 outcomes.push((bearer_id, ebi, gtp_cause::REQUEST_ACCEPTED));
                 accepted.push(bearer_id);

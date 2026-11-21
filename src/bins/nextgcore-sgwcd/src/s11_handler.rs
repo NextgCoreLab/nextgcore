@@ -155,7 +155,7 @@ fn handle_create_session_continue(imsi: &[u8], apn: &str, ebi: u8) -> HandlerRes
     let bearer = match ctx.bearer_add(sess.id) {
         Some(mut b) => {
             b.ebi = ebi;
-            ctx.bearer_update(&b);
+            ctx.bearer_modify(b.id, |stored| stored.ebi = ebi);
             b
         }
         None => {
@@ -178,6 +178,12 @@ fn handle_create_session_continue(imsi: &[u8], apn: &str, ebi: u8) -> HandlerRes
 
 /// Handle Modify Bearer Request from MME
 /// Port of sgwc_s11_handle_modify_bearer_request
+///
+/// Validates the bearer only. The downlink tunnel's new eNB endpoint (TEID, address
+/// and generation) is written by the dispatcher in ONE in-place step (#2288): it used
+/// to be two copy-and-write-back steps, the TEID here and the address there, so a
+/// release or rollback landing in between left this request's address with another
+/// writer's TEID.
 pub fn handle_modify_bearer_request(
     sgwc_ue: Option<&SgwcUe>,
     _xact_id: u64,
@@ -206,13 +212,10 @@ pub fn handle_modify_bearer_request(
         }
     };
 
-    // Update DL tunnel with eNB TEID
-    if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
-        dl_tunnel.remote_teid = enb_teid;
-        ctx.tunnel_update(&dl_tunnel);
+    if let Some(dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
         log::info!(
             "    ENB_S1U_TEID[{}] SGW_S1U_TEID[{}]",
-            dl_tunnel.remote_teid,
+            enb_teid,
             dl_tunnel.local_teid
         );
     }
@@ -557,7 +560,16 @@ pub fn handle_create_indirect_data_forwarding_tunnel_request(
                 ipv4: remote_ip.map(Ipv4Addr::from),
                 ipv6: remote_ip6.map(std::net::Ipv6Addr::from),
             };
-            ctx.tunnel_update(&tunnel);
+            // In place (#2288).
+            let fresh = tunnel.clone();
+            ctx.tunnel_modify(tunnel.id, |t| {
+                t.local_teid = fresh.local_teid;
+                t.local_addr = fresh.local_addr;
+                t.pdr_id = fresh.pdr_id;
+                t.far_id = fresh.far_id;
+                t.remote_teid = fresh.remote_teid;
+                t.remote_ip = fresh.remote_ip;
+            });
             allocated += 1;
         }
     }

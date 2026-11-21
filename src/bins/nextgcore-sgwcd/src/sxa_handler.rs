@@ -118,10 +118,22 @@ pub fn handle_session_establishment_response(
 
     let ctx = sgwc_self();
 
-    // Update session with SGW-U SEID
+    // Update session with SGW-U SEID, in place (#2288): the caller's snapshot
+    // written back would resurrect a session a concurrent Delete Session removed, and
+    // revert whatever another procedure set since the snapshot.
     let mut sess = sess.clone();
     sess.sgwu_sxa_seid = up_f_seid;
-    ctx.sess_update(&sess);
+    crate::context::race_point("sess_sgwu_seid");
+    if ctx
+        .sess_modify(sess.id, |s| s.sgwu_sxa_seid = up_f_seid)
+        .is_none()
+    {
+        log::warn!(
+            "Session {} was removed before its PFCP Session Establishment Response",
+            sess.id
+        );
+        return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
+    }
 
     log::info!(
         "    SGW_S5C_TEID[0x{:x}] PGW_S5C_TEID[0x{:x}]",

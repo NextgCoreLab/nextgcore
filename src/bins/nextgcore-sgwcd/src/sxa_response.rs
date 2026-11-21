@@ -389,15 +389,24 @@ pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) 
                     // old eNB endpoint, so the SGW-C does too. Otherwise a later
                     // PFCP modification built from this tunnel would push an
                     // endpoint the MME never confirmed.
-                    if let (Some((teid, ip)), Some(mut dl)) =
+                    // #2288: the generation check and the restore are one in-place
+                    // step, so a newer Modify Bearer cannot land between them and
+                    // have its endpoint overwritten with this one's previous.
+                    if let (Some((teid, ip)), Some(dl)) =
                         (b.previous, ctx.dl_tunnel_in_bearer(b.bearer_id))
                     {
-                        let still_ours = dl.generation == b.written;
-                        if still_ours {
-                            dl.remote_teid = teid;
-                            dl.remote_ip = ip;
-                            ctx.tunnel_update(&dl);
-                        } else {
+                        crate::context::race_point("mbr_rollback");
+                        let still_ours = ctx
+                            .tunnel_modify(dl.id, |dl| {
+                                let ours = dl.generation == b.written;
+                                if ours {
+                                    dl.remote_teid = teid;
+                                    dl.remote_ip = ip;
+                                }
+                                ours
+                            })
+                            .unwrap_or(false);
+                        if !still_ours {
                             log::info!(
                                 "EBI {}: the DL endpoint changed after this Modify Bearer \
                                  Request; its refusal leaves the newer one",
@@ -1084,6 +1093,220 @@ mod modify_bearer_tests {
             ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
             0x2222,
             "the newer writer's endpoint stays"
+        );
+        ctx.ue_remove(ue.id);
+    }
+}
+
+/// #2288 (R48 on #2290): the copy-then-write-back races in the SGW-C, each made
+/// deterministic. A race point runs a competing writer exactly where the old code held
+/// its copy (after the lookup, before the write); the in-place `*_modify` writes see
+/// it, where a copy written back would overwrite it or bring back what it removed.
+#[cfg(test)]
+mod copy_write_back_race_tests {
+    use super::*;
+    use crate::context::{on_race_point, IpAddr};
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr {
+            ipv4: Some(std::net::Ipv4Addr::new(10, 22, 88, last)),
+            ipv6: None,
+        }
+    }
+
+    type Endpoint = (u32, Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>);
+
+    fn endpoint(bearer_id: u64) -> Endpoint {
+        let dl = sgwc_self()
+            .dl_tunnel_in_bearer(bearer_id)
+            .expect("a DL tunnel");
+        (dl.remote_teid, dl.remote_ip.ipv4, dl.remote_ip.ipv6)
+    }
+
+    fn at(teid: u32, last: u8) -> Endpoint {
+        let ip = ip(last);
+        (teid, ip.ipv4, ip.ipv6)
+    }
+
+    /// R48 MAJOR 1: a Modify Bearer refused by the SGW-U rolls its endpoint back only
+    /// while the tunnel still holds its write. A newer Modify Bearer landing between
+    /// the rollback's lookup and its write keeps its endpoint.
+    ///
+    /// Revert-verified: with the generation checked on a copy taken at the lookup and
+    /// the copy written back, the newer endpoint is overwritten with the old one.
+    #[test]
+    fn a_rollback_never_overwrites_a_newer_modify_bearer() {
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        crate::context::clear_race_points();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010228800001").expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let bearer = ctx.bearer_add(sess.id).expect("bearer");
+        ctx.bearer_modify(bearer.id, |b| b.ebi = 5);
+        let (previous, written) =
+            crate::gtp_path::write_modify_bearer_endpoint(bearer.id, 0x1111, ip(1));
+        let join = park_modify_bearer(PendingModifyBearer {
+            peer: "127.0.0.1:2123".parse().unwrap(),
+            seq: 0x2288,
+            mme_teid: 1,
+            waiting: [(
+                sess.id,
+                vec![SwitchedBearer {
+                    bearer_id: bearer.id,
+                    ebi: 5,
+                    previous,
+                    written,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            modified: Vec::new(),
+            marked_for_removal: Vec::new(),
+        });
+        let bearer_id = bearer.id;
+        on_race_point("mbr_rollback", move || {
+            crate::gtp_path::write_modify_bearer_endpoint(bearer_id, 0x2222, ip(2));
+        });
+        modify_bearer_session_done(join, sess.id, Some(gtp_cause::SYSTEM_FAILURE));
+        assert_eq!(
+            endpoint(bearer.id),
+            at(0x2222, 2),
+            "the newer Modify Bearer's endpoint stays"
+        );
+        assert_eq!(
+            crate::context::race_points_pending(),
+            0,
+            "the race point was reached"
+        );
+        ctx.ue_remove(ue.id);
+    }
+
+    /// R48 MAJOR 2: a Modify Bearer writes the eNB's TEID and address together. A
+    /// release landing just before the write leaves this request's full endpoint,
+    /// never a mix of the release's TEID 0 and this request's address.
+    ///
+    /// Revert-verified: with the TEID written first and the address written from a
+    /// fresh copy after the release, the tunnel holds TEID 0 with the new address.
+    #[test]
+    fn a_modify_bearer_writes_its_teid_and_address_together() {
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        crate::context::clear_race_points();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010228800002").expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let bearer = ctx.bearer_add(sess.id).expect("bearer");
+        let _ = crate::gtp_path::write_modify_bearer_endpoint(bearer.id, 0x1111, ip(1));
+        let dl_id = ctx.dl_tunnel_in_bearer(bearer.id).expect("DL").id;
+        on_race_point("mbr_write", move || {
+            sgwc_self().tunnel_modify(dl_id, |t| {
+                t.remote_teid = 0;
+                t.remote_ip = IpAddr::default();
+            });
+        });
+        let (_, written) = crate::gtp_path::write_modify_bearer_endpoint(bearer.id, 0x3333, ip(3));
+        assert_eq!(
+            endpoint(bearer.id),
+            at(0x3333, 3),
+            "one consistent endpoint"
+        );
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().generation,
+            written,
+            "the generation returned is the one the write left"
+        );
+        assert_eq!(
+            crate::context::race_points_pending(),
+            0,
+            "the race point was reached"
+        );
+        ctx.ue_remove(ue.id);
+    }
+
+    /// R48 MAJOR 3: releasing the S1-U bearers changes the tunnels in place. A tunnel
+    /// removed while the release was underway stays removed.
+    ///
+    /// Revert-verified: with the release writing back the copy it looked up, the
+    /// removed tunnel is back.
+    #[test]
+    fn releasing_s1u_never_brings_back_a_removed_tunnel() {
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        crate::context::clear_race_points();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010228800003").expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let bearer = ctx.bearer_add(sess.id).expect("bearer");
+        let _ = crate::gtp_path::write_modify_bearer_endpoint(bearer.id, 0x1111, ip(1));
+        let dl_id = ctx.dl_tunnel_in_bearer(bearer.id).expect("DL").id;
+        on_race_point("release_s1u", move || {
+            sgwc_self().tunnel_remove(dl_id);
+        });
+        let ue = ctx.ue_find_by_id(ue.id).expect("ue");
+        let _ = crate::gtp_path::release_s1u_bearers(&ue, 0x2288);
+        assert!(
+            ctx.tunnel_find_by_id(dl_id).is_none(),
+            "the removed tunnel is not resurrected"
+        );
+        assert_eq!(
+            crate::context::race_points_pending(),
+            0,
+            "the race point was reached"
+        );
+        ctx.ue_remove(ue.id);
+    }
+
+    /// R48 MAJOR 4: the PFCP Session Establishment Response and the S5/S8 Create
+    /// Session Response each set one session field in place. A session a concurrent
+    /// Delete Session removed after the caller's snapshot stays removed, and the
+    /// response is answered as for no context.
+    ///
+    /// Revert-verified: with the snapshot written back, the session is resurrected.
+    #[test]
+    fn a_response_never_resurrects_a_deleted_session() {
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        crate::context::clear_race_points();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010228800004").expect("ue");
+        for point in ["sess_sgwu_seid", "sess_pgw_s5c_teid"] {
+            let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+            let snapshot = ctx.sess_find_by_id(sess.id).expect("snapshot");
+            let sess_id = sess.id;
+            on_race_point(point, move || {
+                sgwc_self().sess_remove(sess_id);
+            });
+            let no_context = if point == "sess_sgwu_seid" {
+                matches!(
+                    crate::sxa_handler::handle_session_establishment_response(
+                        Some(&snapshot),
+                        0,
+                        crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+                        0x5e1d,
+                    ),
+                    crate::sxa_handler::HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND)
+                )
+            } else {
+                matches!(
+                    crate::s5c_handler::handle_create_session_response(
+                        Some(&snapshot),
+                        0,
+                        &[],
+                        gtp_cause::REQUEST_ACCEPTED,
+                        0x5c,
+                        0x5d,
+                        IpAddr::default(),
+                    ),
+                    crate::s5c_handler::HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND)
+                )
+            };
+            assert!(
+                ctx.sess_find_by_id(sess_id).is_none(),
+                "{point}: the deleted session is not resurrected"
+            );
+            assert!(no_context, "{point}: answered as for no context");
+        }
+        assert_eq!(
+            crate::context::race_points_pending(),
+            0,
+            "the race point was reached"
         );
         ctx.ue_remove(ue.id);
     }
