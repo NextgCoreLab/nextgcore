@@ -161,6 +161,37 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
     f(g.get_or_insert_with(HashMap::new))
 }
 
+/// #2270 follow-up: told whenever a task lets go of a session's IE 271 leg
+/// ([`SessionMon::tdr_busy`]), for [`transport_delay_in_place`].
+static TDR_IDLE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// #2270 follow-up: test-only, holds session `r`'s IE 271 leg as another task's
+/// [`sync_transport_delay`] would while its Update PDR is in flight. Let go when
+/// dropped.
+#[cfg(test)]
+#[must_use = "the leg is held until this drops"]
+pub(crate) struct TransportDelayLegHeld(String);
+
+#[cfg(test)]
+impl TransportDelayLegHeld {
+    pub(crate) fn hold(r: &str) -> Self {
+        with(|m| m.entry(r.to_string()).or_default().tdr_busy = true);
+        Self(r.to_string())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransportDelayLegHeld {
+    fn drop(&mut self) {
+        with(|m| {
+            if let Some(s) = m.get_mut(&self.0) {
+                s.tdr_busy = false;
+            }
+        });
+        TDR_IDLE.notify_waiters();
+    }
+}
+
 /// Drop a session's entry once it holds nothing.
 fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
     if m.get(r).is_some_and(|s| {
@@ -848,7 +879,7 @@ async fn install(sm_context_ref: &str, key: &str) -> bool {
     };
     // #2208: the PSA's UL PDR names its preceding UL GTP-U peer before the GTPUPM
     // SRR asks it to measure (TS 29.244 §5.24.5.3).
-    sync_transport_delay(sm_context_ref).await;
+    transport_delay_in_place(sm_context_ref).await;
     n4_hold(SrrOp::Create).await;
     let params = crate::n4_build::SessionModificationParams {
         create_srrs: vec![(srr_id, want.clone())],
@@ -1062,6 +1093,37 @@ fn transport_delay_wanted(
 /// SRR goes. One task per session sends, looking again after each request, so the
 /// last Update PDR the PSA gets names the current peer.
 pub async fn sync_transport_delay(r: &str) {
+    sync_transport_delay_once(r).await;
+    // Whoever lets go of the leg says so, for `transport_delay_in_place`.
+    TDR_IDLE.notify_waiters();
+}
+
+/// #2270 follow-up: [`sync_transport_delay`], waiting first for another task that
+/// owns the leg to let go of it, so IE 271 is in place when this returns. A plain
+/// [`sync_transport_delay`] that finds the leg owned only flags the owner and
+/// returns, and `install` then sent its Create SRR while the owner's Update PDR
+/// (spawned by `on_session_request` after the policy's own N4 request) was still
+/// on its way: the PSA got the SRR first ("IE 271 before the GTPUPM SRR" failed
+/// under load).
+async fn transport_delay_in_place(r: &str) {
+    loop {
+        let idle = TDR_IDLE.notified();
+        tokio::pin!(idle);
+        // Before the look, so a let-go between the look and the wait is not missed.
+        idle.as_mut().enable();
+        if !with(|m| m.get(r).is_some_and(|s| s.tdr_busy)) {
+            sync_transport_delay(r).await;
+            // Taken by another task between the look and the claim: wait for it.
+            if !with(|m| m.get(r).is_some_and(|s| s.tdr_busy)) {
+                return;
+            }
+            continue;
+        }
+        idle.await;
+    }
+}
+
+async fn sync_transport_delay_once(r: &str) {
     let claimed = with(|m| {
         let Some(s) = m.get_mut(r) else {
             return false;

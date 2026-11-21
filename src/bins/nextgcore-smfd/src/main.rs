@@ -37350,6 +37350,72 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// #2270 follow-up (the `..._ie_271_at_the_psa_2208` flake, "IE 271 before the
+    /// GTPUPM SRR" 1/200 loaded): a GTPUPM install waits for an IE 271 another
+    /// task is sending, and the Create SRR goes only once the PSA's UL PDR names
+    /// its peer (TS 29.244 §5.24.5.3). Under load the policy's own N4 request had
+    /// `on_session_request` spawn that other task, and `install`'s
+    /// `sync_transport_delay` only flagged it and returned.
+    ///
+    /// REVERT-VERIFIED: with `install` calling `sync_transport_delay` again, the
+    /// Create SRR is prepared while the leg is held ("no Create SRR while another
+    /// task is sending IE 271" fails).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gtpupm_srr_waits_for_an_ie_271_another_task_is_sending_2270() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
+        let _method = pcc_qos_mon::MethodForTest::set(pcc_qos_mon::Method::GtpuPath);
+        let supi = "imsi-001010000022701";
+        let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, true).await;
+        upf.clear_seen();
+
+        let create = qos_mon::N4Hold::arm(qos_mon::SrrOp::Create);
+        let held = qos_mon::TransportDelayLegHeld::hold(&reference);
+        let r = reference.clone();
+        let notify =
+            tokio::spawn(async move { notify_2208(&r, pcc_qos_mon_decision_2208()).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), create.reached())
+                .await
+                .is_err(),
+            "no Create SRR while another task is sending IE 271"
+        );
+        drop(held);
+        create.reached().await;
+        assert!(
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !tdr_updates_2208(b).is_empty()),
+            "IE 271 is in place before the Create SRR is sent"
+        );
+        create.release();
+        notify.await.expect("the notify");
+        wait_until(|| {
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !srr_ops_1390(b).0.is_empty())
+        })
+        .await;
+        let bodies = upf.modification_bodies();
+        let tdr_at = bodies.iter().position(|b| !tdr_updates_2208(b).is_empty());
+        let create_at = bodies.iter().position(|b| !srr_ops_1390(b).0.is_empty());
+        assert!(tdr_at < create_at, "IE 271 before the GTPUPM SRR");
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        pcc_qos_mon::clear_for_test();
+        amf.stop().await.ok();
+    }
+
     /// #2208, off unless configured: with the default per QoS flow method (and
     /// with `gtpu_path` toward a PSA that did not advertise GPQM) the PCF's policy
     /// is a GTPUPM 0 SRR and no UL PDR is updated. And a decision with no
