@@ -953,7 +953,7 @@ jobs:
           sudo TOL_MS=5 bash docker/qos-delay-netem/run.sh src/target/debug/nextgcore-upfd /tmp/qos-delay-netem
       - name: upload the netem leg logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qos-delay-netem
           path: /tmp/qos-delay-netem
@@ -1026,7 +1026,7 @@ jobs:
         run: bash docker/iupf-delay-e2e/check-lease.sh "$RUNNER_TEMP/iupf-delay-bin" "$IUPF_DELAY_OUT/lease"
       - name: upload the logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: iupf-delay-e2e
           path: ${{ runner.temp }}/iupf-delay
@@ -2605,7 +2605,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the manifest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: validated-pair
           path: validated-pair.json
@@ -2646,7 +2646,7 @@ jobs:
         run: sudo bash docker/nat-exclude/run.sh src/target/debug/nextgcore-upfd /tmp/nat-exclude
       - name: upload the leg logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nat-exclude
           path: /tmp/nat-exclude
@@ -2748,7 +2748,7 @@ jobs:
         run: git diff --quiet HEAD -- || { echo "::error::tracked files differ from HEAD"; git status --short; exit 1; }
       - name: upload the captured logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: demo-d441e
           path: ${{ runner.temp }}/d441e
