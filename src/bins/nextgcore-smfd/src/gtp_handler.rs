@@ -1652,9 +1652,9 @@ async fn create_session(
         return;
     };
 
-    // #2291: the session as it was created, so only what this handler sets is written
-    // back across its N4 round trips.
-    let sess_created = sess.clone();
+    // #2291: the session and UE as they were found, so only what this handler sets is
+    // written back across its N4 round trips.
+    let (sess_created, ue_found) = (sess.clone(), smf_ue.clone());
 
     // The SGW's control-plane TEID is what the response is addressed to, and the PDN
     // address is the one THIS node allocated rather than the one the SGW-C proposed.
@@ -1867,6 +1867,11 @@ async fn create_session(
         // `bearer_add` appends to under the context's own lock) and anything another
         // task wrote across the N4 round trips stay as they are, and a session released
         // meanwhile is not brought back.
+        // The MSISDN the request carried (TS 29.274 §8.11), on the UE. It was set on a
+        // copy and never stored (#2291).
+        ctx.ue_modify(smf_ue.id, |u| {
+            crate::context::merge_changed!(u, smf_ue, ue_found; msisdn, msisdn_bcd);
+        });
         ctx.sess_modify(sess.id, |s| {
             crate::context::merge_changed!(s, sess, sess_created;
                 sgw_s5c_teid, sgw_s5c_interface_type, sgw_s5c_ip, sgw_restart_counter,
@@ -7039,6 +7044,56 @@ mod tests {
             1,
             "and the default bearer is linked"
         );
+        server.close();
+    }
+
+    /// #2291: the MSISDN a Create Session Request carries (TS 29.274 §8.11) is stored
+    /// on the UE. The handler set it on a copy of the UE that nothing wrote back, so the
+    /// stored UE never had it.
+    ///
+    /// REVERT-VERIFIED: with the UE write-back (`ue_modify`) removed, "the MSISDN is
+    /// stored on the UE" fails.
+    #[tokio::test]
+    async fn a_create_session_stores_the_msisdn_on_the_ue_2291() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+        // IMSI ...0x94: this test's alone. MSISDN 46 70 12 34 56 (BCD, TS 29.274 §8.11).
+        let mut csr = s5c_csr(0x94, 0x2294_0001, [10, 99, 99, 99]);
+        let imsi_pos = csr
+            .windows(8)
+            .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .expect("IMSI");
+        csr[imsi_pos + 7] = 0x94;
+        let msisdn = [0x64, 0x07, 0x21, 0x43, 0x65];
+        let mut b = bytes::Bytes::copy_from_slice(&csr);
+        let mut msg = nextgcore_gtp::v2::Gtp2Message::decode(&mut b).expect("decode");
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Msisdn as u8,
+            0,
+            &msisdn,
+        ));
+        sgw.send_to(&msg.encode(), server.local_addr())
+            .await
+            .expect("send");
+        let _ = recv_type(&sgw, gtp2_message_type::CREATE_SESSION_RESPONSE).await;
+        let ue = the_only_session()
+            .and_then(|s| {
+                crate::context::smf_self()
+                    .read()
+                    .unwrap()
+                    .ue_find_by_id(s.smf_ue_id)
+            })
+            .expect("the UE");
+        assert_eq!(ue.msisdn, msisdn, "the MSISDN is stored on the UE");
+        assert_eq!(ue.msisdn_bcd, buffer_to_bcd(&msisdn));
         server.close();
     }
 

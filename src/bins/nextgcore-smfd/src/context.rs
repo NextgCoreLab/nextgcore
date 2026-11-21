@@ -3437,8 +3437,18 @@ impl SmfContext {
         smf_ue_list.get(&id).cloned()
     }
 
-    /// Write a whole UE copy back (tests only, #2291; see `sess_update`). No
-    /// production code writes a UE back.
+    /// Change UE `id` in place under the UE list's write lock (#2291); see
+    /// [`Self::sess_modify`]. A UE removed meanwhile is not resurrected (`None`).
+    /// `f` must not call back into the context.
+    pub fn ue_modify<R>(&self, id: u64, f: impl FnOnce(&mut SmfUe) -> R) -> Option<R> {
+        let mut list = self.smf_ue_list.write().ok()?;
+        let ue = list.get_mut(&id)?;
+        let r = f(ue);
+        ue.id = id;
+        Some(r)
+    }
+
+    /// Write a whole UE copy back (tests only, #2291; see `sess_update`).
     #[cfg(test)]
     pub fn ue_update(&self, ue: &SmfUe) -> bool {
         if let Ok(mut smf_ue_list) = self.smf_ue_list.write() {
