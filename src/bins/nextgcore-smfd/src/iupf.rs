@@ -134,6 +134,17 @@ struct Config {
 
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 
+/// #2270: the configured I-UPF, as [`set`] takes it, for
+/// `context::AmbientRestore`'s snapshot.
+#[cfg(test)]
+pub(crate) fn get_for_test() -> Option<(Arc<PfcpClient>, Vec<String>)> {
+    CONFIG
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| (c.client.clone(), c.dnns.clone()))
+}
+
 /// Install the configured I-UPF (startup, and tests).
 pub fn set(client: Option<(Arc<PfcpClient>, Vec<String>)>) {
     *CONFIG.write().unwrap_or_else(|e| e.into_inner()) =

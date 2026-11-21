@@ -1381,6 +1381,7 @@ mod tests {
     #[tokio::test]
     async fn boot_counts_out_an_unrestorable_admitted_session() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _n4 = N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

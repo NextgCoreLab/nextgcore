@@ -71,6 +71,31 @@ pub fn install(mode: Option<&str>) {
     }
 }
 
+/// #2270 (R47 on #2282): puts [`ACTIVE`] back as it was when made, when it drops,
+/// passing or panicking. It borrows [`TEST_LOCK`]'s guard, so it restores while
+/// that lock is held.
+#[cfg(test)]
+#[must_use = "it restores when it drops"]
+pub(crate) struct ActiveRestore<'held>(bool, &'held crate::context::TestLockGuard);
+
+#[cfg(test)]
+impl<'held> ActiveRestore<'held> {
+    pub(crate) fn new(held: &'held crate::context::TestLockGuard) -> Self {
+        assert!(
+            held.is_of(&TEST_LOCK),
+            "ActiveRestore: pass demo_d443a::TEST_LOCK's guard"
+        );
+        Self(active(), held)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveRestore<'_> {
+    fn drop(&mut self) {
+        ACTIVE.store(self.0, Ordering::SeqCst);
+    }
+}
+
 /// Test only: set the decision without the banner.
 #[cfg(test)]
 pub(crate) fn set_active_for_test(on: bool) {
@@ -186,6 +211,7 @@ mod tests {
     async fn the_notification_carries_the_psa_upf_s_n6_delays_only_when_on_471() {
         let _n6 = n6_delay::N6_TEST_LOCK.lock().await;
         let _t = TEST_LOCK.lock().await;
+        let _active = ActiveRestore::new(&_t);
         n6_delay::reset_for_test();
         let a: IpAddr = "10.60.0.12".parse().unwrap();
         let b: IpAddr = "10.60.0.11".parse().unwrap();

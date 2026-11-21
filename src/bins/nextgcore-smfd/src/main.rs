@@ -14484,6 +14484,7 @@ mod tests {
     #[tokio::test]
     async fn a_releasing_shutdown_tells_the_sgw_with_a_blackholed_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -14665,6 +14666,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_create_failure_releases_the_session_without_announcing_it() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _g = event_exposure::lock_store();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -18728,6 +18730,7 @@ mod tests {
     #[tokio::test]
     async fn nudm_calls_reuse_pooled_connections_without_oauth2_1648() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let sk = p256::ecdsa::SigningKey::from_slice(&[19u8; 32]).expect("key");
         let (_udm, udm_port, seen) = oauth2_producer_1648(
             &sk,
@@ -18767,6 +18770,7 @@ mod tests {
     #[tokio::test]
     async fn tokened_udm_calls_reuse_pooled_connections_and_namf_is_not_cached_1648() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _cache = TOKENED_PEER_CLIENTS_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[20u8; 32]).expect("key");
         let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
@@ -18906,6 +18910,7 @@ mod tests {
     #[tokio::test]
     async fn namf_service_requests_pass_an_oauth2_required_amf_1648() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let sk = p256::ecdsa::SigningKey::from_slice(&[16u8; 32]).expect("key");
         let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
         let (_amf, port, seen) =
@@ -19005,6 +19010,7 @@ mod tests {
     #[tokio::test]
     async fn nudm_service_requests_pass_an_oauth2_required_udm_1648() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let sk = p256::ecdsa::SigningKey::from_slice(&[17u8; 32]).expect("key");
         let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
         let sm_data = sm_data_with("40 Mbps", "80 Mbps", 6);
@@ -19103,6 +19109,7 @@ mod tests {
     #[tokio::test]
     async fn neasdf_service_requests_pass_an_oauth2_required_easdf_1648() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let sk = p256::ecdsa::SigningKey::from_slice(&[18u8; 32]).expect("key");
         let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
         let (_easdf, easdf_port, seen) =
@@ -19175,6 +19182,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_subscribed_default_dnn_queries_the_udm_and_returns_the_flagged_dnn() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         // The stub UDM is a loopback PLAINTEXT peer, which describes a dev-profile
         // deployment; the default profile is Production and would require client
         // TLS material this test has no business inventing.
@@ -20170,6 +20178,7 @@ mod tests {
         // Lock order (see `context::PROCESS_STATE_TEST_LOCK`): ambient state first,
         // N4 second — `stand_in` takes the N4 lock on this test's behalf.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
@@ -20237,6 +20246,7 @@ mod tests {
         // Lock order (see `context::PROCESS_STATE_TEST_LOCK`): ambient state first,
         // N4 second — `stand_in` takes the N4 lock on this test's behalf.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
@@ -20313,6 +20323,7 @@ mod tests {
     #[tokio::test]
     async fn releasing_a_session_deletes_its_easdf_dns_context() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
 
         seed_binding("easdf-release-ref", 9);
@@ -20522,6 +20533,7 @@ mod tests {
     #[tokio::test]
     async fn releasing_a_session_returns_its_ebi_to_the_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         eps_iwk::set_for_test(true);
         let (amf, amf_uri, seen) = spawn_recording_amf().await;
@@ -20591,6 +20603,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_interworking_leg_releases_no_ebi() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         eps_iwk::set_for_test(false);
         let (amf, amf_uri, seen) = spawn_recording_amf().await;
@@ -20624,6 +20637,7 @@ mod tests {
     #[tokio::test]
     async fn a_container_on_a_create_changes_nothing_when_the_leg_is_off() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _upf = pfcp_path::stand_in::associated_upf().await;
@@ -20694,6 +20708,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_ebi_release_does_not_fail_the_session_release() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         eps_iwk::set_for_test(true);
 
@@ -20724,6 +20739,7 @@ mod tests {
     #[tokio::test]
     async fn the_create_subscribes_to_sm_data_and_the_release_deregisters_and_unsubscribes() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let upf = pfcp_path::stand_in::associated_upf().await;
@@ -20879,6 +20895,7 @@ mod tests {
     #[tokio::test]
     async fn a_sdm_notification_applies_the_changed_ambr_to_a_live_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM now answers with DIFFERENT values from the ones the session holds.
@@ -21103,6 +21120,7 @@ mod tests {
     #[tokio::test]
     async fn the_establishment_request_provisions_a_urr_bound_to_both_pdrs() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         std::env::set_var("SMF_URR_VOLUME_QUOTA", "5000000");
@@ -21283,6 +21301,7 @@ mod tests {
     #[test]
     fn a_zero_or_unparseable_quota_is_ignored() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         std::env::set_var("SMF_URR_VOLUME_QUOTA", "0");
         std::env::set_var("SMF_URR_TIME_QUOTA", "not-a-number");
         let params = session_urr_params();
@@ -21323,6 +21342,7 @@ mod tests {
     #[tokio::test]
     async fn a_ue_completed_release_deregisters_from_the_udm_and_frees_the_address() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, seen) = spawn_recording_udm(serde_json::json!({})).await;
         udm::set_for_test(true);
@@ -21608,6 +21628,7 @@ mod tests {
     #[tokio::test]
     async fn an_amf_release_racing_t3592_frees_the_address_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -21647,6 +21668,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_session_waits_for_the_previous_release_of_its_psi() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -21724,6 +21746,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_registers_only_after_the_old_deregistration_is_answered() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -21811,6 +21834,7 @@ mod tests {
     #[tokio::test]
     async fn the_release_side_effect_drain_is_bounded() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -21850,6 +21874,7 @@ mod tests {
     #[tokio::test]
     async fn ue_requested_and_t3592_releases_tell_the_udm() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -21922,6 +21947,7 @@ mod tests {
     #[tokio::test]
     async fn a_deregistration_the_udm_never_answers_holds_a_create_only_for_its_bound() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -21977,6 +22003,7 @@ mod tests {
     #[tokio::test]
     async fn the_udm_cleanup_is_not_held_behind_the_release_fanout() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -22022,6 +22049,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_queued_for_the_udm_is_superseded_not_waited_for() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -22124,6 +22152,7 @@ mod tests {
     #[tokio::test]
     async fn no_t3592_for_a_context_the_user_plane_release_completed() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -22232,6 +22261,7 @@ mod tests {
     #[tokio::test]
     async fn the_nsacf_decrease_names_the_nf_id_of_the_increase() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -22846,6 +22876,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_sends_the_nsacf_decrease_for_an_admitted_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -22919,6 +22950,7 @@ mod tests {
     #[tokio::test]
     async fn a_releasing_shutdown_counts_out_the_unreleased_sessions_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -23038,6 +23070,7 @@ mod tests {
     #[tokio::test]
     async fn a_reestablishment_counts_in_after_the_old_session_counts_out() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23159,6 +23192,7 @@ mod tests {
     #[tokio::test]
     async fn a_reestablishment_takes_over_a_decrease_not_yet_sent() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23218,6 +23252,7 @@ mod tests {
     #[tokio::test]
     async fn a_reestablishment_on_another_slice_neither_waits_nor_takes_over() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23284,6 +23319,7 @@ mod tests {
     #[tokio::test]
     async fn a_releasing_shutdown_counts_out_while_the_release_runs_out_its_time() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23357,6 +23393,7 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_count_out_reports_only_accepted_decreases() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -23387,6 +23424,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_failing_at_the_n2_encode_counts_out_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23427,6 +23465,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_on_an_unsubscribed_slice_is_refused_and_rolled_back_1878() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23724,6 +23763,7 @@ mod tests {
     /// 201 was read.
     async fn cancelled_create_1874(stage: Option<CreateStage1874>, supi: &str, psi: u8) {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -23928,6 +23968,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_create_spares_the_retry_that_replaced_it_1890() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _g = event_exposure::lock_store();
         event_exposure::clear_for_test();
@@ -24076,6 +24117,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_nsacf_decrease_is_counted() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (nsacf, seen) = recording_nsacf(
             204,
@@ -24156,6 +24198,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_nsac_decrease_is_reconciled_when_the_nsacf_recovers_1875() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         reconcile::clear_for_test();
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
@@ -24198,6 +24241,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_sm_policy_delete_is_reconciled_when_the_pcf_recovers_1875() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         reconcile::clear_for_test();
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
@@ -24234,6 +24278,7 @@ mod tests {
     #[tokio::test]
     async fn failed_udm_release_cleanups_are_reconciled_when_the_udm_recovers_1875() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         reconcile::clear_for_test();
@@ -24277,6 +24322,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_session_for_the_pair_supersedes_a_parked_cleanup_1875() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -24361,6 +24407,7 @@ mod tests {
     #[tokio::test]
     async fn a_live_session_on_another_slice_does_not_supersede_a_decrease_1900() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -24415,6 +24462,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_waits_for_a_reconciler_decrease_on_the_wire_1900() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -24516,6 +24564,7 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_increase_is_reconciled_with_a_decrease() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -24589,6 +24638,7 @@ mod tests {
     #[tokio::test]
     async fn a_created_and_released_session_is_counted_in_and_out_at_the_nsacf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25076,6 +25126,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_report_deactivates_the_sessions_toward_the_failed_peer() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25170,6 +25221,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_still_down_after_the_hold_releases_the_session() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -25215,6 +25267,7 @@ mod tests {
     #[tokio::test]
     async fn a_recovery_report_cancels_the_hold() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25323,6 +25376,7 @@ mod tests {
     #[tokio::test]
     async fn an_epc_pdn_connection_toward_a_failed_sgw_u_is_deleted_after_the_hold() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         smf_context_init(64, 256, 512);
         let upf = pfcp_path::stand_in::associated_upf().await;
         up_path::reset_for_test();
@@ -25380,6 +25434,7 @@ mod tests {
     #[tokio::test]
     async fn a_restored_failed_path_is_held_again_and_released() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25428,6 +25483,7 @@ mod tests {
     #[tokio::test]
     async fn a_restored_hold_waits_for_the_association_and_drops_unknown_upfs() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25488,6 +25544,7 @@ mod tests {
     #[tokio::test]
     async fn a_shutdown_stops_the_holds_before_deregistering() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25538,6 +25595,7 @@ mod tests {
     #[tokio::test]
     async fn with_no_hold_a_failure_releases_without_a_separate_deactivation() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25587,6 +25645,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_that_fails_after_a_supersede_removes_its_udm_records() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -25763,6 +25822,7 @@ mod tests {
     #[tokio::test]
     async fn a_reactivation_release_completed_by_the_ue_deletes_the_sm_policy() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
         let reference = "n719-complete";
@@ -25795,6 +25855,7 @@ mod tests {
     #[tokio::test]
     async fn a_upf_restart_release_completed_by_the_ue_deletes_the_sm_policy() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
@@ -25846,6 +25907,7 @@ mod tests {
     #[tokio::test]
     async fn a_reactivation_release_abandoned_on_t3592_deletes_the_sm_policy() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
         let reference = "n719-t3592";
@@ -25867,6 +25929,7 @@ mod tests {
     #[tokio::test]
     async fn the_sm_policy_is_deleted_once_however_many_steps_reach_it() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
         let reference = "n719-once";
@@ -25889,6 +25952,7 @@ mod tests {
     #[tokio::test]
     async fn a_reactivation_release_completed_while_the_pcf_refuses_still_releases() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (pcf_srv, pcf_seen) = spawn_recording_pcf(Err(503)).await;
         let (amf_srv, amf_uri, amf_seen) = spawn_recording_amf().await;
@@ -25938,6 +26002,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_with_an_unreachable_pcf_completes_without_waiting_for_it() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // A port that refuses and that no `bind(:0)` can be handed (#1316). A bound and
         // dropped one could be, and then the "unreachable" PCF answered.
@@ -25970,6 +26035,7 @@ mod tests {
     #[tokio::test]
     async fn a_blackholed_pcf_does_not_stall_the_5gsm_timer_tick() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = blackhole.local_addr().unwrap().port();
@@ -26146,6 +26212,7 @@ mod tests {
     #[tokio::test]
     async fn an_overloaded_pcf_delete_is_retried_after_retry_after() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
         let sink = hits.clone();
@@ -26188,6 +26255,7 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_drains_policy_deletes_and_counts_the_abandoned() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         // #1145 review E: a sibling's terminations, if any are still running, are not
         // this test's to drain or count.
         settle_sm_policy_deletes_for_test().await;
@@ -26287,6 +26355,7 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_terminates_pending_release_policies_and_counts_the_unlanded() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -26492,6 +26561,7 @@ mod tests {
     #[tokio::test]
     async fn a_sdm_notification_reports_se_ambr_ch_to_the_pcf_and_applies_the_answer() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM reports 40/80 Mbps; the session holds 100/100.
@@ -26576,6 +26646,7 @@ mod tests {
     #[tokio::test]
     async fn an_sdm_notification_that_changes_nothing_reports_nothing_to_the_pcf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM reports exactly what `seed_binding` already holds (100/100, 5QI 9).
@@ -26644,6 +26715,7 @@ mod tests {
     #[tokio::test]
     async fn an_se_ambr_ch_answer_is_a_delta_over_what_the_session_enforces_1399() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -26740,6 +26812,7 @@ mod tests {
     #[tokio::test]
     async fn a_res_mo_re_answer_is_a_delta_over_what_the_session_enforces_1399() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -26833,6 +26906,7 @@ mod tests {
     #[tokio::test]
     async fn a_res_mo_re_answer_applies_its_default_qos_and_session_ambr_1573() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -26994,6 +27068,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pcf_refused_ue_modification_is_a_modification_reject_1590() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -27092,6 +27167,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn res_mo_re_merges_onto_a_notify_applied_in_flight_1399() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -27117,6 +27193,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_res_mo_re_update_keeps_a_notify_applied_in_flight_1399() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -27138,6 +27215,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn se_ambr_ch_merges_onto_a_notify_applied_in_flight_1399() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -27195,6 +27273,7 @@ mod tests {
     #[tokio::test]
     async fn a_pcf_that_rejects_the_se_ambr_ch_report_leaves_the_session_as_authorised() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -27248,6 +27327,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_udm_teardown_does_not_fail_the_session_release() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         udm::set_for_test(true);
         std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
@@ -27284,6 +27364,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_udm_leg_neither_deregisters_nor_unsubscribes() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
         udm::set_for_test(false);
@@ -28266,6 +28347,7 @@ mod tests {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
@@ -30390,6 +30472,7 @@ mod tests {
     #[tokio::test]
     async fn an_nsacf_refusal_is_insufficient_resources_slice() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -30499,6 +30582,7 @@ mod tests {
     #[tokio::test]
     async fn a_slice_refusal_backs_off_only_an_ordinary_request() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -31303,6 +31387,7 @@ mod tests {
     #[tokio::test]
     async fn an_n2_handover_without_a_direct_path_forwards_through_the_upf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
         std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "400");
@@ -31443,6 +31528,7 @@ mod tests {
     #[tokio::test]
     async fn no_indirect_connectivity_is_data_forwarding_not_possible() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         std::env::set_var("SMF_N2_INDIRECT_FORWARDING", "off");
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
@@ -34920,6 +35006,7 @@ mod tests {
     #[test]
     fn the_step_3c_policy_values_1707() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         use ue_reachability::UpfPolicy;
         assert_eq!(ue_reachability::upf_policy(), UpfPolicy::Refrain);
         for (value, policy) in [
@@ -36733,6 +36820,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_sdm_driven_ambr_change_reaches_the_ue_and_the_ran_1385() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -37262,6 +37350,130 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// #2270 follow-up (the `..._ie_271_at_the_psa_2208` flake, "IE 271 before the
+    /// GTPUPM SRR" 1/200 loaded): a GTPUPM install waits for an IE 271 another
+    /// task is sending, and the Create SRR goes only once the PSA's UL PDR names
+    /// its peer (TS 29.244 §5.24.5.3). Under load the policy's own N4 request had
+    /// `on_session_request` spawn that other task, and `install`'s
+    /// `sync_transport_delay` only flagged it and returned.
+    ///
+    /// REVERT-VERIFIED: with `install` calling `sync_transport_delay` again, the
+    /// Create SRR is prepared while the leg is held ("no Create SRR while another
+    /// task is sending IE 271" fails).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gtpupm_srr_waits_for_an_ie_271_another_task_is_sending_2270() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        pcc_qos_mon::clear_for_test();
+        let _pcc = pcc_qos_mon::PccForTest::on();
+        let _method = pcc_qos_mon::MethodForTest::set(pcc_qos_mon::Method::GtpuPath);
+        let supi = "imsi-001010000022701";
+        let (upf, reference, amf, _posts) = pcc_qos_mon_session_2208(supi, 5, true).await;
+        upf.clear_seen();
+
+        let create = qos_mon::N4Hold::arm(qos_mon::SrrOp::Create);
+        let held = qos_mon::TransportDelayLegHeld::hold(&reference);
+        let r = reference.clone();
+        let notify =
+            tokio::spawn(async move { notify_2208(&r, pcc_qos_mon_decision_2208()).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), create.reached())
+                .await
+                .is_err(),
+            "no Create SRR while another task is sending IE 271"
+        );
+        drop(held);
+        create.reached().await;
+        assert!(
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !tdr_updates_2208(b).is_empty()),
+            "IE 271 is in place before the Create SRR is sent"
+        );
+        create.release();
+        notify.await.expect("the notify");
+        wait_until(|| {
+            upf.modification_bodies()
+                .iter()
+                .any(|b| !srr_ops_1390(b).0.is_empty())
+        })
+        .await;
+        let bodies = upf.modification_bodies();
+        let tdr_at = bodies.iter().position(|b| !tdr_updates_2208(b).is_empty());
+        let create_at = bodies.iter().position(|b| !srr_ops_1390(b).0.is_empty());
+        assert!(tdr_at < create_at, "IE 271 before the GTPUPM SRR");
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        pcc_qos_mon::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// #2270 follow-up (R47 on #2285, hardening): an IE 271 owner that panics
+    /// lets go of the leg ([`qos_mon::TdrClaim`]'s drop), so a later install's
+    /// wait for the leg is not parked for good.
+    ///
+    /// REVERT-VERIFIED: with `TdrClaim::drop` not clearing the flag, "the leg is
+    /// let go" fails (and the install would wait for ever).
+    #[tokio::test]
+    async fn a_panicking_ie_271_owner_lets_go_of_the_leg_2270() {
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        qos_mon::clear_for_test();
+        let r = "ref-2270-ie271-claim";
+        let owner = tokio::spawn(async move {
+            let _held = qos_mon::TransportDelayLegHeld::hold(r);
+            assert!(qos_mon::leg_owned_for_test(r), "owned while held");
+            panic!("the owner fails while it sends IE 271 (#2270)");
+        });
+        assert!(owner.await.is_err(), "the owner panicked");
+        assert!(!qos_mon::leg_owned_for_test(r), "the leg is let go");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            qos_mon::transport_delay_in_place(r),
+        )
+        .await
+        .expect("a later install's wait for the leg ends");
+        qos_mon::clear_for_test();
+    }
+
+    /// #2270 follow-up (R47 on #2285, its MAJOR at 46869e39): an IE 271 request
+    /// that arrives as the owner stops is not lost. The owner lets go in the
+    /// same locked step in which it decides it is done, so a task arriving right
+    /// after (the hook) finds the leg free and claims it. At 46869e39 the flag
+    /// was cleared only at the claim's drop: that task found the leg owned,
+    /// flagged `tdr_dirty` for an owner already leaving, and the PSA kept a stale
+    /// IE 271.
+    ///
+    /// REVERT-VERIFIED: with the flag cleared only at the claim's drop again,
+    /// "a request as the owner stops gets the leg" fails.
+    #[tokio::test]
+    async fn an_ie_271_request_as_the_owner_stops_is_not_lost_2270() {
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        qos_mon::clear_for_test();
+        let r = "ref-2270-ie271-exit";
+        qos_mon::seed_session_for_test(r);
+        let (tx, rx) = std::sync::mpsc::channel();
+        qos_mon::on_tdr_exit_for_test(move || {
+            // Another task's sync, right as the owner stops.
+            let claim = qos_mon::try_claim_for_test(r);
+            tx.send(claim.is_some()).unwrap();
+        });
+        qos_mon::sync_transport_delay(r).await;
+        assert!(
+            rx.try_recv().expect("the owner stopped"),
+            "a request as the owner stops gets the leg"
+        );
+        assert!(!qos_mon::leg_owned_for_test(r), "and it is let go after");
+        qos_mon::clear_for_test();
+    }
+
     /// #2208, off unless configured: with the default per QoS flow method (and
     /// with `gtpu_path` toward a PSA that did not advertise GPQM) the PCF's policy
     /// is a GTPUPM 0 SRR and no UL PDR is updated. And a decision with no
@@ -37335,6 +37547,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_psa_report_goes_to_the_pcf_or_to_the_notify_uri_2208() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _q = qos_mon::TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let _e = event_exposure::lock_store();
@@ -37458,6 +37671,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn this_smf_and_the_real_pcfd_carry_an_af_s_qos_monitoring_end_to_end_2221() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _q = qos_mon::TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let _e = event_exposure::lock_store();
@@ -37631,6 +37845,7 @@ mod tests {
     async fn a_create_answer_s_qos_monitoring_policy_is_installed_on_activation_2208() {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _q = qos_mon::TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let _e = event_exposure::lock_store();
@@ -37938,9 +38153,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_qos_mon_notify_carries_the_psa_upf_s_n6_delays_with_the_demo_on_471() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _q = qos_mon::TEST_LOCK.lock().await;
         let _n6 = n6_delay::N6_TEST_LOCK.lock().await;
         let _d = demo_d443a::TEST_LOCK.lock().await;
+        let _active = demo_d443a::ActiveRestore::new(&_d);
         let _seeded = crate::context::SeededState::track();
         let _e = event_exposure::lock_store();
         event_exposure::clear_for_test();

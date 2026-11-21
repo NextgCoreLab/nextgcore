@@ -4894,6 +4894,15 @@ pub fn set_pgw_discovery_nrf_for_test(uri: Option<String>) {
         .unwrap_or_else(|e| e.into_inner()) = uri;
 }
 
+/// Test-only: the override [`set_pgw_discovery_nrf_for_test`] set, for smfd's
+/// `context::AmbientRestore` test (#2270). Not `#[cfg(test)]`, for the same reason.
+pub fn pgw_discovery_nrf_for_test() -> Option<String> {
+    PGW_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Normalise an FQDN for comparison: case-insensitive (RFC 4343) and without a trailing
 /// root dot, so `PGW.Example.` and `pgw.example` name the same node.
 fn normalise_fqdn(fqdn: &str) -> String {

@@ -836,6 +836,7 @@ mod tests {
     #[tokio::test]
     async fn a_cleanup_not_sent_does_not_credit_its_peer_2223() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         clear_for_test();
         crate::udm::set_for_test(false);

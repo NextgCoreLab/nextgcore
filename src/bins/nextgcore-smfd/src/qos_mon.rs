@@ -161,6 +161,135 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
     f(g.get_or_insert_with(HashMap::new))
 }
 
+/// #2270 follow-up: told whenever a task lets go of a session's IE 271 leg
+/// ([`SessionMon::tdr_busy`]), for [`transport_delay_in_place`].
+static TDR_IDLE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// #2270 follow-up (R47 on #2285): a task's claim on session `r`'s IE 271 leg
+/// ([`SessionMon::tdr_busy`]).
+///
+/// The owner lets go in the same locked step in which it decides it is done,
+/// then [`Self::disarm`]s the claim. A task arriving in between finds the leg
+/// free and sends itself. (Clearing the flag later, at the drop, lost it: that
+/// task saw the leg owned, flagged `tdr_dirty` and returned, and the owner was
+/// already leaving, R47's MAJOR at 46869e39.)
+///
+/// A claim dropped still armed (the owner panicked, or the session went) lets
+/// go then: it clears the flag, tidies the entry and tells [`TDR_IDLE`], so a
+/// panic cannot park the session's later installs in
+/// [`transport_delay_in_place`].
+#[must_use = "the leg is let go when this drops"]
+pub(crate) struct TdrClaim {
+    r: String,
+    armed: bool,
+}
+
+impl TdrClaim {
+    /// Claim `r`'s leg, or (`None`) flag its owner to look again.
+    pub(crate) fn try_claim(r: &str) -> Option<Self> {
+        let claimed = with(|m| {
+            let Some(s) = m.get_mut(r) else {
+                return false;
+            };
+            if s.tdr_busy {
+                s.tdr_dirty = true;
+                return false;
+            }
+            s.tdr_busy = true;
+            true
+        });
+        claimed.then(|| Self {
+            r: r.to_string(),
+            armed: true,
+        })
+    }
+
+    /// The owner let go under the lock already: tell [`TDR_IDLE`], and leave
+    /// the flag alone at the drop (another task may own the leg by then).
+    fn disarm(&mut self) {
+        self.armed = false;
+        TDR_IDLE.notify_waiters();
+    }
+}
+
+impl Drop for TdrClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        with(|m| {
+            if let Some(s) = m.get_mut(&self.r) {
+                s.tdr_busy = false;
+            }
+            tidy(m, &self.r);
+        });
+        TDR_IDLE.notify_waiters();
+    }
+}
+
+/// #2270 follow-up: test-only, run right after an IE 271 owner has decided it
+/// is done (and, with the fix, let go), before it returns, for the test of that
+/// window.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static TDR_EXIT_HOOK_FOR_TEST: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn on_tdr_exit_for_test(hook: impl FnOnce() + Send + 'static) {
+    *TDR_EXIT_HOOK_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+}
+
+fn tdr_exit_hook() {
+    #[cfg(test)]
+    if let Some(hook) = TDR_EXIT_HOOK_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        hook();
+    }
+}
+
+/// #2270 follow-up: test-only, a session entry that [`tidy`] keeps (its RAN leg
+/// on), with nothing for IE 271 to send.
+#[cfg(test)]
+pub(crate) fn seed_session_for_test(r: &str) {
+    with(|m| m.entry(r.to_string()).or_default().ran_on = true);
+}
+
+/// #2270 follow-up: test-only, claim session `r`'s IE 271 leg as another task's
+/// [`sync_transport_delay`] would.
+#[cfg(test)]
+pub(crate) fn try_claim_for_test(r: &str) -> Option<TdrClaim> {
+    TdrClaim::try_claim(r)
+}
+
+/// #2270 follow-up: test-only, holds session `r`'s IE 271 leg as another task's
+/// [`sync_transport_delay`] would while its Update PDR is in flight. Let go when
+/// dropped.
+#[cfg(test)]
+#[must_use = "the leg is held until this drops"]
+pub(crate) struct TransportDelayLegHeld(#[allow(dead_code)] TdrClaim);
+// (Dropped armed: it lets go then, as a panicking owner's claim does.)
+
+#[cfg(test)]
+impl TransportDelayLegHeld {
+    pub(crate) fn hold(r: &str) -> Self {
+        with(|m| {
+            m.entry(r.to_string()).or_default();
+        });
+        Self(TdrClaim::try_claim(r).expect("the leg is free"))
+    }
+}
+
+/// #2270 follow-up: whether a task owns session `r`'s IE 271 leg.
+#[cfg(test)]
+pub(crate) fn leg_owned_for_test(r: &str) -> bool {
+    with(|m| m.get(r).is_some_and(|s| s.tdr_busy))
+}
+
 /// Drop a session's entry once it holds nothing.
 fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
     if m.get(r).is_some_and(|s| {
@@ -848,7 +977,7 @@ async fn install(sm_context_ref: &str, key: &str) -> bool {
     };
     // #2208: the PSA's UL PDR names its preceding UL GTP-U peer before the GTPUPM
     // SRR asks it to measure (TS 29.244 §5.24.5.3).
-    sync_transport_delay(sm_context_ref).await;
+    transport_delay_in_place(sm_context_ref).await;
     n4_hold(SrrOp::Create).await;
     let params = crate::n4_build::SessionModificationParams {
         create_srrs: vec![(srr_id, want.clone())],
@@ -1062,20 +1191,41 @@ fn transport_delay_wanted(
 /// SRR goes. One task per session sends, looking again after each request, so the
 /// last Update PDR the PSA gets names the current peer.
 pub async fn sync_transport_delay(r: &str) {
-    let claimed = with(|m| {
-        let Some(s) = m.get_mut(r) else {
-            return false;
-        };
-        if s.tdr_busy {
-            s.tdr_dirty = true;
-            return false;
-        }
-        s.tdr_busy = true;
-        true
-    });
-    if !claimed {
+    // Let go when it drops, however this returns or unwinds (R47 on #2285).
+    let Some(mut claim) = TdrClaim::try_claim(r) else {
         return;
+    };
+    sync_transport_delay_claimed(r, &mut claim).await;
+}
+
+/// #2270 follow-up: [`sync_transport_delay`], waiting first for another task that
+/// owns the leg to let go of it, so IE 271 is in place when this returns. A plain
+/// [`sync_transport_delay`] that finds the leg owned only flags the owner and
+/// returns, and `install` then sent its Create SRR while the owner's Update PDR
+/// (spawned by `on_session_request` after the policy's own N4 request) was still
+/// on its way: the PSA got the SRR first ("IE 271 before the GTPUPM SRR" failed
+/// under load).
+pub(crate) async fn transport_delay_in_place(r: &str) {
+    loop {
+        let idle = TDR_IDLE.notified();
+        tokio::pin!(idle);
+        // Before the look, so a let-go between the look and the wait is not missed.
+        idle.as_mut().enable();
+        if !with(|m| m.get(r).is_some_and(|s| s.tdr_busy)) {
+            sync_transport_delay(r).await;
+            // Taken by another task between the look and the claim: wait for it.
+            if !with(|m| m.get(r).is_some_and(|s| s.tdr_busy)) {
+                return;
+            }
+            continue;
+        }
+        idle.await;
     }
+}
+
+/// The loop of [`sync_transport_delay`], run while its caller holds `claim`.
+/// Each exit lets go of the leg under the lock it decides in, then disarms it.
+async fn sync_transport_delay_claimed(r: &str, claim: &mut TdrClaim) {
     loop {
         let psa_seid = crate::lookup_upf_seid(r).map(|_| crate::smf_n4_seid_for(r));
         let peer = psa_seid.and_then(preceding_peer);
@@ -1104,6 +1254,8 @@ pub async fn sync_transport_delay(r: &str) {
             Some((psa, iupf))
         });
         let Some((psa, iupf)) = step else {
+            claim.disarm();
+            tdr_exit_hook();
             return;
         };
         let mut sent_psa = None;
@@ -1138,6 +1290,8 @@ pub async fn sync_transport_delay(r: &str) {
             false
         });
         if !again {
+            claim.disarm();
+            tdr_exit_hook();
             return;
         }
     }
