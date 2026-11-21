@@ -881,7 +881,24 @@ impl SgwcContext {
         self.ue_find_by_id(id)
     }
 
+    /// Change UE `id` in place, under the UE list's write lock (#2288).
+    ///
+    /// Prefer this to [`Self::ue_find_by_id`] + [`Self::ue_update`]: that pair writes
+    /// back a whole copy, so anything another task changed in between is reverted. The
+    /// Downlink Data Notification path did exactly that to the MME's Data Notification
+    /// Delay, when the acknowledge was handled while it held a copy. `f` must not call
+    /// back into the context (the lock is held).
+    pub fn ue_modify<R>(&self, id: u64, f: impl FnOnce(&mut SgwcUe) -> R) -> Option<R> {
+        let mut list = self.sgwc_ue_list.write().ok()?;
+        list.get_mut(&id).map(f)
+    }
+
     /// Update UE in context
+    ///
+    /// #2288: test-only. It writes back a whole copy, so anything another task changed
+    /// since the copy was taken is reverted, and an entry removed meanwhile comes back.
+    /// Production code changes an entry in place with the `*_modify` methods.
+    #[cfg(test)]
     pub fn ue_update(&self, ue: &SgwcUe) -> bool {
         if let Ok(mut list) = self.sgwc_ue_list.write() {
             list.insert(ue.id, ue.clone());
@@ -1000,7 +1017,22 @@ impl SgwcContext {
             .cloned()
     }
 
+    /// Change session `id` in place, under the session list's write lock (#2288).
+    ///
+    /// A no-op (`None`) when the session is gone: it never re-inserts one, so a
+    /// procedure finishing after a concurrent Delete Session cannot bring the session
+    /// back. `f` must not call back into the context (the lock is held).
+    pub fn sess_modify<R>(&self, id: u64, f: impl FnOnce(&mut SgwcSess) -> R) -> Option<R> {
+        let mut list = self.sess_list.write().ok()?;
+        list.get_mut(&id).map(f)
+    }
+
     /// Update session in context
+    ///
+    /// #2288: test-only. It writes back a whole copy, so anything another task changed
+    /// since the copy was taken is reverted, and an entry removed meanwhile comes back.
+    /// Production code changes an entry in place with the `*_modify` methods.
+    #[cfg(test)]
     pub fn sess_update(&self, sess: &SgwcSess) -> bool {
         if let Ok(mut list) = self.sess_list.write() {
             list.insert(sess.id, sess.clone());
@@ -1129,7 +1161,19 @@ impl SgwcContext {
             .and_then(|&id| self.bearer_find_by_id(id))
     }
 
+    /// Change bearer `id` in place, under the bearer list's write lock (#2288). A no-op
+    /// (`None`) when the bearer is gone. `f` must not call back into the context.
+    pub fn bearer_modify<R>(&self, id: u64, f: impl FnOnce(&mut SgwcBearer) -> R) -> Option<R> {
+        let mut list = self.bearer_list.write().ok()?;
+        list.get_mut(&id).map(f)
+    }
+
     /// Update bearer in context
+    ///
+    /// #2288: test-only. It writes back a whole copy, so anything another task changed
+    /// since the copy was taken is reverted, and an entry removed meanwhile comes back.
+    /// Production code changes an entry in place with the `*_modify` methods.
+    #[cfg(test)]
     pub fn bearer_update(&self, bearer: &SgwcBearer) -> bool {
         if let Ok(mut list) = self.bearer_list.write() {
             list.insert(bearer.id, bearer.clone());
@@ -1237,6 +1281,34 @@ impl SgwcContext {
         self.tunnel_find_by_interface_type(bearer_id, gtp_interface::S1_U_SGW_GTP_U)
     }
 
+    /// Change tunnel `id` in place, under the tunnel list's write lock (#2288), keeping
+    /// the generation and the downlink peer index as [`Self::tunnel_update`] does: a
+    /// changed remote endpoint, or a generation `f` advanced, is a new generation. A
+    /// no-op (`None`) when the tunnel is gone.
+    ///
+    /// The read, any check on it (the Modify Bearer rollback's generation) and the
+    /// write are one step, so no other writer can land in between. `f` must not call
+    /// back into the context (the lock is held).
+    pub fn tunnel_modify<R>(&self, id: u64, f: impl FnOnce(&mut SgwcTunnel) -> R) -> Option<R> {
+        let mut list = self.tunnel_list.write().ok()?;
+        let tunnel = list.get_mut(&id)?;
+        let old = tunnel.clone();
+        let result = f(tunnel);
+        let moved = old.remote_teid != tunnel.remote_teid
+            || old.remote_ip.ipv4 != tunnel.remote_ip.ipv4
+            || old.remote_ip.ipv6 != tunnel.remote_ip.ipv6
+            || tunnel.generation != old.generation;
+        tunnel.generation = if moved {
+            old.generation.wrapping_add(1)
+        } else {
+            old.generation
+        };
+        let new = tunnel.clone();
+        // Under the tunnel list's lock, so the index never disagrees with it.
+        self.index_dl_peer(Some(&old), Some(&new));
+        Some(result)
+    }
+
     /// Update tunnel in context.
     ///
     /// A changed remote endpoint, or a generation the writer advanced, is a new
@@ -1244,6 +1316,11 @@ impl SgwcContext {
     /// must therefore re-read the tunnel just before updating it: writing back
     /// an older clone counts as a write and blocks a legitimate rollback (and
     /// would clobber the endpoint anyway).
+    ///
+    /// #2288: test-only. It writes back a whole copy, so anything another task changed
+    /// since the copy was taken is reverted, and an entry removed meanwhile comes back.
+    /// Production code changes an entry in place with the `*_modify` methods.
+    #[cfg(test)]
     pub fn tunnel_update(&self, tunnel: &SgwcTunnel) -> bool {
         if let Ok(mut list) = self.tunnel_list.write() {
             let mut tunnel = tunnel.clone();
@@ -1339,6 +1416,57 @@ impl Default for SgwcContext {
 // ============================================================================
 
 use std::sync::OnceLock;
+
+/// #2288: test-only interleaving points. Each is where a procedure has looked an
+/// entry up and is about to write it, which is where the copy-and-write-back code
+/// held its copy. A test registers a one-shot hook by name ([`on_race_point`]) to run
+/// a competing writer exactly there.
+#[cfg(test)]
+type RaceHook = (&'static str, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static RACE_HOOKS: std::sync::Mutex<Vec<RaceHook>> = std::sync::Mutex::new(Vec::new());
+
+/// Test-only: run `hook` once, the next time the race point `name` is reached.
+#[cfg(test)]
+pub(crate) fn on_race_point(name: &'static str, hook: impl FnOnce() + Send + 'static) {
+    RACE_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name, Box::new(hook)));
+}
+
+/// Test-only: how many registered hooks have not run yet. A test asserts 0, so a
+/// race point that was never reached (a renamed one) cannot pass vacuously.
+#[cfg(test)]
+pub(crate) fn race_points_pending() -> usize {
+    RACE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Test-only: forget every hook not yet run.
+#[cfg(test)]
+pub(crate) fn clear_race_points() {
+    RACE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// A race point (#2288): in tests, runs the hook registered for `name`, if any. A
+/// no-op otherwise.
+#[inline]
+pub(crate) fn race_point(_name: &'static str) {
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut hooks = RACE_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+            hooks
+                .iter()
+                .position(|(n, _)| *n == _name)
+                .map(|i| hooks.remove(i).1)
+        };
+        // Run outside the lock: the hook writes the context.
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
 
 static SGWC_CONTEXT: OnceLock<Arc<SgwcContext>> = OnceLock::new();
 
