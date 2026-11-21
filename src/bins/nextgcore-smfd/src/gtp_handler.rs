@@ -1652,6 +1652,10 @@ async fn create_session(
         return;
     };
 
+    // #2291: the session as it was created, so only what this handler sets is written
+    // back across its N4 round trips.
+    let sess_created = sess.clone();
+
     // The SGW's control-plane TEID is what the response is addressed to, and the PDN
     // address is the one THIS node allocated rather than the one the SGW-C proposed.
     if let Some(ref sender) = req.sender_f_teid {
@@ -1833,13 +1837,20 @@ async fn create_session(
         );
         (pco, extended)
     });
+    crate::context::interleave("create_session");
     if let Ok(ctx) = context.read() {
         match ctx.bearer_add(sess.id) {
             Some(stored) => {
                 bearer.id = stored.id;
                 bearer.sess_id = stored.sess_id;
                 bearer.qfi = bc.ebi;
-                ctx.bearer_update(&bearer);
+                // The bearer was added just now: it takes everything built above, and
+                // keeps the packet filters `bearer_add`'s record may already link.
+                ctx.bearer_modify(stored.id, |b| {
+                    let pf_ids = std::mem::take(&mut b.pf_ids);
+                    *b = bearer.clone();
+                    b.pf_ids = pf_ids;
+                });
             }
             None => {
                 // Not fatal: the session is established and the user plane exists, so refusing
@@ -1852,12 +1863,16 @@ async fn create_session(
                 );
             }
         }
-        // After the bearer, so `sess.bearer_ids` (which `bearer_add` appends to under the
-        // context's own lock) is not overwritten by this session's stale copy of it.
-        if let Some(linked) = ctx.sess_find_by_id(sess.id) {
-            sess.bearer_ids = linked.bearer_ids;
-        }
-        ctx.sess_update(&sess);
+        // #2291: in place, only the fields this handler set. `bearer_ids` (which
+        // `bearer_add` appends to under the context's own lock) and anything another
+        // task wrote across the N4 round trips stay as they are, and a session released
+        // meanwhile is not brought back.
+        ctx.sess_modify(sess.id, |s| {
+            crate::context::merge_changed!(s, sess, sess_created;
+                sgw_s5c_teid, sgw_s5c_interface_type, sgw_s5c_ip, sgw_restart_counter,
+                sgw_attached_at, ipv4_addr, session_type, ue_session_type, session_ambr,
+                session_qos, upf_n4_seid, eps_psi, s_nssai);
+        });
     }
 
     let local_ipv4 = match server.local_addr().ip() {
@@ -1959,7 +1974,8 @@ async fn reject(
 /// **This is the live caller `gsm_handler::handle_pdu_session_release_request` did not have.**
 /// It validates the session identity and sets `ngap_state = DeleteTriggerUeRequested` — the
 /// SMF's own note that a peer asked for this session to go — and the result is written back
-/// with `sess_update`, so the mutation lands on the stored session rather than a temporary.
+/// in place (`sess_modify`), so the mutation lands on the stored session rather than a
+/// temporary.
 /// `sess` is left carrying it too, so the caller sees the same state the store does.
 ///
 /// **Why the PSI is substituted.** `psi` is 0 on an EPS session (`sess_add_by_apn` sets the
@@ -2010,8 +2026,9 @@ fn record_eps_release(sess: &mut SmfSess, req: &DeleteSessionRequest) -> bool {
         Ok(()) => {
             // Persisted BEFORE the N4 delete, so the recorded release survives a UPF that
             // never answers.
+            // #2291: in place; the 5GSM handler sets only the NGAP state.
             if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.sess_update(sess);
+                ctx.sess_modify(sess.id, |s| s.ngap_state = sess.ngap_state);
             }
             true
         }
@@ -2042,7 +2059,7 @@ fn record_eps_release(sess: &mut SmfSess, req: &DeleteSessionRequest) -> bool {
 /// before this.
 ///
 /// The mutation is observable because the session is re-read from the context, mutated, and
-/// `sess_update`d — not built, handed over and dropped, which is the defect #223 was filed
+/// written back in place — not built, handed over and dropped, which is the defect #223 was filed
 /// about.
 async fn delete_session(
     server: &crate::gtp_path::S5S8Server,
@@ -2199,6 +2216,8 @@ async fn modify_bearer(
         return;
     }
 
+    // #2291: what was read, against which the write-back below tells what changed.
+    let (sess_before, bearers_before) = (sess.clone(), bearers.clone());
     let result = handle_modify_bearer_request(&mut sess, &mut bearers, &req);
     let sgw_relocation = match result {
         ModifyBearerResult::Rejected(cause) => {
@@ -2299,12 +2318,21 @@ async fn modify_bearer(
         }
     };
 
-    // Write back what the handlers changed: the session's SGW control TEID and modification
-    // list, and each bearer's downlink endpoint.
+    // Write back what the handlers changed: the session's SGW control endpoint and
+    // modification list, and each bearer's downlink endpoint and QoS. #2291: in place,
+    // only fields that differ from what was read before the PFCP round trip, so an update
+    // made by another task meanwhile stands, and nothing removed meanwhile comes back.
+    crate::context::interleave("modify_bearer");
     if let Ok(ctx) = crate::context::smf_self().read() {
-        ctx.sess_update(&sess);
-        for bearer in &bearers {
-            ctx.bearer_update(bearer);
+        ctx.sess_modify(sess.id, |s| {
+            crate::context::merge_changed!(s, sess, sess_before;
+                sgw_s5c_teid, sgw_s5c_ip, sgw_restart_counter, sgw_attached_at,
+                qos_flow_to_modify_list);
+        });
+        for (bearer, before) in bearers.iter().zip(&bearers_before) {
+            ctx.bearer_modify(bearer.id, |b| {
+                crate::context::merge_changed!(b, bearer, before; sgw_s5u_teid, sgw_s5u_ip, qos);
+            });
         }
     }
 
@@ -6959,5 +6987,236 @@ mod tests {
             sent(&mods, &remove_ul),
             "its PGW-U rules are removed (Remove PDR 0x61)"
         );
+    }
+
+    // ---- #2291: no copy held across an await is written back whole ----
+
+    /// The one session this test's fresh context holds (tests run one at a time under
+    /// `PROCESS_STATE_TEST_LOCK`).
+    fn the_only_session() -> Option<crate::context::SmfSess> {
+        crate::context::smf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.sess_find_by(|_| true))
+    }
+
+    /// #2291: a Create Session's write-back keeps what another task wrote to the new
+    /// session across its N4 round trips. The `create_session` interleaving point sets
+    /// a field the handler never sets (`sm_context_status_uri`), the way a concurrent
+    /// writer would, just before the handler writes its own fields back. The handler's
+    /// fields (the address, the PGW-U SEID) land too.
+    ///
+    /// REVERT-VERIFIED: with the handler writing its copy back whole (`sess_update`)
+    /// the concurrent value is reverted and "the concurrent update stands" fails.
+    #[tokio::test]
+    async fn a_create_session_keeps_a_concurrent_update_2291() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let _hook = crate::context::set_interleave("create_session", || {
+            if let (Some(s), Ok(ctx)) = (the_only_session(), crate::context::smf_self().read()) {
+                ctx.sess_modify(s.id, |s| {
+                    s.sm_context_status_uri = Some("concurrent".into())
+                });
+            }
+        });
+        // IMSI ...0x91, SGW TEID 0x2291_0001: this test's alone.
+        let (server, _sgw, sess) = establish_over_the_wire(7, 0x91, 0x2291_0001).await;
+        let stored = crate::context::smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_id(sess.id)
+            .expect("the session");
+        assert_eq!(
+            stored.sm_context_status_uri.as_deref(),
+            Some("concurrent"),
+            "the concurrent update stands"
+        );
+        assert!(stored.ipv4_addr.is_some(), "the handler's address landed");
+        assert_ne!(stored.upf_n4_seid, 0, "the handler's PGW-U SEID landed");
+        assert_eq!(
+            stored.bearer_ids.len(),
+            1,
+            "and the default bearer is linked"
+        );
+        server.close();
+    }
+
+    /// #2291: a Modify Bearer's write-back keeps what another task wrote across its
+    /// PFCP round trip, and does not bring back a session released meanwhile. At the
+    /// `modify_bearer` interleaving point, run 1 sets the session's AMBR and the
+    /// bearer's PCC rule name (neither of which the handler changes); run 2 removes the
+    /// session.
+    ///
+    /// REVERT-VERIFIED: with the session and bearers written back whole
+    /// (`sess_update` / `bearer_update`), "the concurrent AMBR stands" fails.
+    #[tokio::test]
+    async fn a_modify_bearer_keeps_a_concurrent_update_and_resurrects_nothing_2291() {
+        use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, sess) = establish_over_the_wire(8, 0x92, 0x2292_0001).await;
+        let bearer_id = crate::context::smf_self()
+            .read()
+            .unwrap()
+            .bearer_find_by_ebi(sess.id, 5)
+            .expect("the default bearer")
+            .id;
+        let mbr = |seq: u32, teid: u32| {
+            let mut msg = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::MODIFY_BEARER_REQUEST,
+                sess.smf_n4_teid,
+                seq,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(5);
+            bc.set_fteid(1, &Gtp2FTeidIe::new_ipv4(4, teid, [127, 0, 0, 2]));
+            msg.add_bearer_context(0, &bc);
+            msg.encode()
+        };
+        async fn answered(sgw: &tokio::net::UdpSocket, seq: u32) {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let (len, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sgw.recv_from(&mut buf),
+                )
+                .await
+                .expect("the PGW-C answers")
+                .expect("recv");
+                let mut b = bytes::Bytes::copy_from_slice(&buf[..len]);
+                let m = nextgcore_gtp::v2::Gtp2Message::decode(&mut b).expect("decode");
+                if m.header.sequence_number == seq {
+                    return;
+                }
+            }
+        }
+
+        // Run 1: concurrent updates to fields the handler leaves alone.
+        let (sid, bid) = (sess.id, bearer_id);
+        let hook = crate::context::set_interleave("modify_bearer", move || {
+            let ctx = crate::context::smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.sess_modify(sid, |s| s.session_ambr.uplink = 2_291_000);
+            ctx.bearer_modify(bid, |b| b.pcc_rule_name = Some("concurrent".into()));
+        });
+        sgw.send_to(&mbr(0x41, 0x2292_5555), server.local_addr())
+            .await
+            .expect("send");
+        answered(&sgw, 0x41).await;
+        drop(hook);
+        {
+            let ctx = crate::context::smf_self();
+            let ctx = ctx.read().unwrap();
+            let s = ctx.sess_find_by_id(sess.id).expect("the session");
+            let b = ctx.bearer_find_by_id(bearer_id).expect("the bearer");
+            assert_eq!(
+                s.session_ambr.uplink, 2_291_000,
+                "the concurrent AMBR stands"
+            );
+            assert_eq!(
+                b.pcc_rule_name.as_deref(),
+                Some("concurrent"),
+                "the concurrent bearer update stands"
+            );
+            assert_eq!(b.sgw_s5u_teid, 0x2292_5555, "the handler's endpoint landed");
+            assert_eq!(s.qos_flow_to_modify_list, vec![bearer_id], "and its list");
+        }
+
+        // Run 2: the session is released meanwhile; nothing brings it back.
+        let hook = crate::context::set_interleave("modify_bearer", move || {
+            let ctx = crate::context::smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.bearer_remove(bid);
+            ctx.sess_remove(sid);
+        });
+        sgw.send_to(&mbr(0x42, 0x2292_6666), server.local_addr())
+            .await
+            .expect("send");
+        answered(&sgw, 0x42).await;
+        drop(hook);
+        let ctx = crate::context::smf_self();
+        let ctx = ctx.read().unwrap();
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_none(),
+            "the session stays released"
+        );
+        assert!(
+            ctx.bearer_find_by_id(bearer_id).is_none(),
+            "and so does its bearer"
+        );
+        drop(ctx);
+        server.close();
+    }
+
+    /// #2291: a dedicated bearer's activation keeps what another task wrote to the
+    /// bearer across its S5/S8 and PFCP round trips. At each of its two write-backs
+    /// (`eps_bearer_uplink` after the uplink's PFCP modification, `eps_bearer_active`
+    /// after the Create Bearer Response and the downlink's), a concurrent QoS change is
+    /// made to the stored bearer; both must survive, and so must the activation's own
+    /// fields.
+    ///
+    /// REVERT-VERIFIED: with either write-back restored to a whole copy
+    /// (`bearer_update`), its marker is reverted and the matching assertion fails.
+    #[tokio::test]
+    async fn a_dedicated_bearer_activation_keeps_a_concurrent_update_2291() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let voice = |set: fn(&mut crate::context::SmfBearer)| {
+            move || {
+                let ctx = crate::context::smf_self();
+                let ctx = ctx.read().unwrap();
+                if let Some(b) = ctx
+                    .sess_find_all_by(|_| true)
+                    .into_iter()
+                    .find_map(|s| ctx.bearer_find_by_pcc_rule_name(s.id, "voice"))
+                {
+                    ctx.bearer_modify(b.id, set);
+                }
+            }
+        };
+        let _uplink = crate::context::set_interleave(
+            "eps_bearer_uplink",
+            voice(|b| b.qos.mbr_uplink = 2_291_001),
+        );
+        let _active = crate::context::set_interleave(
+            "eps_bearer_active",
+            voice(|b| b.qos.mbr_downlink = 2_291_002),
+        );
+        upf.clear_seen();
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x93, vec![voice_rule()]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        let pgw_u = cbr
+            .bearer_context(0)
+            .unwrap()
+            .expect("Bearer Context")
+            .fteid(1)
+            .unwrap()
+            .expect("the PGW's S5/S8-U F-TEID");
+        let pgw_u_teid = pgw_u.teid;
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, Some(pgw_u)),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let bearer = stored_bearer(sess.id, 6).await.expect("the active bearer");
+        assert_eq!(
+            bearer.qos.mbr_downlink, 2_291_002,
+            "the concurrent update made during the activation's round trips stands"
+        );
+        assert_eq!(
+            bearer.qos.mbr_uplink, 2_291_001,
+            "the concurrent update made during the uplink's round trip stands"
+        );
+        assert_eq!(
+            bearer.sgw_s5u_teid, SGW_DEDICATED_S5U_TEID,
+            "the activation landed"
+        );
+        assert_eq!(bearer.pgw_s5u_teid, pgw_u_teid, "and so did the uplink");
+        server.close();
     }
 }

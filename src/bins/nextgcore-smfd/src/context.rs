@@ -9,6 +9,72 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// Write back the fields of a working copy that the caller changed (#2291). For each
+/// listed field, `$from.f` replaces `$to.f` when it differs from `$before.f`, the value
+/// read when the copy was taken, so a field the caller left alone keeps whatever
+/// another task wrote meanwhile. Used inside [`SmfContext::sess_modify`] and
+/// [`SmfContext::bearer_modify`] by the handlers that build up a copy across awaits.
+macro_rules! merge_changed {
+    ($to:expr, $from:expr, $before:expr; $($field:ident),+ $(,)?) => {
+        $(
+            if $from.$field != $before.$field {
+                $to.$field = $from.$field.clone();
+            }
+        )+
+    };
+}
+pub(crate) use merge_changed;
+
+/// #2291: a deterministic interleaving point. Each handler that holds a working copy
+/// across an await calls this right before it writes its changes back, so a test can
+/// run "another task's" update exactly there ([`set_interleave`]). Nothing outside
+/// tests. Called with no context lock held, so a hook may use the context.
+#[inline]
+pub(crate) fn interleave(site: &'static str) {
+    #[cfg(test)]
+    {
+        let mut hooks = INTERLEAVE.lock().unwrap_or_else(|e| e.into_inner());
+        for (at, f) in hooks.iter_mut() {
+            if *at == site {
+                f();
+            }
+        }
+    }
+    let _ = site;
+}
+
+#[cfg(test)]
+type InterleaveHook = (&'static str, Box<dyn FnMut() + Send>);
+#[cfg(test)]
+static INTERLEAVE: std::sync::Mutex<Vec<InterleaveHook>> = std::sync::Mutex::new(Vec::new());
+
+/// Run `f` at interleaving point `site` until the returned guard drops (tests). The
+/// tests that use it hold [`PROCESS_STATE_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn set_interleave(
+    site: &'static str,
+    f: impl FnMut() + Send + 'static,
+) -> InterleaveGuard {
+    INTERLEAVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((site, Box::new(f)));
+    InterleaveGuard(site)
+}
+
+#[cfg(test)]
+pub(crate) struct InterleaveGuard(&'static str);
+
+#[cfg(test)]
+impl Drop for InterleaveGuard {
+    fn drop(&mut self) {
+        INTERLEAVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(at, _)| *at != self.0);
+    }
+}
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -282,14 +348,14 @@ pub enum MaxIntegrityProtectedDataRate {
 }
 
 /// IP Address (IPv4 or IPv6)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct IpAddr {
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
 }
 
 /// QoS parameters
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Qos {
     pub index: u8, // 5QI
     pub arp_priority_level: u8,
@@ -751,7 +817,7 @@ impl V2xQosProfile {
 }
 
 /// Session AMBR
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionAmbr {
     pub uplink: u64,
     pub downlink: u64,
@@ -2473,7 +2539,7 @@ impl SmfContext {
     ///
     /// **Takes one lock at a time, holding at most one at any instant.** This
     /// file carries several documented lock-ordering rules (see `sess_remove`,
-    /// `sess_update`, `sess_find_by_ipv4`); a function holding three guards at
+    /// `sess_modify`, `sess_find_by_ipv4`); a function holding three guards at
     /// once would be a new inversion waiting to happen. Cloning each map out and
     /// dropping its guard before taking the next means this function cannot
     /// participate in any cycle, whatever order the mutators use.
@@ -3371,7 +3437,9 @@ impl SmfContext {
         smf_ue_list.get(&id).cloned()
     }
 
-    /// Update UE in the context
+    /// Write a whole UE copy back (tests only, #2291; see `sess_update`). No
+    /// production code writes a UE back.
+    #[cfg(test)]
     pub fn ue_update(&self, ue: &SmfUe) -> bool {
         if let Ok(mut smf_ue_list) = self.smf_ue_list.write() {
             if let Some(existing) = smf_ue_list.get_mut(&ue.id) {
@@ -3638,7 +3706,7 @@ impl SmfContext {
 
     /// Find session by IPv4 address
     pub fn sess_find_by_ipv4(&self, addr: Ipv4Addr) -> Option<SmfSess> {
-        // Lock order sess_list < ipv4_hash (matches sess_remove/sess_update).
+        // Lock order sess_list < ipv4_hash (matches sess_remove/sess_modify).
         let sess_list = self.sess_list.read().ok()?;
         let ipv4_hash = self.ipv4_hash.read().ok()?;
         ipv4_hash
@@ -3648,7 +3716,7 @@ impl SmfContext {
 
     /// Find session by IPv6 prefix
     pub fn sess_find_by_ipv6(&self, addr: &[u8; 8]) -> Option<SmfSess> {
-        // Lock order sess_list < ipv6_hash (matches sess_remove/sess_update).
+        // Lock order sess_list < ipv6_hash (matches sess_remove/sess_modify).
         let sess_list = self.sess_list.read().ok()?;
         let ipv6_hash = self.ipv6_hash.read().ok()?;
         ipv6_hash
@@ -3658,7 +3726,7 @@ impl SmfContext {
 
     /// Find session by paging N1N2 message location
     pub fn sess_find_by_paging_n1n2message_location(&self, location: &str) -> Option<SmfSess> {
-        // Lock order sess_list < n1n2message_hash (matches sess_remove/sess_update/
+        // Lock order sess_list < n1n2message_hash (matches sess_remove/sess_modify/
         // sess_set_paging_n1n2message_location).
         let sess_list = self.sess_list.read().ok()?;
         let n1n2message_hash = self.n1n2message_hash.read().ok()?;
@@ -3667,49 +3735,82 @@ impl SmfContext {
             .and_then(|&id| sess_list.get(&id).cloned())
     }
 
-    /// Update session in the context
-    pub fn sess_update(&self, sess: &SmfSess) -> bool {
-        if let (Ok(mut sess_list), Ok(mut ipv4_hash), Ok(mut ipv6_hash), Ok(mut n1n2message_hash)) = (
-            self.sess_list.write(),
-            self.ipv4_hash.write(),
-            self.ipv6_hash.write(),
-            self.n1n2message_hash.write(),
-        ) {
-            if let Some(existing) = sess_list.get_mut(&sess.id) {
-                // Update IPv4 hash if changed
-                if existing.ipv4_addr != sess.ipv4_addr {
-                    if let Some(old_addr) = existing.ipv4_addr {
-                        ipv4_hash.remove(&u32::from(old_addr));
-                    }
-                    if let Some(new_addr) = sess.ipv4_addr {
-                        ipv4_hash.insert(u32::from(new_addr), sess.id);
-                    }
-                }
-                // Update IPv6 hash if changed
-                if existing.ipv6_prefix != sess.ipv6_prefix {
-                    if let Some((_, old_addr)) = existing.ipv6_prefix {
-                        let prefix: [u8; 8] = old_addr.octets()[..8].try_into().unwrap_or([0; 8]);
-                        ipv6_hash.remove(&prefix);
-                    }
-                    if let Some((_, new_addr)) = sess.ipv6_prefix {
-                        let prefix: [u8; 8] = new_addr.octets()[..8].try_into().unwrap_or([0; 8]);
-                        ipv6_hash.insert(prefix, sess.id);
-                    }
-                }
-                // Update N1N2 message hash if changed
-                if existing.paging_n1n2message_location != sess.paging_n1n2message_location {
-                    if let Some(ref old_loc) = existing.paging_n1n2message_location {
-                        n1n2message_hash.remove(old_loc);
-                    }
-                    if let Some(ref new_loc) = sess.paging_n1n2message_location {
-                        n1n2message_hash.insert(new_loc.clone(), sess.id);
-                    }
-                }
-                *existing = sess.clone();
-                return true;
+    /// Change session `id` in place, under the session list's write lock, and keep the
+    /// IPv4, IPv6 and N1N2-location indexes in step with what `f` changed (#2291).
+    ///
+    /// The way to update a session: a task that takes a copy (`sess_find_*`), awaits
+    /// (a PFCP round trip, an SBI call) and then writes the whole copy back reverts
+    /// whatever another task changed meanwhile (a report, a release, a
+    /// modification). Here only the fields `f` touches change. A session removed
+    /// meanwhile is not found, so it is never resurrected; `None` is returned.
+    ///
+    /// `f` runs with the session list and the three indexes locked, so it must not
+    /// call back into the context, and it cannot await.
+    pub fn sess_modify<R>(&self, id: u64, f: impl FnOnce(&mut SmfSess) -> R) -> Option<R> {
+        let (mut sess_list, mut ipv4_hash, mut ipv6_hash, mut n1n2message_hash) = (
+            self.sess_list.write().ok()?,
+            self.ipv4_hash.write().ok()?,
+            self.ipv6_hash.write().ok()?,
+            self.n1n2message_hash.write().ok()?,
+        );
+        let sess = sess_list.get_mut(&id)?;
+        let (ipv4, ipv6, location) = (
+            sess.ipv4_addr,
+            sess.ipv6_prefix,
+            sess.paging_n1n2message_location.clone(),
+        );
+        let r = f(sess);
+        // The id is the key: `f` cannot move the session to another one.
+        sess.id = id;
+        if ipv4 != sess.ipv4_addr {
+            if let Some(old) = ipv4 {
+                ipv4_hash.remove(&u32::from(old));
+            }
+            if let Some(new) = sess.ipv4_addr {
+                ipv4_hash.insert(u32::from(new), id);
             }
         }
-        false
+        if ipv6 != sess.ipv6_prefix {
+            let prefix = |a: Ipv6Addr| -> [u8; 8] { a.octets()[..8].try_into().unwrap_or([0; 8]) };
+            if let Some((_, old)) = ipv6 {
+                ipv6_hash.remove(&prefix(old));
+            }
+            if let Some((_, new)) = sess.ipv6_prefix {
+                ipv6_hash.insert(prefix(new), id);
+            }
+        }
+        if location != sess.paging_n1n2message_location {
+            if let Some(old) = location {
+                n1n2message_hash.remove(&old);
+            }
+            if let Some(ref new) = sess.paging_n1n2message_location {
+                n1n2message_hash.insert(new.clone(), id);
+            }
+        }
+        Some(r)
+    }
+
+    /// [`Self::sess_modify`] on the session `sm_context_ref` names.
+    pub fn sess_modify_by_sm_context_ref<R>(
+        &self,
+        sm_context_ref: &str,
+        f: impl FnOnce(&mut SmfSess) -> R,
+    ) -> Option<R> {
+        let id = self.sess_find_by_sm_context_ref(sm_context_ref)?.id;
+        // Re-checked under the lock: the reference may have moved meanwhile.
+        self.sess_modify(id, |s| {
+            (s.sm_context_ref.as_deref() == Some(sm_context_ref)).then(|| f(s))
+        })
+        .flatten()
+    }
+
+    /// Write a whole session copy back (tests only, #2291): outside tests a copy
+    /// written back whole is a lost update, so production code uses
+    /// [`Self::sess_modify`].
+    #[cfg(test)]
+    pub fn sess_update(&self, sess: &SmfSess) -> bool {
+        self.sess_modify(sess.id, |existing| *existing = sess.clone())
+            .is_some()
     }
 
     /// Set paging N1N2 message location for session
@@ -3899,7 +4000,19 @@ impl SmfContext {
         None
     }
 
-    /// Update bearer in the context
+    /// Change bearer `id` in place under the bearer list's write lock (#2291); see
+    /// [`Self::sess_modify`]. A bearer removed meanwhile is not resurrected (`None`).
+    /// `f` must not call back into the context.
+    pub fn bearer_modify<R>(&self, id: u64, f: impl FnOnce(&mut SmfBearer) -> R) -> Option<R> {
+        let mut bearer_list = self.bearer_list.write().ok()?;
+        let bearer = bearer_list.get_mut(&id)?;
+        let r = f(bearer);
+        bearer.id = id;
+        Some(r)
+    }
+
+    /// Write a whole bearer copy back (tests only, #2291; see `sess_update`).
+    #[cfg(test)]
     pub fn bearer_update(&self, bearer: &SmfBearer) -> bool {
         if let Ok(mut bearer_list) = self.bearer_list.write() {
             if let Some(existing) = bearer_list.get_mut(&bearer.id) {
@@ -4917,6 +5030,51 @@ mod tests {
         let found = ctx.sess_find_by_ipv4("10.45.0.1".parse().unwrap());
         assert!(found.is_some());
         assert_eq!(found.unwrap().psi, 1);
+    }
+
+    /// #2291: `sess_modify` changes only what its closure touches, keeps the IPv4
+    /// index in step, and does nothing to a session that is gone (no resurrection);
+    /// `bearer_modify` likewise.
+    #[test]
+    fn modify_in_place_reindexes_and_never_resurrects_2291() {
+        let mut ctx = SmfContext::new();
+        ctx.init(100, 200, 400);
+        let ue = ctx.ue_add_by_supi("imsi-001010000022911").unwrap();
+        let sess = ctx.sess_add_by_psi(ue.id, 1).unwrap();
+        let old: Ipv4Addr = "10.45.22.1".parse().unwrap();
+        let new: Ipv4Addr = "10.45.22.2".parse().unwrap();
+        ctx.sess_modify(sess.id, |s| {
+            s.ipv4_addr = Some(old);
+            s.full_dnn = Some("kept".into());
+        });
+        assert_eq!(
+            ctx.sess_modify(sess.id, |s| s.ipv4_addr = Some(new)),
+            Some(())
+        );
+        assert!(
+            ctx.sess_find_by_ipv4(old).is_none(),
+            "the old address is unindexed"
+        );
+        let found = ctx
+            .sess_find_by_ipv4(new)
+            .expect("the new address is indexed");
+        assert_eq!(
+            found.full_dnn.as_deref(),
+            Some("kept"),
+            "untouched fields stay"
+        );
+
+        let bearer = ctx.qos_flow_add(sess.id).unwrap();
+        ctx.bearer_modify(bearer.id, |b| b.qfi = 9);
+        assert_eq!(ctx.bearer_find_by_id(bearer.id).unwrap().qfi, 9);
+
+        ctx.bearer_remove(bearer.id);
+        ctx.sess_remove(sess.id);
+        assert_eq!(ctx.sess_modify(sess.id, |s| s.psi = 7), None);
+        assert_eq!(ctx.bearer_modify(bearer.id, |b| b.qfi = 7), None);
+        assert!(ctx.sess_find_by_id(sess.id).is_none(), "not resurrected");
+        assert!(ctx.bearer_find_by_id(bearer.id).is_none(), "nor its bearer");
+        assert!(ctx.sess_find_by_ipv4(new).is_none());
     }
 
     #[test]

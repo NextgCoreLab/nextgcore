@@ -304,20 +304,22 @@ pub fn record_mapped_eps_bearer(
     let ctx = crate::context::smf_self();
     let context = ctx.read().ok()?;
     match context.qos_flow_add(sess_id) {
-        Some(mut flow) => {
-            flow.ebi = ebi;
-            flow.qfi = qfi;
-            flow.qos.index = five_qi;
-            flow.qos.arp_priority_level = arp_priority_level;
-            // The default flow's ARP is "shall not trigger pre-emption, not
-            // pre-emptable" (the establishment's), which the Bearer QoS codes as PCI
-            // and PVI set: they are *disable* flags (TS 29.274 §8.15). Left clear, a
-            // rebuilt transfer inverted them into may-trigger and pre-emptable, and
-            // the gNB's ARP changed on the first Service Request (#1147 review N1).
-            flow.qos.arp_preempt_cap = true;
-            flow.qos.arp_preempt_vuln = true;
+        Some(flow) => {
+            // #2291: in place on the flow just added.
             let id = flow.id;
-            context.bearer_update(&flow);
+            context.bearer_modify(id, |flow| {
+                flow.ebi = ebi;
+                flow.qfi = qfi;
+                flow.qos.index = five_qi;
+                flow.qos.arp_priority_level = arp_priority_level;
+                // The default flow's ARP is "shall not trigger pre-emption, not
+                // pre-emptable" (the establishment's), which the Bearer QoS codes as PCI
+                // and PVI set: they are *disable* flags (TS 29.274 §8.15). Left clear, a
+                // rebuilt transfer inverted them into may-trigger and pre-emptable, and
+                // the gNB's ARP changed on the first Service Request (#1147 review N1).
+                flow.qos.arp_preempt_cap = true;
+                flow.qos.arp_preempt_vuln = true;
+            });
             log::info!(
                 "[{supi}] EPS bearer {ebi} mapped onto QoS flow QFI {qfi} (5QI {five_qi}) for session {sess_id}"
             );

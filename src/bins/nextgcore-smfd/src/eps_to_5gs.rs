@@ -849,14 +849,11 @@ fn is_live_sm_context(sm_context_ref: &str) -> bool {
 /// Record PREPARED's forwarding EBIs on the session as it is now (#894 review B1).
 fn record_forwarding_intent(sm_context_ref: &str, sess_id: u64, ebis: &[u8]) {
     if let Ok(ctx) = smf_self().read() {
-        if let Some(mut fresh) = ctx
-            .sess_find_by_sm_context_ref(sm_context_ref)
-            .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
-            .filter(|f| f.id == sess_id)
-        {
-            fresh.handover.forwarding_ids = ebis.to_vec();
-            ctx.sess_update(&fresh);
-        }
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |fresh| {
+            if fresh.id == sess_id {
+                fresh.handover.forwarding_ids = ebis.to_vec();
+            }
+        });
     }
 }
 
@@ -1268,7 +1265,14 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     {
         let handle = smf_self();
         if let Ok(ctx) = handle.read() {
-            ctx.sess_update(&sess);
+            // #2291: in place, the fields this create set.
+            ctx.sess_modify(sess.id, |s| {
+                s.psi = sess.psi;
+                s.sm_context_ref = sess.sm_context_ref.clone();
+                s.sm_context_status_uri = sess.sm_context_status_uri.clone();
+                s.full_dnn = sess.full_dnn.clone();
+                s.handover = sess.handover.clone();
+            });
             if let Ok(mut m) = ctx.pfcp_sessions.write() {
                 m.insert(sm_context_ref.clone(), upf_seid);
             }
@@ -1713,17 +1717,16 @@ fn apply_prepared(sm_context_ref: &str, decided: &SmfSess) -> bool {
         .read()
         .ok()
         .and_then(|ctx| {
-            let mut fresh = ctx
-                .sess_find_by_sm_context_ref(sm_context_ref)
-                .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
-                .filter(|f| f.id == decided.id)?;
-            fresh.handover.gnb_n3_teid = decided.handover.gnb_n3_teid;
-            fresh.handover.gnb_n3_ip = decided.handover.gnb_n3_ip.clone();
-            fresh.handover.target_dl_known = true;
-            fresh.handover.prepared = true;
-            fresh.handover.forwarding_ids = decided.handover.forwarding_ids.clone();
-            ctx.sess_update(&fresh);
-            Some(())
+            ctx.sess_modify_by_sm_context_ref(sm_context_ref, |fresh| {
+                (fresh.id == decided.id).then(|| {
+                    fresh.handover.gnb_n3_teid = decided.handover.gnb_n3_teid;
+                    fresh.handover.gnb_n3_ip = decided.handover.gnb_n3_ip.clone();
+                    fresh.handover.target_dl_known = true;
+                    fresh.handover.prepared = true;
+                    fresh.handover.forwarding_ids = decided.handover.forwarding_ids.clone();
+                })
+            })
+            .flatten()
         })
         .is_some()
 }
@@ -1884,8 +1887,20 @@ async fn handle_completed_inner(
             sess.epc = false;
             sess.establishment_accept_sent = true;
         }
+        // #2291: in place, the fields set above.
         if let Ok(ctx) = smf_self().read() {
-            ctx.sess_update(sess);
+            ctx.sess_modify(sess.id, |s| {
+                s.handover.prepared = false;
+                s.handover.target_dl_known = false;
+                s.handover.eps_to_5gs = false;
+                s.handover.n3_ul_pdr_id = None;
+                s.handover.forwarding_ids.clear();
+                s.up_cnx_state = context::UpCnxState::Activated;
+                if was_eps {
+                    s.epc = false;
+                    s.establishment_accept_sent = true;
+                }
+            });
         }
     }
     if was_eps {
@@ -2052,8 +2067,17 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
             );
         }
         sess.handover = context::HandoverInfo::default();
+        // #2291: in place, across the round trips above. An abandoned EPS->5GS
+        // preparation also gives up the 5G identity it took (set above).
+        let gave_up_5g = sess.sm_context_ref.is_none();
         if let Ok(ctx) = smf_self().read() {
-            ctx.sess_update(&sess);
+            ctx.sess_modify(sess.id, |s| {
+                if gave_up_5g {
+                    s.psi = 0;
+                    s.sm_context_ref = None;
+                }
+                s.handover = context::HandoverInfo::default();
+            });
         }
     }
     SbiResponse::with_status(200).with_body(
