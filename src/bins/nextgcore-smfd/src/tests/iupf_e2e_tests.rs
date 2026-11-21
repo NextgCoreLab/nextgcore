@@ -233,6 +233,7 @@ async fn n6_read(fd: RawFd) -> Option<Vec<u8>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
@@ -441,6 +442,7 @@ async fn a_session_s_traffic_goes_through_the_i_upf_both_ways_2208() {
 async fn the_per_flow_delay_through_an_i_upf_reaches_the_pcf_2208() {
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
@@ -726,6 +728,7 @@ async fn session_with_refusing_psa_on(
 async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
     use crate::n4_build::apply_action::{BUFF, FORW};
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -862,6 +865,7 @@ async fn a_split_the_psa_refuses_or_that_is_cancelled_applies_nothing_2208() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_psa_teardown_deletes_the_i_upf_session_2208() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -910,6 +914,7 @@ fn last_psa_far2_action(psa: &pfcp_path::stand_in::StandInUpf) -> Option<u16> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_i_upf_loss_releases_its_sessions_at_the_psa_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -981,6 +986,7 @@ async fn an_i_upf_loss_releases_its_sessions_at_the_psa_2225() {
 async fn an_i_upf_path_failure_deactivates_then_releases_its_sessions_2225() {
     use crate::n4_build::apply_action::{BUFF, FORW, NOCP};
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -1059,6 +1065,7 @@ async fn an_i_upf_path_failure_deactivates_then_releases_its_sessions_2225() {
 async fn an_i_upf_error_indication_report_is_its_psa_session_s_2225() {
     use crate::n4_build::apply_action::{BUFF, FORW, NOCP};
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -1163,6 +1170,7 @@ async fn an_i_upf_downlink_data_report_pages_for_its_psa_session_2225() {
     use nextgcore_sbi::message::SbiResponse;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -1243,6 +1251,7 @@ async fn an_i_upf_downlink_data_report_pages_for_its_psa_session_2225() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_i_upf_gets_no_stale_deletion_and_its_new_leg_survives_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -1325,6 +1334,7 @@ async fn a_restarted_i_upf_gets_no_stale_deletion_and_its_new_leg_survives_2225(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unanswered_leg_deletion_is_queued_and_resent_once_retained_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _q = qos_mon::TEST_LOCK.lock().await;
     let _seeded = crate::context::SeededState::track();
     let _restore = ProcessStateRestore;
@@ -1406,6 +1416,7 @@ async fn the_deletion_queue_is_bounded_and_drops_the_oldest_2225() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1457,20 +1468,36 @@ async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
 /// #2270: an I-UPF test that panics leaves no `PCF_URI` and no I-UPF behind for
 /// the next test in the binary.
 ///
-/// REVERT-VERIFIED: with `ProcessStateRestore::drop` empty, this fails.
+/// R47 on #2282 (a): the body configures an associated I-UPF before it panics,
+/// so "no I-UPF is left configured" can fail. Before, the body set none, and
+/// that half held under any `Drop`.
+///
+/// REVERT-VERIFIED: with `ProcessStateRestore::drop` empty, this fails. With
+/// only its `iupf::set(None)` removed, "no I-UPF is left configured" fails.
 #[tokio::test]
 async fn a_panicking_i_upf_test_leaves_no_process_state_behind_2270() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    // Drops after the assertions, so it cannot stand in for the body's restore.
+    let _ambient = crate::context::AmbientRestore::new(&_state);
     let panicked = tokio::spawn(async {
         let _restore = ProcessStateRestore;
         std::env::set_var("PCF_URI", "http://127.0.0.1:9");
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = sock.local_addr().unwrap();
+        let client = Arc::new(pfcp_path::PfcpClient::new(sock, peer, [127, 0, 0, 1]));
+        client.set_assoc_state_for_test(true, None, None).await;
+        iupf::set(Some((client, Vec::new())));
+        assert!(
+            iupf::will_insert("internet"),
+            "the I-UPF is live in the body"
+        );
         panic!("an assertion of the end to end fails");
     })
     .await;
     assert!(panicked.is_err(), "the test body panicked");
     assert!(std::env::var("PCF_URI").is_err(), "PCF_URI is not left set");
     assert!(
-        !iupf::will_insert("internet"),
+        !iupf::will_insert("internet") && iupf::client().is_none(),
         "no I-UPF is left configured"
     );
 }

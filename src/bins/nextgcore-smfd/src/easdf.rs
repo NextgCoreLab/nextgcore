@@ -99,6 +99,13 @@ pub fn set_for_test(config: Option<EasdfConfig>) {
     EASDF_ENABLED.store(enabled, Ordering::SeqCst);
 }
 
+/// #2270: the switch and config together, as [`set_for_test`] takes them, for
+/// `context::AmbientRestore`'s snapshot.
+#[cfg(test)]
+pub(crate) fn config_for_test() -> Option<EasdfConfig> {
+    config()
+}
+
 /// A snapshot of the config, cloned so no lock is held across an `await`.
 fn config() -> Option<EasdfConfig> {
     if !enabled() {

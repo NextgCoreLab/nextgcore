@@ -2575,6 +2575,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn an_eps_to_5gs_handover_runs_end_to_end_against_the_real_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let _amf_guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().await;
@@ -3260,6 +3261,7 @@ mod tests {
         let (upf_ip, local) = (ip("NEXTG_REAL_UPF"), ip("NEXTG_REAL_UPF_LOCAL"));
         let container = std::env::var("NEXTG_REAL_UPF_CONTAINER").expect("container name");
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _upf =
             crate::pfcp_path::stand_in::real_upf((local, 0).into(), (upf_ip, 8805).into()).await;
         crate::context::smf_context_init(64, 256, 512);
@@ -3459,6 +3461,7 @@ mod tests {
         let (upf_ip, local) = (ip("NEXTG_REAL_UPF"), ip("NEXTG_REAL_UPF_LOCAL"));
         let container = std::env::var("NEXTG_REAL_UPF_CONTAINER").expect("container name");
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _upf =
             crate::pfcp_path::stand_in::real_upf((local, 0).into(), (upf_ip, 8805).into()).await;
         crate::context::smf_context_init(64, 256, 512);
@@ -3681,6 +3684,7 @@ mod tests {
     #[tokio::test]
     async fn an_earlier_forwarding_timer_leaves_a_newer_entry_alone() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let reference = "n2ho-982-m2";
         seed_n4_session(reference, upf.upf_seid);
@@ -3715,6 +3719,7 @@ mod tests {
     #[tokio::test]
     async fn a_forwarding_timer_of_a_released_or_moved_session_sends_nothing() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (released, moved) = ("n2ho-982-m3-released", "n2ho-982-m3-moved");
         seed_n4_session(released, upf.upf_seid);
@@ -4268,6 +4273,7 @@ mod tests {
     #[tokio::test]
     async fn an_eps_to_5gs_move_is_counted_in_and_a_cancel_counts_it_out() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -4347,6 +4353,7 @@ mod tests {
     #[tokio::test]
     async fn an_eps_to_5gs_move_the_nsacf_rejects_is_not_transferred() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -4565,6 +4572,7 @@ mod tests {
     #[test]
     fn the_nf_profile_advertises_the_pgw_fqdn_only_when_configured() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         std::env::remove_var("SMF_PGW_FQDN");
         assert!(crate::build_smf_nf_profile(
             "i",

@@ -1056,6 +1056,7 @@ mod tests {
         // module's own would be a second disjoint agreement about one variable, and
         // that is exactly how this test first flaked.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         set_for_test(true);
 
         // `(method, path, body, dnn-query-param)`. The fourth field exists because
@@ -1248,6 +1249,7 @@ mod tests {
         // process-global; one lock covers all of them (#308 -- a second lock would be a
         // second disjoint agreement about the same variables).
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         set_for_test(true);
 
         let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =

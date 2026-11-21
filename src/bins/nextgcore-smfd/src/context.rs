@@ -4308,6 +4308,103 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
 #[cfg(test)]
 pub(crate) static PROCESS_STATE_TEST_LOCK: TestLock = TestLock::with_census();
 
+/// #2270 (R47 on #2282): the environment knobs smfd tests set. They are read
+/// on the session paths every [`PROCESS_STATE_TEST_LOCK`] holder runs, so that
+/// lock owns them. `every_env_knob_a_test_sets_is_restored_2270` fails if a test
+/// sets one not listed here.
+#[cfg(test)]
+pub(crate) const AMBIENT_ENV: &[&str] = &[
+    "NRF_URI",
+    "NSACF_URI",
+    "PCF_URI",
+    "SMF_INDIRECT_FORWARDING_TIMER_MS",
+    "SMF_N2_INDIRECT_FORWARDING",
+    "SMF_PGW_FQDN",
+    "SMF_UE_UNREACHABLE_UPF_POLICY",
+    "SMF_UP_PATH_FAILURE_HOLD_SECS",
+    "SMF_URR_MEASUREMENT_PERIOD",
+    "SMF_URR_TIME_QUOTA",
+    "SMF_URR_VOLUME_QUOTA",
+    "SMF_URR_VOLUME_THRESHOLD",
+    "UDM_SBI_ADDR",
+    "UDM_SBI_PORT",
+];
+
+/// #2270 (R47 on #2282): puts the process-globals [`PROCESS_STATE_TEST_LOCK`]
+/// owns back as they were when it was made, when it drops, whether the test
+/// passed or panicked. Before, a test cleared what it set only on success, so a
+/// failing test left `PCF_URI` (or a UDM, a switch, an I-UPF) set and the next
+/// lock holder met it.
+///
+/// It restores:
+/// - the [`AMBIENT_ENV`] knobs;
+/// - the udm, easdf and eps_iwk switches;
+/// - the configured I-UPF;
+/// - the up_path test hold;
+/// - amfd's PGW-discovery NRF override. No smfd production code sets that, so
+///   its baseline in this binary is `None`.
+///
+/// It borrows the lock's guard: it can be made only while the lock is held, and
+/// it drops (restores) before the lock is released. Make it right after taking
+/// the lock, before the test sets anything.
+///
+/// REVERT-VERIFIED (knock-on): with a panic forced in
+/// `a_late_create_failure_releases_the_session_without_announcing_it` right after
+/// it sets `PCF_URI`, `only_the_serving_amf_..._1860` run after it still passes.
+/// With that test's `AmbientRestore` removed as well, the `PCF_URI` it leaves
+/// names a stopped PCF, and `_1860` fails `504 PEER_NOT_RESPONDING` (#2270).
+#[cfg(test)]
+#[must_use = "it restores when it drops"]
+pub(crate) struct AmbientRestore<'held> {
+    env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    udm: bool,
+    easdf: Option<crate::easdf::EasdfConfig>,
+    eps_iwk: bool,
+    iupf: Option<(Arc<crate::pfcp_path::PfcpClient>, Vec<String>)>,
+    up_hold: Option<std::time::Duration>,
+    _held: &'held TestLockGuard,
+}
+
+#[cfg(test)]
+impl<'held> AmbientRestore<'held> {
+    pub(crate) fn new(held: &'held TestLockGuard) -> Self {
+        assert!(
+            held.is_of(&PROCESS_STATE_TEST_LOCK),
+            "AmbientRestore restores PROCESS_STATE_TEST_LOCK's globals: pass its guard"
+        );
+        Self {
+            env: AMBIENT_ENV
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect(),
+            udm: crate::udm::enabled(),
+            easdf: crate::easdf::config_for_test(),
+            eps_iwk: crate::eps_iwk::enabled(),
+            iupf: crate::iupf::get_for_test(),
+            up_hold: crate::up_path::hold_for_test(),
+            _held: held,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AmbientRestore<'_> {
+    fn drop(&mut self) {
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        crate::udm::set_for_test(self.udm);
+        crate::easdf::set_for_test(self.easdf.take());
+        crate::eps_iwk::set_for_test(self.eps_iwk);
+        crate::iupf::set(self.iupf.take());
+        crate::up_path::set_hold_for_test(self.up_hold);
+        nextgcore_amfd::sbi_path::set_pgw_discovery_nrf_for_test(None);
+    }
+}
+
 /// A test lock that knows its holder (#979).
 ///
 /// A `tokio::sync::Mutex<()>` cannot say who holds it, so [`require_test_lock`]
@@ -4560,6 +4657,11 @@ pub(crate) struct TestLockGuard {
 
 #[cfg(test)]
 impl TestLockGuard {
+    /// #2270: whether this guard holds `lock`, for a restore that borrows it.
+    pub(crate) fn is_of(&self, lock: &'static TestLock) -> bool {
+        std::ptr::eq(self.lock, lock)
+    }
+
     fn new(lock: &'static TestLock, guard: tokio::sync::MutexGuard<'static, ()>) -> Self {
         lock.set_holder(Some(std::thread::current().id()));
         let census = if lock.census { Census::take() } else { None };
@@ -6321,5 +6423,164 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The smfd sources, as (file, text).
+    fn smfd_sources_2270() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for e in std::fs::read_dir(dir).expect("src") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).expect("read");
+                    out.push((p.display().to_string(), text));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        out
+    }
+
+    /// The fns of `text`: (name, is a test, body). A fn ends at the first line
+    /// back at its own indentation that starts with `}`.
+    fn fns_2270(text: &str) -> Vec<(String, bool, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut test_attr = false;
+        for (i, l) in lines.iter().enumerate() {
+            let t = l.trim_start();
+            if t.starts_with("#[test]") || t.starts_with("#[tokio::test") {
+                test_attr = true;
+            }
+            let Some(at) = t.find("fn ") else { continue };
+            let head = &t[..at];
+            if !head
+                .split_whitespace()
+                .all(|w| matches!(w, "pub" | "pub(crate)" | "async" | "const" | "unsafe"))
+                || t.trim_end().ends_with(';')
+            {
+                continue;
+            }
+            let name: String = t[at + 3..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let indent = l.len() - t.len();
+            let end = lines[i + 1..]
+                .iter()
+                .position(|m| {
+                    m.len() - m.trim_start().len() == indent && m.trim_start().starts_with('}')
+                })
+                .map_or(lines.len(), |p| i + 1 + p);
+            out.push((name, test_attr, lines[i + 1..end].join("\n")));
+            test_attr = false;
+        }
+        out
+    }
+
+    /// **#2270** (R47 on #2282, b): every environment knob an smfd test sets is
+    /// one [`AmbientRestore`] puts back, and every fn that takes the process-state
+    /// lock and sets one of its globals, itself or through a helper, holds an
+    /// `AmbientRestore`. A test that cleared what it set only on success left it
+    /// set for the next lock holder when it panicked.
+    ///
+    /// REVERT-VERIFIED: with `PCF_URI` taken out of `AMBIENT_ENV`, the first half
+    /// fails naming it; with one test's `AmbientRestore` line removed, the second
+    /// fails naming that test.
+    #[test]
+    fn every_env_knob_a_test_sets_is_restored_2270() {
+        const SETTERS: &[&str] = &[
+            "udm::set_for_test(",
+            "easdf::set_for_test(",
+            "eps_iwk::set_for_test(",
+            "iupf::set(",
+            "up_path::set_hold_for_test(",
+            "set_pgw_discovery_nrf_for_test(",
+        ];
+        const LOCKS: &[&str] = &[
+            "PROCESS_STATE_TEST_LOCK.lock()",
+            "UP_PATH_TEST_LOCK.lock()",
+            "RELEASE_STATE_TEST_LOCK.lock()",
+            "PROCESS_STATE_TEST_LOCK.blocking_lock()",
+        ];
+        // Not helpers: production startup, and the setters and restores themselves.
+        const NOT_HELPERS: &[&str] = &["main", "set", "drop", "new", "set_for_test", "enable"];
+        // This scanner names the patterns it looks for.
+        const SCANNER: &[&str] = &[
+            "every_env_knob_a_test_sets_is_restored_2270",
+            "fns_2270",
+            "smfd_sources_2270",
+        ];
+        let sources = smfd_sources_2270();
+        let mut unlisted = Vec::new();
+        for (file, text) in &sources {
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("std::env::set_var(") {
+                rest = &rest[at + "std::env::set_var(".len()..];
+                let arg = rest.trim_start();
+                if let Some(q) = arg.strip_prefix('"') {
+                    let key = &q[..q.find('"').expect("closing quote")];
+                    // An env key, not this scanner's own pattern literals.
+                    let is_key = !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                    if is_key && !AMBIENT_ENV.contains(&key) {
+                        unlisted.push(format!("{file}: {key}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            unlisted.is_empty(),
+            "set by a test, not in AMBIENT_ENV: {unlisted:#?}"
+        );
+
+        let all: Vec<(String, bool, String)> = sources
+            .iter()
+            .flat_map(|(_, t)| fns_2270(t))
+            .filter(|(n, _, _)| !SCANNER.contains(&n.as_str()))
+            .collect();
+        let direct =
+            |b: &str| b.contains("std::env::set_var(") || SETTERS.iter().any(|s| b.contains(s));
+        let mut helpers: std::collections::BTreeSet<String> = all
+            .iter()
+            .filter(|(n, t, b)| !t && !NOT_HELPERS.contains(&n.as_str()) && direct(b))
+            .map(|(n, _, _)| n.clone())
+            .collect();
+        loop {
+            let more: Vec<String> = all
+                .iter()
+                .filter(|(n, t, b)| {
+                    !t && !NOT_HELPERS.contains(&n.as_str())
+                        && !helpers.contains(n)
+                        && helpers.iter().any(|h| b.contains(&format!("{h}(")))
+                })
+                .map(|(n, _, _)| n.clone())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            helpers.extend(more);
+        }
+        let unguarded: Vec<&String> = all
+            .iter()
+            .filter(|(_, _, b)| {
+                LOCKS.iter().any(|l| b.contains(l))
+                    && (direct(b) || helpers.iter().any(|h| b.contains(&format!("{h}("))))
+                    && !b.contains("AmbientRestore::new(")
+            })
+            .map(|(n, _, _)| n)
+            .collect();
+        assert!(
+            unguarded.is_empty(),
+            "take the process-state lock and set its globals without an AmbientRestore: \
+             {unguarded:#?}"
+        );
     }
 }

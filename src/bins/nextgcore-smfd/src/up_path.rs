@@ -319,6 +319,12 @@ pub fn hold_duration() -> Duration {
 #[cfg(test)]
 static HOLD_FOR_TEST: Mutex<Option<Duration>> = Mutex::new(None);
 
+/// #2270: the test hold, for `context::AmbientRestore`'s snapshot.
+#[cfg(test)]
+pub(crate) fn hold_for_test() -> Option<Duration> {
+    *HOLD_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub(crate) fn set_hold_for_test(hold: Option<Duration>) {
     *HOLD_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) = hold;
@@ -1048,6 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_report_during_the_shutdown_records_the_path_but_arms_no_hold() {
         let _state = UP_PATH_TEST_LOCK.lock().await;
+        let _ambient = crate::context::AmbientRestore::new(&_state);
         let upf_key = "upf-1091g:8805";
         let ip: IpAddr = "10.10.91.7".parse().unwrap();
         let before = pending_hold_count();
