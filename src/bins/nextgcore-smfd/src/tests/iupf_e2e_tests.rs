@@ -1502,6 +1502,7 @@ fn queued_1_to_3() -> Vec<(u64, u64)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_is_not_retransmitted_under_a_new_association_2277() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let (client, heard, ear) =
         silent_iupf_with_queue(std::time::Duration::from_millis(200), 3).await;
@@ -1538,6 +1539,7 @@ async fn a_deletion_is_not_retransmitted_under_a_new_association_2277() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pass_stopped_by_a_retaining_re_association_resends_under_it_2277() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _restore = ProcessStateRestore;
     iupf::clear_pending_deletions();
     let (client, heard, ear) =
         silent_iupf_with_queue(std::time::Duration::from_millis(200), 3).await;
