@@ -421,6 +421,26 @@ fn five_qi_for_component(mc: &MediaComponent) -> u8 {
         .unwrap_or_else(|| mc.med_type.default_5qi())
 }
 
+/// #2269: the id an AF PCC rule for media component `med_comp_n` had before
+/// #2263 keyed rules by app session: `PccRule-af-<psi>-<medCompN>`. A session
+/// restored from a snapshot written before the upgrade can still hold one.
+pub fn legacy_af_pcc_rule_id(psi: u8, med_comp_n: u32) -> String {
+    format!("PccRule-af-{psi}-{med_comp_n}")
+}
+
+/// #2269: whether `id` is an AF PCC rule id of the pre-#2263 form
+/// ([`legacy_af_pcc_rule_id`]): `PccRule-af-<psi>-<medCompN>`, two numbers, where
+/// the current form has three (`<psi>-<appId>-<medCompN>`).
+pub fn is_legacy_af_pcc_rule_id(id: &str) -> bool {
+    id.strip_prefix("PccRule-af-").is_some_and(|rest| {
+        let parts: Vec<&str> = rest.split('-').collect();
+        parts.len() == 2
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 /// Convert AF media components to PCC rules (TS 29.514 §4.2.2.2). For each
 /// component the flowDescriptions become flowInfos, `medType`/`marBw{Ul,Dl}`
 /// and the resolved 5QI become a QosData (with `gbr` for GBR 5QIs), and
@@ -588,8 +608,14 @@ pub fn build_af_removal_notification(
         .map(|r| (r.qos_data.qos_id.clone(), serde_json::Value::Null))
         .collect();
     let mut decision = serde_json::Map::new();
-    decision.insert("pccRules".to_string(), serde_json::Value::Object(pcc));
-    decision.insert("qosDecs".to_string(), serde_json::Value::Object(qos));
+    // #2269: TS 29.512 gives both maps minProperties 1, so an empty one is left
+    // out rather than sent as `{}`.
+    if !pcc.is_empty() {
+        decision.insert("pccRules".to_string(), serde_json::Value::Object(pcc));
+    }
+    if !qos.is_empty() {
+        decision.insert("qosDecs".to_string(), serde_json::Value::Object(qos));
+    }
     if let Some(qm) = qm_id {
         decision.insert("qosMonDecs".to_string(), serde_json::json!({ qm: null }));
     }
@@ -632,6 +658,21 @@ mod tests {
     fn test_flow_status_default() {
         let fs = FlowStatus::default();
         assert_eq!(fs, FlowStatus::Enabled);
+    }
+
+    /// #2269: a removal with no PCC rule to remove (only a QoS monitoring
+    /// instance) leaves `pccRules` and `qosDecs` out: TS 29.512 gives both maps
+    /// minProperties 1, so `{}` is not a valid value.
+    ///
+    /// REVERT-VERIFIED: inserting the maps unconditionally fails this.
+    #[test]
+    fn a_removal_with_no_rule_leaves_the_empty_maps_out_2269() {
+        let sess = PcfSess::new(1, 1, 5);
+        let body = build_af_removal_notification(&sess, &[], Some("qm-1"));
+        let d = &body["smPolicyDecision"];
+        assert!(d.get("pccRules").is_none(), "{d}");
+        assert!(d.get("qosDecs").is_none(), "{d}");
+        assert_eq!(d["qosMonDecs"], serde_json::json!({ "qm-1": null }));
     }
 
     /// pcfd-02: TS 29.514 §4.2.2.2 — an AscReqData with one audio media

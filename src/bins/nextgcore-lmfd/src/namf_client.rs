@@ -115,6 +115,13 @@ struct N1MessageContainer<'a> {
     n1_message_class: &'a str,
     #[serde(rename = "n1MessageContent")]
     n1_message_content: RefToBinaryData<'a>,
+    /// This LMF's NF Instance ID. TS 29.518 Table 6.1.6.2.17-1: "This IE shall
+    /// be present when the n1MessageClass IE is set to "LPP", "LCS" or
+    /// "UPP-CM" ... It may be present otherwise", so SLPP carries it too. The
+    /// AMF binds the transfer's LCS correlation to it, so the UE's answer
+    /// comes back here and no other caller can claim the correlation (#2256).
+    #[serde(rename = "nfId")]
+    nf_id: &'a str,
 }
 
 /// `N1N2MessageTransferReqData` (TS 29.518 §6.1.6.2.3,
@@ -215,6 +222,7 @@ pub fn build_n1_transfer_request(
             n1_message_content: RefToBinaryData {
                 content_id: class.content_id(),
             },
+            nf_id: serving_lmf_identification,
         },
         lcs_correlation_id,
         serving_lmf_identification,
@@ -971,7 +979,7 @@ mod tests {
         let expected: Vec<u8> = [
             b"--gold\r\n".as_slice(),
             b"Content-Type: application/json\r\n\r\n",
-            br#"{"n1MessageContainer":{"n1MessageClass":"LPP","n1MessageContent":{"contentId":"lpp-req"}},"lcsCorrelationId":"corr-0001","servingLMFIdentification":"lmf-1"}"#,
+            br#"{"n1MessageContainer":{"n1MessageClass":"LPP","n1MessageContent":{"contentId":"lpp-req"},"nfId":"lmf-1"},"lcsCorrelationId":"corr-0001","servingLMFIdentification":"lmf-1"}"#,
             b"\r\n",
             b"--gold\r\n",
             b"Content-Id: lpp-req\r\n",

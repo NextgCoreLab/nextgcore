@@ -308,12 +308,26 @@ impl FlowState {
         }
     }
 
-    fn average(&self) -> Option<Delays> {
+    /// The period's average. For a GTPUPM control (`rt_is_sum`) the round trip
+    /// is the averaged DL plus the averaged UL, as each sample's is
+    /// (§5.24.5.4, [`TransportSample::delays`]). Averaged on its own, each of
+    /// the three is rounded down separately, so samples that differ (any load
+    /// makes the transport delay vary) reported a round trip 1 ms more than DL +
+    /// UL (#2270).
+    fn average(&self, rt_is_sum: bool) -> Option<Delays> {
         let n = self.count as u64;
-        (n > 0).then(|| Delays {
-            dl: (self.sum.0 / n) as u32,
-            ul: (self.sum.1 / n) as u32,
-            rp: (self.sum.2 / n) as u32,
+        (n > 0).then(|| {
+            let dl = (self.sum.0 / n) as u32;
+            let ul = (self.sum.1 / n) as u32;
+            Delays {
+                dl,
+                ul,
+                rp: if rt_is_sum {
+                    dl.saturating_add(ul)
+                } else {
+                    (self.sum.2 / n) as u32
+                },
+            }
         })
     }
 }
@@ -759,7 +773,7 @@ impl QosFlowMonitor {
                             && now.saturating_duration_since(st.period_start) >= period
                         {
                             let start = st.period_start_wall;
-                            let m = match st.average() {
+                            let m = match st.average(c.cfg.gtpupm) {
                                 Some(avg) => c.cfg.measurement(&avg),
                                 None => failure(),
                             };

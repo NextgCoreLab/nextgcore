@@ -4204,11 +4204,11 @@ impl AmfContext {
     /// verified identity > declared nfId > no identity:
     /// - a verified identity takes over a binding made from a declaration or
     ///   none (the declaration could have been anyone's);
-    /// - a declaration fills a binding made with no identity;
     /// - a caller with no identity may re-use a declared binding, which stays
     ///   (its answers go to the declared LMF), but never a verified one;
-    /// - a declaration never takes over another declaration or a verified
-    ///   binding.
+    /// - a declaration never takes over a binding made with no identity (an
+    ///   unverified caller would capture that LMF's session), another
+    ///   declaration, or a verified binding.
     ///
     /// A new correlation past [`MAX_LCS_UPLINK_ROUTES_PER_LMF`] drops the same
     /// LMF's least recently used one. Past [`MAX_LCS_UPLINK_ROUTES_PER_UE`] in
@@ -4245,10 +4245,6 @@ impl AmfContext {
                 }
                 // A verified identity outranks a declaration or no identity.
                 _ if route.verified && !known.verified => route,
-                // A declared nfId fills a binding made with none (an LMF that
-                // names itself in one container and not another, as lmfd's LPP
-                // and NRPPa transfers do).
-                (None, Some(_)) => route,
                 // A caller naming no identity re-uses a declared binding, which
                 // stays: its answers go to the LMF the binding names.
                 (Some(_), None) if !known.verified => keep(known, route),
@@ -8484,17 +8480,20 @@ mod tests {
         assert_eq!(rec(route("c-d", Some("lmf-b"), true)), Recorded);
         assert_eq!(lmf_of("c-d").as_deref(), Some("lmf-b"));
         assert_eq!(rec(route("c-d", Some("lmf-a"), true)), OwnedByAnotherLmf);
-        // No identity < a declaration < a verified identity.
+        // No identity < a declaration < a verified identity. A declaration
+        // never captures a binding made with no identity.
         assert_eq!(rec(route("c-n", None, false)), Recorded);
         assert_eq!(
             rec(route("c-n", Some("lmf-n"), false)),
-            Recorded,
-            "fills it"
+            OwnedByAnotherLmf,
+            "a declaration does not capture an anonymous binding"
         );
-        assert_eq!(lmf_of("c-n").as_deref(), Some("lmf-n"));
-        assert_eq!(rec(route("c-n", None, false)), Recorded, "re-used, kept");
-        assert_eq!(lmf_of("c-n").as_deref(), Some("lmf-n"));
-        assert_eq!(rec(route("c-n", Some("lmf-m"), false)), OwnedByAnotherLmf);
+        assert_eq!(lmf_of("c-n"), None);
+        assert_eq!(rec(route("c-n", None, false)), Recorded, "its own, re-used");
+        assert_eq!(rec(route("c-e", Some("lmf-n"), false)), Recorded);
+        assert_eq!(rec(route("c-e", None, false)), Recorded, "re-used, kept");
+        assert_eq!(lmf_of("c-e").as_deref(), Some("lmf-n"));
+        assert_eq!(rec(route("c-e", Some("lmf-m"), false)), OwnedByAnotherLmf);
         assert_eq!(rec(route("c-n", Some("lmf-m"), true)), Recorded);
         assert_eq!(lmf_of("c-n").as_deref(), Some("lmf-m"));
         assert_eq!(

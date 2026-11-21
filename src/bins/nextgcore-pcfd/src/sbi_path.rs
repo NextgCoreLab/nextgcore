@@ -956,6 +956,16 @@ pub fn pcf_sbi_send_pcscf_restoration_notify(sess_id: u64) -> bool {
 /// re-derives the subscription decision), this pushes the
 /// media-component-installed PccRule/QosData decisions.
 pub fn pcf_sbi_send_af_smpolicycontrol_update_notify(sess_id: u64) -> bool {
+    pcf_sbi_send_af_smpolicycontrol_update_notify_removing(sess_id, &[])
+}
+
+/// [`pcf_sbi_send_af_smpolicycontrol_update_notify`], also removing `removed`
+/// from the SMF (#2269): a `null` for each rule and its QosData (TS 29.512
+/// §4.2.6.1), in the same decision as the rules that replace them.
+pub fn pcf_sbi_send_af_smpolicycontrol_update_notify_removing(
+    sess_id: u64,
+    removed: &[crate::npcf_handler::AfPccRule],
+) -> bool {
     let sess = crate::context::pcf_self()
         .read()
         .ok()
@@ -968,7 +978,12 @@ pub fn pcf_sbi_send_af_smpolicycontrol_update_notify(sess_id: u64) -> bool {
         log::warn!("[sess_id={sess_id}] AF SM policy update notify: no notification URI stored");
         return false;
     };
-    let body = crate::npcf_handler::build_af_sm_policy_notification(&sess);
+    let mut body = crate::npcf_handler::build_af_sm_policy_notification(&sess);
+    for r in removed {
+        let d = &mut body["smPolicyDecision"];
+        d["pccRules"][&r.pcc_rule_id] = serde_json::Value::Null;
+        d["qosDecs"][&r.qos_data.qos_id] = serde_json::Value::Null;
+    }
     spawn_notification(uri, "/update", body, "AF SM policy update")
 }
 
