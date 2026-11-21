@@ -95,11 +95,10 @@ pub fn handle_create_session_request(
             }
             // Re-fetch the UE
             match ctx.ue_find_by_imsi(imsi) {
-                Some(ue) => {
-                    // Update MME S11 TEID
-                    let mut ue = ue;
+                Some(mut ue) => {
+                    // Update MME S11 TEID, in place (#2288).
                     ue.mme_s11_teid = mme_s11_teid;
-                    ctx.ue_update(&ue);
+                    ctx.ue_modify(ue.id, |u| u.mme_s11_teid = mme_s11_teid);
                     log::info!(
                         "    MME_S11_TEID[{}] SGW_S11_TEID[{}]",
                         ue.mme_s11_teid,
@@ -118,7 +117,7 @@ pub fn handle_create_session_request(
     let ctx = sgwc_self();
     let mut ue = sgwc_ue.clone();
     ue.mme_s11_teid = mme_s11_teid;
-    ctx.ue_update(&ue);
+    ctx.ue_modify(ue.id, |u| u.mme_s11_teid = mme_s11_teid);
 
     log::info!("UE IMSI[{}] APN[{}]", ue.imsi_bcd, apn);
     log::info!(

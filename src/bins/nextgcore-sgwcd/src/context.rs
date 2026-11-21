@@ -882,6 +882,18 @@ impl SgwcContext {
     }
 
     /// Update UE in context
+    /// Change UE `id` in place, under the UE list's write lock (#2288).
+    ///
+    /// Prefer this to [`Self::ue_find_by_id`] + [`Self::ue_update`]: that pair writes
+    /// back a whole copy, so anything another task changed in between is reverted. The
+    /// Downlink Data Notification path did exactly that to the MME's Data Notification
+    /// Delay, when the acknowledge was handled while it held a copy. `f` must not call
+    /// back into the context (the lock is held).
+    pub fn ue_modify<R>(&self, id: u64, f: impl FnOnce(&mut SgwcUe) -> R) -> Option<R> {
+        let mut list = self.sgwc_ue_list.write().ok()?;
+        list.get_mut(&id).map(f)
+    }
+
     pub fn ue_update(&self, ue: &SgwcUe) -> bool {
         if let Ok(mut list) = self.sgwc_ue_list.write() {
             list.insert(ue.id, ue.clone());

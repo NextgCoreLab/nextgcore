@@ -1784,7 +1784,12 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     };
     ue.mme_addr = Some(peer);
     ue.rat_type = parsed.rat_type;
-    ctx.ue_update(&ue);
+    // In place (#2288): a whole copy written back could revert a field another task
+    // set in between, such as the Data Notification Delay.
+    ctx.ue_modify(ue.id, |u| {
+        u.mme_addr = Some(peer);
+        u.rat_type = parsed.rat_type;
+    });
 
     // The new session, by its default bearer's EBI: unique once the collision is
     // resolved, where the APN is not (two PDN connections may share one).
@@ -5964,6 +5969,15 @@ mod tests {
     /// The IE was PARSED into `ParsedDdnAck.data_notification_delay` and then dropped by
     /// the handler, so the throttling TS 29.274 §7.2.11.2 defines could not happen and a
     /// busy idle UE could produce a notification per downlink packet.
+    ///
+    /// #2288: this was flaky under load (about 1 in 100 with 128 parallel runs), and not
+    /// because of its timing. The DDN send path wrote back a copy of the UE after the
+    /// send, which reverted the delay whenever the MME's acknowledge was handled in
+    /// between; `the_ddn_bookkeeping_never_reverts_the_acknowledges_delay` reproduces
+    /// that interleaving deterministically. The test also no longer guesses: it waits
+    /// for the delay to be recorded rather than 200ms, uses the largest delay (255 x
+    /// 50ms) so no wall-clock window can close during it, and waits for the second
+    /// report to be throttled before asserting that nothing was sent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_data_notification_delay_throttles_the_next_ddn() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
@@ -6004,7 +6018,8 @@ mod tests {
             .await;
         let ddn = recv_s11(&sock).await.expect("the first DDN");
 
-        // Accepted, with a 20 x 50ms = 1s delay before the next one.
+        // Accepted, with a 255 x 50ms = 12.75s delay before the next one: the largest
+        // the IE carries, so the window outlasts the test however loaded the host is.
         let mut ack = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::DownlinkDataNotificationAcknowledge as u8,
             ue.sgw_s11_teid,
@@ -6014,23 +6029,122 @@ mod tests {
         ack.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
             Gtp2IeType::DelayValue as u8,
             0,
-            &[20],
+            &[255],
         ));
         sock.send_to(&ack.encode(), server.local_addr()).unwrap();
-        // Let the acknowledge be processed before the next report.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The acknowledge is processed: its delay is recorded on the UE.
+        let mut recorded = false;
+        for _ in 0..200 {
+            if ctx
+                .ue_find_by_id(ue.id)
+                .is_some_and(|u| u.ddn_delay_remaining().is_some())
+            {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            recorded,
+            "the DDN Acknowledge's Data Notification Delay is recorded"
+        );
 
-        // A second report inside the delay window must NOT page again.
+        // A second report inside the delay window must NOT page again. Wait until the
+        // SGW-C has throttled it, so "nothing arrived" is not just "not handled yet".
         sock.set_read_timeout(Some(Duration::from_millis(300)))
             .unwrap();
+        let throttled =
+            || crate::sxa_response::DDN_THROTTLED.load(std::sync::atomic::Ordering::Relaxed);
+        let before = throttled();
         sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9C)
             .await;
+        let mut handled = false;
+        for _ in 0..200 {
+            if throttled() > before {
+                handled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handled, "the second report is handled, and throttled");
         assert!(
             recv_s11(&sock).await.is_none(),
             "the MME asked for a 1s Data Notification Delay: a second notification inside \
              it is the storm the IE exists to suppress"
         );
 
+        server.close();
+    }
+
+    /// #2288: the root cause of the flake above, made deterministic. The MME's DDN
+    /// Acknowledge, with its Data Notification Delay, is handled the instant the DDN is
+    /// sent, before the send path goes on (`AFTER_DDN_SENT`). The delay must survive:
+    /// the send path used to write back a copy of the UE taken before the acknowledge,
+    /// which reverted it, so the next DDN was not throttled.
+    ///
+    /// Revert-verified: with the send path writing back a copy of the UE taken before
+    /// the send, the delay is gone and the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ddn_bookkeeping_never_reverts_the_acknowledges_delay() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x8f];
+        sock.send_to(&csr(0x5408, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        let pdr_id = ctx
+            .dl_tunnel_in_bearer(sess.bearer_ids[0])
+            .and_then(|t| t.pdr_id)
+            .or_else(|| {
+                ctx.ul_tunnel_in_bearer(sess.bearer_ids[0])
+                    .and_then(|t| t.pdr_id)
+            })
+            .expect("pdr id");
+
+        let ue_id = ue.id;
+        *crate::sxa_response::AFTER_DDN_SENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            crate::sxa_response::downlink_data_notification_ack(
+                Some(ue_id),
+                gtp_cause::REQUEST_ACCEPTED,
+                Some(255),
+            );
+        }));
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9D)
+            .await;
+        let _ddn = recv_s11(&sock).await.expect("the DDN");
+        *crate::sxa_response::AFTER_DDN_SENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        // The send path is done once its log line is behind it; give it the same
+        // bounded wait the other tests use, then look.
+        let mut settled = None;
+        for _ in 0..200 {
+            let u = ctx.ue_find_by_id(ue_id).expect("ue");
+            if u.ddn_outstanding_sess_id.is_none() {
+                settled = Some(u);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let u = settled.expect("the acknowledge cleared the outstanding DDN");
+        assert!(
+            u.ddn_delay_remaining().is_some(),
+            "the acknowledge's Data Notification Delay survives the DDN send path"
+        );
         server.close();
     }
 

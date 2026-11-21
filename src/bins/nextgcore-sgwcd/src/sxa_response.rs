@@ -22,6 +22,17 @@ use crate::s11_handler::gtp_cause;
 use crate::sxa_handler::{self, HandlerResult};
 use crate::{gtp_path, s11_build};
 
+/// Downlink Data Notifications held back by the MME's Data Notification Delay (TS
+/// 29.274 §7.2.11.2), so a test can tell "throttled" from "not handled yet" (#2288).
+pub(crate) static DDN_THROTTLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only: runs right after a Downlink Data Notification is sent, before the send
+/// path goes on, as if the MME's acknowledge were handled at once (#2288).
+#[cfg(test)]
+pub(crate) static AFTER_DDN_SENT: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>> =
+    std::sync::Mutex::new(None);
+
 /// A PFCP response landed for a transaction that was gating an S11 procedure.
 pub fn dispatch(sess_id: u64, continuation: S11Continuation, resp_type: u8, body: &[u8]) {
     match resp_type {
@@ -754,6 +765,7 @@ pub fn downlink_data_notification(sess_id: u64, pdr_id: Option<u16>) {
     // the next DDN. Honoured here rather than at the report, because the delay is per UE.
     if let Some(ue) = ctx.ue_find_by_id(bearer.sgwc_ue_id) {
         if let Some(remaining) = ue.ddn_delay_remaining() {
+            DDN_THROTTLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::info!(
                 "Downlink Data Notification for bearer {} throttled for {}ms more \
                  (Data Notification Delay, TS 29.274 §7.2.11.2)",
@@ -768,13 +780,24 @@ pub fn downlink_data_notification(sess_id: u64, pdr_id: Option<u16>) {
         log::error!("S11 server not open: cannot send a Downlink Data Notification");
         return;
     };
+    // Remember that one is outstanding, so a failure can be tied back to the session
+    // whose buffered packets have to be discarded. Recorded in place and BEFORE the
+    // send (#2288): the MME's acknowledge can only follow the send, and it sets the
+    // Data Notification Delay. A copy of the UE written back after the send reverted
+    // that delay whenever the acknowledge was handled in between, so the next DDN was
+    // not throttled.
+    let previous = ctx.ue_modify(bearer.sgwc_ue_id, |ue| {
+        ue.ddn_outstanding_sess_id.replace(sess_id)
+    });
     match server.send_downlink_data_notification(None, &bearer) {
         Ok(seq) => {
-            // Remember that one is outstanding, so a failure can be tied back to the
-            // session whose buffered packets have to be discarded.
-            if let Some(mut ue) = ctx.ue_find_by_id(bearer.sgwc_ue_id) {
-                ue.ddn_outstanding_sess_id = Some(sess_id);
-                ctx.ue_update(&ue);
+            #[cfg(test)]
+            if let Some(hook) = AFTER_DDN_SENT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                hook();
             }
             log::info!(
                 "Downlink Data Notification sent for bearer {} (seq={seq}) after a Downlink \
@@ -782,10 +805,20 @@ pub fn downlink_data_notification(sess_id: u64, pdr_id: Option<u16>) {
                 bearer.id
             );
         }
-        Err(e) => log::error!(
-            "Downlink Data Notification for bearer {} failed: {e}",
-            bearer.id
-        ),
+        Err(e) => {
+            // Not sent, so not outstanding: put back what was.
+            if let Some(previous) = previous {
+                ctx.ue_modify(bearer.sgwc_ue_id, |ue| {
+                    if ue.ddn_outstanding_sess_id == Some(sess_id) {
+                        ue.ddn_outstanding_sess_id = previous;
+                    }
+                });
+            }
+            log::error!(
+                "Downlink Data Notification for bearer {} failed: {e}",
+                bearer.id
+            )
+        }
     }
 }
 
@@ -806,13 +839,14 @@ pub fn downlink_data_notification_ack(
 ) {
     let Some(ue_id) = ue_id else { return };
     let ctx = sgwc_self();
-    let Some(mut ue) = ctx.ue_find_by_id(ue_id) else {
+    // In place (#2288): a whole copy written back could revert a field another task
+    // set in between.
+    let Some(outstanding) = ctx.ue_modify(ue_id, |ue| {
+        ue.set_ddn_delay(data_notification_delay);
+        ue.ddn_outstanding_sess_id.take()
+    }) else {
         return;
     };
-
-    ue.set_ddn_delay(data_notification_delay);
-    let outstanding = ue.ddn_outstanding_sess_id.take();
-    ctx.ue_update(&ue);
 
     if let Some(units) = data_notification_delay.filter(|u| *u > 0) {
         log::info!(
@@ -837,11 +871,9 @@ pub fn downlink_data_notification_ack(
 pub fn downlink_data_notification_failed(ue_id: Option<u64>, cause: u8) {
     let Some(ue_id) = ue_id else { return };
     let ctx = sgwc_self();
-    let Some(mut ue) = ctx.ue_find_by_id(ue_id) else {
+    let Some(outstanding) = ctx.ue_modify(ue_id, |ue| ue.ddn_outstanding_sess_id.take()) else {
         return;
     };
-    let outstanding = ue.ddn_outstanding_sess_id.take();
-    ctx.ue_update(&ue);
     discard_buffered(
         outstanding,
         ue_id,
