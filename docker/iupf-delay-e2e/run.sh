@@ -2,7 +2,7 @@
 # #2222: the nightly real-binary run of #2208's per-flow delay through an I-UPF.
 #
 # The REAL smfd and two REAL upfd binaries (a PSA and an I-UPF, each in a
-# privileged container with a TUN device), and one harness process standing in
+# container with NET_ADMIN and a TUN device), and one harness process standing in
 # for the AMF, the PCF and the gNB's GTP-U side (src/tests/e2e/
 # iupf_delay_harness.rs). The PCF's PCC rule asks for QoS monitoring (DL, UL,
 # round trip, every 1 s); the SMF runs `smf.qos_monitoring.method: gtpu_path`
@@ -34,26 +34,35 @@
 # Environment: ECHO_HOLD_MS (40), N9_MS (15, expected), NETEM_N9_MS (N9_MS,
 # injected), TOLERANCE_MS (8; below min(ECHO_HOLD_MS/2, N9_MS)), RUN_ID (this
 # shell's PID; digits only), NET_OCTET (derived from RUN_ID; 1-254),
-# SWEEP_ONLY (1: the start-up checks and the sweep, then exit), STALE_AFTER_S
-# (3600: a run started longer ago than this, whose harness is not running, is
-# swept; keep it above the job's lifetime).
+# STALE_AFTER_S (3600), LEASE_S (3600; keep both above the longest run),
+# SWEEP_ONLY (1: take the lease, sweep, exit), PAUSE_AFTER_LEASE_S (0; a test
+# hook that holds the run in its pre-build window), CLEAN_UNSTAMPED (1: remove
+# labelled resources that have no `started` label, then exit).
 #
 # Usage: run.sh <dir with nextgcore-smfd, nextgcore-upfd, iupf-delay-harness> <out-dir>
-# Needs docker and the sch_netem module; plain `docker run`, no compose. Each run
-# has its own container names, network, subnet and image tags (RUN_ID), so two
-# runs on one host do not clobber each other; a subnet already taken refuses the
-# run rather than reusing it. Every container, network and image carries the
-# label nextg.iupf-delay.run=<RUN_ID>, and nextg.iupf-delay.started=<epoch>, the
-# time run.sh began. Cleanup removes by the run label, so it is idempotent.
-# At start, a run sweeps what a killed (SIGKILL) run left behind, and refuses
-# to touch its own RUN_ID's resources unless they are stale. "Stale" means
-# two things (R43 on #2275):
-#   - the run's newest `started` label is older than STALE_AFTER_S. Build
-#     timestamps are never used: a cached BuildKit rebuild keeps the first
-#     build's .Created, so a live run's images can look hours old;
-#   - the run's harness container is not running. The harness exists only
-#     while run.sh drives a test. A killed run's daemons keep running for
-#     ever, so "any container running" would never let them be swept.
+# Needs docker and the sch_netem module; plain `docker run`, no compose.
+#
+# Isolation and cleanup. Each run has its own container names, network, subnet
+# and image tags (RUN_ID), and a subnet already taken refuses the run. Every
+# container, network and image carries nextg.iupf-delay.run=<RUN_ID> and
+# nextg.iupf-delay.started=<epoch>, the time this invocation began.
+#   - The lease (R43 on #2275). The first thing a run does, before any build,
+#     is start a small labelled container, iupf-delay-<RUN_ID>-lease, that
+#     sleeps LEASE_S. It is the run's lock and its liveness signal: a second
+#     start with the same RUN_ID hits the name clash and refuses (exit 2)
+#     without touching anything. A run is live while its lease or its harness
+#     runs. Cleanup on exit removes only this invocation's resources (run and
+#     started labels both), lease included. A SIGKILLed run's lease ends after
+#     LEASE_S and removes itself (--rm).
+#   - The sweep. At start, every other run that is not live and whose newest
+#     `started` is older than STALE_AFTER_S is removed: a killed run's
+#     leftovers. Build timestamps are never read, since a cached BuildKit
+#     rebuild keeps the first build's .Created. The leftovers of an earlier
+#     invocation with this RUN_ID go too, once the lease is held, unless its
+#     harness still runs (then the run refuses).
+#   - A resource with no `started` label counts as just started and is never
+#     swept. Runs of the version before it (8e35337a) left such resources;
+#     remove them once with `CLEAN_UNSTAMPED=1 run.sh . .`.
 set -euo pipefail
 
 BIN="$(cd "${1:?binaries dir}" && pwd)"
@@ -76,6 +85,8 @@ OCTET=$((10#$OCTET))
 STALE_AFTER_S="${STALE_AFTER_S:-3600}"
 LABEL=nextg.iupf-delay.run
 STARTED_LABEL=nextg.iupf-delay.started
+LEASE_LABEL=nextg.iupf-delay.lease
+LEASE_S="${LEASE_S:-3600}"
 STARTED="$(date +%s)"
 CORE_IMAGE="${IUPF_DELAY_CORE_IMAGE:-nextgcore-core:latest}"
 SMF_IMAGE="nextgcore-rust/smf:iupf-delay-$RUN_ID"
@@ -92,64 +103,71 @@ if [ "$TOLERANCE_MS" -ge "$N9_MS" ] || [ "$TOLERANCE_MS" -ge "$N3_MS" ]; then
   exit 2
 fi
 
-for b in nextgcore-smfd nextgcore-upfd iupf-delay-harness; do
-  test -x "$BIN/$b" || { echo "missing $BIN/$b" >&2; exit 2; }
-done
-mkdir -p "$OUT/harness"
-cp "$BIN/iupf-delay-harness" "$OUT/harness/"
-
-docker image inspect "$CORE_IMAGE" >/dev/null 2>&1 ||
-  docker build -q -f "$RUST/Dockerfile.core" -t "$CORE_IMAGE" "$RUST" >/dev/null
-ctx="$OUT/image-context"
-mkdir -p "$ctx/binaries"
-cp "$BIN/nextgcore-smfd" "$BIN/nextgcore-upfd" "$ctx/binaries/"
-# Remove this run's labelled resources: containers, then networks, then images.
-# Safe to run any number of times.
-remove_run() { # <run id>
-  local ids=()
-  mapfile -t ids < <(docker ps -aq --filter "label=$LABEL=$1")
-  [ "${#ids[@]}" -eq 0 ] || docker rm -f "${ids[@]}" >/dev/null 2>&1 || true
-  mapfile -t ids < <(docker network ls -q --filter "label=$LABEL=$1")
-  [ "${#ids[@]}" -eq 0 ] || docker network rm "${ids[@]}" >/dev/null 2>&1 || true
-  mapfile -t ids < <(docker images -q --filter "label=$LABEL=$1" | sort -u)
-  [ "${#ids[@]}" -eq 0 ] || docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true
+# The ids of the labelled resources of one kind matching the given filters.
+ids_of() { # <container|network|image> [--filter ...]...
+  local kind=$1
+  shift
+  case $kind in
+    container) docker ps -aq "$@" ;;
+    network) docker network ls -q "$@" ;;
+    image) docker images -q "$@" | sort -u ;;
+  esac
 }
-# Every labelled resource as "<run> <started>", one per line.
+labels_fmt() { [ "$1" = network ] && echo .Labels || echo .Config.Labels; }
+# Remove the given resources of each kind: containers, then networks, then images.
+remove_matching() { # [--filter ...]...
+  local kind ids=()
+  for kind in container network image; do
+    mapfile -t ids < <(ids_of "$kind" "$@")
+    [ "${#ids[@]}" -eq 0 ] && continue
+    case $kind in
+      container) docker rm -f "${ids[@]}" >/dev/null 2>&1 || true ;;
+      network) docker network rm "${ids[@]}" >/dev/null 2>&1 || true ;;
+      image) docker image rm -f "${ids[@]}" >/dev/null 2>&1 || true ;;
+    esac
+  done
+}
+remove_run() { remove_matching --filter "label=$LABEL=$1"; } # every invocation of <run>
+# Every labelled resource as "<kind> <id> <run> <started>", one per line.
 labelled() {
   local kind fmt ids id
   for kind in container network image; do
-    case $kind in
-      container) mapfile -t ids < <(docker ps -aq --filter "label=$LABEL"); fmt=.Config.Labels ;;
-      network) mapfile -t ids < <(docker network ls -q --filter "label=$LABEL"); fmt=.Labels ;;
-      image) mapfile -t ids < <(docker images -q --filter "label=$LABEL" | sort -u); fmt=.Config.Labels ;;
-    esac
+    fmt="$(labels_fmt "$kind")"
+    mapfile -t ids < <(ids_of "$kind" --filter "label=$LABEL")
     # ${a[@]+...}: an empty array under set -u in bash < 4.4.
     for id in ${ids[@]+"${ids[@]}"}; do
-      docker "$kind" inspect -f "{{index $fmt \"$LABEL\"}} {{index $fmt \"$STARTED_LABEL\"}}" \
-        "$id" 2>/dev/null || true
+      docker "$kind" inspect -f \
+        "$kind $id {{index $fmt \"$LABEL\"}} {{index $fmt \"$STARTED_LABEL\"}}" "$id" \
+        2>/dev/null || true
     done
   done
 }
-# Whether run <id> is stale: its newest `started` is older than STALE_AFTER_S
-# and its harness is not running. A resource with no `started` label (or a
-# non-numeric one) counts as just started, so it is never swept by mistake.
-is_stale() { # <run id>
-  local newest=0 run started now
+# `labelled` lines with containers first, then networks, then images.
+in_removal_order() {
+  awk '{ print ($1 == "container" ? 1 : $1 == "network" ? 2 : 3), $0 }' | sort -n -k1,1 | cut -d' ' -f2-
+}
+running() { # <run> <container suffix>
+  [ -n "$(docker ps -q --filter "label=$LABEL=$1" --filter "name=^iupf-delay-$1-$2\$")" ]
+}
+live() { running "$1" lease || running "$1" harness; } # <run>
+# Not live, and its newest `started` is older than STALE_AFTER_S. A missing or
+# non-numeric `started` counts as now, so such a resource is never swept.
+is_stale() { # <run>
+  local newest=0 now kind id run started
+  live "$1" && return 1
   now="$(date +%s)"
-  if [ -n "$(docker ps -q --filter "label=$LABEL=$1" --filter "name=^iupf-delay-$1-harness\$")" ]; then
-    return 1
-  fi
-  while read -r run started; do
+  while read -r kind id run started; do
     [ "$run" = "$1" ] || continue
-    [[ $started =~ ^[0-9]+$ ]] || started=$now
+    [[ ${started:-} =~ ^[0-9]+$ ]] || started=$now
     [ "$started" -gt "$newest" ] && newest=$started
   done < <(labelled)
+  # Nothing left (it finished between the listing and now): nothing to sweep.
+  [ "$newest" -gt 0 ] || return 1
   [ $((now - newest)) -gt "$STALE_AFTER_S" ]
 }
-# Every other run that is stale: a killed run's leftovers.
 sweep_stale() {
   local run
-  for run in $(labelled | cut -d' ' -f1 | sort -u); do
+  for run in $(labelled | cut -d' ' -f3 | sort -u); do
     if ! [[ $run =~ ^[0-9]+$ ]] || [ "$run" = "$RUN_ID" ]; then
       continue
     fi
@@ -159,18 +177,70 @@ sweep_stale() {
     fi
   done
 }
-if labelled | grep -q "^$RUN_ID "; then
-  if is_stale "$RUN_ID"; then
-    echo "removing stale resources of an earlier iupf-delay run $RUN_ID" >&2
-    remove_run "$RUN_ID"
-  else
-    echo "run $RUN_ID has live resources; refusing to start (pick another RUN_ID)" >&2
+
+if [ "${CLEAN_UNSTAMPED:-0}" = 1 ]; then
+  while read -r kind id run started; do
+    if [ -z "${started:-}" ] || [ "$started" = "<no value>" ]; then
+      echo "removing unstamped $kind $id (run $run)" >&2
+      case $kind in
+        container) docker rm -f "$id" >/dev/null ;;
+        network) docker network rm "$id" >/dev/null ;;
+        image) docker image rm -f "$id" >/dev/null ;;
+      esac
+    fi
+  done < <(labelled | in_removal_order)
+  exit 0
+fi
+
+for b in nextgcore-smfd nextgcore-upfd iupf-delay-harness; do
+  test -x "$BIN/$b" || { echo "missing $BIN/$b" >&2; exit 2; }
+done
+mkdir -p "$OUT/harness"
+cp "$BIN/iupf-delay-harness" "$OUT/harness/"
+
+# The shared base image, unlabelled: no sweep ever touches it.
+docker image inspect "$CORE_IMAGE" >/dev/null 2>&1 ||
+  docker build -q -f "$RUST/Dockerfile.core" -t "$CORE_IMAGE" "$RUST" >/dev/null
+ctx="$OUT/image-context"
+mkdir -p "$ctx/binaries"
+cp "$BIN/nextgcore-smfd" "$BIN/nextgcore-upfd" "$ctx/binaries/"
+
+# The lease: this run's lock and liveness signal, before anything else.
+docker run -d --rm --name "iupf-delay-$RUN_ID-lease" \
+  --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --label "$LEASE_LABEL=1" \
+  --entrypoint sleep "$CORE_IMAGE" "$LEASE_S" >/dev/null 2>&1 || {
+  echo "run $RUN_ID has live resources (its lease is held); refusing to start (pick another RUN_ID)" >&2
+  exit 2
+}
+names=(harness smf iupf psa)
+cleanup() {
+  for c in "${names[@]}"; do
+    docker logs "iupf-delay-$RUN_ID-$c" > "$OUT/$c.log" 2>&1 || true
+  done
+  # This invocation's resources only, lease included.
+  remove_matching --filter "label=$LABEL=$RUN_ID" --filter "label=$STARTED_LABEL=$STARTED"
+}
+trap cleanup EXIT
+
+# An earlier invocation with this RUN_ID: its lease is gone (we hold the name),
+# so it is dead unless its harness still runs.
+if labelled | awk -v r="$RUN_ID" -v s="$STARTED" '$3 == r && $4 != s' | grep -q .; then
+  if running "$RUN_ID" harness; then
+    echo "run $RUN_ID has live resources (its harness runs); refusing to start (pick another RUN_ID)" >&2
     exit 2
   fi
+  echo "removing the leftovers of an earlier iupf-delay run $RUN_ID" >&2
+  while read -r kind id _ _; do
+    case $kind in
+      container) docker rm -f "$id" >/dev/null 2>&1 || true ;;
+      network) docker network rm "$id" >/dev/null 2>&1 || true ;;
+      image) docker image rm -f "$id" >/dev/null 2>&1 || true ;;
+    esac
+  done < <(labelled | awk -v r="$RUN_ID" -v s="$STARTED" '$3 == r && $4 != s' | in_removal_order)
 fi
 sweep_stale
-# SWEEP_ONLY=1: only the start-up checks and the sweep (check-sweep.sh).
 [ "${SWEEP_ONLY:-0}" != 1 ] || exit 0
+sleep "${PAUSE_AFTER_LEASE_S:-0}"
 
 docker build -q -f "$RUST/Dockerfile.nf" --build-arg CORE_IMAGE="$CORE_IMAGE" \
   --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" \
@@ -184,14 +254,6 @@ P="172.29.$OCTET"
 SMF=$P.4 PSA=$P.7 IUPF=$P.8 HARNESS=$P.20
 # The SMF's YAML with this run's addresses.
 sed "s/172\.29\.22\./$P./g" "$HERE/smf.yaml" > "$OUT/smf.yaml"
-names=(harness smf iupf psa)
-cleanup() {
-  for c in "${names[@]}"; do
-    docker logs "iupf-delay-$RUN_ID-$c" > "$OUT/$c.log" 2>&1 || true
-  done
-  remove_run "$RUN_ID"
-}
-trap cleanup EXIT
 docker network create --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --subnet "$P.0/24" "$NET" >/dev/null || {
   echo "cannot create $NET on $P.0/24 (taken?); set NET_OCTET or RUN_ID" >&2
   exit 2
