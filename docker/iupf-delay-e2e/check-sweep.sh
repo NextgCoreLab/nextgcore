@@ -5,6 +5,9 @@
 #   3. D with PAUSE_AFTER_LEASE_S: held after taking its lease, before any
 #      build. While D is in that window, deterministically, a sweep-only C with
 #      STALE_AFTER_S=0 must spare both D (lease only) and A (R43's second).
+#      D runs with LEASE_S=8 and is held 30 s, so its lease outlives LEASE_S
+#      only by being renewed; a second STALE_AFTER_S=0 sweep after that spares
+#      it too.
 #   4. A second start with D's RUN_ID, while D is still held, refuses (exit 2):
 #      the lease is the lock.
 #   5. Two starts with one fresh RUN_ID at once: exactly one refuses, the other
@@ -41,7 +44,7 @@ wait_for "$A" smf 120 || fail "A never started its SMF"
 RUN_ID=$B STALE_AFTER_S=30 bash "$RUN" "$BIN" "$OUT/b" > "$OUT/b.log" 2>&1 & b=$!
 
 echo "3. D ($D) held before its builds; a STALE_AFTER_S=0 sweep (C, $C) meanwhile"
-RUN_ID=$D PAUSE_AFTER_LEASE_S=30 bash "$RUN" "$BIN" "$OUT/d" > "$OUT/d.log" 2>&1 & d=$!
+RUN_ID=$D LEASE_S=8 PAUSE_AFTER_LEASE_S=30 bash "$RUN" "$BIN" "$OUT/d" > "$OUT/d.log" 2>&1 & d=$!
 wait_for "$D" lease 60 || fail "D never took its lease"
 running "$D" harness && fail "D is past its build window already"
 [ -z "$(docker images -q --filter "label=$LABEL=$D")" ] || fail "D has built already"
@@ -49,6 +52,11 @@ RUN_ID=$C STALE_AFTER_S=0 SWEEP_ONLY=1 bash "$RUN" "$BIN" "$OUT/c" > "$OUT/c.log
   fail "the sweep-only run C failed"
 swept "$D" && fail "C swept D in its build window"
 swept "$A" && fail "C swept live A"
+sleep 12
+running "$D" lease || fail "D's lease was not renewed past LEASE_S=8"
+RUN_ID=$C STALE_AFTER_S=0 SWEEP_ONLY=1 bash "$RUN" "$BIN" "$OUT/c2" > "$OUT/c2.log" 2>&1 ||
+  fail "the second sweep-only run C failed"
+swept "$D" && fail "a sweep after LEASE_S removed renewed D"
 
 echo "4. a second start with D's RUN_ID ($D) refuses while D is held"
 running "$D" lease || fail "D's lease ended before step 4"
