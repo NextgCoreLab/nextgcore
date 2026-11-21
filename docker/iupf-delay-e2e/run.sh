@@ -34,7 +34,8 @@
 # Environment: ECHO_HOLD_MS (40), N9_MS (15, expected), NETEM_N9_MS (N9_MS,
 # injected), TOLERANCE_MS (8; below min(ECHO_HOLD_MS/2, N9_MS)), RUN_ID (this
 # shell's PID; digits only), NET_OCTET (derived from RUN_ID; 1-254),
-# STALE_AFTER_S (3600), LEASE_S (3600; keep both above the longest run),
+# STALE_AFTER_S (3600; keep it above the longest run), LEASE_S (120: how long
+# a lease outlives its last renewal),
 # SWEEP_ONLY (1: take the lease, sweep, exit), PAUSE_AFTER_LEASE_S (0; a test
 # hook that holds the run in its pre-build window), CLEAN_UNSTAMPED (1: remove
 # labelled resources that have no `started` label, then exit).
@@ -47,13 +48,18 @@
 # container, network and image carries nextg.iupf-delay.run=<RUN_ID> and
 # nextg.iupf-delay.started=<epoch>, the time this invocation began.
 #   - The lease (R43 on #2275). The first thing a run does, before any build,
-#     is start a small labelled container, iupf-delay-<RUN_ID>-lease, that
-#     sleeps LEASE_S. It is the run's lock and its liveness signal: a second
+#     is start a small labelled container, iupf-delay-<RUN_ID>-lease. It is
+#     renewed while run.sh lives: every LEASE_S/4 a background loop writes a
+#     heartbeat into it, and the lease exits once its heartbeat is LEASE_S
+#     old, so a run of any length keeps it and a dead one loses it within
+#     LEASE_S. It is the run's lock and its liveness signal: a second
 #     start with the same RUN_ID hits the name clash and refuses (exit 2)
 #     without touching anything. A run is live while its lease or its harness
 #     runs. Cleanup on exit removes only this invocation's resources (run and
-#     started labels both), lease included. A SIGKILLed run's lease ends after
-#     LEASE_S and removes itself (--rm).
+#     started labels both), lease included. A SIGKILLed run's heartbeat stops
+#     with it, so its lease ends LEASE_S later and removes itself (--rm). A
+#     lease that fails to start for any reason but the name clash is reported
+#     as it is, with exit 3.
 #   - The sweep. At start, every other run that is not live and whose newest
 #     `started` is older than STALE_AFTER_S is removed: a killed run's
 #     leftovers. Build timestamps are never read, since a cached BuildKit
@@ -62,7 +68,8 @@
 #     harness still runs (then the run refuses).
 #   - A resource with no `started` label counts as just started and is never
 #     swept. Runs of the version before it (8e35337a) left such resources;
-#     remove them once with `CLEAN_UNSTAMPED=1 run.sh . .`.
+#     remove them once with `CLEAN_UNSTAMPED=1 run.sh . .`, which skips any
+#     run whose lease or harness is running.
 set -euo pipefail
 
 BIN="$(cd "${1:?binaries dir}" && pwd)"
@@ -86,7 +93,11 @@ STALE_AFTER_S="${STALE_AFTER_S:-3600}"
 LABEL=nextg.iupf-delay.run
 STARTED_LABEL=nextg.iupf-delay.started
 LEASE_LABEL=nextg.iupf-delay.lease
-LEASE_S="${LEASE_S:-3600}"
+LEASE_S="${LEASE_S:-120}"
+if ! [[ $LEASE_S =~ ^[0-9]+$ ]] || [ "$LEASE_S" -lt 4 ]; then
+  echo "LEASE_S must be a whole number of seconds, at least 4: '$LEASE_S'" >&2
+  exit 2
+fi
 STARTED="$(date +%s)"
 CORE_IMAGE="${IUPF_DELAY_CORE_IMAGE:-nextgcore-core:latest}"
 SMF_IMAGE="nextgcore-rust/smf:iupf-delay-$RUN_ID"
@@ -181,6 +192,10 @@ sweep_stale() {
 if [ "${CLEAN_UNSTAMPED:-0}" = 1 ]; then
   while read -r kind id run started; do
     if [ -z "${started:-}" ] || [ "$started" = "<no value>" ]; then
+      if live "$run"; then
+        echo "skipping unstamped $kind $id: run $run has a live lease or harness" >&2
+        continue
+      fi
       echo "removing unstamped $kind $id (run $run)" >&2
       case $kind in
         container) docker rm -f "$id" >/dev/null ;;
@@ -206,14 +221,55 @@ mkdir -p "$ctx/binaries"
 cp "$BIN/nextgcore-smfd" "$BIN/nextgcore-upfd" "$ctx/binaries/"
 
 # The lease: this run's lock and liveness signal, before anything else.
-docker run -d --rm --name "iupf-delay-$RUN_ID-lease" \
+# It runs until its heartbeat (/tmp/hb, epoch seconds) is LEASE_S ($1) old.
+# R43 on #2286: the writer replaces the file atomically (a temporary file in
+# the same directory, then mv), and the reader never aborts. An empty or
+# non-numeric read (which `$((...))` would turn into a dash abort, ending the
+# lease of a live run) keeps the last good value instead.
+HB_WRITE='date +%s > /tmp/hb.n && mv -f /tmp/hb.n /tmp/hb'
+# shellcheck disable=SC2016 # expanded by the lease's own shell
+LEASE_LOOP='
+  date +%s > /tmp/hb
+  last=$(date +%s)
+  while :; do
+    v=$(cat /tmp/hb 2>/dev/null)
+    case $v in "" | *[!0-9]*) v=$last ;; esac
+    last=$v
+    [ $(($(date +%s) - v)) -lt "$1" ] || break
+    sleep 2
+  done'
+LEASE="iupf-delay-$RUN_ID-lease"
+if ! err="$(docker run -d --rm --name "$LEASE" \
   --label "$LABEL=$RUN_ID" --label "$STARTED_LABEL=$STARTED" --label "$LEASE_LABEL=1" \
-  --entrypoint sleep "$CORE_IMAGE" "$LEASE_S" >/dev/null 2>&1 || {
-  echo "run $RUN_ID has live resources (its lease is held); refusing to start (pick another RUN_ID)" >&2
-  exit 2
-}
+  --entrypoint /bin/sh "$CORE_IMAGE" -c "$LEASE_LOOP" lease "$LEASE_S" \
+  2>&1 >/dev/null)"; then
+  if grep -q 'is already in use' <<<"$err"; then
+    echo "run $RUN_ID has live resources (its lease is held); refusing to start (pick another RUN_ID)" >&2
+    exit 2
+  fi
+  echo "cannot start the lease $LEASE: $err" >&2
+  exit 3
+fi
+# Renew it every RENEW_EVERY_S (LEASE_S/4; 0, a test hook, renews back to
+# back) while this shell lives; a SIGKILL stops the loop too. Its fds are
+# not run.sh's, so nothing it leaves holds a caller's pipe, and on TERM it
+# takes its in-flight sleep with it.
+RENEW_EVERY_S="${RENEW_EVERY_S:-$((LEASE_S / 4))}"
+(
+  trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+  nap=
+  while kill -0 "$$" 2>/dev/null; do
+    docker exec "$LEASE" sh -c "$HB_WRITE" || true
+    sleep "$RENEW_EVERY_S" &
+    nap=$!
+    wait "$nap"
+  done
+) >/dev/null 2>&1 </dev/null &
+RENEW=$!
 names=(harness smf iupf psa)
 cleanup() {
+  pkill -P "$RENEW" 2>/dev/null || true
+  kill "$RENEW" 2>/dev/null || true
   for c in "${names[@]}"; do
     docker logs "iupf-delay-$RUN_ID-$c" > "$OUT/$c.log" 2>&1 || true
   done
