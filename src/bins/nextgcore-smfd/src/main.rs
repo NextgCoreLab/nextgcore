@@ -37443,6 +37443,37 @@ mod tests {
         qos_mon::clear_for_test();
     }
 
+    /// #2270 follow-up (R47 on #2285, its MAJOR at 46869e39): an IE 271 request
+    /// that arrives as the owner stops is not lost. The owner lets go in the
+    /// same locked step in which it decides it is done, so a task arriving right
+    /// after (the hook) finds the leg free and claims it. At 46869e39 the flag
+    /// was cleared only at the claim's drop: that task found the leg owned,
+    /// flagged `tdr_dirty` for an owner already leaving, and the PSA kept a stale
+    /// IE 271.
+    ///
+    /// REVERT-VERIFIED: with the flag cleared only at the claim's drop again,
+    /// "a request as the owner stops gets the leg" fails.
+    #[tokio::test]
+    async fn an_ie_271_request_as_the_owner_stops_is_not_lost_2270() {
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        qos_mon::clear_for_test();
+        let r = "ref-2270-ie271-exit";
+        qos_mon::seed_session_for_test(r);
+        let (tx, rx) = std::sync::mpsc::channel();
+        qos_mon::on_tdr_exit_for_test(move || {
+            // Another task's sync, right as the owner stops.
+            let claim = qos_mon::try_claim_for_test(r);
+            tx.send(claim.is_some()).unwrap();
+        });
+        qos_mon::sync_transport_delay(r).await;
+        assert!(
+            rx.try_recv().expect("the owner stopped"),
+            "a request as the owner stops gets the leg"
+        );
+        assert!(!qos_mon::leg_owned_for_test(r), "and it is let go after");
+        qos_mon::clear_for_test();
+    }
+
     /// #2208, off unless configured: with the default per QoS flow method (and
     /// with `gtpu_path` toward a PSA that did not advertise GPQM) the PCF's policy
     /// is a GTPUPM 0 SRR and no UL PDR is updated. And a decision with no
