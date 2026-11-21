@@ -659,7 +659,13 @@ pub async fn activate(
         bearer.qos = req.qos.clone();
         bearer.pcc_rule_name = req.pcc_rule_name.clone();
         bearer.eps_rule_index = rule_index;
-        ctx.bearer_update(&bearer);
+        // #2291: in place, the fields set here.
+        ctx.bearer_modify(bearer.id, |b| {
+            b.ebi = bearer.ebi;
+            b.qos = bearer.qos.clone();
+            b.pcc_rule_name = bearer.pcc_rule_name.clone();
+            b.eps_rule_index = bearer.eps_rule_index;
+        });
         for f in &req.filters {
             if let Some(mut pf) = ctx.pf_add(bearer.id) {
                 pf.direction = f.direction;
@@ -714,8 +720,14 @@ pub async fn activate(
     };
     bearer.pgw_s5u_teid = pgw_teid;
     bearer.pgw_s5u_addr = Some(std::net::Ipv4Addr::from(pgw_addr));
+    // #2291: in place. `bearer` was read before the PFCP round trip; writing it back
+    // whole reverted whatever another task changed meanwhile.
+    crate::context::interleave("eps_bearer_uplink");
     if let Ok(ctx) = handle.read() {
-        ctx.bearer_update(&bearer);
+        ctx.bearer_modify(bearer.id, |b| {
+            b.pgw_s5u_teid = bearer.pgw_s5u_teid;
+            b.pgw_s5u_addr = bearer.pgw_s5u_addr;
+        });
     }
 
     // Step 3: the Create Bearer Request.
@@ -860,8 +872,16 @@ pub async fn activate(
 
     // The EPS bearer maps onto the QoS flow with QFI = EBI (#583, TS 23.502 §4.11.1.1).
     bearer.qfi = assigned;
+    // #2291: in place, what the Create Bearer Response and the mapping set, across the
+    // S5/S8 and PFCP round trips above.
+    crate::context::interleave("eps_bearer_active");
     if let Ok(ctx) = handle.read() {
-        ctx.bearer_update(&bearer);
+        ctx.bearer_modify(bearer.id, |b| {
+            b.ebi = bearer.ebi;
+            b.sgw_s5u_teid = bearer.sgw_s5u_teid;
+            b.sgw_s5u_ip = bearer.sgw_s5u_ip.clone();
+            b.qfi = bearer.qfi;
+        });
     }
     log::info!(
         "dedicated bearer EBI {assigned} (LBI {linked_ebi}) active: PGW S5/S8-U TEID \
@@ -1919,14 +1939,14 @@ pub async fn modify_on_command(
         let ctx = handle
             .read()
             .map_err(|_| Failed("context poisoned".into()))?;
-        let mut fresh = ctx
+        let fresh = ctx
             .bearer_find_by_id(bearer.id)
             .ok_or_else(|| Failed(format!("bearer EBI {ebi} went away meanwhile")))?;
         if tft.is_some() {
-            for id in std::mem::take(&mut fresh.pf_ids) {
-                ctx.pf_remove(id);
+            // `pf_remove` unlinks each filter from the stored bearer itself.
+            for id in &fresh.pf_ids {
+                ctx.pf_remove(*id);
             }
-            ctx.bearer_update(&fresh);
             for f in &filters {
                 if let Some(mut pf) = ctx.pf_add(fresh.id) {
                     pf.direction = f.direction;
@@ -1936,11 +1956,13 @@ pub async fn modify_on_command(
                     ctx.pf_update(&pf);
                 }
             }
-            fresh = ctx.bearer_find_by_id(fresh.id).unwrap_or(fresh);
         }
-        fresh.qos = proposed.qos.clone();
-        ctx.bearer_update(&fresh);
-        fresh
+        // #2291: in place; the stored bearer (with the filters linked above) is the answer.
+        ctx.bearer_modify(fresh.id, |b| {
+            b.qos = proposed.qos.clone();
+            b.clone()
+        })
+        .ok_or_else(|| Failed(format!("bearer EBI {ebi} went away meanwhile")))?
     };
     let (ul, dl) = rule_ids(stored.eps_rule_index);
     let dl_before = downlink_descriptions(&current);

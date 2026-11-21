@@ -3880,10 +3880,9 @@ async fn pfcp_session_modify(
             log::info!("PFCP Session Modification successful");
             if let Some(sess) = split {
                 if let Ok(ctx) = smf_self().read() {
-                    if let Some(mut s) = ctx.sess_find_by_id(sess.id) {
+                    ctx.sess_modify(sess.id, |s| {
                         s.dc_tunnel_fars.clear();
-                        ctx.sess_update(&s);
-                    }
+                    });
                 }
             }
             Ok(())
@@ -4566,10 +4565,12 @@ async fn split_pdu_session_modification(
             format!("PFCP Session Modification failed ({e})"),
         )
     })?;
-    if let Some(mut s) = sess {
-        s.dc_tunnel_fars = new_fars.clone();
+    // #2291: in place. `sess` was read before the PFCP round trip, and writing it back
+    // whole reverted whatever another task changed meanwhile.
+    if let Some(s) = &sess {
+        context::interleave("split_pdu_session_modification");
         if let Ok(ctx) = smf_self().read() {
-            ctx.sess_update(&s);
+            ctx.sess_modify(s.id, |s| s.dc_tunnel_fars = new_fars.clone());
         }
     }
     log::info!(
@@ -6122,7 +6123,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
     // activated connection for a session whose N4 leg had not been established.
     if let Some(sess_id) = registered_sess_id {
         if let Ok(context) = ctx.read() {
-            if let Some(mut sess) = context.sess_find_by_id(sess_id) {
+            context.sess_modify(sess_id, |sess| {
                 sess.session_name = Some(dnn.clone());
                 sess.full_dnn = Some(dnn.clone());
                 sess.pti = pti;
@@ -6151,7 +6152,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                 // ---- #415: the EPS→5GS handover preparation, recorded on the session ----
                 //
                 // Written here rather than at the parse site so it lands in the SAME
-                // `sess_update` as everything else the create settles: a second update
+                // `sess_modify` as everything else the create settles: a second update
                 // would be a second writer of one session, which is how two descriptions
                 // of one fact drift apart in this tree.
                 //
@@ -6205,8 +6206,7 @@ async fn establish_sm_context(request: &SbiRequest, req_body: serde_json::Value)
                          has none; treated as no handover in progress."
                     );
                 }
-                context.sess_update(&sess);
-            }
+            });
         }
     }
 
@@ -6435,10 +6435,9 @@ fn up_cnx_state_of(sm_context_ref: &str) -> Option<context::UpCnxState> {
 /// plane, so a network-triggered paging in progress has ended: it is dropped.
 fn mark_up_cnx_state(sm_context_ref: &str, state: context::UpCnxState) {
     if let Ok(ctx) = smf_self().read() {
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             sess.up_cnx_state = state;
-            ctx.sess_update(&sess);
-        }
+        });
         if let Ok(mut bindings) = ctx.policy_bindings.write() {
             if let Some(b) = bindings.get_mut(sm_context_ref) {
                 b.network_paging = None;
@@ -6550,12 +6549,11 @@ fn hold_temporarily_rejected_paging(sm_context_ref: &str, token: &str) -> bool {
         Some(None) => return true,
         Some(Some(token)) => token,
     };
-    if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+    ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
         if sess.up_cnx_state == context::UpCnxState::Activating {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
-            ctx.sess_update(&sess);
         }
-    }
+    });
     drop(ctx);
     log::info!(
         "Paging of ref={sm_context_ref} temporarily rejected by the AMF: waiting up to {:?} \
@@ -6669,12 +6667,11 @@ fn expire_network_paging(sm_context_ref: &str) {
             "The network-triggered paging of ref={sm_context_ref} ran past its guard with no \
              word from the AMF; taken as unanswered"
         );
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             if sess.up_cnx_state == context::UpCnxState::Activating {
                 sess.up_cnx_state = context::UpCnxState::Deactivated;
-                ctx.sess_update(&sess);
             }
-        }
+        });
     }
 }
 
@@ -6928,13 +6925,12 @@ fn settle_network_paging(
         ours
     };
     if ours && matches!(answer, PagingAnswer::Paging | PagingAnswer::Delivered) {
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             // TS 29.502 §5.2.2.3.2.1: an N3 tunnel is being established.
             if sess.up_cnx_state == context::UpCnxState::Deactivated {
                 sess.up_cnx_state = context::UpCnxState::Activating;
-                ctx.sess_update(&sess);
             }
-        }
+        });
     }
     drop(ctx);
     if ours && unreachable {
@@ -6971,13 +6967,9 @@ fn record_serving_amf(sm_context_ref: &str, serving_nf_id: &str, status_uri: &st
             }
         }
     }
-    if let Some(mut sess) = ctx
-        .sess_find_by_sm_context_ref(sm_context_ref)
-        .filter(|s| s.sm_context_ref.as_deref() == Some(sm_context_ref))
-    {
+    ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
         sess.sm_context_status_uri = Some(status_uri.to_string());
-        ctx.sess_update(&sess);
-    }
+    });
     ctx.persist();
     log::info!(
         "SM Context Update for ref={sm_context_ref}: serving AMF is now {serving_nf_id} \
@@ -7163,7 +7155,7 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         ..Default::default()
     };
     if let Ok(ctx) = smf_self().read() {
-        ctx.sess_update(&sess);
+        ctx.sess_modify(sess.id, |s| s.handover = sess.handover.clone());
     }
     log::info!(
         "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: PREPARING, Handover \
@@ -7217,7 +7209,7 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
     };
     sess.handover = context::HandoverInfo::default();
     if let Ok(ctx) = smf_self().read() {
-        ctx.sess_update(&sess);
+        ctx.sess_modify(sess.id, |s| s.handover = context::HandoverInfo::default());
     }
     log::warn!(
         "SM Context Update (HANDOVER_RES_ALLOC_FAIL) for ref={sm_context_ref}: the target \
@@ -7754,13 +7746,11 @@ impl ServingAmfState {
             }
         }
         if restored {
-            if let Some(mut sess) = ctx
-                .sess_find_by_sm_context_ref(sm_context_ref)
-                .filter(|s| s.sm_context_status_uri.as_deref() == Some(status_uri))
-            {
-                sess.sm_context_status_uri = self.sess_status_uri.clone();
-                ctx.sess_update(&sess);
-            }
+            ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
+                if sess.sm_context_status_uri.as_deref() == Some(status_uri) {
+                    sess.sm_context_status_uri = self.sess_status_uri.clone();
+                }
+            });
             ctx.persist();
             log::info!(
                 "SM Context Update for ref={sm_context_ref} failed: the AMF change to {serving} \
@@ -8225,13 +8215,12 @@ async fn handle_sm_context_update_inner(sm_context_ref: &str, request: &SbiReque
                             b.arp_priority_level = decision.arp_priority_level;
                         }
                     }
-                    if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+                    ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
                         sess.session_ambr = context::SessionAmbr {
                             uplink: ambr_ul,
                             downlink: ambr_dl,
                         };
-                        ctx.sess_update(&sess);
-                    }
+                    });
                     // Issue #191: durable too, not just in memory.
                     ctx.persist();
                 }
@@ -9917,11 +9906,11 @@ pub(crate) async fn deactivate_up_toward_failed_path(a: &up_path::Affected, reas
         .and_then(|ctx| {
             // #1631 review M1: a paging in progress ends with the deactivation.
             drop_network_paging_in(&ctx, reference);
-            let mut sess = ctx.sess_find_by_sm_context_ref(reference)?;
-            let was = sess.up_cnx_state != context::UpCnxState::Deactivated;
-            sess.up_cnx_state = context::UpCnxState::Deactivated;
-            ctx.sess_update(&sess);
-            Some(was)
+            ctx.sess_modify_by_sm_context_ref(reference, |sess| {
+                let was = sess.up_cnx_state != context::UpCnxState::Deactivated;
+                sess.up_cnx_state = context::UpCnxState::Deactivated;
+                was
+            })
         })
         .unwrap_or(false);
     let Some(binding) = lookup_policy_binding(reference) else {
@@ -10063,10 +10052,9 @@ pub(crate) async fn release_for_reactivation(
     if let Ok(ctx) = smf_self().read() {
         // #1631 review M1: a paging in progress ends with the deactivation.
         drop_network_paging_in(&ctx, sm_context_ref);
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
-            ctx.sess_update(&sess);
-        }
+        });
     }
     // #1430: armed with the N2 it goes out with, so a T3592 retransmission carries
     // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b), or none when the first
@@ -11694,10 +11682,9 @@ async fn ran_released_session(sm_context_ref: &str, n2: Option<&[u8]>) -> SbiRes
     if let Ok(ctx) = smf_self().read() {
         // #1631 review M1: a paging in progress ends with the deactivation.
         drop_network_paging_in(&ctx, sm_context_ref);
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
-            ctx.sess_update(&sess);
-        }
+        });
     }
     let n1_cmd = policy::build_release_command(
         binding.psi,
@@ -13434,13 +13421,12 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
                 b.arp_priority_level = dec.arp_priority_level;
             }
         }
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             sess.session_ambr = context::SessionAmbr {
                 uplink: dec.sess_ambr_ul_bps,
                 downlink: dec.sess_ambr_dl_bps,
             };
-            ctx.sess_update(&sess);
-        }
+        });
         // Issue #191: durable too, not just in memory.
         ctx.persist();
     }
@@ -13752,13 +13738,12 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
         }
         // The session carries the AMBR the Retrieve and the EPS-interworking encoders
         // read, so leaving it stale would make the two disagree about one value.
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             sess.session_ambr = context::SessionAmbr {
                 uplink: decision.sess_ambr_ul_bps,
                 downlink: decision.sess_ambr_dl_bps,
             };
-            ctx.sess_update(&sess);
-        }
+        });
         // Issue #191: durable too, not just in memory.
         ctx.persist();
     }
@@ -13860,12 +13845,11 @@ async fn handle_n1n2_transfer_failure_notification(
         );
     }
     if let Ok(ctx) = smf_self().read() {
-        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+        ctx.sess_modify_by_sm_context_ref(sm_context_ref, |sess| {
             if sess.up_cnx_state == context::UpCnxState::Activating {
                 sess.up_cnx_state = context::UpCnxState::Deactivated;
-                ctx.sess_update(&sess);
             }
-        }
+        });
     }
     // #1707, TS 23.502 §4.2.3.3 step 3c: "the UE is not reachable for the non-3GPP PDU
     // session" (TS 29.518 Table 6.1.6.3.x), so this session is recorded,
@@ -16684,6 +16668,74 @@ mod tests {
             has(&[0x00, 0x00, 0xab, 0xcd, 10, 1, 2, 3]),
             "the DL FAR's Outer Header Creation carries the reported endpoint: {body:02x?}"
         );
+    }
+
+    /// #2291: a split PDU session's Modify Indication (#582) writes only its tunnel
+    /// FARs back after its PFCP round trip, so what another task wrote meanwhile
+    /// stands. At the `split_pdu_session_modification` interleaving point an AN release
+    /// marks the user plane DEACTIVATED, as a concurrent N2 handler would; it must
+    /// survive, and the handler's own change (the extra tunnel's FAR gone with the
+    /// extra tunnel) must land.
+    ///
+    /// REVERT-VERIFIED: with the session copy read before the PFCP round trip written
+    /// back whole (`sess_update`), the AN release is reverted to ACTIVATED and "the AN
+    /// release made during the PFCP round trip stands" fails.
+    #[tokio::test]
+    async fn a_split_modification_keeps_a_concurrent_update_2291() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let r = seed_registered_session("imsi-001010000229101", 5, "internet");
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        seed_session(&r, Some(upf.upf_seid), Some((upf.upf_teid, upf.upf_ip)));
+        // The default QoS flow, QFI 1, so the indication's flow is confirmed.
+        {
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.qfi = 1;
+            b.five_qi = 9;
+            smf_self()
+                .read()
+                .unwrap()
+                .policy_bindings
+                .write()
+                .unwrap()
+                .insert(r.clone(), b);
+        }
+        // A split session: an earlier Modify Indication gave it a second NG-U tunnel.
+        smf_self()
+            .read()
+            .unwrap()
+            .sess_modify_by_sm_context_ref(&r, |s| {
+                s.dc_tunnel_fars = vec![DC_TUNNEL_FAR_BASE + 1];
+                s.up_cnx_state = context::UpCnxState::Activated;
+            });
+        let released = r.clone();
+        let hook = context::set_interleave("split_pdu_session_modification", move || {
+            mark_up_cnx_state(&released, context::UpCnxState::Deactivated);
+        });
+
+        // Back to one tunnel.
+        let resp = an_initiated_modification(&r, &indication([10, 1, 2, 3], 0x2291, &[1])).await;
+        drop(hook);
+        let (ty, _) = answer(&resp);
+        assert_eq!(ty, "PDU_RES_MOD_CFM");
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&r)
+            .expect("the session");
+        assert_eq!(
+            sess.up_cnx_state,
+            context::UpCnxState::Deactivated,
+            "the AN release made during the PFCP round trip stands"
+        );
+        assert!(
+            sess.dc_tunnel_fars.is_empty(),
+            "the handler's tunnel FARs landed: {:?}",
+            sess.dc_tunnel_fars
+        );
+        unseed_session(&r);
+        forget_seeded_session(&r);
     }
 
     /// #1230 review 2: a Modify Indication for a context without its uplink endpoint
