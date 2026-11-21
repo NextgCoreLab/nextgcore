@@ -1525,7 +1525,23 @@ impl PfcpClient {
         seid: Option<u64>,
         body: &[u8],
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
-        self.request_on(msg_type, seid, body).await.0
+        self.request_on(msg_type, seid, body, None).await.0
+    }
+
+    /// The generation of the association with this UPF: incremented by every
+    /// Association Setup (#966, #2277).
+    pub async fn association_generation(&self) -> u64 {
+        self.assoc.read().await.generation
+    }
+
+    /// Test-only: a new association, as an Association Setup makes one: the
+    /// generation bumped and `then` run under one hold of the association, as the
+    /// setup decides the I-UPF deletion queue (#2277).
+    #[cfg(test)]
+    pub(crate) async fn reassociate_for_test(&self, then: impl FnOnce()) {
+        let mut assoc = self.assoc.write().await;
+        assoc.generation = assoc.generation.wrapping_add(1);
+        then();
     }
 
     /// A node-level request whose loss says nothing about the association (#1502
@@ -1539,22 +1555,35 @@ impl PfcpClient {
         body: &[u8],
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
         let mut sent_on = self.assoc.read().await.generation;
-        self.request_sent_on(msg_type, None, body, &mut sent_on, Exhaustion::Report)
+        self.request_sent_on(msg_type, None, body, &mut sent_on, Exhaustion::Report, None)
             .await
     }
 
     /// [`Self::request`], and the association generation the request was last sent on
     /// (#966 follow-up 2): read as each (re)transmission leaves, so an association set
     /// up between the caller's decision and the send is the one the answer is about.
+    ///
+    /// #2277: with `only_on`, the request is sent (and retransmitted) only while
+    /// the association is generation `only_on`: a transmission that would leave
+    /// under another is not sent, and the request fails
+    /// [`PfcpRequestError::Local`].
     async fn request_on(
         &self,
         msg_type: u8,
         seid: Option<u64>,
         body: &[u8],
+        only_on: Option<u64>,
     ) -> (Result<(u8, Vec<u8>), PfcpRequestError>, u64) {
         let mut sent_on = self.assoc.read().await.generation;
         let result = self
-            .request_sent_on(msg_type, seid, body, &mut sent_on, Exhaustion::MarkDown)
+            .request_sent_on(
+                msg_type,
+                seid,
+                body,
+                &mut sent_on,
+                Exhaustion::MarkDown,
+                only_on,
+            )
             .await;
         (result, sent_on)
     }
@@ -1566,6 +1595,7 @@ impl PfcpClient {
         body: &[u8],
         sent_on: &mut u64,
         exhaustion: Exhaustion,
+        only_on: Option<u64>,
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
         let seq = crate::PFCP_SEQ.fetch_add(1, Ordering::Relaxed) & 0x00FF_FFFF;
         let pkt = encode_wire_message(msg_type, seid, seq, body);
@@ -1590,8 +1620,24 @@ impl PfcpClient {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(seq, tx);
 
-            *sent_on = self.assoc.read().await.generation;
-            if let Err(e) = self.socket.send_to(&pkt, peer).await {
+            let assoc = self.assoc.read().await;
+            let now = assoc.generation;
+            if let Some(g) = only_on.filter(|g| *g != now) {
+                drop(assoc);
+                self.pending.lock().await.remove(&seq);
+                break Err(PfcpRequestError::Local(format!(
+                    "the association changed (generation {g}, now {now}): type={msg_type} \
+                     seq={seq} not sent"
+                )));
+            }
+            *sent_on = now;
+            // #2277 (R45): a request bound to a generation holds the association
+            // across its send, so no Association Setup lands between the check and
+            // the datagram leaving. Others release it at once, as before.
+            let held = only_on.is_some().then_some(assoc);
+            let sent = self.socket.send_to(&pkt, peer).await;
+            drop(held);
+            if let Err(e) = sent {
                 self.pending.lock().await.remove(&seq);
                 break Err(PfcpRequestError::Local(format!("send failed: {e}")));
             }
@@ -1759,6 +1805,23 @@ impl PfcpClient {
         second
     }
 
+    /// [`Self::session_request`] for this peer alone, sent only while the
+    /// association is `generation` (#2277): a transmission that would leave under
+    /// a later association is not sent. A session's SEIDs name it only within the
+    /// association that created it; a UPF that restarted counts them from the
+    /// start again.
+    pub(crate) async fn session_request_within(
+        &self,
+        generation: u64,
+        msg_type: u8,
+        smf_seid: u64,
+        upf_seid: Option<u64>,
+        body: &[u8],
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        self.session_request_direct_on(msg_type, smf_seid, upf_seid, body, Some(generation))
+            .await
+    }
+
     /// [`Self::session_request`] for this peer alone.
     async fn session_request_direct(
         &self,
@@ -1767,8 +1830,22 @@ impl PfcpClient {
         upf_seid: Option<u64>,
         body: &[u8],
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        self.session_request_direct_on(msg_type, smf_seid, upf_seid, body, None)
+            .await
+    }
+
+    /// [`Self::session_request_direct`], sent only under generation `only_on` when
+    /// one is given ([`Self::request_on`]).
+    async fn session_request_direct_on(
+        &self,
+        msg_type: u8,
+        smf_seid: u64,
+        upf_seid: Option<u64>,
+        body: &[u8],
+        only_on: Option<u64>,
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
         // #966 follow-up 2: the generation as the request left, not as this was called.
-        let (result, generation) = self.request_on(msg_type, upf_seid, body).await;
+        let (result, generation) = self.request_on(msg_type, upf_seid, body, only_on).await;
         if let Ok((_, response)) = &result {
             crate::up_path::note_session_request(smf_seid, msg_type, body, response);
             // #2208: the PSA's Transport Delay Reporting follows its access peer.

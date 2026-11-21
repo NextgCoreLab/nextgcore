@@ -77,10 +77,22 @@ pub fn handle_create_session_response(
         return HandlerResult::Error(session_cause);
     }
 
-    // Update session with PGW TEIDs
+    // Update session with PGW TEIDs, in place (#2288): the caller's snapshot written
+    // back would resurrect a session a concurrent Delete Session removed, and revert
+    // whatever another procedure set since the snapshot.
     let mut sess = sess.clone();
     sess.pgw_s5c_teid = pgw_s5c_teid;
-    ctx.sess_update(&sess);
+    crate::context::race_point("sess_pgw_s5c_teid");
+    if ctx
+        .sess_modify(sess.id, |s| s.pgw_s5c_teid = pgw_s5c_teid)
+        .is_none()
+    {
+        log::warn!(
+            "Session {} was removed before its Create Session Response",
+            sess.id
+        );
+        return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
+    }
 
     // Update UL tunnel with PGW S5U TEID
     if let Some(bearer) = ctx.default_bearer_in_sess(sess.id) {
@@ -99,7 +111,11 @@ pub fn handle_create_session_response(
             if pgw_s5u_addr.ipv4.is_some() || pgw_s5u_addr.ipv6.is_some() {
                 ul_tunnel.remote_ip = pgw_s5u_addr;
             }
-            ctx.tunnel_update(&ul_tunnel);
+            let (teid, ip) = (ul_tunnel.remote_teid, ul_tunnel.remote_ip.clone());
+            ctx.tunnel_modify(ul_tunnel.id, |t| {
+                t.remote_teid = teid;
+                t.remote_ip = ip;
+            });
             log::info!(
                 "    SGW_S5U_TEID[{}] PGW_S5U_TEID[{}] PGW_S5U_ADDR[{:?}]",
                 ul_tunnel.local_teid,
@@ -269,7 +285,7 @@ pub fn handle_create_bearer_request(
     let bearer = match ctx.bearer_add(sess.id) {
         Some(mut b) => {
             b.ebi = bearer_ebi;
-            ctx.bearer_update(&b);
+            ctx.bearer_modify(b.id, |stored| stored.ebi = bearer_ebi);
             b
         }
         None => {
@@ -281,7 +297,7 @@ pub fn handle_create_bearer_request(
     // Update UL tunnel with PGW S5U TEID
     if let Some(mut ul_tunnel) = ctx.ul_tunnel_in_bearer(bearer.id) {
         ul_tunnel.remote_teid = pgw_s5u_teid;
-        ctx.tunnel_update(&ul_tunnel);
+        ctx.tunnel_modify(ul_tunnel.id, |t| t.remote_teid = pgw_s5u_teid);
         log::info!(
             "    SGW_S5U_TEID[{}] PGW_S5U_TEID[{}]",
             ul_tunnel.local_teid,

@@ -1526,6 +1526,123 @@ async fn a_resend_pass_is_single_and_stops_at_the_first_unanswered_2225() {
     iupf::set(None);
 }
 
+/// A silent I-UPF counting what it hears, and a client toward it with deletion
+/// T1 `t1` and N1 `n1`, installed as the I-UPF, with deletions 1..=3 queued.
+async fn silent_iupf_with_queue(
+    t1: std::time::Duration,
+    n1: u32,
+) -> (
+    Arc<pfcp_path::PfcpClient>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+    let heard = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = heard.clone();
+    let ear = tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        while silent.recv(&mut buf).await.is_ok() {
+            h.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let client = Arc::new(
+        pfcp_path::PfcpClient::new(sock, silent_addr, [127, 0, 0, 1])
+            .with_deletion_timer_for_test(t1, n1),
+    );
+    client.set_assoc_state_for_test(true, None, None).await;
+    iupf::set(Some((client.clone(), Vec::new())));
+    for i in 1..=3u64 {
+        iupf::queue_deletion(iupf::leg_seid(i << 4), i);
+    }
+    (client, heard, ear)
+}
+
+fn queued_1_to_3() -> Vec<(u64, u64)> {
+    (1..=3u64).map(|i| (iupf::leg_seid(i << 4), i)).collect()
+}
+
+/// #2277: a deletion being retransmitted when the I-UPF re-associates WITHOUT
+/// retaining its sessions (a restart: the setup drops the queue, and the I-UPF
+/// may give a new leg the same SEID) is not retransmitted under the new
+/// association. Only its first transmission is heard, and nothing is sent after.
+///
+/// REVERT-VERIFIED: with the pass sending without its generation, or without
+/// `session_request_within`'s check, this fails (the retransmissions are heard).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_is_not_retransmitted_under_a_new_association_2277() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _restore = ProcessStateRestore;
+    iupf::clear_pending_deletions();
+    let (client, heard, ear) =
+        silent_iupf_with_queue(std::time::Duration::from_millis(200), 3).await;
+    iupf::retry_pending_deletions();
+    wait_until(|| heard.load(Ordering::SeqCst) >= 1).await;
+    client
+        .reassociate_for_test(|| iupf::drop_pending_deletions("did not retain its sessions"))
+        .await;
+    wait_until(|| !iupf::retry_running()).await;
+    // Past the deletion's remaining T1 x N1 (3 x 200 ms).
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(
+        heard.load(Ordering::SeqCst),
+        1,
+        "the first transmission only"
+    );
+    assert!(
+        iupf::pending_deletion_list().is_empty(),
+        "the setup dropped them"
+    );
+    ear.abort();
+    iupf::clear_pending_deletions();
+    iupf::set(None);
+}
+
+/// R45 M1 on #2283 (R45's probe): an association B set up mid-pass, retaining
+/// the sessions, calls the resend while pass T still runs, and that call returns.
+/// T stops on the generation change; it must hand over, so the queue is resent
+/// under B rather than waiting for some later association.
+///
+/// REVERT-VERIFIED: without the stopped pass starting a new one, this fails
+/// (only T's first transmission is heard).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_stopped_by_a_retaining_re_association_resends_under_it_2277() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _restore = ProcessStateRestore;
+    iupf::clear_pending_deletions();
+    let (client, heard, ear) =
+        silent_iupf_with_queue(std::time::Duration::from_millis(200), 3).await;
+    let passes = iupf::RETRY_PASSES.load(Ordering::SeqCst);
+    iupf::retry_pending_deletions();
+    wait_until(|| heard.load(Ordering::SeqCst) >= 1).await;
+    // B: a new association, with the sessions retained; its setup's resend finds
+    // T running.
+    client.reassociate_for_test(|| {}).await;
+    iupf::retry_pending_deletions();
+    wait_until(|| heard.load(Ordering::SeqCst) >= 2).await;
+    assert!(
+        heard.load(Ordering::SeqCst) >= 2,
+        "the queue is resent under B"
+    );
+    assert_eq!(
+        iupf::RETRY_PASSES.load(Ordering::SeqCst),
+        passes + 2,
+        "T, then one pass under B"
+    );
+    wait_until(|| !iupf::retry_running()).await;
+    assert_eq!(
+        iupf::pending_deletion_list(),
+        queued_1_to_3(),
+        "still unanswered, all kept"
+    );
+    ear.abort();
+    iupf::clear_pending_deletions();
+    iupf::set(None);
+}
+
 /// #2270: an I-UPF test that panics leaves no `PCF_URI` and no I-UPF behind for
 /// the next test in the binary.
 ///

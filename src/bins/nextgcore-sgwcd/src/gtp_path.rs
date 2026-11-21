@@ -1784,7 +1784,12 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     };
     ue.mme_addr = Some(peer);
     ue.rat_type = parsed.rat_type;
-    ctx.ue_update(&ue);
+    // In place (#2288): a whole copy written back could revert a field another task
+    // set in between, such as the Data Notification Delay.
+    ctx.ue_modify(ue.id, |u| {
+        u.mme_addr = Some(peer);
+        u.rat_type = parsed.rat_type;
+    });
 
     // The new session, by its default bearer's EBI: unique once the collision is
     // resolved, where the APN is not (two PDN connections may share one).
@@ -1830,7 +1835,26 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     // SGW-C is the only node that has them.
     sess.serving_network = parsed.serving_network.clone();
     sess.uli = parsed.uli.clone();
-    ctx.sess_update(&sess);
+    // In place (#2288): only the fields this request sets.
+    let applied = ctx.sess_modify(sess.id, |s| {
+        s.paa.pdn_type = sess.paa.pdn_type;
+        s.requested_paa = sess.requested_paa.clone();
+        s.ambr_ul = sess.ambr_ul;
+        s.ambr_dl = sess.ambr_dl;
+        s.serving_network = sess.serving_network.clone();
+        s.uli = sess.uli.clone();
+    });
+    if applied.is_none() {
+        send_cause_response(
+            server,
+            peer,
+            Gtp2MessageType::CreateSessionResponse,
+            ue.mme_s11_teid,
+            seq,
+            gtp_cause::CONTEXT_NOT_FOUND,
+        );
+        return;
+    }
 
     // Bearer QoS + user-plane endpoint allocation
     let Some(gtpu_addr) = ctx.gtpu_address() else {
@@ -1854,7 +1878,17 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
         bearer.mbr_dl = parsed.bearer.qos.mbr_dl;
         bearer.gbr_ul = parsed.bearer.qos.gbr_ul;
         bearer.gbr_dl = parsed.bearer.qos.gbr_dl;
-        ctx.bearer_update(&bearer);
+        // In place (#2288).
+        ctx.bearer_modify(bearer.id, |b| {
+            b.qci = bearer.qci;
+            b.arp_priority_level = bearer.arp_priority_level;
+            b.arp_pci = bearer.arp_pci;
+            b.arp_pvi = bearer.arp_pvi;
+            b.mbr_ul = bearer.mbr_ul;
+            b.mbr_dl = bearer.mbr_dl;
+            b.gbr_ul = bearer.gbr_ul;
+            b.gbr_dl = bearer.gbr_dl;
+        });
 
         // Allocate local user-plane endpoints for both directions, and the PDR/FAR ids
         // that name them on Sxa.
@@ -1872,18 +1906,22 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
         .into_iter()
         .flatten()
         {
-            let mut tunnel = tunnel;
-            if tunnel.local_teid == 0 {
-                tunnel.local_teid = ctx.next_gtpu_teid();
-            }
-            if tunnel.pdr_id.is_none() {
-                tunnel.pdr_id = Some(ctx.next_pdr_id());
-            }
-            if tunnel.far_id.is_none() {
-                tunnel.far_id = Some(ctx.next_far_id());
-            }
-            tunnel.local_addr = Some(gtpu_addr);
-            ctx.tunnel_update(&tunnel);
+            // Ids are drawn before the in-place write (#2288), which holds the lock.
+            let teid = (tunnel.local_teid == 0).then(|| ctx.next_gtpu_teid());
+            let pdr = tunnel.pdr_id.is_none().then(|| ctx.next_pdr_id());
+            let far = tunnel.far_id.is_none().then(|| ctx.next_far_id());
+            ctx.tunnel_modify(tunnel.id, |t| {
+                if let Some(teid) = teid.filter(|_| t.local_teid == 0) {
+                    t.local_teid = teid;
+                }
+                if t.pdr_id.is_none() {
+                    t.pdr_id = pdr;
+                }
+                if t.far_id.is_none() {
+                    t.far_id = far;
+                }
+                t.local_addr = Some(gtpu_addr);
+            });
         }
     }
 
@@ -2207,18 +2245,18 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     // PDN) still anchors the PDN connection at that PGW. Both families, so an
     // IPv6 (or dual-stack) PGW is matched too.
     if let Some(ft) = pgw_c.as_ref() {
-        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
+        ctx.sess_modify(sess_id, |sess| {
             sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
             sess.pgw_addr6 = ft.ipv6_addr.map(std::net::Ipv6Addr::from);
-            ctx.sess_update(&sess);
-        }
+        });
     }
     if let Some(paa) = paa {
-        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
+        if let Some(sess) = ctx.sess_modify(sess_id, |sess| {
             sess.paa.pdn_type = paa.pdn_type;
             sess.paa.ipv4_addr = paa.ipv4_addr.map(std::net::Ipv4Addr::from);
             sess.paa.ipv6_addr = paa.ipv6_addr.map(std::net::Ipv6Addr::from);
-            ctx.sess_update(&sess);
+            sess.clone()
+        }) {
             log::info!(
                 "S5/S8 Create Session Response from {peer}: PGW allocated PAA {:?} (pdn_type={})",
                 sess.paa.ipv4_addr,
@@ -2418,11 +2456,6 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             continue;
         };
         let enb_teid = enb_fteid.teid;
-        // The endpoint before this request, restored if the SGW-U refuses.
-        let previous = ctx
-            .bearer_find_by_ue_ebi(ue.id, *ebi)
-            .and_then(|b| ctx.dl_tunnel_in_bearer(b.id))
-            .map(|t| (t.remote_teid, t.remote_ip.clone()));
         match s11_handler::handle_modify_bearer_request(Some(&ue), seq as u64, &[], *ebi, enb_teid)
         {
             HandlerResult::SendPfcp => {}
@@ -2439,23 +2472,19 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             marked_for_removal.push((*ebi, gtp_cause::CONTEXT_NOT_FOUND));
             continue;
         };
-        if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
-            // #936, TS 29.274 §8.22: the F-TEID carries IPv4, IPv6 or both;
-            // whichever families it carries are the eNB's.
-            dl_tunnel.remote_ip.ipv4 = enb_fteid.ipv4_addr.map(Ipv4Addr::from);
-            dl_tunnel.remote_ip.ipv6 = enb_fteid.ipv6_addr.map(std::net::Ipv6Addr::from);
-            // Every Modify Bearer write is a new generation, even one that
-            // writes the endpoint the tunnel already holds (#991 review): its
-            // refusal must not undo a later writer that wrote the same value.
-            dl_tunnel.generation = dl_tunnel.generation.wrapping_add(1);
-            ctx.tunnel_update(&dl_tunnel);
-        }
-        // The generation this request's writes left (TEID by the handler, IP
-        // above).
-        let written = ctx
-            .dl_tunnel_in_bearer(bearer.id)
-            .map(|t| t.generation)
-            .unwrap_or(0);
+        // #2288: one in-place write of the eNB's TEID and address, and a new
+        // generation, which also reads the endpoint it replaces (restored if the
+        // SGW-U refuses) and the generation it leaves. As two copy-and-write-back
+        // steps, a release or rollback in between mixed another writer's TEID with
+        // this request's address.
+        let (previous, written) = write_modify_bearer_endpoint(
+            bearer.id,
+            enb_teid,
+            crate::context::IpAddr {
+                ipv4: enb_fteid.ipv4_addr.map(Ipv4Addr::from),
+                ipv6: enb_fteid.ipv6_addr.map(std::net::Ipv6Addr::from),
+            },
+        );
         per_session
             .entry(bearer.sess_id)
             .or_default()
@@ -2620,6 +2649,41 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     }
 }
 
+/// A Modify Bearer Request's write of the eNB's S1-U endpoint onto bearer
+/// `bearer_id`'s downlink tunnel (#2288): TEID, address (#936, TS 29.274 §8.22:
+/// whichever families the F-TEID carries) and a new generation, in ONE in-place step
+/// that also reads the endpoint it replaces. Returns that previous endpoint (restored
+/// if the SGW-U refuses) and the generation the write left; `(None, 0)` with no
+/// downlink tunnel.
+///
+/// Every Modify Bearer write is a new generation, even one that writes the endpoint
+/// the tunnel already holds (#991 review): its refusal must not undo a later writer
+/// that wrote the same value. As two copy-and-write-back steps (the TEID in the
+/// handler, the address here), a release or rollback in between mixed another
+/// writer's TEID with this request's address.
+pub(crate) fn write_modify_bearer_endpoint(
+    bearer_id: u64,
+    enb_teid: u32,
+    enb_ip: crate::context::IpAddr,
+) -> (Option<(u32, crate::context::IpAddr)>, u64) {
+    let ctx = sgwc_self();
+    let Some(dl) = ctx.dl_tunnel_in_bearer(bearer_id) else {
+        return (None, 0);
+    };
+    crate::context::race_point("mbr_write");
+    // The generation is the one this write left, read inside the same step: read
+    // after it, it could already be a later writer's. `tunnel_modify` stores old + 1
+    // for an advanced generation, which is what is set here.
+    ctx.tunnel_modify(dl.id, |t| {
+        let previous = (t.remote_teid, t.remote_ip.clone());
+        t.remote_teid = enb_teid;
+        t.remote_ip = enb_ip;
+        t.generation = t.generation.wrapping_add(1);
+        (Some(previous), t.generation)
+    })
+    .unwrap_or((None, 0))
+}
+
 /// Release the UE's S1-U bearers at the user plane (TS 23.401 §5.3.5 step 3): the
 /// eNodeB endpoints are forgotten and the downlink FARs go to BUFF + NOCP, so the
 /// next downlink packet is buffered and reported, and a Downlink Data Notification
@@ -2633,10 +2697,14 @@ pub(crate) fn release_s1u_bearers(ue: &crate::context::SgwcUe, xact: u64) -> usi
             continue;
         };
         for bearer_id in &sess.bearer_ids {
-            if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(*bearer_id) {
-                dl_tunnel.remote_teid = 0;
-                dl_tunnel.remote_ip = crate::context::IpAddr::default();
-                ctx.tunnel_update(&dl_tunnel);
+            // In place (#2288): a copy written back could revert a Modify Bearer
+            // that switched this tunnel in between.
+            if let Some(dl_tunnel) = ctx.dl_tunnel_in_bearer(*bearer_id) {
+                crate::context::race_point("release_s1u");
+                ctx.tunnel_modify(dl_tunnel.id, |t| {
+                    t.remote_teid = 0;
+                    t.remote_ip = crate::context::IpAddr::default();
+                });
             }
         }
         match pfcp_path::send_session_modification_request(
@@ -5964,6 +6032,15 @@ mod tests {
     /// The IE was PARSED into `ParsedDdnAck.data_notification_delay` and then dropped by
     /// the handler, so the throttling TS 29.274 §7.2.11.2 defines could not happen and a
     /// busy idle UE could produce a notification per downlink packet.
+    ///
+    /// #2288: this was flaky under load (about 1 in 100 with 128 parallel runs), and not
+    /// because of its timing. The DDN send path wrote back a copy of the UE after the
+    /// send, which reverted the delay whenever the MME's acknowledge was handled in
+    /// between; `the_ddn_bookkeeping_never_reverts_the_acknowledges_delay` reproduces
+    /// that interleaving deterministically. The test also no longer guesses: it waits
+    /// for the delay to be recorded rather than 200ms, uses the largest delay (255 x
+    /// 50ms) so no wall-clock window can close during it, and waits for the second
+    /// report to be throttled before asserting that nothing was sent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_data_notification_delay_throttles_the_next_ddn() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
@@ -6004,7 +6081,8 @@ mod tests {
             .await;
         let ddn = recv_s11(&sock).await.expect("the first DDN");
 
-        // Accepted, with a 20 x 50ms = 1s delay before the next one.
+        // Accepted, with a 255 x 50ms = 12.75s delay before the next one: the largest
+        // the IE carries, so the window outlasts the test however loaded the host is.
         let mut ack = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::DownlinkDataNotificationAcknowledge as u8,
             ue.sgw_s11_teid,
@@ -6014,23 +6092,122 @@ mod tests {
         ack.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
             Gtp2IeType::DelayValue as u8,
             0,
-            &[20],
+            &[255],
         ));
         sock.send_to(&ack.encode(), server.local_addr()).unwrap();
-        // Let the acknowledge be processed before the next report.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The acknowledge is processed: its delay is recorded on the UE.
+        let mut recorded = false;
+        for _ in 0..200 {
+            if ctx
+                .ue_find_by_id(ue.id)
+                .is_some_and(|u| u.ddn_delay_remaining().is_some())
+            {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            recorded,
+            "the DDN Acknowledge's Data Notification Delay is recorded"
+        );
 
-        // A second report inside the delay window must NOT page again.
+        // A second report inside the delay window must NOT page again. Wait until the
+        // SGW-C has throttled it, so "nothing arrived" is not just "not handled yet".
         sock.set_read_timeout(Some(Duration::from_millis(300)))
             .unwrap();
+        let throttled =
+            || crate::sxa_response::DDN_THROTTLED.load(std::sync::atomic::Ordering::Relaxed);
+        let before = throttled();
         sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9C)
             .await;
+        let mut handled = false;
+        for _ in 0..200 {
+            if throttled() > before {
+                handled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handled, "the second report is handled, and throttled");
         assert!(
             recv_s11(&sock).await.is_none(),
             "the MME asked for a 1s Data Notification Delay: a second notification inside \
              it is the storm the IE exists to suppress"
         );
 
+        server.close();
+    }
+
+    /// #2288: the root cause of the flake above, made deterministic. The MME's DDN
+    /// Acknowledge, with its Data Notification Delay, is handled the instant the DDN is
+    /// sent, before the send path goes on (`AFTER_DDN_SENT`). The delay must survive:
+    /// the send path used to write back a copy of the UE taken before the acknowledge,
+    /// which reverted it, so the next DDN was not throttled.
+    ///
+    /// Revert-verified: with the send path writing back a copy of the UE taken before
+    /// the send, the delay is gone and the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ddn_bookkeeping_never_reverts_the_acknowledges_delay() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x8f];
+        sock.send_to(&csr(0x5408, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        let pdr_id = ctx
+            .dl_tunnel_in_bearer(sess.bearer_ids[0])
+            .and_then(|t| t.pdr_id)
+            .or_else(|| {
+                ctx.ul_tunnel_in_bearer(sess.bearer_ids[0])
+                    .and_then(|t| t.pdr_id)
+            })
+            .expect("pdr id");
+
+        let ue_id = ue.id;
+        *crate::sxa_response::AFTER_DDN_SENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            crate::sxa_response::downlink_data_notification_ack(
+                Some(ue_id),
+                gtp_cause::REQUEST_ACCEPTED,
+                Some(255),
+            );
+        }));
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9D)
+            .await;
+        let _ddn = recv_s11(&sock).await.expect("the DDN");
+        *crate::sxa_response::AFTER_DDN_SENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        // The send path is done once its log line is behind it; give it the same
+        // bounded wait the other tests use, then look.
+        let mut settled = None;
+        for _ in 0..200 {
+            let u = ctx.ue_find_by_id(ue_id).expect("ue");
+            if u.ddn_outstanding_sess_id.is_none() {
+                settled = Some(u);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let u = settled.expect("the acknowledge cleared the outstanding DDN");
+        assert!(
+            u.ddn_delay_remaining().is_some(),
+            "the acknowledge's Data Notification Delay survives the DDN send path"
+        );
         server.close();
     }
 

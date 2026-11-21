@@ -969,8 +969,9 @@ jobs:
     # the SMF reports to it must be RAN + N3 (the gNB's held Echo) + N9 (tc
     # netem between the UPFs), within a band narrower than N3 and N9. The
     # negative control injects no N9 delay and must fail, and the difference of
-    # the two arms' DL must be N9 (check-n9.sh, R43). What the per-PR in-process test does not prove, and what neither
-    # does: docker/iupf-delay-e2e/run.sh's header.
+    # the two arms' DL must be N9 (check-n9.sh, R43). What the per-PR
+    # in-process test does not prove, and what neither does:
+    # docker/iupf-delay-e2e/run.sh's header.
     runs-on: ubuntu-latest
     needs: check
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -1016,8 +1017,13 @@ jobs:
           grep -q '^FAIL: DL' "$IUPF_DELAY_OUT/no-n9/results.txt"
       - name: the N9 part, differentially (pass DL - no-N9 DL = N9)
         run: |
-          bash docker/iupf-delay-e2e/check-n9.sh "$IUPF_DELAY_OUT/pass/results.txt" "$IUPF_DELAY_OUT/no-n9/results.txt" \
+          bash docker/iupf-delay-e2e/check-n9.sh \
+            "$IUPF_DELAY_OUT/pass/results.txt" "$IUPF_DELAY_OUT/no-n9/results.txt" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: the stale sweep spares a live run (R43 on #2275)
+        run: bash docker/iupf-delay-e2e/check-sweep.sh "$RUNNER_TEMP/iupf-delay-bin" "$IUPF_DELAY_OUT/sweep"
+      - name: the lease survives hammered renewals (R43 on #2286)
+        run: bash docker/iupf-delay-e2e/check-lease.sh "$RUNNER_TEMP/iupf-delay-bin" "$IUPF_DELAY_OUT/lease"
       - name: upload the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
